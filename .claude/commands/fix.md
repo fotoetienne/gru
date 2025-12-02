@@ -1,10 +1,12 @@
 ---
-description: Create a branch/worktree for an issue and implement a fix
+description: Implement a fix for a GitHub issue (run from worktree)
 allowed-tools: Bash(gh:*), Bash(git:*), Read, Glob, Grep, Edit, Write, Task, TodoWrite, WebFetch
 argument-hint: "<issue# or URL>"
 ---
 
-Fix a GitHub issue end-to-end: setup workspace, plan, and implement.
+Implement a fix for a GitHub issue.
+
+**Prerequisites:** Run `/setup-worktree $ARGUMENTS` first, then launch Claude in that directory.
 
 **Issue:** $ARGUMENTS
 
@@ -28,20 +30,10 @@ Fix a GitHub issue end-to-end: setup workspace, plan, and implement.
 - **If the issue is focused and ready to fix:**
   - Proceed to the next step
 
-## 3. Create Branch & Worktree
-- Derive a branch name from the issue: `gru/issue-<issue#>` (e.g., `gru/issue-42`)
-- Determine the repository owner and name from the git remote
-- Check if a worktree already exists in `~/.gru/work/owner/repo/` for this issue
-  - If found, use the existing worktree
-  - If not, create a git worktree following Gru's filesystem structure:
-    1. Ensure bare repo exists at `~/.gru/repos/owner/repo.git/`
-       - If not, create it: `git clone --bare <remote-url> ~/.gru/repos/owner/repo.git`
-    2. Create worktree from bare repo:
-       ```
-       cd ~/.gru/repos/owner/repo.git
-       git worktree add ~/.gru/work/owner/repo/issue-<issue#> -b gru/issue-<issue#>
-       ```
-- Inform the user of the worktree location
+## 3. Verify Worktree Setup
+- Confirm current directory is a git worktree with `git rev-parse --git-dir`
+- Check current branch matches expected pattern `gru/issue-<issue#>`
+- If not in correct worktree, remind user to run `/setup-worktree` first
 
 ## 4. Plan the Fix
 - Explore the codebase to understand the relevant code
@@ -88,15 +80,14 @@ Fix a GitHub issue end-to-end: setup workspace, plan, and implement.
 - make a reply that addresses each comment and includes a summary of the changes made
 - Repeat until the PR is ready to merge
 
-## 10. Cleanup
-- Once PR has been merged, remove the worktree directory
+## 10. Merge & Cleanup
 - **IMPORTANT**: When merging PRs created from worktrees:
-  - DO NOT run `gh pr merge` from inside the worktree - it will fail with "fatal: 'main' is already used by worktree"
-  - Instead, run the merge command from the main working directory or use `--auto` flag
-  - After successful merge, clean up the worktree from the bare repo:
+  - Use `gh pr merge` with the `--auto` flag or `--merge` flag to avoid worktree conflicts
+  - After successful merge, inform user that worktree can be cleaned up
+  - User should run cleanup from main session or bare repo:
     ```
     cd ~/.gru/repos/owner/repo.git
     git worktree remove ~/.gru/work/owner/repo/issue-<issue#>
+    git branch -D gru/issue-<issue#>
     ```
-  - Optionally delete the branch: `git branch -D gru/issue-<issue#>`
-- After merging, run `git pull` on main to sync locally.
+- Do NOT attempt to remove the worktree from within itself
