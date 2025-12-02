@@ -2,7 +2,7 @@
 # Pre-commit hook for Gru project
 # Runs code quality checks before allowing a commit
 
-set -e
+# Note: Not using 'set -e' because we handle errors explicitly with if statements
 
 # Color codes for output
 RED='\033[0;31m'
@@ -11,6 +11,14 @@ GREEN='\033[0;32m'
 NC='\033[0m' # No Color
 
 echo "🔍 Running pre-commit checks..."
+
+# Verify this is a Rust project
+if [ ! -f "Cargo.toml" ]; then
+    echo -e "${RED}✗ Error: Cargo.toml not found${NC}"
+    echo "  This pre-commit hook is designed for Rust projects"
+    echo "  Current directory: $(pwd)"
+    exit 1
+fi
 
 # Get current branch name
 BRANCH=$(git rev-parse --abbrev-ref HEAD)
@@ -64,11 +72,18 @@ echo -e "${GREEN}✓ All tests passed${NC}"
 
 # 5. Check for TODO/FIXME comments (warning only)
 echo "📋 Checking for TODO/FIXME comments..."
-if git diff --cached --name-only | xargs grep -n "TODO\|FIXME" 2>/dev/null; then
-    echo -e "${YELLOW}⚠ Found TODO/FIXME comments in staged files${NC}"
-    echo "  This is just a reminder - commit will proceed"
+STAGED_FILES=$(git diff --cached --name-only --diff-filter=ACMR)
+if [ -n "$STAGED_FILES" ]; then
+    # Use -z and xargs -0 to safely handle filenames with special characters
+    if git diff --cached --name-only -z --diff-filter=ACMR | xargs -0 grep -l "TODO\|FIXME" 2>/dev/null | head -1 | grep -q .; then
+        echo -e "${YELLOW}⚠ Found TODO/FIXME comments in staged files${NC}"
+        git diff --cached --name-only -z --diff-filter=ACMR | xargs -0 grep -n "TODO\|FIXME" 2>/dev/null || true
+        echo "  This is just a reminder - commit will proceed"
+    else
+        echo -e "${GREEN}✓ No TODO/FIXME comments found${NC}"
+    fi
 else
-    echo -e "${GREEN}✓ No TODO/FIXME comments found${NC}"
+    echo -e "${GREEN}✓ No staged files to check${NC}"
 fi
 
 echo ""

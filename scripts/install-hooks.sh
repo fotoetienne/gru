@@ -34,6 +34,18 @@ mkdir -p "$GIT_HOOKS_DIR"
 HOOK_SOURCE="$SCRIPTS_DIR/pre-commit"
 HOOK_TARGET="$GIT_HOOKS_DIR/pre-commit"
 
+# Verify the source hook exists and is executable
+if [ ! -f "$HOOK_SOURCE" ]; then
+    echo -e "${RED}✗ Error: Hook source not found: $HOOK_SOURCE${NC}"
+    exit 1
+fi
+
+if [ ! -x "$HOOK_SOURCE" ]; then
+    echo -e "${YELLOW}⚠ Warning: Hook source is not executable${NC}"
+    echo "  Making it executable..."
+    chmod +x "$HOOK_SOURCE"
+fi
+
 if [ -f "$HOOK_TARGET" ] || [ -L "$HOOK_TARGET" ]; then
     echo -e "${YELLOW}⚠ Pre-commit hook already exists${NC}"
     read -p "  Replace it? (y/N) " -n 1 -r
@@ -41,9 +53,13 @@ if [ -f "$HOOK_TARGET" ] || [ -L "$HOOK_TARGET" ]; then
     if [[ ! $REPLY =~ ^[Yy]$ ]]; then
         echo "  Skipping pre-commit hook installation"
     else
-        rm "$HOOK_TARGET"
-        ln -s "$HOOK_SOURCE" "$HOOK_TARGET"
-        echo -e "${GREEN}✓ Pre-commit hook installed${NC}"
+        if rm "$HOOK_TARGET" 2>/dev/null; then
+            ln -s "$HOOK_SOURCE" "$HOOK_TARGET"
+            echo -e "${GREEN}✓ Pre-commit hook installed${NC}"
+        else
+            echo -e "${RED}✗ Error: Failed to remove existing hook${NC}"
+            exit 1
+        fi
     fi
 else
     ln -s "$HOOK_SOURCE" "$HOOK_TARGET"
