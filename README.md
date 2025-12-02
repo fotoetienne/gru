@@ -37,13 +37,13 @@ This project includes pre-commit hooks to ensure code quality before commits are
 
 #### Installing Hooks
 
-To install the pre-commit hooks, run:
+To enable the pre-commit hooks, run:
 
 ```bash
-./.githooks/install-hooks.sh
+git config core.hooksPath .githooks
 ```
 
-This configures git to use the `.githooks/` directory via `git config core.hooksPath .githooks`. No symlinks needed!
+This tells git to use hooks from the `.githooks/` directory. Simple and standard!
 
 #### Bypassing Hooks
 
