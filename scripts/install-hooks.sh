@@ -53,17 +53,24 @@ if [ -f "$HOOK_TARGET" ] || [ -L "$HOOK_TARGET" ]; then
     if [[ ! $REPLY =~ ^[Yy]$ ]]; then
         echo "  Skipping pre-commit hook installation"
     else
-        if rm "$HOOK_TARGET" 2>/dev/null; then
-            ln -s "$HOOK_SOURCE" "$HOOK_TARGET"
+        if ! rm "$HOOK_TARGET" 2>/dev/null; then
+            echo -e "${RED}✗ Error: Failed to remove existing hook${NC}"
+            exit 1
+        fi
+        if ln -s "$HOOK_SOURCE" "$HOOK_TARGET"; then
             echo -e "${GREEN}✓ Pre-commit hook installed${NC}"
         else
-            echo -e "${RED}✗ Error: Failed to remove existing hook${NC}"
+            echo -e "${RED}✗ Error: Failed to create symlink for pre-commit hook${NC}"
             exit 1
         fi
     fi
 else
-    ln -s "$HOOK_SOURCE" "$HOOK_TARGET"
-    echo -e "${GREEN}✓ Pre-commit hook installed${NC}"
+    if ln -s "$HOOK_SOURCE" "$HOOK_TARGET"; then
+        echo -e "${GREEN}✓ Pre-commit hook installed${NC}"
+    else
+        echo -e "${RED}✗ Error: Failed to create symlink for pre-commit hook${NC}"
+        exit 1
+    fi
 fi
 
 echo ""

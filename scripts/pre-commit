@@ -48,7 +48,7 @@ echo -e "${GREEN}✓ Code formatting looks good${NC}"
 
 # 3. Run clippy linter
 echo "🔍 Running clippy linter..."
-if ! cargo clippy -- -D warnings; then
+if ! cargo clippy --all-targets -- -D warnings; then
     echo -e "${RED}✗ Clippy found issues${NC}"
     echo "  Fix the issues above before committing"
     echo ""
@@ -75,7 +75,7 @@ echo "📋 Checking for TODO/FIXME comments..."
 STAGED_FILES=$(git diff --cached --name-only --diff-filter=ACMR)
 if [ -n "$STAGED_FILES" ]; then
     # Use -z and xargs -0 to safely handle filenames with special characters
-    if git diff --cached --name-only -z --diff-filter=ACMR | xargs -0 grep -l "TODO\|FIXME" 2>/dev/null | head -1 | grep -q .; then
+    if git diff --cached --name-only -z --diff-filter=ACMR | xargs -0 grep -l "TODO\|FIXME" 2>/dev/null; then
         echo -e "${YELLOW}⚠ Found TODO/FIXME comments in staged files${NC}"
         git diff --cached --name-only -z --diff-filter=ACMR | xargs -0 grep -n "TODO\|FIXME" 2>/dev/null || true
         echo "  This is just a reminder - commit will proceed"
