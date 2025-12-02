@@ -30,7 +30,7 @@ For a full list of commands with descriptions, run `just --list`.
 This project includes pre-commit hooks to ensure code quality before commits are made. The hooks automatically run:
 
 - **Code formatting check** (`cargo fmt --check`) - Ensures code follows Rust formatting standards
-- **Linting** (`cargo clippy -- -D warnings`) - Catches common mistakes and enforces best practices
+- **Linting** (`cargo clippy --all-targets -- -D warnings`) - Catches common mistakes and enforces best practices across all code including tests
 - **Tests** (`cargo test`) - Validates that all tests pass
 - **Branch protection** - Prevents direct commits to the main branch
 - **TODO/FIXME check** - Warns about TODO/FIXME comments (warning only, doesn't block commits)
@@ -40,10 +40,10 @@ This project includes pre-commit hooks to ensure code quality before commits are
 To install the pre-commit hooks, run:
 
 ```bash
-./scripts/install-hooks.sh
+./.githooks/install-hooks.sh
 ```
 
-This creates symlinks from `.git/hooks/` to the hook scripts in the `scripts/` directory.
+This configures git to use the `.githooks/` directory via `git config core.hooksPath .githooks`. No symlinks needed!
 
 #### Bypassing Hooks
 
