@@ -29,7 +29,7 @@ fn handle_fix(issue: &str) -> ! {
         .status();
 
     match result {
-        Ok(status) => std::process::exit(status.code().unwrap_or(1)),
+        Ok(status) => std::process::exit(status.code().unwrap_or(128)),
         Err(e) => {
             if e.kind() == std::io::ErrorKind::NotFound {
                 eprintln!("Error: 'claude' command not found. Please install Claude CLI first.");
