@@ -8,26 +8,8 @@
 
 ## Development
 
+### Just Commands
 This project uses [Just](https://just.systems/) as a command runner for common development tasks.
-
-### Installing Just
-
-**macOS:**
-```bash
-brew install just
-```
-
-**Linux:**
-```bash
-curl --proto '=https' --tlsv1.2 -sSf https://just.systems/install.sh | bash -s -- --to /usr/local/bin
-```
-
-**Cargo:**
-```bash
-cargo install just
-```
-
-### Available Commands
 
 Run `just` to see all available recipes:
 
@@ -38,6 +20,7 @@ just test             # Run all tests
 just lint             # Run clippy linter
 just fmt              # Format code
 just check            # Run all checks (fmt, lint, test, build)
+just install          # Build and install the binary to ~/.cargo/bin
 ```
 
 For a full list of commands with descriptions, run `just --list`.
