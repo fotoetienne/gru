@@ -37,7 +37,17 @@ fn validate_issue_format(issue: &str) -> Result<()> {
     // Check if it's a GitHub URL with proper format
     // Expected: https://github.com/owner/repo/issues/123
     if issue.starts_with("https://github.com/") {
-        let parts: Vec<&str> = issue
+        // Strip query parameters and fragments
+        let url = issue
+            .split('?')
+            .next()
+            .unwrap()
+            .split('#')
+            .next()
+            .unwrap()
+            .trim_end_matches('/');
+
+        let parts: Vec<&str> = url
             .strip_prefix("https://github.com/")
             .unwrap()
             .split('/')
@@ -72,7 +82,17 @@ fn validate_pr_format(pr: &str) -> Result<()> {
     // Check if it's a GitHub URL with proper format
     // Expected: https://github.com/owner/repo/pull/123
     if pr.starts_with("https://github.com/") {
-        let parts: Vec<&str> = pr
+        // Strip query parameters and fragments
+        let url = pr
+            .split('?')
+            .next()
+            .unwrap()
+            .split('#')
+            .next()
+            .unwrap()
+            .trim_end_matches('/');
+
+        let parts: Vec<&str> = url
             .strip_prefix("https://github.com/")
             .unwrap()
             .split('/')
@@ -115,7 +135,8 @@ fn handle_fix(issue: &str) -> Result<i32> {
         )?;
 
     // Return the exit code from the claude process
-    Ok(status.code().unwrap_or(1))
+    // Use 128 for signal terminations to follow shell conventions
+    Ok(status.code().unwrap_or(128))
 }
 
 /// Handles the review command by delegating to the Claude CLI
@@ -136,7 +157,8 @@ fn handle_review(pr: &str) -> Result<i32> {
         )?;
 
     // Return the exit code from the claude process
-    Ok(status.code().unwrap_or(1))
+    // Use 128 for signal terminations to follow shell conventions
+    Ok(status.code().unwrap_or(128))
 }
 
 fn main() {
@@ -192,6 +214,36 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_issue_format_handles_edge_cases() {
+        // Trailing slashes should be handled
+        assert!(
+            validate_issue_format("https://github.com/owner/repo/issues/42/").is_ok()
+        );
+        // Query parameters should be ignored
+        assert!(
+            validate_issue_format("https://github.com/owner/repo/issues/42?foo=bar").is_ok()
+        );
+        // Fragments should be ignored
+        assert!(
+            validate_issue_format("https://github.com/owner/repo/issues/42#comment-123").is_ok()
+        );
+        // Combined edge cases
+        assert!(
+            validate_issue_format("https://github.com/owner/repo/issues/42/?foo=bar#comment").is_ok()
+        );
+    }
+
+    #[test]
+    fn test_validate_issue_format_rejects_empty_owner_or_repo() {
+        // Empty owner
+        assert!(validate_issue_format("https://github.com//repo/issues/42").is_err());
+        // Empty repo
+        assert!(validate_issue_format("https://github.com/owner//issues/42").is_err());
+        // Both empty
+        assert!(validate_issue_format("https://github.com///issues/42").is_err());
+    }
+
+    #[test]
     fn test_validate_pr_format_with_number() {
         assert!(validate_pr_format("42").is_ok());
         assert!(validate_pr_format("1").is_ok());
@@ -217,5 +269,31 @@ mod tests {
     #[test]
     fn test_validate_pr_format_rejects_negative_numbers() {
         assert!(validate_pr_format("-42").is_err());
+    }
+
+    #[test]
+    fn test_validate_pr_format_handles_edge_cases() {
+        // Trailing slashes should be handled
+        assert!(validate_pr_format("https://github.com/owner/repo/pull/42/").is_ok());
+        // Query parameters should be ignored
+        assert!(validate_pr_format("https://github.com/owner/repo/pull/42?foo=bar").is_ok());
+        // Fragments should be ignored
+        assert!(
+            validate_pr_format("https://github.com/owner/repo/pull/42#comment-123").is_ok()
+        );
+        // Combined edge cases
+        assert!(
+            validate_pr_format("https://github.com/owner/repo/pull/42/?foo=bar#comment").is_ok()
+        );
+    }
+
+    #[test]
+    fn test_validate_pr_format_rejects_empty_owner_or_repo() {
+        // Empty owner
+        assert!(validate_pr_format("https://github.com//repo/pull/42").is_err());
+        // Empty repo
+        assert!(validate_pr_format("https://github.com/owner//pull/42").is_err());
+        // Both empty
+        assert!(validate_pr_format("https://github.com///pull/42").is_err());
     }
 }
