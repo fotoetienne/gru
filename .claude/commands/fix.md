@@ -29,13 +29,18 @@ Fix a GitHub issue end-to-end: setup workspace, plan, and implement.
   - Proceed to the next step
 
 ## 3. Create Branch & Worktree
-- Derive a branch name from the issue: `fix/<issue#>-<short-description>` (e.g., `fix/42-cors-headers`)
-- Check if a worktree already exists in `../worktrees/` for this branch
+- Derive a branch name from the issue: `gru/issue-<issue#>` (e.g., `gru/issue-42`)
+- Determine the repository owner and name from the git remote
+- Check if a worktree already exists in `~/.gru/work/owner/repo/` for this issue
   - If found, use the existing worktree
-  - If not, create a git worktree for isolated work:
-    ```
-    git worktree add ../worktrees/fix-<issue#>-<desc> -b fix/<issue#>-<desc>
-    ```
+  - If not, create a git worktree following Gru's filesystem structure:
+    1. Ensure bare repo exists at `~/.gru/repos/owner/repo.git/`
+       - If not, create it: `git clone --bare <remote-url> ~/.gru/repos/owner/repo.git`
+    2. Create worktree from bare repo:
+       ```
+       cd ~/.gru/repos/owner/repo.git
+       git worktree add ~/.gru/work/owner/repo/issue-<issue#> -b gru/issue-<issue#>
+       ```
 - Inform the user of the worktree location
 
 ## 4. Plan the Fix
@@ -88,5 +93,10 @@ Fix a GitHub issue end-to-end: setup workspace, plan, and implement.
 - **IMPORTANT**: When merging PRs created from worktrees:
   - DO NOT run `gh pr merge` from inside the worktree - it will fail with "fatal: 'main' is already used by worktree"
   - Instead, run the merge command from the main working directory or use `--auto` flag
-  - After successful merge, manually clean up: `git worktree remove ../worktrees/fix-<issue#>-<desc>`
+  - After successful merge, clean up the worktree from the bare repo:
+    ```
+    cd ~/.gru/repos/owner/repo.git
+    git worktree remove ~/.gru/work/owner/repo/issue-<issue#>
+    ```
+  - Optionally delete the branch: `git branch -D gru/issue-<issue#>`
 - After merging, run `git pull` on main to sync locally.
