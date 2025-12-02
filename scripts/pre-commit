@@ -1,0 +1,76 @@
+#!/bin/bash
+# Pre-commit hook for Gru project
+# Runs code quality checks before allowing a commit
+
+set -e
+
+# Color codes for output
+RED='\033[0;31m'
+YELLOW='\033[1;33m'
+GREEN='\033[0;32m'
+NC='\033[0m' # No Color
+
+echo "🔍 Running pre-commit checks..."
+
+# Get current branch name
+BRANCH=$(git rev-parse --abbrev-ref HEAD)
+
+# 1. Prevent direct commits to main/master
+if [ "$BRANCH" = "main" ] || [ "$BRANCH" = "master" ]; then
+    echo -e "${RED}✗ Direct commits to '$BRANCH' branch are not allowed${NC}"
+    echo "  Please create a feature branch instead:"
+    echo "  git checkout -b feature/your-feature-name"
+    echo ""
+    echo "  To bypass this check (use with caution):"
+    echo "  git commit --no-verify"
+    exit 1
+fi
+
+# 2. Check code formatting
+echo "📝 Checking code formatting..."
+if ! cargo fmt --all -- --check; then
+    echo -e "${RED}✗ Code formatting check failed${NC}"
+    echo "  Run 'cargo fmt --all' or 'just fmt' to fix formatting"
+    echo ""
+    echo "  To bypass this check (not recommended):"
+    echo "  git commit --no-verify"
+    exit 1
+fi
+echo -e "${GREEN}✓ Code formatting looks good${NC}"
+
+# 3. Run clippy linter
+echo "🔍 Running clippy linter..."
+if ! cargo clippy -- -D warnings; then
+    echo -e "${RED}✗ Clippy found issues${NC}"
+    echo "  Fix the issues above before committing"
+    echo ""
+    echo "  To bypass this check (not recommended):"
+    echo "  git commit --no-verify"
+    exit 1
+fi
+echo -e "${GREEN}✓ Clippy checks passed${NC}"
+
+# 4. Run tests
+echo "🧪 Running tests..."
+if ! cargo test; then
+    echo -e "${RED}✗ Tests failed${NC}"
+    echo "  Fix the failing tests before committing"
+    echo ""
+    echo "  To bypass this check (not recommended):"
+    echo "  git commit --no-verify"
+    exit 1
+fi
+echo -e "${GREEN}✓ All tests passed${NC}"
+
+# 5. Check for TODO/FIXME comments (warning only)
+echo "📋 Checking for TODO/FIXME comments..."
+if git diff --cached --name-only | xargs grep -n "TODO\|FIXME" 2>/dev/null; then
+    echo -e "${YELLOW}⚠ Found TODO/FIXME comments in staged files${NC}"
+    echo "  This is just a reminder - commit will proceed"
+else
+    echo -e "${GREEN}✓ No TODO/FIXME comments found${NC}"
+fi
+
+echo ""
+echo -e "${GREEN}✅ All pre-commit checks passed!${NC}"
+echo ""
