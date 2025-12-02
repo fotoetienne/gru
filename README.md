@@ -25,6 +25,36 @@ just install          # Build and install the binary to ~/.cargo/bin
 
 For a full list of commands with descriptions, run `just --list`.
 
+### Pre-commit Hooks
+
+This project includes pre-commit hooks to ensure code quality before commits are made. The hooks automatically run:
+
+- **Code formatting check** (`just fmt-check`) - Ensures code follows Rust formatting standards
+- **Linting** (`just lint`) - Catches common mistakes and enforces best practices across all code including tests
+- **Tests** (`just test`) - Validates that all tests pass
+- **Branch protection** - Prevents direct commits to the main branch
+- **TODO/FIXME check** - Warns about TODO/FIXME comments (warning only, doesn't block commits)
+
+#### Installing Hooks
+
+To enable the pre-commit hooks, run:
+
+```bash
+git config core.hooksPath .githooks
+```
+
+This tells git to use hooks from the `.githooks/` directory. Simple and standard!
+
+#### Bypassing Hooks
+
+In emergencies, you can bypass the hooks using:
+
+```bash
+git commit --no-verify
+```
+
+**Note:** Use this sparingly, as it skips important code quality checks.
+
 ---
 
 ## 1) Core Concepts
