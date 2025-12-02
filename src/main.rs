@@ -131,7 +131,7 @@ fn handle_fix(issue: &str) -> Result<i32> {
         .stderr(std::process::Stdio::inherit())
         .status()
         .context(
-            "claude command not found. Install from: https://github.com/anthropics/claude-code"
+            "claude command not found. Install from: https://github.com/anthropics/claude-code",
         )?;
 
     // Return the exit code from the claude process
@@ -153,7 +153,7 @@ fn handle_review(pr: &str) -> Result<i32> {
         .stderr(std::process::Stdio::inherit())
         .status()
         .context(
-            "claude command not found. Install from: https://github.com/anthropics/claude-code"
+            "claude command not found. Install from: https://github.com/anthropics/claude-code",
         )?;
 
     // Return the exit code from the claude process
@@ -193,9 +193,7 @@ mod tests {
     #[test]
     fn test_validate_issue_format_with_valid_url() {
         assert!(validate_issue_format("https://github.com/fotoetienne/gru/issues/42").is_ok());
-        assert!(
-            validate_issue_format("https://github.com/owner/repo-name/issues/123").is_ok()
-        );
+        assert!(validate_issue_format("https://github.com/owner/repo-name/issues/123").is_ok());
     }
 
     #[test]
@@ -216,20 +214,17 @@ mod tests {
     #[test]
     fn test_validate_issue_format_handles_edge_cases() {
         // Trailing slashes should be handled
-        assert!(
-            validate_issue_format("https://github.com/owner/repo/issues/42/").is_ok()
-        );
+        assert!(validate_issue_format("https://github.com/owner/repo/issues/42/").is_ok());
         // Query parameters should be ignored
-        assert!(
-            validate_issue_format("https://github.com/owner/repo/issues/42?foo=bar").is_ok()
-        );
+        assert!(validate_issue_format("https://github.com/owner/repo/issues/42?foo=bar").is_ok());
         // Fragments should be ignored
         assert!(
             validate_issue_format("https://github.com/owner/repo/issues/42#comment-123").is_ok()
         );
         // Combined edge cases
         assert!(
-            validate_issue_format("https://github.com/owner/repo/issues/42/?foo=bar#comment").is_ok()
+            validate_issue_format("https://github.com/owner/repo/issues/42/?foo=bar#comment")
+                .is_ok()
         );
     }
 
@@ -278,9 +273,7 @@ mod tests {
         // Query parameters should be ignored
         assert!(validate_pr_format("https://github.com/owner/repo/pull/42?foo=bar").is_ok());
         // Fragments should be ignored
-        assert!(
-            validate_pr_format("https://github.com/owner/repo/pull/42#comment-123").is_ok()
-        );
+        assert!(validate_pr_format("https://github.com/owner/repo/pull/42#comment-123").is_ok());
         // Combined edge cases
         assert!(
             validate_pr_format("https://github.com/owner/repo/pull/42/?foo=bar#comment").is_ok()

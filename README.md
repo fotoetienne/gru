@@ -36,6 +36,18 @@ gru fix 42
 gru fix https://github.com/owner/repo/issues/42
 ```
 
+**`gru review <pr>`** - Review a GitHub pull request using Claude CLI
+
+Delegates to Claude CLI's `/pr_review` command.
+
+```bash
+# Review a PR by number
+gru review 42
+
+# Review a PR by URL
+gru review https://github.com/owner/repo/pull/42
+```
+
 ### Other Commands
 
 ```bash
@@ -87,6 +99,38 @@ just test    # Run tests
 just lint    # Run clippy
 just check   # Run all checks
 ```
+
+For a full list of commands with descriptions, run `just --list`.
+
+### Pre-commit Hooks
+
+This project includes pre-commit hooks to ensure code quality before commits are made. The hooks automatically run:
+
+- **Code formatting check** (`just fmt-check`) - Ensures code follows Rust formatting standards
+- **Linting** (`just lint`) - Catches common mistakes and enforces best practices across all code including tests
+- **Tests** (`just test`) - Validates that all tests pass
+- **Branch protection** - Prevents direct commits to the main branch
+- **TODO/FIXME check** - Warns about TODO/FIXME comments (warning only, doesn't block commits)
+
+#### Installing Hooks
+
+To enable the pre-commit hooks, run:
+
+```bash
+git config core.hooksPath .githooks
+```
+
+This tells git to use hooks from the `.githooks/` directory. Simple and standard!
+
+#### Bypassing Hooks
+
+In emergencies, you can bypass the hooks using:
+
+```bash
+git commit --no-verify
+```
+
+**Note:** Use this sparingly, as it skips important code quality checks.
 
 ## Roadmap
 
