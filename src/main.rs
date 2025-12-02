@@ -29,9 +29,24 @@ fn validate_issue_format(issue: &str) -> Result<()> {
         return Ok(());
     }
 
-    // Check if it's a GitHub URL
-    if issue.starts_with("https://github.com/") && issue.contains("/issues/") {
-        return Ok(());
+    // Check if it's a GitHub URL with proper format
+    // Expected: https://github.com/owner/repo/issues/123
+    if issue.starts_with("https://github.com/") {
+        let parts: Vec<&str> = issue
+            .strip_prefix("https://github.com/")
+            .unwrap()
+            .split('/')
+            .collect();
+
+        if parts.len() == 4
+            && !parts[0].is_empty() // owner
+            && !parts[1].is_empty() // repo
+            && parts[2] == "issues"
+            && parts[3].parse::<u32>().is_ok()
+        // issue number
+        {
+            return Ok(());
+        }
     }
 
     anyhow::bail!(
@@ -43,7 +58,8 @@ fn validate_issue_format(issue: &str) -> Result<()> {
 }
 
 /// Handles the fix command by delegating to the Claude CLI
-fn handle_fix(issue: &str) -> Result<()> {
+/// Returns the exit code from the claude process
+fn handle_fix(issue: &str) -> Result<i32> {
     // Validate the issue format before proceeding
     validate_issue_format(issue)?;
 
@@ -58,8 +74,8 @@ fn handle_fix(issue: &str) -> Result<()> {
             "claude command not found. Install from: https://github.com/anthropics/claude-code"
         )?;
 
-    // Exit with the same code as the claude process
-    std::process::exit(status.code().unwrap_or(1));
+    // Return the exit code from the claude process
+    Ok(status.code().unwrap_or(1))
 }
 
 fn main() {
@@ -70,8 +86,46 @@ fn main() {
     };
 
     // Handle any errors that occurred
-    if let Err(e) = result {
-        eprintln!("Error: {:#}", e);
-        std::process::exit(1);
+    match result {
+        Ok(exit_code) => std::process::exit(exit_code),
+        Err(e) => {
+            eprintln!("Error: {:#}", e);
+            std::process::exit(1);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_validate_issue_format_with_number() {
+        assert!(validate_issue_format("42").is_ok());
+        assert!(validate_issue_format("1").is_ok());
+        assert!(validate_issue_format("999999").is_ok());
+    }
+
+    #[test]
+    fn test_validate_issue_format_with_valid_url() {
+        assert!(validate_issue_format("https://github.com/fotoetienne/gru/issues/42").is_ok());
+        assert!(
+            validate_issue_format("https://github.com/owner/repo-name/issues/123").is_ok()
+        );
+    }
+
+    #[test]
+    fn test_validate_issue_format_rejects_invalid_input() {
+        assert!(validate_issue_format("not-a-number").is_err());
+        assert!(validate_issue_format("https://example.com/issues/42").is_err());
+        assert!(validate_issue_format("https://github.com/issues/").is_err());
+        assert!(validate_issue_format("https://github.com/owner/issues/").is_err());
+        assert!(validate_issue_format("https://github.com/owner/repo/issues/").is_err());
+        assert!(validate_issue_format("").is_err());
+    }
+
+    #[test]
+    fn test_validate_issue_format_rejects_negative_numbers() {
+        assert!(validate_issue_format("-42").is_err());
     }
 }
