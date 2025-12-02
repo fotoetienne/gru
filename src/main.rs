@@ -22,7 +22,9 @@ fn main() {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Fix { issue: _ } => {
+        Commands::Fix { issue } => {
+            // TODO: Implement fix functionality using issue number
+            let _ = issue;
             println!("Not implemented");
         }
     }
