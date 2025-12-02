@@ -1,248 +1,142 @@
 # Gru: Local-First LLM Agent Orchestrator
 
-## 0) One-paragraph TL;DR
+Gru is a command-line tool that helps you work with GitHub issues using LLM-based agents. Currently in Phase 1, it provides a convenient way to delegate issue fixing to the Claude CLI.
 
-**Gru** is a single-binary, local-first orchestrator for running and supervising LLM-based agents that work on GitHub issues. Each Gru instance (a **Lab**) runs **Minions** locally—fetching issues, creating branches, generating code, testing, and opening PRs. After a PR is submitted, Minions remain active to monitor reviews, respond to comments, and react to failed checks. A **Tower** (optional) provides a web UI and proxy layer for remote access, handoffs, and live attach sessions. Labs don’t know about each other; GitHub acts as the shared source of truth. One binary, three modes: `gru lab`, `gru tower`, and `gru up` (both).
+## Installation
 
----
+### Prerequisites
+
+- [Rust](https://rustup.rs/) (1.70 or later)
+- [Claude CLI](https://github.com/anthropics/claude-code) installed and configured
+- Git and GitHub CLI (`gh`) recommended
+
+### Install from Source
+
+```bash
+git clone https://github.com/fotoetienne/gru.git
+cd gru
+cargo install --path .
+```
+
+This will install the `gru` binary to `~/.cargo/bin/gru`.
+
+## Usage
+
+### Current Features (Phase 1)
+
+**`gru fix <issue>`** - Fix a GitHub issue using Claude CLI
+
+Delegates to Claude CLI's `/fix` command with improved error handling and validation.
+
+```bash
+# Fix an issue by number (must be run from within the repo)
+gru fix 42
+
+# Fix an issue by URL (works from anywhere)
+gru fix https://github.com/owner/repo/issues/42
+```
+
+### Other Commands
+
+```bash
+# Show version
+gru --version
+
+# Show help
+gru --help
+
+# Show help for fix command
+gru fix --help
+```
+
+## Error Handling
+
+Gru provides helpful error messages:
+
+- **Invalid issue format**: Clear examples of valid formats (number or GitHub URL)
+- **Claude CLI not found**: Direct link to installation instructions
+- **Other errors**: Contextual error messages with actionable information
 
 ## Development
 
-### Just Commands
-This project uses [Just](https://just.systems/) as a command runner for common development tasks.
-
-Run `just` to see all available recipes:
+### Building
 
 ```bash
-just                  # List all available commands
-just build            # Build the project
-just test             # Run all tests
-just lint             # Run clippy linter
-just fmt              # Format code
-just check            # Run all checks (fmt, lint, test, build)
-just install          # Build and install the binary to ~/.cargo/bin
+cargo build
 ```
 
-For a full list of commands with descriptions, run `just --list`.
-
----
-
-## 1) Core Concepts
-
-### **Lab**
-
-* A local worker that polls GitHub for issues labeled `ready-for-minion`.
-* Claims issues optimistically, creates worktrees, launches Minions, and opens PRs.
-* Keeps Minions alive post-PR to handle follow-up interactions such as code review feedback, test reruns, or CI failures.
-* Exposes a **GraphQL API** and **WebSocket** for real-time event streaming.
-* Runs fully offline except for GitHub and (optionally) Tower.
-
-### **Tower** (optional)
-
-* Hosts a web UI for viewing Minions, handoffs, and logs.
-* Acts as a **relay** for Labs that dial out (no inbound networking required).
-* Proxies GraphQL requests and PTY sessions to connected Labs.
-* Stateless—if restarted, Labs reconnect and re-register.
-
-### **GitHub as the database**
-
-* **Issues** = task queue.
-* **Labels** = state machine (`ready-for-minion`, `in-progress:<minion-id>`, `done/failed`).
-* **PRs** = results and feedback loop.
-* **Comments** = structured logs, handoffs, and review discussions.
-
----
-
-## 2) System Overview
-
-```
-┌─────────────┐        WS + GraphQL proxy         ┌──────────────┐
-│   Browser   │ <────────────────────────────────>│    Tower     │
-│ (Web UI)    │                                   │ (optional)   │
-└─────────────┘                                   └──────┬───────┘
-                                                         │
-                                                secure dial-out WS
-                                                         │
-                                                   ┌──────┴──────┐
-                                                   │    Lab      │
-                                                   │ (gru lab)   │
-                                                   └──────┬──────┘
-                                                          │
-                                                GitHub API + Git ops
-                                                          │
-                                                   ┌──────┴──────┐
-                                                   │   GitHub    │
-                                                   │ (Issues/PRs)│
-                                                   └─────────────┘
-```
-
----
-
-## 3) CLI Modes
-
-### `gru lab`
-
-Runs the local agent engine.
+### Running Tests
 
 ```bash
-gru lab --port 7777 --slots 2 --tower https://tower.example.com
+cargo test
 ```
 
-* Polls GitHub for `ready-for-minion` issues.
-* Claims issues and launches Minions.
-* Exposes GraphQL + WebSocket APIs.
-* Optionally dials out to Tower.
-
-### `gru tower`
-
-Hosts the web UI and relays to connected Labs.
+### Running Clippy
 
 ```bash
-gru tower --port 8080 --ui ./ui-dist
+cargo clippy
 ```
 
-* Proxies GraphQL and attach sessions.
-* Performs GitHub OAuth for web users.
-* No scheduling or storage.
+### Using Just (optional)
 
-### `gru up`
-
-Convenience command to start both in one process.
+This project includes a [Justfile](https://just.systems/) for common tasks:
 
 ```bash
-gru up --slots 2 --port 7777 --ui ./ui-dist
+just build   # Build the project
+just test    # Run tests
+just lint    # Run clippy
+just check   # Run all checks
 ```
 
----
+## Roadmap
 
-## 4) Lab GraphQL API
+Gru is being developed in phases, with Phase 1 now complete. Future phases will add:
 
-### HTTP Endpoint
+### Phase 2: Local Minion Management
+- Direct integration with Claude Agent Protocol
+- Local worktree management (`~/.gru/work/`)
+- Bare repository mirroring (`~/.gru/repos/`)
+- Issue claiming and branch creation
 
-* `POST /graphql` for queries/mutations.
+### Phase 3: Lab Mode
+- Continuous polling for `ready-for-minion` labeled issues
+- Parallel Minion execution with configurable slots
+- GraphQL API for querying Minion status
+- WebSocket support for real-time updates
+- Post-PR monitoring (reviews, CI failures, comments)
 
-### WebSocket Endpoint
+### Phase 4: Tower Mode
+- Web UI for monitoring Labs and Minions
+- Multi-Lab coordination
+- Proxy layer for remote access
+- Handoff and live attach sessions
 
-* `WS /graphql` (GraphQL over WebSocket, using `graphql-transport-ws` protocol).
-* Used for **subscriptions** (live updates: Minion events, handoffs, attach output).
+### Phase 5: Advanced Features
+- Learned prioritization
+- Multi-repo orchestration
+- Local embedding index
+- Cost and token accounting
+- Slack/mobile notifications
 
-### Example Schema (simplified)
+## Architecture
 
-```graphql
-schema { query: Query, mutation: Mutation, subscription: Subscription }
+Gru's long-term vision includes three main components:
 
-type Query {
-  lab: LabInfo!              # metadata about this Lab instance
-  issuesReady(repo: String!): [Issue!]!
-  minions(state:[MinionState!]): [Minion!]!
-}
+- **Lab**: Local worker that manages Minions and processes GitHub issues
+- **Tower** (optional): Web UI and relay for remote access to Labs
+- **GitHub**: Acts as the distributed database using issues, labels, and PRs
 
-type Mutation {
-  startMinion(repo:String!, issueNumber:Int!): Minion!
-  respondHandoff(minionId:ID!, data:JSON!): Boolean!
-  openAttach(minionId:ID!): AttachSession!
-}
+See [ARCHITECTURE.md](ARCHITECTURE.md) for the complete architecture documentation (coming soon).
 
-type Subscription {
-  minionEvents(minionId:ID!): MinionEvent!
-  handoffs(repo:String): Handoff!
-}
-```
+## Contributing
 
-### Notes
+Contributions are welcome! Please feel free to submit issues and pull requests.
 
-* The `lab` field identifies the current Lab (hostname, slots, version, capabilities).
+## License
 
-### Attach WebSocket
+[License information to be added]
 
-* `WS /attach/:sessionId` for real-time terminal (Minion REPL) streaming.
+## Related Projects
 
----
-
-## 5) GitHub Integration
-
-| Object      | Purpose      | Example                                                    |
-| ----------- | ------------ | ---------------------------------------------------------- |
-| **Label**   | State        | `ready-for-minion`, `in-progress:M42`, `minion:done`       |
-| **Comment** | Minion trace | `[minions] claimed minion=M42 branch=minion/issue-123-M42` |
-| **PR**      | Result       | `[minions][M42] Fixes #123`                                |
-
-**First-PR-Wins Rule**: If multiple Labs claim an issue, the first PR merged/opened becomes canonical; others yield.
-
-After submitting a PR, Minions monitor for:
-
-* **Review comments**: automatically update code or seek human input.
-* **Failed checks**: attempt to fix errors and push new commits.
-* **Merge events**: mark `minion:done` and archive.
-
----
-
-## 6) Tower Proxy Endpoints
-
-```
-GET  /ui/*                          # Static web bundle
-POST /labs/:labId/graphql           # HTTP GraphQL proxy
-WS   /labs/:labId/graphql           # GraphQL WS proxy
-WS   /labs/:labId/attach/:sessionId # PTY proxy
-WS   /labs/connect                  # Lab dial-out (control + events)
-```
-
-Tower relays requests to Labs that have dialed out; clients never connect directly to Labs.
-
----
-
-## 7) File Layout (Lab)
-
-```
-~/.gru/
-  repos/<owner>/<repo>.git          # bare mirrors
-  work/<owner>/<repo>/<MINION_ID>/  # worktrees
-  archive/<MINION_ID>/              # plan.md, events.jsonl, junit.xml
-  config.yaml                       # local config
-```
-
----
-
-## 8) Example Lifecycle
-
-1. Lab polls for `ready-for-minion` issues.
-2. Claims one: adds `in-progress:<MINION_ID>` and posts claim comment.
-3. Creates worktree and launches Minion.
-4. Streams `minionEvents` (plan, patch, tests, PR).
-5. Opens PR (`Fixes #123`) and posts summary.
-6. Minion remains active for reviews, failed checks, and discussion updates.
-7. Marks `minion:done`, archives logs, cleans up after merge.
-
-If a second Lab picks the same issue, duplicate work is tolerated and visible in GitHub.
-
----
-
-## 9) Security Model
-
-* **Lab** holds your GitHub token; scoped to repos only.
-* **Tower** never stores secrets; Labs authenticate via short-lived tokens.
-* **Attach sessions** are temporary (5–15 min) and validated per-minion.
-* **No inbound Lab traffic**: Labs dial out to Tower.
-
----
-
-## 10) Why This Design
-
-* **Local-first**: runs even if Tower is off.
-* **One binary** keeps install & update simple.
-* **GitHub as state** eliminates DB complexity.
-* **Stateless Tower** enables easy restarts and remote UI.
-* **Persistent Minions** ensure PRs receive intelligent follow-up without human babysitting.
-* **No inter-lab coordination**: eventual consistency through GitHub.
-* **Explicit Lab identity** avoids ambiguity in APIs.
-
----
-
-## 11) Future Extensions
-
-* Learned prioritizer for issues.
-* Multi-repo orchestration.
-* Local embedding index for code context.
-* Cost and token accounting.
-* Slack / mobile notifications via Tower.
-* Continuous review support and reviewer feedback learning.
+- [Claude Code](https://github.com/anthropics/claude-code) - Official CLI for Claude
+- [Claude Agent SDK](https://github.com/anthropics/claude-agent-sdk) - Agent protocol implementation
