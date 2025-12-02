@@ -1,11 +1,13 @@
 # Gru: Design Document
 
-> **Version:** 1.0 (Single-Lab MVP)  
-> **Last Updated:** 2025-11-30
+> **Version:** 1.0 (Single-Lab MVP)
+> **Last Updated:** 2025-12-02
 
 ## Table of Contents
 
 1. [Introduction](#introduction)
+   - [Core Technology Stack](#core-technology-stack)
+   - [Implementation Approach](#implementation-approach)
 2. [Architecture Overview](#architecture-overview)
 3. [Core Components](#core-components)
 4. [Session Management & Attach](#session-management--attach)
@@ -49,6 +51,96 @@ This design describes the **single-Lab MVP**:
 - ✅ CLI-only (no web UI/Tower)
 - ✅ Polling (30s interval, no webhooks yet)
 - ✅ Tokens via environment variables only
+
+### Core Technology Stack
+
+**Language:** Rust
+**Runtime:** Tokio (async)
+**CLI Framework:** Clap
+**GraphQL:** async-graphql (for Tower in future)
+**Web:** Axum (for Tower in future)
+**GitHub API:** octocrab
+
+**Rationale:** See `docs/DECISIONS.md` for quantitative DMX analysis. Rust scored 0.890 vs Python 0.110 for this use case.
+
+---
+
+## Implementation Approach
+
+### Minion Execution: CLI + Stream Parsing
+
+Each Minion is a Claude Code CLI process spawned with stream JSON output:
+
+```bash
+claude --print \
+  --session-id <UUID> \
+  --output-format stream-json \
+  --dangerously-skip-permissions \
+  "<task prompt>"
+```
+
+**Key Flags:**
+- `--print`: Non-interactive mode (no TTY needed)
+- `--session-id`: Maintains conversation context across restarts
+- `--output-format stream-json`: Real-time event stream on stdout
+- `--dangerously-skip-permissions`: Autonomous operation (no approval prompts)
+
+### Stream Monitoring
+
+Lab parses JSON events from Claude's stdout in real-time:
+
+```rust
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type")]
+enum ClaudeEvent {
+    #[serde(rename = "thinking")]
+    Thinking { content: String },
+
+    #[serde(rename = "tool_use")]
+    ToolUse {
+        name: String,           // "bash", "write", "read", etc
+        input: serde_json::Value
+    },
+
+    #[serde(rename = "message")]
+    Message { content: String },
+
+    #[serde(rename = "complete")]
+    Complete,
+
+    #[serde(rename = "error")]
+    Error { message: String },
+}
+```
+
+**Benefits:**
+- Real-time state tracking (thinking → tool_use → message → complete)
+- Event-based stuck detection (no activity timeout)
+- Structured logging to `events.jsonl`
+- JSON parsing is stable (no regex fragility)
+- No subprocess complexity (tmux/zellij not needed)
+
+### Why This Approach
+
+After evaluating 6 approaches via spike testing and DMX analysis:
+
+| Approach | Score | Status |
+|----------|-------|--------|
+| CLI + Stream Parsing | 0.735 | ✅ **Selected** |
+| ACP Integration | 0.706 | Future (V2+) |
+| Agent SDK (Python) | 0.688 | Too complex |
+| Pure CLI | 0.559 | No monitoring |
+| Rust + tmux | 0.466 | High fragility |
+| Zellij | 0.210 | Failed tests |
+
+**Key Advantages:**
+- Perfect monitoring (10/10) via structured events
+- Proven in tests (10/10) - production-ready code exists
+- Balanced complexity (~300 LOC for full implementation)
+- Simple deployment (single binary, no tmux dependency)
+- Low maintenance (JSON format stable)
+
+**See:** `experiments/DMX_ANALYSIS.md` for full quantitative comparison.
 
 ---
 
@@ -1728,6 +1820,11 @@ gru_issue_duration_seconds_bucket{le="3600"} 30
 - [Sweep](https://github.com/sweepai/sweep) - AI junior developer
 - [Devin](https://www.cognition-labs.com/devin) - AI software engineer
 - [AutoGPT](https://github.com/Significant-Gravitas/AutoGPT) - Autonomous agents
+
+### Inspirational Resources
+
+- [How to Use Claude Code Subagents to Parallelize Development](https://zachwills.net/how-to-use-claude-code-subagents-to-parallelize-development/)
+- [Mastering Git Worktrees with Claude Code for Parallel Development Workflow](https://medium.com/@dtunai/mastering-git-worktrees-with-claude-code-for-parallel-development-workflow-41dc91e645fe)
 
 ---
 

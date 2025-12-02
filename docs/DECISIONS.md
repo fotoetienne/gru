@@ -1,5 +1,84 @@
 # Gru Design Decisions
 
+**Last Updated:** 2025-12-02
+**Status:** Final decisions made via quantitative DMX analysis
+
+---
+
+## Critical Implementation Decisions (2025-12-02)
+
+### Decision 1: Architecture Approach
+
+**Question:** How to spawn and manage autonomous Claude Code agents?
+
+**Answer:** **CLI + Stream Parsing** (scored 0.735/1.0)
+
+After evaluating 6 approaches through spike testing and DMX analysis:
+
+| Approach | Score | Verdict |
+|----------|-------|---------|
+| CLI + Stream Parsing | 0.735 | ✅ SELECTED |
+| ACP Integration | 0.706 | Future (V2+) |
+| Agent SDK (Python) | 0.688 | Too complex |
+| Pure CLI | 0.559 | No monitoring |
+| Rust + tmux | 0.466 | High fragility |
+| Zellij | 0.210 | Failed tests |
+
+**Implementation:**
+```bash
+claude --print \
+  --session-id <UUID> \
+  --output-format stream-json \
+  --dangerously-skip-permissions
+```
+
+Parse JSON events from stdout for real-time monitoring.
+
+**See:** `experiments/DMX_ANALYSIS.md` for full analysis.
+
+### Decision 2: Implementation Language
+
+**Question:** Python or Rust?
+
+**Answer:** **Rust** (scored 0.890 vs Python 0.110 - 8x advantage)
+
+Rust scored perfectly on all high-priority criteria:
+- Single Binary Deployment: 10/10 (Python: 4/10)
+- Daemon Reliability: 10/10 (Python: 6/10)
+- Concurrency: 10/10 (Python: 6/10)
+- Type Safety: 10/10 (Python: 3/10)
+
+**Rationale:** The vision is "single-binary, local-first" (mentioned 3x in docs). Architecture requires 24/7 daemon with true concurrency for 10+ minions. Rust is the only logical choice for the production system.
+
+**See:** `experiments/LANGUAGE_DECISION.md` for full analysis.
+
+### Technology Stack
+
+**Core:**
+- Language: Rust
+- Runtime: Tokio async
+- CLI: Clap
+- GraphQL: async-graphql
+- Web: Axum
+- GitHub: octocrab
+
+**Key Dependencies:**
+```toml
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+async-graphql = "7"
+axum = "0.7"
+clap = { version = "4", features = ["derive"] }
+octocrab = "0.38"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+```
+
+**Timeline:** 6-8 weeks to production-ready V1
+
+---
+
 ## V1: Simplified Single-Lab Design
 
 ### Core Principles
@@ -423,13 +502,23 @@ impl Minion {
 - ⚠️ **Less resilient** - Sessions die with Lab (unless we persist)
 - ⚠️ **Reinventing wheel** - Solving problems tmux already solved
 
-**Decision: V1 uses tmux, V2 custom if needed**
+**Decision: V1 uses CLI + Stream Parsing (tmux superseded)**
 
-**Rationale:**
+**IMPORTANT UPDATE (2025-12-02):** After DMX analysis and spike testing, tmux approach has been **superseded** by CLI + stream-json parsing. This provides better monitoring with less complexity.
+
+**Original V1 tmux rationale (now superseded):**
 1. **Speed to MVP** - tmux gives us attach functionality for free
 2. **Reliability** - tmux is rock-solid, handles edge cases we'd miss
 3. **User familiarity** - Developers already know tmux
 4. **Easy migration** - Can swap implementation later without changing API
+
+**Why CLI + stream-json is better:**
+- No subprocess complexity (tmux sessions)
+- No fragile regex parsing
+- JSON events provide structured monitoring
+- Claude CLI has `--output-format stream-json` natively
+- Simpler deployment (no tmux dependency)
+- See `experiments/DMX_ANALYSIS.md` for quantitative comparison
 
 **V1 Implementation:**
 ```rust
@@ -666,21 +755,20 @@ Gru is a CLI tool that:
 | Type safety | ★★★☆☆ | ★★★★★ |
 | Contributor pool | ★★★★★ | ★★★☆☆ |
 
-### Decision: Rust for V1
+### Decision: Rust for V1 ✅
+
+**CONFIRMED (2025-12-02):** DMX analysis strongly validates Rust choice with 0.890 score vs Python 0.110.
 
 **Rationale:**
-1. **Developer familiarity** - Primary author knows Rust better (most important factor!)
-2. **Type safety** - State machine + lifecycle management benefit from Rust's type system
-3. **Modern tooling** - cargo, clippy, rustfmt are excellent
-4. **CLI sweet spot** - Rust excels at CLI tools (ripgrep, fd, bat, etc.)
-5. **Future-proof** - Easier to add Zellij plugin integration later
-6. **No real downside** - `octocrab` + `clap` + `tokio` are mature enough
+1. **Single Binary** - Emphasized 3x in product docs; Rust delivers perfectly (10/10)
+2. **Daemon Reliability** - 24/7 operation requires Rust's stability (10/10)
+3. **True Concurrency** - Managing 10+ minions needs no-GIL parallelism (10/10)
+4. **Type Safety** - State machine + lifecycle management benefit from compile-time guarantees (10/10)
+5. **Production Polish** - "It just works" deployment experience (10/10)
+6. **Modern tooling** - cargo, clippy, rustfmt are excellent
+7. **CLI sweet spot** - Rust excels at CLI tools (ripgrep, fd, bat, etc.)
 
-**When developer familiarity matters most:**
-- Solo/small team project
-- Velocity comes from knowing the language, not the ecosystem
-- You'll debug faster in Rust than Go if that's what you know
-- Avoiding context switching is valuable
+**Key Insight:** The architecture was designed for Rust's strengths. Not a preference, but an alignment with requirements.
 
 **Code structure:**
 ```
@@ -748,12 +836,13 @@ tracing-subscriber = "0.3"
 - ❌ No static typing (even with mypy)
 - ✅ Quick prototyping
 
-**Verdict: Go is the pragmatic choice for V1**
+**Implementation Notes:**
 
-- Ship faster without sacrificing quality
-- Well-trodden path for this type of tool
-- Can always rewrite hot paths later if needed
-- Focus on product, not language debates
+- Rust + Tokio provides excellent async foundation
+- CLI + stream-json parsing eliminates need for complex session management
+- No tmux/zellij dependency reduces complexity
+- Single binary deployment aligns with product vision
+- See `experiments/` for working prototypes validating approach
 
 ---
 
