@@ -27,7 +27,7 @@ test-verbose:
 
 # Run clippy linter with warnings as errors
 lint:
-    cargo clippy -- -D warnings
+    cargo clippy --all-targets -- -D warnings
 
 # Format code
 fmt:

@@ -36,9 +36,9 @@ fi
 
 # 2. Check code formatting
 echo "📝 Checking code formatting..."
-if ! cargo fmt --all -- --check; then
+if ! just fmt-check; then
     echo -e "${RED}✗ Code formatting check failed${NC}"
-    echo "  Run 'cargo fmt --all' or 'just fmt' to fix formatting"
+    echo "  Run 'just fmt' to fix formatting"
     echo ""
     echo "  To bypass this check (not recommended):"
     echo "  git commit --no-verify"
@@ -48,7 +48,7 @@ echo -e "${GREEN}✓ Code formatting looks good${NC}"
 
 # 3. Run clippy linter
 echo "🔍 Running clippy linter..."
-if ! cargo clippy --all-targets -- -D warnings; then
+if ! just lint; then
     echo -e "${RED}✗ Clippy found issues${NC}"
     echo "  Fix the issues above before committing"
     echo ""
@@ -60,7 +60,7 @@ echo -e "${GREEN}✓ Clippy checks passed${NC}"
 
 # 4. Run tests
 echo "🧪 Running tests..."
-if ! cargo test; then
+if ! just test; then
     echo -e "${RED}✗ Tests failed${NC}"
     echo "  Fix the failing tests before committing"
     echo ""

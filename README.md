@@ -29,9 +29,9 @@ For a full list of commands with descriptions, run `just --list`.
 
 This project includes pre-commit hooks to ensure code quality before commits are made. The hooks automatically run:
 
-- **Code formatting check** (`cargo fmt --check`) - Ensures code follows Rust formatting standards
-- **Linting** (`cargo clippy --all-targets -- -D warnings`) - Catches common mistakes and enforces best practices across all code including tests
-- **Tests** (`cargo test`) - Validates that all tests pass
+- **Code formatting check** (`just fmt-check`) - Ensures code follows Rust formatting standards
+- **Linting** (`just lint`) - Catches common mistakes and enforces best practices across all code including tests
+- **Tests** (`just test`) - Validates that all tests pass
 - **Branch protection** - Prevents direct commits to the main branch
 - **TODO/FIXME check** - Warns about TODO/FIXME comments (warning only, doesn't block commits)
 
