@@ -21,8 +21,7 @@ enum Commands {
 
 fn handle_fix(issue: &str) -> ! {
     let result = Command::new("claude")
-        .arg("/fix")
-        .arg(issue)
+        .arg(format!("/fix {}", issue))
         .stdin(std::process::Stdio::inherit())
         .stdout(std::process::Stdio::inherit())
         .stderr(std::process::Stdio::inherit())
