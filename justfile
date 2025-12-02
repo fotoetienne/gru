@@ -44,5 +44,5 @@ clean:
 # Show project information
 info:
     @echo "Gru - Local-First LLM Agent Orchestrator"
-    @echo "Rust version: $(rustc --version)"
-    @echo "Cargo version: $(cargo --version)"
+    @echo "Rust version: `rustc --version`"
+    @echo "Cargo version: `cargo --version`"
