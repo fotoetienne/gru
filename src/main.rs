@@ -1,3 +1,5 @@
+mod workspace;
+
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use std::process::Command;
