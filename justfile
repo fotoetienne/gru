@@ -13,6 +13,10 @@ build:
 build-release:
     cargo build --release
 
+# Install the binary locally
+install:
+    cargo install --path .
+
 # Run all tests
 test:
     cargo test
