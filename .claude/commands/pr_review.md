@@ -15,9 +15,19 @@ Review a GitHub pull request: fetch details, analyze changes, and provide feedba
 - Use `gh pr view $ARGUMENTS` to get the PR title, body, and metadata
 - Use `gh pr view $ARGUMENTS --json files` to get a quick overview of changed files
 - **Do NOT use `git checkout`. Always use worktrees:**
-  1. Check if a worktree exists: `ls ../worktrees/` for a directory matching the branch
-  2. If found, read files from that worktree path
-  3. If not found, create one: `git worktree add ../worktrees/<branch-name> <branch-name>`
+  - Determine the repository owner and name from the git remote
+  - Derive the worktree path: `~/.gru/work/owner/repo/<branch-name>`
+  - Check if a worktree already exists at that path
+    - If found, use the existing worktree
+    - If not, create a git worktree following Gru's filesystem structure:
+      1. Ensure bare repo exists at `~/.gru/repos/owner/repo.git/`
+         - If not, create it: `git clone --bare <remote-url> ~/.gru/repos/owner/repo.git`
+      2. Create worktree from bare repo:
+         ```
+         cd ~/.gru/repos/owner/repo.git
+         git worktree add ~/.gru/work/owner/repo/<branch-name> <branch-name>
+         ```
+  - Inform the user of the worktree location
 - Fetch existing review comments: `gh api repos/{owner}/{repo}/pulls/{pr#}/comments`
 - Understand the scope and intent of the PR, and any prior discussion
 - If this PR is addressing an Issue, read Issue details to understand the problem and context. Does this PR address the issue completely? Are there any missing details or assumptions?
@@ -41,16 +51,28 @@ Review a GitHub pull request: fetch details, analyze changes, and provide feedba
 - Give an overall assessment (approve, request changes, or needs discussion)
 
 ## 4. Submit Review
+- BEFORE submitting: Check if this is your own PR:
+  - Use `gh pr view $ARGUMENTS --json author --jq '.author.login'` to get the PR author
+  - Use `gh api user --jq '.login'` to get your GitHub username
+  - If they match, you CANNOT use `--approve` or `--request-changes` (GitHub will reject it)
 - Ask the user: "Would you like me to submit this review as comments on the PR?"
 - If yes, use `gh pr review $ARGUMENTS` with:
-  - `--comment -b "review content"` for general feedback (default)
-  - `--approve -b "review content"` if explicitly approving
-  - `--request-changes -b "review content"` if changes are required
+  - `--comment -b "review content"` for general feedback (use this for your own PRs)
+  - `--approve -b "review content"` if explicitly approving AND it's not your own PR
+  - `--request-changes -b "review content"` if changes are required AND it's not your own PR
 - Use a HEREDOC for multi-line review content to preserve formatting
-- Note: You cannot use `--request-changes` or `--approve` on your own PR; use `--comment` instead
+- **IMPORTANT**: ALWAYS verify the gh command succeeded by checking its output. If it returns empty or fails, inform the user of the issue
 
 ## 5. Merge (if appropriate)
 - If the PR looks ready to merge (CI passing, no blocking issues), ask: "Would you like me to merge this PR?"
 - If yes, use `gh pr merge $ARGUMENTS` with appropriate merge strategy (--squash, --merge, or --rebase)
-- Note: Do NOT use `--delete-branch` if a local worktree exists for this branch - it will fail. Clean up worktrees manually.
+- **IMPORTANT**: When merging PRs created from worktrees:
+  - DO NOT run `gh pr merge` from inside the worktree - it will fail with "fatal: 'main' is already used by worktree"
+  - Instead, run the merge command from the main working directory or use `--auto` flag
+  - After successful merge, clean up the worktree from the bare repo:
+    ```
+    cd ~/.gru/repos/owner/repo.git
+    git worktree remove ~/.gru/work/owner/repo/<branch-name>
+    ```
+  - Optionally delete the branch: `git branch -D <branch-name>`
 - After merging, run `git pull` on main to sync locally.

@@ -20,6 +20,11 @@ enum Commands {
         #[arg(help = "Issue number or URL to fix")]
         issue: String,
     },
+    #[command(about = "Review a GitHub pull request")]
+    Review {
+        #[arg(help = "PR number or URL to review")]
+        pr: String,
+    },
 }
 
 /// Validates that the issue argument is either a number or a valid GitHub URL
@@ -57,6 +62,41 @@ fn validate_issue_format(issue: &str) -> Result<()> {
     );
 }
 
+/// Validates that the PR argument is either a number or a valid GitHub URL
+fn validate_pr_format(pr: &str) -> Result<()> {
+    // Check if it's a number
+    if pr.parse::<u32>().is_ok() {
+        return Ok(());
+    }
+
+    // Check if it's a GitHub URL with proper format
+    // Expected: https://github.com/owner/repo/pull/123
+    if pr.starts_with("https://github.com/") {
+        let parts: Vec<&str> = pr
+            .strip_prefix("https://github.com/")
+            .unwrap()
+            .split('/')
+            .collect();
+
+        if parts.len() == 4
+            && !parts[0].is_empty() // owner
+            && !parts[1].is_empty() // repo
+            && parts[2] == "pull"
+            && parts[3].parse::<u32>().is_ok()
+        // PR number
+        {
+            return Ok(());
+        }
+    }
+
+    anyhow::bail!(
+        "Invalid PR format. Expected: <number> or <github-url>\n\
+         Examples:\n\
+         - gru review 42\n\
+         - gru review https://github.com/owner/repo/pull/42"
+    );
+}
+
 /// Handles the fix command by delegating to the Claude CLI
 /// Returns the exit code from the claude process
 fn handle_fix(issue: &str) -> Result<i32> {
@@ -78,11 +118,33 @@ fn handle_fix(issue: &str) -> Result<i32> {
     Ok(status.code().unwrap_or(1))
 }
 
+/// Handles the review command by delegating to the Claude CLI
+/// Returns the exit code from the claude process
+fn handle_review(pr: &str) -> Result<i32> {
+    // Validate the PR format before proceeding
+    validate_pr_format(pr)?;
+
+    // Execute the claude CLI with the /pr_review command
+    let status = Command::new("claude")
+        .arg(format!("/pr_review {}", pr))
+        .stdin(std::process::Stdio::inherit())
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit())
+        .status()
+        .context(
+            "claude command not found. Install from: https://github.com/anthropics/claude-code"
+        )?;
+
+    // Return the exit code from the claude process
+    Ok(status.code().unwrap_or(1))
+}
+
 fn main() {
     let cli = Cli::parse();
 
     let result = match cli.command {
         Commands::Fix { issue } => handle_fix(&issue),
+        Commands::Review { pr } => handle_review(&pr),
     };
 
     // Handle any errors that occurred
@@ -127,5 +189,33 @@ mod tests {
     #[test]
     fn test_validate_issue_format_rejects_negative_numbers() {
         assert!(validate_issue_format("-42").is_err());
+    }
+
+    #[test]
+    fn test_validate_pr_format_with_number() {
+        assert!(validate_pr_format("42").is_ok());
+        assert!(validate_pr_format("1").is_ok());
+        assert!(validate_pr_format("999999").is_ok());
+    }
+
+    #[test]
+    fn test_validate_pr_format_with_valid_url() {
+        assert!(validate_pr_format("https://github.com/fotoetienne/gru/pull/42").is_ok());
+        assert!(validate_pr_format("https://github.com/owner/repo-name/pull/123").is_ok());
+    }
+
+    #[test]
+    fn test_validate_pr_format_rejects_invalid_input() {
+        assert!(validate_pr_format("not-a-number").is_err());
+        assert!(validate_pr_format("https://example.com/pull/42").is_err());
+        assert!(validate_pr_format("https://github.com/pull/").is_err());
+        assert!(validate_pr_format("https://github.com/owner/pull/").is_err());
+        assert!(validate_pr_format("https://github.com/owner/repo/pull/").is_err());
+        assert!(validate_pr_format("").is_err());
+    }
+
+    #[test]
+    fn test_validate_pr_format_rejects_negative_numbers() {
+        assert!(validate_pr_format("-42").is_err());
     }
 }
