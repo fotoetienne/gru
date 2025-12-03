@@ -1,11 +1,10 @@
+mod git;
 mod minion;
 mod workspace;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use std::process::Command;
-
-mod git;
 
 /// CLI structure for the Gru agent orchestrator
 #[derive(Parser)]
@@ -122,26 +121,128 @@ fn validate_pr_format(pr: &str) -> Result<()> {
     );
 }
 
+/// Extracts owner, repo, and issue number from an issue argument
+/// Supports both plain issue numbers and GitHub URLs
+fn parse_issue_info(issue: &str) -> Result<(Option<String>, Option<String>, String)> {
+    // First validate the format
+    validate_issue_format(issue)?;
+
+    // Check if it's a GitHub URL
+    if issue.starts_with("https://github.com/") {
+        // Strip query parameters and fragments
+        let url = issue
+            .split('?')
+            .next()
+            .unwrap()
+            .split('#')
+            .next()
+            .unwrap()
+            .trim_end_matches('/');
+
+        let parts: Vec<&str> = url
+            .strip_prefix("https://github.com/")
+            .unwrap()
+            .split('/')
+            .collect();
+
+        // parts[0] = owner, parts[1] = repo, parts[2] = "issues", parts[3] = number
+        let owner = parts[0].to_string();
+        let repo = parts[1].to_string();
+        let issue_num = parts[3].to_string();
+
+        Ok((Some(owner), Some(repo), issue_num))
+    } else {
+        // Plain issue number - no owner/repo info
+        Ok((None, None, issue.to_string()))
+    }
+}
+
 /// Handles the fix command by delegating to the Claude CLI
 /// Returns the exit code from the claude process
 fn handle_fix(issue: &str) -> Result<i32> {
-    // Validate the issue format before proceeding
-    validate_issue_format(issue)?;
+    // Parse issue information
+    let (owner_opt, repo_opt, issue_num) = parse_issue_info(issue)?;
 
-    // Execute the claude CLI with the /fix command
-    let status = Command::new("claude")
-        .arg(format!("/fix {}", issue))
-        .stdin(std::process::Stdio::inherit())
-        .stdout(std::process::Stdio::inherit())
-        .stderr(std::process::Stdio::inherit())
-        .status()
-        .context(
-            "claude command not found. Install from: https://github.com/anthropics/claude-code",
-        )?;
+    // Check if we have full repo information for workspace creation
+    if let (Some(owner), Some(repo)) = (owner_opt, repo_opt) {
+        // Full URL provided - create workspace and launch Claude
+        println!(
+            "🚀 Setting up workspace for {}/{}#{}",
+            owner, repo, issue_num
+        );
 
-    // Return the exit code from the claude process
-    // Use 128 for signal terminations to follow shell conventions
-    Ok(status.code().unwrap_or(128))
+        // Initialize workspace
+        let workspace =
+            workspace::Workspace::new().context("Failed to initialize Gru workspace")?;
+
+        // Generate minion ID
+        let minion_id = minion::generate_minion_id().context("Failed to generate Minion ID")?;
+
+        println!("📋 Generated Minion ID: {}", minion_id);
+
+        // Create bare repository path
+        let bare_path = workspace.repos().join(&owner).join(format!("{}.git", repo));
+        let git_repo = git::GitRepo::new(&owner, &repo, bare_path);
+
+        // Ensure bare repository is cloned/updated
+        println!("📦 Ensuring repository is cloned...");
+        git_repo
+            .ensure_bare_clone()
+            .context("Failed to clone or update repository")?;
+
+        // Create worktree path
+        let repo_name = format!("{}/{}", owner, repo);
+        let worktree_path = workspace
+            .work_dir(&repo_name, &minion_id)
+            .context("Failed to compute worktree path")?;
+
+        // Create worktree with branch name: minion/issue-<num>-<id>
+        let branch_name = format!("minion/issue-{}-{}", issue_num, minion_id);
+        println!("🌿 Creating worktree with branch: {}", branch_name);
+
+        git_repo
+            .create_worktree(&branch_name, &worktree_path)
+            .context("Failed to create worktree")?;
+
+        println!("📂 Workspace created at: {}", worktree_path.display());
+        println!("🤖 Launching Claude...\n");
+
+        // Launch Claude with environment variable and in the worktree directory
+        let status = Command::new("claude")
+            .arg(format!("/fix {}", issue_num))
+            .current_dir(&worktree_path)
+            .env("GRU_WORKSPACE", &minion_id)
+            .stdin(std::process::Stdio::inherit())
+            .stdout(std::process::Stdio::inherit())
+            .stderr(std::process::Stdio::inherit())
+            .status()
+            .context(
+                "claude command not found. Install from: https://github.com/anthropics/claude-code",
+            )?;
+
+        // Return the exit code from the claude process
+        Ok(status.code().unwrap_or(128))
+    } else {
+        // Plain issue number - fall back to simple delegation
+        // This maintains backward compatibility when no URL is provided
+        println!("⚠️  No repository URL provided. Using simple mode without workspace management.");
+        println!(
+            "   For full workspace support, use: gru fix https://github.com/owner/repo/issues/{}\n",
+            issue_num
+        );
+
+        let status = Command::new("claude")
+            .arg(format!("/fix {}", issue_num))
+            .stdin(std::process::Stdio::inherit())
+            .stdout(std::process::Stdio::inherit())
+            .stderr(std::process::Stdio::inherit())
+            .status()
+            .context(
+                "claude command not found. Install from: https://github.com/anthropics/claude-code",
+            )?;
+
+        Ok(status.code().unwrap_or(128))
+    }
 }
 
 /// Handles the review command by delegating to the Claude CLI
@@ -293,5 +394,29 @@ mod tests {
         assert!(validate_pr_format("https://github.com/owner//pull/42").is_err());
         // Both empty
         assert!(validate_pr_format("https://github.com///pull/42").is_err());
+    }
+
+    #[test]
+    fn test_parse_issue_info_with_url() {
+        let result = parse_issue_info("https://github.com/fotoetienne/gru/issues/42").unwrap();
+        assert_eq!(result.0, Some("fotoetienne".to_string()));
+        assert_eq!(result.1, Some("gru".to_string()));
+        assert_eq!(result.2, "42".to_string());
+    }
+
+    #[test]
+    fn test_parse_issue_info_with_plain_number() {
+        let result = parse_issue_info("42").unwrap();
+        assert_eq!(result.0, None);
+        assert_eq!(result.1, None);
+        assert_eq!(result.2, "42".to_string());
+    }
+
+    #[test]
+    fn test_parse_issue_info_with_url_and_query_params() {
+        let result = parse_issue_info("https://github.com/owner/repo/issues/123?foo=bar").unwrap();
+        assert_eq!(result.0, Some("owner".to_string()));
+        assert_eq!(result.1, Some("repo".to_string()));
+        assert_eq!(result.2, "123".to_string());
     }
 }
