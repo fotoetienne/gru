@@ -1,12 +1,20 @@
 mod git;
 mod logger;
 mod minion;
+mod progress;
 mod stream;
 mod workspace;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use std::process::Command;
+use progress::{ProgressConfig, ProgressDisplay};
+use stream::EventStream;
+use tokio::process::Command;
+use tokio::time::{timeout, Duration};
+
+/// Timeout in seconds for each line read from Claude's output stream
+/// Set to 5 minutes to accommodate long-running LLM operations
+const STREAM_TIMEOUT_SECS: u64 = 300;
 
 /// CLI structure for the Gru agent orchestrator
 #[derive(Parser)]
@@ -16,6 +24,10 @@ use std::process::Command;
 struct Cli {
     #[command(subcommand)]
     command: Commands,
+
+    /// Run in quiet mode (only show errors)
+    #[arg(short, long, global = true)]
+    quiet: bool,
 }
 
 /// Available commands for Gru
@@ -161,12 +173,16 @@ fn parse_issue_info(issue: &str) -> Result<(Option<String>, Option<String>, Stri
 
 /// Handles the fix command by delegating to the Claude CLI
 /// Returns the exit code from the claude process
-fn handle_fix(issue: &str) -> Result<i32> {
+async fn handle_fix(issue: &str, quiet: bool) -> Result<i32> {
     // Parse issue information
     let (owner_opt, repo_opt, issue_num) = parse_issue_info(issue)?;
 
+    // Always generate a unique minion ID
+    let minion_id = minion::generate_minion_id().context("Failed to generate Minion ID")?;
+    println!("📋 Generated Minion ID: {}", minion_id);
+
     // Check if we have full repo information for workspace creation
-    if let (Some(owner), Some(repo)) = (owner_opt, repo_opt) {
+    let worktree_path_opt = if let (Some(owner), Some(repo)) = (owner_opt, repo_opt) {
         // Full URL provided - create workspace and launch Claude
         println!(
             "🚀 Setting up workspace for {}/{}#{}",
@@ -176,11 +192,6 @@ fn handle_fix(issue: &str) -> Result<i32> {
         // Initialize workspace
         let workspace =
             workspace::Workspace::new().context("Failed to initialize Gru workspace")?;
-
-        // Generate minion ID
-        let minion_id = minion::generate_minion_id().context("Failed to generate Minion ID")?;
-
-        println!("📋 Generated Minion ID: {}", minion_id);
 
         // Create bare repository path
         let bare_path = workspace.repos().join(&owner).join(format!("{}.git", repo));
@@ -209,47 +220,95 @@ fn handle_fix(issue: &str) -> Result<i32> {
         println!("📂 Workspace created at: {}", worktree_path.display());
         println!("🤖 Launching Claude...\n");
 
-        // Launch Claude with environment variable and in the worktree directory
-        let status = Command::new("claude")
-            .arg(format!("/fix {}", issue_num))
-            .current_dir(&worktree_path)
-            .env("GRU_WORKSPACE", &minion_id)
-            .stdin(std::process::Stdio::inherit())
-            .stdout(std::process::Stdio::inherit())
-            .stderr(std::process::Stdio::inherit())
-            .status()
-            .context(
-                "claude command not found. Install from: https://github.com/anthropics/claude-code",
-            )?;
-
-        // Return the exit code from the claude process
-        Ok(status.code().unwrap_or(128))
+        Some(worktree_path)
     } else {
-        // Plain issue number - fall back to simple delegation
-        // This maintains backward compatibility when no URL is provided
+        // Plain issue number - use simple mode without workspace
         println!("⚠️  No repository URL provided. Using simple mode without workspace management.");
         println!(
             "   For full workspace support, use: gru fix https://github.com/owner/repo/issues/{}\n",
             issue_num
         );
+        None
+    };
 
-        let status = Command::new("claude")
-            .arg(format!("/fix {}", issue_num))
-            .stdin(std::process::Stdio::inherit())
-            .stdout(std::process::Stdio::inherit())
-            .stderr(std::process::Stdio::inherit())
-            .status()
-            .context(
-                "claude command not found. Install from: https://github.com/anthropics/claude-code",
-            )?;
+    // Create progress display
+    let config = ProgressConfig {
+        minion_id: minion_id.clone(),
+        issue: issue.to_string(),
+        quiet,
+    };
+    let progress = ProgressDisplay::new(config);
 
-        Ok(status.code().unwrap_or(128))
+    // Build the command
+    let mut cmd = Command::new("claude");
+    cmd.arg(format!("/fix {}", issue_num))
+        .stdin(std::process::Stdio::inherit())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::inherit());
+
+    // If we have a worktree, set the working directory and env var
+    if let Some(ref path) = worktree_path_opt {
+        cmd.current_dir(path);
+        cmd.env("GRU_WORKSPACE", &minion_id);
     }
+
+    // Spawn the command
+    let mut child = cmd.spawn().context(
+        "claude command not found. Install from: https://github.com/anthropics/claude-code",
+    )?;
+
+    // Get the stdout handle
+    let stdout = child
+        .stdout
+        .take()
+        .context("Failed to capture stdout from claude process")?;
+
+    // Create event stream reader
+    let mut stream = EventStream::from_stdout(stdout);
+
+    // Process stream output asynchronously with timeout and error handling
+    let stream_result = async {
+        loop {
+            // Handle timeout first, then flatten the stream result
+            let line_result = timeout(Duration::from_secs(STREAM_TIMEOUT_SECS), stream.next_line())
+                .await
+                .map_err(|_| {
+                    anyhow::anyhow!(
+                        "Timeout: Claude process hasn't produced output in {} seconds",
+                        STREAM_TIMEOUT_SECS
+                    )
+                })?;
+
+            // Now handle the stream result
+            match line_result? {
+                Some(output) => progress.handle_output(&output),
+                None => break, // Stream ended normally
+            }
+        }
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+
+    // Always wait for the process, regardless of stream errors
+    let status = child.wait().await?;
+
+    // Now check if there was a stream error
+    stream_result?;
+
+    // Finish the progress display
+    if status.success() {
+        progress.finish_with_message(&format!("✅ Completed issue {}", issue));
+    } else {
+        progress.finish_with_message(&format!("❌ Failed to fix issue {}", issue));
+    }
+
+    // Return the exit code from the claude process
+    Ok(status.code().unwrap_or(128))
 }
 
 /// Handles the review command by delegating to the Claude CLI
 /// Returns the exit code from the claude process
-fn handle_review(pr: &str) -> Result<i32> {
+async fn handle_review(pr: &str) -> Result<i32> {
     // Validate the PR format before proceeding
     validate_pr_format(pr)?;
 
@@ -260,6 +319,7 @@ fn handle_review(pr: &str) -> Result<i32> {
         .stdout(std::process::Stdio::inherit())
         .stderr(std::process::Stdio::inherit())
         .status()
+        .await
         .context(
             "claude command not found. Install from: https://github.com/anthropics/claude-code",
         )?;
@@ -269,12 +329,13 @@ fn handle_review(pr: &str) -> Result<i32> {
     Ok(status.code().unwrap_or(128))
 }
 
-fn main() {
+#[tokio::main]
+async fn main() {
     let cli = Cli::parse();
 
     let result = match cli.command {
-        Commands::Fix { issue } => handle_fix(&issue),
-        Commands::Review { pr } => handle_review(&pr),
+        Commands::Fix { issue } => handle_fix(&issue, cli.quiet).await,
+        Commands::Review { pr } => handle_review(&pr).await,
     };
 
     // Handle any errors that occurred
