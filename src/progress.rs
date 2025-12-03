@@ -68,7 +68,10 @@ impl ProgressDisplay {
 
     /// Add an event to the recent events list
     fn add_event(&self, event_text: String) {
-        let mut events = self.recent_events.lock().unwrap();
+        let mut events = self
+            .recent_events
+            .lock()
+            .expect("Progress event mutex poisoned");
         events.push(event_text);
 
         // Keep only the last 4 events
@@ -106,6 +109,16 @@ impl ProgressDisplay {
         }
     }
 
+    /// Truncate a string to a maximum number of characters (not bytes)
+    fn truncate_string(s: &str, max_chars: usize) -> String {
+        if s.chars().count() <= max_chars {
+            s.to_string()
+        } else {
+            let truncated: String = s.chars().take(max_chars).collect();
+            format!("{}...", truncated)
+        }
+    }
+
     /// Handle a parsed Claude event
     fn handle_event(&self, event: &ClaudeEvent) {
         let timestamp = Local::now().format("%H:%M:%S");
@@ -113,11 +126,7 @@ impl ProgressDisplay {
         match event {
             ClaudeEvent::Thinking { content } => {
                 self.update_header("💭 Thinking...");
-                let truncated = if content.len() > 50 {
-                    format!("{}...", &content[..50])
-                } else {
-                    content.clone()
-                };
+                let truncated = Self::truncate_string(content, 50);
                 self.add_event(format!("[{}] Thinking: {}", timestamp, truncated));
             }
             ClaudeEvent::ToolUse { name, input } => {
@@ -140,11 +149,7 @@ impl ProgressDisplay {
                 let event_text = if detail.is_empty() {
                     format!("[{}] Tool: {}", timestamp, name)
                 } else {
-                    let truncated = if detail.len() > 40 {
-                        format!("{}...", &detail[..40])
-                    } else {
-                        detail.to_string()
-                    };
+                    let truncated = Self::truncate_string(detail, 40);
                     format!("[{}] Tool: {} - {}", timestamp, name, truncated)
                 };
 
@@ -152,11 +157,7 @@ impl ProgressDisplay {
             }
             ClaudeEvent::Message { content } => {
                 self.update_header("📝 Responding...");
-                let truncated = if content.len() > 50 {
-                    format!("{}...", &content[..50])
-                } else {
-                    content.clone()
-                };
+                let truncated = Self::truncate_string(content, 50);
                 self.add_event(format!("[{}] Message: {}", timestamp, truncated));
             }
             ClaudeEvent::Complete => {

@@ -263,7 +263,7 @@ fn handle_fix(issue: &str, quiet: bool) -> Result<i32> {
 
     // Create progress display
     let config = ProgressConfig {
-        minion_id: minion_id.clone(),
+        minion_id,
         issue: issue.to_string(),
         quiet,
     };
