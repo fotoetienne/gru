@@ -1,4 +1,5 @@
 mod git;
+mod logger;
 mod minion;
 mod stream;
 mod workspace;
