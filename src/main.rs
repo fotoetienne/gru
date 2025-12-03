@@ -648,8 +648,14 @@ async fn handle_clean(dry_run: bool, force: bool, base_branch: &str) -> Result<i
         print!("Removing {}... ", wt.path.display());
         std::io::stdout().flush()?;
 
+        // Validate path is UTF-8
+        let path_str = wt
+            .path
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("Invalid UTF-8 in path: {}", wt.path.display()))?;
+
         let status = Command::new("git")
-            .args(["worktree", "remove", wt.path.to_str().unwrap()])
+            .args(["worktree", "remove", path_str])
             .output()
             .await?;
 
@@ -657,12 +663,24 @@ async fn handle_clean(dry_run: bool, force: bool, base_branch: &str) -> Result<i
             println!("✓");
             removed += 1;
 
-            // Also remove the branch
-            let _ = Command::new("git")
-                .args(["branch", "-D", &wt.branch])
-                .current_dir(ws.work())
-                .output()
-                .await;
+            // Also remove the branch from the bare repository
+            let bare_repo = ws.repos().join(&wt.repo).with_extension("git");
+            if bare_repo.exists() {
+                let branch_result = Command::new("git")
+                    .args(["branch", "-D", &wt.branch])
+                    .current_dir(&bare_repo)
+                    .output()
+                    .await;
+
+                if let Err(e) = branch_result {
+                    eprintln!("  Warning: Failed to delete branch {}: {}", wt.branch, e);
+                }
+            } else {
+                eprintln!(
+                    "  Warning: Could not find bare repo at {}",
+                    bare_repo.display()
+                );
+            }
         } else {
             println!("✗");
             eprintln!("  Error: {}", String::from_utf8_lossy(&status.stderr));

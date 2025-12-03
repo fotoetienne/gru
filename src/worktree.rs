@@ -51,19 +51,20 @@ impl Worktree {
             return None;
         }
 
-        // Extract repo name from path: ~/.gru/work/owner/repo/issue-XX
-        let path_str = path.to_str()?;
-        let work_prefix = "/work/";
-        let work_idx = path_str.find(work_prefix)?;
-        let after_work = &path_str[work_idx + work_prefix.len()..];
+        // Extract repo name from path using proper path manipulation
+        // Expected structure: workspace_root/owner/repo/worktree-id
+        let relative_path = path.strip_prefix(workspace_root).ok()?;
+        let components: Vec<_> = relative_path
+            .components()
+            .filter_map(|c| c.as_os_str().to_str())
+            .collect();
 
-        // Split by / and take first two parts (owner/repo)
-        let parts: Vec<&str> = after_work.split('/').collect();
-        if parts.len() < 3 {
+        // Need at least owner/repo/worktree-id (3 components)
+        if components.len() < 3 {
             return None;
         }
 
-        let repo = format!("{}/{}", parts[0], parts[1]);
+        let repo = format!("{}/{}", components[0], components[1]);
 
         Some(Worktree {
             path,
@@ -125,10 +126,17 @@ impl Worktree {
     /// Check if the branch has been deleted on the remote
     pub async fn check_remote_deleted(&self) -> Result<bool> {
         // Fetch to ensure we have latest remote info
-        let _ = Command::new("git")
+        let fetch_result = Command::new("git")
             .args(["fetch", "--prune"])
             .current_dir(&self.path)
-            .output();
+            .output()
+            .context("Failed to fetch from remote")?;
+
+        // If fetch fails, we can't reliably determine remote status
+        if !fetch_result.status.success() {
+            // Conservative: assume branch still exists if we can't check
+            return Ok(false);
+        }
 
         let output = Command::new("git")
             .args(["ls-remote", "--heads", "origin", &self.branch])
@@ -194,8 +202,18 @@ pub fn discover_worktrees(workspace_root: &Path) -> Result<Vec<Worktree>> {
     }
 
     // Walk through the repos directory to find bare repos
-    fn find_bare_repos(dir: &Path, bare_repos: &mut Vec<PathBuf>) -> Result<()> {
+    fn find_bare_repos(dir: &Path, bare_repos: &mut Vec<PathBuf>, depth: usize) -> Result<()> {
+        // Limit recursion depth to prevent stack overflow
+        if depth > 10 {
+            return Ok(());
+        }
+
         if !dir.is_dir() {
+            return Ok(());
+        }
+
+        // Skip symlinks to prevent cycles
+        if dir.symlink_metadata()?.is_symlink() {
             return Ok(());
         }
 
@@ -210,7 +228,7 @@ pub fn discover_worktrees(workspace_root: &Path) -> Result<Vec<Worktree>> {
             let entry = entry?;
             let path = entry.path();
             if path.is_dir() {
-                find_bare_repos(&path, bare_repos)?;
+                find_bare_repos(&path, bare_repos, depth + 1)?;
             }
         }
 
@@ -218,7 +236,7 @@ pub fn discover_worktrees(workspace_root: &Path) -> Result<Vec<Worktree>> {
     }
 
     let mut bare_repos = Vec::new();
-    find_bare_repos(&repos_dir, &mut bare_repos)?;
+    find_bare_repos(&repos_dir, &mut bare_repos, 0)?;
 
     // For each bare repo, list its worktrees
     for bare_repo in bare_repos {
@@ -276,7 +294,7 @@ mod tests {
 
     #[test]
     fn test_from_git_output() {
-        let workspace_root = PathBuf::from("/Users/test/.gru");
+        let workspace_root = PathBuf::from("/Users/test/.gru/work");
         let line = "/Users/test/.gru/work/owner/repo/issue-36  1234567  [gru/issue-36]";
 
         let wt = Worktree::from_git_output(line, &workspace_root);
@@ -293,7 +311,7 @@ mod tests {
 
     #[test]
     fn test_from_git_output_rejects_non_workspace() {
-        let workspace_root = PathBuf::from("/Users/test/.gru");
+        let workspace_root = PathBuf::from("/Users/test/.gru/work");
         let line = "/other/path/repo  1234567  [main]";
 
         let wt = Worktree::from_git_output(line, &workspace_root);
@@ -302,7 +320,7 @@ mod tests {
 
     #[test]
     fn test_from_git_output_rejects_head() {
-        let workspace_root = PathBuf::from("/Users/test/.gru");
+        let workspace_root = PathBuf::from("/Users/test/.gru/work");
         let line = "/Users/test/.gru/repos/owner/repo.git  1234567  [HEAD]";
 
         let wt = Worktree::from_git_output(line, &workspace_root);
