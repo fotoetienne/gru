@@ -273,7 +273,10 @@ async fn handle_fix(issue: &str, quiet: bool) -> Result<i32> {
             let line_result = timeout(Duration::from_secs(STREAM_TIMEOUT_SECS), stream.next_line())
                 .await
                 .map_err(|_| {
-                    anyhow::anyhow!("Timeout: Claude process hasn't produced output in {} seconds", STREAM_TIMEOUT_SECS)
+                    anyhow::anyhow!(
+                        "Timeout: Claude process hasn't produced output in {} seconds",
+                        STREAM_TIMEOUT_SECS
+                    )
                 })?;
 
             // Now handle the stream result
