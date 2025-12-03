@@ -12,6 +12,13 @@ use stream::EventStream;
 use tokio::process::Command;
 use tokio::time::{timeout, Duration};
 
+/// Default minion ID used when workspace extraction is not available
+const DEFAULT_MINION_ID: &str = "M04R";
+
+/// Timeout in seconds for each line read from Claude's output stream
+/// Set to 5 minutes to accommodate long-running LLM operations
+const STREAM_TIMEOUT_SECS: u64 = 300;
+
 /// CLI structure for the Gru agent orchestrator
 #[derive(Parser)]
 #[command(name = "gru")]
@@ -225,7 +232,7 @@ async fn handle_fix(issue: &str, quiet: bool) -> Result<i32> {
             "   For full workspace support, use: gru fix https://github.com/owner/repo/issues/{}\n",
             issue_num
         );
-        ("M04R".to_string(), None)
+        (DEFAULT_MINION_ID.to_string(), None)
     };
 
     // Create progress display
@@ -266,7 +273,7 @@ async fn handle_fix(issue: &str, quiet: bool) -> Result<i32> {
     // Process stream output asynchronously with timeout and error handling
     let stream_result = async {
         loop {
-            match timeout(Duration::from_secs(300), stream.next_line()).await {
+            match timeout(Duration::from_secs(STREAM_TIMEOUT_SECS), stream.next_line()).await {
                 Ok(Ok(Some(output))) => {
                     progress.handle_output(&output);
                 }

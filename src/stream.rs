@@ -13,6 +13,10 @@ pub enum ClaudeEvent {
     #[serde(rename = "tool_use")]
     ToolUse {
         name: String,
+        /// The `#[serde(default)]` attribute allows deserialization to succeed
+        /// even when the `input` field is missing from the JSON. This is required
+        /// because some tool_use events may not include input parameters.
+        /// Removing this attribute will cause deserialization failures for such events.
         #[serde(default)]
         input: serde_json::Value,
     },

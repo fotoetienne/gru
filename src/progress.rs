@@ -4,6 +4,9 @@ use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+/// Maximum number of recent events to keep in the display history
+const MAX_RECENT_EVENTS: usize = 4;
+
 /// Configuration for the progress display
 pub struct ProgressConfig {
     pub minion_id: String,
@@ -78,8 +81,8 @@ impl ProgressDisplay {
         };
         events.push(event_text);
 
-        // Keep only the last 4 events
-        if events.len() > 4 {
+        // Keep only the last MAX_RECENT_EVENTS events
+        if events.len() > MAX_RECENT_EVENTS {
             events.remove(0);
         }
 
@@ -118,10 +121,14 @@ impl ProgressDisplay {
     }
 
     /// Truncate a string to a maximum number of characters (not bytes)
+    /// Uses single-pass iteration to avoid counting characters twice
     fn truncate_string(s: &str, max_chars: usize) -> String {
-        if s.chars().count() <= max_chars {
+        // Check if truncation is needed using nth() which short-circuits
+        if s.chars().nth(max_chars).is_none() {
+            // String has max_chars or fewer characters
             s.to_string()
         } else {
+            // String exceeds max_chars, truncate and add ellipsis
             let truncated: String = s.chars().take(max_chars).collect();
             format!("{}...", truncated)
         }
@@ -143,11 +150,7 @@ impl ProgressDisplay {
                 // Extract relevant info from input for display
                 let detail = match name.as_str() {
                     "bash" => input.get("command").and_then(|c| c.as_str()).unwrap_or(""),
-                    "read" => input
-                        .get("file_path")
-                        .and_then(|p| p.as_str())
-                        .unwrap_or(""),
-                    "write" | "edit" => input
+                    "read" | "write" | "edit" => input
                         .get("file_path")
                         .and_then(|p| p.as_str())
                         .unwrap_or(""),
