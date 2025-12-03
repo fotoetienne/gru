@@ -21,9 +21,9 @@ pub struct Minion {
 /// to ensure thread-safety and atomicity.
 #[allow(dead_code)]
 pub fn generate_minion_id() -> io::Result<String> {
-    let state_dir = dirs::home_dir()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Home directory not found"))?
-        .join(".gru")
+    let state_dir = dirs::data_local_dir()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Local data directory not found"))?
+        .join("gru")
         .join("state");
 
     fs::create_dir_all(&state_dir)?;
@@ -49,14 +49,46 @@ pub fn generate_minion_id() -> io::Result<String> {
         }
     }
 
-    // Read current counter value
-    let mut contents = String::new();
-    file.read_to_string(&mut contents)?;
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::{LockFileEx, LOCKFILE_EXCLUSIVE_LOCK};
+        use windows_sys::Win32::System::IO::OVERLAPPED;
 
-    let counter: u64 = if contents.trim().is_empty() {
-        1 // Start at 1 for new installations
+        unsafe {
+            let mut overlapped: OVERLAPPED = std::mem::zeroed();
+            if LockFileEx(
+                file.as_raw_handle() as _,
+                LOCKFILE_EXCLUSIVE_LOCK,
+                0,
+                u32::MAX,
+                u32::MAX,
+                &mut overlapped,
+            ) == 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+        }
+    }
+
+    // Read current counter value
+    let metadata = file.metadata()?;
+    let counter: u64 = if metadata.len() == 0 {
+        1 // Empty file means new installation
     } else {
-        contents.trim().parse().unwrap_or(1)
+        let mut contents = String::new();
+        file.read_to_string(&mut contents)?;
+
+        if contents.trim().is_empty() {
+            1 // Start at 1 for new installations
+        } else {
+            contents.trim().parse().map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("Corrupted counter file: {}", e),
+                )
+            })?
+        }
     };
 
     // Generate the ID
