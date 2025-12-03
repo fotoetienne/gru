@@ -45,7 +45,7 @@ Review a GitHub pull request: fetch details, analyze changes, and provide feedba
   - Test coverage
 
 ## 3. Provide Feedback
-- Summarize what the PR does
+- Summarize what the PR does (Be Concise. Don't give unnecessary praise. Focus on the most important points.)
 - List any issues found (bugs, security concerns, style problems)
 - Suggest improvements if applicable
 - Give an overall assessment (approve, request changes, or needs discussion)
