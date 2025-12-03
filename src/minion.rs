@@ -15,7 +15,7 @@ pub struct Minion {
 /// Generates a unique Minion ID using a monotonic counter
 ///
 /// IDs are formatted as M<base36> where the counter is encoded in base36:
-/// M001, M002, ..., M00Z, M010, ..., M0ZZ, M100, ...
+/// M000, M001, M002, ..., M00Z, M010, ..., M0ZZ, M100, ...
 ///
 /// The counter is stored in `~/.gru/state/next_id.txt` and uses file locking
 /// to ensure thread-safety and atomicity.
@@ -74,13 +74,13 @@ pub fn generate_minion_id() -> io::Result<String> {
     // Read current counter value
     let metadata = file.metadata()?;
     let counter: u64 = if metadata.len() == 0 {
-        1 // Empty file means new installation
+        0 // Empty file means new installation - start at 0 for M000
     } else {
         let mut contents = String::new();
         file.read_to_string(&mut contents)?;
 
         if contents.trim().is_empty() {
-            1 // Start at 1 for new installations
+            0 // Start at 0 for new installations (first ID will be M000)
         } else {
             contents.trim().parse().map_err(|e| {
                 io::Error::new(
@@ -101,7 +101,7 @@ pub fn generate_minion_id() -> io::Result<String> {
     write!(file, "{}", next_counter)?;
     file.flush()?;
 
-    // Unlock the file (happens automatically when file is dropped on Unix)
+    // Unlock the file (happens automatically when file is dropped on both Unix and Windows)
 
     Ok(id)
 }
@@ -111,7 +111,7 @@ fn to_base36(mut num: u64) -> String {
     const DIGITS: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
 
     if num == 0 {
-        return "001".to_string();
+        return "000".to_string();
     }
 
     let mut result = Vec::new();
@@ -137,6 +137,7 @@ mod tests {
 
     #[test]
     fn test_base36_encoding() {
+        assert_eq!(to_base36(0), "000");
         assert_eq!(to_base36(1), "001");
         assert_eq!(to_base36(2), "002");
         assert_eq!(to_base36(10), "00A");
