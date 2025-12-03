@@ -97,9 +97,11 @@ impl GitRepo {
             // If token is provided, use credential helper to provide it securely
             // Otherwise, rely on system git credentials (SSH keys, credential helpers, etc.)
             if let Some(token) = token {
+                // Escape single quotes in the token to prevent command injection
+                let safe_token = token.replace('\'', "'\\''");
                 cmd.arg("-c").arg(format!(
-                    "credential.helper=!f() {{ echo username=oauth2; echo password={}; }}; f",
-                    token
+                    "credential.helper=!f() {{ echo username=oauth2; echo password='{}'; }}; f",
+                    safe_token
                 ));
             }
 
