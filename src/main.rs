@@ -1,3 +1,4 @@
+mod stream;
 mod workspace;
 
 use anyhow::{Context, Result};
