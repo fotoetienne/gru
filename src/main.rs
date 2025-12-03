@@ -12,9 +12,6 @@ use stream::EventStream;
 use tokio::process::Command;
 use tokio::time::{timeout, Duration};
 
-/// Default minion ID used when workspace extraction is not available
-const DEFAULT_MINION_ID: &str = "M04R";
-
 /// Timeout in seconds for each line read from Claude's output stream
 /// Set to 5 minutes to accommodate long-running LLM operations
 const STREAM_TIMEOUT_SECS: u64 = 300;
@@ -180,8 +177,12 @@ async fn handle_fix(issue: &str, quiet: bool) -> Result<i32> {
     // Parse issue information
     let (owner_opt, repo_opt, issue_num) = parse_issue_info(issue)?;
 
+    // Always generate a unique minion ID
+    let minion_id = minion::generate_minion_id().context("Failed to generate Minion ID")?;
+    println!("📋 Generated Minion ID: {}", minion_id);
+
     // Check if we have full repo information for workspace creation
-    let (minion_id, worktree_path_opt) = if let (Some(owner), Some(repo)) = (owner_opt, repo_opt) {
+    let worktree_path_opt = if let (Some(owner), Some(repo)) = (owner_opt, repo_opt) {
         // Full URL provided - create workspace and launch Claude
         println!(
             "🚀 Setting up workspace for {}/{}#{}",
@@ -191,11 +192,6 @@ async fn handle_fix(issue: &str, quiet: bool) -> Result<i32> {
         // Initialize workspace
         let workspace =
             workspace::Workspace::new().context("Failed to initialize Gru workspace")?;
-
-        // Generate minion ID
-        let minion_id = minion::generate_minion_id().context("Failed to generate Minion ID")?;
-
-        println!("📋 Generated Minion ID: {}", minion_id);
 
         // Create bare repository path
         let bare_path = workspace.repos().join(&owner).join(format!("{}.git", repo));
@@ -224,15 +220,15 @@ async fn handle_fix(issue: &str, quiet: bool) -> Result<i32> {
         println!("📂 Workspace created at: {}", worktree_path.display());
         println!("🤖 Launching Claude...\n");
 
-        (minion_id, Some(worktree_path))
+        Some(worktree_path)
     } else {
-        // Plain issue number - use simple mode
+        // Plain issue number - use simple mode without workspace
         println!("⚠️  No repository URL provided. Using simple mode without workspace management.");
         println!(
             "   For full workspace support, use: gru fix https://github.com/owner/repo/issues/{}\n",
             issue_num
         );
-        (DEFAULT_MINION_ID.to_string(), None)
+        None
     };
 
     // Create progress display
