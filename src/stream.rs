@@ -1,9 +1,8 @@
-use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use std::io::{BufRead, BufReader};
-use std::process::{ChildStderr, ChildStdout};
+use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::process::{ChildStderr, ChildStdout};
 
-/// Represents the different types of events that Claude Code can emit
+/// Represents the different types of events that can be emitted by Claude Code
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type")]
 pub enum ClaudeEvent {
@@ -36,50 +35,46 @@ pub enum StreamOutput {
     RawLine(String),
 }
 
-/// Synchronous stream reader for Claude Code output
-pub struct EventStream<R: BufRead> {
-    reader: R,
+/// Async event stream reader for Claude Code output
+pub struct EventStream<R> {
+    reader: BufReader<R>,
 }
 
-impl EventStream<BufReader<ChildStdout>> {
+impl EventStream<ChildStdout> {
     /// Create a new EventStream from a child process's stdout
     pub fn from_stdout(stdout: ChildStdout) -> Self {
-        Self {
-            reader: BufReader::new(stdout),
-        }
+        Self::new(stdout)
     }
 }
 
-impl EventStream<BufReader<ChildStderr>> {
+impl EventStream<ChildStderr> {
     /// Create a new EventStream from a child process's stderr
     #[allow(dead_code)]
     pub fn from_stderr(stderr: ChildStderr) -> Self {
-        Self {
-            reader: BufReader::new(stderr),
-        }
+        Self::new(stderr)
     }
 }
 
-impl<R: BufRead> EventStream<R> {
-    /// Create a new EventStream from any BufRead implementation
+impl<R: tokio::io::AsyncRead + Unpin> EventStream<R> {
+    /// Creates a new event stream from an async reader
     #[allow(dead_code)]
     pub fn new(reader: R) -> Self {
-        Self { reader }
+        Self {
+            reader: BufReader::new(reader),
+        }
     }
 
-    /// Read the next line and try to parse it as a Claude event
-    /// Returns None if end of stream is reached
-    pub fn read_line(&mut self) -> Result<Option<StreamOutput>> {
+    /// Reads the next line from the stream and attempts to parse it as a ClaudeEvent
+    /// Returns None when the stream ends
+    pub async fn next_line(&mut self) -> std::io::Result<Option<StreamOutput>> {
         let mut line = String::new();
-        let bytes_read = self.reader.read_line(&mut line)?;
+        let bytes_read = self.reader.read_line(&mut line).await?;
 
         if bytes_read == 0 {
-            return Ok(None); // EOF
+            return Ok(None);
         }
 
         let trimmed = line.trim();
-
-        // Skip empty lines
         if trimmed.is_empty() {
             return Ok(Some(StreamOutput::RawLine(line)));
         }
@@ -93,9 +88,9 @@ impl<R: BufRead> EventStream<R> {
 
     /// Read all lines from the stream
     #[allow(dead_code)]
-    pub fn read_all(&mut self) -> Result<Vec<StreamOutput>> {
+    pub async fn read_all(&mut self) -> std::io::Result<Vec<StreamOutput>> {
         let mut outputs = Vec::new();
-        while let Some(output) = self.read_line()? {
+        while let Some(output) = self.next_line().await? {
             outputs.push(output);
         }
         Ok(outputs)
@@ -105,10 +100,9 @@ impl<R: BufRead> EventStream<R> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Cursor;
 
-    #[test]
-    fn test_parse_thinking_event() {
+    #[tokio::test]
+    async fn test_parse_thinking_event() {
         let json = r#"{"type":"thinking","content":"Analyzing the codebase..."}"#;
         let event: ClaudeEvent = serde_json::from_str(json).unwrap();
         match event {
@@ -119,8 +113,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_parse_tool_use_event() {
+    #[tokio::test]
+    async fn test_parse_tool_use_event() {
         let json = r#"{"type":"tool_use","name":"bash","input":{"command":"ls"}}"#;
         let event: ClaudeEvent = serde_json::from_str(json).unwrap();
         match event {
@@ -132,8 +126,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_parse_message_event() {
+    #[tokio::test]
+    async fn test_parse_message_event() {
         let json = r#"{"type":"message","content":"Task completed"}"#;
         let event: ClaudeEvent = serde_json::from_str(json).unwrap();
         match event {
@@ -144,15 +138,15 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_parse_complete_event() {
+    #[tokio::test]
+    async fn test_parse_complete_event() {
         let json = r#"{"type":"complete"}"#;
         let event: ClaudeEvent = serde_json::from_str(json).unwrap();
         assert!(matches!(event, ClaudeEvent::Complete));
     }
 
-    #[test]
-    fn test_parse_error_event() {
+    #[tokio::test]
+    async fn test_parse_error_event() {
         let json = r#"{"type":"error","message":"Something went wrong"}"#;
         let event: ClaudeEvent = serde_json::from_str(json).unwrap();
         match event {
@@ -163,15 +157,14 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_stream_reader_with_json() {
+    #[tokio::test]
+    async fn test_stream_reader_with_json() {
         let input = r#"{"type":"thinking","content":"test"}
 {"type":"complete"}
 "#;
-        let cursor = Cursor::new(input);
-        let mut stream = EventStream::new(cursor);
+        let mut stream = EventStream::new(input.as_bytes());
 
-        let outputs = stream.read_all().unwrap();
+        let outputs = stream.read_all().await.unwrap();
         assert_eq!(outputs.len(), 2);
 
         match &outputs[0] {
@@ -187,14 +180,13 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_stream_reader_with_mixed_content() {
+    #[tokio::test]
+    async fn test_stream_reader_with_mixed_content() {
         let input =
             "Regular output line\n{\"type\":\"thinking\",\"content\":\"test\"}\nAnother line\n";
-        let cursor = Cursor::new(input);
-        let mut stream = EventStream::new(cursor);
+        let mut stream = EventStream::new(input.as_bytes());
 
-        let outputs = stream.read_all().unwrap();
+        let outputs = stream.read_all().await.unwrap();
         assert_eq!(outputs.len(), 3);
 
         assert!(matches!(outputs[0], StreamOutput::RawLine(_)));
@@ -202,13 +194,12 @@ mod tests {
         assert!(matches!(outputs[2], StreamOutput::RawLine(_)));
     }
 
-    #[test]
-    fn test_stream_reader_with_malformed_json() {
+    #[tokio::test]
+    async fn test_stream_reader_with_malformed_json() {
         let input = "{\"type\":\"invalid\"\nNot JSON\n";
-        let cursor = Cursor::new(input);
-        let mut stream = EventStream::new(cursor);
+        let mut stream = EventStream::new(input.as_bytes());
 
-        let outputs = stream.read_all().unwrap();
+        let outputs = stream.read_all().await.unwrap();
         assert_eq!(outputs.len(), 2);
 
         // Both should be treated as raw lines since they're malformed/invalid
@@ -216,13 +207,12 @@ mod tests {
         assert!(matches!(outputs[1], StreamOutput::RawLine(_)));
     }
 
-    #[test]
-    fn test_stream_reader_with_empty_lines() {
+    #[tokio::test]
+    async fn test_stream_reader_with_empty_lines() {
         let input = "\n\n{\"type\":\"complete\"}\n\n";
-        let cursor = Cursor::new(input);
-        let mut stream = EventStream::new(cursor);
+        let mut stream = EventStream::new(input.as_bytes());
 
-        let outputs = stream.read_all().unwrap();
+        let outputs = stream.read_all().await.unwrap();
         // Empty lines are preserved as RawLine
         assert_eq!(outputs.len(), 4);
     }
