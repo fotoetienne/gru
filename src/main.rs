@@ -2,6 +2,8 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use std::process::Command;
 
+mod git;
+
 /// CLI structure for the Gru agent orchestrator
 #[derive(Parser)]
 #[command(name = "gru")]
