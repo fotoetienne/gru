@@ -7,3 +7,4 @@ rust-version = "1.70"
 [dependencies]
 anyhow = "1.0"
 clap = { version = "4.5", features = ["derive"] }
+dirs = "5.0"
