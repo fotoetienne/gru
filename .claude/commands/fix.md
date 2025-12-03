@@ -1,6 +1,6 @@
 ---
 description: Implement a fix for a GitHub issue (run from worktree)
-allowed-tools: Bash(gh:*), Bash(git:*), Read, Glob, Grep, Edit, Write, Task, TodoWrite, WebFetch
+allowed-tools: Bash(gh:*), Bash(git:*), Bash(cargo:*), Read, Glob, Grep, Edit, Write, Task, TodoWrite, WebFetch
 argument-hint: "<issue# or URL>"
 ---
 

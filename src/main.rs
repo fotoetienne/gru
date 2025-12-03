@@ -1,3 +1,5 @@
+mod git;
+mod minion;
 mod stream;
 mod workspace;
 
