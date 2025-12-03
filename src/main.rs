@@ -1,3 +1,4 @@
+mod minion;
 mod workspace;
 
 use anyhow::{Context, Result};
