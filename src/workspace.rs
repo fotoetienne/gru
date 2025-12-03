@@ -9,6 +9,8 @@ use std::path::{Path, PathBuf};
 /// - `repos`: Cloned Git repositories
 /// - `work`: Active working directories for minions
 /// - `archive`: Completed or archived minion workspaces
+// Allow dead code for now - workspace module will be integrated in future issues
+#[allow(dead_code)]
 pub struct Workspace {
     root: PathBuf,
     repos: PathBuf,
@@ -16,6 +18,7 @@ pub struct Workspace {
     archive: PathBuf,
 }
 
+#[allow(dead_code)]
 impl Workspace {
     /// Creates a new workspace, initializing all required directories.
     ///
@@ -86,20 +89,29 @@ impl Workspace {
     ///
     /// # Arguments
     ///
-    /// * `repo` - Repository identifier (e.g., "owner/repo")
+    /// * `repo` - Repository identifier (e.g., "owner/repo" or "owner_repo")
     /// * `minion_id` - Unique minion identifier
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// let ws = Workspace::new()?;
+    /// // Creates path: ~/.gru/work/owner/repo/M007
+    /// let path = ws.work_dir("owner/repo", "M007")?;
+    /// ```
     ///
     /// # Errors
     ///
     /// Returns an error if:
-    /// - The repo or minion_id contains path separators or parent directory references
+    /// - The repo or minion_id contains backslashes or parent directory references
     /// - The resulting path would escape the workspace directory
     ///
     /// # Note
     ///
     /// This method validates inputs and computes the path, but does not create the directory.
+    /// Forward slashes in repo names are allowed and will create nested directories.
     pub fn work_dir(&self, repo: &str, minion_id: &str) -> io::Result<PathBuf> {
-        if repo.contains('/') || repo.contains('\\') || repo.contains("..") {
+        if repo.contains('\\') || repo.contains("..") {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!(
@@ -203,7 +215,15 @@ mod tests {
         let ws = Workspace::new().unwrap();
         assert!(ws.work_dir("../../etc", "minion").is_err());
         assert!(ws.work_dir("repo", "../minion").is_err());
-        assert!(ws.work_dir("repo/subpath", "minion").is_err());
+        assert!(ws.work_dir("repo\\subpath", "minion").is_err()); // Backslashes not allowed
+    }
+
+    #[test]
+    fn test_work_dir_allows_forward_slashes() {
+        let ws = Workspace::new().unwrap();
+        // Forward slashes should be allowed in repo names (e.g., "owner/repo")
+        assert!(ws.work_dir("owner/repo", "minion").is_ok());
+        assert!(ws.work_dir("org/project/subproject", "M001").is_ok());
     }
 
     #[test]
