@@ -5,7 +5,7 @@ mod minion;
 mod progress;
 mod stream;
 mod workspace;
-mod worktree;
+mod worktree_scanner;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -566,14 +566,14 @@ async fn resolve_minion_from_pr(pr_num: u64) -> Result<String> {
 }
 
 /// Handles the clean command to remove merged/closed worktrees
-async fn handle_clean(dry_run: bool, force: bool, base_branch: &str) -> Result<i32> {
+fn handle_clean(dry_run: bool, force: bool, base_branch: &str) -> Result<i32> {
     let ws = workspace::Workspace::new().context("Failed to initialize workspace")?;
 
-    println!("Scanning for worktrees in {}...", ws.work().display());
+    println!("Scanning for worktrees in {}...", ws.repos().display());
 
     // Discover all worktrees
-    let worktrees =
-        worktree::discover_worktrees(ws.work()).context("Failed to discover worktrees")?;
+    let worktrees = worktree_scanner::discover_worktrees(ws.repos())
+        .context("Failed to discover worktrees")?;
 
     if worktrees.is_empty() {
         println!("No worktrees found.");
@@ -587,16 +587,10 @@ async fn handle_clean(dry_run: bool, force: bool, base_branch: &str) -> Result<i
     for wt in worktrees {
         let status = wt
             .status(base_branch)
-            .await
             .context(format!("Failed to check status of {}", wt.path.display()))?;
 
-        match status {
-            worktree::WorktreeStatus::Active => {
-                // Skip active worktrees
-            }
-            _ => {
-                cleanable.push((wt, status));
-            }
+        if status != worktree_scanner::WorktreeStatus::Active {
+            cleanable.push((wt, status));
         }
     }
 
@@ -609,10 +603,10 @@ async fn handle_clean(dry_run: bool, force: bool, base_branch: &str) -> Result<i
     println!("Cleanable worktrees:\n");
     for (wt, status) in &cleanable {
         let reason = match status {
-            worktree::WorktreeStatus::Merged => "branch merged",
-            worktree::WorktreeStatus::IssueClosed => "issue closed",
-            worktree::WorktreeStatus::RemoteDeleted => "remote deleted",
-            worktree::WorktreeStatus::Active => unreachable!(),
+            worktree_scanner::WorktreeStatus::Merged => "branch merged",
+            worktree_scanner::WorktreeStatus::IssueClosed => "issue closed",
+            worktree_scanner::WorktreeStatus::RemoteDeleted => "remote deleted",
+            worktree_scanner::WorktreeStatus::Active => unreachable!(),
         };
         println!("  {} ({})", wt.path.display(), reason);
         println!("    Branch: {}", wt.branch);
@@ -648,38 +642,34 @@ async fn handle_clean(dry_run: bool, force: bool, base_branch: &str) -> Result<i
         print!("Removing {}... ", wt.path.display());
         std::io::stdout().flush()?;
 
-        // Validate path is UTF-8
-        let path_str = wt
-            .path
-            .to_str()
-            .ok_or_else(|| anyhow::anyhow!("Invalid UTF-8 in path: {}", wt.path.display()))?;
-
-        let status = Command::new("git")
-            .args(["worktree", "remove", path_str])
-            .output()
-            .await?;
+        // Remove the worktree
+        let status = std::process::Command::new("git")
+            .args([
+                "-C",
+                &wt.bare_repo_path.to_string_lossy(),
+                "worktree",
+                "remove",
+                &wt.path.to_string_lossy(),
+            ])
+            .output()?;
 
         if status.status.success() {
             println!("✓");
             removed += 1;
 
             // Also remove the branch from the bare repository
-            let bare_repo = ws.repos().join(&wt.repo).with_extension("git");
-            if bare_repo.exists() {
-                let branch_result = Command::new("git")
-                    .args(["branch", "-D", &wt.branch])
-                    .current_dir(&bare_repo)
-                    .output()
-                    .await;
+            let branch_result = std::process::Command::new("git")
+                .args([
+                    "-C",
+                    &wt.bare_repo_path.to_string_lossy(),
+                    "branch",
+                    "-D",
+                    &wt.branch,
+                ])
+                .output();
 
-                if let Err(e) = branch_result {
-                    eprintln!("  Warning: Failed to delete branch {}: {}", wt.branch, e);
-                }
-            } else {
-                eprintln!(
-                    "  Warning: Could not find bare repo at {}",
-                    bare_repo.display()
-                );
+            if let Err(e) = branch_result {
+                eprintln!("  Warning: Failed to delete branch: {}", e);
             }
         } else {
             println!("✗");
@@ -709,7 +699,7 @@ async fn main() {
             dry_run,
             force,
             base_branch,
-        } => handle_clean(dry_run, force, &base_branch).await,
+        } => handle_clean(dry_run, force, &base_branch),
     };
 
     // Handle any errors that occurred
