@@ -99,14 +99,17 @@ impl Workspace {
     ///
     /// This method validates inputs and computes the path, but does not create the directory.
     pub fn work_dir(&self, repo: &str, minion_id: &str) -> io::Result<PathBuf> {
-        if repo.contains(['/', '\\', '.']) {
+        if repo.contains('/') || repo.contains('\\') || repo.contains("..") {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("Repository identifier '{}' contains invalid characters", repo),
+                format!(
+                    "Repository identifier '{}' contains invalid characters",
+                    repo
+                ),
             ));
         }
 
-        if minion_id.contains(['/', '\\', '.']) {
+        if minion_id.contains('/') || minion_id.contains('\\') || minion_id.contains("..") {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!("Minion ID '{}' contains invalid characters", minion_id),
@@ -141,7 +144,7 @@ impl Workspace {
     ///
     /// This method validates inputs and computes the path, but does not create the directory.
     pub fn archive_dir(&self, minion_id: &str) -> io::Result<PathBuf> {
-        if minion_id.contains(['/', '\\', '.']) {
+        if minion_id.contains('/') || minion_id.contains('\\') || minion_id.contains("..") {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!("Minion ID '{}' contains invalid characters", minion_id),
@@ -208,6 +211,25 @@ mod tests {
         let ws = Workspace::new().unwrap();
         assert!(ws.archive_dir("../minion").is_err());
         assert!(ws.archive_dir("minion/subpath").is_err());
+    }
+
+    #[test]
+    fn test_work_dir_accepts_dots_in_identifiers() {
+        let ws = Workspace::new().unwrap();
+        // Dots in repo names should be allowed (e.g., "owner.io/repo")
+        assert!(ws.work_dir("owner.io", "minion").is_ok());
+        assert!(ws.work_dir("my.repo", "minion").is_ok());
+        // Dots in minion IDs should be allowed (e.g., version numbers)
+        assert!(ws.work_dir("repo", "minion-1.2.3").is_ok());
+        assert!(ws.work_dir("repo", "v2.0").is_ok());
+    }
+
+    #[test]
+    fn test_archive_dir_accepts_dots_in_identifiers() {
+        let ws = Workspace::new().unwrap();
+        // Dots in minion IDs should be allowed
+        assert!(ws.archive_dir("minion-1.2.3").is_ok());
+        assert!(ws.archive_dir("v2.0").is_ok());
     }
 
     #[test]
