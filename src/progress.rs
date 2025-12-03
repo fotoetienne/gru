@@ -124,7 +124,7 @@ impl ProgressDisplay {
     /// Uses true single-pass iteration by collecting max_chars + 1 characters at once
     fn truncate_string(s: &str, max_chars: usize) -> String {
         // Fast path: if string has max_chars or fewer characters, return as is
-        if s.chars().count() <= max_chars {
+        if s.chars().nth(max_chars).is_some() {
             return s.to_string();
         }
         // Otherwise, collect up to max_chars characters and add ellipsis
