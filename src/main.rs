@@ -5,11 +5,13 @@ mod minion;
 mod progress;
 mod stream;
 mod workspace;
+mod worktree;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use once_cell::sync::Lazy;
 use progress::{ProgressConfig, ProgressDisplay};
+use std::io::Write;
 use std::path::PathBuf;
 use stream::EventStream;
 use tokio::process::Command;
@@ -62,6 +64,15 @@ enum Commands {
 
         #[arg(long, help = "Resolve from PR number", conflicts_with_all = ["minion_id", "issue"])]
         pr: Option<u64>,
+    },
+    #[command(about = "Clean up merged/closed worktrees")]
+    Clean {
+        #[arg(long, help = "Show what would be cleaned without removing")]
+        dry_run: bool,
+        #[arg(long, help = "Force removal without confirmation")]
+        force: bool,
+        #[arg(long, default_value = "main", help = "Base branch to check for merges")]
+        base_branch: String,
     },
 }
 
@@ -554,6 +565,116 @@ async fn resolve_minion_from_pr(pr_num: u64) -> Result<String> {
     );
 }
 
+/// Handles the clean command to remove merged/closed worktrees
+async fn handle_clean(dry_run: bool, force: bool, base_branch: &str) -> Result<i32> {
+    let ws = workspace::Workspace::new().context("Failed to initialize workspace")?;
+
+    println!("Scanning for worktrees in {}...", ws.work().display());
+
+    // Discover all worktrees
+    let worktrees =
+        worktree::discover_worktrees(ws.work()).context("Failed to discover worktrees")?;
+
+    if worktrees.is_empty() {
+        println!("No worktrees found.");
+        return Ok(0);
+    }
+
+    println!("Found {} worktrees. Checking status...\n", worktrees.len());
+
+    // Check status of each worktree
+    let mut cleanable = Vec::new();
+    for wt in worktrees {
+        let status = wt
+            .status(base_branch)
+            .await
+            .context(format!("Failed to check status of {}", wt.path.display()))?;
+
+        match status {
+            worktree::WorktreeStatus::Active => {
+                // Skip active worktrees
+            }
+            _ => {
+                cleanable.push((wt, status));
+            }
+        }
+    }
+
+    if cleanable.is_empty() {
+        println!("No worktrees to clean.");
+        return Ok(0);
+    }
+
+    // Display cleanable worktrees
+    println!("Cleanable worktrees:\n");
+    for (wt, status) in &cleanable {
+        let reason = match status {
+            worktree::WorktreeStatus::Merged => "branch merged",
+            worktree::WorktreeStatus::IssueClosed => "issue closed",
+            worktree::WorktreeStatus::RemoteDeleted => "remote deleted",
+            worktree::WorktreeStatus::Active => unreachable!(),
+        };
+        println!("  {} ({})", wt.path.display(), reason);
+        println!("    Branch: {}", wt.branch);
+        println!("    Repo: {}\n", wt.repo);
+    }
+
+    if dry_run {
+        println!("Dry run mode - no worktrees were removed.");
+        return Ok(0);
+    }
+
+    // Confirm removal unless force flag is set
+    if !force {
+        print!("Remove {} worktrees? [y/N]: ", cleanable.len());
+        std::io::stdout().flush()?;
+
+        let mut input = String::new();
+        std::io::stdin().read_line(&mut input)?;
+        let input = input.trim().to_lowercase();
+
+        if input != "y" && input != "yes" {
+            println!("Cancelled.");
+            return Ok(0);
+        }
+    }
+
+    // Remove worktrees
+    println!("\nRemoving worktrees...");
+    let mut removed = 0;
+    let mut failed = 0;
+
+    for (wt, _) in cleanable {
+        print!("Removing {}... ", wt.path.display());
+        std::io::stdout().flush()?;
+
+        let status = Command::new("git")
+            .args(["worktree", "remove", wt.path.to_str().unwrap()])
+            .output()
+            .await?;
+
+        if status.status.success() {
+            println!("✓");
+            removed += 1;
+
+            // Also remove the branch
+            let _ = Command::new("git")
+                .args(["branch", "-D", &wt.branch])
+                .current_dir(ws.work())
+                .output()
+                .await;
+        } else {
+            println!("✗");
+            eprintln!("  Error: {}", String::from_utf8_lossy(&status.stderr));
+            failed += 1;
+        }
+    }
+
+    println!("\nSummary: {} removed, {} failed", removed, failed);
+
+    Ok(if failed > 0 { 1 } else { 0 })
+}
+
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
@@ -566,6 +687,11 @@ async fn main() {
             issue,
             pr,
         } => handle_path(minion_id, issue, pr).await,
+        Commands::Clean {
+            dry_run,
+            force,
+            base_branch,
+        } => handle_clean(dry_run, force, &base_branch).await,
     };
 
     // Handle any errors that occurred
