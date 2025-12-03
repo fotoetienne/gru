@@ -49,19 +49,19 @@ impl GitRepo {
     /// If the repository doesn't exist, it will be cloned
     /// If it already exists, it will fetch the latest changes
     ///
+    /// Authentication is handled in the following order:
+    /// 1. If `GRU_GITHUB_TOKEN` is set, use it via credential helper
+    /// 2. Otherwise, use system git credentials (SSH keys, credential helpers, etc.)
+    ///
     /// # Errors
     ///
     /// Returns an error if:
-    /// - `GRU_GITHUB_TOKEN` environment variable is not set or empty
     /// - The git clone or fetch command fails (network issues, authentication, etc.)
     /// - Unable to create parent directories
     pub fn ensure_bare_clone(&self) -> Result<()> {
         let token = std::env::var("GRU_GITHUB_TOKEN")
-            .context("GRU_GITHUB_TOKEN environment variable not set")?;
-
-        if token.is_empty() {
-            anyhow::bail!("GRU_GITHUB_TOKEN environment variable is empty");
-        }
+            .ok()
+            .filter(|t| !t.is_empty());
 
         // Check if the bare repository already exists
         if self.bare_path.exists() {
@@ -83,7 +83,7 @@ impl GitRepo {
                 );
             }
         } else {
-            // Clone as bare repository using credential helper to avoid token in URL
+            // Clone as bare repository
             let url = format!("https://github.com/{}/{}.git", self.owner, self.repo);
 
             // Create parent directory if it doesn't exist
@@ -92,21 +92,24 @@ impl GitRepo {
                     .context("Failed to create parent directory for bare repository")?;
             }
 
-            // Use git credential helper to provide token securely
-            // This prevents the token from appearing in URLs or error messages
-            let output = Command::new("git")
-                .arg("-c")
-                .arg(format!(
+            let mut cmd = Command::new("git");
+
+            // If token is provided, use credential helper to provide it securely
+            // Otherwise, rely on system git credentials (SSH keys, credential helpers, etc.)
+            if let Some(token) = token {
+                cmd.arg("-c").arg(format!(
                     "credential.helper=!f() {{ echo username=oauth2; echo password={}; }}; f",
                     token
-                ))
-                .arg("clone")
+                ));
+            }
+
+            cmd.arg("clone")
                 .arg("--bare")
                 .arg(&url)
                 .arg(&self.bare_path)
-                .env("GIT_TERMINAL_PROMPT", "0") // Disable interactive prompts
-                .output()
-                .context("Failed to execute git clone")?;
+                .env("GIT_TERMINAL_PROMPT", "0"); // Disable interactive prompts
+
+            let output = cmd.output().context("Failed to execute git clone")?;
 
             if !output.status.success() {
                 let stderr = String::from_utf8_lossy(&output.stderr);
@@ -232,48 +235,6 @@ mod tests {
     }
 
     #[test]
-    fn test_ensure_bare_clone_fails_without_token() {
-        // Save the current token value if it exists
-        let original_token = env::var("GRU_GITHUB_TOKEN").ok();
-
-        // Remove the token
-        env::remove_var("GRU_GITHUB_TOKEN");
-
-        let repo = GitRepo::new("owner", "repo", PathBuf::from("/tmp/test-repo.git"));
-        let result = repo.ensure_bare_clone();
-
-        // Restore the original token if it existed
-        if let Some(token) = original_token {
-            env::set_var("GRU_GITHUB_TOKEN", token);
-        }
-
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("GRU_GITHUB_TOKEN"));
-    }
-
-    #[test]
-    fn test_ensure_bare_clone_fails_with_empty_token() {
-        // Save the current token value if it exists
-        let original_token = env::var("GRU_GITHUB_TOKEN").ok();
-
-        // Set an empty token
-        env::set_var("GRU_GITHUB_TOKEN", "");
-
-        let repo = GitRepo::new("owner", "repo", PathBuf::from("/tmp/test-repo.git"));
-        let result = repo.ensure_bare_clone();
-
-        // Restore the original token if it existed
-        if let Some(token) = original_token {
-            env::set_var("GRU_GITHUB_TOKEN", token);
-        } else {
-            env::remove_var("GRU_GITHUB_TOKEN");
-        }
-
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("empty"));
-    }
-
-    #[test]
     fn test_create_worktree_fails_without_bare_repo() {
         let repo = GitRepo::new(
             "owner",
@@ -363,16 +324,13 @@ mod tests {
     // Integration tests that actually clone a repository
     // These are marked with #[ignore] and should be run explicitly with:
     // cargo test git_operations -- --ignored
+    //
+    // Note: This test will use GRU_GITHUB_TOKEN if set, otherwise it will
+    // fall back to system git credentials (SSH keys, credential helpers, etc.)
     #[test]
     #[ignore]
     fn test_git_operations_integration() {
         use std::fs;
-
-        // This test requires GRU_GITHUB_TOKEN to be set
-        if env::var("GRU_GITHUB_TOKEN").is_err() {
-            eprintln!("Skipping integration test: GRU_GITHUB_TOKEN not set");
-            return;
-        }
 
         let temp_dir = env::temp_dir();
         let bare_path = temp_dir.join("test-gru-bare.git");
