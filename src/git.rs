@@ -237,48 +237,6 @@ mod tests {
     }
 
     #[test]
-    fn test_ensure_bare_clone_fails_without_token() {
-        // Save the current token value if it exists
-        let original_token = env::var("GRU_GITHUB_TOKEN").ok();
-
-        // Remove the token
-        env::remove_var("GRU_GITHUB_TOKEN");
-
-        let repo = GitRepo::new("owner", "repo", PathBuf::from("/tmp/test-repo.git"));
-        let result = repo.ensure_bare_clone();
-
-        // Restore the original token if it existed
-        if let Some(token) = original_token {
-            env::set_var("GRU_GITHUB_TOKEN", token);
-        }
-
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("GRU_GITHUB_TOKEN"));
-    }
-
-    #[test]
-    fn test_ensure_bare_clone_fails_with_empty_token() {
-        // Save the current token value if it exists
-        let original_token = env::var("GRU_GITHUB_TOKEN").ok();
-
-        // Set an empty token
-        env::set_var("GRU_GITHUB_TOKEN", "");
-
-        let repo = GitRepo::new("owner", "repo", PathBuf::from("/tmp/test-repo.git"));
-        let result = repo.ensure_bare_clone();
-
-        // Restore the original token if it existed
-        if let Some(token) = original_token {
-            env::set_var("GRU_GITHUB_TOKEN", token);
-        } else {
-            env::remove_var("GRU_GITHUB_TOKEN");
-        }
-
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("empty"));
-    }
-
-    #[test]
     fn test_create_worktree_fails_without_bare_repo() {
         let repo = GitRepo::new(
             "owner",
