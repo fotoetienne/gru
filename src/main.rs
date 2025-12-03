@@ -572,8 +572,8 @@ fn handle_clean(dry_run: bool, force: bool, base_branch: &str) -> Result<i32> {
     println!("Scanning for worktrees in {}...", ws.repos().display());
 
     // Discover all worktrees
-    let worktrees = worktree_scanner::discover_worktrees(ws.repos())
-        .context("Failed to discover worktrees")?;
+    let worktrees =
+        worktree_scanner::discover_worktrees(ws.repos()).context("Failed to discover worktrees")?;
 
     if worktrees.is_empty() {
         println!("No worktrees found.");

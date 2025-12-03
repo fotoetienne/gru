@@ -55,7 +55,15 @@ impl Worktree {
     /// Check if the worktree's branch has been merged into the base branch
     pub fn check_merged(&self, base_branch: &str) -> Result<bool> {
         let output = Command::new("git")
-            .args(["-C", &self.bare_repo_path.to_string_lossy(), "branch", "--merged", base_branch, "--list", &self.branch])
+            .args([
+                "-C",
+                &self.bare_repo_path.to_string_lossy(),
+                "branch",
+                "--merged",
+                base_branch,
+                "--list",
+                &self.branch,
+            ])
             .output()
             .context("Failed to check if branch is merged")?;
 
@@ -97,7 +105,12 @@ impl Worktree {
     pub fn check_remote_deleted(&self) -> Result<bool> {
         // First fetch to ensure we have latest remote info
         let fetch_output = Command::new("git")
-            .args(["-C", &self.bare_repo_path.to_string_lossy(), "fetch", "--prune"])
+            .args([
+                "-C",
+                &self.bare_repo_path.to_string_lossy(),
+                "fetch",
+                "--prune",
+            ])
             .output()
             .context("Failed to fetch from remote")?;
 
@@ -112,7 +125,14 @@ impl Worktree {
 
         // Check if remote branch exists
         let output = Command::new("git")
-            .args(["-C", &self.bare_repo_path.to_string_lossy(), "ls-remote", "--heads", "origin", &self.branch])
+            .args([
+                "-C",
+                &self.bare_repo_path.to_string_lossy(),
+                "ls-remote",
+                "--heads",
+                "origin",
+                &self.branch,
+            ])
             .output()
             .context("Failed to check remote branch")?;
 
@@ -174,7 +194,13 @@ pub fn discover_worktrees(repos_dir: &Path) -> Result<Vec<Worktree>> {
 
         // List worktrees for this bare repo
         let output = Command::new("git")
-            .args(["-C", &path.to_string_lossy(), "worktree", "list", "--porcelain"])
+            .args([
+                "-C",
+                &path.to_string_lossy(),
+                "worktree",
+                "list",
+                "--porcelain",
+            ])
             .output()
             .context(format!("Failed to list worktrees for {}", path.display()))?;
 
