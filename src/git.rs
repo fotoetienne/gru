@@ -2,6 +2,30 @@ use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+/// Validates a branch name according to Git ref naming rules
+fn validate_branch_name(branch_name: &str) -> Result<()> {
+    if branch_name.is_empty() {
+        anyhow::bail!("Branch name cannot be empty");
+    }
+
+    if branch_name.starts_with('-') {
+        anyhow::bail!("Branch name cannot start with '-'");
+    }
+
+    // Git ref name validation
+    if branch_name.contains("..")
+        || branch_name.contains("@{")
+        || branch_name.contains('\\')
+        || branch_name.ends_with('.')
+        || branch_name.ends_with(".lock")
+        || branch_name.contains('\x00')
+    {
+        anyhow::bail!("Invalid branch name: {}", branch_name);
+    }
+
+    Ok(())
+}
+
 /// Represents a Git repository with owner and repo name
 #[allow(dead_code)]
 pub struct GitRepo {
@@ -68,17 +92,19 @@ impl GitRepo {
                     .context("Failed to create parent directory for bare repository")?;
             }
 
-            // Use GIT_ASKPASS to provide credentials securely
+            // Use git credential helper to provide token securely
             // This prevents the token from appearing in URLs or error messages
             let output = Command::new("git")
+                .arg("-c")
+                .arg(format!(
+                    "credential.helper=!f() {{ echo username=oauth2; echo password={}; }}; f",
+                    token
+                ))
                 .arg("clone")
                 .arg("--bare")
                 .arg(&url)
                 .arg(&self.bare_path)
                 .env("GIT_TERMINAL_PROMPT", "0") // Disable interactive prompts
-                .env("GIT_ASKPASS", "echo") // Use echo as askpass
-                .env("GIT_USERNAME", &token)
-                .env("GIT_PASSWORD", &token)
                 .output()
                 .context("Failed to execute git clone")?;
 
@@ -107,24 +133,7 @@ impl GitRepo {
     /// - Git worktree creation fails
     pub fn create_worktree(&self, branch_name: &str, worktree_path: &Path) -> Result<()> {
         // Validate branch name
-        if branch_name.is_empty() {
-            anyhow::bail!("Branch name cannot be empty");
-        }
-
-        if branch_name.starts_with('-') {
-            anyhow::bail!("Branch name cannot start with '-'");
-        }
-
-        // Git ref name validation
-        if branch_name.contains("..")
-            || branch_name.contains("@{")
-            || branch_name.contains('\\')
-            || branch_name.ends_with('.')
-            || branch_name.ends_with(".lock")
-            || branch_name.contains('\0')
-        {
-            anyhow::bail!("Invalid branch name: {}", branch_name);
-        }
+        validate_branch_name(branch_name)?;
 
         // Ensure the bare repository exists first
         if !self.bare_path.exists() {
