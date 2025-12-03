@@ -1,12 +1,15 @@
 mod git;
 mod logger;
 mod minion;
+mod progress;
 mod stream;
 mod workspace;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use progress::{ProgressConfig, ProgressDisplay};
 use std::process::Command;
+use stream::EventStream;
 
 /// CLI structure for the Gru agent orchestrator
 #[derive(Parser)]
@@ -16,6 +19,10 @@ use std::process::Command;
 struct Cli {
     #[command(subcommand)]
     command: Commands,
+
+    /// Run in quiet mode (only show errors)
+    #[arg(short, long, global = true)]
+    quiet: bool,
 }
 
 /// Available commands for Gru
@@ -161,6 +168,7 @@ fn parse_issue_info(issue: &str) -> Result<(Option<String>, Option<String>, Stri
 
 /// Handles the fix command by delegating to the Claude CLI
 /// Returns the exit code from the claude process
+<<<<<<< HEAD
 fn handle_fix(issue: &str) -> Result<i32> {
     // Parse issue information
     let (owner_opt, repo_opt, issue_num) = parse_issue_info(issue)?;
@@ -245,6 +253,61 @@ fn handle_fix(issue: &str) -> Result<i32> {
 
         Ok(status.code().unwrap_or(128))
     }
+=======
+fn handle_fix(issue: &str, quiet: bool) -> Result<i32> {
+    // Validate the issue format before proceeding
+    validate_issue_format(issue)?;
+
+    // TODO: Extract actual minion ID from workspace
+    let minion_id = "M04R".to_string();
+
+    // Create progress display
+    let config = ProgressConfig {
+        minion_id: minion_id.clone(),
+        issue: issue.to_string(),
+        quiet,
+    };
+    let progress = ProgressDisplay::new(config);
+
+    // Execute the claude CLI with the /fix command, capturing stdout
+    let mut child = Command::new("claude")
+        .arg(format!("/fix {}", issue))
+        .stdin(std::process::Stdio::inherit())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::inherit())
+        .spawn()
+        .context(
+            "claude command not found. Install from: https://github.com/anthropics/claude-code",
+        )?;
+
+    // Get the stdout handle
+    let stdout = child
+        .stdout
+        .take()
+        .context("Failed to capture stdout from claude process")?;
+
+    // Create event stream reader
+    let mut stream = EventStream::from_stdout(stdout);
+
+    // Process stream output
+    while let Some(output) = stream.read_line()? {
+        progress.handle_output(&output);
+    }
+
+    // Wait for the process to finish
+    let status = child.wait()?;
+
+    // Finish the progress display
+    if status.success() {
+        progress.finish_with_message(&format!("✅ Completed issue {}", issue));
+    } else {
+        progress.finish_with_message(&format!("❌ Failed to fix issue {}", issue));
+    }
+
+    // Return the exit code from the claude process
+    // Use 128 for signal terminations to follow shell conventions
+    Ok(status.code().unwrap_or(128))
+>>>>>>> b25526d (Implement real-time progress display for Minion work)
 }
 
 /// Handles the review command by delegating to the Claude CLI
@@ -273,7 +336,7 @@ fn main() {
     let cli = Cli::parse();
 
     let result = match cli.command {
-        Commands::Fix { issue } => handle_fix(&issue),
+        Commands::Fix { issue } => handle_fix(&issue, cli.quiet),
         Commands::Review { pr } => handle_review(&pr),
     };
 
