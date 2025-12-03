@@ -273,17 +273,17 @@ async fn handle_fix(issue: &str, quiet: bool) -> Result<i32> {
     // Process stream output asynchronously with timeout and error handling
     let stream_result = async {
         loop {
-            match timeout(Duration::from_secs(STREAM_TIMEOUT_SECS), stream.next_line()).await {
-                Ok(Ok(Some(output))) => {
-                    progress.handle_output(&output);
-                }
-                Ok(Ok(None)) => break,       // Stream ended normally
-                Ok(Err(e)) => return Err(e), // Stream error
-                Err(_) => {
-                    return Err(anyhow::anyhow!(
-                        "Timeout: Claude process hasn't produced output in 5 minutes"
-                    ));
-                }
+            // Handle timeout first, then flatten the stream result
+            let line_result = timeout(Duration::from_secs(STREAM_TIMEOUT_SECS), stream.next_line())
+                .await
+                .map_err(|_| {
+                    anyhow::anyhow!("Timeout: Claude process hasn't produced output in 5 minutes")
+                })?;
+
+            // Now handle the stream result
+            match line_result? {
+                Some(output) => progress.handle_output(&output),
+                None => break, // Stream ended normally
             }
         }
         Ok::<_, anyhow::Error>(())

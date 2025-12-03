@@ -121,16 +121,16 @@ impl ProgressDisplay {
     }
 
     /// Truncate a string to a maximum number of characters (not bytes)
-    /// Uses single-pass iteration to avoid counting characters twice
+    /// Uses true single-pass iteration by collecting max_chars + 1 characters at once
     fn truncate_string(s: &str, max_chars: usize) -> String {
-        // Check if truncation is needed using nth() which short-circuits
-        if s.chars().nth(max_chars).is_none() {
+        // Collect up to max_chars + 1 characters in a single pass
+        let chars: Vec<char> = s.chars().take(max_chars + 1).collect();
+        if chars.len() > max_chars {
+            // String exceeds max_chars, truncate and add ellipsis
+            format!("{}...", chars[..max_chars].iter().collect::<String>())
+        } else {
             // String has max_chars or fewer characters
             s.to_string()
-        } else {
-            // String exceeds max_chars, truncate and add ellipsis
-            let truncated: String = s.chars().take(max_chars).collect();
-            format!("{}...", truncated)
         }
     }
 

@@ -85,7 +85,8 @@ impl<R: tokio::io::AsyncRead + Unpin> EventStream<R> {
 
         let trimmed = line.trim();
         if trimmed.is_empty() {
-            return Ok(Some(StreamOutput::RawLine(line)));
+            // Return empty string for truly empty lines to avoid unnecessary whitespace
+            return Ok(Some(StreamOutput::RawLine(String::new())));
         }
 
         // Try to parse as JSON event
