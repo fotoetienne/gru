@@ -167,42 +167,49 @@ impl Worktree {
 pub fn discover_worktrees(repos_dir: &Path) -> Result<Vec<Worktree>> {
     let mut worktrees = Vec::new();
 
-    // Iterate through all directories in repos_dir
     if !repos_dir.exists() {
         return Ok(worktrees);
     }
 
-    for entry in std::fs::read_dir(repos_dir).context("Failed to read repos directory")? {
-        let entry = entry?;
-        let path = entry.path();
+    // Find all bare repositories recursively
+    let bare_repos = find_bare_repos(repos_dir)?;
 
-        // Skip if not a directory
-        if !path.is_dir() {
-            continue;
-        }
-
-        // Check if this looks like a bare repo (ends with .git or contains objects/refs)
-        let is_bare = path.extension().and_then(|e| e.to_str()) == Some("git")
-            || (path.join("objects").exists() && path.join("refs").exists());
-
-        if !is_bare {
-            continue;
-        }
-
-        // Extract repo name from path
-        let repo_name = extract_repo_from_bare_path(&path)?;
+    for bare_repo_path in bare_repos {
+        // Extract repo name from git config
+        let repo_name = match extract_repo_from_git_config(&bare_repo_path) {
+            Ok(name) => name,
+            Err(e) => {
+                eprintln!(
+                    "Warning: Failed to extract repo name from {}: {}",
+                    bare_repo_path.display(),
+                    e
+                );
+                continue;
+            }
+        };
 
         // List worktrees for this bare repo
         let output = Command::new("git")
             .args([
                 "-C",
-                &path.to_string_lossy(),
+                &bare_repo_path.to_string_lossy(),
                 "worktree",
                 "list",
                 "--porcelain",
             ])
-            .output()
-            .context(format!("Failed to list worktrees for {}", path.display()))?;
+            .output();
+
+        let output = match output {
+            Ok(out) => out,
+            Err(e) => {
+                eprintln!(
+                    "Warning: Failed to list worktrees for {}: {}",
+                    bare_repo_path.display(),
+                    e
+                );
+                continue;
+            }
+        };
 
         if !output.status.success() {
             continue;
@@ -210,29 +217,104 @@ pub fn discover_worktrees(repos_dir: &Path) -> Result<Vec<Worktree>> {
 
         // Parse worktree list output
         let stdout = String::from_utf8_lossy(&output.stdout);
-        let discovered = parse_worktree_list(&stdout, &repo_name, &path)?;
+        let discovered = parse_worktree_list(&stdout, &repo_name, &bare_repo_path)?;
         worktrees.extend(discovered);
     }
 
     Ok(worktrees)
 }
 
-/// Extract repository identifier from bare repo path
-/// Example: ~/.gru/repos/owner_repo.git -> "owner/repo"
-fn extract_repo_from_bare_path(path: &Path) -> Result<String> {
-    let file_name = path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .context("Invalid bare repository path")?;
+/// Recursively find all bare repositories in the given directory
+fn find_bare_repos(dir: &Path) -> Result<Vec<PathBuf>> {
+    let mut bare_repos = Vec::new();
+    let mut dirs_to_scan = vec![dir.to_path_buf()];
 
-    // Replace first underscore with slash to get owner/repo format
-    let repo = if let Some(pos) = file_name.find('_') {
-        format!("{}/{}", &file_name[..pos], &file_name[pos + 1..])
-    } else {
-        file_name.to_string()
-    };
+    while let Some(current_dir) = dirs_to_scan.pop() {
+        let entries = match std::fs::read_dir(&current_dir) {
+            Ok(entries) => entries,
+            Err(e) => {
+                eprintln!(
+                    "Warning: Failed to read directory {}: {}",
+                    current_dir.display(),
+                    e
+                );
+                continue;
+            }
+        };
 
-    Ok(repo)
+        for entry in entries {
+            let entry = match entry {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+
+            let path = entry.path();
+
+            if !path.is_dir() {
+                continue;
+            }
+
+            // Check if this looks like a bare repo (ends with .git or contains objects/refs)
+            let is_bare = path.extension().and_then(|e| e.to_str()) == Some("git")
+                || (path.join("objects").exists() && path.join("refs").exists());
+
+            if is_bare {
+                bare_repos.push(path);
+            } else {
+                // Not a bare repo, so continue scanning deeper
+                dirs_to_scan.push(path);
+            }
+        }
+    }
+
+    Ok(bare_repos)
+}
+
+/// Extract repository identifier from git config
+/// Uses `git config remote.origin.url` to get the actual repo URL and parses it
+/// Example: https://github.com/owner/repo.git -> "owner/repo"
+///          git@github.com:owner/repo.git -> "owner/repo"
+fn extract_repo_from_git_config(path: &Path) -> Result<String> {
+    // Get remote.origin.url from git config
+    let output = Command::new("git")
+        .args(["-C", &path.to_string_lossy(), "config", "remote.origin.url"])
+        .output()
+        .context("Failed to run git config")?;
+
+    if !output.status.success() {
+        anyhow::bail!(
+            "Failed to get remote.origin.url: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let url = String::from_utf8_lossy(&output.stdout).trim().to_string();
+
+    // Parse the URL to extract owner/repo
+    parse_repo_from_url(&url).context("Failed to parse repo from URL")
+}
+
+/// Parse owner/repo from a git URL
+/// Handles both HTTPS and SSH formats
+fn parse_repo_from_url(url: &str) -> Result<String> {
+    // Handle HTTPS format: https://github.com/owner/repo.git
+    if url.starts_with("https://") || url.starts_with("http://") {
+        let parts: Vec<&str> = url.split('/').collect();
+        if parts.len() >= 2 {
+            let owner = parts[parts.len() - 2];
+            let repo = parts[parts.len() - 1].trim_end_matches(".git");
+            return Ok(format!("{}/{}", owner, repo));
+        }
+    }
+    // Handle SSH format: git@github.com:owner/repo.git
+    else if url.contains(':') {
+        if let Some(path_part) = url.split(':').nth(1) {
+            let repo = path_part.trim_end_matches(".git");
+            return Ok(repo.to_string());
+        }
+    }
+
+    anyhow::bail!("Unable to parse repo from URL: {}", url)
 }
 
 /// Parse git worktree list --porcelain output
@@ -321,15 +403,40 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_repo_from_bare_path() {
-        let path = PathBuf::from("/home/user/.gru/repos/fotoetienne_gru.git");
+    fn test_parse_repo_from_url() {
+        // HTTPS format
         assert_eq!(
-            extract_repo_from_bare_path(&path).unwrap(),
+            parse_repo_from_url("https://github.com/fotoetienne/gru.git").unwrap(),
             "fotoetienne/gru"
         );
 
-        let path = PathBuf::from("/home/user/.gru/repos/owner_repo.git");
-        assert_eq!(extract_repo_from_bare_path(&path).unwrap(), "owner/repo");
+        assert_eq!(
+            parse_repo_from_url("https://github.com/owner/repo.git").unwrap(),
+            "owner/repo"
+        );
+
+        // Without .git suffix
+        assert_eq!(
+            parse_repo_from_url("https://github.com/owner/repo").unwrap(),
+            "owner/repo"
+        );
+
+        // SSH format
+        assert_eq!(
+            parse_repo_from_url("git@github.com:fotoetienne/gru.git").unwrap(),
+            "fotoetienne/gru"
+        );
+
+        assert_eq!(
+            parse_repo_from_url("git@github.com:owner/repo.git").unwrap(),
+            "owner/repo"
+        );
+
+        // Without .git suffix
+        assert_eq!(
+            parse_repo_from_url("git@github.com:owner/repo").unwrap(),
+            "owner/repo"
+        );
     }
 
     #[test]
