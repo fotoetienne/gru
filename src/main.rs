@@ -10,6 +10,7 @@ use clap::{Parser, Subcommand};
 use progress::{ProgressConfig, ProgressDisplay};
 use stream::EventStream;
 use tokio::process::Command;
+use tokio::time::{timeout, Duration};
 
 /// CLI structure for the Gru agent orchestrator
 #[derive(Parser)]
@@ -262,13 +263,31 @@ async fn handle_fix(issue: &str, quiet: bool) -> Result<i32> {
     // Create event stream reader
     let mut stream = EventStream::from_stdout(stdout);
 
-    // Process stream output asynchronously
-    while let Some(output) = stream.next_line().await? {
-        progress.handle_output(&output);
+    // Process stream output asynchronously with timeout and error handling
+    let stream_result = async {
+        loop {
+            match timeout(Duration::from_secs(300), stream.next_line()).await {
+                Ok(Ok(Some(output))) => {
+                    progress.handle_output(&output);
+                }
+                Ok(Ok(None)) => break,       // Stream ended normally
+                Ok(Err(e)) => return Err(e), // Stream error
+                Err(_) => {
+                    return Err(anyhow::anyhow!(
+                        "Timeout: Claude process hasn't produced output in 5 minutes"
+                    ));
+                }
+            }
+        }
+        Ok::<_, anyhow::Error>(())
     }
+    .await;
 
-    // Wait for the process to finish
+    // Always wait for the process, regardless of stream errors
     let status = child.wait().await?;
+
+    // Now check if there was a stream error
+    stream_result?;
 
     // Finish the progress display
     if status.success() {

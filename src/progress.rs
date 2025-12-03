@@ -68,10 +68,14 @@ impl ProgressDisplay {
 
     /// Add an event to the recent events list
     fn add_event(&self, event_text: String) {
-        let mut events = self
-            .recent_events
-            .lock()
-            .expect("Progress event mutex poisoned");
+        let mut events = match self.recent_events.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                // Log the error and recover with the data
+                eprintln!("Warning: Progress display mutex poisoned, recovering");
+                poisoned.into_inner()
+            }
+        };
         events.push(event_text);
 
         // Keep only the last 4 events
@@ -104,7 +108,11 @@ impl ProgressDisplay {
             StreamOutput::Event(event) => self.handle_event(event),
             StreamOutput::RawLine(line) => {
                 // Pass through non-JSON output to stdout
-                print!("{}", line);
+                use std::io::Write;
+                if let Err(e) = std::io::stdout().write_all(line.as_bytes()) {
+                    eprintln!("Warning: Failed to write to stdout: {}", e);
+                }
+                let _ = std::io::stdout().flush();
             }
         }
     }

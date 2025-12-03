@@ -1,3 +1,4 @@
+use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{ChildStderr, ChildStdout};
@@ -66,9 +67,13 @@ impl<R: tokio::io::AsyncRead + Unpin> EventStream<R> {
 
     /// Reads the next line from the stream and attempts to parse it as a ClaudeEvent
     /// Returns None when the stream ends
-    pub async fn next_line(&mut self) -> std::io::Result<Option<StreamOutput>> {
+    pub async fn next_line(&mut self) -> anyhow::Result<Option<StreamOutput>> {
         let mut line = String::new();
-        let bytes_read = self.reader.read_line(&mut line).await?;
+        let bytes_read = self
+            .reader
+            .read_line(&mut line)
+            .await
+            .context("Failed to read line from stream")?;
 
         if bytes_read == 0 {
             return Ok(None);
@@ -88,7 +93,7 @@ impl<R: tokio::io::AsyncRead + Unpin> EventStream<R> {
 
     /// Read all lines from the stream
     #[allow(dead_code)]
-    pub async fn read_all(&mut self) -> std::io::Result<Vec<StreamOutput>> {
+    pub async fn read_all(&mut self) -> anyhow::Result<Vec<StreamOutput>> {
         let mut outputs = Vec::new();
         while let Some(output) = self.next_line().await? {
             outputs.push(output);
