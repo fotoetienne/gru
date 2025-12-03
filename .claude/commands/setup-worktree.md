@@ -24,7 +24,7 @@ Create a git worktree using Gru's filesystem structure for working on an issue.
 - Create worktree from bare repo:
   ```
   cd ~/.gru/repos/owner/repo.git
-  git worktree add ~/.gru/work/owner/repo/issue-<issue#> -b gru/issue-<issue#>
+  git worktree add ~/.gru/work/owner/repo/issue-<issue#> -b issue-<issue#>
   ```
 
 ### 4. Check if Worktree Already Exists
@@ -36,12 +36,8 @@ Create a git worktree using Gru's filesystem structure for working on an issue.
 Inform the user:
 ```
 ✓ Worktree created at ~/.gru/work/owner/repo/issue-<issue#>
-✓ Branch: gru/issue-<issue#>
+✓ Branch: issue-<issue#>
 
 Next steps:
-  cd ~/.gru/work/owner/repo/issue-<issue#>
-  claude code .
-  /fix <issue#>
+  cd ~/.gru/work/owner/repo/issue-<issue#> && gru fix <issue#>
 ```
-
-**Important:** The user needs to launch a new Claude Code session in the worktree directory to avoid permission issues. The `/fix` command will handle the actual implementation.
