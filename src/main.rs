@@ -1,5 +1,6 @@
 mod git;
 mod minion;
+mod stream;
 mod workspace;
 
 use anyhow::{Context, Result};
