@@ -1,9 +1,16 @@
+use crate::workspace::Workspace;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, OpenOptions};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
+
+/// Maximum content length for event strings (1MB)
+const MAX_CONTENT_LENGTH: usize = 1_000_000;
+
+/// Maximum tool name length
+const MAX_TOOL_NAME_LENGTH: usize = 1_000;
 
 /// Represents a Claude event that can be logged
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -29,6 +36,43 @@ pub enum ClaudeEvent {
     Error { message: String },
 }
 
+impl ClaudeEvent {
+    /// Validates the event content to prevent disk exhaustion and log injection attacks
+    fn validate(&self) -> Result<()> {
+        match self {
+            ClaudeEvent::Thinking { content }
+            | ClaudeEvent::Message { content }
+            | ClaudeEvent::Error { message: content } => {
+                if content.len() > MAX_CONTENT_LENGTH {
+                    anyhow::bail!(
+                        "Event content exceeds maximum length of {} bytes",
+                        MAX_CONTENT_LENGTH
+                    );
+                }
+            }
+            ClaudeEvent::ToolUse { name, input } => {
+                if name.len() > MAX_TOOL_NAME_LENGTH {
+                    anyhow::bail!(
+                        "Tool name exceeds maximum length of {} bytes",
+                        MAX_TOOL_NAME_LENGTH
+                    );
+                }
+                let serialized_size = serde_json::to_string(input)
+                    .context("Failed to serialize tool input")?
+                    .len();
+                if serialized_size > MAX_CONTENT_LENGTH {
+                    anyhow::bail!(
+                        "Tool input exceeds maximum length of {} bytes when serialized",
+                        MAX_CONTENT_LENGTH
+                    );
+                }
+            }
+            ClaudeEvent::Complete => {}
+        }
+        Ok(())
+    }
+}
+
 /// A logged event with timestamp and minion_id
 #[derive(Debug, Serialize, Deserialize)]
 #[allow(dead_code)] // Module will be used in future issues
@@ -50,14 +94,14 @@ pub struct EventLogger {
 impl EventLogger {
     /// Creates a new EventLogger for the given minion_id
     /// This creates the archive directory if it doesn't exist
+    ///
+    /// # Security
+    ///
+    /// The minion_id is validated to prevent path traversal attacks.
+    /// Only alphanumeric characters, hyphens, underscores, and dots are allowed.
     pub fn new(minion_id: impl Into<String>) -> Result<Self> {
         let minion_id = minion_id.into();
         let log_path = Self::get_log_path(&minion_id)?;
-
-        // Create the parent directory if it doesn't exist
-        if let Some(parent) = log_path.parent() {
-            fs::create_dir_all(parent).context("Failed to create archive directory")?;
-        }
 
         Ok(Self {
             minion_id,
@@ -67,24 +111,39 @@ impl EventLogger {
 
     /// Gets the log path for a given minion_id
     /// Returns ~/.gru/archive/<minion-id>/events.jsonl
+    ///
+    /// This method uses Workspace::archive_dir() which validates the minion_id
+    /// to prevent path traversal attacks and creates the directory with proper permissions.
     fn get_log_path(minion_id: &str) -> Result<PathBuf> {
-        let home_dir = dirs::home_dir().context("Failed to get home directory")?;
-        Ok(home_dir
-            .join(".gru")
-            .join("archive")
-            .join(minion_id)
-            .join("events.jsonl"))
+        let workspace = Workspace::new().context("Failed to initialize workspace")?;
+        let archive_dir = workspace
+            .archive_dir(minion_id)
+            .context("Invalid minion_id")?;
+        Ok(archive_dir.join("events.jsonl"))
     }
 
     /// Logs an event to the JSONL file
     /// Each event is written as a single line with timestamp and minion_id
     /// The file is flushed immediately to ensure durability
+    ///
+    /// # Security
+    ///
+    /// Event content is validated to prevent disk exhaustion attacks.
+    /// Content exceeding 1MB will be rejected.
     pub fn log_event(&self, event: ClaudeEvent) -> Result<()> {
+        // Validate event content before logging
+        event.validate().context("Event validation failed")?;
+
         let logged_event = LoggedEvent {
             timestamp: Utc::now(),
             minion_id: self.minion_id.clone(),
             event,
         };
+
+        // Ensure parent directory exists
+        if let Some(parent) = self.log_path.parent() {
+            fs::create_dir_all(parent).context("Failed to create archive directory")?;
+        }
 
         // Open file in append mode, create if it doesn't exist
         let file = OpenOptions::new()
@@ -259,5 +318,73 @@ mod tests {
             }
             _ => panic!("Expected Error event"),
         }
+    }
+
+    #[test]
+    fn test_rejects_path_traversal_in_minion_id() {
+        // Test that path traversal attempts are rejected
+        assert!(EventLogger::new("../../../etc/passwd").is_err());
+        assert!(EventLogger::new("../../secrets").is_err());
+        assert!(EventLogger::new("foo/../bar").is_err());
+        assert!(EventLogger::new("foo/bar").is_err());
+        assert!(EventLogger::new("foo\\bar").is_err());
+    }
+
+    #[test]
+    fn test_rejects_oversized_content() {
+        let minion_id = unique_minion_id("M_TEST_SIZE");
+        let logger = EventLogger::new(&minion_id).unwrap();
+
+        // Create content that exceeds MAX_CONTENT_LENGTH
+        let large_content = "A".repeat(MAX_CONTENT_LENGTH + 1);
+        let event = ClaudeEvent::Thinking {
+            content: large_content,
+        };
+
+        // Should fail validation
+        assert!(logger.log_event(event).is_err());
+
+        // Cleanup
+        fs::remove_file(logger.log_path()).ok();
+    }
+
+    #[test]
+    fn test_rejects_oversized_tool_input() {
+        let minion_id = unique_minion_id("M_TEST_TOOL_SIZE");
+        let logger = EventLogger::new(&minion_id).unwrap();
+
+        // Create a tool input that's too large when serialized
+        // Each string "x" takes about 3 bytes in JSON: "x",
+        // So we need about 350,000 strings to exceed 1MB
+        let large_array = vec![String::from("x"); 350_000];
+        let event = ClaudeEvent::ToolUse {
+            name: "test".to_string(),
+            input: serde_json::json!(large_array),
+        };
+
+        // Should fail validation
+        assert!(logger.log_event(event).is_err());
+
+        // Cleanup
+        fs::remove_file(logger.log_path()).ok();
+    }
+
+    #[test]
+    fn test_rejects_oversized_tool_name() {
+        let minion_id = unique_minion_id("M_TEST_TOOL_NAME");
+        let logger = EventLogger::new(&minion_id).unwrap();
+
+        // Create a tool name that's too long
+        let long_name = "A".repeat(MAX_TOOL_NAME_LENGTH + 1);
+        let event = ClaudeEvent::ToolUse {
+            name: long_name,
+            input: serde_json::json!({}),
+        };
+
+        // Should fail validation
+        assert!(logger.log_event(event).is_err());
+
+        // Cleanup
+        fs::remove_file(logger.log_path()).ok();
     }
 }
