@@ -1,6 +1,13 @@
 use anyhow::{anyhow, Context, Result};
+use chrono::Utc;
 use octocrab::{models, Octocrab};
+use serde::{Deserialize, Serialize};
 use std::env;
+use std::process::Command;
+
+// ============================================================================
+// Octocrab API Client
+// ============================================================================
 
 /// GitHub API client wrapper using octocrab
 #[derive(Debug)]
@@ -127,10 +134,137 @@ impl GitHubClient {
     }
 }
 
+// ============================================================================
+// gh CLI Helper Functions
+// ============================================================================
+
+/// Represents a GitHub issue with essential metadata
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Issue {
+    pub number: u32,
+    pub title: String,
+    pub body: Option<String>,
+    pub labels: Vec<Label>,
+}
+
+/// Represents a GitHub label
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Label {
+    pub name: String,
+}
+
+/// Fetches issue details from GitHub using the gh CLI
+pub async fn fetch_issue(owner: &str, repo: &str, issue_num: &str) -> Result<Issue> {
+    let output = Command::new("gh")
+        .args([
+            "issue",
+            "view",
+            issue_num,
+            "--repo",
+            &format!("{}/{}", owner, repo),
+            "--json",
+            "number,title,body,labels",
+        ])
+        .output()
+        .context("Failed to execute gh command")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("Failed to fetch issue: {}", stderr);
+    }
+
+    let issue: Issue = serde_json::from_slice(&output.stdout)
+        .context("Failed to parse issue JSON from gh output")?;
+
+    Ok(issue)
+}
+
+/// Checks if an issue has the "in-progress" label
+pub fn has_in_progress_label(issue: &Issue) -> bool {
+    issue.labels.iter().any(|label| label.name == "in-progress")
+}
+
+/// Adds the "in-progress" label to an issue
+pub async fn add_in_progress_label(owner: &str, repo: &str, issue_num: &str) -> Result<()> {
+    let output = Command::new("gh")
+        .args([
+            "issue",
+            "edit",
+            issue_num,
+            "--repo",
+            &format!("{}/{}", owner, repo),
+            "--add-label",
+            "in-progress",
+        ])
+        .output()
+        .context("Failed to execute gh command")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("Failed to add in-progress label: {}", stderr);
+    }
+
+    Ok(())
+}
+
+/// Posts a claim comment on an issue with YAML frontmatter
+pub async fn post_claim_comment(
+    owner: &str,
+    repo: &str,
+    issue_num: &str,
+    minion_id: &str,
+    branch: &str,
+    workspace_path: &str,
+) -> Result<()> {
+    let timestamp = Utc::now().to_rfc3339();
+
+    let comment = format!(
+        r#"🤖 **Minion {} claimed this issue**
+
+---
+event: minion:claim
+minion_id: {}
+branch: {}
+timestamp: {}
+---
+
+Starting work on this issue. I'll create a branch and begin implementation.
+
+Workspace: `{}`
+"#,
+        minion_id, minion_id, branch, timestamp, workspace_path
+    );
+
+    let output = Command::new("gh")
+        .args([
+            "issue",
+            "comment",
+            issue_num,
+            "--repo",
+            &format!("{}/{}", owner, repo),
+            "--body",
+            &comment,
+        ])
+        .output()
+        .context("Failed to execute gh command")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("Failed to post claim comment: {}", stderr);
+    }
+
+    Ok(())
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    // Octocrab API Client Tests
     #[test]
     fn test_new_without_token() {
         // Save original token if present
@@ -231,5 +365,51 @@ mod tests {
             .remove_label(owner, repo, issue, label)
             .await
             .expect("Failed to remove label");
+    }
+
+    // gh CLI Helper Function Tests
+    #[test]
+    fn test_has_in_progress_label_when_present() {
+        let issue = Issue {
+            number: 123,
+            title: "Test Issue".to_string(),
+            body: Some("Test body".to_string()),
+            labels: vec![
+                Label {
+                    name: "bug".to_string(),
+                },
+                Label {
+                    name: "in-progress".to_string(),
+                },
+            ],
+        };
+
+        assert!(has_in_progress_label(&issue));
+    }
+
+    #[test]
+    fn test_has_in_progress_label_when_absent() {
+        let issue = Issue {
+            number: 123,
+            title: "Test Issue".to_string(),
+            body: Some("Test body".to_string()),
+            labels: vec![Label {
+                name: "bug".to_string(),
+            }],
+        };
+
+        assert!(!has_in_progress_label(&issue));
+    }
+
+    #[test]
+    fn test_has_in_progress_label_empty_labels() {
+        let issue = Issue {
+            number: 123,
+            title: "Test Issue".to_string(),
+            body: Some("Test body".to_string()),
+            labels: vec![],
+        };
+
+        assert!(!has_in_progress_label(&issue));
     }
 }

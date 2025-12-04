@@ -213,7 +213,8 @@ async fn handle_fix(issue: &str, quiet: bool) -> Result<i32> {
     println!("📋 Generated Minion ID: {}", minion_id);
 
     // Check if we have full repo information for workspace creation
-    let worktree_path_opt = if let (Some(owner), Some(repo)) = (owner_opt, repo_opt) {
+    let worktree_path_opt = if let (Some(owner), Some(repo)) = (owner_opt.clone(), repo_opt.clone())
+    {
         // Full URL provided - create workspace and launch Claude
         println!(
             "🚀 Setting up workspace for {}/{}#{}",
@@ -234,6 +235,28 @@ async fn handle_fix(issue: &str, quiet: bool) -> Result<i32> {
             .ensure_bare_clone()
             .context("Failed to clone or update repository")?;
 
+        // Fetch issue details to check if already claimed
+        println!("🔍 Fetching issue details...");
+        let issue_data = github::fetch_issue(&owner, &repo, &issue_num)
+            .await
+            .context("Failed to fetch issue details")?;
+
+        // Check if issue already has in-progress label
+        if github::has_in_progress_label(&issue_data) {
+            println!(
+                "⚠️  Warning: Issue #{} already has 'in-progress' label",
+                issue_num
+            );
+            println!("   This issue may already be claimed by another Minion.");
+            println!("   Do you want to continue? (Press Ctrl+C to cancel or Enter to continue)");
+
+            // Wait for user confirmation
+            let mut input = String::new();
+            std::io::stdin()
+                .read_line(&mut input)
+                .context("Failed to read user input")?;
+        }
+
         // Create worktree path
         let repo_name = format!("{}/{}", owner, repo);
         let worktree_path = workspace
@@ -249,6 +272,26 @@ async fn handle_fix(issue: &str, quiet: bool) -> Result<i32> {
             .context("Failed to create worktree")?;
 
         println!("📂 Workspace created at: {}", worktree_path.display());
+
+        // Add in-progress label to the issue
+        println!("🏷️  Adding 'in-progress' label...");
+        github::add_in_progress_label(&owner, &repo, &issue_num)
+            .await
+            .context("Failed to add in-progress label")?;
+
+        // Post claim comment
+        println!("💬 Posting claim comment...");
+        github::post_claim_comment(
+            &owner,
+            &repo,
+            &issue_num,
+            &minion_id,
+            &branch_name,
+            &worktree_path.to_string_lossy(),
+        )
+        .await
+        .context("Failed to post claim comment")?;
+
         println!("🤖 Launching Claude...\n");
 
         Some(worktree_path)
