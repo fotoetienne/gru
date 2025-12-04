@@ -394,11 +394,11 @@ async fn handle_path(
         .count();
 
     if options_count == 0 {
-        anyhow::bail!("Error: Must provide either a minion ID, --issue, or --pr");
+        anyhow::bail!("Must provide either a minion ID, --issue, or --pr");
     }
 
     if options_count > 1 {
-        anyhow::bail!("Error: Can only specify one of: minion ID, --issue, or --pr");
+        anyhow::bail!("Can only specify one of: minion ID, --issue, or --pr");
     }
 
     // Resolve to a Minion ID
@@ -514,7 +514,7 @@ async fn resolve_minion_from_issue(issue_num: u64) -> Result<String> {
     }
 
     anyhow::bail!(
-        "Error: No active Minion found for issue #{}. Issue may not be in progress.",
+        "No active Minion found for issue #{}. Issue may not be in progress.",
         issue_num
     );
 }
