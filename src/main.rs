@@ -1,4 +1,5 @@
 mod git;
+mod github;
 mod logger;
 mod minion;
 mod progress;
