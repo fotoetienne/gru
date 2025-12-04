@@ -387,18 +387,10 @@ async fn handle_path(
     issue: Option<u64>,
     pr: Option<u64>,
 ) -> Result<i32> {
-    // Validate that exactly one option is provided
-    let options_count = [minion_id.is_some(), issue.is_some(), pr.is_some()]
-        .iter()
-        .filter(|&&x| x)
-        .count();
-
-    if options_count == 0 {
+    // Validate that at least one option is provided
+    // Note: clap's conflicts_with_all ensures mutual exclusion (at most one)
+    if minion_id.is_none() && issue.is_none() && pr.is_none() {
         anyhow::bail!("Must provide either a minion ID, --issue, or --pr");
-    }
-
-    if options_count > 1 {
-        anyhow::bail!("Can only specify one of: minion ID, --issue, or --pr");
     }
 
     // Resolve to a Minion ID
@@ -408,11 +400,9 @@ async fn handle_path(
     } else if let Some(issue_num) = issue {
         // Resolve from issue number via GitHub API
         resolve_minion_from_issue(issue_num).await?
-    } else if let Some(pr_num) = pr {
-        // Resolve from PR number via GitHub API
-        resolve_minion_from_pr(pr_num).await?
     } else {
-        unreachable!("Validation should ensure at least one option is provided");
+        // Must be PR number (validated above that at least one is present)
+        resolve_minion_from_pr(pr.unwrap()).await?
     };
 
     // Construct the worktree path
