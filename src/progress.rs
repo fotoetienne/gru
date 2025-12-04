@@ -126,11 +126,11 @@ impl ProgressDisplay {
 
     /// Truncate a string to a maximum number of characters (not bytes)
     fn truncate_string(s: &str, max_chars: usize) -> String {
-        // If the character at position max_chars exists, string is longer than max_chars
-        if s.chars().nth(max_chars).is_some() {
+        // Collect up to max_chars + 1 characters to determine if truncation is needed
+        let chars: Vec<char> = s.chars().take(max_chars + 1).collect();
+        if chars.len() > max_chars {
             // String is too long, truncate it
-            let chars: Vec<char> = s.chars().take(max_chars).collect();
-            format!("{}...", chars.iter().collect::<String>())
+            format!("{}...", chars[..max_chars].iter().collect::<String>())
         } else {
             // String is max_chars or shorter, return as-is
             s.to_string()
