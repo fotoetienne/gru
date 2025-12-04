@@ -239,9 +239,15 @@ async fn handle_fix(issue: &str, quiet: bool) -> Result<i32> {
     };
     let progress = ProgressDisplay::new(config);
 
-    // Build the command
+    // Build the command with flags for non-interactive stream-json output
     let mut cmd = Command::new("claude");
-    cmd.arg(format!("/fix {}", issue_num))
+    cmd.arg("--print")
+        .arg("--verbose")
+        .arg("--output-format")
+        .arg("stream-json")
+        .arg("--include-partial-messages")
+        .arg("--dangerously-skip-permissions")
+        .arg(format!("/fix {}", issue_num))
         .stdin(std::process::Stdio::inherit())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::inherit());
