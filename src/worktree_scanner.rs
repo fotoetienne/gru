@@ -275,9 +275,22 @@ fn find_bare_repos(dir: &Path) -> Result<Vec<PathBuf>> {
                 continue;
             }
 
-            // Check if this looks like a bare repo (ends with .git or contains objects/refs)
-            let is_bare = path.extension().and_then(|e| e.to_str()) == Some("git")
-                || (path.join("objects").exists() && path.join("refs").exists());
+            // Check if this is a bare repo using git rev-parse
+            let is_bare = match Command::new("git")
+                .args([
+                    "-C",
+                    &path.to_string_lossy(),
+                    "rev-parse",
+                    "--is-bare-repository",
+                ])
+                .output()
+            {
+                Ok(output) => {
+                    output.status.success()
+                        && String::from_utf8_lossy(&output.stdout).trim() == "true"
+                }
+                Err(_) => false,
+            };
 
             if is_bare {
                 bare_repos.push(path);
