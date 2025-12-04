@@ -145,17 +145,38 @@ impl Worktree {
         // Check in order of priority
 
         // 1. Check if merged
-        if self.check_merged(base_branch).unwrap_or(false) {
+        if self
+            .check_merged(base_branch)
+            .map_err(|e| {
+                eprintln!("Warning: Failed to check if branch is merged: {}", e);
+                e
+            })
+            .unwrap_or(false)
+        {
             return Ok(WorktreeStatus::Merged);
         }
 
         // 2. Check if issue is closed
-        if let Some(true) = self.check_issue_closed().unwrap_or(None) {
+        if let Some(true) = self
+            .check_issue_closed()
+            .map_err(|e| {
+                eprintln!("Warning: Failed to check issue status: {}", e);
+                e
+            })
+            .unwrap_or(None)
+        {
             return Ok(WorktreeStatus::IssueClosed);
         }
 
         // 3. Check if remote branch is deleted
-        if self.check_remote_deleted().unwrap_or(false) {
+        if self
+            .check_remote_deleted()
+            .map_err(|e| {
+                eprintln!("Warning: Failed to check remote status: {}", e);
+                e
+            })
+            .unwrap_or(false)
+        {
             return Ok(WorktreeStatus::RemoteDeleted);
         }
 
