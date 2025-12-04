@@ -257,6 +257,13 @@ async fn handle_fix(issue: &str, quiet: bool) -> Result<i32> {
                 .context("Failed to read user input")?;
         }
 
+        // Add in-progress label immediately to minimize race condition window
+        // This must happen before the expensive worktree creation
+        println!("🏷️  Adding 'in-progress' label...");
+        github::add_in_progress_label(&owner, &repo, &issue_num)
+            .await
+            .context("Failed to add in-progress label")?;
+
         // Create worktree path
         let repo_name = format!("{}/{}", owner, repo);
         let worktree_path = workspace
@@ -273,15 +280,9 @@ async fn handle_fix(issue: &str, quiet: bool) -> Result<i32> {
 
         println!("📂 Workspace created at: {}", worktree_path.display());
 
-        // Add in-progress label to the issue
-        println!("🏷️  Adding 'in-progress' label...");
-        github::add_in_progress_label(&owner, &repo, &issue_num)
-            .await
-            .context("Failed to add in-progress label")?;
-
-        // Post claim comment
+        // Post claim comment (non-critical, so we can tolerate failure here)
         println!("💬 Posting claim comment...");
-        github::post_claim_comment(
+        if let Err(e) = github::post_claim_comment(
             &owner,
             &repo,
             &issue_num,
@@ -290,7 +291,10 @@ async fn handle_fix(issue: &str, quiet: bool) -> Result<i32> {
             &worktree_path.to_string_lossy(),
         )
         .await
-        .context("Failed to post claim comment")?;
+        {
+            eprintln!("⚠️  Warning: Failed to post claim comment: {}", e);
+            eprintln!("   Continuing with the fix anyway...");
+        }
 
         println!("🤖 Launching Claude...\n");
 

@@ -3,7 +3,7 @@ use chrono::Utc;
 use octocrab::{models, Octocrab};
 use serde::{Deserialize, Serialize};
 use std::env;
-use std::process::Command;
+use tokio::process::Command;
 
 // ============================================================================
 // Octocrab API Client
@@ -153,8 +153,46 @@ pub struct Label {
     pub name: String,
 }
 
+/// Validates that owner/repo names are safe to use in commands
+fn validate_github_identifier(s: &str, field_name: &str) -> Result<()> {
+    if s.is_empty() {
+        anyhow::bail!("{} cannot be empty", field_name);
+    }
+
+    // GitHub usernames and repo names can only contain alphanumeric, hyphens, underscores, and dots
+    if !s
+        .chars()
+        .all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '.')
+    {
+        anyhow::bail!(
+            "{} contains invalid characters (only alphanumeric, hyphens, underscores, and dots allowed)",
+            field_name
+        );
+    }
+
+    Ok(())
+}
+
+/// Validates that an issue number is numeric only
+fn validate_issue_number(issue_num: &str) -> Result<()> {
+    if issue_num.is_empty() {
+        anyhow::bail!("Issue number cannot be empty");
+    }
+
+    if !issue_num.chars().all(|c| c.is_ascii_digit()) {
+        anyhow::bail!("Issue number must contain only digits");
+    }
+
+    Ok(())
+}
+
 /// Fetches issue details from GitHub using the gh CLI
 pub async fn fetch_issue(owner: &str, repo: &str, issue_num: &str) -> Result<Issue> {
+    // Validate inputs to prevent command injection
+    validate_github_identifier(owner, "owner")?;
+    validate_github_identifier(repo, "repo")?;
+    validate_issue_number(issue_num)?;
+
     let output = Command::new("gh")
         .args([
             "issue",
@@ -166,11 +204,37 @@ pub async fn fetch_issue(owner: &str, repo: &str, issue_num: &str) -> Result<Iss
             "number,title,body,labels",
         ])
         .output()
+        .await
         .context("Failed to execute gh command")?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("Failed to fetch issue: {}", stderr);
+
+        // Parse common error scenarios for better user guidance
+        if stderr.contains("not found") || stderr.contains("404") {
+            anyhow::bail!(
+                "Issue #{} not found in {}/{}. Please verify the issue number and repository.",
+                issue_num,
+                owner,
+                repo
+            );
+        } else if stderr.contains("authentication")
+            || stderr.contains("401")
+            || stderr.contains("403")
+        {
+            anyhow::bail!(
+                "GitHub authentication failed. Please run 'gh auth login' or set GRU_GITHUB_TOKEN.\nError: {}",
+                stderr
+            );
+        } else {
+            anyhow::bail!(
+                "Failed to fetch issue #{} from {}/{}: {}",
+                issue_num,
+                owner,
+                repo,
+                stderr
+            );
+        }
     }
 
     let issue: Issue = serde_json::from_slice(&output.stdout)
@@ -186,6 +250,11 @@ pub fn has_in_progress_label(issue: &Issue) -> bool {
 
 /// Adds the "in-progress" label to an issue
 pub async fn add_in_progress_label(owner: &str, repo: &str, issue_num: &str) -> Result<()> {
+    // Validate inputs to prevent command injection
+    validate_github_identifier(owner, "owner")?;
+    validate_github_identifier(repo, "repo")?;
+    validate_issue_number(issue_num)?;
+
     let output = Command::new("gh")
         .args([
             "issue",
@@ -197,11 +266,27 @@ pub async fn add_in_progress_label(owner: &str, repo: &str, issue_num: &str) -> 
             "in-progress",
         ])
         .output()
+        .await
         .context("Failed to execute gh command")?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("Failed to add in-progress label: {}", stderr);
+
+        // Parse common error scenarios for better user guidance
+        if stderr.contains("authentication") || stderr.contains("401") || stderr.contains("403") {
+            anyhow::bail!(
+                "GitHub authentication failed. Please run 'gh auth login' or set GRU_GITHUB_TOKEN.\nError: {}",
+                stderr
+            );
+        } else {
+            anyhow::bail!(
+                "Failed to add in-progress label to issue #{} in {}/{}: {}",
+                issue_num,
+                owner,
+                repo,
+                stderr
+            );
+        }
     }
 
     Ok(())
@@ -216,6 +301,11 @@ pub async fn post_claim_comment(
     branch: &str,
     workspace_path: &str,
 ) -> Result<()> {
+    // Validate inputs to prevent command injection
+    validate_github_identifier(owner, "owner")?;
+    validate_github_identifier(repo, "repo")?;
+    validate_issue_number(issue_num)?;
+
     let timestamp = Utc::now().to_rfc3339();
 
     let comment = format!(
@@ -246,11 +336,27 @@ Workspace: `{}`
             &comment,
         ])
         .output()
+        .await
         .context("Failed to execute gh command")?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("Failed to post claim comment: {}", stderr);
+
+        // Parse common error scenarios for better user guidance
+        if stderr.contains("authentication") || stderr.contains("401") || stderr.contains("403") {
+            anyhow::bail!(
+                "GitHub authentication failed. Please run 'gh auth login' or set GRU_GITHUB_TOKEN.\nError: {}",
+                stderr
+            );
+        } else {
+            anyhow::bail!(
+                "Failed to post claim comment on issue #{} in {}/{}: {}",
+                issue_num,
+                owner,
+                repo,
+                stderr
+            );
+        }
     }
 
     Ok(())
@@ -411,5 +517,41 @@ mod tests {
         };
 
         assert!(!has_in_progress_label(&issue));
+    }
+
+    #[test]
+    fn test_validate_github_identifier_accepts_valid_names() {
+        assert!(validate_github_identifier("fotoetienne", "owner").is_ok());
+        assert!(validate_github_identifier("gru", "repo").is_ok());
+        assert!(validate_github_identifier("my-repo", "repo").is_ok());
+        assert!(validate_github_identifier("my_repo", "repo").is_ok());
+        assert!(validate_github_identifier("repo.name", "repo").is_ok());
+        assert!(validate_github_identifier("user-123", "owner").is_ok());
+    }
+
+    #[test]
+    fn test_validate_github_identifier_rejects_invalid_names() {
+        assert!(validate_github_identifier("", "owner").is_err());
+        assert!(validate_github_identifier("evil; rm -rf /", "owner").is_err());
+        assert!(validate_github_identifier("repo name", "repo").is_err());
+        assert!(validate_github_identifier("repo|name", "repo").is_err());
+        assert!(validate_github_identifier("repo&name", "repo").is_err());
+        assert!(validate_github_identifier("repo$name", "repo").is_err());
+    }
+
+    #[test]
+    fn test_validate_issue_number_accepts_valid_numbers() {
+        assert!(validate_issue_number("1").is_ok());
+        assert!(validate_issue_number("42").is_ok());
+        assert!(validate_issue_number("123456").is_ok());
+    }
+
+    #[test]
+    fn test_validate_issue_number_rejects_invalid_numbers() {
+        assert!(validate_issue_number("").is_err());
+        assert!(validate_issue_number("not-a-number").is_err());
+        assert!(validate_issue_number("123; rm -rf /").is_err());
+        assert!(validate_issue_number("-42").is_err());
+        assert!(validate_issue_number("12.34").is_err());
     }
 }
