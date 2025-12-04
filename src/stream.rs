@@ -4,31 +4,63 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{ChildStderr, ChildStdout};
 
 /// Represents the different types of events that can be emitted by Claude Code
+/// in stream-json mode. These follow the Anthropic Messages API streaming format.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type")]
 pub enum ClaudeEvent {
-    #[serde(rename = "thinking")]
-    Thinking { content: String },
-
-    #[serde(rename = "tool_use")]
-    ToolUse {
-        name: String,
-        /// The `#[serde(default)]` attribute allows deserialization to succeed
-        /// even when the `input` field is missing from the JSON. This is required
-        /// because some tool_use events may not include input parameters.
-        /// Removing this attribute will cause deserialization failures for such events.
+    /// Start of a new message
+    #[serde(rename = "message_start")]
+    MessageStart {
         #[serde(default)]
-        input: serde_json::Value,
+        message: serde_json::Value,
     },
 
-    #[serde(rename = "message")]
-    Message { content: String },
+    /// Start of a content block (text or tool_use)
+    #[serde(rename = "content_block_start")]
+    ContentBlockStart {
+        #[serde(default)]
+        index: usize,
+        #[serde(default)]
+        content_block: serde_json::Value,
+    },
 
-    #[serde(rename = "complete")]
-    Complete,
+    /// Delta/update to a content block
+    #[serde(rename = "content_block_delta")]
+    ContentBlockDelta {
+        #[serde(default)]
+        index: usize,
+        #[serde(default)]
+        delta: serde_json::Value,
+    },
 
+    /// End of a content block
+    #[serde(rename = "content_block_stop")]
+    ContentBlockStop {
+        #[serde(default)]
+        index: usize,
+    },
+
+    /// Delta/update to the message (e.g., stop_reason)
+    #[serde(rename = "message_delta")]
+    MessageDelta {
+        #[serde(default)]
+        delta: serde_json::Value,
+    },
+
+    /// End of the message stream
+    #[serde(rename = "message_stop")]
+    MessageStop,
+
+    /// Error event
     #[serde(rename = "error")]
-    Error { message: String },
+    Error {
+        #[serde(default)]
+        error: serde_json::Value,
+    },
+
+    /// Ping event (keepalive)
+    #[serde(rename = "ping")]
+    Ping,
 }
 
 /// Represents the output from parsing a stream line
@@ -90,10 +122,20 @@ impl<R: tokio::io::AsyncRead + Unpin> EventStream<R> {
         }
 
         // Try to parse as JSON event
-        match serde_json::from_str::<ClaudeEvent>(trimmed) {
-            Ok(event) => Ok(Some(StreamOutput::Event(event))),
-            Err(_) => Ok(Some(StreamOutput::RawLine(line))),
+        // First check if it's a stream_event wrapper from Claude Code
+        if let Ok(wrapper) = serde_json::from_str::<serde_json::Value>(trimmed) {
+            if wrapper.get("type").and_then(|t| t.as_str()) == Some("stream_event") {
+                // Extract the inner event and try to parse it
+                if let Some(event_value) = wrapper.get("event") {
+                    if let Ok(event) = serde_json::from_value::<ClaudeEvent>(event_value.clone()) {
+                        return Ok(Some(StreamOutput::Event(event)));
+                    }
+                }
+            }
         }
+
+        // Not a stream_event, treat as raw line
+        Ok(Some(StreamOutput::RawLine(line)))
     }
 
     /// Read all lines from the stream
@@ -112,65 +154,102 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn test_parse_thinking_event() {
-        let json = r#"{"type":"thinking","content":"Analyzing the codebase..."}"#;
+    async fn test_parse_message_start_event() {
+        let json = r#"{"type":"message_start","message":{"id":"msg_123","role":"assistant"}}"#;
+        let event: ClaudeEvent = serde_json::from_str(json).unwrap();
+        assert!(matches!(event, ClaudeEvent::MessageStart { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_parse_content_block_start_event() {
+        let json = r#"{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","name":"Bash"}}"#;
         let event: ClaudeEvent = serde_json::from_str(json).unwrap();
         match event {
-            ClaudeEvent::Thinking { content } => {
-                assert_eq!(content, "Analyzing the codebase...");
+            ClaudeEvent::ContentBlockStart {
+                index,
+                content_block,
+            } => {
+                assert_eq!(index, 0);
+                assert_eq!(
+                    content_block.get("type").and_then(|t| t.as_str()),
+                    Some("tool_use")
+                );
+                assert_eq!(
+                    content_block.get("name").and_then(|n| n.as_str()),
+                    Some("Bash")
+                );
             }
-            _ => panic!("Expected Thinking event"),
+            _ => panic!("Expected ContentBlockStart event"),
         }
     }
 
     #[tokio::test]
-    async fn test_parse_tool_use_event() {
-        let json = r#"{"type":"tool_use","name":"bash","input":{"command":"ls"}}"#;
+    async fn test_parse_content_block_delta_event() {
+        let json = r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hello"}}"#;
         let event: ClaudeEvent = serde_json::from_str(json).unwrap();
         match event {
-            ClaudeEvent::ToolUse { name, input } => {
-                assert_eq!(name, "bash");
-                assert_eq!(input["command"], "ls");
+            ClaudeEvent::ContentBlockDelta { index, delta } => {
+                assert_eq!(index, 0);
+                assert_eq!(
+                    delta.get("type").and_then(|t| t.as_str()),
+                    Some("text_delta")
+                );
+                assert_eq!(delta.get("text").and_then(|t| t.as_str()), Some("Hello"));
             }
-            _ => panic!("Expected ToolUse event"),
+            _ => panic!("Expected ContentBlockDelta event"),
         }
     }
 
     #[tokio::test]
-    async fn test_parse_message_event() {
-        let json = r#"{"type":"message","content":"Task completed"}"#;
+    async fn test_parse_message_delta_event() {
+        let json = r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"}}"#;
         let event: ClaudeEvent = serde_json::from_str(json).unwrap();
         match event {
-            ClaudeEvent::Message { content } => {
-                assert_eq!(content, "Task completed");
+            ClaudeEvent::MessageDelta { delta } => {
+                assert_eq!(
+                    delta.get("stop_reason").and_then(|r| r.as_str()),
+                    Some("end_turn")
+                );
             }
-            _ => panic!("Expected Message event"),
+            _ => panic!("Expected MessageDelta event"),
         }
     }
 
     #[tokio::test]
-    async fn test_parse_complete_event() {
-        let json = r#"{"type":"complete"}"#;
+    async fn test_parse_message_stop_event() {
+        let json = r#"{"type":"message_stop"}"#;
         let event: ClaudeEvent = serde_json::from_str(json).unwrap();
-        assert!(matches!(event, ClaudeEvent::Complete));
+        assert!(matches!(event, ClaudeEvent::MessageStop));
     }
 
     #[tokio::test]
     async fn test_parse_error_event() {
-        let json = r#"{"type":"error","message":"Something went wrong"}"#;
+        let json =
+            r#"{"type":"error","error":{"type":"api_error","message":"Something went wrong"}}"#;
         let event: ClaudeEvent = serde_json::from_str(json).unwrap();
         match event {
-            ClaudeEvent::Error { message } => {
-                assert_eq!(message, "Something went wrong");
+            ClaudeEvent::Error { error } => {
+                assert_eq!(
+                    error.get("message").and_then(|m| m.as_str()),
+                    Some("Something went wrong")
+                );
             }
             _ => panic!("Expected Error event"),
         }
     }
 
     #[tokio::test]
+    async fn test_parse_ping_event() {
+        let json = r#"{"type":"ping"}"#;
+        let event: ClaudeEvent = serde_json::from_str(json).unwrap();
+        assert!(matches!(event, ClaudeEvent::Ping));
+    }
+
+    #[tokio::test]
     async fn test_stream_reader_with_json() {
-        let input = r#"{"type":"thinking","content":"test"}
-{"type":"complete"}
+        // Using Claude Code wrapper format
+        let input = r#"{"type":"stream_event","event":{"type":"message_start","message":{}}}
+{"type":"stream_event","event":{"type":"message_stop"}}
 "#;
         let mut stream = EventStream::new(input.as_bytes());
 
@@ -178,22 +257,20 @@ mod tests {
         assert_eq!(outputs.len(), 2);
 
         match &outputs[0] {
-            StreamOutput::Event(ClaudeEvent::Thinking { content }) => {
-                assert_eq!(content, "test");
-            }
-            _ => panic!("Expected Thinking event"),
+            StreamOutput::Event(ClaudeEvent::MessageStart { .. }) => {}
+            _ => panic!("Expected MessageStart event"),
         }
 
         match &outputs[1] {
-            StreamOutput::Event(ClaudeEvent::Complete) => {}
-            _ => panic!("Expected Complete event"),
+            StreamOutput::Event(ClaudeEvent::MessageStop) => {}
+            _ => panic!("Expected MessageStop event"),
         }
     }
 
     #[tokio::test]
     async fn test_stream_reader_with_mixed_content() {
-        let input =
-            "Regular output line\n{\"type\":\"thinking\",\"content\":\"test\"}\nAnother line\n";
+        // Using Claude Code wrapper format
+        let input = "Regular output line\n{\"type\":\"stream_event\",\"event\":{\"type\":\"message_start\",\"message\":{}}}\nAnother line\n";
         let mut stream = EventStream::new(input.as_bytes());
 
         let outputs = stream.read_all().await.unwrap();
@@ -219,11 +296,40 @@ mod tests {
 
     #[tokio::test]
     async fn test_stream_reader_with_empty_lines() {
-        let input = "\n\n{\"type\":\"complete\"}\n\n";
+        let input = "\n\n{\"type\":\"message_stop\"}\n\n";
         let mut stream = EventStream::new(input.as_bytes());
 
         let outputs = stream.read_all().await.unwrap();
         // Empty lines are preserved as RawLine
         assert_eq!(outputs.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn test_stream_reader_with_claude_code_wrapper() {
+        // Test the actual Claude Code stream_event wrapper format
+        let input = r#"{"type":"stream_event","event":{"type":"message_start","message":{}},"session_id":"test","uuid":"test"}
+{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hello"}},"session_id":"test","uuid":"test"}
+{"type":"stream_event","event":{"type":"message_stop"},"session_id":"test","uuid":"test"}
+"#;
+        let mut stream = EventStream::new(input.as_bytes());
+
+        let outputs = stream.read_all().await.unwrap();
+        assert_eq!(outputs.len(), 3);
+
+        // All should be parsed as events, not raw lines
+        match &outputs[0] {
+            StreamOutput::Event(ClaudeEvent::MessageStart { .. }) => {}
+            _ => panic!("Expected MessageStart event"),
+        }
+
+        match &outputs[1] {
+            StreamOutput::Event(ClaudeEvent::ContentBlockDelta { .. }) => {}
+            _ => panic!("Expected ContentBlockDelta event"),
+        }
+
+        match &outputs[2] {
+            StreamOutput::Event(ClaudeEvent::MessageStop) => {}
+            _ => panic!("Expected MessageStop event"),
+        }
     }
 }
