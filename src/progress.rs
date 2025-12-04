@@ -125,15 +125,16 @@ impl ProgressDisplay {
     }
 
     /// Truncate a string to a maximum number of characters (not bytes)
-    /// Uses true single-pass iteration by collecting max_chars + 1 characters at once
     fn truncate_string(s: &str, max_chars: usize) -> String {
-        // Fast path: if string has max_chars or fewer characters, return as is
+        // If the character at position max_chars exists, string is longer than max_chars
         if s.chars().nth(max_chars).is_some() {
-            return s.to_string();
+            // String is too long, truncate it
+            let chars: Vec<char> = s.chars().take(max_chars).collect();
+            format!("{}...", chars.iter().collect::<String>())
+        } else {
+            // String is max_chars or shorter, return as-is
+            s.to_string()
         }
-        // Otherwise, collect up to max_chars characters and add ellipsis
-        let chars: Vec<char> = s.chars().take(max_chars).collect();
-        format!("{}...", chars.iter().collect::<String>())
     }
 
     /// Handle a parsed Claude event
@@ -206,7 +207,7 @@ impl ProgressDisplay {
                 eprintln!("Error: {}", error_msg);
             }
             ClaudeEvent::Ping => {
-                // Keepalive ping - just tick the spinner
+                // Keepalive ping - no action needed, spinner ticks below
             }
         }
 
