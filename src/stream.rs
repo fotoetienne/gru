@@ -127,7 +127,8 @@ impl<R: tokio::io::AsyncRead + Unpin> EventStream<R> {
             if wrapper.get("type").and_then(|t| t.as_str()) == Some("stream_event") {
                 // Extract the inner event and try to parse it
                 if let Some(event_value) = wrapper.get("event") {
-                    if let Ok(event) = serde_json::from_value::<ClaudeEvent>(event_value.to_owned()) {
+                    if let Ok(event) = serde_json::from_value::<ClaudeEvent>(event_value.to_owned())
+                    {
                         return Ok(Some(StreamOutput::Event(event)));
                     }
                 }
