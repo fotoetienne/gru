@@ -587,7 +587,7 @@ fn handle_clean(dry_run: bool, force: bool, base_branch: &str) -> Result<i32> {
     for wt in worktrees {
         let status = wt
             .status(base_branch)
-            .context(format!("Failed to check status of {}", wt.path.display()))?;
+            .with_context(|| format!("Failed to check status of {}", wt.path.display()))?;
 
         if status != worktree_scanner::WorktreeStatus::Active {
             cleanable.push((wt, status));
