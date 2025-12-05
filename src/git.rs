@@ -191,6 +191,15 @@ impl GitRepo {
     /// Uses `git worktree list --porcelain` to get machine-readable output
     /// and parses it to find if the branch is currently checked out in any worktree.
     ///
+    /// Note: This only matches worktrees with branches checked out, not:
+    /// - Detached HEAD worktrees
+    /// - The bare repository itself
+    ///
+    /// # Arguments
+    ///
+    /// * `branch_name` - The branch name without the `refs/heads/` prefix
+    ///   (e.g., "main" or "minion/issue-64-M0u1")
+    ///
     /// # Returns
     ///
     /// - `Ok(Some(PathBuf))` if a worktree with the branch is found
@@ -200,9 +209,13 @@ impl GitRepo {
     /// # Errors
     ///
     /// Returns an error if:
+    /// - The branch name is invalid
     /// - The bare repository doesn't exist
     /// - The git worktree list command fails
     pub fn find_worktree_for_branch(&self, branch_name: &str) -> Result<Option<PathBuf>> {
+        // Validate branch name
+        validate_branch_name(branch_name)?;
+
         if !self.bare_path.exists() {
             anyhow::bail!(
                 "Bare repository does not exist at {}",
@@ -238,14 +251,21 @@ impl GitRepo {
         let mut current_worktree: Option<PathBuf> = None;
 
         for line in stdout.lines() {
+            let line = line.trim();
+
+            // Empty line indicates end of worktree entry - reset state
+            if line.is_empty() {
+                current_worktree = None;
+                continue;
+            }
+
             if line.starts_with("worktree ") {
                 current_worktree = Some(PathBuf::from(line.trim_start_matches("worktree ")));
             } else if line.starts_with("branch ") {
                 let branch_ref = line.trim_start_matches("branch ");
-                // Match both "refs/heads/branch-name" and just "branch-name"
-                if branch_ref == format!("refs/heads/{}", branch_name) || branch_ref == branch_name
-                {
-                    if let Some(worktree_path) = current_worktree {
+                // Git worktree list --porcelain outputs branches in refs/heads/ format
+                if branch_ref == format!("refs/heads/{}", branch_name) {
+                    if let Some(worktree_path) = current_worktree.take() {
                         return Ok(Some(worktree_path));
                     }
                 }
