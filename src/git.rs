@@ -2,6 +2,139 @@ use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+/// Detects if the current directory is within a git repository
+/// Returns the root path of the git repository
+pub fn detect_git_repo() -> Result<PathBuf> {
+    let output = Command::new("git")
+        .arg("rev-parse")
+        .arg("--show-toplevel")
+        .output()
+        .context("Failed to execute git rev-parse")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!(
+            "Not in a git repository. Run from within a git repository or provide the full GitHub URL.\n{}",
+            stderr.trim()
+        );
+    }
+
+    let path_str = String::from_utf8(output.stdout)
+        .context("Git output is not valid UTF-8")?
+        .trim()
+        .to_string();
+
+    Ok(PathBuf::from(path_str))
+}
+
+/// Gets the GitHub remote URL from the current git repository
+/// Tries "origin" first, then falls back to the first remote found
+pub fn get_github_remote() -> Result<String> {
+    // First try "origin"
+    let output = Command::new("git")
+        .arg("remote")
+        .arg("get-url")
+        .arg("origin")
+        .output()
+        .context("Failed to execute git remote get-url")?;
+
+    if output.status.success() {
+        let url = String::from_utf8(output.stdout)
+            .context("Git remote URL is not valid UTF-8")?
+            .trim()
+            .to_string();
+
+        if is_github_url(&url) {
+            return Ok(url);
+        }
+    }
+
+    // If "origin" doesn't exist or isn't a GitHub URL, try all remotes
+    let output = Command::new("git")
+        .arg("remote")
+        .output()
+        .context("Failed to list git remotes")?;
+
+    if !output.status.success() {
+        anyhow::bail!("Failed to list git remotes");
+    }
+
+    let remotes =
+        String::from_utf8(output.stdout).context("Git remotes output is not valid UTF-8")?;
+
+    for remote in remotes.lines() {
+        let output = Command::new("git")
+            .arg("remote")
+            .arg("get-url")
+            .arg(remote.trim())
+            .output()
+            .context("Failed to get remote URL")?;
+
+        if output.status.success() {
+            let url = String::from_utf8(output.stdout)
+                .context("Git remote URL is not valid UTF-8")?
+                .trim()
+                .to_string();
+
+            if is_github_url(&url) {
+                return Ok(url);
+            }
+        }
+    }
+
+    anyhow::bail!(
+        "No GitHub remote found. Add a GitHub remote or provide the full issue URL.\n\
+         Example: git remote add origin https://github.com/owner/repo.git"
+    );
+}
+
+/// Checks if a URL is a GitHub URL
+/// Only matches URLs that start with recognized GitHub URL patterns
+fn is_github_url(url: &str) -> bool {
+    url.starts_with("https://github.com/")
+        || url.starts_with("http://github.com/")
+        || url.starts_with("git@github.com:")
+}
+
+/// Parses a GitHub remote URL to extract owner and repo name
+/// Supports both HTTPS and SSH formats:
+/// - https://github.com/owner/repo.git
+/// - git@github.com:owner/repo.git
+pub fn parse_github_remote(url: &str) -> Result<(String, String)> {
+    if !is_github_url(url) {
+        anyhow::bail!("Not a GitHub URL: {}", url);
+    }
+
+    // Handle HTTPS format
+    if url.starts_with("https://github.com/") || url.starts_with("http://github.com/") {
+        let path = url
+            .trim_start_matches("https://github.com/")
+            .trim_start_matches("http://github.com/")
+            .trim_end_matches(".git")
+            .trim_end_matches('/');
+
+        let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+        if parts.len() >= 2 && !parts[0].is_empty() && !parts[1].is_empty() {
+            return Ok((parts[0].to_string(), parts[1].to_string()));
+        }
+    }
+
+    // Handle SSH format: git@github.com:owner/repo.git
+    if url.starts_with("git@github.com:") {
+        let path = url
+            .trim_start_matches("git@github.com:")
+            .trim_end_matches(".git")
+            .trim_end_matches('/');
+
+        let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+        if parts.len() >= 2 && !parts[0].is_empty() && !parts[1].is_empty() {
+            return Ok((parts[0].to_string(), parts[1].to_string()));
+        }
+    }
+
+    anyhow::bail!("Could not parse GitHub URL: {}", url);
+}
+
 /// Validates a branch name according to Git ref naming rules
 fn validate_branch_name(branch_name: &str) -> Result<()> {
     if branch_name.is_empty() {
@@ -227,6 +360,63 @@ impl GitRepo {
 mod tests {
     use super::*;
     use std::env;
+
+    #[test]
+    fn test_parse_github_remote_https() {
+        let result = parse_github_remote("https://github.com/owner/repo.git").unwrap();
+        assert_eq!(result.0, "owner");
+        assert_eq!(result.1, "repo");
+    }
+
+    #[test]
+    fn test_parse_github_remote_https_without_git_extension() {
+        let result = parse_github_remote("https://github.com/owner/repo").unwrap();
+        assert_eq!(result.0, "owner");
+        assert_eq!(result.1, "repo");
+    }
+
+    #[test]
+    fn test_parse_github_remote_ssh() {
+        let result = parse_github_remote("git@github.com:owner/repo.git").unwrap();
+        assert_eq!(result.0, "owner");
+        assert_eq!(result.1, "repo");
+    }
+
+    #[test]
+    fn test_parse_github_remote_ssh_without_git_extension() {
+        let result = parse_github_remote("git@github.com:owner/repo").unwrap();
+        assert_eq!(result.0, "owner");
+        assert_eq!(result.1, "repo");
+    }
+
+    #[test]
+    fn test_parse_github_remote_rejects_non_github() {
+        let result = parse_github_remote("https://gitlab.com/owner/repo.git");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Not a GitHub URL"));
+    }
+
+    #[test]
+    fn test_parse_github_remote_rejects_invalid_format() {
+        let result = parse_github_remote("https://github.com/incomplete");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_is_github_url() {
+        // Valid GitHub URLs
+        assert!(is_github_url("https://github.com/owner/repo.git"));
+        assert!(is_github_url("http://github.com/owner/repo.git"));
+        assert!(is_github_url("git@github.com:owner/repo.git"));
+
+        // Invalid - not GitHub
+        assert!(!is_github_url("https://gitlab.com/owner/repo.git"));
+
+        // Invalid - security: malicious URLs that contain "github.com" but aren't GitHub
+        assert!(!is_github_url("https://evil.com/github.com/malware.git"));
+        assert!(!is_github_url("https://github.com.attacker.com/repo.git"));
+        assert!(!is_github_url("user@attacker.com:github.com:malware.git"));
+    }
 
     #[test]
     fn test_git_repo_new() {
