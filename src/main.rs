@@ -14,6 +14,7 @@ use progress::{ProgressConfig, ProgressDisplay};
 use std::io::Write;
 use std::path::PathBuf;
 use stream::EventStream;
+use tokio::io::AsyncBufReadExt;
 use tokio::process::Command;
 use tokio::time::{timeout, Duration};
 
@@ -250,10 +251,13 @@ async fn handle_fix(issue: &str, quiet: bool) -> Result<i32> {
             println!("   This issue may already be claimed by another Minion.");
             println!("   Do you want to continue? (Press Ctrl+C to cancel or Enter to continue)");
 
-            // Wait for user confirmation
+            // Wait for user confirmation using async stdin
             let mut input = String::new();
-            std::io::stdin()
+            let stdin = tokio::io::stdin();
+            let mut reader = tokio::io::BufReader::new(stdin);
+            reader
                 .read_line(&mut input)
+                .await
                 .context("Failed to read user input")?;
         }
 
@@ -613,7 +617,7 @@ async fn resolve_minion_from_pr(pr_num: u64) -> Result<String> {
 }
 
 /// Handles the clean command to remove merged/closed worktrees
-fn handle_clean(dry_run: bool, force: bool, base_branch: &str) -> Result<i32> {
+async fn handle_clean(dry_run: bool, force: bool, base_branch: &str) -> Result<i32> {
     let ws = workspace::Workspace::new().context("Failed to initialize workspace")?;
 
     println!("Scanning for worktrees in {}...", ws.repos().display());
@@ -671,7 +675,9 @@ fn handle_clean(dry_run: bool, force: bool, base_branch: &str) -> Result<i32> {
         std::io::stdout().flush()?;
 
         let mut input = String::new();
-        std::io::stdin().read_line(&mut input)?;
+        let stdin = tokio::io::stdin();
+        let mut reader = tokio::io::BufReader::new(stdin);
+        reader.read_line(&mut input).await?;
         let input = input.trim().to_lowercase();
 
         if input != "y" && input != "yes" {
@@ -746,7 +752,7 @@ async fn main() {
             dry_run,
             force,
             base_branch,
-        } => handle_clean(dry_run, force, &base_branch),
+        } => handle_clean(dry_run, force, &base_branch).await,
     };
 
     // Handle any errors that occurred
