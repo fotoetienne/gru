@@ -1,4 +1,6 @@
-use anyhow::Result;
+use crate::git;
+use anyhow::{Context, Result};
+use tokio::process::Command;
 
 /// Validates that the issue argument is either a number or a valid GitHub URL
 pub fn validate_issue_format(issue: &str) -> Result<()> {
@@ -91,8 +93,8 @@ pub fn validate_pr_format(pr: &str) -> Result<()> {
 }
 
 /// Extracts owner, repo, and issue number from an issue argument
-/// Supports both plain issue numbers and GitHub URLs
-pub fn parse_issue_info(issue: &str) -> Result<(Option<String>, Option<String>, String)> {
+/// Supports both plain issue numbers (auto-detects from current directory) and GitHub URLs
+pub fn parse_issue_info(issue: &str) -> Result<(String, String, String)> {
     // First validate the format
     validate_issue_format(issue)?;
 
@@ -119,11 +121,120 @@ pub fn parse_issue_info(issue: &str) -> Result<(Option<String>, Option<String>, 
         let repo = parts[1].to_string();
         let issue_num = parts[3].to_string();
 
-        Ok((Some(owner), Some(repo), issue_num))
+        Ok((owner, repo, issue_num))
     } else {
-        // Plain issue number - no owner/repo info
-        Ok((None, None, issue.to_string()))
+        // Plain issue number - auto-detect repository from current directory
+        git::detect_git_repo().context("Failed to detect git repository")?;
+
+        let remote_url = git::get_github_remote().context("Failed to get GitHub remote")?;
+
+        let (owner, repo) =
+            git::parse_github_remote(&remote_url).context("Failed to parse GitHub remote URL")?;
+
+        Ok((owner, repo, issue.to_string()))
     }
+}
+
+/// Extracts owner, repo, PR number, and branch name from a PR argument
+/// Supports both plain PR numbers and GitHub URLs
+/// For plain numbers, fetches metadata from GitHub to get branch info
+pub async fn parse_pr_info(pr: &str) -> Result<(String, String, String, String)> {
+    // First validate the format
+    validate_pr_format(pr)?;
+
+    // Extract PR number
+    let pr_num = if pr.parse::<u32>().is_ok() {
+        pr.to_string()
+    } else if pr.starts_with("https://github.com/") {
+        // Strip query parameters and fragments
+        let url = pr
+            .split('?')
+            .next()
+            .unwrap()
+            .split('#')
+            .next()
+            .unwrap()
+            .trim_end_matches('/');
+
+        let parts: Vec<&str> = url
+            .strip_prefix("https://github.com/")
+            .unwrap()
+            .split('/')
+            .collect();
+
+        // parts[0] = owner, parts[1] = repo, parts[2] = "pull", parts[3] = number
+        parts[3].to_string()
+    } else {
+        anyhow::bail!("Invalid PR format");
+    };
+
+    // Fetch PR metadata from GitHub to get branch and repo info
+    let output = Command::new("gh")
+        .args([
+            "pr",
+            "view",
+            &pr_num,
+            "--json",
+            "headRefName,headRepository,headRepositoryOwner",
+        ])
+        .output()
+        .await
+        .context("Failed to execute gh pr view")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("Failed to fetch PR metadata: {}", stderr);
+    }
+
+    let json: serde_json::Value = serde_json::from_str(&String::from_utf8_lossy(&output.stdout))
+        .context("Failed to parse PR metadata JSON")?;
+
+    let branch = json["headRefName"]
+        .as_str()
+        .context("Missing branch name in PR metadata")?
+        .to_string();
+    let repo = json["headRepository"]["name"]
+        .as_str()
+        .context("Missing repo name in PR metadata")?
+        .to_string();
+    let owner = json["headRepositoryOwner"]["login"]
+        .as_str()
+        .context("Missing owner in PR metadata")?
+        .to_string();
+
+    Ok((owner, repo, pr_num, branch))
+}
+
+/// Normalizes a Minion ID by adding the 'M' prefix if missing
+/// Validates that the ID contains only alphanumeric characters to prevent path traversal
+pub fn normalize_minion_id(id: &str) -> Result<String> {
+    // Validate against path traversal and invalid characters
+    if id.contains('/') || id.contains('\\') || id.contains("..") {
+        anyhow::bail!(
+            "Invalid Minion ID '{}': contains path separators or parent directory references",
+            id
+        );
+    }
+
+    if id.contains('\0') {
+        anyhow::bail!("Invalid Minion ID '{}': contains null bytes", id);
+    }
+
+    let normalized = if id.starts_with('M') {
+        id.to_string()
+    } else {
+        format!("M{}", id)
+    };
+
+    // Additional validation: ensure only alphanumeric characters
+    if !normalized.chars().all(|c| c.is_alphanumeric()) {
+        anyhow::bail!(
+            "Invalid Minion ID '{}': must contain only alphanumeric characters",
+            id
+        );
+    }
+
+    Ok(normalized)
 }
 
 #[cfg(test)]
@@ -240,24 +351,51 @@ mod tests {
     #[test]
     fn test_parse_issue_info_with_url() {
         let result = parse_issue_info("https://github.com/fotoetienne/gru/issues/42").unwrap();
-        assert_eq!(result.0, Some("fotoetienne".to_string()));
-        assert_eq!(result.1, Some("gru".to_string()));
-        assert_eq!(result.2, "42".to_string());
-    }
-
-    #[test]
-    fn test_parse_issue_info_with_plain_number() {
-        let result = parse_issue_info("42").unwrap();
-        assert_eq!(result.0, None);
-        assert_eq!(result.1, None);
+        assert_eq!(result.0, "fotoetienne".to_string());
+        assert_eq!(result.1, "gru".to_string());
         assert_eq!(result.2, "42".to_string());
     }
 
     #[test]
     fn test_parse_issue_info_with_url_and_query_params() {
         let result = parse_issue_info("https://github.com/owner/repo/issues/123?foo=bar").unwrap();
-        assert_eq!(result.0, Some("owner".to_string()));
-        assert_eq!(result.1, Some("repo".to_string()));
+        assert_eq!(result.0, "owner".to_string());
+        assert_eq!(result.1, "repo".to_string());
         assert_eq!(result.2, "123".to_string());
+    }
+
+    #[test]
+    fn test_normalize_minion_id_with_prefix() {
+        assert_eq!(normalize_minion_id("M42").unwrap(), "M42");
+        assert_eq!(normalize_minion_id("M001").unwrap(), "M001");
+        assert_eq!(normalize_minion_id("M0ZZ").unwrap(), "M0ZZ");
+    }
+
+    #[test]
+    fn test_normalize_minion_id_without_prefix() {
+        assert_eq!(normalize_minion_id("42").unwrap(), "M42");
+        assert_eq!(normalize_minion_id("001").unwrap(), "M001");
+        assert_eq!(normalize_minion_id("0ZZ").unwrap(), "M0ZZ");
+    }
+
+    #[test]
+    fn test_normalize_minion_id_rejects_path_traversal() {
+        // Test parent directory references
+        assert!(normalize_minion_id("M../../etc").is_err());
+        assert!(normalize_minion_id("M42/../evil").is_err());
+        assert!(normalize_minion_id("../M42").is_err());
+
+        // Test path separators
+        assert!(normalize_minion_id("M/etc/passwd").is_err());
+        assert!(normalize_minion_id("M42/subdir").is_err());
+        assert!(normalize_minion_id(r"M42\subdir").is_err());
+
+        // Test null bytes
+        assert!(normalize_minion_id("M42\0").is_err());
+
+        // Test non-alphanumeric characters
+        assert!(normalize_minion_id("M42!").is_err());
+        assert!(normalize_minion_id("M42@evil").is_err());
+        assert!(normalize_minion_id("M42-test").is_err());
     }
 }

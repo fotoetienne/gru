@@ -2,6 +2,126 @@ use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+/// Detects if the current directory is within a git repository
+/// Returns the root path of the git repository
+pub fn detect_git_repo() -> Result<PathBuf> {
+    let output = Command::new("git")
+        .arg("rev-parse")
+        .arg("--show-toplevel")
+        .output()
+        .context("Failed to execute git rev-parse")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!(
+            "Not in a git repository. Run from within a git repository or provide the full GitHub URL.\n{}",
+            stderr.trim()
+        );
+    }
+
+    let path_str = String::from_utf8(output.stdout)
+        .context("Git output is not valid UTF-8")?
+        .trim()
+        .to_string();
+
+    Ok(PathBuf::from(path_str))
+}
+
+/// Gets the GitHub remote URL from the current git repository
+/// Tries "origin" first, then falls back to the first GitHub remote found
+pub fn get_github_remote() -> Result<String> {
+    // Use `git remote -v` to get all remotes and their URLs in one call
+    let output = Command::new("git")
+        .arg("remote")
+        .arg("-v")
+        .output()
+        .context("Failed to execute git remote -v")?;
+
+    if !output.status.success() {
+        anyhow::bail!("Failed to list git remotes");
+    }
+
+    let remote_lines =
+        String::from_utf8(output.stdout).context("Git remote -v output is not valid UTF-8")?;
+
+    // Parse remotes, prioritizing "origin"
+    let mut origin_url: Option<String> = None;
+    let mut first_github_url: Option<String> = None;
+
+    // Each line format: <name> <url> (fetch|push)
+    for line in remote_lines.lines() {
+        let mut parts = line.split_whitespace();
+        let remote_name = parts.next();
+        let remote_url = parts.next();
+
+        if let (Some(name), Some(url)) = (remote_name, remote_url) {
+            if is_github_url(url) {
+                // Prioritize "origin" remote
+                if name == "origin" && origin_url.is_none() {
+                    origin_url = Some(url.to_string());
+                } else if first_github_url.is_none() {
+                    first_github_url = Some(url.to_string());
+                }
+            }
+        }
+    }
+
+    // Return origin if found, otherwise return first GitHub remote
+    origin_url.or(first_github_url).ok_or_else(|| {
+        anyhow::anyhow!(
+            "No GitHub remote found. Add a GitHub remote or provide the full issue URL.\n\
+                 Example: git remote add origin https://github.com/owner/repo.git"
+        )
+    })
+}
+
+/// Checks if a URL is a GitHub URL
+/// Only matches URLs that start with recognized GitHub URL patterns
+fn is_github_url(url: &str) -> bool {
+    url.starts_with("https://github.com/")
+        || url.starts_with("http://github.com/")
+        || url.starts_with("git@github.com:")
+}
+
+/// Parses a GitHub remote URL to extract owner and repo name
+/// Supports both HTTPS and SSH formats:
+/// - https://github.com/owner/repo.git
+/// - git@github.com:owner/repo.git
+pub fn parse_github_remote(url: &str) -> Result<(String, String)> {
+    if !is_github_url(url) {
+        anyhow::bail!("Not a GitHub URL: {}", url);
+    }
+
+    // Handle HTTPS format
+    if url.starts_with("https://github.com/") || url.starts_with("http://github.com/") {
+        let path = url
+            .trim_start_matches("https://github.com/")
+            .trim_start_matches("http://github.com/")
+            .trim_end_matches(".git")
+            .trim_end_matches('/');
+
+        let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+        if parts.len() >= 2 && !parts[0].is_empty() && !parts[1].is_empty() {
+            return Ok((parts[0].to_string(), parts[1].to_string()));
+        }
+    }
+
+    // Handle SSH format: git@github.com:owner/repo.git
+    if url.starts_with("git@github.com:") {
+        let path = url
+            .trim_start_matches("git@github.com:")
+            .trim_end_matches(".git")
+            .trim_end_matches('/');
+
+        let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+        if parts.len() >= 2 && !parts[0].is_empty() && !parts[1].is_empty() {
+            return Ok((parts[0].to_string(), parts[1].to_string()));
+        }
+    }
+
+    anyhow::bail!("Could not parse GitHub URL: {}", url);
+}
+
 /// Validates a branch name according to Git ref naming rules
 fn validate_branch_name(branch_name: &str) -> Result<()> {
     if branch_name.is_empty() {
@@ -129,12 +249,16 @@ impl GitRepo {
     /// Creates a new worktree from the bare repository
     /// The worktree will have a new branch checked out
     ///
+    /// If the branch already exists (from a previous minion), it will check it out.
+    /// If git reports that the worktree is already checked out elsewhere, this will fail
+    /// with an error (respecting git's internal locking).
+    ///
     /// # Errors
     ///
     /// Returns an error if:
     /// - The bare repository doesn't exist
-    /// - The branch name is invalid or already exists
-    /// - The worktree path already exists
+    /// - The branch name is invalid
+    /// - The branch is already checked out in another worktree
     /// - Git worktree creation fails
     pub fn create_worktree(&self, branch_name: &str, worktree_path: &Path) -> Result<()> {
         // Validate branch name
@@ -148,10 +272,89 @@ impl GitRepo {
             );
         }
 
-        // Check if worktree path already exists
+        // Check if the branch already exists
+        let branch_check = Command::new("git")
+            .arg("-C")
+            .arg(&self.bare_path)
+            .arg("show-ref")
+            .arg("--verify")
+            .arg(format!("refs/heads/{}", branch_name))
+            .output()
+            .context("Failed to check if branch exists")?;
+
+        let branch_exists = branch_check.status.success();
+
+        // Create or checkout the worktree
+        // Let git handle directory creation and locking
+        let mut cmd = Command::new("git");
+        cmd.arg("-C")
+            .arg(&self.bare_path)
+            .arg("worktree")
+            .arg("add")
+            .arg(worktree_path);
+
+        if branch_exists {
+            // Branch exists, just check it out
+            cmd.arg(branch_name);
+        } else {
+            // Branch doesn't exist, create it
+            cmd.arg("-b").arg(branch_name);
+        }
+
+        let output = cmd.output().context("Failed to execute git worktree add")?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+
+            // Provide helpful error messages for common cases
+            if stderr.contains("already checked out") {
+                anyhow::bail!(
+                    "Branch '{}' is already checked out in another worktree. \
+                     Another minion may be working on this issue. \
+                     Check active worktrees with: git -C {} worktree list",
+                    branch_name,
+                    self.bare_path.display()
+                );
+            }
+
+            anyhow::bail!(
+                "git worktree add failed with exit code {:?}: {}",
+                output.status.code(),
+                stderr
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Creates a worktree for an existing branch
+    /// Unlike create_worktree, this checks out an existing branch instead of creating a new one
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The bare repository doesn't exist
+    /// - The branch name is invalid or doesn't exist
+    /// - The worktree path already exists
+    /// - Git worktree creation fails
+    pub fn checkout_worktree(&self, branch_name: &str, worktree_path: &Path) -> Result<()> {
+        // Validate branch name
+        validate_branch_name(branch_name)?;
+
+        // Ensure the bare repository exists first
+        if !self.bare_path.exists() {
+            anyhow::bail!(
+                "Bare repository does not exist at {}. Call ensure_bare_clone() first.",
+                self.bare_path.display()
+            );
+        }
+
+        // Check if worktree path already exists (defensive check)
+        // Callers should check for existence first to provide better error messages
         if worktree_path.exists() {
             anyhow::bail!(
-                "Path already exists: {}. Remove it first or choose a different path.",
+                "Worktree path already exists: {}. This is likely a programming error - \
+                 the caller should check for existing worktrees before calling this method.",
                 worktree_path.display()
             );
         }
@@ -162,14 +365,13 @@ impl GitRepo {
                 .context("Failed to create parent directory for worktree")?;
         }
 
-        // Create the worktree with a new branch
+        // Create the worktree for an existing branch (no -b flag)
         let output = Command::new("git")
             .arg("-C")
             .arg(&self.bare_path)
             .arg("worktree")
             .arg("add")
             .arg(worktree_path)
-            .arg("-b")
             .arg(branch_name)
             .output()
             .context("Failed to execute git worktree add")?;
@@ -221,12 +423,144 @@ impl GitRepo {
 
         Ok(())
     }
+
+    /// Removes a worktree forcefully, handling stale or locked worktrees
+    ///
+    /// This is useful when a worktree is locked or stale from a previous minion session.
+    /// It uses the `--force` flag to bypass checks for locks, but will refuse to remove
+    /// a worktree with uncommitted changes to prevent data loss.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The bare repository doesn't exist
+    /// - The worktree has uncommitted changes (safety check)
+    /// - The worktree removal fails
+    pub fn cleanup_worktree_force(&self, worktree_path: &Path) -> Result<()> {
+        if !self.bare_path.exists() {
+            anyhow::bail!(
+                "Bare repository does not exist at {}",
+                self.bare_path.display()
+            );
+        }
+
+        // Safety check: refuse to force-remove worktree with uncommitted changes
+        // First check if this is a valid git worktree
+        if worktree_path.exists() {
+            let is_worktree = Command::new("git")
+                .arg("-C")
+                .arg(worktree_path)
+                .arg("rev-parse")
+                .arg("--is-inside-work-tree")
+                .output();
+
+            // If it's a valid worktree, check for uncommitted changes
+            if let Ok(output) = is_worktree {
+                if output.status.success() {
+                    let status = Command::new("git")
+                        .arg("-C")
+                        .arg(worktree_path)
+                        .arg("status")
+                        .arg("--porcelain")
+                        .output();
+
+                    if let Ok(status_output) = status {
+                        if !status_output.stdout.is_empty() {
+                            anyhow::bail!(
+                                "Worktree at {} has uncommitted changes. Refusing to force-remove. \
+                                 Commit or stash changes first.",
+                                worktree_path.display()
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&self.bare_path)
+            .arg("worktree")
+            .arg("remove")
+            .arg("--force")
+            .arg(worktree_path)
+            .output()
+            .context("Failed to execute git worktree remove --force")?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!(
+                "git worktree remove --force failed with exit code {:?}: {}",
+                output.status.code(),
+                stderr
+            );
+        }
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::env;
+
+    #[test]
+    fn test_parse_github_remote_https() {
+        let result = parse_github_remote("https://github.com/owner/repo.git").unwrap();
+        assert_eq!(result.0, "owner");
+        assert_eq!(result.1, "repo");
+    }
+
+    #[test]
+    fn test_parse_github_remote_https_without_git_extension() {
+        let result = parse_github_remote("https://github.com/owner/repo").unwrap();
+        assert_eq!(result.0, "owner");
+        assert_eq!(result.1, "repo");
+    }
+
+    #[test]
+    fn test_parse_github_remote_ssh() {
+        let result = parse_github_remote("git@github.com:owner/repo.git").unwrap();
+        assert_eq!(result.0, "owner");
+        assert_eq!(result.1, "repo");
+    }
+
+    #[test]
+    fn test_parse_github_remote_ssh_without_git_extension() {
+        let result = parse_github_remote("git@github.com:owner/repo").unwrap();
+        assert_eq!(result.0, "owner");
+        assert_eq!(result.1, "repo");
+    }
+
+    #[test]
+    fn test_parse_github_remote_rejects_non_github() {
+        let result = parse_github_remote("https://gitlab.com/owner/repo.git");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Not a GitHub URL"));
+    }
+
+    #[test]
+    fn test_parse_github_remote_rejects_invalid_format() {
+        let result = parse_github_remote("https://github.com/incomplete");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_is_github_url() {
+        // Valid GitHub URLs
+        assert!(is_github_url("https://github.com/owner/repo.git"));
+        assert!(is_github_url("http://github.com/owner/repo.git"));
+        assert!(is_github_url("git@github.com:owner/repo.git"));
+
+        // Invalid - not GitHub
+        assert!(!is_github_url("https://gitlab.com/owner/repo.git"));
+
+        // Invalid - security: malicious URLs that contain "github.com" but aren't GitHub
+        assert!(!is_github_url("https://evil.com/github.com/malware.git"));
+        assert!(!is_github_url("https://github.com.attacker.com/repo.git"));
+        assert!(!is_github_url("user@attacker.com:github.com:malware.git"));
+    }
 
     #[test]
     fn test_git_repo_new() {

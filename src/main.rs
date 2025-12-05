@@ -1,14 +1,16 @@
 mod commands;
 mod git;
+mod github;
 mod logger;
 mod minion;
 mod progress;
 mod stream;
 mod url_utils;
 mod workspace;
+mod worktree_scanner;
 
 use clap::{Parser, Subcommand};
-use commands::{fix, review};
+use commands::{clean, fix, path, review};
 
 /// CLI structure for the Gru agent orchestrator
 #[derive(Parser)]
@@ -37,6 +39,26 @@ enum Commands {
         #[arg(help = "PR number or URL to review")]
         pr: String,
     },
+    #[command(about = "Get the filesystem path to a Minion's worktree")]
+    Path {
+        #[arg(help = "Minion ID (e.g., M42 or 42)", conflicts_with_all = ["issue", "pr"])]
+        minion_id: Option<String>,
+
+        #[arg(long, help = "Resolve from issue number", conflicts_with_all = ["minion_id", "pr"])]
+        issue: Option<u64>,
+
+        #[arg(long, help = "Resolve from PR number", conflicts_with_all = ["minion_id", "issue"])]
+        pr: Option<u64>,
+    },
+    #[command(about = "Clean up merged/closed worktrees")]
+    Clean {
+        #[arg(long, help = "Show what would be cleaned without removing")]
+        dry_run: bool,
+        #[arg(long, help = "Force removal without confirmation")]
+        force: bool,
+        #[arg(long, default_value = "main", help = "Base branch to check for merges")]
+        base_branch: String,
+    },
 }
 
 #[tokio::main]
@@ -46,6 +68,16 @@ async fn main() {
     let result = match cli.command {
         Commands::Fix { issue } => fix::handle_fix(&issue, cli.quiet).await,
         Commands::Review { pr } => review::handle_review(&pr).await,
+        Commands::Path {
+            minion_id,
+            issue,
+            pr,
+        } => path::handle_path(minion_id, issue, pr).await,
+        Commands::Clean {
+            dry_run,
+            force,
+            base_branch,
+        } => clean::handle_clean(dry_run, force, &base_branch).await,
     };
 
     // Handle any errors that occurred

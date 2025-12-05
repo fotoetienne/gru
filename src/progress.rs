@@ -101,8 +101,12 @@ impl ProgressDisplay {
     pub fn handle_output(&self, output: &StreamOutput) {
         if self.config.quiet {
             // In quiet mode, only show errors
-            if let StreamOutput::Event(ClaudeEvent::Error { message }) = output {
-                eprintln!("Error: {}", message);
+            if let StreamOutput::Event(ClaudeEvent::Error { error }) = output {
+                let error_msg = error
+                    .get("message")
+                    .and_then(|m| m.as_str())
+                    .unwrap_or("Unknown error");
+                eprintln!("Error: {}", error_msg);
             }
             return;
         }
@@ -121,15 +125,16 @@ impl ProgressDisplay {
     }
 
     /// Truncate a string to a maximum number of characters (not bytes)
-    /// Uses true single-pass iteration by collecting max_chars + 1 characters at once
     fn truncate_string(s: &str, max_chars: usize) -> String {
-        // Fast path: if string has max_chars or fewer characters, return as is
-        if s.chars().nth(max_chars).is_some() {
-            return s.to_string();
+        // Collect up to max_chars + 1 characters to determine if truncation is needed
+        let chars: Vec<char> = s.chars().take(max_chars + 1).collect();
+        if chars.len() > max_chars {
+            // String is too long, truncate it
+            format!("{}...", chars[..max_chars].iter().collect::<String>())
+        } else {
+            // String is max_chars or shorter, return as-is
+            s.to_string()
         }
-        // Otherwise, collect up to max_chars characters and add ellipsis
-        let chars: Vec<char> = s.chars().take(max_chars).collect();
-        format!("{}...", chars.iter().collect::<String>())
     }
 
     /// Handle a parsed Claude event
@@ -137,46 +142,72 @@ impl ProgressDisplay {
         let timestamp = Local::now().format("%H:%M:%S");
 
         match event {
-            ClaudeEvent::Thinking { content } => {
+            ClaudeEvent::MessageStart { .. } => {
                 self.update_header("💭 Thinking...");
-                let truncated = Self::truncate_string(content, 50);
-                self.add_event(format!("[{}] Thinking: {}", timestamp, truncated));
+                self.add_event(format!("[{}] Message started", timestamp));
             }
-            ClaudeEvent::ToolUse { name, input } => {
-                self.update_header(&format!("🔧 Using tool: {}", name));
-
-                // Extract relevant info from input for display
-                let detail = match name.as_str() {
-                    "bash" => input.get("command").and_then(|c| c.as_str()).unwrap_or(""),
-                    "read" | "write" | "edit" => input
-                        .get("file_path")
-                        .and_then(|p| p.as_str())
-                        .unwrap_or(""),
-                    _ => "",
-                };
-
-                let event_text = if detail.is_empty() {
-                    format!("[{}] Tool: {}", timestamp, name)
-                } else {
-                    let truncated = Self::truncate_string(detail, 40);
-                    format!("[{}] Tool: {} - {}", timestamp, name, truncated)
-                };
-
-                self.add_event(event_text);
+            ClaudeEvent::ContentBlockStart { content_block, .. } => {
+                // Check if this is a tool_use block
+                if let Some(block_type) = content_block.get("type").and_then(|t| t.as_str()) {
+                    match block_type {
+                        "tool_use" => {
+                            let tool_name = content_block
+                                .get("name")
+                                .and_then(|n| n.as_str())
+                                .unwrap_or("unknown");
+                            self.update_header(&format!("🔧 Using tool: {}", tool_name));
+                            self.add_event(format!("[{}] Tool: {}", timestamp, tool_name));
+                        }
+                        "text" => {
+                            self.update_header("📝 Responding...");
+                        }
+                        _ => {}
+                    }
+                }
             }
-            ClaudeEvent::Message { content } => {
-                self.update_header("📝 Responding...");
-                let truncated = Self::truncate_string(content, 50);
-                self.add_event(format!("[{}] Message: {}", timestamp, truncated));
+            ClaudeEvent::ContentBlockDelta { delta, .. } => {
+                // Handle text deltas
+                if let Some(delta_type) = delta.get("type").and_then(|t| t.as_str()) {
+                    if delta_type == "text_delta" {
+                        if let Some(text) = delta.get("text").and_then(|t| t.as_str()) {
+                            let truncated = Self::truncate_string(text, 50);
+                            self.add_event(format!("[{}] Text: {}", timestamp, truncated));
+                        }
+                    }
+                }
             }
-            ClaudeEvent::Complete => {
-                self.update_header("✅ Complete");
-                self.add_event(format!("[{}] Complete", timestamp));
+            ClaudeEvent::ContentBlockStop { .. } => {
+                // Content block finished - no specific action needed
             }
-            ClaudeEvent::Error { message } => {
+            ClaudeEvent::MessageDelta { delta } => {
+                // Check for stop_reason to detect completion
+                if let Some(stop_reason) = delta.get("stop_reason").and_then(|r| r.as_str()) {
+                    match stop_reason {
+                        "end_turn" => {
+                            self.update_header("✅ Complete");
+                            self.add_event(format!("[{}] Complete", timestamp));
+                        }
+                        "tool_use" => {
+                            self.update_header("⏸️  Waiting for tool results...");
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            ClaudeEvent::MessageStop => {
+                self.update_header("✅ Message complete");
+            }
+            ClaudeEvent::Error { error } => {
                 self.update_header("❌ Error");
-                self.add_event(format!("[{}] Error: {}", timestamp, message));
-                eprintln!("Error: {}", message);
+                let error_msg = error
+                    .get("message")
+                    .and_then(|m| m.as_str())
+                    .unwrap_or("Unknown error");
+                self.add_event(format!("[{}] Error: {}", timestamp, error_msg));
+                eprintln!("Error: {}", error_msg);
+            }
+            ClaudeEvent::Ping => {
+                // Keepalive ping - no action needed, spinner ticks below
             }
         }
 
@@ -247,11 +278,11 @@ mod tests {
         let display = ProgressDisplay::new(config);
 
         // In quiet mode, non-error events shouldn't be added
-        let thinking = StreamOutput::Event(ClaudeEvent::Thinking {
-            content: "test".to_string(),
+        let message_start = StreamOutput::Event(ClaudeEvent::MessageStart {
+            message: serde_json::json!({}),
         });
 
-        display.handle_output(&thinking);
+        display.handle_output(&message_start);
 
         // The event shouldn't be added to recent events in quiet mode
         // (This is a simplified test - in practice, quiet mode just doesn't display)

@@ -15,62 +15,48 @@ const STREAM_TIMEOUT_SECS: u64 = 300;
 /// Handles the fix command by delegating to the Claude CLI
 /// Returns the exit code from the claude process
 pub async fn handle_fix(issue: &str, quiet: bool) -> Result<i32> {
-    // Parse issue information
-    let (owner_opt, repo_opt, issue_num) = parse_issue_info(issue)?;
+    // Parse issue information (auto-detects repo from current directory if plain number)
+    let (owner, repo, issue_num) = parse_issue_info(issue)?;
 
     // Always generate a unique minion ID
     let minion_id = minion::generate_minion_id().context("Failed to generate Minion ID")?;
     println!("📋 Generated Minion ID: {}", minion_id);
 
-    // Check if we have full repo information for workspace creation
-    let worktree_path_opt = if let (Some(owner), Some(repo)) = (owner_opt, repo_opt) {
-        // Full URL provided - create workspace and launch Claude
-        println!(
-            "🚀 Setting up workspace for {}/{}#{}",
-            owner, repo, issue_num
-        );
+    // Create workspace and launch Claude
+    println!(
+        "🚀 Setting up workspace for {}/{}#{}",
+        owner, repo, issue_num
+    );
 
-        // Initialize workspace
-        let workspace =
-            workspace::Workspace::new().context("Failed to initialize Gru workspace")?;
+    // Initialize workspace
+    let workspace = workspace::Workspace::new().context("Failed to initialize Gru workspace")?;
 
-        // Create bare repository path
-        let bare_path = workspace.repos().join(&owner).join(format!("{}.git", repo));
-        let git_repo = git::GitRepo::new(&owner, &repo, bare_path);
+    // Create bare repository path
+    let bare_path = workspace.repos().join(&owner).join(format!("{}.git", repo));
+    let git_repo = git::GitRepo::new(&owner, &repo, bare_path);
 
-        // Ensure bare repository is cloned/updated
-        println!("📦 Ensuring repository is cloned...");
-        git_repo
-            .ensure_bare_clone()
-            .context("Failed to clone or update repository")?;
+    // Ensure bare repository is cloned/updated
+    println!("📦 Ensuring repository is cloned...");
+    git_repo
+        .ensure_bare_clone()
+        .context("Failed to clone or update repository")?;
 
-        // Create worktree path
-        let repo_name = format!("{}/{}", owner, repo);
-        let worktree_path = workspace
-            .work_dir(&repo_name, &minion_id)
-            .context("Failed to compute worktree path")?;
+    // Create worktree path
+    let repo_name = format!("{}/{}", owner, repo);
+    let worktree_path = workspace
+        .work_dir(&repo_name, &minion_id)
+        .context("Failed to compute worktree path")?;
 
-        // Create worktree with branch name: minion/issue-<num>-<id>
-        let branch_name = format!("minion/issue-{}-{}", issue_num, minion_id);
-        println!("🌿 Creating worktree with branch: {}", branch_name);
+    // Create worktree with branch name: minion/issue-<num>-<id>
+    let branch_name = format!("minion/issue-{}-{}", issue_num, minion_id);
+    println!("🌿 Creating worktree with branch: {}", branch_name);
 
-        git_repo
-            .create_worktree(&branch_name, &worktree_path)
-            .context("Failed to create worktree")?;
+    git_repo
+        .create_worktree(&branch_name, &worktree_path)
+        .context("Failed to create worktree")?;
 
-        println!("📂 Workspace created at: {}", worktree_path.display());
-        println!("🤖 Launching Claude...\n");
-
-        Some(worktree_path)
-    } else {
-        // Plain issue number - use simple mode without workspace
-        println!("⚠️  No repository URL provided. Using simple mode without workspace management.");
-        println!(
-            "   For full workspace support, use: gru fix https://github.com/owner/repo/issues/{}\n",
-            issue_num
-        );
-        None
-    };
+    println!("📂 Workspace created at: {}", worktree_path.display());
+    println!("🤖 Launching Claude...\n");
 
     // Create progress display
     let config = ProgressConfig {
@@ -80,18 +66,20 @@ pub async fn handle_fix(issue: &str, quiet: bool) -> Result<i32> {
     };
     let progress = ProgressDisplay::new(config);
 
-    // Build the command
+    // Build the command with flags for non-interactive stream-json output
     let mut cmd = Command::new("claude");
-    cmd.arg(format!("/fix {}", issue_num))
+    cmd.arg("--print")
+        .arg("--verbose")
+        .arg("--output-format")
+        .arg("stream-json")
+        .arg("--include-partial-messages")
+        .arg("--dangerously-skip-permissions")
+        .arg(format!("/fix {}", issue_num))
         .stdin(std::process::Stdio::inherit())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::inherit());
-
-    // If we have a worktree, set the working directory and env var
-    if let Some(ref path) = worktree_path_opt {
-        cmd.current_dir(path);
-        cmd.env("GRU_WORKSPACE", &minion_id);
-    }
+        .stderr(std::process::Stdio::inherit())
+        .current_dir(&worktree_path)
+        .env("GRU_WORKSPACE", &minion_id);
 
     // Spawn the command
     let mut child = cmd.spawn().context(
