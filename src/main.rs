@@ -252,6 +252,7 @@ async fn handle_fix(issue: &str, quiet: bool) -> Result<i32> {
             println!("   Do you want to continue? (Press Ctrl+C to cancel or Enter to continue)");
 
             // Wait for user confirmation using async stdin
+            // Any input (including just Enter) continues - user can Ctrl+C to cancel
             let mut input = String::new();
             let stdin = tokio::io::stdin();
             let mut reader = tokio::io::BufReader::new(stdin);
