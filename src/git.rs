@@ -384,21 +384,34 @@ impl GitRepo {
         }
 
         // Safety check: refuse to force-remove worktree with uncommitted changes
-        if worktree_path.exists() && worktree_path.join(".git").exists() {
-            let status = Command::new("git")
+        // First check if this is a valid git worktree
+        if worktree_path.exists() {
+            let is_worktree = Command::new("git")
                 .arg("-C")
                 .arg(worktree_path)
-                .arg("status")
-                .arg("--porcelain")
+                .arg("rev-parse")
+                .arg("--is-inside-work-tree")
                 .output();
 
-            if let Ok(output) = status {
-                if !output.stdout.is_empty() {
-                    anyhow::bail!(
-                        "Worktree at {} has uncommitted changes. Refusing to force-remove. \
-                         Commit or stash changes first.",
-                        worktree_path.display()
-                    );
+            // If it's a valid worktree, check for uncommitted changes
+            if let Ok(output) = is_worktree {
+                if output.status.success() {
+                    let status = Command::new("git")
+                        .arg("-C")
+                        .arg(worktree_path)
+                        .arg("status")
+                        .arg("--porcelain")
+                        .output();
+
+                    if let Ok(status_output) = status {
+                        if !status_output.stdout.is_empty() {
+                            anyhow::bail!(
+                                "Worktree at {} has uncommitted changes. Refusing to force-remove. \
+                                 Commit or stash changes first.",
+                                worktree_path.display()
+                            );
+                        }
+                    }
                 }
             }
         }
