@@ -28,64 +28,51 @@ pub fn detect_git_repo() -> Result<PathBuf> {
 }
 
 /// Gets the GitHub remote URL from the current git repository
-/// Tries "origin" first, then falls back to the first remote found
+/// Tries "origin" first, then falls back to the first GitHub remote found
 pub fn get_github_remote() -> Result<String> {
-    // First try "origin"
+    // Use `git remote -v` to get all remotes and their URLs in one call
     let output = Command::new("git")
         .arg("remote")
-        .arg("get-url")
-        .arg("origin")
+        .arg("-v")
         .output()
-        .context("Failed to execute git remote get-url")?;
-
-    if output.status.success() {
-        let url = String::from_utf8(output.stdout)
-            .context("Git remote URL is not valid UTF-8")?
-            .trim()
-            .to_string();
-
-        if is_github_url(&url) {
-            return Ok(url);
-        }
-    }
-
-    // If "origin" doesn't exist or isn't a GitHub URL, try all remotes
-    let output = Command::new("git")
-        .arg("remote")
-        .output()
-        .context("Failed to list git remotes")?;
+        .context("Failed to execute git remote -v")?;
 
     if !output.status.success() {
         anyhow::bail!("Failed to list git remotes");
     }
 
-    let remotes =
-        String::from_utf8(output.stdout).context("Git remotes output is not valid UTF-8")?;
+    let remote_lines =
+        String::from_utf8(output.stdout).context("Git remote -v output is not valid UTF-8")?;
 
-    for remote in remotes.lines() {
-        let output = Command::new("git")
-            .arg("remote")
-            .arg("get-url")
-            .arg(remote.trim())
-            .output()
-            .context("Failed to get remote URL")?;
+    // Parse remotes, prioritizing "origin"
+    let mut origin_url: Option<String> = None;
+    let mut first_github_url: Option<String> = None;
 
-        if output.status.success() {
-            let url = String::from_utf8(output.stdout)
-                .context("Git remote URL is not valid UTF-8")?
-                .trim()
-                .to_string();
+    // Each line format: <name> <url> (fetch|push)
+    for line in remote_lines.lines() {
+        let mut parts = line.split_whitespace();
+        let remote_name = parts.next();
+        let remote_url = parts.next();
 
-            if is_github_url(&url) {
-                return Ok(url);
+        if let (Some(name), Some(url)) = (remote_name, remote_url) {
+            if is_github_url(url) {
+                // Prioritize "origin" remote
+                if name == "origin" && origin_url.is_none() {
+                    origin_url = Some(url.to_string());
+                } else if first_github_url.is_none() {
+                    first_github_url = Some(url.to_string());
+                }
             }
         }
     }
 
-    anyhow::bail!(
-        "No GitHub remote found. Add a GitHub remote or provide the full issue URL.\n\
-         Example: git remote add origin https://github.com/owner/repo.git"
-    );
+    // Return origin if found, otherwise return first GitHub remote
+    origin_url.or(first_github_url).ok_or_else(|| {
+        anyhow::anyhow!(
+            "No GitHub remote found. Add a GitHub remote or provide the full issue URL.\n\
+                 Example: git remote add origin https://github.com/owner/repo.git"
+        )
+    })
 }
 
 /// Checks if a URL is a GitHub URL
