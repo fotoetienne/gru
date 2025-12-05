@@ -108,9 +108,12 @@ claude --print \
 - **No SQLite** - Rebuild state from GitHub on restart
 
 **Git Worktrees:**
-- Each Minion works in isolated worktree: `~/.gru/work/owner/repo/M<id>/`
+- Each Minion works in isolated worktree: `~/.gru/work/owner/repo/<branch-name>/`
+- Worktree path always matches branch name exactly (universal rule)
 - Bare repo mirrors: `~/.gru/repos/owner/repo.git`
-- Branch naming: `gru/issue-<number>` (note: no "gru/" prefix in worktree branch names post-#37)
+- Branch naming: `gru/issue-<number>` for Gru-created branches
+- Example: Branch `gru/issue-123` → Worktree `~/.gru/work/owner/repo/gru/issue-123/`
+- Multiple minions can work sequentially on same issue (git manages locking)
 
 **Stream Parsing:**
 - Parse JSON events from Claude's stdout: `thinking`, `tool_use`, `message`, `complete`, `error`
@@ -159,7 +162,10 @@ Located in `.claude/commands/`:
 - Comments use YAML frontmatter for structured events
 
 ### Worktree Management
+- Worktree paths are deterministically derived from branch names
 - Create from bare repos to avoid conflicts
+- Stale worktrees are automatically force-removed if they exist
+- Multiple minions can work on same issue sequentially (git handles locking)
 - Remove worktrees from outside (not from within themselves)
 - Use `gh pr merge --auto` to avoid checkout conflicts on merge
 - Post-merge cleanup: remove worktree + delete branch from bare repo
