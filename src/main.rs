@@ -204,8 +204,8 @@ fn parse_pr_info(pr: &str) -> Result<(Option<String>, Option<String>, String)> {
 }
 
 /// Extracts owner, repo, and issue number from an issue argument
-/// Supports both plain issue numbers and GitHub URLs
-fn parse_issue_info(issue: &str) -> Result<(Option<String>, Option<String>, String)> {
+/// Supports both plain issue numbers (auto-detects from current directory) and GitHub URLs
+fn parse_issue_info(issue: &str) -> Result<(String, String, String)> {
     // First validate the format
     validate_issue_format(issue)?;
 
@@ -232,123 +232,65 @@ fn parse_issue_info(issue: &str) -> Result<(Option<String>, Option<String>, Stri
         let repo = parts[1].to_string();
         let issue_num = parts[3].to_string();
 
-        Ok((Some(owner), Some(repo), issue_num))
+        Ok((owner, repo, issue_num))
     } else {
-        // Plain issue number - no owner/repo info
-        Ok((None, None, issue.to_string()))
+        // Plain issue number - auto-detect repository from current directory
+        git::detect_git_repo().context("Failed to detect git repository")?;
+
+        let remote_url = git::get_github_remote().context("Failed to get GitHub remote")?;
+
+        let (owner, repo) =
+            git::parse_github_remote(&remote_url).context("Failed to parse GitHub remote URL")?;
+
+        Ok((owner, repo, issue.to_string()))
     }
 }
 
 /// Handles the fix command by delegating to the Claude CLI
 /// Returns the exit code from the claude process
 async fn handle_fix(issue: &str, quiet: bool) -> Result<i32> {
-    // Parse issue information
-    let (owner_opt, repo_opt, issue_num) = parse_issue_info(issue)?;
+    // Parse issue information (auto-detects repo from current directory if plain number)
+    let (owner, repo, issue_num) = parse_issue_info(issue)?;
 
     // Always generate a unique minion ID
     let minion_id = minion::generate_minion_id().context("Failed to generate Minion ID")?;
     println!("📋 Generated Minion ID: {}", minion_id);
 
-    // Check if we have full repo information for workspace creation
-    let worktree_path_opt = if let (Some(owner), Some(repo)) = (owner_opt.clone(), repo_opt.clone())
-    {
-        // Full URL provided - create workspace and launch Claude
-        println!(
-            "🚀 Setting up workspace for {}/{}#{}",
-            owner, repo, issue_num
-        );
+    // Create workspace and launch Claude
+    println!(
+        "🚀 Setting up workspace for {}/{}#{}",
+        owner, repo, issue_num
+    );
 
-        // Initialize workspace
-        let workspace =
-            workspace::Workspace::new().context("Failed to initialize Gru workspace")?;
+    // Initialize workspace
+    let workspace = workspace::Workspace::new().context("Failed to initialize Gru workspace")?;
 
-        // Create bare repository path
-        let bare_path = workspace.repos().join(&owner).join(format!("{}.git", repo));
-        let git_repo = git::GitRepo::new(&owner, &repo, bare_path);
+    // Create bare repository path
+    let bare_path = workspace.repos().join(&owner).join(format!("{}.git", repo));
+    let git_repo = git::GitRepo::new(&owner, &repo, bare_path);
 
-        // Ensure bare repository is cloned/updated
-        println!("📦 Ensuring repository is cloned...");
-        git_repo
-            .ensure_bare_clone()
-            .context("Failed to clone or update repository")?;
+    // Ensure bare repository is cloned/updated
+    println!("📦 Ensuring repository is cloned...");
+    git_repo
+        .ensure_bare_clone()
+        .context("Failed to clone or update repository")?;
 
-        // Fetch issue details to check if already claimed
-        println!("🔍 Fetching issue details...");
-        let issue_data = github::fetch_issue(&owner, &repo, &issue_num)
-            .await
-            .context("Failed to fetch issue details")?;
+    // Create worktree path
+    let repo_name = format!("{}/{}", owner, repo);
+    let worktree_path = workspace
+        .work_dir(&repo_name, &minion_id)
+        .context("Failed to compute worktree path")?;
 
-        // Check if issue already has in-progress label
-        if github::has_in_progress_label(&issue_data) {
-            println!(
-                "⚠️  Warning: Issue #{} already has 'in-progress' label",
-                issue_num
-            );
-            println!("   This issue may already be claimed by another Minion.");
-            println!("   Do you want to continue? (Press Ctrl+C to cancel or Enter to continue)");
+    // Create worktree with branch name: minion/issue-<num>-<id>
+    let branch_name = format!("minion/issue-{}-{}", issue_num, minion_id);
+    println!("🌿 Creating worktree with branch: {}", branch_name);
 
-            // Wait for user confirmation using async stdin
-            // Any input (including just Enter) continues - user can Ctrl+C to cancel
-            let mut input = String::new();
-            let stdin = tokio::io::stdin();
-            let mut reader = tokio::io::BufReader::new(stdin);
-            reader
-                .read_line(&mut input)
-                .await
-                .context("Failed to read user input")?;
-        }
+    git_repo
+        .create_worktree(&branch_name, &worktree_path)
+        .context("Failed to create worktree")?;
 
-        // Add in-progress label immediately to minimize race condition window
-        // This must happen before the expensive worktree creation
-        println!("🏷️  Adding 'in-progress' label...");
-        github::add_in_progress_label(&owner, &repo, &issue_num)
-            .await
-            .context("Failed to add in-progress label")?;
-
-        // Create worktree path
-        let repo_name = format!("{}/{}", owner, repo);
-        let worktree_path = workspace
-            .work_dir(&repo_name, &minion_id)
-            .context("Failed to compute worktree path")?;
-
-        // Create worktree with branch name: minion/issue-<num>-<id>
-        let branch_name = format!("minion/issue-{}-{}", issue_num, minion_id);
-        println!("🌿 Creating worktree with branch: {}", branch_name);
-
-        git_repo
-            .create_worktree(&branch_name, &worktree_path)
-            .context("Failed to create worktree")?;
-
-        println!("📂 Workspace created at: {}", worktree_path.display());
-
-        // Post claim comment (non-critical, so we can tolerate failure here)
-        println!("💬 Posting claim comment...");
-        if let Err(e) = github::post_claim_comment(
-            &owner,
-            &repo,
-            &issue_num,
-            &minion_id,
-            &branch_name,
-            &worktree_path.to_string_lossy(),
-        )
-        .await
-        {
-            eprintln!("⚠️  Warning: Failed to post claim comment: {}", e);
-            eprintln!("   Continuing with the fix anyway...");
-        }
-
-        println!("🤖 Launching Claude...\n");
-
-        Some(worktree_path)
-    } else {
-        // Plain issue number - use simple mode without workspace
-        println!("⚠️  No repository URL provided. Using simple mode without workspace management.");
-        println!(
-            "   For full workspace support, use: gru fix https://github.com/owner/repo/issues/{}\n",
-            issue_num
-        );
-        None
-    };
+    println!("📂 Workspace created at: {}", worktree_path.display());
+    println!("🤖 Launching Claude...\n");
 
     // Create progress display
     let config = ProgressConfig {
@@ -369,13 +311,9 @@ async fn handle_fix(issue: &str, quiet: bool) -> Result<i32> {
         .arg(format!("/fix {}", issue_num))
         .stdin(std::process::Stdio::inherit())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::inherit());
-
-    // If we have a worktree, set the working directory and env var
-    if let Some(ref path) = worktree_path_opt {
-        cmd.current_dir(path);
-        cmd.env("GRU_WORKSPACE", &minion_id);
-    }
+        .stderr(std::process::Stdio::inherit())
+        .current_dir(&worktree_path)
+        .env("GRU_WORKSPACE", &minion_id);
 
     // Spawn the command
     let mut child = cmd.spawn().context(
@@ -1018,24 +956,16 @@ mod tests {
     #[test]
     fn test_parse_issue_info_with_url() {
         let result = parse_issue_info("https://github.com/fotoetienne/gru/issues/42").unwrap();
-        assert_eq!(result.0, Some("fotoetienne".to_string()));
-        assert_eq!(result.1, Some("gru".to_string()));
-        assert_eq!(result.2, "42".to_string());
-    }
-
-    #[test]
-    fn test_parse_issue_info_with_plain_number() {
-        let result = parse_issue_info("42").unwrap();
-        assert_eq!(result.0, None);
-        assert_eq!(result.1, None);
+        assert_eq!(result.0, "fotoetienne".to_string());
+        assert_eq!(result.1, "gru".to_string());
         assert_eq!(result.2, "42".to_string());
     }
 
     #[test]
     fn test_parse_issue_info_with_url_and_query_params() {
         let result = parse_issue_info("https://github.com/owner/repo/issues/123?foo=bar").unwrap();
-        assert_eq!(result.0, Some("owner".to_string()));
-        assert_eq!(result.1, Some("repo".to_string()));
+        assert_eq!(result.0, "owner".to_string());
+        assert_eq!(result.1, "repo".to_string());
         assert_eq!(result.2, "123".to_string());
     }
 
