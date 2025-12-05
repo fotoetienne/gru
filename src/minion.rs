@@ -17,6 +17,9 @@ pub struct Minion {
 /// IDs are formatted as M<base36> where the counter is encoded in base36:
 /// M000, M001, M002, ..., M00z, M010, ..., M0zz, M100, ...
 ///
+/// Note: IDs use lowercase letters (a-z) for improved readability. Legacy IDs
+/// from earlier versions may contain uppercase letters (A-Z) for counter values 10-35.
+///
 /// The counter is stored in `~/.gru/state/next_id.txt` and uses file locking
 /// to ensure thread-safety and atomicity.
 #[allow(dead_code)]
@@ -162,9 +165,16 @@ mod tests {
         let id = generate_minion_id().unwrap();
         assert!(id.starts_with("M"));
         assert!(id.len() >= 4); // M + at least 3 digits
-                                // Check that all characters after M are valid base36
+                                // Check that all characters after M are valid lowercase base36
         for c in id.chars().skip(1) {
             assert!(c.is_ascii_alphanumeric());
+            if c.is_ascii_alphabetic() {
+                assert!(
+                    c.is_ascii_lowercase(),
+                    "Minion ID should only contain lowercase letters, found: {}",
+                    c
+                );
+            }
         }
     }
 
