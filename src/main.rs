@@ -14,6 +14,7 @@ use progress::{ProgressConfig, ProgressDisplay};
 use std::io::Write;
 use std::path::PathBuf;
 use stream::EventStream;
+use tokio::io::AsyncBufReadExt;
 use tokio::process::Command;
 use tokio::time::{timeout, Duration};
 
@@ -249,7 +250,8 @@ async fn handle_fix(issue: &str, quiet: bool) -> Result<i32> {
     println!("📋 Generated Minion ID: {}", minion_id);
 
     // Check if we have full repo information for workspace creation
-    let worktree_path_opt = if let (Some(owner), Some(repo)) = (owner_opt, repo_opt) {
+    let worktree_path_opt = if let (Some(owner), Some(repo)) = (owner_opt.clone(), repo_opt.clone())
+    {
         // Full URL provided - create workspace and launch Claude
         println!(
             "🚀 Setting up workspace for {}/{}#{}",
@@ -270,6 +272,39 @@ async fn handle_fix(issue: &str, quiet: bool) -> Result<i32> {
             .ensure_bare_clone()
             .context("Failed to clone or update repository")?;
 
+        // Fetch issue details to check if already claimed
+        println!("🔍 Fetching issue details...");
+        let issue_data = github::fetch_issue(&owner, &repo, &issue_num)
+            .await
+            .context("Failed to fetch issue details")?;
+
+        // Check if issue already has in-progress label
+        if github::has_in_progress_label(&issue_data) {
+            println!(
+                "⚠️  Warning: Issue #{} already has 'in-progress' label",
+                issue_num
+            );
+            println!("   This issue may already be claimed by another Minion.");
+            println!("   Do you want to continue? (Press Ctrl+C to cancel or Enter to continue)");
+
+            // Wait for user confirmation using async stdin
+            // Any input (including just Enter) continues - user can Ctrl+C to cancel
+            let mut input = String::new();
+            let stdin = tokio::io::stdin();
+            let mut reader = tokio::io::BufReader::new(stdin);
+            reader
+                .read_line(&mut input)
+                .await
+                .context("Failed to read user input")?;
+        }
+
+        // Add in-progress label immediately to minimize race condition window
+        // This must happen before the expensive worktree creation
+        println!("🏷️  Adding 'in-progress' label...");
+        github::add_in_progress_label(&owner, &repo, &issue_num)
+            .await
+            .context("Failed to add in-progress label")?;
+
         // Create worktree path
         let repo_name = format!("{}/{}", owner, repo);
         let worktree_path = workspace
@@ -285,6 +320,23 @@ async fn handle_fix(issue: &str, quiet: bool) -> Result<i32> {
             .context("Failed to create worktree")?;
 
         println!("📂 Workspace created at: {}", worktree_path.display());
+
+        // Post claim comment (non-critical, so we can tolerate failure here)
+        println!("💬 Posting claim comment...");
+        if let Err(e) = github::post_claim_comment(
+            &owner,
+            &repo,
+            &issue_num,
+            &minion_id,
+            &branch_name,
+            &worktree_path.to_string_lossy(),
+        )
+        .await
+        {
+            eprintln!("⚠️  Warning: Failed to post claim comment: {}", e);
+            eprintln!("   Continuing with the fix anyway...");
+        }
+
         println!("🤖 Launching Claude...\n");
 
         Some(worktree_path)
@@ -704,7 +756,7 @@ async fn resolve_minion_from_pr(pr_num: u64) -> Result<String> {
 }
 
 /// Handles the clean command to remove merged/closed worktrees
-fn handle_clean(dry_run: bool, force: bool, base_branch: &str) -> Result<i32> {
+async fn handle_clean(dry_run: bool, force: bool, base_branch: &str) -> Result<i32> {
     let ws = workspace::Workspace::new().context("Failed to initialize workspace")?;
 
     println!("Scanning for worktrees in {}...", ws.repos().display());
@@ -762,7 +814,9 @@ fn handle_clean(dry_run: bool, force: bool, base_branch: &str) -> Result<i32> {
         std::io::stdout().flush()?;
 
         let mut input = String::new();
-        std::io::stdin().read_line(&mut input)?;
+        let stdin = tokio::io::stdin();
+        let mut reader = tokio::io::BufReader::new(stdin);
+        reader.read_line(&mut input).await?;
         let input = input.trim().to_lowercase();
 
         if input != "y" && input != "yes" {
@@ -837,7 +891,7 @@ async fn main() {
             dry_run,
             force,
             base_branch,
-        } => handle_clean(dry_run, force, &base_branch),
+        } => handle_clean(dry_run, force, &base_branch).await,
     };
 
     // Handle any errors that occurred
