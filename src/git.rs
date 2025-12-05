@@ -208,10 +208,12 @@ impl GitRepo {
             );
         }
 
-        // Check if worktree path already exists
+        // Check if worktree path already exists (defensive check)
+        // Callers should check for existence first to provide better error messages
         if worktree_path.exists() {
             anyhow::bail!(
-                "Path already exists: {}. Remove it first or choose a different path.",
+                "Worktree path already exists: {}. This is likely a programming error - \
+                 the caller should check for existing worktrees before calling this method.",
                 worktree_path.display()
             );
         }

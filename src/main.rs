@@ -481,6 +481,7 @@ async fn handle_review(pr: &str) -> Result<i32> {
 
     // Create bare repository path
     let bare_path = workspace.repos().join(&owner).join(format!("{}.git", repo));
+    // Clone bare_path here since GitRepo::new takes ownership, but we need it later for git fetch
     let git_repo = git::GitRepo::new(&owner, &repo, bare_path.clone());
 
     // Ensure bare repository is cloned/updated
