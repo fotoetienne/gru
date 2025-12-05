@@ -8,26 +8,14 @@ Review a GitHub pull request: fetch details, analyze changes, and provide feedba
 
 **Pull Request:** $ARGUMENTS
 
+**Note:** This command assumes you're already in the PR's worktree directory. Use `gru review <pr#>` (with a full GitHub URL) to automatically handle workspace setup.
+
 **Workflow:**
 
 ## 1. Fetch PR Details
 - Use `gh pr view $ARGUMENTS --json headRefName` to get the branch name
 - Use `gh pr view $ARGUMENTS` to get the PR title, body, and metadata
 - Use `gh pr view $ARGUMENTS --json files` to get a quick overview of changed files
-- **Do NOT use `git checkout`. Always use worktrees:**
-  - Determine the repository owner and name from the git remote
-  - Derive the worktree path: `~/.gru/work/owner/repo/<branch-name>`
-  - Check if a worktree already exists at that path
-    - If found, use the existing worktree
-    - If not, create a git worktree following Gru's filesystem structure:
-      1. Ensure bare repo exists at `~/.gru/repos/owner/repo.git/`
-         - If not, create it: `git clone --bare <remote-url> ~/.gru/repos/owner/repo.git`
-      2. Create worktree from bare repo:
-         ```
-         cd ~/.gru/repos/owner/repo.git
-         git worktree add ~/.gru/work/owner/repo/<branch-name> <branch-name>
-         ```
-  - Inform the user of the worktree location
 - Fetch existing review comments: `gh api repos/{owner}/{repo}/pulls/{pr#}/comments`
 - Understand the scope and intent of the PR, and any prior discussion
 - If this PR is addressing an Issue, read Issue details to understand the problem and context. Does this PR address the issue completely? Are there any missing details or assumptions?
