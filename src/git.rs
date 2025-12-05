@@ -186,6 +186,75 @@ impl GitRepo {
         Ok(())
     }
 
+    /// Finds an existing worktree that has the specified branch checked out
+    ///
+    /// Uses `git worktree list --porcelain` to get machine-readable output
+    /// and parses it to find if the branch is currently checked out in any worktree.
+    ///
+    /// # Returns
+    ///
+    /// - `Ok(Some(PathBuf))` if a worktree with the branch is found
+    /// - `Ok(None)` if no worktree has the branch checked out
+    /// - `Err` if the git command fails or the bare repository doesn't exist
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The bare repository doesn't exist
+    /// - The git worktree list command fails
+    pub fn find_worktree_for_branch(&self, branch_name: &str) -> Result<Option<PathBuf>> {
+        if !self.bare_path.exists() {
+            anyhow::bail!(
+                "Bare repository does not exist at {}",
+                self.bare_path.display()
+            );
+        }
+
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&self.bare_path)
+            .arg("worktree")
+            .arg("list")
+            .arg("--porcelain")
+            .output()
+            .context("Failed to execute git worktree list")?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!(
+                "git worktree list failed with exit code {:?}: {}",
+                output.status.code(),
+                stderr
+            );
+        }
+
+        // Parse the porcelain output
+        // Format:
+        // worktree /path/to/worktree
+        // HEAD <commit-sha>
+        // branch refs/heads/branch-name
+        // <blank line>
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let mut current_worktree: Option<PathBuf> = None;
+
+        for line in stdout.lines() {
+            if line.starts_with("worktree ") {
+                current_worktree = Some(PathBuf::from(line.trim_start_matches("worktree ")));
+            } else if line.starts_with("branch ") {
+                let branch_ref = line.trim_start_matches("branch ");
+                // Match both "refs/heads/branch-name" and just "branch-name"
+                if branch_ref == format!("refs/heads/{}", branch_name) || branch_ref == branch_name
+                {
+                    if let Some(worktree_path) = current_worktree {
+                        return Ok(Some(worktree_path));
+                    }
+                }
+            }
+        }
+
+        Ok(None)
+    }
+
     /// Removes a worktree
     ///
     /// # Errors
@@ -323,6 +392,22 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_find_worktree_for_branch_fails_without_bare_repo() {
+        let repo = GitRepo::new(
+            "owner",
+            "repo",
+            PathBuf::from("/tmp/nonexistent-bare-repo.git"),
+        );
+        let result = repo.find_worktree_for_branch("test-branch");
+
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Bare repository does not exist"));
+    }
+
     // Integration tests that actually clone a repository
     // These are marked with #[ignore] and should be run explicitly with:
     // cargo test git_operations -- --ignored
@@ -379,9 +464,46 @@ mod tests {
         let branch_name = String::from_utf8_lossy(&branch_check.stdout);
         assert_eq!(branch_name.trim(), "test-branch");
 
+        // Test find_worktree_for_branch - should find the worktree we just created
+        let result = repo.find_worktree_for_branch("test-branch");
+        assert!(
+            result.is_ok(),
+            "Failed to find worktree for branch: {:?}",
+            result
+        );
+        assert_eq!(
+            result.unwrap(),
+            Some(worktree_path.clone()),
+            "Found worktree path should match the created worktree"
+        );
+
+        // Test find_worktree_for_branch with non-existent branch
+        let result = repo.find_worktree_for_branch("nonexistent-branch");
+        assert!(
+            result.is_ok(),
+            "find_worktree_for_branch should not error for non-existent branch"
+        );
+        assert_eq!(
+            result.unwrap(),
+            None,
+            "Should return None for non-existent branch"
+        );
+
         // Test cleanup_worktree
         let result = repo.cleanup_worktree(&worktree_path);
         assert!(result.is_ok(), "Failed to cleanup worktree: {:?}", result);
+
+        // Test find_worktree_for_branch after cleanup - should return None
+        let result = repo.find_worktree_for_branch("test-branch");
+        assert!(
+            result.is_ok(),
+            "find_worktree_for_branch should not error after cleanup"
+        );
+        assert_eq!(
+            result.unwrap(),
+            None,
+            "Should return None after worktree is cleaned up"
+        );
 
         // Clean up test directories
         let _ = fs::remove_dir_all(&bare_path);
