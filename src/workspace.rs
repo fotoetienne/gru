@@ -85,32 +85,40 @@ impl Workspace {
         &self.archive
     }
 
-    /// Returns the working directory path for a specific repo and minion.
+    /// Returns the working directory path for a specific repo and branch name.
+    ///
+    /// This is the universal worktree path function that derives the path from the branch name.
+    /// The worktree path always matches the branch name exactly for consistency.
     ///
     /// # Arguments
     ///
     /// * `repo` - Repository identifier (e.g., "owner/repo" or "owner_repo")
-    /// * `minion_id` - Unique minion identifier
+    /// * `branch_name` - Branch name (e.g., "gru/issue-123", "fix-auth-bug", "feature/new-api")
     ///
     /// # Examples
     ///
     /// ```ignore
     /// let ws = Workspace::new()?;
-    /// // Creates path: ~/.gru/work/owner/repo/M007
-    /// let path = ws.work_dir("owner/repo", "M007")?;
+    /// // Creates path: ~/.gru/work/owner/repo/gru/issue-123/
+    /// let path = ws.work_dir("owner/repo", "gru/issue-123")?;
+    ///
+    /// // Creates path: ~/.gru/work/owner/repo/fix-auth-bug/
+    /// let path = ws.work_dir("owner/repo", "fix-auth-bug")?;
     /// ```
     ///
     /// # Errors
     ///
     /// Returns an error if:
-    /// - The repo or minion_id contains backslashes or parent directory references
+    /// - The repo contains backslashes or parent directory references
+    /// - The branch_name contains backslashes or parent directory references
     /// - The resulting path would escape the workspace directory
     ///
     /// # Note
     ///
     /// This method validates inputs and computes the path, but does not create the directory.
-    /// Forward slashes in repo names are allowed and will create nested directories.
-    pub fn work_dir(&self, repo: &str, minion_id: &str) -> io::Result<PathBuf> {
+    /// Forward slashes in repo names and branch names are allowed and will create nested directories.
+    /// Remote prefixes (like "origin/") are automatically stripped from branch names.
+    pub fn work_dir(&self, repo: &str, branch_name: &str) -> io::Result<PathBuf> {
         if repo.contains('\\') || repo.contains("..") {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -121,14 +129,17 @@ impl Workspace {
             ));
         }
 
-        if minion_id.contains('/') || minion_id.contains('\\') || minion_id.contains("..") {
+        // Strip remote prefix if present (origin/main → main)
+        let local_branch = branch_name.strip_prefix("origin/").unwrap_or(branch_name);
+
+        if local_branch.contains('\\') || local_branch.contains("..") {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("Minion ID '{}' contains invalid characters", minion_id),
+                format!("Branch name '{}' contains invalid characters", local_branch),
             ));
         }
 
-        let path = self.work.join(repo).join(minion_id);
+        let path = self.work.join(repo).join(local_branch);
 
         if !path.starts_with(&self.work) {
             return Err(io::Error::new(
@@ -192,8 +203,13 @@ mod tests {
     #[test]
     fn test_work_dir_path() {
         let ws = Workspace::new().unwrap();
-        let work_path = ws.work_dir("myrepo", "minion-123").unwrap();
-        assert_eq!(work_path, ws.work().join("myrepo").join("minion-123"));
+        // Test with gru-created branch
+        let work_path = ws.work_dir("myrepo", "gru/issue-123").unwrap();
+        assert_eq!(work_path, ws.work().join("myrepo").join("gru/issue-123"));
+
+        // Test with human-created branch
+        let work_path2 = ws.work_dir("myrepo", "fix-auth-bug").unwrap();
+        assert_eq!(work_path2, ws.work().join("myrepo").join("fix-auth-bug"));
     }
 
     #[test]
@@ -213,17 +229,19 @@ mod tests {
     #[test]
     fn test_work_dir_rejects_path_traversal() {
         let ws = Workspace::new().unwrap();
-        assert!(ws.work_dir("../../etc", "minion").is_err());
-        assert!(ws.work_dir("repo", "../minion").is_err());
-        assert!(ws.work_dir("repo\\subpath", "minion").is_err()); // Backslashes not allowed
+        assert!(ws.work_dir("../../etc", "branch").is_err());
+        assert!(ws.work_dir("repo", "../branch").is_err());
+        assert!(ws.work_dir("repo\\subpath", "branch").is_err()); // Backslashes not allowed
     }
 
     #[test]
     fn test_work_dir_allows_forward_slashes() {
         let ws = Workspace::new().unwrap();
-        // Forward slashes should be allowed in repo names (e.g., "owner/repo")
-        assert!(ws.work_dir("owner/repo", "minion").is_ok());
-        assert!(ws.work_dir("org/project/subproject", "M001").is_ok());
+        // Forward slashes should be allowed in both repo names and branch names
+        assert!(ws.work_dir("owner/repo", "gru/issue-123").is_ok());
+        assert!(ws
+            .work_dir("org/project/subproject", "feature/new-api")
+            .is_ok());
     }
 
     #[test]
@@ -237,10 +255,10 @@ mod tests {
     fn test_work_dir_accepts_dots_in_identifiers() {
         let ws = Workspace::new().unwrap();
         // Dots in repo names should be allowed (e.g., "owner.io/repo")
-        assert!(ws.work_dir("owner.io", "minion").is_ok());
-        assert!(ws.work_dir("my.repo", "minion").is_ok());
-        // Dots in minion IDs should be allowed (e.g., version numbers)
-        assert!(ws.work_dir("repo", "minion-1.2.3").is_ok());
+        assert!(ws.work_dir("owner.io", "branch").is_ok());
+        assert!(ws.work_dir("my.repo", "branch").is_ok());
+        // Dots in branch names should be allowed (e.g., version branches)
+        assert!(ws.work_dir("repo", "release/1.2.3").is_ok());
         assert!(ws.work_dir("repo", "v2.0").is_ok());
     }
 
@@ -250,6 +268,20 @@ mod tests {
         // Dots in minion IDs should be allowed
         assert!(ws.archive_dir("minion-1.2.3").is_ok());
         assert!(ws.archive_dir("v2.0").is_ok());
+    }
+
+    #[test]
+    fn test_work_dir_strips_remote_prefix() {
+        let ws = Workspace::new().unwrap();
+        // Remote prefixes should be stripped automatically
+        let work_path = ws.work_dir("owner/repo", "origin/main").unwrap();
+        assert_eq!(work_path, ws.work().join("owner/repo").join("main"));
+
+        let work_path2 = ws.work_dir("owner/repo", "origin/gru/issue-123").unwrap();
+        assert_eq!(
+            work_path2,
+            ws.work().join("owner/repo").join("gru/issue-123")
+        );
     }
 
     #[test]

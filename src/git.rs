@@ -249,12 +249,16 @@ impl GitRepo {
     /// Creates a new worktree from the bare repository
     /// The worktree will have a new branch checked out
     ///
+    /// If the branch already exists (from a previous minion), it will check it out.
+    /// If git reports that the worktree is already checked out elsewhere, this will fail
+    /// with an error (respecting git's internal locking).
+    ///
     /// # Errors
     ///
     /// Returns an error if:
     /// - The bare repository doesn't exist
-    /// - The branch name is invalid or already exists
-    /// - The worktree path already exists
+    /// - The branch name is invalid
+    /// - The branch is already checked out in another worktree
     /// - Git worktree creation fails
     pub fn create_worktree(&self, branch_name: &str, worktree_path: &Path) -> Result<()> {
         // Validate branch name
@@ -268,34 +272,51 @@ impl GitRepo {
             );
         }
 
-        // Check if worktree path already exists
-        if worktree_path.exists() {
-            anyhow::bail!(
-                "Path already exists: {}. Remove it first or choose a different path.",
-                worktree_path.display()
-            );
-        }
-
-        // Create parent directory if it doesn't exist
-        if let Some(parent) = worktree_path.parent() {
-            std::fs::create_dir_all(parent)
-                .context("Failed to create parent directory for worktree")?;
-        }
-
-        // Create the worktree with a new branch
-        let output = Command::new("git")
+        // Check if the branch already exists
+        let branch_check = Command::new("git")
             .arg("-C")
+            .arg(&self.bare_path)
+            .arg("show-ref")
+            .arg("--verify")
+            .arg(format!("refs/heads/{}", branch_name))
+            .output()
+            .context("Failed to check if branch exists")?;
+
+        let branch_exists = branch_check.status.success();
+
+        // Create or checkout the worktree
+        // Let git handle directory creation and locking
+        let mut cmd = Command::new("git");
+        cmd.arg("-C")
             .arg(&self.bare_path)
             .arg("worktree")
             .arg("add")
-            .arg(worktree_path)
-            .arg("-b")
-            .arg(branch_name)
-            .output()
-            .context("Failed to execute git worktree add")?;
+            .arg(worktree_path);
+
+        if branch_exists {
+            // Branch exists, just check it out
+            cmd.arg(branch_name);
+        } else {
+            // Branch doesn't exist, create it
+            cmd.arg("-b").arg(branch_name);
+        }
+
+        let output = cmd.output().context("Failed to execute git worktree add")?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
+
+            // Provide helpful error messages for common cases
+            if stderr.contains("already checked out") {
+                anyhow::bail!(
+                    "Branch '{}' is already checked out in another worktree. \
+                     Another minion may be working on this issue. \
+                     Check active worktrees with: git -C {} worktree list",
+                    branch_name,
+                    self.bare_path.display()
+                );
+            }
+
             anyhow::bail!(
                 "git worktree add failed with exit code {:?}: {}",
                 output.status.code(),
@@ -334,6 +355,81 @@ impl GitRepo {
             let stderr = String::from_utf8_lossy(&output.stderr);
             anyhow::bail!(
                 "git worktree remove failed with exit code {:?}: {}",
+                output.status.code(),
+                stderr
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Removes a worktree forcefully, handling stale or locked worktrees
+    ///
+    /// This is useful when a worktree is locked or stale from a previous minion session.
+    /// It uses the `--force` flag to bypass checks for locks, but will refuse to remove
+    /// a worktree with uncommitted changes to prevent data loss.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The bare repository doesn't exist
+    /// - The worktree has uncommitted changes (safety check)
+    /// - The worktree removal fails
+    pub fn cleanup_worktree_force(&self, worktree_path: &Path) -> Result<()> {
+        if !self.bare_path.exists() {
+            anyhow::bail!(
+                "Bare repository does not exist at {}",
+                self.bare_path.display()
+            );
+        }
+
+        // Safety check: refuse to force-remove worktree with uncommitted changes
+        // First check if this is a valid git worktree
+        if worktree_path.exists() {
+            let is_worktree = Command::new("git")
+                .arg("-C")
+                .arg(worktree_path)
+                .arg("rev-parse")
+                .arg("--is-inside-work-tree")
+                .output();
+
+            // If it's a valid worktree, check for uncommitted changes
+            if let Ok(output) = is_worktree {
+                if output.status.success() {
+                    let status = Command::new("git")
+                        .arg("-C")
+                        .arg(worktree_path)
+                        .arg("status")
+                        .arg("--porcelain")
+                        .output();
+
+                    if let Ok(status_output) = status {
+                        if !status_output.stdout.is_empty() {
+                            anyhow::bail!(
+                                "Worktree at {} has uncommitted changes. Refusing to force-remove. \
+                                 Commit or stash changes first.",
+                                worktree_path.display()
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&self.bare_path)
+            .arg("worktree")
+            .arg("remove")
+            .arg("--force")
+            .arg(worktree_path)
+            .output()
+            .context("Failed to execute git worktree remove --force")?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!(
+                "git worktree remove --force failed with exit code {:?}: {}",
                 output.status.code(),
                 stderr
             );
