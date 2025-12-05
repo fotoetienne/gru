@@ -15,7 +15,10 @@ pub struct Minion {
 /// Generates a unique Minion ID using a monotonic counter
 ///
 /// IDs are formatted as M<base36> where the counter is encoded in base36:
-/// M000, M001, M002, ..., M00Z, M010, ..., M0ZZ, M100, ...
+/// M000, M001, M002, ..., M00z, M010, ..., M0zz, M100, ...
+///
+/// Note: IDs use lowercase letters (a-z) for improved readability. Legacy IDs
+/// from earlier versions may contain uppercase letters (A-Z) for counter values 10-35.
 ///
 /// The counter is stored in `~/.gru/state/next_id.txt` and uses file locking
 /// to ensure thread-safety and atomicity.
@@ -108,7 +111,7 @@ pub fn generate_minion_id() -> io::Result<String> {
 
 /// Converts a number to base36 with minimum 3 digits (padded with zeros)
 fn to_base36(mut num: u64) -> String {
-    const DIGITS: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    const DIGITS: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyz";
 
     if num == 0 {
         return "000".to_string();
@@ -140,11 +143,11 @@ mod tests {
         assert_eq!(to_base36(0), "000");
         assert_eq!(to_base36(1), "001");
         assert_eq!(to_base36(2), "002");
-        assert_eq!(to_base36(10), "00A");
-        assert_eq!(to_base36(35), "00Z");
+        assert_eq!(to_base36(10), "00a");
+        assert_eq!(to_base36(35), "00z");
         assert_eq!(to_base36(36), "010");
-        assert_eq!(to_base36(71), "01Z");
-        assert_eq!(to_base36(1295), "0ZZ");
+        assert_eq!(to_base36(71), "01z");
+        assert_eq!(to_base36(1295), "0zz");
         assert_eq!(to_base36(1296), "100");
     }
 
@@ -162,9 +165,16 @@ mod tests {
         let id = generate_minion_id().unwrap();
         assert!(id.starts_with("M"));
         assert!(id.len() >= 4); // M + at least 3 digits
-                                // Check that all characters after M are valid base36
+                                // Check that all characters after M are valid lowercase base36
         for c in id.chars().skip(1) {
             assert!(c.is_ascii_alphanumeric());
+            if c.is_ascii_alphabetic() {
+                assert!(
+                    c.is_ascii_lowercase(),
+                    "Minion ID should only contain lowercase letters, found: {}",
+                    c
+                );
+            }
         }
     }
 

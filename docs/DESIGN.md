@@ -263,7 +263,7 @@ Minion M43  =  Claude Code session in worktree ~/.gru/work/owner/repo/M43
 use chrono::{DateTime, Utc};
 
 struct Minion {
-    id: String,              // Base36: "M001", "M002", ..., "M0ZZ"
+    id: String,              // Base36: "M001", "M002", ..., "M0zz"
     lab_id: String,          // hostname of Lab
     repo: String,            // "owner/repo"
     issue_number: i32,       // 123

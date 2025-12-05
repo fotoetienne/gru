@@ -1350,13 +1350,13 @@ After exhausting retries:
 - Only escalates when truly stuck
 
 **Minion ID format:**
-- Sequential base36 with padding: `M001`, `M002`, ..., `M00Z`, `M010`, ..., `MZZZ`
+- Sequential base36 with padding: `M001`, `M002`, ..., `M00z`, `M010`, ..., `Mzzz`
 - Compact, human-readable, sortable
 - Monotonic counter stored in `~/.gru/state/next_id.txt`
 
 **Branch management:**
 - Format: `<type>/issue<number>-<slug>-<minion-id>`
-- Examples: `feat/issue123-add-user-auth-M007`, `fix/issue456-memory-leak-M00A`
+- Examples: `feat/issue123-add-user-auth-M007`, `fix/issue456-memory-leak-M00a`
 - Type prefix derived from issue labels (bug→fix, enhancement→feat, documentation→docs, etc.)
 - Slug: first 4 words of issue title, lowercased, hyphenated
 - Branches from repository default branch (main/master/develop, detected via API)

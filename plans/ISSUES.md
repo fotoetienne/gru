@@ -422,7 +422,7 @@ Generate semantic branch names based on issue type and title.
 3. Format: `<type>/issue<number>-<slug>-<minion-id>`
 4. Examples:
    - `feat/issue123-add-user-auth-M007`
-   - `fix/issue456-memory-leak-M00A`
+   - `fix/issue456-memory-leak-M00a`
 5. Sanitize special characters from slug
 
 **Acceptance Criteria:**
