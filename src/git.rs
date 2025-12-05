@@ -186,6 +186,65 @@ impl GitRepo {
         Ok(())
     }
 
+    /// Creates a worktree for an existing branch
+    /// Unlike create_worktree, this checks out an existing branch instead of creating a new one
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The bare repository doesn't exist
+    /// - The branch name is invalid or doesn't exist
+    /// - The worktree path already exists
+    /// - Git worktree creation fails
+    pub fn checkout_worktree(&self, branch_name: &str, worktree_path: &Path) -> Result<()> {
+        // Validate branch name
+        validate_branch_name(branch_name)?;
+
+        // Ensure the bare repository exists first
+        if !self.bare_path.exists() {
+            anyhow::bail!(
+                "Bare repository does not exist at {}. Call ensure_bare_clone() first.",
+                self.bare_path.display()
+            );
+        }
+
+        // Check if worktree path already exists
+        if worktree_path.exists() {
+            anyhow::bail!(
+                "Path already exists: {}. Remove it first or choose a different path.",
+                worktree_path.display()
+            );
+        }
+
+        // Create parent directory if it doesn't exist
+        if let Some(parent) = worktree_path.parent() {
+            std::fs::create_dir_all(parent)
+                .context("Failed to create parent directory for worktree")?;
+        }
+
+        // Create the worktree for an existing branch (no -b flag)
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&self.bare_path)
+            .arg("worktree")
+            .arg("add")
+            .arg(worktree_path)
+            .arg(branch_name)
+            .output()
+            .context("Failed to execute git worktree add")?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!(
+                "git worktree add failed with exit code {:?}: {}",
+                output.status.code(),
+                stderr
+            );
+        }
+
+        Ok(())
+    }
+
     /// Removes a worktree
     ///
     /// # Errors

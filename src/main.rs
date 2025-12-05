@@ -167,14 +167,17 @@ fn validate_pr_format(pr: &str) -> Result<()> {
     );
 }
 
-/// Extracts owner, repo, and PR number from a PR argument
+/// Extracts owner, repo, PR number, and branch name from a PR argument
 /// Supports both plain PR numbers and GitHub URLs
-fn parse_pr_info(pr: &str) -> Result<(Option<String>, Option<String>, String)> {
+/// For plain numbers, fetches metadata from GitHub to get branch info
+async fn parse_pr_info(pr: &str) -> Result<(String, String, String, String)> {
     // First validate the format
     validate_pr_format(pr)?;
 
-    // Check if it's a GitHub URL
-    if pr.starts_with("https://github.com/") {
+    // Extract PR number
+    let pr_num = if pr.parse::<u32>().is_ok() {
+        pr.to_string()
+    } else if pr.starts_with("https://github.com/") {
         // Strip query parameters and fragments
         let url = pr
             .split('?')
@@ -192,15 +195,46 @@ fn parse_pr_info(pr: &str) -> Result<(Option<String>, Option<String>, String)> {
             .collect();
 
         // parts[0] = owner, parts[1] = repo, parts[2] = "pull", parts[3] = number
-        let owner = parts[0].to_string();
-        let repo = parts[1].to_string();
-        let pr_num = parts[3].to_string();
-
-        Ok((Some(owner), Some(repo), pr_num))
+        parts[3].to_string()
     } else {
-        // Plain PR number - no owner/repo info
-        Ok((None, None, pr.to_string()))
+        anyhow::bail!("Invalid PR format");
+    };
+
+    // Fetch PR metadata from GitHub to get branch and repo info
+    let output = Command::new("gh")
+        .args([
+            "pr",
+            "view",
+            &pr_num,
+            "--json",
+            "headRefName,headRepository,headRepositoryOwner",
+        ])
+        .output()
+        .await
+        .context("Failed to execute gh pr view")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("Failed to fetch PR metadata: {}", stderr);
     }
+
+    let json: serde_json::Value = serde_json::from_str(&String::from_utf8_lossy(&output.stdout))
+        .context("Failed to parse PR metadata JSON")?;
+
+    let branch = json["headRefName"]
+        .as_str()
+        .context("Missing branch name in PR metadata")?
+        .to_string();
+    let repo = json["headRepository"]["name"]
+        .as_str()
+        .context("Missing repo name in PR metadata")?
+        .to_string();
+    let owner = json["headRepositoryOwner"]["login"]
+        .as_str()
+        .context("Missing owner in PR metadata")?
+        .to_string();
+
+    Ok((owner, repo, pr_num, branch))
 }
 
 /// Extracts owner, repo, and issue number from an issue argument
@@ -431,125 +465,78 @@ async fn handle_fix(issue: &str, quiet: bool) -> Result<i32> {
     Ok(status.code().unwrap_or(128))
 }
 
-/// Handles the review command by delegating to the Claude CLI
+/// Handles the review command by setting up workspace and delegating to the Claude CLI
 /// Returns the exit code from the claude process
 async fn handle_review(pr: &str) -> Result<i32> {
-    // Parse PR information
-    let (owner_opt, repo_opt, pr_num) = parse_pr_info(pr)?;
+    // Parse PR information and fetch metadata from GitHub
+    let (owner, repo, pr_num, branch) = parse_pr_info(pr).await?;
 
-    // Check if we have full repo information for workspace creation
-    let worktree_path_opt = if let (Some(_owner), Some(_repo)) = (owner_opt, repo_opt) {
-        // Full URL provided - fetch PR details and create workspace
-        println!("🔍 Fetching PR details from GitHub...");
+    println!(
+        "🔍 Setting up workspace for {}/{}#{} (branch: {})",
+        owner, repo, pr_num, branch
+    );
 
-        // Fetch PR metadata: branch name, repo info
-        let output = Command::new("gh")
-            .args([
-                "pr",
-                "view",
-                &pr_num,
-                "--json",
-                "headRefName,headRepository,headRepositoryOwner",
-            ])
-            .output()
-            .await
-            .context("Failed to execute gh command. Is GitHub CLI installed?")?;
+    // Initialize workspace
+    let workspace = workspace::Workspace::new().context("Failed to initialize Gru workspace")?;
 
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            anyhow::bail!(
-                "Failed to fetch PR details: {}",
-                if stderr.is_empty() {
-                    "Unknown error"
-                } else {
-                    stderr.as_ref()
-                }
-            );
-        }
+    // Create bare repository path
+    let bare_path = workspace.repos().join(&owner).join(format!("{}.git", repo));
+    let git_repo = git::GitRepo::new(&owner, &repo, bare_path.clone());
 
-        let json_str =
-            String::from_utf8(output.stdout).context("GitHub CLI returned invalid UTF-8")?;
-        let json: serde_json::Value =
-            serde_json::from_str(&json_str).context("Failed to parse GitHub CLI JSON response")?;
+    // Ensure bare repository is cloned/updated
+    println!("📦 Ensuring repository is cloned...");
+    git_repo.ensure_bare_clone().context(format!(
+        "Failed to clone or update repository for PR {}",
+        pr_num
+    ))?;
 
-        let branch = json["headRefName"]
-            .as_str()
-            .context("Missing headRefName in PR response")?;
-        let pr_repo = json["headRepository"]["name"]
-            .as_str()
-            .context("Missing repository name in PR response")?;
-        let pr_owner = json["headRepositoryOwner"]["login"]
-            .as_str()
-            .context("Missing repository owner in PR response")?;
+    // Fetch the specific PR branch to ensure it's available locally
+    println!("🔄 Fetching PR branch: {}", branch);
+    let fetch_output = Command::new("git")
+        .arg("-C")
+        .arg(&bare_path)
+        .arg("fetch")
+        .arg("origin")
+        .arg(format!("{}:{}", branch, branch))
+        .output()
+        .await
+        .context("Failed to execute git fetch for PR branch")?;
 
-        println!(
-            "🚀 Setting up workspace for {}/{}#{}",
-            pr_owner, pr_repo, pr_num
-        );
-
-        // Initialize workspace
-        let workspace =
-            workspace::Workspace::new().context("Failed to initialize Gru workspace")?;
-
-        // Create bare repository path
-        let bare_path = workspace
-            .repos()
-            .join(pr_owner)
-            .join(format!("{}.git", pr_repo));
-        let git_repo = git::GitRepo::new(pr_owner, pr_repo, bare_path);
-
-        // Ensure bare repository is cloned/updated
-        println!("📦 Ensuring repository is cloned...");
-        git_repo
-            .ensure_bare_clone()
-            .context("Failed to clone or update repository")?;
-
-        // Create worktree path using the PR branch name
-        let repo_name = format!("{}/{}", pr_owner, pr_repo);
-        let worktree_path = workspace
-            .work_dir(&repo_name, branch)
-            .context("Failed to compute worktree path")?;
-
-        // Create worktree if it doesn't exist, otherwise reuse it
-        if !worktree_path.exists() {
-            println!("🌿 Creating worktree for branch: {}", branch);
-            git_repo
-                .create_worktree(branch, &worktree_path)
-                .context("Failed to create worktree")?;
-        } else {
-            println!("📂 Using existing worktree: {}", worktree_path.display());
-        }
-
-        println!("🤖 Launching agent for PR review...\n");
-
-        Some(worktree_path)
-    } else {
-        // Plain PR number - use simple mode without workspace
-        println!("⚠️  No repository URL provided. Using simple mode without workspace management.");
-        println!(
-            "   For full workspace support, use: gru review https://github.com/owner/repo/pull/{}\n",
-            pr_num
-        );
-        None
-    };
-
-    // Build the command
-    let mut cmd = Command::new("claude");
-    cmd.arg("--print")
-        .arg(format!("/pr_review {}", pr_num))
-        .stdin(std::process::Stdio::inherit())
-        .stdout(std::process::Stdio::inherit())
-        .stderr(std::process::Stdio::inherit());
-
-    // If we have a worktree, set the working directory
-    if let Some(ref path) = worktree_path_opt {
-        cmd.current_dir(path);
+    if !fetch_output.status.success() {
+        let stderr = String::from_utf8_lossy(&fetch_output.stderr);
+        anyhow::bail!("Failed to fetch PR branch '{}': {}", branch, stderr);
     }
 
-    // Execute the command
-    let status = cmd.status().await.context(
-        "claude command not found. Install from: https://github.com/anthropics/claude-code",
-    )?;
+    // Create worktree path based on branch name
+    let repo_name = format!("{}/{}", owner, repo);
+    let worktree_path = workspace
+        .work_dir(&repo_name, &branch)
+        .context("Failed to compute worktree path")?;
+
+    // Create worktree if it doesn't exist, or reuse existing one
+    if !worktree_path.exists() {
+        println!("🌿 Creating worktree for branch: {}", branch);
+        git_repo
+            .checkout_worktree(&branch, &worktree_path)
+            .context(format!("Failed to checkout worktree for PR {}", pr_num))?;
+    } else {
+        println!("📂 Using existing worktree: {}", worktree_path.display());
+    }
+
+    println!("🤖 Launching agent for PR review...\n");
+
+    // Execute the claude CLI with the /pr_review command in the worktree
+    let status = Command::new("claude")
+        .arg(format!("/pr_review {}", pr))
+        .current_dir(&worktree_path)
+        .stdin(std::process::Stdio::inherit())
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit())
+        .status()
+        .await
+        .context(
+            "claude command not found. Install from: https://github.com/anthropics/claude-code",
+        )?;
 
     // Return the exit code from the claude process
     // Use 128 for signal terminations to follow shell conventions
