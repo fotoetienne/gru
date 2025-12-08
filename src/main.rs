@@ -176,7 +176,23 @@ fn parse_issue_from_branch(branch: &str) -> String {
 /// Determines if a Minion is Active or Idle based on git index modification time
 /// A Minion is considered Active if the git index was modified in the last 5 minutes
 fn determine_status(worktree_path: &std::path::Path) -> Result<String> {
-    let git_index = worktree_path.join(".git").join("index");
+    // Use git rev-parse to get the actual git directory path
+    // In worktrees, .git is a file, not a directory
+    let git_dir_output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(worktree_path)
+        .arg("rev-parse")
+        .arg("--git-dir")
+        .output()?;
+
+    if !git_dir_output.status.success() {
+        return Ok("Idle".to_string());
+    }
+
+    let git_dir = String::from_utf8_lossy(&git_dir_output.stdout)
+        .trim()
+        .to_string();
+    let git_index = std::path::PathBuf::from(git_dir).join("index");
 
     if !git_index.exists() {
         return Ok("Idle".to_string());
@@ -210,8 +226,10 @@ fn calculate_uptime(worktree_path: &std::path::Path) -> Result<String> {
         Ok(format!("{}d", days))
     } else if hours > 0 {
         Ok(format!("{}h", hours))
-    } else {
+    } else if minutes > 0 {
         Ok(format!("{}m", minutes))
+    } else {
+        Ok("< 1m".to_string())
     }
 }
 
@@ -244,7 +262,7 @@ fn handle_status() -> Result<i32> {
     }
 
     println!();
-    println!("{} active Minion(s)", minions.len());
+    println!("{} Minion(s) found", minions.len());
 
     Ok(0)
 }
@@ -430,11 +448,19 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_worktrees_empty_workspace() {
-        // This test verifies that scan_worktrees returns an empty vector
-        // when the workspace directory doesn't exist or is empty
-        // Note: This is a basic test - a more thorough test would use a temporary directory
+    fn test_scan_worktrees_returns_valid_vec() {
+        // This test verifies that scan_worktrees succeeds and returns a valid vector
+        // Note: A more thorough test would use a temporary directory with known contents
         let result = scan_worktrees();
         assert!(result.is_ok());
+
+        // Verify we get a vector and all minions have required fields
+        let minions = result.unwrap();
+        for minion in &minions {
+            assert!(!minion.minion_id.is_empty());
+            assert!(!minion.repo_name.is_empty());
+            assert!(!minion.status.is_empty());
+            assert!(!minion.uptime.is_empty());
+        }
     }
 }
