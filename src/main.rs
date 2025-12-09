@@ -33,6 +33,13 @@ enum Commands {
     Fix {
         #[arg(help = "Issue number or URL to fix")]
         issue: String,
+
+        #[arg(
+            short,
+            long,
+            help = "Maximum duration for the task (e.g., '10s', '5m', '1h'). Exits with error if exceeded."
+        )]
+        timeout: Option<String>,
     },
     #[command(about = "Review a GitHub pull request")]
     Review {
@@ -68,7 +75,7 @@ async fn main() {
     let cli = Cli::parse();
 
     let result = match cli.command {
-        Commands::Fix { issue } => fix::handle_fix(&issue, cli.quiet).await,
+        Commands::Fix { issue, timeout } => fix::handle_fix(&issue, timeout, cli.quiet).await,
         Commands::Review { pr } => review::handle_review(&pr).await,
         Commands::Path {
             minion_id,
