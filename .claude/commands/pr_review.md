@@ -16,6 +16,28 @@ Review a GitHub pull request: fetch details, analyze changes, and provide feedba
 - Use `gh pr view $ARGUMENTS --json headRefName` to get the branch name
 - Use `gh pr view $ARGUMENTS` to get the PR title, body, and metadata
 - Use `gh pr view $ARGUMENTS --json files` to get a quick overview of changed files
+- **Do NOT use `git checkout`. Always use worktrees:**
+  - Determine the repository owner and name from the git remote
+  - Derive paths:
+    - Bare repo: `~/.gru/repos/owner/repo.git/`
+    - Worktree: `~/.gru/work/owner/repo/<branch-name>`
+  - **Check if branch is already checked out in a worktree:**
+    1. Run `git -C ~/.gru/repos/owner/repo.git worktree list --porcelain` to list all worktrees
+    2. Parse output to find if `<branch-name>` is checked out (look for line: `branch refs/heads/<branch-name>`)
+    3. If found, extract the worktree path (line starting with `worktree `)
+  - **If worktree exists:**
+    - Use the existing worktree path
+    - Optionally run `git -C <worktree-path> pull` to update it
+    - Inform user: "Using existing worktree at <worktree-path>"
+  - **If no worktree exists:**
+    - Ensure bare repo exists at `~/.gru/repos/owner/repo.git/`
+      - If not, create it: `git clone --bare <remote-url> ~/.gru/repos/owner/repo.git`
+    - Fetch the PR branch: `git -C ~/.gru/repos/owner/repo.git fetch origin <branch-name>:<branch-name>`
+    - Create worktree:
+      ```
+      git -C ~/.gru/repos/owner/repo.git worktree add ~/.gru/work/owner/repo/<branch-name> <branch-name>
+      ```
+    - Inform user: "Created new worktree at <worktree-path>"
 - Fetch existing review comments: `gh api repos/{owner}/{repo}/pulls/{pr#}/comments`
 - Understand the scope and intent of the PR, and any prior discussion
 - If this PR is addressing an Issue, read Issue details to understand the problem and context. Does this PR address the issue completely? Are there any missing details or assumptions?
