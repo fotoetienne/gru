@@ -20,8 +20,7 @@ pub async fn handle_review(pr: &str) -> Result<i32> {
 
     // Create bare repository path
     let bare_path = workspace.repos().join(&owner).join(format!("{}.git", repo));
-    // Clone bare_path here since GitRepo::new takes ownership, but we need it later for git fetch
-    let git_repo = git::GitRepo::new(&owner, &repo, bare_path.clone());
+    let git_repo = git::GitRepo::new(&owner, &repo, bare_path);
 
     // Ensure bare repository is cloned/updated
     println!("📦 Ensuring repository is cloned...");
@@ -32,36 +31,34 @@ pub async fn handle_review(pr: &str) -> Result<i32> {
 
     // Fetch the specific PR branch to ensure it's available locally
     println!("🔄 Fetching PR branch: {}", branch);
-    let fetch_output = Command::new("git")
-        .arg("-C")
-        .arg(&bare_path)
-        .arg("fetch")
-        .arg("origin")
-        .arg(format!("{}:{}", branch, branch))
-        .output()
-        .await
-        .context("Failed to execute git fetch for PR branch")?;
+    git_repo
+        .fetch_branch(&branch)
+        .context(format!("Failed to fetch PR branch '{}'", branch))?;
 
-    if !fetch_output.status.success() {
-        let stderr = String::from_utf8_lossy(&fetch_output.stderr);
-        anyhow::bail!("Failed to fetch PR branch '{}': {}", branch, stderr);
-    }
+    // Check if a worktree already exists for this branch
+    let worktree_path = if let Some(existing_path) = git_repo
+        .find_worktree_for_branch(&branch)
+        .context("Failed to check for existing worktree")?
+    {
+        println!(
+            "♻️  Reusing existing worktree at: {}",
+            existing_path.display()
+        );
+        existing_path
+    } else {
+        // No existing worktree, create a new one
+        let repo_name = format!("{}/{}", owner, repo);
+        let new_worktree_path = workspace
+            .work_dir(&repo_name, &branch)
+            .context("Failed to compute worktree path")?;
 
-    // Create worktree path based on branch name
-    let repo_name = format!("{}/{}", owner, repo);
-    let worktree_path = workspace
-        .work_dir(&repo_name, &branch)
-        .context("Failed to compute worktree path")?;
-
-    // Create worktree if it doesn't exist, or reuse existing one
-    if !worktree_path.exists() {
         println!("🌿 Creating worktree for branch: {}", branch);
         git_repo
-            .checkout_worktree(&branch, &worktree_path)
+            .checkout_worktree(&branch, &new_worktree_path)
             .context(format!("Failed to checkout worktree for PR {}", pr_num))?;
-    } else {
-        println!("📂 Using existing worktree: {}", worktree_path.display());
-    }
+
+        new_worktree_path
+    };
 
     println!("🤖 Launching agent for PR review...\n");
 

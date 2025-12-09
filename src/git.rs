@@ -592,59 +592,6 @@ impl GitRepo {
         Ok(())
     }
 
-    /// Checks if a worktree exists for a given branch
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if:
-    /// - The bare repository doesn't exist
-    /// - The git worktree list command fails
-    pub fn worktree_exists(&self, branch_name: &str) -> Result<Option<PathBuf>> {
-        if !self.bare_path.exists() {
-            anyhow::bail!(
-                "Bare repository does not exist at {}",
-                self.bare_path.display()
-            );
-        }
-
-        let output = Command::new("git")
-            .arg("-C")
-            .arg(&self.bare_path)
-            .arg("worktree")
-            .arg("list")
-            .arg("--porcelain")
-            .output()
-            .context("Failed to execute git worktree list")?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            anyhow::bail!(
-                "git worktree list failed with exit code {:?}: {}",
-                output.status.code(),
-                stderr
-            );
-        }
-
-        let output_str = String::from_utf8_lossy(&output.stdout);
-
-        // Parse the porcelain output to find a worktree with the matching branch
-        let mut current_worktree: Option<PathBuf> = None;
-
-        for line in output_str.lines() {
-            if line.starts_with("worktree ") {
-                current_worktree = Some(PathBuf::from(line.trim_start_matches("worktree ")));
-            } else if line.starts_with("branch ") {
-                let branch = line.trim_start_matches("branch refs/heads/");
-                if branch == branch_name {
-                    return Ok(current_worktree);
-                }
-                current_worktree = None;
-            }
-        }
-
-        Ok(None)
-    }
-
     /// Fetches the latest changes for a branch in the bare repository
     /// This is useful for updating an existing worktree's branch before checking it out
     ///
@@ -652,19 +599,17 @@ impl GitRepo {
     ///
     /// Returns an error if:
     /// - The bare repository doesn't exist
-    /// - The branch name contains invalid characters
+    /// - The branch name is invalid
     /// - The git fetch command fails
     pub fn fetch_branch(&self, branch_name: &str) -> Result<()> {
+        // Validate branch name using existing comprehensive validation
+        validate_branch_name(branch_name)?;
+
         if !self.bare_path.exists() {
             anyhow::bail!(
                 "Bare repository does not exist at {}",
                 self.bare_path.display()
             );
-        }
-
-        // Validate branch name to prevent issues with git refspec
-        if branch_name.is_empty() || branch_name.contains('\0') || branch_name.contains(':') {
-            anyhow::bail!("Invalid branch name for fetch: {}", branch_name);
         }
 
         // Fetch the specific branch
@@ -680,9 +625,11 @@ impl GitRepo {
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             anyhow::bail!(
-                "git fetch failed with exit code {:?}: {}",
+                "Failed to fetch branch '{}' from origin in repository {}: git fetch exited with code {:?}: {}",
+                branch_name,
+                self.bare_path.display(),
                 output.status.code(),
-                stderr
+                stderr.trim()
             );
         }
 
