@@ -321,7 +321,7 @@ impl GitRepo {
     ///
     /// If the branch already exists (from a previous minion), it will check it out.
     /// If the branch doesn't exist, it will be created based on the repository's default
-    /// branch (origin/main or origin/master).
+    /// branch (as determined by querying the remote, e.g., origin/main, origin/master, origin/develop, origin/trunk, etc.).
     /// If git reports that the worktree is already checked out elsewhere, this will fail
     /// with an error (respecting git's internal locking).
     ///
