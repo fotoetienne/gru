@@ -251,13 +251,16 @@ impl GitRepo {
 
     /// Determines the default branch to use as base for new worktrees
     ///
-    /// Tries common default branch names defined in [`DEFAULT_BRANCHES`]
+    /// Queries the remote repository to discover the actual default branch dynamically.
+    /// This works with any default branch name (main, master, develop, trunk, etc.).
+    ///
+    /// Falls back to [`DEFAULT_BRANCHES`] if remote query fails.
     ///
     /// # Errors
     ///
     /// Returns an error if:
     /// - The bare repository doesn't exist
-    /// - None of the common default branches exist
+    /// - Remote query fails and fallback branches don't exist
     fn get_base_branch(&self) -> Result<String> {
         if !self.bare_path.exists() {
             anyhow::bail!(
@@ -266,7 +269,31 @@ impl GitRepo {
             );
         }
 
-        // Try common default branch names in order
+        // Query the remote to discover the default branch
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&self.bare_path)
+            .arg("ls-remote")
+            .arg("--symref")
+            .arg("origin")
+            .arg("HEAD")
+            .output()
+            .context("Failed to query remote for default branch")?;
+
+        if output.status.success() {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            // Parse: "ref: refs/heads/main\tHEAD"
+            if let Some(line) = stdout.lines().next() {
+                if let Some(ref_path) = line
+                    .strip_prefix("ref: refs/heads/")
+                    .and_then(|s| s.split('\t').next())
+                {
+                    return Ok(format!("origin/{}", ref_path));
+                }
+            }
+        }
+
+        // Fallback to trying common default branch names
         for branch in DEFAULT_BRANCHES {
             let check = Command::new("git")
                 .arg("-C")
@@ -283,8 +310,8 @@ impl GitRepo {
         }
 
         anyhow::bail!(
-            "Could not find default branch. Tried: {}. \
-             Ensure the repository has been fetched with ensure_bare_clone().",
+            "Could not determine default branch from remote and fallback branches not found. \
+             Tried: {}. Ensure the repository has been fetched with ensure_bare_clone().",
             DEFAULT_BRANCHES.join(", ")
         )
     }
