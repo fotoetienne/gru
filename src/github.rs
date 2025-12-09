@@ -15,16 +15,15 @@ pub struct GitHubClient {
 
 #[allow(dead_code)]
 impl GitHubClient {
-    /// Initialize a new GitHub client with token from environment
+    /// Initialize a new GitHub client with the provided token
     ///
-    /// Reads `GRU_GITHUB_TOKEN` from environment variables.
-    /// Returns an error if the token is missing or invalid.
-    pub fn new() -> Result<Self> {
-        let token = env::var("GRU_GITHUB_TOKEN")
-            .context("GRU_GITHUB_TOKEN environment variable not set")?;
-
+    /// # Arguments
+    /// * `token` - GitHub personal access token
+    ///
+    /// Returns an error if the token is empty or invalid.
+    pub fn new(token: String) -> Result<Self> {
         if token.is_empty() {
-            return Err(anyhow!("GRU_GITHUB_TOKEN is empty"));
+            return Err(anyhow!("GitHub token is empty"));
         }
 
         let client = Octocrab::builder()
@@ -33,6 +32,17 @@ impl GitHubClient {
             .context("Failed to build GitHub client")?;
 
         Ok(Self { client })
+    }
+
+    /// Initialize a new GitHub client with token from environment
+    ///
+    /// Reads `GRU_GITHUB_TOKEN` from environment variables.
+    /// Returns an error if the token is missing or invalid.
+    pub fn from_env() -> Result<Self> {
+        let token = env::var("GRU_GITHUB_TOKEN")
+            .context("GRU_GITHUB_TOKEN environment variable not set")?;
+
+        Self::new(token)
     }
 
     /// Fetch issue details
@@ -145,18 +155,33 @@ impl GitHubClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     // Octocrab API Client Tests
     #[test]
-    fn test_new_without_token() {
-        // Save original token if present
-        let original_token = env::var("GRU_GITHUB_TOKEN").ok();
+    fn test_new_with_empty_token() {
+        // Should fail with empty token
+        let result = GitHubClient::new(String::new());
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("empty"));
+    }
 
-        // Remove token
+    #[tokio::test]
+    async fn test_new_with_valid_token() {
+        // Should succeed with valid token format
+        let result = GitHubClient::new("ghp_test123".to_string());
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    #[serial]
+    fn test_from_env_without_token() {
+        // Save and remove the token
+        let original_token = env::var("GRU_GITHUB_TOKEN").ok();
         env::remove_var("GRU_GITHUB_TOKEN");
 
         // Should fail with missing token
-        let result = GitHubClient::new();
+        let result = GitHubClient::from_env();
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("GRU_GITHUB_TOKEN"));
 
@@ -166,33 +191,12 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_new_with_empty_token() {
-        // Save original token if present
-        let original_token = env::var("GRU_GITHUB_TOKEN").ok();
-
-        // Set empty token
-        env::set_var("GRU_GITHUB_TOKEN", "");
-
-        // Should fail with empty token
-        let result = GitHubClient::new();
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("empty"));
-
-        // Restore original token if it existed
-        if let Some(token) = original_token {
-            env::set_var("GRU_GITHUB_TOKEN", token);
-        } else {
-            env::remove_var("GRU_GITHUB_TOKEN");
-        }
-    }
-
     // Integration tests that require a real GitHub token
     // Run with: cargo test github_client -- --ignored
     #[tokio::test]
     #[ignore]
     async fn test_get_issue() {
-        let client = GitHubClient::new().expect("Failed to create client");
+        let client = GitHubClient::from_env().expect("Failed to create client");
 
         // Test against a known public issue
         let issue = client
@@ -206,7 +210,7 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn test_post_comment() {
-        let client = GitHubClient::new().expect("Failed to create client");
+        let client = GitHubClient::from_env().expect("Failed to create client");
 
         // This test requires write access to a repository
         // You should replace these with your own test repo details
@@ -226,7 +230,7 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn test_add_and_remove_label() {
-        let client = GitHubClient::new().expect("Failed to create client");
+        let client = GitHubClient::from_env().expect("Failed to create client");
 
         // This test requires write access to a repository
         let owner = "your-username";
