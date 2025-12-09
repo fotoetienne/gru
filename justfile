@@ -29,6 +29,10 @@ test-verbose:
 lint:
     cargo clippy --all-targets -- -D warnings
 
+# Automatically fix clippy lints where possible
+fix-clippy:
+    cargo clippy --all-targets --fix --allow-dirty --allow-staged
+
 # Format code
 fmt:
     cargo fmt --all

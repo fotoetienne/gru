@@ -8,6 +8,8 @@ Review a GitHub pull request: fetch details, analyze changes, and provide feedba
 
 **Pull Request:** $ARGUMENTS
 
+**Note:** This command assumes you're already in the PR's worktree directory. Use `gru review <pr#>` (with a full GitHub URL) to automatically handle workspace setup.
+
 **Workflow:**
 
 ## 1. Fetch PR Details
@@ -53,7 +55,7 @@ Review a GitHub pull request: fetch details, analyze changes, and provide feedba
   - Test coverage
 
 ## 3. Provide Feedback
-- Summarize what the PR does
+- Summarize what the PR does (Be Concise. Don't give unnecessary praise. Focus on the most important points.)
 - List any issues found (bugs, security concerns, style problems)
 - Suggest improvements if applicable
 - Give an overall assessment (approve, request changes, or needs discussion)
