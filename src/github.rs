@@ -172,6 +172,23 @@ mod tests {
         assert!(result.is_ok());
     }
 
+    #[test]
+    fn test_from_env_without_token() {
+        // Save and remove the token
+        let original_token = env::var("GRU_GITHUB_TOKEN").ok();
+        env::remove_var("GRU_GITHUB_TOKEN");
+
+        // Should fail with missing token
+        let result = GitHubClient::from_env();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("GRU_GITHUB_TOKEN"));
+
+        // Restore original token if it existed
+        if let Some(token) = original_token {
+            env::set_var("GRU_GITHUB_TOKEN", token);
+        }
+    }
+
     // Integration tests that require a real GitHub token
     // Run with: cargo test github_client -- --ignored
     #[tokio::test]
