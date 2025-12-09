@@ -664,6 +664,56 @@ impl GitRepo {
 
         Ok(())
     }
+
+    /// Fetches the latest changes for a branch in the bare repository
+    /// This is useful for updating an existing worktree's branch before checking it out
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The bare repository doesn't exist
+    /// - The branch name is invalid
+    /// - The git fetch command fails
+    pub fn fetch_branch(&self, branch_name: &str) -> Result<()> {
+        // Validate branch name using existing comprehensive validation
+        validate_branch_name(branch_name)?;
+
+        if !self.bare_path.exists() {
+            anyhow::bail!(
+                "Bare repository does not exist at {}",
+                self.bare_path.display()
+            );
+        }
+
+        // Fetch the specific branch with explicit refspec
+        // +refs/heads/branch:refs/heads/branch ensures we:
+        // 1. Fetch from the remote's refs/heads/branch
+        // 2. Update the local refs/heads/branch (even if non-fast-forward due to +)
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&self.bare_path)
+            .arg("fetch")
+            .arg("origin")
+            .arg(format!(
+                "+refs/heads/{}:refs/heads/{}",
+                branch_name, branch_name
+            ))
+            .output()
+            .context("Failed to execute git fetch")?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!(
+                "Failed to fetch branch '{}' from origin in repository {}: git fetch exited with code {:?}: {}",
+                branch_name,
+                self.bare_path.display(),
+                output.status.code(),
+                stderr.trim()
+            );
+        }
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
