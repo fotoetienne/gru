@@ -254,6 +254,7 @@ impl GitRepo {
             let line = line.trim();
 
             // Empty line indicates end of worktree entry - reset state
+            // Entries without branches (detached HEAD, bare repo) are intentionally skipped
             if line.is_empty() {
                 current_worktree = None;
                 continue;
@@ -265,8 +266,11 @@ impl GitRepo {
                 let branch_ref = line.trim_start_matches("branch ");
                 // Git worktree list --porcelain outputs branches in refs/heads/ format
                 if branch_ref == format!("refs/heads/{}", branch_name) {
-                    if let Some(worktree_path) = current_worktree.take() {
-                        return Ok(Some(worktree_path));
+                    match current_worktree {
+                        Some(worktree_path) => return Ok(Some(worktree_path)),
+                        None => anyhow::bail!(
+                            "Malformed git worktree list output: found branch entry without preceding worktree path"
+                        ),
                     }
                 }
             }
