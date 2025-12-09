@@ -155,6 +155,7 @@ impl GitHubClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     // Octocrab API Client Tests
     #[test]
@@ -173,6 +174,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_from_env_without_token() {
         // Save and remove the token
         let original_token = env::var("GRU_GITHUB_TOKEN").ok();
