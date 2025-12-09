@@ -612,13 +612,19 @@ impl GitRepo {
             );
         }
 
-        // Fetch the specific branch
+        // Fetch the specific branch with explicit refspec
+        // +refs/heads/branch:refs/heads/branch ensures we:
+        // 1. Fetch from the remote's refs/heads/branch
+        // 2. Update the local refs/heads/branch (even if non-fast-forward due to +)
         let output = Command::new("git")
             .arg("-C")
             .arg(&self.bare_path)
             .arg("fetch")
             .arg("origin")
-            .arg(format!("{}:{}", branch_name, branch_name))
+            .arg(format!(
+                "+refs/heads/{}:refs/heads/{}",
+                branch_name, branch_name
+            ))
             .output()
             .context("Failed to execute git fetch")?;
 
