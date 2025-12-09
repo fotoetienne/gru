@@ -24,10 +24,9 @@ pub async fn handle_review(pr: &str) -> Result<i32> {
 
     // Ensure bare repository is cloned/updated
     println!("📦 Ensuring repository is cloned...");
-    git_repo.ensure_bare_clone().context(format!(
-        "Failed to clone or update repository for PR {}",
-        pr_num
-    ))?;
+    git_repo
+        .ensure_bare_clone()
+        .with_context(|| format!("Failed to clone or update repository for PR {}", pr_num))?;
 
     // Check if a worktree already exists for this branch
     let worktree_path = if let Some(existing_path) = git_repo
@@ -44,7 +43,7 @@ pub async fn handle_review(pr: &str) -> Result<i32> {
         println!("🔄 Fetching PR branch: {}", branch);
         git_repo
             .fetch_branch(&branch)
-            .context(format!("Failed to fetch PR branch '{}'", branch))?;
+            .with_context(|| format!("Failed to fetch PR branch '{}'", branch))?;
 
         let repo_name = format!("{}/{}", owner, repo);
         let new_worktree_path = workspace
@@ -54,7 +53,7 @@ pub async fn handle_review(pr: &str) -> Result<i32> {
         println!("🌿 Creating worktree for branch: {}", branch);
         git_repo
             .checkout_worktree(&branch, &new_worktree_path)
-            .context(format!("Failed to checkout worktree for PR {}", pr_num))?;
+            .with_context(|| format!("Failed to checkout worktree for PR {}", pr_num))?;
 
         new_worktree_path
     };

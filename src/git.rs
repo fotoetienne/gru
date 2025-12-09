@@ -151,7 +151,7 @@ fn validate_branch_name(branch_name: &str) -> Result<()> {
 pub struct GitRepo {
     owner: String,
     repo: String,
-    pub(crate) bare_path: PathBuf,
+    bare_path: PathBuf,
 }
 
 #[allow(dead_code)]
