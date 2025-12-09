@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 /// - `repos`: Cloned Git repositories
 /// - `work`: Active working directories for minions
 /// - `archive`: Completed or archived minion workspaces
+/// - `state`: State files (e.g., minion ID counter)
 // Allow dead code for now - workspace module will be integrated in future issues
 #[allow(dead_code)]
 pub struct Workspace {
@@ -16,6 +17,7 @@ pub struct Workspace {
     repos: PathBuf,
     work: PathBuf,
     archive: PathBuf,
+    state: PathBuf,
 }
 
 #[allow(dead_code)]
@@ -41,8 +43,9 @@ impl Workspace {
         let repos = root.join("repos");
         let work = root.join("work");
         let archive = root.join("archive");
+        let state = root.join("state");
 
-        for dir in [&root, &repos, &work, &archive] {
+        for dir in [&root, &repos, &work, &archive, &state] {
             #[cfg(unix)]
             {
                 use std::os::unix::fs::DirBuilderExt;
@@ -62,6 +65,7 @@ impl Workspace {
             repos,
             work,
             archive,
+            state,
         })
     }
 
@@ -83,6 +87,11 @@ impl Workspace {
     /// Returns a reference to the archive directory path (`~/.gru/archive`).
     pub fn archive(&self) -> &Path {
         &self.archive
+    }
+
+    /// Returns a reference to the state directory path (`~/.gru/state`).
+    pub fn state(&self) -> &Path {
+        &self.state
     }
 
     /// Returns the working directory path for a specific repo and branch name.

@@ -1,6 +1,14 @@
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Seek, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+use once_cell::sync::Lazy;
+
+use crate::workspace::Workspace;
+
+/// Cached workspace instance for production state directory access.
+/// Initialized once on first use to avoid repeated directory creation checks.
+static WORKSPACE: Lazy<io::Result<Workspace>> = Lazy::new(Workspace::new);
 
 /// Represents a Minion workspace for working on a specific GitHub issue
 #[allow(dead_code)]
@@ -22,16 +30,26 @@ pub struct Minion {
 ///
 /// The counter is stored in `~/.gru/state/next_id.txt` and uses file locking
 /// to ensure thread-safety and atomicity.
+///
+/// # Arguments
+///
+/// * `state_dir` - Optional custom state directory path. If None, uses `~/.gru/state/`.
+///   This parameter is primarily for testing with isolated temp directories.
 #[allow(dead_code)]
-pub fn generate_minion_id() -> io::Result<String> {
-    let state_dir = dirs::data_local_dir()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Local data directory not found"))?
-        .join("gru")
-        .join("state");
+pub fn generate_minion_id_with_state(state_dir: Option<&Path>) -> io::Result<String> {
+    let state_path = if let Some(custom_dir) = state_dir {
+        // Test path: use provided directory and ensure it exists
+        fs::create_dir_all(custom_dir)?;
+        custom_dir.to_path_buf()
+    } else {
+        // Production path: use cached workspace (directory already created by Workspace::new)
+        let workspace = WORKSPACE.as_ref().map_err(|e| {
+            io::Error::new(e.kind(), format!("Failed to initialize workspace: {}", e))
+        })?;
+        workspace.state().to_path_buf()
+    };
 
-    fs::create_dir_all(&state_dir)?;
-
-    let counter_path = state_dir.join("next_id.txt");
+    let counter_path = state_path.join("next_id.txt");
 
     // Open or create the counter file with exclusive access
     let mut file = OpenOptions::new()
@@ -109,6 +127,14 @@ pub fn generate_minion_id() -> io::Result<String> {
     Ok(id)
 }
 
+/// Generates a unique Minion ID using the default production state directory.
+///
+/// This is a convenience wrapper around `generate_minion_id_with_state(None)`.
+#[allow(dead_code)]
+pub fn generate_minion_id() -> io::Result<String> {
+    generate_minion_id_with_state(None)
+}
+
 /// Converts a number to base36 with minimum 3 digits (padded with zeros)
 fn to_base36(mut num: u64) -> String {
     const DIGITS: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyz";
@@ -153,8 +179,9 @@ mod tests {
 
     #[test]
     fn test_unique_ids() {
-        let id1 = generate_minion_id().unwrap();
-        let id2 = generate_minion_id().unwrap();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let id1 = generate_minion_id_with_state(Some(temp_dir.path())).unwrap();
+        let id2 = generate_minion_id_with_state(Some(temp_dir.path())).unwrap();
         assert_ne!(id1, id2);
         assert!(id1.starts_with("M"));
         assert!(id2.starts_with("M"));
@@ -162,7 +189,8 @@ mod tests {
 
     #[test]
     fn test_id_format() {
-        let id = generate_minion_id().unwrap();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let id = generate_minion_id_with_state(Some(temp_dir.path())).unwrap();
         assert!(id.starts_with("M"));
         assert!(id.len() >= 4); // M + at least 3 digits
                                 // Check that all characters after M are valid lowercase base36
@@ -180,12 +208,17 @@ mod tests {
 
     #[test]
     fn test_concurrent_id_generation() {
+        use std::sync::Arc;
+        let temp_dir = Arc::new(tempfile::tempdir().unwrap());
         let mut handles = vec![];
         let mut ids = HashSet::new();
 
         // Generate IDs concurrently
         for _ in 0..5 {
-            let handle = thread::spawn(|| generate_minion_id().unwrap());
+            let temp_dir_clone = Arc::clone(&temp_dir);
+            let handle = thread::spawn(move || {
+                generate_minion_id_with_state(Some(temp_dir_clone.path())).unwrap()
+            });
             handles.push(handle);
         }
 
