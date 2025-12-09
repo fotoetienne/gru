@@ -29,12 +29,6 @@ pub async fn handle_review(pr: &str) -> Result<i32> {
         pr_num
     ))?;
 
-    // Fetch the specific PR branch to ensure it's available locally
-    println!("🔄 Fetching PR branch: {}", branch);
-    git_repo
-        .fetch_branch(&branch)
-        .context(format!("Failed to fetch PR branch '{}'", branch))?;
-
     // Check if a worktree already exists for this branch
     let worktree_path = if let Some(existing_path) = git_repo
         .find_worktree_for_branch(&branch)
@@ -46,7 +40,12 @@ pub async fn handle_review(pr: &str) -> Result<i32> {
         );
         existing_path
     } else {
-        // No existing worktree, create a new one
+        // No existing worktree, fetch the branch and create one
+        println!("🔄 Fetching PR branch: {}", branch);
+        git_repo
+            .fetch_branch(&branch)
+            .context(format!("Failed to fetch PR branch '{}'", branch))?;
+
         let repo_name = format!("{}/{}", owner, repo);
         let new_worktree_path = workspace
             .work_dir(&repo_name, &branch)
