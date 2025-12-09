@@ -652,6 +652,7 @@ impl GitRepo {
     ///
     /// Returns an error if:
     /// - The bare repository doesn't exist
+    /// - The branch name contains invalid characters
     /// - The git fetch command fails
     pub fn fetch_branch(&self, branch_name: &str) -> Result<()> {
         if !self.bare_path.exists() {
@@ -659,6 +660,11 @@ impl GitRepo {
                 "Bare repository does not exist at {}",
                 self.bare_path.display()
             );
+        }
+
+        // Validate branch name to prevent issues with git refspec
+        if branch_name.is_empty() || branch_name.contains('\0') || branch_name.contains(':') {
+            anyhow::bail!("Invalid branch name for fetch: {}", branch_name);
         }
 
         // Fetch the specific branch
