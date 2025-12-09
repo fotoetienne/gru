@@ -10,7 +10,7 @@ mod workspace;
 mod worktree_scanner;
 
 use clap::{Parser, Subcommand};
-use commands::{clean, fix, path, review};
+use commands::{clean, fix, path, review, status};
 
 /// CLI structure for the Gru agent orchestrator
 #[derive(Parser)]
@@ -59,6 +59,8 @@ enum Commands {
         #[arg(long, default_value = "main", help = "Base branch to check for merges")]
         base_branch: String,
     },
+    #[command(about = "List active Minions")]
+    Status,
 }
 
 #[tokio::main]
@@ -78,6 +80,7 @@ async fn main() {
             force,
             base_branch,
         } => clean::handle_clean(dry_run, force, &base_branch).await,
+        Commands::Status => status::handle_status(),
     };
 
     // Handle any errors that occurred
