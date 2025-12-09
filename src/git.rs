@@ -2,6 +2,9 @@ use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+/// Default branch names to try when creating new worktrees, in priority order
+const DEFAULT_BRANCHES: &[&str] = &["origin/main", "origin/master"];
+
 /// Detects if the current directory is within a git repository
 /// Returns the root path of the git repository
 pub fn detect_git_repo() -> Result<PathBuf> {
@@ -248,7 +251,7 @@ impl GitRepo {
 
     /// Determines the default branch to use as base for new worktrees
     ///
-    /// Tries common default branch names in order: origin/main, origin/master
+    /// Tries common default branch names defined in [`DEFAULT_BRANCHES`]
     ///
     /// # Errors
     ///
@@ -264,7 +267,7 @@ impl GitRepo {
         }
 
         // Try common default branch names in order
-        for branch in &["origin/main", "origin/master"] {
+        for branch in DEFAULT_BRANCHES {
             let check = Command::new("git")
                 .arg("-C")
                 .arg(&self.bare_path)
@@ -272,7 +275,7 @@ impl GitRepo {
                 .arg("--verify")
                 .arg(branch)
                 .output()
-                .context("Failed to check if branch exists")?;
+                .with_context(|| format!("Failed to check if branch '{}' exists", branch))?;
 
             if check.status.success() {
                 return Ok(branch.to_string());
@@ -280,8 +283,9 @@ impl GitRepo {
         }
 
         anyhow::bail!(
-            "Could not find default branch. Tried: origin/main, origin/master. \
-             Ensure the repository has been fetched with ensure_bare_clone()."
+            "Could not find default branch. Tried: {}. \
+             Ensure the repository has been fetched with ensure_bare_clone().",
+            DEFAULT_BRANCHES.join(", ")
         )
     }
 
