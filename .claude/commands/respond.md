@@ -1,7 +1,6 @@
 ---
 description: Respond to all comments and reviews on a PR
 allowed-tools: Bash(gh:*), Bash(git:*)
-argument-hint: "<pr# or URL>"
 ---
 
 Respond to all comments and reviews on a GitHub pull request.
