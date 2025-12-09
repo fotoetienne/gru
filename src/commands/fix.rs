@@ -219,11 +219,7 @@ pub async fn handle_fix(issue: &str, timeout_opt: Option<String>, quiet: bool) -
                     "⚠️  No activity for {} minutes",
                     INACTIVITY_WARNING_SECS / 60
                 );
-                // Set warning flag to prevent duplicate warnings in subsequent iterations
-                #[allow(unused_assignments)]
-                {
-                    warned_at_5min = true;
-                }
+                warned_at_5min = true;
             }
 
             // Handle timeout first, then flatten the stream result
@@ -244,7 +240,11 @@ pub async fn handle_fix(issue: &str, timeout_opt: Option<String>, quiet: bool) -
 
                     // Update last event time for any output
                     last_event_time = Instant::now();
-                    warned_at_5min = false; // Reset warning flag on activity
+
+                    // Reset warning flag only on actual events (not raw output lines)
+                    if matches!(output, stream::StreamOutput::Event(_)) {
+                        warned_at_5min = false;
+                    }
 
                     // Display progress
                     progress.handle_output(&output);
