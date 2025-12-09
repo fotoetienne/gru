@@ -246,10 +246,51 @@ impl GitRepo {
         Ok(())
     }
 
+    /// Determines the default branch to use as base for new worktrees
+    ///
+    /// Tries common default branch names in order: origin/main, origin/master
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The bare repository doesn't exist
+    /// - None of the common default branches exist
+    fn get_base_branch(&self) -> Result<String> {
+        if !self.bare_path.exists() {
+            anyhow::bail!(
+                "Bare repository does not exist at {}",
+                self.bare_path.display()
+            );
+        }
+
+        // Try common default branch names in order
+        for branch in &["origin/main", "origin/master"] {
+            let check = Command::new("git")
+                .arg("-C")
+                .arg(&self.bare_path)
+                .arg("rev-parse")
+                .arg("--verify")
+                .arg(branch)
+                .output()
+                .context("Failed to check if branch exists")?;
+
+            if check.status.success() {
+                return Ok(branch.to_string());
+            }
+        }
+
+        anyhow::bail!(
+            "Could not find default branch. Tried: origin/main, origin/master. \
+             Ensure the repository has been fetched with ensure_bare_clone()."
+        )
+    }
+
     /// Creates a new worktree from the bare repository
     /// The worktree will have a new branch checked out
     ///
     /// If the branch already exists (from a previous minion), it will check it out.
+    /// If the branch doesn't exist, it will be created based on the repository's default
+    /// branch (origin/main or origin/master).
     /// If git reports that the worktree is already checked out elsewhere, this will fail
     /// with an error (respecting git's internal locking).
     ///
@@ -297,8 +338,9 @@ impl GitRepo {
             // Branch exists, just check it out
             cmd.arg(branch_name);
         } else {
-            // Branch doesn't exist, create it
-            cmd.arg("-b").arg(branch_name);
+            // Branch doesn't exist, create it based on the default branch
+            let base_branch = self.get_base_branch()?;
+            cmd.arg("-b").arg(branch_name).arg(base_branch);
         }
 
         let output = cmd.output().context("Failed to execute git worktree add")?;
