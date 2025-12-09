@@ -3,6 +3,7 @@ mod git;
 mod github;
 mod logger;
 mod minion;
+mod minion_resolver;
 mod progress;
 mod stream;
 mod url_utils;
@@ -48,13 +49,13 @@ enum Commands {
     },
     #[command(about = "Get the filesystem path to a Minion's worktree")]
     Path {
-        #[arg(help = "Minion ID (e.g., M42 or 42)", conflicts_with_all = ["issue", "pr"])]
-        minion_id: Option<String>,
+        #[arg(help = "Minion ID, issue number, or PR number (e.g., M42, 42)")]
+        id: String,
 
-        #[arg(long, help = "Resolve from issue number", conflicts_with_all = ["minion_id", "pr"])]
+        #[arg(long, help = "[DEPRECATED] Resolve from issue number")]
         issue: Option<u64>,
 
-        #[arg(long, help = "Resolve from PR number", conflicts_with_all = ["minion_id", "issue"])]
+        #[arg(long, help = "[DEPRECATED] Resolve from PR number")]
         pr: Option<u64>,
     },
     #[command(about = "Clean up merged/closed worktrees")]
@@ -67,7 +68,10 @@ enum Commands {
         base_branch: String,
     },
     #[command(about = "List active Minions")]
-    Status,
+    Status {
+        #[arg(help = "Optional ID to filter by (minion ID, issue number, or PR number)")]
+        id: Option<String>,
+    },
 }
 
 #[tokio::main]
@@ -77,17 +81,13 @@ async fn main() {
     let result = match cli.command {
         Commands::Fix { issue, timeout } => fix::handle_fix(&issue, timeout, cli.quiet).await,
         Commands::Review { pr } => review::handle_review(&pr).await,
-        Commands::Path {
-            minion_id,
-            issue,
-            pr,
-        } => path::handle_path(minion_id, issue, pr).await,
+        Commands::Path { id, issue, pr } => path::handle_path(id, issue, pr).await,
         Commands::Clean {
             dry_run,
             force,
             base_branch,
         } => clean::handle_clean(dry_run, force, &base_branch).await,
-        Commands::Status => status::handle_status(),
+        Commands::Status { id } => status::handle_status(id).await,
     };
 
     // Handle any errors that occurred
