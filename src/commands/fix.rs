@@ -118,15 +118,15 @@ pub async fn handle_fix(issue: &str, timeout_opt: Option<String>, quiet: bool) -
         .ensure_bare_clone()
         .context("Failed to clone or update repository")?;
 
-    // Create worktree path
-    let repo_name = format!("{}/{}", owner, repo);
-    let worktree_path = workspace
-        .work_dir(&repo_name, &minion_id)
-        .context("Failed to compute worktree path")?;
-
-    // Create worktree with branch name: minion/issue-<num>-<id>
+    // Create branch name first: minion/issue-<num>-<id>
     let branch_name = format!("minion/issue-{}-{}", issue_num, minion_id);
     println!("🌿 Creating worktree with branch: {}", branch_name);
+
+    // Create worktree path using branch name
+    let repo_name = format!("{}/{}", owner, repo);
+    let worktree_path = workspace
+        .work_dir(&repo_name, &branch_name)
+        .context("Failed to compute worktree path")?;
 
     git_repo
         .create_worktree(&branch_name, &worktree_path)
