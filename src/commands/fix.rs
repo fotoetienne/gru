@@ -89,19 +89,26 @@ async fn create_pr_for_issue(
 
     println!("📌 Creating PR targeting base branch: {}", base_branch);
 
-    // Get issue title from GitHub API
-    let github_client = GitHubClient::from_env().context(
-        "Failed to initialize GitHub client. Set GRU_GITHUB_TOKEN environment variable.",
-    )?;
-
+    // Get issue title from GitHub API or CLI
     let issue_number: u64 = issue_num.parse().context("Failed to parse issue number")?;
 
-    let issue = github_client
-        .get_issue(owner, repo, issue_number)
-        .await
-        .context("Failed to fetch issue from GitHub")?;
-
-    let issue_title = issue.title;
+    let issue_title = if let Some(github_client) = GitHubClient::try_from_env() {
+        // Use API if token is available
+        let issue = github_client
+            .get_issue(owner, repo, issue_number)
+            .await
+            .context("Failed to fetch issue from GitHub API")?;
+        issue.title
+    } else {
+        // Fall back to gh CLI
+        println!("ℹ️  GRU_GITHUB_TOKEN not set, using gh CLI for GitHub operations");
+        let issue = crate::github::get_issue_via_cli(owner, repo, issue_number)
+            .await
+            .context(
+                "Failed to fetch issue using gh CLI. Make sure gh is installed and authenticated.",
+            )?;
+        issue.title
+    };
 
     // Create PR title and body
     let pr_title = format!("[WIP] Fixes #{}: {}", issue_num, issue_title);
@@ -120,11 +127,17 @@ Fixes #{}"#,
         minion_id, issue_num
     );
 
-    // Create the draft PR
-    let pr_number = github_client
-        .create_draft_pr(owner, repo, branch_name, &base_branch, &pr_title, &pr_body)
-        .await
-        .context("Failed to create draft PR")?;
+    // Create the draft PR using gh CLI (PR operations always use CLI)
+    let pr_number = crate::github::create_draft_pr_via_cli(
+        owner,
+        repo,
+        branch_name,
+        &base_branch,
+        &pr_title,
+        &pr_body,
+    )
+    .await
+    .context("Failed to create draft PR using gh CLI")?;
 
     Ok(pr_number)
 }
