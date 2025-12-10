@@ -254,18 +254,23 @@ async fn trigger_pr_review(
         })?;
 
     // Wait for the process with timeout
-    let status = timeout(timeout_duration, child.wait())
-        .await
-        .map_err(|_| {
-            anyhow::anyhow!(
+    match timeout(timeout_duration, child.wait()).await {
+        Ok(status) => {
+            let status = status.with_context(|| {
+                format!("Failed to wait for review process for PR #{}", pr_number)
+            })?;
+            Ok(status.code().unwrap_or(EXIT_CODE_SIGNAL_TERMINATED))
+        }
+        Err(_) => {
+            // Timeout occurred - kill the child process to prevent orphaned process
+            let _ = child.kill().await; // Ignore kill errors, already timing out
+            Err(anyhow::anyhow!(
                 "Review process timed out after {} minutes. PR #{} review may be stuck.",
                 timeout_duration.as_secs() / 60,
                 pr_number
-            )
-        })?
-        .with_context(|| format!("Failed to wait for review process for PR #{}", pr_number))?;
-
-    Ok(status.code().unwrap_or(EXIT_CODE_SIGNAL_TERMINATED))
+            ))
+        }
+    }
 }
 
 /// Helper function to post a progress comment to a GitHub issue
