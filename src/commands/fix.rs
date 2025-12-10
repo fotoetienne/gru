@@ -196,6 +196,51 @@ fn parse_timeout(timeout_str: &str) -> Result<Duration> {
     }
 }
 
+/// Triggers an automated PR review by spawning a separate gru review command
+///
+/// This function spawns `gru review` as a completely separate process with a fresh
+/// Claude session context. This ensures the review is unbiased and not influenced
+/// by the implementation process.
+///
+/// # Arguments
+/// * `pr_number` - The PR number to review (must be a valid number)
+/// * `worktree_path` - Path to the worktree where the review should run
+///
+/// # Returns
+/// The exit code from the review process (0 for success, non-zero for failure)
+///
+/// # Errors
+/// Returns an error if:
+/// - The PR number is not a valid numeric value
+/// - The gru command fails to spawn (e.g., not in PATH)
+/// - The process cannot be waited on
+async fn trigger_pr_review(pr_number: &str, worktree_path: &Path) -> Result<i32> {
+    // Validate PR number format (defense in depth)
+    pr_number
+        .parse::<u64>()
+        .with_context(|| format!("Invalid PR number format: '{}'", pr_number))?;
+
+    // Spawn gru review as a separate process
+    let status = TokioCommand::new("gru")
+        .arg("review")
+        .arg(pr_number)
+        .current_dir(worktree_path)
+        .stdin(std::process::Stdio::inherit())
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit())
+        .status()
+        .await
+        .with_context(|| {
+            format!(
+                "Failed to spawn gru review command for PR #{}. Is gru in your PATH?",
+                pr_number
+            )
+        })?;
+
+    // Use 128 as exit code when process is terminated by signal (shell convention)
+    Ok(status.code().unwrap_or(128))
+}
+
 /// Helper function to post a progress comment to a GitHub issue
 /// Returns true if the comment was posted successfully, false otherwise
 async fn try_post_progress_comment(
@@ -525,6 +570,25 @@ pub async fn handle_fix(issue: &str, timeout_opt: Option<String>, quiet: bool) -
                         "🔗 View PR at: https://github.com/{}/{}/pull/{}",
                         owner, repo, pr_number
                     );
+
+                    // Auto-trigger review for Minion-created PRs
+                    println!("\n🔍 Starting automated PR review...");
+                    match trigger_pr_review(&pr_number, &worktree_path).await {
+                        Ok(review_exit_code) => {
+                            if review_exit_code == 0 {
+                                println!("✅ PR review completed successfully");
+                            } else {
+                                eprintln!(
+                                    "⚠️  PR review completed with exit code: {}",
+                                    review_exit_code
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("⚠️  Failed to run PR review: {}", e);
+                            eprintln!("   You can review manually with: gru review {}", pr_number);
+                        }
+                    }
                 }
                 Err(e) => {
                     let err_msg = e.to_string();
