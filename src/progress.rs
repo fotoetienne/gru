@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 const MAX_RECENT_EVENTS: usize = 4;
 
 /// Maximum characters to display for buffered text chunks.
-/// Since text is now buffered for up to 250ms, chunks can be larger.
+/// Since text is now buffered for up to 500ms, chunks can be larger.
 /// 200 characters allows ~3-4 lines of text to display coherently.
 const MAX_DISPLAY_CHARS: usize = 200;
 
@@ -56,7 +56,7 @@ impl ProgressDisplay {
             start_time: Instant::now(),
             config,
             recent_events: Arc::new(Mutex::new(Vec::new())),
-            text_buffer: TextBuffer::new(Duration::from_millis(250)),
+            text_buffer: TextBuffer::new(Duration::from_millis(500)),
         };
 
         display.update_header("Starting...");
