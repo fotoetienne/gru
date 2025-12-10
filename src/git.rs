@@ -714,6 +714,57 @@ impl GitRepo {
 
         Ok(())
     }
+
+    /// Push a branch to the remote repository
+    ///
+    /// # Arguments
+    /// * `worktree_path` - Path to the worktree containing the branch to push
+    /// * `branch_name` - Name of the branch to push
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The branch name is invalid
+    /// - The worktree path doesn't exist
+    /// - Git push fails (authentication, network, conflicts, etc.)
+    ///
+    /// # Note
+    ///
+    /// Reserved for future use when programmatically pushing branches.
+    /// Currently, branches are pushed by the Claude agent via git commands.
+    #[allow(dead_code)]
+    pub fn push_branch(&self, worktree_path: &Path, branch_name: &str) -> Result<()> {
+        // Validate branch name
+        validate_branch_name(branch_name)?;
+
+        if !worktree_path.exists() {
+            anyhow::bail!("Worktree does not exist at {}", worktree_path.display());
+        }
+
+        // Push the branch to origin with --set-upstream
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(worktree_path)
+            .arg("push")
+            .arg("--set-upstream")
+            .arg("origin")
+            .arg(branch_name)
+            .output()
+            .context("Failed to execute git push")?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!(
+                "Failed to push branch '{}' from worktree {}: git push exited with code {:?}: {}",
+                branch_name,
+                worktree_path.display(),
+                output.status.code(),
+                stderr.trim()
+            );
+        }
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
