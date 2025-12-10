@@ -31,6 +31,13 @@ const MAX_OUTPUT_BUFFER_SIZE: usize = 10000;
 /// Size to trim the output buffer to when it exceeds the maximum (in bytes)
 const TRIM_OUTPUT_BUFFER_SIZE: usize = 5000;
 
+/// Exit code returned when a process is terminated by a signal (shell convention)
+const EXIT_CODE_SIGNAL_TERMINATED: i32 = 128;
+
+/// Default timeout for review process in seconds (30 minutes)
+/// Reviews can take longer than fixes due to analysis depth
+const DEFAULT_REVIEW_TIMEOUT_SECS: u64 = 1800;
+
 /// Logs an event to events.jsonl in the worktree directory
 async fn log_event(worktree_path: &Path, event: &stream::StreamOutput) -> Result<()> {
     let events_file = worktree_path.join("events.jsonl");
@@ -193,6 +200,76 @@ fn parse_timeout(timeout_str: &str) -> Result<Duration> {
             "Invalid timeout unit: '{}'. Supported units: s (seconds), m (minutes), h (hours)",
             unit
         ),
+    }
+}
+
+/// Triggers an automated PR review by spawning a separate gru review command
+///
+/// This function spawns `gru review` as a completely separate process with a fresh
+/// Claude session context. This ensures the review is unbiased and not influenced
+/// by the implementation process.
+///
+/// # Arguments
+/// * `pr_number` - The PR number to review (must be a valid number)
+/// * `worktree_path` - Path to the worktree where the review should run
+/// * `review_timeout` - Optional timeout duration for the review process
+///
+/// # Returns
+/// The exit code from the review process (0 for success, non-zero for failure)
+///
+/// # Errors
+/// Returns an error if:
+/// - The PR number is not a valid numeric value
+/// - The gru command fails to spawn (e.g., not in PATH)
+/// - The process cannot be waited on
+/// - The review process exceeds the timeout
+async fn trigger_pr_review(
+    pr_number: &str,
+    worktree_path: &Path,
+    review_timeout: Option<Duration>,
+) -> Result<i32> {
+    // Validate PR number format (defense in depth)
+    pr_number
+        .parse::<u64>()
+        .with_context(|| format!("Invalid PR number format: '{}'", pr_number))?;
+
+    // Use provided timeout or default
+    let timeout_duration =
+        review_timeout.unwrap_or_else(|| Duration::from_secs(DEFAULT_REVIEW_TIMEOUT_SECS));
+
+    // Spawn gru review as a separate process
+    let mut child = TokioCommand::new("gru")
+        .arg("review")
+        .arg(pr_number)
+        .current_dir(worktree_path)
+        .stdin(std::process::Stdio::inherit())
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit())
+        .spawn()
+        .with_context(|| {
+            format!(
+                "Failed to spawn gru review command for PR #{}. Is gru in your PATH?",
+                pr_number
+            )
+        })?;
+
+    // Wait for the process with timeout
+    match timeout(timeout_duration, child.wait()).await {
+        Ok(status) => {
+            let status = status.with_context(|| {
+                format!("Failed to wait for review process for PR #{}", pr_number)
+            })?;
+            Ok(status.code().unwrap_or(EXIT_CODE_SIGNAL_TERMINATED))
+        }
+        Err(_) => {
+            // Timeout occurred - kill the child process to prevent orphaned process
+            let _ = child.kill().await; // Ignore kill errors, already timing out
+            Err(anyhow::anyhow!(
+                "Review process timed out after {} minutes. PR #{} review may be stuck.",
+                timeout_duration.as_secs() / 60,
+                pr_number
+            ))
+        }
     }
 }
 
@@ -525,6 +602,25 @@ pub async fn handle_fix(issue: &str, timeout_opt: Option<String>, quiet: bool) -
                         "🔗 View PR at: https://github.com/{}/{}/pull/{}",
                         owner, repo, pr_number
                     );
+
+                    // Auto-trigger review for Minion-created PRs
+                    println!("\n🔍 Starting automated PR review...");
+                    match trigger_pr_review(&pr_number, &worktree_path, None).await {
+                        Ok(review_exit_code) => {
+                            if review_exit_code == 0 {
+                                println!("✅ PR review completed successfully");
+                            } else {
+                                eprintln!(
+                                    "⚠️  PR review completed with exit code: {}",
+                                    review_exit_code
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("⚠️  Failed to run PR review: {}", e);
+                            eprintln!("   You can review manually with: gru review {}", pr_number);
+                        }
+                    }
                 }
                 Err(e) => {
                     let err_msg = e.to_string();
@@ -553,7 +649,7 @@ pub async fn handle_fix(issue: &str, timeout_opt: Option<String>, quiet: bool) -
     }
 
     // Return the exit code from the claude process
-    Ok(status.code().unwrap_or(128))
+    Ok(status.code().unwrap_or(EXIT_CODE_SIGNAL_TERMINATED))
 }
 
 #[cfg(test)]
