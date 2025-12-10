@@ -727,6 +727,12 @@ impl GitRepo {
     /// - The branch name is invalid
     /// - The worktree path doesn't exist
     /// - Git push fails (authentication, network, conflicts, etc.)
+    ///
+    /// # Note
+    ///
+    /// Reserved for future use when programmatically pushing branches.
+    /// Currently, branches are pushed by the Claude agent via git commands.
+    #[allow(dead_code)]
     pub fn push_branch(&self, worktree_path: &Path, branch_name: &str) -> Result<()> {
         // Validate branch name
         validate_branch_name(branch_name)?;

@@ -106,15 +106,15 @@ async fn create_pr_for_issue(
     // Create PR title and body
     let pr_title = format!("[WIP] Fixes #{}: {}", issue_num, issue_title);
     let pr_body = format!(
-        r#"🤖 This PR is being worked on by Minion {}
+        r#"This PR is being worked on by Minion {}
 
 ## Status
 Work in progress - I'll update this when ready for review.
 
 ## Changes
-- ✅ Initial implementation
-- ⏳ Writing tests
-- ⏳ Documentation
+- [ ] Initial implementation
+- [ ] Writing tests
+- [ ] Documentation
 
 Fixes #{}"#,
         minion_id, issue_num

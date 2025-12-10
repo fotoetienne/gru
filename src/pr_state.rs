@@ -40,9 +40,11 @@ impl PrState {
     /// * `worktree_path` - Path to the worktree directory
     ///
     /// Returns None if the file doesn't exist
+    ///
+    /// Note: Reserved for future use when checking existing PR state
     #[allow(dead_code)]
     pub fn load(worktree_path: &Path) -> Result<Option<Self>> {
-        let pr_state_path = worktree_path.join("pr_state.json");
+        let pr_state_path = worktree_path.join(".gru_pr_state.json");
 
         if !pr_state_path.exists() {
             return Ok(None);
@@ -63,8 +65,10 @@ impl PrState {
     ///
     /// # Arguments
     /// * `worktree_path` - Path to the worktree directory
+    ///
+    /// Note: Uses hidden file (.gru_pr_state.json) to avoid git status pollution
     pub fn save(&self, worktree_path: &Path) -> Result<()> {
-        let pr_state_path = worktree_path.join("pr_state.json");
+        let pr_state_path = worktree_path.join(".gru_pr_state.json");
 
         let contents =
             serde_json::to_string_pretty(self).context("Failed to serialize PR state")?;
@@ -78,6 +82,8 @@ impl PrState {
     }
 
     /// Mark the PR as ready for review
+    ///
+    /// Note: Reserved for future use when marking PRs ready after completion
     #[allow(dead_code)]
     pub fn mark_ready(&mut self) {
         self.status = PrStatus::ReadyForReview;
@@ -107,6 +113,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_pr_state_save_and_load() {
         let temp_dir = env::temp_dir().join("gru-test-pr-state");
         let _ = fs::create_dir_all(&temp_dir);
@@ -133,6 +140,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_pr_state_load_nonexistent() {
         let temp_dir = env::temp_dir().join("gru-test-pr-state-nonexistent");
         let _ = fs::remove_dir_all(&temp_dir);
