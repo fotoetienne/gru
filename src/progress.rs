@@ -1,8 +1,9 @@
 use crate::stream::{ClaudeEvent, StreamOutput};
+use crate::text_buffer::TextBuffer;
 use chrono::Local;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// Maximum number of recent events to keep in the display history
 const MAX_RECENT_EVENTS: usize = 4;
@@ -22,6 +23,7 @@ pub struct ProgressDisplay {
     start_time: Instant,
     config: ProgressConfig,
     recent_events: Arc<Mutex<Vec<String>>>,
+    text_buffer: TextBuffer,
 }
 
 impl ProgressDisplay {
@@ -49,6 +51,7 @@ impl ProgressDisplay {
             start_time: Instant::now(),
             config,
             recent_events: Arc::new(Mutex::new(Vec::new())),
+            text_buffer: TextBuffer::new(Duration::from_millis(150)),
         };
 
         display.update_header("Starting...");
@@ -166,18 +169,25 @@ impl ProgressDisplay {
                 }
             }
             ClaudeEvent::ContentBlockDelta { delta, .. } => {
-                // Handle text deltas
+                // Handle text deltas with buffering
                 if let Some(delta_type) = delta.get("type").and_then(|t| t.as_str()) {
                     if delta_type == "text_delta" {
                         if let Some(text) = delta.get("text").and_then(|t| t.as_str()) {
-                            let truncated = Self::truncate_string(text, 50);
-                            self.add_event(format!("[{}] Text: {}", timestamp, truncated));
+                            // Add text to buffer; flush if ready
+                            if let Some(flushed_text) = self.text_buffer.add(text) {
+                                let truncated = Self::truncate_string(&flushed_text, 50);
+                                self.add_event(format!("[{}] Text: {}", timestamp, truncated));
+                            }
                         }
                     }
                 }
             }
             ClaudeEvent::ContentBlockStop { .. } => {
-                // Content block finished - no specific action needed
+                // Content block finished - flush any remaining buffered text
+                if let Some(flushed_text) = self.text_buffer.flush() {
+                    let truncated = Self::truncate_string(&flushed_text, 50);
+                    self.add_event(format!("[{}] Text: {}", timestamp, truncated));
+                }
             }
             ClaudeEvent::MessageDelta { delta } => {
                 // Check for stop_reason to detect completion
@@ -195,6 +205,11 @@ impl ProgressDisplay {
                 }
             }
             ClaudeEvent::MessageStop => {
+                // Flush any remaining buffered text before completing
+                if let Some(flushed_text) = self.text_buffer.flush() {
+                    let truncated = Self::truncate_string(&flushed_text, 50);
+                    self.add_event(format!("[{}] Text: {}", timestamp, truncated));
+                }
                 self.update_header("✅ Message complete");
             }
             ClaudeEvent::Error { error } => {

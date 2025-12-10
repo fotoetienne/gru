@@ -7,6 +7,7 @@ mod minion_resolver;
 mod pr_state;
 mod progress;
 mod stream;
+mod text_buffer;
 mod url_utils;
 mod workspace;
 mod worktree_scanner;
