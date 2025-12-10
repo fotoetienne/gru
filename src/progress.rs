@@ -293,9 +293,14 @@ impl ProgressDisplay {
                             self.update_header(&format!("🔧 Using tool: {}", tool_name));
 
                             // Start tracking this tool's input
-                            if let Ok(mut tracker) = self.tool_tracker.lock() {
-                                tracker.start_tool(tool_name.to_string());
-                            }
+                            let mut tracker = match self.tool_tracker.lock() {
+                                Ok(guard) => guard,
+                                Err(poisoned) => {
+                                    eprintln!("Warning: Tool tracker mutex poisoned, recovering");
+                                    poisoned.into_inner()
+                                }
+                            };
+                            tracker.start_tool(tool_name.to_string());
                         }
                         "text" => {
                             self.update_header("📝 Responding...");
@@ -324,9 +329,16 @@ impl ProgressDisplay {
                             if let Some(partial_json) =
                                 delta.get("partial_json").and_then(|p| p.as_str())
                             {
-                                if let Ok(mut tracker) = self.tool_tracker.lock() {
-                                    tracker.add_input_chunk(partial_json);
-                                }
+                                let mut tracker = match self.tool_tracker.lock() {
+                                    Ok(guard) => guard,
+                                    Err(poisoned) => {
+                                        eprintln!(
+                                            "Warning: Tool tracker mutex poisoned, recovering"
+                                        );
+                                        poisoned.into_inner()
+                                    }
+                                };
+                                tracker.add_input_chunk(partial_json);
                             }
                         }
                         _ => {}
@@ -337,11 +349,14 @@ impl ProgressDisplay {
                 // Content block finished - handle both text and tool blocks
 
                 // First, check if we have a tool to format
-                let tool_info = if let Ok(mut tracker) = self.tool_tracker.lock() {
-                    tracker.take()
-                } else {
-                    None
+                let mut tracker = match self.tool_tracker.lock() {
+                    Ok(guard) => guard,
+                    Err(poisoned) => {
+                        eprintln!("Warning: Tool tracker mutex poisoned, recovering");
+                        poisoned.into_inner()
+                    }
                 };
+                let tool_info = tracker.take();
 
                 if let Some((tool_name, input_json)) = tool_info {
                     // Format and display tool information
