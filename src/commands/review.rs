@@ -110,39 +110,53 @@ async fn resolve_pr_from_current_worktree() -> Result<(String, String, String, S
 /// Resolves PR information from a user-provided argument
 /// Handles Minion IDs, issue numbers, PR numbers, and URLs
 async fn resolve_pr_from_arg(arg: &str) -> Result<(String, String, String, String)> {
+    let mut errors = Vec::new();
+
     // Strategy 1: Try as Minion ID (if it looks like one)
     if looks_like_minion_id(arg) {
-        if let Ok(pr_info) = resolve_pr_from_minion_id(arg).await {
-            return Ok(pr_info);
+        match resolve_pr_from_minion_id(arg).await {
+            Ok(pr_info) => return Ok(pr_info),
+            Err(e) => errors.push(format!("Minion ID '{}': {:#}", arg, e)),
         }
     }
 
     // Strategy 2: Try as PR number or URL (existing behavior)
-    if let Ok(pr_info) = parse_pr_info(arg).await {
-        return Ok(pr_info);
+    match parse_pr_info(arg).await {
+        Ok(pr_info) => return Ok(pr_info),
+        Err(e) => errors.push(format!("PR number/URL '{}': {:#}", arg, e)),
     }
 
     // Strategy 3: Fallback - try as issue number
     if let Ok(issue_num) = arg.parse::<u64>() {
-        if let Ok(pr_num) = find_pr_for_issue(issue_num).await {
-            return get_pr_info_from_number(&pr_num).await;
+        match find_pr_for_issue(issue_num).await {
+            Ok(pr_num) => match get_pr_info_from_number(&pr_num).await {
+                Ok(pr_info) => return Ok(pr_info),
+                Err(e) => errors.push(format!(
+                    "Issue #{}: Found PR but failed to get info: {:#}",
+                    issue_num, e
+                )),
+            },
+            Err(e) => errors.push(format!("Issue #{}: {:#}", issue_num, e)),
         }
     }
 
     anyhow::bail!(
-        "Could not resolve '{}' to a PR.\n\
-         - No PR found with that number\n\
-         - No Minion found with that ID\n\
-         - No PR found linked to issue #{}\n\
-         \n\
-         Try 'gru status' to see active Minions.",
+        "Could not resolve '{}' to a PR.\n\nAttempted strategies:\n{}",
         arg,
-        arg
+        errors
+            .iter()
+            .map(|e| format!("  • {}", e))
+            .collect::<Vec<_>>()
+            .join("\n")
     )
 }
 
 /// Checks if a string looks like a Minion ID
 /// Minion IDs start with 'M' followed by alphanumeric characters
+///
+/// # Examples
+/// Valid: "M001", "M42", "M0tk", "MABC123"
+/// Invalid: "42", "M", "m001", "M-42"
 fn looks_like_minion_id(s: &str) -> bool {
     s.starts_with('M') && s.len() > 1 && s.chars().all(|c| c.is_alphanumeric())
 }
@@ -165,6 +179,11 @@ async fn resolve_pr_from_minion_id(minion_id: &str) -> Result<(String, String, S
 
 /// Fetches PR information (owner, repo, pr_num, branch) given a PR number
 async fn get_pr_info_from_number(pr_num: &str) -> Result<(String, String, String, String)> {
+    // Validate that pr_num is actually a number to provide better error messages
+    pr_num
+        .parse::<u64>()
+        .with_context(|| format!("Invalid PR number format: '{}'", pr_num))?;
+
     // Use parse_pr_info which fetches metadata from GitHub
     parse_pr_info(pr_num).await
 }
@@ -172,6 +191,8 @@ async fn get_pr_info_from_number(pr_num: &str) -> Result<(String, String, String
 /// Finds a PR number associated with an issue number
 /// Uses gh CLI to search for PRs that link to the issue
 async fn find_pr_for_issue(issue_num: u64) -> Result<String> {
+    // Safe: issue_num is validated as u64 by the type system, which can only contain digits.
+    // This prevents command injection as the format string will never contain shell metacharacters.
     let output = Command::new("gh")
         .args([
             "pr",
