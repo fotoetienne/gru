@@ -4,7 +4,8 @@ use anyhow::Result;
 /// Handles the status command by displaying active Minions
 /// Optionally filters by a specific ID (minion ID, issue number, or PR number)
 pub async fn handle_status(id: Option<String>) -> Result<i32> {
-    let minions = minion_resolver::scan_all_minions()?;
+    // Use spawn_blocking to avoid blocking the async runtime
+    let minions = tokio::task::spawn_blocking(minion_resolver::scan_all_minions).await??;
 
     // Filter by ID if provided (stays purely local for performance)
     let filtered_minions = if let Some(filter_id) = id {

@@ -21,22 +21,41 @@ pub struct MinionInfo {
 /// 3. Parse as number, search local minions by issue number
 /// 4. Fallback to GitHub API for PRs (if online)
 pub async fn resolve_minion(id: &str) -> Result<MinionInfo> {
+    // Scan all minions once using spawn_blocking to avoid blocking the async runtime
+    let minions = tokio::task::spawn_blocking(scan_all_minions)
+        .await
+        .context("Failed to spawn blocking task for scanning minions")??;
+
     // Strategy 1: Try as exact minion ID
-    if let Ok(info) = find_by_minion_id(id) {
+    if let Some(info) = find_by_minion_id_from_list(id, &minions) {
         return Ok(info);
     }
 
     // Strategy 2: Try with M prefix if not already present
     if !id.starts_with('M') {
-        if let Ok(info) = find_by_minion_id(&format!("M{}", id)) {
+        if let Some(info) = find_by_minion_id_from_list(&format!("M{}", id), &minions) {
             return Ok(info);
         }
     }
 
     // Strategy 3: Try as issue/PR number
     if let Ok(num) = id.parse::<u64>() {
-        if let Ok(info) = find_by_issue_number(num).await {
+        if let Some(info) = find_by_issue_number_from_list(num, &minions) {
             return Ok(info);
+        }
+
+        // Fallback to GitHub API (might be a PR)
+        if let Ok(minion_id) = resolve_minion_from_pr(num).await {
+            if let Some(info) = find_by_minion_id_from_list(&minion_id, &minions) {
+                return Ok(info);
+            }
+        }
+
+        // Try to resolve as issue directly via GitHub API
+        if let Ok(minion_id) = resolve_minion_from_issue(num).await {
+            if let Some(info) = find_by_minion_id_from_list(&minion_id, &minions) {
+                return Ok(info);
+            }
         }
     }
 
@@ -53,49 +72,17 @@ pub async fn resolve_minion(id: &str) -> Result<MinionInfo> {
     )
 }
 
-/// Find a minion by exact minion ID
-pub fn find_by_minion_id(minion_id: &str) -> Result<MinionInfo> {
-    let minions = scan_all_minions()?;
-
-    minions
-        .into_iter()
-        .find(|m| m.minion_id == minion_id)
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "No worktree found for Minion {}. It may not have been created yet.",
-                minion_id
-            )
-        })
+/// Find a minion by exact minion ID from a pre-scanned list
+fn find_by_minion_id_from_list(minion_id: &str, minions: &[MinionInfo]) -> Option<MinionInfo> {
+    minions.iter().find(|m| m.minion_id == minion_id).cloned()
 }
 
-/// Find a minion by issue or PR number
-/// First searches locally, then falls back to GitHub API
-pub async fn find_by_issue_number(issue_num: u64) -> Result<MinionInfo> {
-    // First try local resolution
-    let minions = scan_all_minions()?;
-
-    if let Some(minion) = minions
-        .into_iter()
+/// Find a minion by issue number from a pre-scanned list
+fn find_by_issue_number_from_list(issue_num: u64, minions: &[MinionInfo]) -> Option<MinionInfo> {
+    minions
+        .iter()
         .find(|m| m.issue_number == Some(issue_num))
-    {
-        return Ok(minion);
-    }
-
-    // Fallback to GitHub API (might be a PR)
-    // Try to resolve as PR first, which will get the linked issue
-    if let Ok(minion_id) = resolve_minion_from_pr(issue_num).await {
-        return find_by_minion_id(&minion_id);
-    }
-
-    // Try to resolve as issue directly
-    if let Ok(minion_id) = resolve_minion_from_issue(issue_num).await {
-        return find_by_minion_id(&minion_id);
-    }
-
-    anyhow::bail!(
-        "No local worktree found for issue/PR #{}. Try 'gru status' to see active minions.",
-        issue_num
-    )
+        .cloned()
 }
 
 /// Scans all minion worktrees and returns MinionInfo structs
@@ -139,8 +126,16 @@ pub fn scan_all_minions() -> Result<Vec<MinionInfo>> {
                     continue; // Skip invalid directory names
                 }
 
-                if !minion_id.starts_with('M') || !minion_id.chars().all(|c| c.is_alphanumeric()) {
+                if minion_id.len() < 2
+                    || !minion_id.starts_with('M')
+                    || !minion_id.chars().all(|c| c.is_alphanumeric())
+                {
                     continue; // Skip non-minion directories
+                }
+
+                // Security check: verify the path stays within the work directory
+                if !minion_path.starts_with(work_path) {
+                    continue; // Skip paths that escape the work directory
                 }
 
                 // Check if this is a valid git worktree
