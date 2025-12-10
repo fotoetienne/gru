@@ -399,8 +399,13 @@ pub async fn handle_fix(issue: &str, timeout_opt: Option<String>, quiet: bool) -
                         raw_output_buffer.push_str(line);
                         // Keep buffer size reasonable
                         if raw_output_buffer.len() > MAX_OUTPUT_BUFFER_SIZE {
-                            raw_output_buffer =
-                                raw_output_buffer.split_off(TRIM_OUTPUT_BUFFER_SIZE);
+                            // Ensure we split at a valid UTF-8 character boundary to avoid panics
+                            // Find the largest valid UTF-8 boundary at or before TRIM_OUTPUT_BUFFER_SIZE
+                            let mut trim_pos = TRIM_OUTPUT_BUFFER_SIZE;
+                            while trim_pos > 0 && !raw_output_buffer.is_char_boundary(trim_pos) {
+                                trim_pos -= 1;
+                            }
+                            raw_output_buffer = raw_output_buffer.split_off(trim_pos);
                         }
                     }
 
