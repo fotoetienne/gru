@@ -1,7 +1,15 @@
 use crate::workspace;
 use anyhow::{Context, Result};
+use once_cell::sync::Lazy;
+use regex::Regex;
 use std::path::PathBuf;
 use tokio::process::Command;
+
+/// Regex for extracting issue links from PR bodies
+static ISSUE_LINK_REGEX: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?i)(?:fixes|closes|resolves)\s+#(\d+)")
+        .expect("Failed to compile issue link regex")
+});
 
 /// Information about a resolved Minion worktree
 #[derive(Debug, Clone)]
@@ -260,14 +268,6 @@ fn calculate_uptime(worktree_path: &std::path::Path) -> Result<String> {
 /// Extracts the linked issue number from a GitHub PR
 /// Returns the issue number if the PR contains "Fixes #<num>", "Closes #<num>", or "Resolves #<num>"
 async fn resolve_issue_from_pr(pr_num: u64) -> Result<u64> {
-    use once_cell::sync::Lazy;
-    use regex::Regex;
-
-    static ISSUE_LINK_REGEX: Lazy<Regex> = Lazy::new(|| {
-        Regex::new(r"(?i)(?:fixes|closes|resolves)\s+#(\d+)")
-            .expect("Failed to compile issue link regex")
-    });
-
     // Use gh CLI to get linked issue from PR body
     let output = Command::new("gh")
         .args(["pr", "view", &pr_num.to_string(), "--json", "body"])
