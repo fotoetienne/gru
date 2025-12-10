@@ -1,6 +1,6 @@
 ---
 description: Review a GitHub pull request and provide feedback
-allowed-tools: Bash(gh:*), Bash(gh pr view:*"), Bash(gh pr review:*"), Bash(git:*), Read, Glob, Grep, Task, Edit
+allowed-tools: Bash(gh:*), Bash(gh pr view:*"), Bash(gh pr review:*"), Bash(gh pr checks:*), Bash(git:*), Read, Glob, Grep, Task, Edit
 argument-hint: "<pr# or URL>"
 ---
 
