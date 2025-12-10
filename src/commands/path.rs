@@ -14,12 +14,12 @@ pub async fn handle_path(id: String, issue: Option<u64>, pr: Option<u64>) -> Res
     if issue.is_some() {
         eprintln!("Warning: --issue flag is deprecated and will be ignored.");
         eprintln!("Using positional argument '{}' instead.", id);
-        eprintln!("In the future, use: gru path {}\n", issue.unwrap());
+        eprintln!("In the future, use: gru path {}\n", id);
     }
     if pr.is_some() {
         eprintln!("Warning: --pr flag is deprecated and will be ignored.");
         eprintln!("Using positional argument '{}' instead.", id);
-        eprintln!("In the future, use: gru path {}\n", pr.unwrap());
+        eprintln!("In the future, use: gru path {}\n", id);
     }
 
     // Always use the positional id argument (non-deprecated)

@@ -19,8 +19,9 @@ pub async fn handle_status(id: Option<String>) -> Result<i32> {
         } else {
             // Try as minion ID (exact or with M prefix)
             minions
-                .into_iter()
+                .iter()
                 .filter(|m| m.minion_id == filter_id || m.minion_id == format!("M{}", filter_id))
+                .cloned()
                 .collect()
         };
 
