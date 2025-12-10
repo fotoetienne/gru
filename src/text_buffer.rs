@@ -28,13 +28,10 @@ impl TextBuffer {
     /// Add text to the buffer
     /// Returns Some(flushed_text) if the buffer should be flushed, None otherwise
     pub fn add(&self, text: &str) -> Option<String> {
-        let mut state = match self.buffer.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => {
-                eprintln!("Warning: TextBuffer mutex poisoned, recovering");
-                poisoned.into_inner()
-            }
-        };
+        let mut state = self
+            .buffer
+            .lock()
+            .expect("TextBuffer mutex poisoned - indicates a panic in buffer code");
 
         // Check if we should flush due to timeout
         let should_flush_timeout = if let Some(last_update) = state.last_update {
@@ -45,24 +42,27 @@ impl TextBuffer {
 
         // If timeout expired and we have buffered text, flush it before adding new text
         if should_flush_timeout && !state.text.is_empty() {
-            let flushed = state.text.clone();
-            state.text.clear();
+            let flushed = std::mem::take(&mut state.text);
             state.text.push_str(text);
+            // Start timing new buffer with the just-added text
             state.last_update = Some(Instant::now());
             return Some(flushed);
         }
 
         // Add new text to buffer
         state.text.push_str(text);
-        state.last_update = Some(Instant::now());
+        // Update or initialize the timestamp
+        if state.last_update.is_none() {
+            state.last_update = Some(Instant::now());
+        }
 
-        // Check if buffer contains newline
-        let has_newline = state.text.contains('\n');
+        // Check if newly added text contains newline (more efficient than scanning entire buffer)
+        let has_newline = text.contains('\n');
 
         // Flush if newline detected or buffer is getting full
         if has_newline || state.text.len() > 1000 {
-            let flushed = state.text.clone();
-            state.text.clear();
+            let flushed = std::mem::take(&mut state.text);
+            // Reset timestamp since buffer is now empty
             state.last_update = None;
             Some(flushed)
         } else {
@@ -72,19 +72,15 @@ impl TextBuffer {
 
     /// Force flush the buffer, returning any accumulated text
     pub fn flush(&self) -> Option<String> {
-        let mut state = match self.buffer.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => {
-                eprintln!("Warning: TextBuffer mutex poisoned, recovering");
-                poisoned.into_inner()
-            }
-        };
+        let mut state = self
+            .buffer
+            .lock()
+            .expect("TextBuffer mutex poisoned - indicates a panic in buffer code");
 
         if state.text.is_empty() {
             None
         } else {
-            let flushed = state.text.clone();
-            state.text.clear();
+            let flushed = std::mem::take(&mut state.text);
             state.last_update = None;
             Some(flushed)
         }

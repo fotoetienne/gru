@@ -213,6 +213,12 @@ impl ProgressDisplay {
                 self.update_header("✅ Message complete");
             }
             ClaudeEvent::Error { error } => {
+                // Flush any buffered text before showing error
+                if let Some(flushed_text) = self.text_buffer.flush() {
+                    let truncated = Self::truncate_string(&flushed_text, 50);
+                    self.add_event(format!("[{}] Text: {}", timestamp, truncated));
+                }
+
                 self.update_header("❌ Error");
                 let error_msg = error
                     .get("message")
