@@ -40,20 +40,14 @@ pub async fn resolve_minion(id: &str) -> Result<MinionInfo> {
 
     // Strategy 3: Try as issue/PR number
     if let Ok(num) = id.parse::<u64>() {
+        // First try as issue number in local worktrees
         if let Some(info) = find_by_issue_number_from_list(num, &minions) {
             return Ok(info);
         }
 
-        // Fallback to GitHub API (might be a PR)
-        if let Ok(minion_id) = resolve_minion_from_pr(num).await {
-            if let Some(info) = find_by_minion_id_from_list(&minion_id, &minions) {
-                return Ok(info);
-            }
-        }
-
-        // Try to resolve as issue directly via GitHub API
-        if let Ok(minion_id) = resolve_minion_from_issue(num).await {
-            if let Some(info) = find_by_minion_id_from_list(&minion_id, &minions) {
+        // Try to resolve as PR - extract linked issue and search locally
+        if let Ok(issue_num) = resolve_issue_from_pr(num).await {
+            if let Some(info) = find_by_issue_number_from_list(issue_num, &minions) {
                 return Ok(info);
             }
         }
@@ -263,49 +257,9 @@ fn calculate_uptime(worktree_path: &std::path::Path) -> Result<String> {
     }
 }
 
-/// Resolves a Minion ID from a GitHub issue number
-async fn resolve_minion_from_issue(issue_num: u64) -> Result<String> {
-    // Use gh CLI to get issue labels
-    let output = Command::new("gh")
-        .args(["issue", "view", &issue_num.to_string(), "--json", "labels"])
-        .output()
-        .await
-        .context("Failed to execute gh command. Is GitHub CLI installed?")?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("Failed to fetch issue #{}: {}", issue_num, stderr);
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let json: serde_json::Value =
-        serde_json::from_str(&stdout).context("Failed to parse gh output as JSON")?;
-
-    // Look for in-progress:M<id> label
-    let labels = json["labels"]
-        .as_array()
-        .context("Issue labels field is not an array")?;
-
-    for label in labels {
-        let label_name = label["name"]
-            .as_str()
-            .context("Label name is not a string")?;
-
-        if let Some(minion_id) = label_name.strip_prefix("in-progress:") {
-            if minion_id.starts_with('M') {
-                return Ok(minion_id.to_string());
-            }
-        }
-    }
-
-    anyhow::bail!(
-        "No active Minion found for issue #{}. Issue may not be in progress.",
-        issue_num
-    );
-}
-
-/// Resolves a Minion ID from a GitHub PR number
-async fn resolve_minion_from_pr(pr_num: u64) -> Result<String> {
+/// Extracts the linked issue number from a GitHub PR
+/// Returns the issue number if the PR contains "Fixes #<num>", "Closes #<num>", or "Resolves #<num>"
+async fn resolve_issue_from_pr(pr_num: u64) -> Result<u64> {
     use once_cell::sync::Lazy;
     use regex::Regex;
 
@@ -340,8 +294,7 @@ async fn resolve_minion_from_pr(pr_num: u64) -> Result<String> {
             .parse::<u64>()
             .context("Failed to parse issue number from PR body")?;
 
-        // Now resolve the Minion from that issue
-        return resolve_minion_from_issue(issue_num).await;
+        return Ok(issue_num);
     }
 
     anyhow::bail!(
