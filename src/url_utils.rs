@@ -207,6 +207,7 @@ pub async fn parse_pr_info(pr: &str) -> Result<(String, String, String, String)>
 
 /// Normalizes a Minion ID by adding the 'M' prefix if missing
 /// Validates that the ID contains only alphanumeric characters to prevent path traversal
+#[allow(dead_code)]
 pub fn normalize_minion_id(id: &str) -> Result<String> {
     // Validate against path traversal and invalid characters
     if id.contains('/') || id.contains('\\') || id.contains("..") {

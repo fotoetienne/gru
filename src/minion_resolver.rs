@@ -1,0 +1,340 @@
+use crate::workspace;
+use anyhow::{Context, Result};
+use once_cell::sync::Lazy;
+use regex::Regex;
+use std::path::PathBuf;
+use tokio::process::Command;
+
+/// Regex for extracting issue links from PR bodies
+static ISSUE_LINK_REGEX: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?i)(?:fixes|closes|resolves)\s+#(\d+)")
+        .expect("Failed to compile issue link regex")
+});
+
+/// Information about a resolved Minion worktree
+#[derive(Debug, Clone)]
+pub struct MinionInfo {
+    pub minion_id: String,
+    pub issue_number: Option<u64>,
+    pub repo_name: String,
+    pub branch: String,
+    pub worktree_path: PathBuf,
+    pub status: String,
+    pub uptime: String,
+}
+
+/// Smart ID resolution that tries multiple strategies
+/// 1. Try as exact minion ID (e.g., M0wy)
+/// 2. Try with M prefix (e.g., 12 -> M12)
+/// 3. Parse as number, search local minions by issue number
+/// 4. Fallback to GitHub API for PRs (if online)
+pub async fn resolve_minion(id: &str) -> Result<MinionInfo> {
+    // Scan all minions once using spawn_blocking to avoid blocking the async runtime
+    let minions = tokio::task::spawn_blocking(scan_all_minions)
+        .await
+        .context("Failed to spawn blocking task for scanning minions")??;
+
+    // Strategy 1: Try as exact minion ID
+    if let Some(info) = find_by_minion_id_from_list(id, &minions) {
+        return Ok(info);
+    }
+
+    // Strategy 2: Try with M prefix if not already present
+    if !id.starts_with('M') {
+        if let Some(info) = find_by_minion_id_from_list(&format!("M{}", id), &minions) {
+            return Ok(info);
+        }
+    }
+
+    // Strategy 3: Try as issue/PR number
+    if let Ok(num) = id.parse::<u64>() {
+        // First try as issue number in local worktrees
+        if let Some(info) = find_by_issue_number_from_list(num, &minions) {
+            return Ok(info);
+        }
+
+        // Try to resolve as PR - extract linked issue and search locally
+        if let Ok(issue_num) = resolve_issue_from_pr(num).await {
+            if let Some(info) = find_by_issue_number_from_list(issue_num, &minions) {
+                return Ok(info);
+            }
+        }
+    }
+
+    anyhow::bail!(
+        "Could not resolve ID '{}'. Tried:\n  \
+         - Minion ID: {}\n  \
+         - Minion ID: M{}\n  \
+         - Issue/PR number: {}\n\n\
+         Try 'gru status' to see active minions.",
+        id,
+        id,
+        id,
+        id
+    )
+}
+
+/// Find a minion by exact minion ID from a pre-scanned list
+fn find_by_minion_id_from_list(minion_id: &str, minions: &[MinionInfo]) -> Option<MinionInfo> {
+    minions.iter().find(|m| m.minion_id == minion_id).cloned()
+}
+
+/// Find a minion by issue number from a pre-scanned list
+fn find_by_issue_number_from_list(issue_num: u64, minions: &[MinionInfo]) -> Option<MinionInfo> {
+    minions
+        .iter()
+        .find(|m| m.issue_number == Some(issue_num))
+        .cloned()
+}
+
+/// Scans all minion worktrees and returns MinionInfo structs
+pub fn scan_all_minions() -> Result<Vec<MinionInfo>> {
+    let workspace = workspace::Workspace::new().context("Failed to initialize workspace")?;
+    let work_path = workspace.work();
+
+    if !work_path.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut minions = Vec::new();
+
+    // Iterate over owner directories
+    for owner_entry in std::fs::read_dir(work_path)? {
+        let owner_entry = owner_entry?;
+        if !owner_entry.path().is_dir() {
+            continue;
+        }
+
+        // Iterate over repo directories
+        for repo_entry in std::fs::read_dir(owner_entry.path())? {
+            let repo_entry = repo_entry?;
+            if !repo_entry.path().is_dir() {
+                continue;
+            }
+
+            // Iterate over minion directories (should start with 'M')
+            for minion_entry in std::fs::read_dir(repo_entry.path())? {
+                let minion_entry = minion_entry?;
+                let minion_path = minion_entry.path();
+
+                if !minion_path.is_dir() {
+                    continue;
+                }
+
+                let minion_id = minion_entry.file_name().to_string_lossy().to_string();
+
+                // Validate minion ID against path traversal and invalid characters
+                if minion_id.contains('/') || minion_id.contains('\\') || minion_id.contains("..") {
+                    continue; // Skip invalid directory names
+                }
+
+                if minion_id.len() < 2
+                    || !minion_id.starts_with('M')
+                    || !minion_id.chars().all(|c| c.is_alphanumeric())
+                {
+                    continue; // Skip non-minion directories
+                }
+
+                // Security check: verify the path stays within the work directory
+                if !minion_path.starts_with(work_path) {
+                    continue; // Skip paths that escape the work directory
+                }
+
+                // Check if this is a valid git worktree
+                let git_dir = minion_path.join(".git");
+                if !git_dir.exists() {
+                    continue;
+                }
+
+                // Get the branch name from git
+                let branch_output = std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(&minion_path)
+                    .arg("branch")
+                    .arg("--show-current")
+                    .output()?;
+
+                let branch = String::from_utf8_lossy(&branch_output.stdout)
+                    .trim()
+                    .to_string();
+
+                // Parse issue number from branch name (format: minion/issue-<num>-<id>)
+                let issue_number = parse_issue_from_branch(&branch);
+
+                // Determine status (Active or Idle) based on git index modification time
+                let status = determine_status(&minion_path)?;
+
+                // Calculate uptime from worktree creation time
+                let uptime = calculate_uptime(&minion_path)?;
+
+                // Build repo name from path components
+                let owner = owner_entry.file_name().to_string_lossy().to_string();
+                let repo = repo_entry.file_name().to_string_lossy().to_string();
+                let repo_name = format!("{}/{}", owner, repo);
+
+                minions.push(MinionInfo {
+                    minion_id,
+                    issue_number,
+                    repo_name,
+                    branch,
+                    worktree_path: minion_path,
+                    status,
+                    uptime,
+                });
+            }
+        }
+    }
+
+    // Sort by minion ID
+    minions.sort_by(|a, b| a.minion_id.cmp(&b.minion_id));
+
+    Ok(minions)
+}
+
+/// Parses the issue number from a branch name
+/// Expected format: minion/issue-<num>-<id>
+fn parse_issue_from_branch(branch: &str) -> Option<u64> {
+    if let Some(issue_part) = branch.strip_prefix("minion/issue-") {
+        // Extract the number before the next hyphen
+        if let Some(pos) = issue_part.find('-') {
+            if let Ok(num) = issue_part[..pos].parse::<u64>() {
+                return Some(num);
+            }
+        }
+    }
+    None
+}
+
+/// Determines if a Minion is Active or Idle based on git index modification time
+/// A Minion is considered Active if the git index was modified in the last 5 minutes
+fn determine_status(worktree_path: &std::path::Path) -> Result<String> {
+    // Use git rev-parse to get the actual git directory path
+    // In worktrees, .git is a file, not a directory
+    let git_dir_output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(worktree_path)
+        .arg("rev-parse")
+        .arg("--git-dir")
+        .output()?;
+
+    if !git_dir_output.status.success() {
+        return Ok("Idle".to_string());
+    }
+
+    let git_dir = String::from_utf8_lossy(&git_dir_output.stdout)
+        .trim()
+        .to_string();
+    let git_index = std::path::PathBuf::from(git_dir).join("index");
+
+    if !git_index.exists() {
+        return Ok("Idle".to_string());
+    }
+
+    let metadata = std::fs::metadata(&git_index)?;
+    let modified = metadata.modified()?;
+    let now = std::time::SystemTime::now();
+    let elapsed = now.duration_since(modified).unwrap_or_default();
+
+    // Consider active if modified within the last 5 minutes
+    if elapsed.as_secs() < 300 {
+        Ok("Active".to_string())
+    } else {
+        Ok("Idle".to_string())
+    }
+}
+
+/// Calculates the uptime of a worktree based on its creation time
+fn calculate_uptime(worktree_path: &std::path::Path) -> Result<String> {
+    let metadata = std::fs::metadata(worktree_path)?;
+    let created = metadata.created().or_else(|_| metadata.modified())?;
+    let now = std::time::SystemTime::now();
+    let elapsed = now.duration_since(created).unwrap_or_default();
+
+    let minutes = elapsed.as_secs() / 60;
+    let hours = minutes / 60;
+    let days = hours / 24;
+
+    if days > 0 {
+        Ok(format!("{}d", days))
+    } else if hours > 0 {
+        Ok(format!("{}h", hours))
+    } else if minutes > 0 {
+        Ok(format!("{}m", minutes))
+    } else {
+        Ok("< 1m".to_string())
+    }
+}
+
+/// Extracts the linked issue number from a GitHub PR
+/// Returns the issue number if the PR contains "Fixes #<num>", "Closes #<num>", or "Resolves #<num>"
+async fn resolve_issue_from_pr(pr_num: u64) -> Result<u64> {
+    // Use gh CLI to get linked issue from PR body
+    let output = Command::new("gh")
+        .args(["pr", "view", &pr_num.to_string(), "--json", "body"])
+        .output()
+        .await
+        .context("Failed to execute gh command. Is GitHub CLI installed?")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("Failed to fetch PR #{}: {}", pr_num, stderr);
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: serde_json::Value =
+        serde_json::from_str(&stdout).context("Failed to parse gh output as JSON")?;
+
+    let body = json["body"]
+        .as_str()
+        .context("PR body field is not a string")?;
+
+    // Look for "Fixes #<issue>" or "Closes #<issue>" in the PR body
+    if let Some(captures) = ISSUE_LINK_REGEX.captures(body) {
+        let issue_num = captures[1]
+            .parse::<u64>()
+            .context("Failed to parse issue number from PR body")?;
+
+        return Ok(issue_num);
+    }
+
+    anyhow::bail!(
+        "No linked issue found for PR #{}. PR must contain 'Fixes #<issue>' in its description.",
+        pr_num
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_issue_from_branch_valid() {
+        assert_eq!(parse_issue_from_branch("minion/issue-42-M001"), Some(42));
+        assert_eq!(parse_issue_from_branch("minion/issue-123-M999"), Some(123));
+        assert_eq!(parse_issue_from_branch("minion/issue-1-M0tk"), Some(1));
+    }
+
+    #[test]
+    fn test_parse_issue_from_branch_invalid() {
+        assert_eq!(parse_issue_from_branch("main"), None);
+        assert_eq!(parse_issue_from_branch("feature/branch"), None);
+        assert_eq!(parse_issue_from_branch(""), None);
+        assert_eq!(parse_issue_from_branch("minion/issue-"), None);
+    }
+
+    #[test]
+    fn test_scan_all_minions_returns_valid_vec() {
+        // This test verifies that scan_all_minions succeeds and returns a valid vector
+        let result = scan_all_minions();
+        assert!(result.is_ok());
+
+        // Verify we get a vector and all minions have required fields
+        let minions = result.unwrap();
+        for minion in &minions {
+            assert!(!minion.minion_id.is_empty());
+            assert!(!minion.repo_name.is_empty());
+            assert!(!minion.status.is_empty());
+            assert!(!minion.uptime.is_empty());
+        }
+    }
+}
