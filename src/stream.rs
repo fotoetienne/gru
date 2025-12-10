@@ -63,11 +63,39 @@ pub enum ClaudeEvent {
     Ping,
 }
 
+/// Represents a tool result from the Messages API
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ToolResult {
+    #[serde(rename = "type")]
+    pub result_type: String,
+    pub tool_use_id: String,
+    pub content: serde_json::Value,
+    #[serde(default)]
+    pub is_error: bool,
+}
+
+/// Represents a conversation message from the Messages API
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ConversationMessage {
+    #[serde(rename = "type")]
+    pub message_type: String,
+    pub message: MessageContent,
+}
+
+/// Represents the content of a conversation message
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MessageContent {
+    pub role: String,
+    pub content: Vec<ToolResult>,
+}
+
 /// Represents the output from parsing a stream line
 #[derive(Debug, Clone, PartialEq)]
 pub enum StreamOutput {
     /// A parsed Claude event
     Event(ClaudeEvent),
+    /// A parsed tool result message
+    ToolResult(ToolResult),
     /// A raw line that wasn't a JSON event
     RawLine(String),
 }
@@ -134,7 +162,18 @@ impl<R: tokio::io::AsyncRead + Unpin> EventStream<R> {
             }
         }
 
-        // Not a stream_event, treat as raw line
+        // Try to parse as a conversation message (verbose output)
+        if let Ok(conv_msg) = serde_json::from_str::<ConversationMessage>(trimmed) {
+            if conv_msg.message_type == "user" && !conv_msg.message.content.is_empty() {
+                // Return the first tool result (typically there's only one per message)
+                // The is_empty() guard above ensures that direct indexing is safe here.
+                return Ok(Some(StreamOutput::ToolResult(
+                    conv_msg.message.content[0].clone(),
+                )));
+            }
+        }
+
+        // Not a recognized format, treat as raw line
         Ok(Some(StreamOutput::RawLine(line)))
     }
 
@@ -330,6 +369,46 @@ mod tests {
         match &outputs[2] {
             StreamOutput::Event(ClaudeEvent::MessageStop) => {}
             _ => panic!("Expected MessageStop event"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_stream_reader_with_tool_result() {
+        // Test parsing tool result messages from verbose output
+        let input = r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_123","content":"output data","is_error":false}]}}
+"#;
+        let mut stream = EventStream::new(input.as_bytes());
+
+        let outputs = stream.read_all().await.unwrap();
+        assert_eq!(outputs.len(), 1);
+
+        match &outputs[0] {
+            StreamOutput::ToolResult(tool_result) => {
+                assert_eq!(tool_result.result_type, "tool_result");
+                assert_eq!(tool_result.tool_use_id, "toolu_123");
+                assert!(!tool_result.is_error);
+            }
+            _ => panic!("Expected ToolResult"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_stream_reader_with_tool_result_error() {
+        // Test parsing tool result with error
+        let input = r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_456","content":"error message","is_error":true}]}}
+"#;
+        let mut stream = EventStream::new(input.as_bytes());
+
+        let outputs = stream.read_all().await.unwrap();
+        assert_eq!(outputs.len(), 1);
+
+        match &outputs[0] {
+            StreamOutput::ToolResult(tool_result) => {
+                assert_eq!(tool_result.result_type, "tool_result");
+                assert_eq!(tool_result.tool_use_id, "toolu_456");
+                assert!(tool_result.is_error);
+            }
+            _ => panic!("Expected ToolResult with error"),
         }
     }
 }

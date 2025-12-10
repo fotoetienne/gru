@@ -13,6 +13,10 @@ const MAX_RECENT_EVENTS: usize = 4;
 /// 200 characters allows ~3-4 lines of text to display coherently.
 const MAX_DISPLAY_CHARS: usize = 200;
 
+/// Maximum characters for raw lines (JSON and other verbose content).
+/// Raw lines are more aggressively truncated than buffered text to reduce clutter.
+const MAX_RAW_LINE_CHARS: usize = 80;
+
 /// Configuration for the progress display
 pub struct ProgressConfig {
     pub minion_id: String,
@@ -150,15 +154,83 @@ impl ProgressDisplay {
 
         match output {
             StreamOutput::Event(event) => self.handle_event(event),
+            StreamOutput::ToolResult(tool_result) => self.handle_tool_result(tool_result),
             StreamOutput::RawLine(line) => {
-                // Pass through non-JSON output to stdout
-                use std::io::Write;
-                if let Err(e) = std::io::stdout().write_all(line.as_bytes()) {
-                    eprintln!("Warning: Failed to write to stdout: {}", e);
+                // Try to abbreviate if it looks like JSON
+                let abbreviated = Self::abbreviate_raw_line(line);
+
+                // Only output if we have something to show
+                if !abbreviated.is_empty() {
+                    use std::io::Write;
+                    if let Err(e) = std::io::stdout().write_all(abbreviated.as_bytes()) {
+                        eprintln!("Warning: Failed to write to stdout: {}", e);
+                    }
+                    let _ = std::io::stdout().flush();
                 }
-                let _ = std::io::stdout().flush();
             }
         }
+    }
+
+    /// Abbreviate raw lines that might be JSON or other verbose content
+    fn abbreviate_raw_line(line: &str) -> String {
+        let trimmed = line.trim();
+
+        // Empty lines pass through as-is
+        if trimmed.is_empty() {
+            return line.to_string();
+        }
+
+        // Try to parse as JSON to abbreviate
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(trimmed) {
+            // If it's a recognizable JSON structure, try to abbreviate it
+            if json.is_object() {
+                // For now, just truncate JSON objects
+                let preview = format!("{}", json);
+                if preview.len() > MAX_RAW_LINE_CHARS {
+                    return format!("{}\n", Self::truncate_string(&preview, MAX_RAW_LINE_CHARS));
+                }
+            }
+        }
+
+        // If not JSON or too short to worry about, truncate to single line
+        if trimmed.len() > MAX_RAW_LINE_CHARS {
+            format!("{}\n", Self::truncate_string(trimmed, MAX_RAW_LINE_CHARS))
+        } else {
+            line.to_string()
+        }
+    }
+
+    /// Handle a tool result message
+    fn handle_tool_result(&self, tool_result: &crate::stream::ToolResult) {
+        let timestamp = Local::now().format("%H:%M:%S");
+
+        let formatted = if tool_result.is_error {
+            // Format error tool results
+            let error_msg = match tool_result.content.as_str() {
+                Some(s) => s.to_string(),
+                None => format!(
+                    "Tool failed with non-string error content: {}",
+                    tool_result.content
+                ),
+            };
+            // Show first line of error
+            let first_line = error_msg.lines().next().unwrap_or(&error_msg);
+            let truncated = Self::truncate_string(first_line, 60);
+            format!("[{}] ✗ Tool failed: {}", timestamp, truncated)
+        } else {
+            // Format successful tool results
+            let size = tool_result
+                .content
+                .as_str()
+                .map(|s| s.len())
+                .unwrap_or_else(|| {
+                    // For non-string content, estimate size from JSON
+                    tool_result.content.to_string().len()
+                });
+            format!("[{}] ✓ Tool completed ({} bytes)", timestamp, size)
+        };
+
+        self.add_event(formatted);
     }
 
     /// Truncate a string to a maximum number of characters (not bytes)
@@ -602,5 +674,94 @@ mod tests {
 
         // After taking, tracker should be empty
         assert!(tracker.take().is_none());
+    }
+
+    #[test]
+    fn test_abbreviate_raw_line_empty() {
+        let line = "";
+        let result = ProgressDisplay::abbreviate_raw_line(line);
+        assert_eq!(result, "");
+    }
+
+    #[test]
+    fn test_abbreviate_raw_line_short() {
+        let line = "Short message\n";
+        let result = ProgressDisplay::abbreviate_raw_line(line);
+        assert_eq!(result, "Short message\n");
+    }
+
+    #[test]
+    fn test_abbreviate_raw_line_long() {
+        let line = "This is a very long message that exceeds the maximum character limit and should be truncated to fit within the display";
+        let result = ProgressDisplay::abbreviate_raw_line(line);
+        assert!(result.len() <= 84); // MAX_RAW_LINE_CHARS + "..." + "\n"
+        assert!(result.ends_with("...\n"));
+    }
+
+    #[test]
+    fn test_abbreviate_raw_line_json_short() {
+        let line = r#"{"foo":"bar"}"#;
+        let result = ProgressDisplay::abbreviate_raw_line(line);
+        assert_eq!(result, r#"{"foo":"bar"}"#);
+    }
+
+    #[test]
+    fn test_abbreviate_raw_line_json_long() {
+        let line = r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_123","content":"very long content here"}]}}"#;
+        let result = ProgressDisplay::abbreviate_raw_line(line);
+        assert!(result.len() <= 84); // MAX_RAW_LINE_CHARS + "..." + "\n"
+        assert!(result.ends_with("...\n"));
+    }
+
+    #[test]
+    fn test_handle_tool_result_success() {
+        use crate::stream::ToolResult;
+
+        let tool_result = ToolResult {
+            result_type: "tool_result".to_string(),
+            tool_use_id: "toolu_123".to_string(),
+            content: serde_json::json!("Command output here"),
+            is_error: false,
+        };
+
+        let config = ProgressConfig {
+            minion_id: "M001".to_string(),
+            issue: "42".to_string(),
+            quiet: false,
+        };
+
+        let display = ProgressDisplay::new(config);
+        display.handle_tool_result(&tool_result);
+
+        let events = display.recent_events.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert!(events[0].contains("✓ Tool completed"));
+        assert!(events[0].contains("bytes"));
+    }
+
+    #[test]
+    fn test_handle_tool_result_error() {
+        use crate::stream::ToolResult;
+
+        let tool_result = ToolResult {
+            result_type: "tool_result".to_string(),
+            tool_use_id: "toolu_456".to_string(),
+            content: serde_json::json!("Error: command not found"),
+            is_error: true,
+        };
+
+        let config = ProgressConfig {
+            minion_id: "M001".to_string(),
+            issue: "42".to_string(),
+            quiet: false,
+        };
+
+        let display = ProgressDisplay::new(config);
+        display.handle_tool_result(&tool_result);
+
+        let events = display.recent_events.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert!(events[0].contains("✗ Tool failed"));
+        assert!(events[0].contains("Error"));
     }
 }
