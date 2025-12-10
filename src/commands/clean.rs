@@ -214,7 +214,8 @@ pub async fn handle_clean(dry_run: bool, force: bool, base_branch: &str) -> Resu
         };
 
         // Decide whether to use --force flag
-        let force_needed = has_modified && only_ephemeral;
+        // If user specified --force, use it; otherwise auto-force if only ephemeral files
+        let force_needed = force || (has_modified && only_ephemeral);
 
         // Build command arguments - need to store string values to avoid lifetime issues
         let mut cmd = std::process::Command::new("git");
@@ -233,8 +234,10 @@ pub async fn handle_clean(dry_run: bool, force: bool, base_branch: &str) -> Resu
         let status = cmd.output()?;
 
         if status.status.success() {
-            if force_needed {
+            if force_needed && !force {
                 println!("✓ (auto-forced for ephemeral files)");
+            } else if force {
+                println!("✓ (forced)");
             } else {
                 println!("✓");
             }
