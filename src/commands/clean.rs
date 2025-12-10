@@ -168,7 +168,24 @@ pub async fn handle_clean(dry_run: bool, force: bool, base_branch: &str) -> Resu
         };
         println!("  {} ({})", wt.path.display(), reason);
         println!("    Branch: {}", wt.branch);
-        println!("    Repo: {}\n", wt.repo);
+        println!("    Repo: {}", wt.repo);
+
+        // Check worktree dirty status to inform user what will happen
+        match check_worktree_files(&wt.path) {
+            Ok((has_modified, only_ephemeral)) => {
+                if !has_modified {
+                    println!("    Status: clean");
+                } else if only_ephemeral {
+                    println!("    Status: dirty (ephemeral files only - will auto-force)");
+                } else {
+                    println!("    Status: dirty (important files - requires --force)");
+                }
+            }
+            Err(_) => {
+                println!("    Status: unknown (unable to check)");
+            }
+        }
+        println!();
     }
 
     if dry_run {
