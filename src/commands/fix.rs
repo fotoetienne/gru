@@ -656,7 +656,6 @@ mod tests {
         assert!(parse_timeout("s").is_err());
     }
 
-<<<<<<< HEAD
     #[tokio::test]
     async fn test_is_branch_pushed_nonexistent() {
         use std::env;
@@ -668,7 +667,8 @@ mod tests {
         // Git command will fail, but we return Ok(false) to indicate branch is not pushed
         assert!(result.is_ok());
         assert!(!result.unwrap());
-=======
+    }
+
     #[test]
     fn test_check_tests_passing_detects_success() {
         let output = "Running tests...\ntest result: ok. 5 passed; 0 failed\n";
@@ -691,6 +691,5 @@ mod tests {
     fn test_check_tests_passing_returns_none_when_unclear() {
         let output = "Just some random output without test results";
         assert_eq!(check_tests_passing(output), None);
->>>>>>> e540fff (Add progress comment posting)
     }
 }
