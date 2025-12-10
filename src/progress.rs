@@ -8,6 +8,11 @@ use std::time::{Duration, Instant};
 /// Maximum number of recent events to keep in the display history
 const MAX_RECENT_EVENTS: usize = 4;
 
+/// Maximum characters to display for buffered text chunks.
+/// Since text is now buffered for up to 150ms, chunks can be larger.
+/// 200 characters allows ~3-4 lines of text to display coherently.
+const MAX_DISPLAY_CHARS: usize = 200;
+
 /// Configuration for the progress display
 pub struct ProgressConfig {
     pub minion_id: String,
@@ -175,7 +180,8 @@ impl ProgressDisplay {
                         if let Some(text) = delta.get("text").and_then(|t| t.as_str()) {
                             // Add text to buffer; flush if ready
                             if let Some(flushed_text) = self.text_buffer.add(text) {
-                                let truncated = Self::truncate_string(&flushed_text, 50);
+                                let truncated =
+                                    Self::truncate_string(&flushed_text, MAX_DISPLAY_CHARS);
                                 self.add_event(format!("[{}] Text: {}", timestamp, truncated));
                             }
                         }
@@ -185,7 +191,7 @@ impl ProgressDisplay {
             ClaudeEvent::ContentBlockStop { .. } => {
                 // Content block finished - flush any remaining buffered text
                 if let Some(flushed_text) = self.text_buffer.flush() {
-                    let truncated = Self::truncate_string(&flushed_text, 50);
+                    let truncated = Self::truncate_string(&flushed_text, MAX_DISPLAY_CHARS);
                     self.add_event(format!("[{}] Text: {}", timestamp, truncated));
                 }
             }
@@ -207,7 +213,7 @@ impl ProgressDisplay {
             ClaudeEvent::MessageStop => {
                 // Flush any remaining buffered text before completing
                 if let Some(flushed_text) = self.text_buffer.flush() {
-                    let truncated = Self::truncate_string(&flushed_text, 50);
+                    let truncated = Self::truncate_string(&flushed_text, MAX_DISPLAY_CHARS);
                     self.add_event(format!("[{}] Text: {}", timestamp, truncated));
                 }
                 self.update_header("✅ Message complete");
@@ -215,7 +221,7 @@ impl ProgressDisplay {
             ClaudeEvent::Error { error } => {
                 // Flush any buffered text before showing error
                 if let Some(flushed_text) = self.text_buffer.flush() {
-                    let truncated = Self::truncate_string(&flushed_text, 50);
+                    let truncated = Self::truncate_string(&flushed_text, MAX_DISPLAY_CHARS);
                     self.add_event(format!("[{}] Text: {}", timestamp, truncated));
                 }
 
