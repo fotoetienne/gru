@@ -139,6 +139,161 @@ impl GitHubClient {
             ))?;
         Ok(())
     }
+
+    /// Create a draft pull request
+    ///
+    /// # Arguments
+    /// * `owner` - Repository owner
+    /// * `repo` - Repository name
+    /// * `branch` - Head branch name (source)
+    /// * `base` - Base branch name (target, usually "main")
+    /// * `title` - PR title
+    /// * `body` - PR description body (markdown supported)
+    ///
+    /// Returns the PR number as a string
+    pub async fn create_draft_pr(
+        &self,
+        owner: &str,
+        repo: &str,
+        branch: &str,
+        base: &str,
+        title: &str,
+        body: &str,
+    ) -> Result<String> {
+        use tokio::process::Command;
+
+        let output = Command::new("gh")
+            .args([
+                "pr",
+                "create",
+                "--repo",
+                &format!("{}/{}", owner, repo),
+                "--head",
+                branch,
+                "--base",
+                base,
+                "--title",
+                title,
+                "--body",
+                body,
+                "--draft",
+            ])
+            .output()
+            .await
+            .context("Failed to execute gh pr create command")?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(anyhow!(
+                "Failed to create draft PR for branch '{}' in {}/{}: {}",
+                branch,
+                owner,
+                repo,
+                stderr
+            ));
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let pr_url = stdout.trim();
+
+        // Validate URL format (gh returns URL like https://github.com/owner/repo/pull/123)
+        if !pr_url.starts_with("https://github.com/") && !pr_url.starts_with("http://github.com/") {
+            return Err(anyhow!("Expected GitHub PR URL, got: {}", pr_url));
+        }
+
+        // Parse PR number from the last path segment
+        let pr_number = pr_url
+            .rsplit('/')
+            .next()
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| anyhow!("Failed to parse PR number from URL: {}", pr_url))?;
+
+        // Validate it's actually a number
+        pr_number
+            .parse::<u64>()
+            .context(format!("PR number '{}' is not a valid integer", pr_number))?;
+
+        Ok(pr_number.to_string())
+    }
+
+    /// Update the body/description of an existing pull request
+    ///
+    /// # Arguments
+    /// * `owner` - Repository owner
+    /// * `repo` - Repository name
+    /// * `pr_number` - PR number
+    /// * `body` - New PR description body (markdown supported)
+    pub async fn update_pr_body(
+        &self,
+        owner: &str,
+        repo: &str,
+        pr_number: &str,
+        body: &str,
+    ) -> Result<()> {
+        use tokio::process::Command;
+
+        let output = Command::new("gh")
+            .args([
+                "pr",
+                "edit",
+                pr_number,
+                "--repo",
+                &format!("{}/{}", owner, repo),
+                "--body",
+                body,
+            ])
+            .output()
+            .await
+            .context("Failed to execute gh pr edit command")?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(anyhow!(
+                "Failed to update PR #{} in {}/{}: {}",
+                pr_number,
+                owner,
+                repo,
+                stderr
+            ));
+        }
+
+        Ok(())
+    }
+
+    /// Mark a draft PR as ready for review
+    ///
+    /// # Arguments
+    /// * `owner` - Repository owner
+    /// * `repo` - Repository name
+    /// * `pr_number` - PR number
+    pub async fn mark_pr_ready(&self, owner: &str, repo: &str, pr_number: &str) -> Result<()> {
+        use tokio::process::Command;
+
+        let output = Command::new("gh")
+            .args([
+                "pr",
+                "ready",
+                pr_number,
+                "--repo",
+                &format!("{}/{}", owner, repo),
+            ])
+            .output()
+            .await
+            .context("Failed to execute gh pr ready command")?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(anyhow!(
+                "Failed to mark PR #{} as ready in {}/{}: {}",
+                pr_number,
+                owner,
+                repo,
+                stderr
+            ));
+        }
+
+        Ok(())
+    }
 }
 
 // ============================================================================

@@ -1,5 +1,7 @@
 use crate::git;
+use crate::github::GitHubClient;
 use crate::minion;
+use crate::pr_state::PrState;
 use crate::progress::{ProgressConfig, ProgressDisplay};
 use crate::stream::{self, EventStream};
 use crate::url_utils::parse_issue_info;
@@ -9,7 +11,7 @@ use std::path::Path;
 use std::time::Instant;
 use tokio::fs::OpenOptions;
 use tokio::io::AsyncWriteExt;
-use tokio::process::Command;
+use tokio::process::Command as TokioCommand;
 use tokio::time::{timeout, Duration};
 
 /// Timeout in seconds for each line read from Claude's output stream
@@ -40,6 +42,91 @@ async fn log_event(worktree_path: &Path, event: &stream::StreamOutput) -> Result
         file.flush().await?;
     }
     Ok(())
+}
+
+/// Checks if a branch has been pushed to the remote
+async fn is_branch_pushed(worktree_path: &Path, branch_name: &str) -> Result<bool> {
+    let output = TokioCommand::new("git")
+        .arg("-C")
+        .arg(worktree_path)
+        .arg("rev-parse")
+        .arg(format!("origin/{}", branch_name))
+        .output()
+        .await
+        .context("Failed to check if branch is pushed")?;
+
+    Ok(output.status.success())
+}
+
+/// Creates a draft PR for the given branch
+async fn create_pr_for_issue(
+    owner: &str,
+    repo: &str,
+    branch_name: &str,
+    issue_num: &str,
+    minion_id: &str,
+    worktree_path: &Path,
+) -> Result<String> {
+    // Get the default branch (usually main or master)
+    let base_branch_output = TokioCommand::new("git")
+        .arg("-C")
+        .arg(worktree_path)
+        .arg("symbolic-ref")
+        .arg("refs/remotes/origin/HEAD")
+        .output()
+        .await
+        .context("Failed to get default branch")?;
+
+    let base_branch = if base_branch_output.status.success() {
+        String::from_utf8_lossy(&base_branch_output.stdout)
+            .trim()
+            .trim_start_matches("refs/remotes/origin/")
+            .to_string()
+    } else {
+        eprintln!("⚠️  Could not detect default branch, using 'main'");
+        "main".to_string() // Fallback to main
+    };
+
+    println!("📌 Creating PR targeting base branch: {}", base_branch);
+
+    // Get issue title from GitHub API
+    let github_client = GitHubClient::from_env().context(
+        "Failed to initialize GitHub client. Set GRU_GITHUB_TOKEN environment variable.",
+    )?;
+
+    let issue_number: u64 = issue_num.parse().context("Failed to parse issue number")?;
+
+    let issue = github_client
+        .get_issue(owner, repo, issue_number)
+        .await
+        .context("Failed to fetch issue from GitHub")?;
+
+    let issue_title = issue.title;
+
+    // Create PR title and body
+    let pr_title = format!("[WIP] Fixes #{}: {}", issue_num, issue_title);
+    let pr_body = format!(
+        r#"🤖 This PR is being worked on by Minion {}
+
+## Status
+Work in progress - I'll update this when ready for review.
+
+## Changes
+- ✅ Initial implementation
+- ⏳ Writing tests
+- ⏳ Documentation
+
+Fixes #{}"#,
+        minion_id, issue_num
+    );
+
+    // Create the draft PR
+    let pr_number = github_client
+        .create_draft_pr(owner, repo, branch_name, &base_branch, &pr_title, &pr_body)
+        .await
+        .context("Failed to create draft PR")?;
+
+    Ok(pr_number)
 }
 
 /// Parses a timeout string into a Duration
@@ -144,7 +231,7 @@ pub async fn handle_fix(issue: &str, timeout_opt: Option<String>, quiet: bool) -
     let progress = ProgressDisplay::new(config);
 
     // Build the command with flags for non-interactive stream-json output
-    let mut cmd = Command::new("claude");
+    let mut cmd = TokioCommand::new("claude");
     cmd.arg("--print")
         .arg("--verbose")
         .arg("--output-format")
@@ -265,6 +352,59 @@ pub async fn handle_fix(issue: &str, timeout_opt: Option<String>, quiet: bool) -
     // Finish the progress display
     if status.success() {
         progress.finish_with_message(&format!("✅ Completed issue {}", issue));
+
+        // Check if a PR should be created
+        println!("\n🔍 Checking if branch was pushed...");
+        let branch_pushed = is_branch_pushed(&worktree_path, &branch_name).await?;
+
+        if branch_pushed {
+            println!("📋 Branch was pushed, creating pull request...");
+
+            match create_pr_for_issue(
+                &owner,
+                &repo,
+                &branch_name,
+                &issue_num,
+                &minion_id,
+                &worktree_path,
+            )
+            .await
+            {
+                Ok(pr_number) => {
+                    // Save PR state
+                    let pr_state = PrState::new(pr_number.clone(), issue_num.clone());
+                    pr_state
+                        .save(&worktree_path)
+                        .context("Failed to save PR state")?;
+
+                    println!("✅ Draft PR created: #{}", pr_number);
+                    println!(
+                        "🔗 View PR at: https://github.com/{}/{}/pull/{}",
+                        owner, repo, pr_number
+                    );
+                }
+                Err(e) => {
+                    let err_msg = e.to_string();
+                    if err_msg.contains("already exists")
+                        || err_msg.contains("A pull request for branch")
+                    {
+                        eprintln!("ℹ️  A PR already exists for branch '{}'", branch_name);
+                        eprintln!("   Check: https://github.com/{}/{}/pulls", owner, repo);
+                    } else if err_msg.contains("branch not found")
+                        || err_msg.contains("does not exist")
+                    {
+                        eprintln!("⚠️  Branch was pushed but is no longer available.");
+                        eprintln!("   It may have been deleted or force-pushed.");
+                    } else {
+                        eprintln!("⚠️  Failed to create PR: {}", e);
+                    }
+                    eprintln!("   You can create the PR manually if needed.");
+                }
+            }
+        } else {
+            println!("ℹ️  Branch was not pushed. No PR will be created.");
+            println!("   Push your changes with: git push origin {}", branch_name);
+        }
     } else {
         progress.finish_with_message(&format!("❌ Failed to fix issue {}", issue));
     }
@@ -316,5 +456,18 @@ mod tests {
         assert!(parse_timeout("10x").is_err());
         assert!(parse_timeout("-10s").is_err());
         assert!(parse_timeout("s").is_err());
+    }
+
+    #[tokio::test]
+    async fn test_is_branch_pushed_nonexistent() {
+        use std::env;
+
+        // Test with a non-existent directory
+        let temp_dir = env::temp_dir().join("gru-test-nonexistent");
+        let result = is_branch_pushed(&temp_dir, "test-branch").await;
+
+        // Git command will fail, but we return Ok(false) to indicate branch is not pushed
+        assert!(result.is_ok());
+        assert!(!result.unwrap());
     }
 }

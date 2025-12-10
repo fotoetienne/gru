@@ -4,6 +4,7 @@ mod github;
 mod logger;
 mod minion;
 mod minion_resolver;
+mod pr_state;
 mod progress;
 mod stream;
 mod url_utils;
