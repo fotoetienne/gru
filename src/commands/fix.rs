@@ -136,27 +136,6 @@ Fixes #{}"#,
     Ok(pr_number)
 }
 
-/// Get the recent commits in the worktree
-async fn get_recent_commits(worktree_path: &Path, count: usize) -> Result<Vec<String>> {
-    let output = TokioCommand::new("git")
-        .arg("-C")
-        .arg(worktree_path)
-        .arg("log")
-        .arg("--oneline")
-        .arg(format!("-{}", count))
-        .output()
-        .await
-        .context("Failed to execute git log")?;
-
-    if !output.status.success() {
-        // No commits yet - return empty list
-        return Ok(Vec::new());
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    Ok(stdout.lines().map(String::from).collect())
-}
-
 /// Count the number of commits in the worktree
 async fn count_commits(worktree_path: &Path) -> Result<usize> {
     let output = TokioCommand::new("git")
@@ -475,13 +454,9 @@ pub async fn handle_fix(issue: &str, timeout_opt: Option<String>, quiet: bool) -
                     // Check for new commits
                     let current_commit_count = count_commits(&worktree_path).await.unwrap_or(0);
                     if current_commit_count > last_commit_count {
-                        let new_commits = get_recent_commits(
-                            &worktree_path,
-                            current_commit_count - last_commit_count,
-                        )
-                        .await?;
-                        for commit in new_commits {
-                            progress_tracker.add_commit(commit);
+                        let new_commit_count = current_commit_count - last_commit_count;
+                        for _ in 0..new_commit_count {
+                            progress_tracker.add_commit();
                         }
                         last_commit_count = current_commit_count;
 

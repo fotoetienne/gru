@@ -33,7 +33,6 @@ pub struct ProgressUpdate {
     pub tests_passing: bool,
     pub timestamp: DateTime<Utc>,
     pub message: String,
-    pub recent_commits: Vec<String>,
 }
 
 impl ProgressUpdate {
@@ -60,14 +59,6 @@ impl ProgressUpdate {
         // Body message
         comment.push_str(&self.message);
 
-        // Recent commits (if any)
-        if !self.recent_commits.is_empty() {
-            comment.push_str("\n\n**Recent commits:**\n");
-            for commit in &self.recent_commits {
-                comment.push_str(&format!("- {}\n", commit));
-            }
-        }
-
         comment
     }
 }
@@ -78,7 +69,6 @@ pub struct ProgressCommentTracker {
     last_comment_time: Option<Instant>,
     commit_count: usize,
     tests_passing: bool,
-    recent_commits: Vec<String>,
     current_phase: MinionPhase,
 }
 
@@ -90,7 +80,6 @@ impl ProgressCommentTracker {
             last_comment_time: None,
             commit_count: 0,
             tests_passing: false,
-            recent_commits: Vec::new(),
             current_phase: MinionPhase::Planning,
         }
     }
@@ -101,13 +90,8 @@ impl ProgressCommentTracker {
     }
 
     /// Record a new commit
-    pub fn add_commit(&mut self, commit_msg: String) {
+    pub fn add_commit(&mut self) {
         self.commit_count += 1;
-        self.recent_commits.push(commit_msg);
-        // Keep only the last 5 commits
-        if self.recent_commits.len() > 5 {
-            self.recent_commits.remove(0);
-        }
     }
 
     /// Update test status
@@ -132,7 +116,6 @@ impl ProgressCommentTracker {
             tests_passing: self.tests_passing,
             timestamp: Utc::now(),
             message,
-            recent_commits: self.recent_commits.clone(),
         }
     }
 
@@ -175,11 +158,6 @@ mod tests {
                 .unwrap()
                 .with_timezone(&Utc),
             message: "Made 3 commits so far. Tests are passing.".to_string(),
-            recent_commits: vec![
-                "`abc123` Add user authentication endpoint".to_string(),
-                "`def456` Add tests for auth endpoint".to_string(),
-                "`ghi789` Update API documentation".to_string(),
-            ],
         };
 
         let formatted = update.format_comment();
@@ -197,12 +175,6 @@ mod tests {
 
         // Check message
         assert!(formatted.contains("Made 3 commits so far. Tests are passing."));
-
-        // Check commits
-        assert!(formatted.contains("**Recent commits:**"));
-        assert!(formatted.contains("`abc123` Add user authentication endpoint"));
-        assert!(formatted.contains("`def456` Add tests for auth endpoint"));
-        assert!(formatted.contains("`ghi789` Update API documentation"));
     }
 
     #[test]
@@ -218,25 +190,11 @@ mod tests {
     #[test]
     fn test_progress_tracker_add_commit() {
         let mut tracker = ProgressCommentTracker::new("M001".to_string());
-        tracker.add_commit("First commit".to_string());
+        tracker.add_commit();
         assert_eq!(tracker.commit_count, 1);
-        assert_eq!(tracker.recent_commits.len(), 1);
 
-        tracker.add_commit("Second commit".to_string());
+        tracker.add_commit();
         assert_eq!(tracker.commit_count, 2);
-        assert_eq!(tracker.recent_commits.len(), 2);
-    }
-
-    #[test]
-    fn test_progress_tracker_limits_recent_commits() {
-        let mut tracker = ProgressCommentTracker::new("M001".to_string());
-        for i in 0..10 {
-            tracker.add_commit(format!("Commit {}", i));
-        }
-        assert_eq!(tracker.commit_count, 10);
-        assert_eq!(tracker.recent_commits.len(), 5);
-        assert_eq!(tracker.recent_commits[0], "Commit 5");
-        assert_eq!(tracker.recent_commits[4], "Commit 9");
     }
 
     #[test]
@@ -267,7 +225,7 @@ mod tests {
     fn test_create_update() {
         let mut tracker = ProgressCommentTracker::new("M001".to_string());
         tracker.set_phase(MinionPhase::Implementing);
-        tracker.add_commit("First commit".to_string());
+        tracker.add_commit();
         tracker.set_tests_passing(true);
 
         let update = tracker.create_update("Working on implementation".to_string());
@@ -277,6 +235,5 @@ mod tests {
         assert_eq!(update.commits, 1);
         assert!(update.tests_passing);
         assert_eq!(update.message, "Working on implementation");
-        assert_eq!(update.recent_commits.len(), 1);
     }
 }
