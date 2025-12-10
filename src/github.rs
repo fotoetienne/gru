@@ -149,7 +149,7 @@ impl GitHubClient {
         Ok(())
     }
 
-    /// Create a draft pull request
+    /// Create a draft pull request using gh CLI
     ///
     /// # Arguments
     /// * `owner` - Repository owner
@@ -160,6 +160,11 @@ impl GitHubClient {
     /// * `body` - PR description body (markdown supported)
     ///
     /// Returns the PR number as a string
+    ///
+    /// Note: This method uses gh CLI (not the GitHub API) because:
+    /// - The gh CLI handles authentication edge cases better
+    /// - CLI provides better error messages for PR creation failures
+    /// - Consistent with pre-existing implementation pattern
     pub async fn create_draft_pr(
         &self,
         owner: &str,
@@ -169,61 +174,8 @@ impl GitHubClient {
         title: &str,
         body: &str,
     ) -> Result<String> {
-        use tokio::process::Command;
-
-        let output = Command::new("gh")
-            .args([
-                "pr",
-                "create",
-                "--repo",
-                &format!("{}/{}", owner, repo),
-                "--head",
-                branch,
-                "--base",
-                base,
-                "--title",
-                title,
-                "--body",
-                body,
-                "--draft",
-            ])
-            .output()
-            .await
-            .context("Failed to execute gh pr create command")?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(anyhow!(
-                "Failed to create draft PR for branch '{}' in {}/{}: {}",
-                branch,
-                owner,
-                repo,
-                stderr
-            ));
-        }
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let pr_url = stdout.trim();
-
-        // Validate URL format (gh returns URL like https://github.com/owner/repo/pull/123)
-        // Only accept HTTPS URLs for security
-        if !pr_url.starts_with("https://github.com/") {
-            return Err(anyhow!("Expected GitHub HTTPS URL, got: {}", pr_url));
-        }
-
-        // Parse PR number from the last path segment
-        let pr_number = pr_url
-            .rsplit('/')
-            .next()
-            .filter(|s| !s.is_empty())
-            .ok_or_else(|| anyhow!("Failed to parse PR number from URL: {}", pr_url))?;
-
-        // Validate it's actually a number
-        pr_number
-            .parse::<u64>()
-            .context(format!("PR number '{}' is not a valid integer", pr_number))?;
-
-        Ok(pr_number.to_string())
+        // Delegate to CLI implementation (same behavior whether API token is set or not)
+        create_draft_pr_via_cli(owner, repo, branch, base, title, body).await
     }
 
     /// Update the body/description of an existing pull request
@@ -543,12 +495,29 @@ pub async fn create_draft_pr_via_cli(
         return Err(anyhow!("Expected GitHub HTTPS URL, got: {}", pr_url));
     }
 
-    // Parse PR number from the last path segment
-    let pr_number = pr_url
-        .rsplit('/')
+    // Remove any query parameters or fragments before parsing
+    let url_path = pr_url
+        .trim_end_matches('/')
+        .split('?')
         .next()
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| anyhow!("Failed to parse PR number from URL: {}", pr_url))?;
+        .unwrap()
+        .split('#')
+        .next()
+        .unwrap();
+
+    // Parse PR number from path segments
+    // Expected format: https://github.com/owner/repo/pull/123
+    let segments: Vec<&str> = url_path.split('/').collect();
+
+    // segments should be: ["https:", "", "github.com", "owner", "repo", "pull", "123"]
+    if segments.len() < 7 || segments[5] != "pull" {
+        return Err(anyhow!(
+            "Unexpected GitHub PR URL format: {}. Expected: https://github.com/owner/repo/pull/NUMBER",
+            pr_url
+        ));
+    }
+
+    let pr_number = segments[6];
 
     // Validate it's actually a number
     pr_number
