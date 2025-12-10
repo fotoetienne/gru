@@ -25,6 +25,12 @@ const INACTIVITY_WARNING_SECS: u64 = 300; // 5 minutes
 /// Duration of inactivity before considering the task stuck
 const INACTIVITY_STUCK_SECS: u64 = 900; // 15 minutes
 
+/// Maximum size of the output buffer for test detection (in bytes)
+const MAX_OUTPUT_BUFFER_SIZE: usize = 10000;
+
+/// Size to trim the output buffer to when it exceeds the maximum (in bytes)
+const TRIM_OUTPUT_BUFFER_SIZE: usize = 5000;
+
 /// Logs an event to events.jsonl in the worktree directory
 async fn log_event(worktree_path: &Path, event: &stream::StreamOutput) -> Result<()> {
     let events_file = worktree_path.join("events.jsonl");
@@ -231,6 +237,37 @@ fn parse_timeout(timeout_str: &str) -> Result<Duration> {
     }
 }
 
+/// Helper function to post a progress comment to a GitHub issue
+/// Returns true if the comment was posted successfully, false otherwise
+async fn try_post_progress_comment(
+    client: &GitHubClient,
+    owner: &str,
+    repo: &str,
+    issue_num: &str,
+    comment_body: &str,
+) -> bool {
+    // Parse issue number to u64
+    match issue_num.parse::<u64>() {
+        Ok(issue_num_u64) => {
+            // Post comment (fire and forget - don't block on errors)
+            match client
+                .post_comment(owner, repo, issue_num_u64, comment_body)
+                .await
+            {
+                Ok(_) => true,
+                Err(e) => {
+                    eprintln!("⚠️  Failed to post progress comment: {}", e);
+                    false
+                }
+            }
+        }
+        Err(_) => {
+            eprintln!("⚠️  Invalid issue number format: {}", issue_num);
+            false
+        }
+    }
+}
+
 /// Handles the fix command by delegating to the Claude CLI
 /// Returns the exit code from the claude process
 pub async fn handle_fix(issue: &str, timeout_opt: Option<String>, quiet: bool) -> Result<i32> {
@@ -403,8 +440,9 @@ pub async fn handle_fix(issue: &str, timeout_opt: Option<String>, quiet: bool) -
                     if let stream::StreamOutput::RawLine(ref line) = output {
                         raw_output_buffer.push_str(line);
                         // Keep buffer size reasonable
-                        if raw_output_buffer.len() > 10000 {
-                            raw_output_buffer = raw_output_buffer.split_off(5000);
+                        if raw_output_buffer.len() > MAX_OUTPUT_BUFFER_SIZE {
+                            raw_output_buffer =
+                                raw_output_buffer.split_off(TRIM_OUTPUT_BUFFER_SIZE);
                         }
                     }
 
@@ -458,17 +496,16 @@ pub async fn handle_fix(issue: &str, timeout_opt: Option<String>, quiet: bool) -
                                 let update = progress_tracker.create_update(message);
                                 let comment_body = update.format_comment();
 
-                                // Parse issue number to u64
-                                if let Ok(issue_num_u64) = issue_num.parse::<u64>() {
-                                    // Post comment (fire and forget - don't block on errors)
-                                    if let Err(e) = client
-                                        .post_comment(&owner, &repo, issue_num_u64, &comment_body)
-                                        .await
-                                    {
-                                        eprintln!("⚠️  Failed to post progress comment: {}", e);
-                                    } else {
-                                        progress_tracker.mark_comment_posted();
-                                    }
+                                if try_post_progress_comment(
+                                    client,
+                                    &owner,
+                                    &repo,
+                                    &issue_num,
+                                    &comment_body,
+                                )
+                                .await
+                                {
+                                    progress_tracker.mark_comment_posted();
                                 }
                             }
                         }
@@ -506,16 +543,8 @@ pub async fn handle_fix(issue: &str, timeout_opt: Option<String>, quiet: bool) -
         let update = progress_tracker.create_update(final_message);
         let comment_body = update.format_comment();
 
-        // Parse issue number to u64
-        if let Ok(issue_num_u64) = issue_num.parse::<u64>() {
-            // Post final comment (ignore rate limiting for completion)
-            if let Err(e) = client
-                .post_comment(&owner, &repo, issue_num_u64, &comment_body)
-                .await
-            {
-                eprintln!("⚠️  Failed to post completion comment: {}", e);
-            }
-        }
+        // Post final comment (ignore rate limiting for completion)
+        try_post_progress_comment(client, &owner, &repo, &issue_num, &comment_body).await;
     }
 
     // Finish the progress display
