@@ -13,6 +13,10 @@ const MAX_RECENT_EVENTS: usize = 4;
 /// 200 characters allows ~3-4 lines of text to display coherently.
 const MAX_DISPLAY_CHARS: usize = 200;
 
+/// Maximum characters for raw lines (JSON and other verbose content).
+/// Raw lines are more aggressively truncated than buffered text to reduce clutter.
+const MAX_RAW_LINE_CHARS: usize = 80;
+
 /// Configuration for the progress display
 pub struct ProgressConfig {
     pub minion_id: String,
@@ -182,15 +186,15 @@ impl ProgressDisplay {
             if json.is_object() {
                 // For now, just truncate JSON objects
                 let preview = format!("{}", json);
-                if preview.len() > 80 {
-                    return format!("{}\n", Self::truncate_string(&preview, 80));
+                if preview.len() > MAX_RAW_LINE_CHARS {
+                    return format!("{}\n", Self::truncate_string(&preview, MAX_RAW_LINE_CHARS));
                 }
             }
         }
 
         // If not JSON or too short to worry about, truncate to single line
-        if trimmed.len() > 80 {
-            format!("{}\n", Self::truncate_string(trimmed, 80))
+        if trimmed.len() > MAX_RAW_LINE_CHARS {
+            format!("{}\n", Self::truncate_string(trimmed, MAX_RAW_LINE_CHARS))
         } else {
             line.to_string()
         }
@@ -202,9 +206,15 @@ impl ProgressDisplay {
 
         let formatted = if tool_result.is_error {
             // Format error tool results
-            let error_msg = tool_result.content.as_str().unwrap_or("Unknown error");
+            let error_msg = match tool_result.content.as_str() {
+                Some(s) => s.to_string(),
+                None => format!(
+                    "Tool failed with non-string error content: {}",
+                    tool_result.content
+                ),
+            };
             // Show first line of error
-            let first_line = error_msg.lines().next().unwrap_or(error_msg);
+            let first_line = error_msg.lines().next().unwrap_or(&error_msg);
             let truncated = Self::truncate_string(first_line, 60);
             format!("[{}] ✗ Tool failed: {}", timestamp, truncated)
         } else {
@@ -684,7 +694,7 @@ mod tests {
     fn test_abbreviate_raw_line_long() {
         let line = "This is a very long message that exceeds the maximum character limit and should be truncated to fit within the display";
         let result = ProgressDisplay::abbreviate_raw_line(line);
-        assert!(result.len() <= 84); // 80 chars + "..." + "\n"
+        assert!(result.len() <= 84); // MAX_RAW_LINE_CHARS + "..." + "\n"
         assert!(result.ends_with("...\n"));
     }
 
@@ -699,7 +709,7 @@ mod tests {
     fn test_abbreviate_raw_line_json_long() {
         let line = r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_123","content":"very long content here"}]}}"#;
         let result = ProgressDisplay::abbreviate_raw_line(line);
-        assert!(result.len() <= 84); // 80 chars + "..." + "\n"
+        assert!(result.len() <= 84); // MAX_RAW_LINE_CHARS + "..." + "\n"
         assert!(result.ends_with("...\n"));
     }
 

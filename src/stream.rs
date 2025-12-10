@@ -166,6 +166,7 @@ impl<R: tokio::io::AsyncRead + Unpin> EventStream<R> {
         if let Ok(conv_msg) = serde_json::from_str::<ConversationMessage>(trimmed) {
             if conv_msg.message_type == "user" && !conv_msg.message.content.is_empty() {
                 // Return the first tool result (typically there's only one per message)
+                // The is_empty() guard above ensures that direct indexing is safe here.
                 return Ok(Some(StreamOutput::ToolResult(
                     conv_msg.message.content[0].clone(),
                 )));
