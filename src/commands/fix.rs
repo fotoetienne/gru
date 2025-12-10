@@ -3,6 +3,7 @@ use crate::github::GitHubClient;
 use crate::minion;
 use crate::pr_state::PrState;
 use crate::progress::{ProgressConfig, ProgressDisplay};
+use crate::progress_comments::{MinionPhase, ProgressCommentTracker};
 use crate::stream::{self, EventStream};
 use crate::url_utils::parse_issue_info;
 use crate::workspace;
@@ -23,6 +24,12 @@ const INACTIVITY_WARNING_SECS: u64 = 300; // 5 minutes
 
 /// Duration of inactivity before considering the task stuck
 const INACTIVITY_STUCK_SECS: u64 = 900; // 15 minutes
+
+/// Maximum size of the output buffer for test detection (in bytes)
+const MAX_OUTPUT_BUFFER_SIZE: usize = 10000;
+
+/// Size to trim the output buffer to when it exceeds the maximum (in bytes)
+const TRIM_OUTPUT_BUFFER_SIZE: usize = 5000;
 
 /// Logs an event to events.jsonl in the worktree directory
 async fn log_event(worktree_path: &Path, event: &stream::StreamOutput) -> Result<()> {
@@ -189,6 +196,37 @@ fn parse_timeout(timeout_str: &str) -> Result<Duration> {
     }
 }
 
+/// Helper function to post a progress comment to a GitHub issue
+/// Returns true if the comment was posted successfully, false otherwise
+async fn try_post_progress_comment(
+    client: &GitHubClient,
+    owner: &str,
+    repo: &str,
+    issue_num: &str,
+    comment_body: &str,
+) -> bool {
+    // Parse issue number to u64
+    match issue_num.parse::<u64>() {
+        Ok(issue_num_u64) => {
+            // Post comment (fire and forget - don't block on errors)
+            match client
+                .post_comment(owner, repo, issue_num_u64, comment_body)
+                .await
+            {
+                Ok(_) => true,
+                Err(e) => {
+                    eprintln!("⚠️  Failed to post progress comment: {}", e);
+                    false
+                }
+            }
+        }
+        Err(_) => {
+            eprintln!("⚠️  Invalid issue number format: {}", issue_num);
+            false
+        }
+    }
+}
+
 /// Handles the fix command by delegating to the Claude CLI
 /// Returns the exit code from the claude process
 pub async fn handle_fix(issue: &str, timeout_opt: Option<String>, quiet: bool) -> Result<i32> {
@@ -243,6 +281,15 @@ pub async fn handle_fix(issue: &str, timeout_opt: Option<String>, quiet: bool) -
     };
     let progress = ProgressDisplay::new(config);
 
+    // Initialize progress comment tracker
+    let mut progress_tracker = ProgressCommentTracker::new(minion_id.clone());
+
+    // Initialize GitHub client (optional - only if token is available)
+    let github_client = GitHubClient::from_env().ok();
+    if github_client.is_none() {
+        println!("⚠️  GRU_GITHUB_TOKEN not set - progress comments will not be posted");
+    }
+
     // Build the command with flags for non-interactive stream-json output
     let mut cmd = TokioCommand::new("claude");
     cmd.arg("--print")
@@ -286,6 +333,7 @@ pub async fn handle_fix(issue: &str, timeout_opt: Option<String>, quiet: bool) -
     let stream_result = async {
         let mut last_event_time = Instant::now();
         let mut warned_at_5min = false;
+        let mut raw_output_buffer = String::new();
 
         loop {
             // Check overall task timeout
@@ -346,8 +394,68 @@ pub async fn handle_fix(issue: &str, timeout_opt: Option<String>, quiet: bool) -
                         warned_at_5min = false;
                     }
 
+                    // Buffer raw output for test detection
+                    if let stream::StreamOutput::RawLine(ref line) = output {
+                        raw_output_buffer.push_str(line);
+                        // Keep buffer size reasonable
+                        if raw_output_buffer.len() > MAX_OUTPUT_BUFFER_SIZE {
+                            raw_output_buffer =
+                                raw_output_buffer.split_off(TRIM_OUTPUT_BUFFER_SIZE);
+                        }
+                    }
+
                     // Display progress
                     progress.handle_output(&output);
+
+                    // Check for milestones and update tracker
+                    if let stream::StreamOutput::RawLine(ref line) = output {
+                        // Detect phase transitions from output and post progress comments
+                        let previous_phase = progress_tracker.current_phase();
+                        let mut phase_changed = false;
+
+                        if line.contains("Plan") || line.contains("plan") {
+                            if previous_phase != MinionPhase::Planning {
+                                progress_tracker.set_phase(MinionPhase::Planning);
+                                phase_changed = true;
+                            }
+                        } else if (line.contains("Implement") || line.contains("Writing"))
+                            && previous_phase != MinionPhase::Implementing
+                        {
+                            progress_tracker.set_phase(MinionPhase::Implementing);
+                            phase_changed = true;
+                        } else if (line.contains("test") || line.contains("Test"))
+                            && previous_phase != MinionPhase::Testing
+                        {
+                            progress_tracker.set_phase(MinionPhase::Testing);
+                            phase_changed = true;
+                        }
+
+                        // Post progress comment if phase changed and rate limiting allows
+                        if phase_changed {
+                            if let Some(ref client) = github_client {
+                                if progress_tracker.can_post_comment() {
+                                    let message = format!(
+                                        "Now in {} phase.",
+                                        progress_tracker.current_phase().as_str()
+                                    );
+                                    let update = progress_tracker.create_update(message);
+                                    let comment_body = update.format_comment();
+
+                                    if try_post_progress_comment(
+                                        client,
+                                        &owner,
+                                        &repo,
+                                        &issue_num,
+                                        &comment_body,
+                                    )
+                                    .await
+                                    {
+                                        progress_tracker.mark_comment_posted();
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
                 None => break, // Stream ended normally
             }
@@ -361,6 +469,23 @@ pub async fn handle_fix(issue: &str, timeout_opt: Option<String>, quiet: bool) -
 
     // Now check if there was a stream error
     stream_result?;
+
+    // Post final completion comment
+    if let Some(ref client) = github_client {
+        progress_tracker.set_phase(MinionPhase::Completed);
+
+        let final_message = if status.success() {
+            "✅ Task completed successfully!".to_string()
+        } else {
+            "❌ Task failed.".to_string()
+        };
+
+        let update = progress_tracker.create_update(final_message);
+        let comment_body = update.format_comment();
+
+        // Post final comment (ignore rate limiting for completion)
+        try_post_progress_comment(client, &owner, &repo, &issue_num, &comment_body).await;
+    }
 
     // Finish the progress display
     if status.success() {

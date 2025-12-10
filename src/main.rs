@@ -6,6 +6,7 @@ mod minion;
 mod minion_resolver;
 mod pr_state;
 mod progress;
+mod progress_comments;
 mod stream;
 mod text_buffer;
 mod url_utils;
