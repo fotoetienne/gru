@@ -1,6 +1,11 @@
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+/// Maximum buffer size in characters before forcing a flush.
+/// This prevents unbounded memory growth from streaming text without newlines.
+/// 1000 characters is roughly 15-20 lines of typical code or prose.
+const MAX_BUFFER_SIZE: usize = 1000;
+
 /// Time-based text buffer for grouping streaming text fragments
 /// Flushes after a timeout or on newline characters
 pub struct TextBuffer {
@@ -60,7 +65,7 @@ impl TextBuffer {
         let has_newline = text.contains('\n');
 
         // Flush if newline detected or buffer is getting full
-        if has_newline || state.text.len() > 1000 {
+        if has_newline || state.text.len() > MAX_BUFFER_SIZE {
             let flushed = std::mem::take(&mut state.text);
             // Reset timestamp since buffer is now empty
             state.last_update = None;
@@ -149,8 +154,8 @@ mod tests {
     fn test_buffer_flushes_when_full() {
         let buffer = TextBuffer::new(Duration::from_millis(150));
 
-        // Add text that exceeds 1000 chars
-        let long_text = "a".repeat(1001);
+        // Add text that exceeds MAX_BUFFER_SIZE
+        let long_text = "a".repeat(MAX_BUFFER_SIZE + 1);
         let result = buffer.add(&long_text);
 
         // Should flush immediately when buffer is too full
