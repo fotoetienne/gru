@@ -197,8 +197,9 @@ impl GitHubClient {
         let pr_url = stdout.trim();
 
         // Validate URL format (gh returns URL like https://github.com/owner/repo/pull/123)
-        if !pr_url.starts_with("https://github.com/") && !pr_url.starts_with("http://github.com/") {
-            return Err(anyhow!("Expected GitHub PR URL, got: {}", pr_url));
+        // Only accept HTTPS URLs for security
+        if !pr_url.starts_with("https://github.com/") {
+            return Err(anyhow!("Expected GitHub HTTPS URL, got: {}", pr_url));
         }
 
         // Parse PR number from the last path segment
