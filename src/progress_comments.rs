@@ -29,8 +29,6 @@ impl MinionPhase {
 pub struct ProgressUpdate {
     pub minion_id: String,
     pub phase: MinionPhase,
-    pub commits: usize,
-    pub tests_passing: bool,
     pub timestamp: DateTime<Utc>,
     pub message: String,
 }
@@ -51,8 +49,6 @@ impl ProgressUpdate {
         comment.push_str("event: minion:progress\n");
         comment.push_str(&format!("minion_id: {}\n", self.minion_id));
         comment.push_str(&format!("phase: {}\n", self.phase.as_str()));
-        comment.push_str(&format!("commits: {}\n", self.commits));
-        comment.push_str(&format!("tests_passing: {}\n", self.tests_passing));
         comment.push_str(&format!("timestamp: {}\n", self.timestamp.to_rfc3339()));
         comment.push_str("---\n\n");
 
@@ -67,8 +63,6 @@ impl ProgressUpdate {
 pub struct ProgressCommentTracker {
     minion_id: String,
     last_comment_time: Option<Instant>,
-    commit_count: usize,
-    tests_passing: bool,
     current_phase: MinionPhase,
 }
 
@@ -78,8 +72,6 @@ impl ProgressCommentTracker {
         Self {
             minion_id,
             last_comment_time: None,
-            commit_count: 0,
-            tests_passing: false,
             current_phase: MinionPhase::Planning,
         }
     }
@@ -87,16 +79,6 @@ impl ProgressCommentTracker {
     /// Update the current phase
     pub fn set_phase(&mut self, phase: MinionPhase) {
         self.current_phase = phase;
-    }
-
-    /// Record a new commit
-    pub fn add_commit(&mut self) {
-        self.commit_count += 1;
-    }
-
-    /// Update test status
-    pub fn set_tests_passing(&mut self, passing: bool) {
-        self.tests_passing = passing;
     }
 
     /// Check if enough time has passed since the last comment
@@ -112,8 +94,6 @@ impl ProgressCommentTracker {
         ProgressUpdate {
             minion_id: self.minion_id.clone(),
             phase: self.current_phase,
-            commits: self.commit_count,
-            tests_passing: self.tests_passing,
             timestamp: Utc::now(),
             message,
         }
@@ -127,11 +107,6 @@ impl ProgressCommentTracker {
     /// Get the current phase
     pub fn current_phase(&self) -> MinionPhase {
         self.current_phase
-    }
-
-    /// Get the commit count
-    pub fn commit_count(&self) -> usize {
-        self.commit_count
     }
 }
 
@@ -152,12 +127,10 @@ mod tests {
         let update = ProgressUpdate {
             minion_id: "M042".to_string(),
             phase: MinionPhase::Implementing,
-            commits: 3,
-            tests_passing: true,
             timestamp: DateTime::parse_from_rfc3339("2025-01-30T14:45:00Z")
                 .unwrap()
                 .with_timezone(&Utc),
-            message: "Made 3 commits so far. Tests are passing.".to_string(),
+            message: "Working on implementation".to_string(),
         };
 
         let formatted = update.format_comment();
@@ -169,32 +142,18 @@ mod tests {
         assert!(formatted.contains("event: minion:progress"));
         assert!(formatted.contains("minion_id: M042"));
         assert!(formatted.contains("phase: implementing"));
-        assert!(formatted.contains("commits: 3"));
-        assert!(formatted.contains("tests_passing: true"));
         assert!(formatted.contains("timestamp: 2025-01-30T14:45:00+00:00"));
 
         // Check message
-        assert!(formatted.contains("Made 3 commits so far. Tests are passing."));
+        assert!(formatted.contains("Working on implementation"));
     }
 
     #[test]
     fn test_progress_tracker_initialization() {
         let tracker = ProgressCommentTracker::new("M001".to_string());
         assert_eq!(tracker.minion_id, "M001");
-        assert_eq!(tracker.commit_count, 0);
-        assert!(!tracker.tests_passing);
         assert_eq!(tracker.current_phase, MinionPhase::Planning);
         assert!(tracker.can_post_comment());
-    }
-
-    #[test]
-    fn test_progress_tracker_add_commit() {
-        let mut tracker = ProgressCommentTracker::new("M001".to_string());
-        tracker.add_commit();
-        assert_eq!(tracker.commit_count, 1);
-
-        tracker.add_commit();
-        assert_eq!(tracker.commit_count, 2);
     }
 
     #[test]
@@ -225,15 +184,11 @@ mod tests {
     fn test_create_update() {
         let mut tracker = ProgressCommentTracker::new("M001".to_string());
         tracker.set_phase(MinionPhase::Implementing);
-        tracker.add_commit();
-        tracker.set_tests_passing(true);
 
         let update = tracker.create_update("Working on implementation".to_string());
 
         assert_eq!(update.minion_id, "M001");
         assert_eq!(update.phase, MinionPhase::Implementing);
-        assert_eq!(update.commits, 1);
-        assert!(update.tests_passing);
         assert_eq!(update.message, "Working on implementation");
     }
 }
