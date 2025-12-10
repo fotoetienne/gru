@@ -47,8 +47,10 @@ enum Commands {
     },
     #[command(about = "Review a GitHub pull request")]
     Review {
-        #[arg(help = "PR number or URL to review")]
-        pr: String,
+        #[arg(
+            help = "PR number, URL, Minion ID, or issue number. Auto-detects from current worktree if omitted."
+        )]
+        pr: Option<String>,
     },
     #[command(about = "Get the filesystem path to a Minion's worktree")]
     Path {
@@ -88,7 +90,7 @@ async fn main() {
 
     let result = match cli.command {
         Commands::Fix { issue, timeout } => fix::handle_fix(&issue, timeout, cli.quiet).await,
-        Commands::Review { pr } => review::handle_review(&pr).await,
+        Commands::Review { pr } => review::handle_review(pr).await,
         Commands::Path { id, issue, pr } => path::handle_path(id, issue, pr).await,
         Commands::Resume { id } => resume::handle_resume(id).await,
         Commands::Clean {
