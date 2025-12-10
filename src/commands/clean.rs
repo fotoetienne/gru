@@ -8,10 +8,10 @@ use tokio::io::AsyncBufReadExt;
 /// Check if a file path represents an ephemeral file that's safe to discard
 /// Ephemeral files include logs, build artifacts, IDE configs, etc.
 fn is_ephemeral_file(path: &Path) -> bool {
-    let path_str = path.to_string_lossy();
     let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
 
     // Check for specific ephemeral files
+    // Note: Cargo.lock is ephemeral for binary projects (auto-regenerated)
     if matches!(
         file_name,
         "events.jsonl" | "Cargo.lock" | ".DS_Store" | "Thumbs.db"
@@ -19,23 +19,33 @@ fn is_ephemeral_file(path: &Path) -> bool {
         return true;
     }
 
-    // Check for ephemeral directories
-    if path_str.starts_with("target/")
-        || path_str.starts_with(".vscode/")
-        || path_str.starts_with(".idea/")
-        || path_str.starts_with(".vs/")
-        || path_str.starts_with("node_modules/")
-        || path_str.starts_with(".next/")
-        || path_str.starts_with("dist/")
-        || path_str.starts_with("build/")
-        || path_str.starts_with(".cache/")
-    {
-        return true;
-    }
-
     // Check for log files
     if file_name.ends_with(".log") {
         return true;
+    }
+
+    // Check if any path component is an ephemeral directory
+    // Use proper path component matching to avoid false positives
+    // (e.g., "target_backup/" should not match "target/")
+    for component in path.components() {
+        if let std::path::Component::Normal(name) = component {
+            if let Some(name_str) = name.to_str() {
+                if matches!(
+                    name_str,
+                    "target"
+                        | ".vscode"
+                        | ".idea"
+                        | ".vs"
+                        | "node_modules"
+                        | ".next"
+                        | "dist"
+                        | "build"
+                        | ".cache"
+                ) {
+                    return true;
+                }
+            }
+        }
     }
 
     false
@@ -80,7 +90,28 @@ fn check_worktree_files(worktree_path: &Path) -> Result<(bool, bool)> {
             continue;
         }
 
-        let file_path = &line[3..]; // Skip status characters and space
+        let mut file_path = &line[3..]; // Skip status characters and space
+
+        // Handle quoted filenames (git porcelain format quotes special characters)
+        // Example: ?? "file with spaces.txt"
+        if file_path.starts_with('"') && file_path.ends_with('"') {
+            file_path = &file_path[1..file_path.len() - 1];
+        }
+
+        // Handle renamed files (format: "old_name -> new_name")
+        // For renames, we need to check both old and new names
+        if let Some(arrow_pos) = file_path.find(" -> ") {
+            let old_path = &file_path[..arrow_pos];
+            let new_path = &file_path[arrow_pos + 4..];
+
+            // Both old and new names must be ephemeral
+            if !is_ephemeral_file(Path::new(old_path)) || !is_ephemeral_file(Path::new(new_path)) {
+                has_important_files = true;
+                break;
+            }
+            continue;
+        }
+
         let path = Path::new(file_path);
 
         if !is_ephemeral_file(path) {
@@ -328,5 +359,24 @@ mod tests {
     #[test]
     fn test_is_not_ephemeral_file_tests() {
         assert!(!is_ephemeral_file(Path::new("tests/integration_test.rs")));
+    }
+
+    // Edge case tests for path component matching
+    #[test]
+    fn test_path_component_matching_no_false_positives() {
+        // These should NOT be considered ephemeral (false positive prevention)
+        assert!(!is_ephemeral_file(Path::new("target_backup/file.txt")));
+        assert!(!is_ephemeral_file(Path::new("building/config.yaml")));
+        assert!(!is_ephemeral_file(Path::new("dist_old/bundle.js")));
+        assert!(!is_ephemeral_file(Path::new(".vscode_settings/foo.json")));
+    }
+
+    #[test]
+    fn test_path_component_matching_nested_ephemeral() {
+        // Nested paths with ephemeral components should be ephemeral
+        assert!(is_ephemeral_file(Path::new("src/target/debug/gru")));
+        assert!(is_ephemeral_file(Path::new(
+            "foo/bar/node_modules/pkg/index.js"
+        )));
     }
 }
