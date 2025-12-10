@@ -40,9 +40,6 @@ impl PrState {
     /// * `worktree_path` - Path to the worktree directory
     ///
     /// Returns None if the file doesn't exist
-    ///
-    /// Note: Reserved for future use when checking existing PR state
-    #[allow(dead_code)]
     pub fn load(worktree_path: &Path) -> Result<Option<Self>> {
         let pr_state_path = worktree_path.join(".gru_pr_state.json");
 
