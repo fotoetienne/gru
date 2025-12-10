@@ -1,6 +1,6 @@
 ---
 description: Respond to all comments and reviews on a PR
-allowed-tools: Bash(gh:*), Bash(git:*)
+allowed-tools: Bash(gh:*), Bash(git:*), Bash(just:*)
 ---
 
 Respond to all comments and reviews on a GitHub pull request.
