@@ -3,6 +3,7 @@ use crate::github::GitHubClient;
 use crate::minion;
 use crate::pr_state::PrState;
 use crate::progress::{ProgressConfig, ProgressDisplay};
+use crate::progress_comments::{MinionPhase, ProgressCommentTracker};
 use crate::stream::{self, EventStream};
 use crate::url_utils::parse_issue_info;
 use crate::workspace;
@@ -129,6 +130,60 @@ Fixes #{}"#,
     Ok(pr_number)
 }
 
+/// Get the recent commits in the worktree
+async fn get_recent_commits(worktree_path: &Path, count: usize) -> Result<Vec<String>> {
+    let output = TokioCommand::new("git")
+        .arg("-C")
+        .arg(worktree_path)
+        .arg("log")
+        .arg("--oneline")
+        .arg(format!("-{}", count))
+        .output()
+        .await
+        .context("Failed to execute git log")?;
+
+    if !output.status.success() {
+        // No commits yet - return empty list
+        return Ok(Vec::new());
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    Ok(stdout.lines().map(String::from).collect())
+}
+
+/// Count the number of commits in the worktree
+async fn count_commits(worktree_path: &Path) -> Result<usize> {
+    let output = TokioCommand::new("git")
+        .arg("-C")
+        .arg(worktree_path)
+        .arg("rev-list")
+        .arg("--count")
+        .arg("HEAD")
+        .output()
+        .await
+        .context("Failed to execute git rev-list")?;
+
+    if !output.status.success() {
+        // No commits yet
+        return Ok(0);
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    Ok(stdout.trim().parse().unwrap_or(0))
+}
+
+/// Check if tests are passing by looking for common test patterns in recent output
+fn check_tests_passing(raw_output: &str) -> Option<bool> {
+    // Look for common test success/failure patterns
+    if raw_output.contains("test result: ok") || raw_output.contains("All tests passed") {
+        Some(true)
+    } else if raw_output.contains("test result: FAILED") || raw_output.contains("Tests failed") {
+        Some(false)
+    } else {
+        None
+    }
+}
+
 /// Parses a timeout string into a Duration
 /// Supports formats like "10s", "5m", "1h", "30"
 fn parse_timeout(timeout_str: &str) -> Result<Duration> {
@@ -230,6 +285,15 @@ pub async fn handle_fix(issue: &str, timeout_opt: Option<String>, quiet: bool) -
     };
     let progress = ProgressDisplay::new(config);
 
+    // Initialize progress comment tracker
+    let mut progress_tracker = ProgressCommentTracker::new(minion_id.clone());
+
+    // Initialize GitHub client (optional - only if token is available)
+    let github_client = GitHubClient::from_env().ok();
+    if github_client.is_none() {
+        println!("⚠️  GRU_GITHUB_TOKEN not set - progress comments will not be posted");
+    }
+
     // Build the command with flags for non-interactive stream-json output
     let mut cmd = TokioCommand::new("claude");
     cmd.arg("--print")
@@ -273,6 +337,8 @@ pub async fn handle_fix(issue: &str, timeout_opt: Option<String>, quiet: bool) -
     let stream_result = async {
         let mut last_event_time = Instant::now();
         let mut warned_at_5min = false;
+        let mut last_commit_count = 0;
+        let mut raw_output_buffer = String::new();
 
         loop {
             // Check overall task timeout
@@ -333,8 +399,80 @@ pub async fn handle_fix(issue: &str, timeout_opt: Option<String>, quiet: bool) -
                         warned_at_5min = false;
                     }
 
+                    // Buffer raw output for test detection
+                    if let stream::StreamOutput::RawLine(ref line) = output {
+                        raw_output_buffer.push_str(line);
+                        // Keep buffer size reasonable
+                        if raw_output_buffer.len() > 10000 {
+                            raw_output_buffer = raw_output_buffer.split_off(5000);
+                        }
+                    }
+
                     // Display progress
                     progress.handle_output(&output);
+
+                    // Check for milestones and update tracker
+                    if let stream::StreamOutput::RawLine(ref line) = output {
+                        // Detect phase transitions from output
+                        if line.contains("Plan") || line.contains("plan") {
+                            if progress_tracker.current_phase() != MinionPhase::Planning {
+                                progress_tracker.set_phase(MinionPhase::Planning);
+                            }
+                        } else if (line.contains("Implement") || line.contains("Writing"))
+                            && progress_tracker.current_phase() != MinionPhase::Implementing
+                        {
+                            progress_tracker.set_phase(MinionPhase::Implementing);
+                        } else if (line.contains("test") || line.contains("Test"))
+                            && progress_tracker.current_phase() != MinionPhase::Testing
+                        {
+                            progress_tracker.set_phase(MinionPhase::Testing);
+                        }
+
+                        // Check for test results
+                        if let Some(passing) = check_tests_passing(&raw_output_buffer) {
+                            progress_tracker.set_tests_passing(passing);
+                        }
+                    }
+
+                    // Check for new commits
+                    let current_commit_count = count_commits(&worktree_path).await.unwrap_or(0);
+                    if current_commit_count > last_commit_count {
+                        let new_commits = get_recent_commits(
+                            &worktree_path,
+                            current_commit_count - last_commit_count,
+                        )
+                        .await?;
+                        for commit in new_commits {
+                            progress_tracker.add_commit(commit);
+                        }
+                        last_commit_count = current_commit_count;
+
+                        // Post progress comment if allowed
+                        if let Some(ref client) = github_client {
+                            if progress_tracker.can_post_comment() {
+                                let message = format!(
+                                    "Made {} commit(s) so far. Current phase: {}.",
+                                    progress_tracker.commit_count(),
+                                    progress_tracker.current_phase().as_str()
+                                );
+                                let update = progress_tracker.create_update(message);
+                                let comment_body = update.format_comment();
+
+                                // Parse issue number to u64
+                                if let Ok(issue_num_u64) = issue_num.parse::<u64>() {
+                                    // Post comment (fire and forget - don't block on errors)
+                                    if let Err(e) = client
+                                        .post_comment(&owner, &repo, issue_num_u64, &comment_body)
+                                        .await
+                                    {
+                                        eprintln!("⚠️  Failed to post progress comment: {}", e);
+                                    } else {
+                                        progress_tracker.mark_comment_posted();
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
                 None => break, // Stream ended normally
             }
@@ -348,6 +486,37 @@ pub async fn handle_fix(issue: &str, timeout_opt: Option<String>, quiet: bool) -
 
     // Now check if there was a stream error
     stream_result?;
+
+    // Post final completion comment
+    if let Some(ref client) = github_client {
+        progress_tracker.set_phase(MinionPhase::Completed);
+
+        let final_message = if status.success() {
+            format!(
+                "✅ Task completed! Made {} commit(s) total.",
+                progress_tracker.commit_count()
+            )
+        } else {
+            format!(
+                "❌ Task failed. Made {} commit(s) before failure.",
+                progress_tracker.commit_count()
+            )
+        };
+
+        let update = progress_tracker.create_update(final_message);
+        let comment_body = update.format_comment();
+
+        // Parse issue number to u64
+        if let Ok(issue_num_u64) = issue_num.parse::<u64>() {
+            // Post final comment (ignore rate limiting for completion)
+            if let Err(e) = client
+                .post_comment(&owner, &repo, issue_num_u64, &comment_body)
+                .await
+            {
+                eprintln!("⚠️  Failed to post completion comment: {}", e);
+            }
+        }
+    }
 
     // Finish the progress display
     if status.success() {
@@ -458,6 +627,7 @@ mod tests {
         assert!(parse_timeout("s").is_err());
     }
 
+<<<<<<< HEAD
     #[tokio::test]
     async fn test_is_branch_pushed_nonexistent() {
         use std::env;
@@ -469,5 +639,29 @@ mod tests {
         // Git command will fail, but we return Ok(false) to indicate branch is not pushed
         assert!(result.is_ok());
         assert!(!result.unwrap());
+=======
+    #[test]
+    fn test_check_tests_passing_detects_success() {
+        let output = "Running tests...\ntest result: ok. 5 passed; 0 failed\n";
+        assert_eq!(check_tests_passing(output), Some(true));
+
+        let output2 = "All tests passed successfully!";
+        assert_eq!(check_tests_passing(output2), Some(true));
+    }
+
+    #[test]
+    fn test_check_tests_passing_detects_failure() {
+        let output = "Running tests...\ntest result: FAILED. 3 passed; 2 failed\n";
+        assert_eq!(check_tests_passing(output), Some(false));
+
+        let output2 = "Tests failed with errors";
+        assert_eq!(check_tests_passing(output2), Some(false));
+    }
+
+    #[test]
+    fn test_check_tests_passing_returns_none_when_unclear() {
+        let output = "Just some random output without test results";
+        assert_eq!(check_tests_passing(output), None);
+>>>>>>> e540fff (Add progress comment posting)
     }
 }
