@@ -14,7 +14,7 @@ mod workspace;
 mod worktree_scanner;
 
 use clap::{Parser, Subcommand};
-use commands::{clean, fix, path, resume, review, status};
+use commands::{clean, fix, path, prompt, resume, review, status};
 
 /// CLI structure for the Gru agent orchestrator
 #[derive(Parser)]
@@ -82,6 +82,18 @@ enum Commands {
         #[arg(help = "Optional ID to filter by (minion ID, issue number, or PR number)")]
         id: Option<String>,
     },
+    #[command(about = "Run an ad-hoc prompt with Claude")]
+    Prompt {
+        #[arg(help = "Prompt text to send to Claude")]
+        prompt: String,
+
+        #[arg(
+            short,
+            long,
+            help = "Maximum duration for the task (e.g., '10s', '5m', '1h'). Exits with error if exceeded."
+        )]
+        timeout: Option<String>,
+    },
 }
 
 #[tokio::main]
@@ -99,6 +111,9 @@ async fn main() {
             base_branch,
         } => clean::handle_clean(dry_run, force, &base_branch).await,
         Commands::Status { id } => status::handle_status(id).await,
+        Commands::Prompt { prompt, timeout } => {
+            prompt::handle_prompt(&prompt, timeout, cli.quiet).await
+        }
     };
 
     // Handle any errors that occurred
