@@ -2,20 +2,14 @@ use crate::stream::{ClaudeEvent, StreamOutput};
 use crate::text_buffer::TextBuffer;
 use chrono::Local;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-
-/// Maximum number of recent events to keep in the display history
-const MAX_RECENT_EVENTS: usize = 4;
 
 /// Maximum characters to display for buffered text chunks.
 /// Since text is now buffered for up to 2 seconds, chunks can be larger.
 /// 200 characters allows ~3-4 lines of text to display coherently.
 const MAX_DISPLAY_CHARS: usize = 200;
-
-/// Maximum characters for raw lines (JSON and other verbose content).
-/// Raw lines are more aggressively truncated than buffered text to reduce clutter.
-const MAX_RAW_LINE_CHARS: usize = 80;
 
 /// Configuration for the progress display
 pub struct ProgressConfig {
@@ -53,14 +47,14 @@ impl ToolInputTracker {
 
 /// Progress display manager for Minion work
 pub struct ProgressDisplay {
-    _multi: MultiProgress,
+    multi: MultiProgress,
     status_bar: ProgressBar,
-    events_bar: ProgressBar,
     start_time: Instant,
     config: ProgressConfig,
-    recent_events: Arc<Mutex<Vec<String>>>,
     text_buffer: TextBuffer,
     tool_tracker: Arc<Mutex<ToolInputTracker>>,
+    /// Maps tool_use_id to tool_name for displaying tool completion messages
+    tool_names: Arc<Mutex<HashMap<String, String>>>,
 }
 
 impl ProgressDisplay {
@@ -68,7 +62,7 @@ impl ProgressDisplay {
     pub fn new(config: ProgressConfig) -> Self {
         let multi = MultiProgress::new();
 
-        // Main status bar
+        // Status bar at bottom (single line)
         let status_bar = multi.add(ProgressBar::new_spinner());
         status_bar.set_style(
             ProgressStyle::default_spinner()
@@ -77,65 +71,39 @@ impl ProgressDisplay {
                 .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]),
         );
 
-        // Events bar (shows recent activity)
-        let events_bar = multi.add(ProgressBar::new_spinner());
-        events_bar.set_style(ProgressStyle::default_spinner().template("{msg}").unwrap());
-
         let display = Self {
-            _multi: multi,
+            multi,
             status_bar,
-            events_bar,
             start_time: Instant::now(),
             config,
-            recent_events: Arc::new(Mutex::new(Vec::new())),
             text_buffer: TextBuffer::new(Duration::from_secs(2)),
             tool_tracker: Arc::new(Mutex::new(ToolInputTracker::default())),
+            tool_names: Arc::new(Mutex::new(HashMap::new())),
         };
 
-        display.update_header("Starting...");
+        display.update_status("Starting...");
         display
     }
 
-    /// Update the header with current status
-    fn update_header(&self, status: &str) {
+    /// Update the status bar with current status (single line)
+    fn update_status(&self, status: &str) {
         let elapsed = self.start_time.elapsed();
         let mins = elapsed.as_secs() / 60;
         let secs = elapsed.as_secs() % 60;
 
-        let header = format!(
-            "🤖 Minion {} | Issue {} | ⏱️  {}m {:02}s\n\nStatus: {}",
+        let status_line = format!(
+            "🤖 Minion {} | Issue {} | ⏱️  {}m {:02}s | {}",
             self.config.minion_id, self.config.issue, mins, secs, status
         );
 
-        self.status_bar.set_message(header);
+        self.status_bar.set_message(status_line);
     }
 
-    /// Add an event to the recent events list
-    fn add_event(&self, event_text: String) {
-        let mut events = match self.recent_events.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => {
-                // Log the error and recover with the data
-                eprintln!("Warning: Progress display mutex poisoned, recovering");
-                poisoned.into_inner()
-            }
-        };
-        events.push(event_text);
-
-        // Keep only the last MAX_RECENT_EVENTS events
-        if events.len() > MAX_RECENT_EVENTS {
-            events.remove(0);
-        }
-
-        // Update the events bar
-        let recent_text = events
-            .iter()
-            .map(|e| format!("  {}", e))
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        self.events_bar
-            .set_message(format!("Recent:\n{}", recent_text));
+    /// Print an event to stdout (scrolls naturally)
+    fn print_event(&self, event_text: &str) {
+        // Use MultiProgress::println to coordinate with status bar
+        // This ensures events scroll properly while status bar stays at bottom
+        let _ = self.multi.println(event_text);
     }
 
     /// Process a stream output and update the display
@@ -155,54 +123,29 @@ impl ProgressDisplay {
         match output {
             StreamOutput::Event(event) => self.handle_event(event),
             StreamOutput::ToolResult(tool_result) => self.handle_tool_result(tool_result),
-            StreamOutput::RawLine(line) => {
-                // Try to abbreviate if it looks like JSON
-                let abbreviated = Self::abbreviate_raw_line(line);
-
-                // Only output if we have something to show
-                if !abbreviated.is_empty() {
-                    use std::io::Write;
-                    if let Err(e) = std::io::stdout().write_all(abbreviated.as_bytes()) {
-                        eprintln!("Warning: Failed to write to stdout: {}", e);
-                    }
-                    let _ = std::io::stdout().flush();
-                }
+            StreamOutput::RawLine(_line) => {
+                // Raw lines are no longer printed to avoid clutter
+                // Formatted events from handle_event() provide sufficient output
+                // Raw lines are still logged to events.jsonl for debugging
             }
-        }
-    }
-
-    /// Abbreviate raw lines that might be JSON or other verbose content
-    fn abbreviate_raw_line(line: &str) -> String {
-        let trimmed = line.trim();
-
-        // Empty lines pass through as-is
-        if trimmed.is_empty() {
-            return line.to_string();
-        }
-
-        // Try to parse as JSON to abbreviate
-        if let Ok(json) = serde_json::from_str::<serde_json::Value>(trimmed) {
-            // If it's a recognizable JSON structure, try to abbreviate it
-            if json.is_object() {
-                // For now, just truncate JSON objects
-                let preview = format!("{}", json);
-                if preview.len() > MAX_RAW_LINE_CHARS {
-                    return format!("{}\n", Self::truncate_string(&preview, MAX_RAW_LINE_CHARS));
-                }
-            }
-        }
-
-        // If not JSON or too short to worry about, truncate to single line
-        if trimmed.len() > MAX_RAW_LINE_CHARS {
-            format!("{}\n", Self::truncate_string(trimmed, MAX_RAW_LINE_CHARS))
-        } else {
-            line.to_string()
         }
     }
 
     /// Handle a tool result message
     fn handle_tool_result(&self, tool_result: &crate::stream::ToolResult) {
         let timestamp = Local::now().format("%H:%M:%S");
+
+        // Look up the tool name by tool_use_id
+        let tool_name = {
+            let names = match self.tool_names.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => {
+                    eprintln!("Warning: Tool names mutex poisoned, recovering");
+                    poisoned.into_inner()
+                }
+            };
+            names.get(&tool_result.tool_use_id).cloned()
+        };
 
         let formatted = if tool_result.is_error {
             // Format error tool results
@@ -216,7 +159,11 @@ impl ProgressDisplay {
             // Show first line of error
             let first_line = error_msg.lines().next().unwrap_or(&error_msg);
             let truncated = Self::truncate_string(first_line, 60);
-            format!("[{}] ✗ Tool failed: {}", timestamp, truncated)
+            if let Some(name) = tool_name {
+                format!("[{}] ✗ {} failed: {}", timestamp, name, truncated)
+            } else {
+                format!("[{}] ✗ Tool failed: {}", timestamp, truncated)
+            }
         } else {
             // Format successful tool results
             let size = tool_result
@@ -227,10 +174,14 @@ impl ProgressDisplay {
                     // For non-string content, estimate size from JSON
                     tool_result.content.to_string().len()
                 });
-            format!("[{}] ✓ Tool completed ({} bytes)", timestamp, size)
+            if let Some(name) = tool_name {
+                format!("[{}] ✓ {} completed ({} bytes)", timestamp, name, size)
+            } else {
+                format!("[{}] ✓ Tool completed ({} bytes)", timestamp, size)
+            }
         };
 
-        self.add_event(formatted);
+        self.print_event(&formatted);
     }
 
     /// Truncate a string to a maximum number of characters (not bytes)
@@ -350,8 +301,8 @@ impl ProgressDisplay {
 
         match event {
             ClaudeEvent::MessageStart { .. } => {
-                self.update_header("💭 Thinking...");
-                self.add_event(format!("[{}] Message started", timestamp));
+                self.update_status("💭 Thinking...");
+                self.print_event(&format!("[{}] Message started", timestamp));
             }
             ClaudeEvent::ContentBlockStart { content_block, .. } => {
                 // Check if this is a tool_use block
@@ -362,7 +313,24 @@ impl ProgressDisplay {
                                 .get("name")
                                 .and_then(|n| n.as_str())
                                 .unwrap_or("unknown");
-                            self.update_header(&format!("🔧 Using tool: {}", tool_name));
+                            let tool_id = content_block
+                                .get("id")
+                                .and_then(|id| id.as_str())
+                                .unwrap_or("");
+
+                            self.update_status(&format!("🔧 Using tool: {}", tool_name));
+
+                            // Store tool name for later reference when tool completes
+                            if !tool_id.is_empty() {
+                                let mut names = match self.tool_names.lock() {
+                                    Ok(guard) => guard,
+                                    Err(poisoned) => {
+                                        eprintln!("Warning: Tool names mutex poisoned, recovering");
+                                        poisoned.into_inner()
+                                    }
+                                };
+                                names.insert(tool_id.to_string(), tool_name.to_string());
+                            }
 
                             // Start tracking this tool's input
                             let mut tracker = match self.tool_tracker.lock() {
@@ -375,7 +343,7 @@ impl ProgressDisplay {
                             tracker.start_tool(tool_name.to_string());
                         }
                         "text" => {
-                            self.update_header("📝 Responding...");
+                            self.update_status("📝 Responding...");
                         }
                         _ => {}
                     }
@@ -392,7 +360,7 @@ impl ProgressDisplay {
                                 if let Some(flushed_text) = self.text_buffer.add(text) {
                                     let truncated =
                                         Self::truncate_string(&flushed_text, MAX_DISPLAY_CHARS);
-                                    self.add_event(format!("[{}] Text: {}", timestamp, truncated));
+                                    self.print_event(&format!("[{}] {}", timestamp, truncated));
                                 }
                             }
                         }
@@ -433,12 +401,12 @@ impl ProgressDisplay {
                 if let Some((tool_name, input_json)) = tool_info {
                     // Format and display tool information
                     let formatted = Self::format_tool_info(&tool_name, &input_json);
-                    self.add_event(format!("[{}] {}", timestamp, formatted));
+                    self.print_event(&format!("[{}] {}", timestamp, formatted));
                 } else {
                     // No tool, check for buffered text
                     if let Some(flushed_text) = self.text_buffer.flush() {
                         let truncated = Self::truncate_string(&flushed_text, MAX_DISPLAY_CHARS);
-                        self.add_event(format!("[{}] Text: {}", timestamp, truncated));
+                        self.print_event(&format!("[{}] {}", timestamp, truncated));
                     }
                 }
             }
@@ -447,11 +415,11 @@ impl ProgressDisplay {
                 if let Some(stop_reason) = delta.get("stop_reason").and_then(|r| r.as_str()) {
                     match stop_reason {
                         "end_turn" => {
-                            self.update_header("✅ Complete");
-                            self.add_event(format!("[{}] Complete", timestamp));
+                            self.update_status("✅ Complete");
+                            self.print_event(&format!("[{}] Complete", timestamp));
                         }
                         "tool_use" => {
-                            self.update_header("⏸️  Waiting for tool results...");
+                            self.update_status("⏸️  Waiting for tool results...");
                         }
                         _ => {}
                     }
@@ -461,23 +429,23 @@ impl ProgressDisplay {
                 // Flush any remaining buffered text before completing
                 if let Some(flushed_text) = self.text_buffer.flush() {
                     let truncated = Self::truncate_string(&flushed_text, MAX_DISPLAY_CHARS);
-                    self.add_event(format!("[{}] Text: {}", timestamp, truncated));
+                    self.print_event(&format!("[{}] {}", timestamp, truncated));
                 }
-                self.update_header("✅ Message complete");
+                self.update_status("✅ Message complete");
             }
             ClaudeEvent::Error { error } => {
                 // Flush any buffered text before showing error
                 if let Some(flushed_text) = self.text_buffer.flush() {
                     let truncated = Self::truncate_string(&flushed_text, MAX_DISPLAY_CHARS);
-                    self.add_event(format!("[{}] Text: {}", timestamp, truncated));
+                    self.print_event(&format!("[{}] {}", timestamp, truncated));
                 }
 
-                self.update_header("❌ Error");
+                self.update_status("❌ Error");
                 let error_msg = error
                     .get("message")
                     .and_then(|m| m.as_str())
                     .unwrap_or("Unknown error");
-                self.add_event(format!("[{}] Error: {}", timestamp, error_msg));
+                self.print_event(&format!("[{}] Error: {}", timestamp, error_msg));
                 eprintln!("Error: {}", error_msg);
             }
             ClaudeEvent::Ping => {
@@ -493,13 +461,11 @@ impl ProgressDisplay {
     #[allow(dead_code)]
     pub fn finish(&self) {
         self.status_bar.finish_and_clear();
-        self.events_bar.finish_and_clear();
     }
 
     /// Finish the progress display and show a final message
     pub fn finish_with_message(&self, message: &str) {
         self.status_bar.finish_with_message(message.to_string());
-        self.events_bar.finish_and_clear();
     }
 }
 
@@ -516,29 +482,9 @@ mod tests {
         };
 
         let display = ProgressDisplay::new(config);
-        assert_eq!(display.recent_events.lock().unwrap().len(), 0);
-    }
-
-    #[test]
-    fn test_add_event_limits_history() {
-        let config = ProgressConfig {
-            minion_id: "M001".to_string(),
-            issue: "42".to_string(),
-            quiet: false,
-        };
-
-        let display = ProgressDisplay::new(config);
-
-        // Add 6 events
-        for i in 0..6 {
-            display.add_event(format!("Event {}", i));
-        }
-
-        // Should only keep the last 4
-        let events = display.recent_events.lock().unwrap();
-        assert_eq!(events.len(), 4);
-        assert_eq!(events[0], "Event 2");
-        assert_eq!(events[3], "Event 5");
+        // Just verify that the display was created successfully
+        // Events are now printed directly to stdout, not stored
+        assert_eq!(display.config.minion_id, "M001");
     }
 
     #[test]
@@ -551,15 +497,14 @@ mod tests {
 
         let display = ProgressDisplay::new(config);
 
-        // In quiet mode, non-error events shouldn't be added
+        // In quiet mode, non-error events shouldn't be printed
         let message_start = StreamOutput::Event(ClaudeEvent::MessageStart {
             message: serde_json::json!({}),
         });
 
         display.handle_output(&message_start);
 
-        // The event shouldn't be added to recent events in quiet mode
-        // (This is a simplified test - in practice, quiet mode just doesn't display)
+        // Verify quiet mode is enabled (output is suppressed in handle_output)
         assert!(display.config.quiet);
     }
 
@@ -677,43 +622,6 @@ mod tests {
     }
 
     #[test]
-    fn test_abbreviate_raw_line_empty() {
-        let line = "";
-        let result = ProgressDisplay::abbreviate_raw_line(line);
-        assert_eq!(result, "");
-    }
-
-    #[test]
-    fn test_abbreviate_raw_line_short() {
-        let line = "Short message\n";
-        let result = ProgressDisplay::abbreviate_raw_line(line);
-        assert_eq!(result, "Short message\n");
-    }
-
-    #[test]
-    fn test_abbreviate_raw_line_long() {
-        let line = "This is a very long message that exceeds the maximum character limit and should be truncated to fit within the display";
-        let result = ProgressDisplay::abbreviate_raw_line(line);
-        assert!(result.len() <= 84); // MAX_RAW_LINE_CHARS + "..." + "\n"
-        assert!(result.ends_with("...\n"));
-    }
-
-    #[test]
-    fn test_abbreviate_raw_line_json_short() {
-        let line = r#"{"foo":"bar"}"#;
-        let result = ProgressDisplay::abbreviate_raw_line(line);
-        assert_eq!(result, r#"{"foo":"bar"}"#);
-    }
-
-    #[test]
-    fn test_abbreviate_raw_line_json_long() {
-        let line = r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_123","content":"very long content here"}]}}"#;
-        let result = ProgressDisplay::abbreviate_raw_line(line);
-        assert!(result.len() <= 84); // MAX_RAW_LINE_CHARS + "..." + "\n"
-        assert!(result.ends_with("...\n"));
-    }
-
-    #[test]
     fn test_handle_tool_result_success() {
         use crate::stream::ToolResult;
 
@@ -731,12 +639,8 @@ mod tests {
         };
 
         let display = ProgressDisplay::new(config);
+        // Tool results are now printed to stdout, we just verify no panic
         display.handle_tool_result(&tool_result);
-
-        let events = display.recent_events.lock().unwrap();
-        assert_eq!(events.len(), 1);
-        assert!(events[0].contains("✓ Tool completed"));
-        assert!(events[0].contains("bytes"));
     }
 
     #[test]
@@ -757,11 +661,7 @@ mod tests {
         };
 
         let display = ProgressDisplay::new(config);
+        // Tool results are now printed to stdout, we just verify no panic
         display.handle_tool_result(&tool_result);
-
-        let events = display.recent_events.lock().unwrap();
-        assert_eq!(events.len(), 1);
-        assert!(events[0].contains("✗ Tool failed"));
-        assert!(events[0].contains("Error"));
     }
 }
