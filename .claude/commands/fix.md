@@ -14,11 +14,11 @@ Implement a fix for a GitHub issue.
 
 This command is being orchestrated by Gru. GitHub operations (claiming issue, creating PR, posting updates) are handled automatically. Focus on:
 
-1. Understanding the issue (details provided by Gru)
-2. Planning the implementation
-3. Writing clean code
-4. Testing thoroughly
-5. Committing your changes
+1. understanding the issue (details provided by Gru)
+2. planning the implementation
+3. writing clean code
+4. testing thoroughly
+5. committing your changes
 
 Gru will handle:
 - Fetching issue details
@@ -44,7 +44,7 @@ Gru will handle:
 
 ## 2. Verify Worktree Setup
 - Confirm current directory is a git worktree with `git rev-parse --git-dir`
-- Check current branch matches expected pattern `gru/issue-<issue#>`
+- Check current branch matches expected pattern `minion/issue-<number>-<minion-id>`
 - If not in correct worktree, remind user to run `/setup-worktree` first
 
 ## 3. Plan the Fix
