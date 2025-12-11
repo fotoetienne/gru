@@ -2,6 +2,7 @@ use crate::stream::{ClaudeEvent, StreamOutput};
 use crate::text_buffer::TextBuffer;
 use chrono::Local;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -52,6 +53,8 @@ pub struct ProgressDisplay {
     config: ProgressConfig,
     text_buffer: TextBuffer,
     tool_tracker: Arc<Mutex<ToolInputTracker>>,
+    /// Maps tool_use_id to tool_name for displaying tool completion messages
+    tool_names: Arc<Mutex<HashMap<String, String>>>,
 }
 
 impl ProgressDisplay {
@@ -75,6 +78,7 @@ impl ProgressDisplay {
             config,
             text_buffer: TextBuffer::new(Duration::from_secs(2)),
             tool_tracker: Arc::new(Mutex::new(ToolInputTracker::default())),
+            tool_names: Arc::new(Mutex::new(HashMap::new())),
         };
 
         display.update_status("Starting...");
@@ -131,6 +135,18 @@ impl ProgressDisplay {
     fn handle_tool_result(&self, tool_result: &crate::stream::ToolResult) {
         let timestamp = Local::now().format("%H:%M:%S");
 
+        // Look up the tool name by tool_use_id
+        let tool_name = {
+            let names = match self.tool_names.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => {
+                    eprintln!("Warning: Tool names mutex poisoned, recovering");
+                    poisoned.into_inner()
+                }
+            };
+            names.get(&tool_result.tool_use_id).cloned()
+        };
+
         let formatted = if tool_result.is_error {
             // Format error tool results
             let error_msg = match tool_result.content.as_str() {
@@ -143,7 +159,11 @@ impl ProgressDisplay {
             // Show first line of error
             let first_line = error_msg.lines().next().unwrap_or(&error_msg);
             let truncated = Self::truncate_string(first_line, 60);
-            format!("[{}] ✗ Tool failed: {}", timestamp, truncated)
+            if let Some(name) = tool_name {
+                format!("[{}] ✗ {} failed: {}", timestamp, name, truncated)
+            } else {
+                format!("[{}] ✗ Tool failed: {}", timestamp, truncated)
+            }
         } else {
             // Format successful tool results
             let size = tool_result
@@ -154,7 +174,11 @@ impl ProgressDisplay {
                     // For non-string content, estimate size from JSON
                     tool_result.content.to_string().len()
                 });
-            format!("[{}] ✓ Tool completed ({} bytes)", timestamp, size)
+            if let Some(name) = tool_name {
+                format!("[{}] ✓ {} completed ({} bytes)", timestamp, name, size)
+            } else {
+                format!("[{}] ✓ Tool completed ({} bytes)", timestamp, size)
+            }
         };
 
         self.print_event(&formatted);
@@ -289,7 +313,24 @@ impl ProgressDisplay {
                                 .get("name")
                                 .and_then(|n| n.as_str())
                                 .unwrap_or("unknown");
+                            let tool_id = content_block
+                                .get("id")
+                                .and_then(|id| id.as_str())
+                                .unwrap_or("");
+
                             self.update_status(&format!("🔧 Using tool: {}", tool_name));
+
+                            // Store tool name for later reference when tool completes
+                            if !tool_id.is_empty() {
+                                let mut names = match self.tool_names.lock() {
+                                    Ok(guard) => guard,
+                                    Err(poisoned) => {
+                                        eprintln!("Warning: Tool names mutex poisoned, recovering");
+                                        poisoned.into_inner()
+                                    }
+                                };
+                                names.insert(tool_id.to_string(), tool_name.to_string());
+                            }
 
                             // Start tracking this tool's input
                             let mut tracker = match self.tool_tracker.lock() {
