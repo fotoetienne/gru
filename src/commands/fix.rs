@@ -369,24 +369,29 @@ pub async fn handle_fix(issue: &str, timeout_opt: Option<String>, quiet: bool) -
 
     // Claim the issue by adding in-progress label (fire-and-forget)
     if let Some(ref client) = github_client {
-        let issue_number = issue_num.parse::<u64>().unwrap_or(0);
-        if issue_number > 0 {
+        if let Ok(issue_number) = issue_num.parse::<u64>() {
             match client.claim_issue(&owner, &repo, issue_number).await {
                 Ok(true) => {
                     println!("🏷️  Added 'in-progress' label to issue #{}", issue_num);
                 }
                 Ok(false) => {
-                    println!(
+                    eprintln!(
                         "⚠️  Issue #{} is already claimed by another Minion",
                         issue_num
                     );
-                    println!("   Continuing anyway (this Minion will also work on it)");
+                    eprintln!("   This may indicate a race condition or multiple gru instances.");
+                    eprintln!("   Continuing anyway (worktree already created)...");
                 }
                 Err(e) => {
                     eprintln!("⚠️  Failed to add label to issue: {}", e);
                     eprintln!("   Continuing anyway...");
                 }
             }
+        } else {
+            eprintln!(
+                "⚠️  Invalid issue number '{}', cannot update labels",
+                issue_num
+            );
         }
     }
 
@@ -628,8 +633,7 @@ pub async fn handle_fix(issue: &str, timeout_opt: Option<String>, quiet: bool) -
 
                     // Mark issue as done (fire-and-forget)
                     if let Some(ref client) = github_client {
-                        let issue_number = issue_num.parse::<u64>().unwrap_or(0);
-                        if issue_number > 0 {
+                        if let Ok(issue_number) = issue_num.parse::<u64>() {
                             match client.mark_issue_done(&owner, &repo, issue_number).await {
                                 Ok(()) => {
                                     println!("🏷️  Updated issue label to 'minion:done'");
@@ -638,6 +642,11 @@ pub async fn handle_fix(issue: &str, timeout_opt: Option<String>, quiet: bool) -
                                     eprintln!("⚠️  Failed to update issue label: {}", e);
                                 }
                             }
+                        } else {
+                            eprintln!(
+                                "⚠️  Invalid issue number '{}', cannot update labels",
+                                issue_num
+                            );
                         }
                     }
 
@@ -687,8 +696,7 @@ pub async fn handle_fix(issue: &str, timeout_opt: Option<String>, quiet: bool) -
 
         // Mark issue as failed (fire-and-forget)
         if let Some(ref client) = github_client {
-            let issue_number = issue_num.parse::<u64>().unwrap_or(0);
-            if issue_number > 0 {
+            if let Ok(issue_number) = issue_num.parse::<u64>() {
                 match client.mark_issue_failed(&owner, &repo, issue_number).await {
                     Ok(()) => {
                         println!("🏷️  Updated issue label to 'minion:failed'");
@@ -697,6 +705,11 @@ pub async fn handle_fix(issue: &str, timeout_opt: Option<String>, quiet: bool) -
                         eprintln!("⚠️  Failed to update issue label: {}", e);
                     }
                 }
+            } else {
+                eprintln!(
+                    "⚠️  Invalid issue number '{}', cannot update labels",
+                    issue_num
+                );
             }
         }
     }

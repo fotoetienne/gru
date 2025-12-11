@@ -151,13 +151,25 @@ impl GitHubClient {
 
     /// Claim an issue by transitioning from ready-for-minion to in-progress
     ///
+    /// This operation is designed for fire-and-forget usage. While it returns a Result,
+    /// callers typically log errors but don't block the main workflow.
+    ///
+    /// # Race Conditions
+    /// This method attempts to detect if another Minion already claimed the issue
+    /// by checking for the `in-progress` label. However, there is a TOCTOU window
+    /// between the check and the label addition. Multiple Minions could pass the
+    /// check simultaneously and both claim the issue. In V1, we accept this limitation.
+    /// For V2+, consider using GitHub issue assignment or comment-based coordination.
+    ///
     /// # Arguments
     /// * `owner` - Repository owner
     /// * `repo` - Repository name
     /// * `issue` - Issue number
     ///
-    /// Returns `Ok(true)` if the issue was successfully claimed, `Ok(false)` if
-    /// another Minion already claimed it (race condition), or `Err` on failure.
+    /// # Returns
+    /// * `Ok(true)` - Successfully claimed (no race detected)
+    /// * `Ok(false)` - Already claimed by another Minion (race detected)
+    /// * `Err(_)` - API call failed (network error, auth error, etc.)
     pub async fn claim_issue(&self, owner: &str, repo: &str, issue: u64) -> Result<bool> {
         // First, check current labels to detect race conditions
         let issue_info = self.get_issue(owner, repo, issue).await?;
