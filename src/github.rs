@@ -149,6 +149,69 @@ impl GitHubClient {
         Ok(())
     }
 
+    /// Claim an issue by transitioning from ready-for-minion to in-progress
+    ///
+    /// # Arguments
+    /// * `owner` - Repository owner
+    /// * `repo` - Repository name
+    /// * `issue` - Issue number
+    ///
+    /// Returns `Ok(true)` if the issue was successfully claimed, `Ok(false)` if
+    /// another Minion already claimed it (race condition), or `Err` on failure.
+    pub async fn claim_issue(&self, owner: &str, repo: &str, issue: u64) -> Result<bool> {
+        // First, check current labels to detect race conditions
+        let issue_info = self.get_issue(owner, repo, issue).await?;
+        let current_labels: Vec<String> =
+            issue_info.labels.iter().map(|l| l.name.clone()).collect();
+
+        // If already has in-progress, another Minion claimed it
+        if current_labels.iter().any(|l| l == "in-progress") {
+            return Ok(false);
+        }
+
+        // Remove ready-for-minion if present (ignore errors - label may not exist)
+        let _ = self
+            .remove_label(owner, repo, issue, "ready-for-minion")
+            .await;
+
+        // Add in-progress label
+        self.add_label(owner, repo, issue, "in-progress").await?;
+
+        Ok(true)
+    }
+
+    /// Mark an issue as completed by transitioning from in-progress to minion:done
+    ///
+    /// # Arguments
+    /// * `owner` - Repository owner
+    /// * `repo` - Repository name
+    /// * `issue` - Issue number
+    pub async fn mark_issue_done(&self, owner: &str, repo: &str, issue: u64) -> Result<()> {
+        // Remove in-progress label (ignore errors - may not exist)
+        let _ = self.remove_label(owner, repo, issue, "in-progress").await;
+
+        // Add minion:done label
+        self.add_label(owner, repo, issue, "minion:done").await?;
+
+        Ok(())
+    }
+
+    /// Mark an issue as failed by transitioning from in-progress to minion:failed
+    ///
+    /// # Arguments
+    /// * `owner` - Repository owner
+    /// * `repo` - Repository name
+    /// * `issue` - Issue number
+    pub async fn mark_issue_failed(&self, owner: &str, repo: &str, issue: u64) -> Result<()> {
+        // Remove in-progress label (ignore errors - may not exist)
+        let _ = self.remove_label(owner, repo, issue, "in-progress").await;
+
+        // Add minion:failed label
+        self.add_label(owner, repo, issue, "minion:failed").await?;
+
+        Ok(())
+    }
+
     /// Create a draft pull request using gh CLI
     ///
     /// # Arguments

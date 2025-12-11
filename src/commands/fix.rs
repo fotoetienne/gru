@@ -367,6 +367,29 @@ pub async fn handle_fix(issue: &str, timeout_opt: Option<String>, quiet: bool) -
         println!("⚠️  GRU_GITHUB_TOKEN not set - progress comments will not be posted");
     }
 
+    // Claim the issue by adding in-progress label (fire-and-forget)
+    if let Some(ref client) = github_client {
+        let issue_number = issue_num.parse::<u64>().unwrap_or(0);
+        if issue_number > 0 {
+            match client.claim_issue(&owner, &repo, issue_number).await {
+                Ok(true) => {
+                    println!("🏷️  Added 'in-progress' label to issue #{}", issue_num);
+                }
+                Ok(false) => {
+                    println!(
+                        "⚠️  Issue #{} is already claimed by another Minion",
+                        issue_num
+                    );
+                    println!("   Continuing anyway (this Minion will also work on it)");
+                }
+                Err(e) => {
+                    eprintln!("⚠️  Failed to add label to issue: {}", e);
+                    eprintln!("   Continuing anyway...");
+                }
+            }
+        }
+    }
+
     // Build the command with flags for non-interactive stream-json output
     let mut cmd = TokioCommand::new("claude");
     cmd.arg("--print")
@@ -603,6 +626,21 @@ pub async fn handle_fix(issue: &str, timeout_opt: Option<String>, quiet: bool) -
                         owner, repo, pr_number
                     );
 
+                    // Mark issue as done (fire-and-forget)
+                    if let Some(ref client) = github_client {
+                        let issue_number = issue_num.parse::<u64>().unwrap_or(0);
+                        if issue_number > 0 {
+                            match client.mark_issue_done(&owner, &repo, issue_number).await {
+                                Ok(()) => {
+                                    println!("🏷️  Updated issue label to 'minion:done'");
+                                }
+                                Err(e) => {
+                                    eprintln!("⚠️  Failed to update issue label: {}", e);
+                                }
+                            }
+                        }
+                    }
+
                     // Auto-trigger review for Minion-created PRs
                     println!("\n🔍 Starting automated PR review...");
                     match trigger_pr_review(&pr_number, &worktree_path, None).await {
@@ -646,6 +684,21 @@ pub async fn handle_fix(issue: &str, timeout_opt: Option<String>, quiet: bool) -
         }
     } else {
         progress.finish_with_message(&format!("❌ Failed to fix issue {}", issue));
+
+        // Mark issue as failed (fire-and-forget)
+        if let Some(ref client) = github_client {
+            let issue_number = issue_num.parse::<u64>().unwrap_or(0);
+            if issue_number > 0 {
+                match client.mark_issue_failed(&owner, &repo, issue_number).await {
+                    Ok(()) => {
+                        println!("🏷️  Updated issue label to 'minion:failed'");
+                    }
+                    Err(e) => {
+                        eprintln!("⚠️  Failed to update issue label: {}", e);
+                    }
+                }
+            }
+        }
     }
 
     // Return the exit code from the claude process
