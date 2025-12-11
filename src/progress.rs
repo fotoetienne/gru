@@ -46,7 +46,7 @@ impl ToolInputTracker {
 
 /// Progress display manager for Minion work
 pub struct ProgressDisplay {
-    _multi: MultiProgress,
+    multi: MultiProgress,
     status_bar: ProgressBar,
     start_time: Instant,
     config: ProgressConfig,
@@ -69,7 +69,7 @@ impl ProgressDisplay {
         );
 
         let display = Self {
-            _multi: multi,
+            multi,
             status_bar,
             start_time: Instant::now(),
             config,
@@ -97,9 +97,9 @@ impl ProgressDisplay {
 
     /// Print an event to stdout (scrolls naturally)
     fn print_event(&self, event_text: &str) {
-        // Use println! to print directly to stdout
-        // This allows events to scroll up naturally in the terminal
-        println!("{}", event_text);
+        // Use MultiProgress::println to coordinate with status bar
+        // This ensures events scroll properly while status bar stays at bottom
+        let _ = self.multi.println(event_text);
     }
 
     /// Process a stream output and update the display
