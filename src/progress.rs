@@ -319,10 +319,7 @@ impl ProgressDisplay {
                                 if let Some(flushed_text) = self.text_buffer.add(text) {
                                     let truncated =
                                         Self::truncate_string(&flushed_text, MAX_DISPLAY_CHARS);
-                                    self.print_event(&format!(
-                                        "[{}] Text: {}",
-                                        timestamp, truncated
-                                    ));
+                                    self.print_event(&format!("[{}] {}", timestamp, truncated));
                                 }
                             }
                         }
@@ -368,7 +365,7 @@ impl ProgressDisplay {
                     // No tool, check for buffered text
                     if let Some(flushed_text) = self.text_buffer.flush() {
                         let truncated = Self::truncate_string(&flushed_text, MAX_DISPLAY_CHARS);
-                        self.print_event(&format!("[{}] Text: {}", timestamp, truncated));
+                        self.print_event(&format!("[{}] {}", timestamp, truncated));
                     }
                 }
             }
@@ -391,7 +388,7 @@ impl ProgressDisplay {
                 // Flush any remaining buffered text before completing
                 if let Some(flushed_text) = self.text_buffer.flush() {
                     let truncated = Self::truncate_string(&flushed_text, MAX_DISPLAY_CHARS);
-                    self.print_event(&format!("[{}] Text: {}", timestamp, truncated));
+                    self.print_event(&format!("[{}] {}", timestamp, truncated));
                 }
                 self.update_status("✅ Message complete");
             }
@@ -399,7 +396,7 @@ impl ProgressDisplay {
                 // Flush any buffered text before showing error
                 if let Some(flushed_text) = self.text_buffer.flush() {
                     let truncated = Self::truncate_string(&flushed_text, MAX_DISPLAY_CHARS);
-                    self.print_event(&format!("[{}] Text: {}", timestamp, truncated));
+                    self.print_event(&format!("[{}] {}", timestamp, truncated));
                 }
 
                 self.update_status("❌ Error");
