@@ -1,3 +1,7 @@
 venv/
 target/
 .claude/settings.local.json
+
+# Ephemeral Minion files
+events.jsonl
+PR_DESCRIPTION.md
