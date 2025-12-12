@@ -69,6 +69,51 @@ impl Workspace {
         })
     }
 
+    /// Creates a workspace with a custom root directory (for testing only).
+    ///
+    /// This constructor allows tests to use temporary directories instead of
+    /// polluting the production `~/.gru/` directory.
+    ///
+    /// # Arguments
+    ///
+    /// * `root` - Custom root directory path (typically from `tempfile::tempdir()`)
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - Directory creation fails due to permissions or I/O errors
+    /// - Setting directory permissions fails (Unix only)
+    #[cfg(test)]
+    pub fn new_with_root(root: PathBuf) -> io::Result<Self> {
+        let repos = root.join("repos");
+        let work = root.join("work");
+        let archive = root.join("archive");
+        let state = root.join("state");
+
+        for dir in [&root, &repos, &work, &archive, &state] {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt;
+                let mut builder = fs::DirBuilder::new();
+                builder.mode(0o755);
+                builder.recursive(true);
+                builder.create(dir)?;
+            }
+            #[cfg(not(unix))]
+            {
+                fs::create_dir_all(dir)?;
+            }
+        }
+
+        Ok(Workspace {
+            root,
+            repos,
+            work,
+            archive,
+            state,
+        })
+    }
+
     /// Returns a reference to the workspace root directory path (`~/.gru`).
     pub fn root(&self) -> &Path {
         &self.root
