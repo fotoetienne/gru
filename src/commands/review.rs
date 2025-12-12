@@ -1,13 +1,54 @@
 use crate::git;
 use crate::minion_resolver;
 use crate::pr_state::PrState;
+use crate::progress::{ProgressConfig, ProgressDisplay};
+use crate::stream::{self, EventStream};
 use crate::url_utils::parse_pr_info;
 use crate::workspace;
 use anyhow::{Context, Result};
 use std::env;
-use tokio::process::Command;
+use std::path::Path;
+use std::time::Instant;
+use tokio::fs::OpenOptions;
+use tokio::io::AsyncWriteExt;
+use tokio::process::Command as TokioCommand;
+use tokio::time::{timeout, Duration};
+use uuid::Uuid;
 
-/// Handles the review command by setting up workspace and delegating to the Claude CLI
+/// Timeout in seconds for each line read from Claude's output stream
+/// Set to 5 minutes to accommodate long-running LLM operations
+const STREAM_TIMEOUT_SECS: u64 = 300;
+
+/// Duration of inactivity before displaying a warning to the user (5 minutes)
+const INACTIVITY_WARNING_SECS: u64 = 300;
+
+/// Duration of inactivity before considering the task stuck
+const INACTIVITY_STUCK_SECS: u64 = 900; // 15 minutes
+
+/// Exit code returned when a process is terminated by a signal (shell convention)
+const EXIT_CODE_SIGNAL_TERMINATED: i32 = 128;
+
+/// Logs an event to events.jsonl in the worktree directory
+async fn log_event(worktree_path: &Path, event: &stream::StreamOutput) -> Result<()> {
+    let events_file = worktree_path.join("events.jsonl");
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&events_file)
+        .await
+        .context("Failed to open events.jsonl")?;
+
+    // Only log actual events, not raw lines
+    if let stream::StreamOutput::Event(claude_event) = event {
+        let json = serde_json::to_string(claude_event)?;
+        file.write_all(json.as_bytes()).await?;
+        file.write_all(b"\n").await?;
+        file.flush().await?;
+    }
+    Ok(())
+}
+
+/// Handles the review command by setting up workspace and spawning autonomous Claude agent with stream parsing
 /// Returns the exit code from the claude process
 pub async fn handle_review(pr_arg: Option<String>) -> Result<i32> {
     // Resolve PR information from various input formats
@@ -64,24 +105,126 @@ pub async fn handle_review(pr_arg: Option<String>) -> Result<i32> {
         new_worktree_path
     };
 
-    println!("🤖 Launching agent for PR review...\n");
+    println!("🤖 Launching autonomous review agent...\n");
 
-    // Execute the claude CLI with the /pr_review command in the worktree
-    let status = Command::new("claude")
+    // Create progress display for review
+    let config = ProgressConfig {
+        minion_id: format!("Review-{}", pr_num),
+        issue: pr_num.clone(),
+        quiet: false,
+    };
+    let progress = ProgressDisplay::new(config);
+
+    // Generate a unique session ID for conversation continuity
+    let session_id = Uuid::new_v4();
+
+    // Build the command with flags for autonomous stream-json output
+    let mut cmd = TokioCommand::new("claude");
+    cmd.arg("--print")
+        .arg("--verbose")
+        .arg("--session-id")
+        .arg(session_id.to_string())
+        .arg("--output-format")
+        .arg("stream-json")
+        .arg("--include-partial-messages")
+        .arg("--dangerously-skip-permissions")
         .arg(format!("/pr_review {}", pr_num))
-        .current_dir(&worktree_path)
         .stdin(std::process::Stdio::inherit())
-        .stdout(std::process::Stdio::inherit())
+        .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::inherit())
-        .status()
-        .await
-        .context(
-            "claude command not found. Install from: https://github.com/anthropics/claude-code",
-        )?;
+        .current_dir(&worktree_path);
+
+    // Spawn the command
+    let mut child = cmd.spawn().context(
+        "claude command not found. Install from: https://github.com/anthropics/claude-code",
+    )?;
+
+    // Get the stdout handle
+    let stdout = child
+        .stdout
+        .take()
+        .context("Failed to capture stdout from claude process")?;
+
+    // Create event stream reader
+    let mut stream = EventStream::from_stdout(stdout);
+
+    // Process stream output asynchronously with timeout and error handling
+    let stream_result = async {
+        let mut last_event_time = Instant::now();
+        let mut inactivity_warning_shown = false;
+
+        loop {
+            // Check inactivity - time since last event
+            let inactivity = last_event_time.elapsed();
+
+            if inactivity.as_secs() >= INACTIVITY_STUCK_SECS {
+                eprintln!(
+                    "❌ Review appears stuck (no activity for {} minutes)",
+                    INACTIVITY_STUCK_SECS / 60
+                );
+                eprintln!("📝 Events saved to events.jsonl");
+                return Err(anyhow::anyhow!(
+                    "No activity for {} minutes - review appears stuck",
+                    INACTIVITY_STUCK_SECS / 60
+                ));
+            } else if inactivity.as_secs() >= INACTIVITY_WARNING_SECS && !inactivity_warning_shown {
+                eprintln!(
+                    "⚠️  No activity for {} minutes",
+                    INACTIVITY_WARNING_SECS / 60
+                );
+                inactivity_warning_shown = true;
+            }
+
+            // Read next line with timeout
+            let line_result = timeout(Duration::from_secs(STREAM_TIMEOUT_SECS), stream.next_line())
+                .await
+                .map_err(|_| {
+                    anyhow::anyhow!(
+                        "Timeout: Claude process hasn't produced output in {} seconds",
+                        STREAM_TIMEOUT_SECS
+                    )
+                })?;
+
+            // Handle the stream result
+            match line_result? {
+                Some(output) => {
+                    // Log the event to events.jsonl
+                    log_event(&worktree_path, &output).await?;
+
+                    // Update last event time for any output
+                    last_event_time = Instant::now();
+
+                    // Reset warning flag only on actual events (not raw output lines)
+                    if matches!(output, stream::StreamOutput::Event(_)) {
+                        inactivity_warning_shown = false;
+                    }
+
+                    // Display progress
+                    progress.handle_output(&output);
+                }
+                None => break, // Stream ended normally
+            }
+        }
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+
+    // Always wait for the process, regardless of stream errors
+    let status = child.wait().await?;
+
+    // Now check if there was a stream error
+    stream_result?;
+
+    // Finish the progress display
+    if status.success() {
+        progress.finish_with_message(&format!("✅ Review complete for PR #{}", pr_num));
+    } else {
+        progress.finish_with_message(&format!("❌ Review failed for PR #{}", pr_num));
+    }
 
     // Return the exit code from the claude process
     // Use 128 for signal terminations to follow shell conventions
-    Ok(status.code().unwrap_or(128))
+    Ok(status.code().unwrap_or(EXIT_CODE_SIGNAL_TERMINATED))
 }
 
 /// Resolves PR information from the current worktree directory
@@ -193,7 +336,7 @@ async fn get_pr_info_from_number(pr_num: &str) -> Result<(String, String, String
 async fn find_pr_for_issue(issue_num: u64) -> Result<String> {
     // Safe: issue_num is validated as u64 by the type system, which can only contain digits.
     // This prevents command injection as the format string will never contain shell metacharacters.
-    let output = Command::new("gh")
+    let output = TokioCommand::new("gh")
         .args([
             "pr",
             "list",
