@@ -41,6 +41,9 @@ struct CheckRunsResponse {
 /// - Detects new review comments (returns for handling)
 /// - Detects CI failures (returns for handling)
 ///
+/// # Arguments
+/// * `worktree_path` - Reserved for future use (e.g., reading local git state, logging)
+///
 /// Returns `Ok(MonitorResult)` when an event requires action or the PR reaches a terminal state.
 pub async fn monitor_pr(
     owner: &str,
