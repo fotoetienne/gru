@@ -125,10 +125,25 @@ async fn create_pr_for_issue(
         issue.title
     };
 
-    // Create PR title and body
-    let pr_title = format!("[WIP] Fixes #{}: {}", issue_num, issue_title);
-    let pr_body = format!(
-        r#"This PR is being worked on by Minion {}
+    // Check if work is complete (description file exists)
+    let description_path = worktree_path.join("PR_DESCRIPTION.md");
+    let should_mark_ready = description_path.exists();
+
+    let (pr_title, pr_body) = if should_mark_ready {
+        // Read the description file
+        match tokio::fs::read_to_string(&description_path).await {
+            Ok(content) if !content.trim().is_empty() => {
+                // Work is complete - use description and mark ready
+                let pr_title = format!("Fixes #{}: {}", issue_num, issue_title);
+                let pr_body = format!("{}\n\nFixes #{}", content.trim(), issue_num);
+                (pr_title, pr_body)
+            }
+            _ => {
+                // File exists but couldn't be read or is empty - treat as WIP
+                eprintln!("⚠️  Warning: PR_DESCRIPTION.md exists but couldn't be read or is empty");
+                let pr_title = format!("[WIP] Fixes #{}: {}", issue_num, issue_title);
+                let pr_body = format!(
+                    r#"This PR is being worked on by Minion {}
 
 ## Status
 Work in progress - I'll update this when ready for review.
@@ -139,8 +154,30 @@ Work in progress - I'll update this when ready for review.
 - [ ] Documentation
 
 Fixes #{}"#,
-        minion_id, issue_num
-    );
+                    minion_id, issue_num
+                );
+                (pr_title, pr_body)
+            }
+        }
+    } else {
+        // No description file - work in progress
+        let pr_title = format!("[WIP] Fixes #{}: {}", issue_num, issue_title);
+        let pr_body = format!(
+            r#"This PR is being worked on by Minion {}
+
+## Status
+Work in progress - I'll update this when ready for review.
+
+## Changes
+- [ ] Initial implementation
+- [ ] Writing tests
+- [ ] Documentation
+
+Fixes #{}"#,
+            minion_id, issue_num
+        );
+        (pr_title, pr_body)
+    };
 
     // Create the draft PR using gh CLI (PR operations always use CLI)
     let pr_number = crate::github::create_draft_pr_via_cli(
@@ -153,6 +190,37 @@ Fixes #{}"#,
     )
     .await
     .context("Failed to create draft PR using gh CLI")?;
+
+    // Mark ready if description was provided
+    if should_mark_ready {
+        // Use GitHub client to mark PR ready
+        if let Some(github_client) = GitHubClient::try_from_env() {
+            match github_client.mark_pr_ready(owner, repo, &pr_number).await {
+                Ok(_) => {
+                    println!("✅ PR #{} marked ready for review", pr_number);
+                }
+                Err(e) => {
+                    eprintln!("⚠️  Warning: Failed to mark PR ready: {}", e);
+                    eprintln!(
+                        "   PR #{} created as draft - you can mark it ready manually",
+                        pr_number
+                    );
+                }
+            }
+        } else {
+            eprintln!("⚠️  Warning: GRU_GITHUB_TOKEN not set - cannot mark PR ready automatically");
+            eprintln!(
+                "   You can mark PR #{} ready with: gh pr ready {}",
+                pr_number, pr_number
+            );
+        }
+
+        // Clean up description file
+        if let Err(e) = tokio::fs::remove_file(&description_path).await {
+            eprintln!("⚠️  Warning: Failed to remove PR_DESCRIPTION.md: {}", e);
+            eprintln!("   File will be cleaned up by 'gru clean'");
+        }
+    }
 
     Ok(pr_number)
 }

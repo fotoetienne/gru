@@ -14,7 +14,7 @@ fn is_ephemeral_file(path: &Path) -> bool {
     // Note: Cargo.lock is ephemeral for binary projects (auto-regenerated)
     if matches!(
         file_name,
-        "events.jsonl" | "Cargo.lock" | ".DS_Store" | "Thumbs.db"
+        "events.jsonl" | "PR_DESCRIPTION.md" | "Cargo.lock" | ".DS_Store" | "Thumbs.db"
     ) {
         return true;
     }
@@ -319,6 +319,11 @@ mod tests {
     #[test]
     fn test_is_ephemeral_file_thumbs_db() {
         assert!(is_ephemeral_file(Path::new("Thumbs.db")));
+    }
+
+    #[test]
+    fn test_is_ephemeral_file_pr_description() {
+        assert!(is_ephemeral_file(Path::new("PR_DESCRIPTION.md")));
     }
 
     #[test]
