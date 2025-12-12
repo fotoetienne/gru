@@ -48,33 +48,47 @@ pub async fn monitor_pr(
     pr_number: &str,
     _worktree_path: &Path,
 ) -> Result<MonitorResult> {
-    let mut last_check_time = Utc::now();
+    // Initialize last_check_time to avoid missing reviews submitted during monitor startup
+    // Get existing reviews to set the baseline
+    let existing_reviews = get_all_reviews(owner, repo, pr_number).await?;
+    let mut last_check_time = existing_reviews
+        .last()
+        .map(|r| r.submitted_at)
+        .unwrap_or_else(Utc::now);
 
     loop {
         // Fetch PR state
         let pr = get_pr(owner, repo, pr_number).await?;
 
-        // Check for merged
-        if pr.merged {
-            return Ok(MonitorResult::Merged);
-        }
-
-        // Check for closed
+        // Check terminal states - merged PRs are also in "closed" state
+        // Must check merged flag first to distinguish merged from just closed
         if pr.state == "closed" {
-            return Ok(MonitorResult::Closed);
+            if pr.merged {
+                return Ok(MonitorResult::Merged);
+            } else {
+                return Ok(MonitorResult::Closed);
+            }
         }
 
-        // Check for new reviews
+        // Check for new reviews (use >= to avoid missing reviews at exact timestamp)
         let reviews = get_reviews_since(owner, repo, pr_number, last_check_time).await?;
         if !reviews.is_empty() {
             return Ok(MonitorResult::NewReviews(reviews.len()));
         }
 
-        // Check for failed CI runs
+        // Check for failed CI runs - include all error states
         let check_runs = get_check_runs(owner, repo, &pr.head.sha).await?;
         let failed_checks = check_runs
             .iter()
-            .filter(|c| c.conclusion.as_deref() == Some("failure"))
+            .filter(|c| {
+                matches!(
+                    c.conclusion.as_deref(),
+                    Some("failure")
+                        | Some("cancelled")
+                        | Some("timed_out")
+                        | Some("action_required")
+                )
+            })
             .count();
 
         if failed_checks > 0 {
@@ -119,13 +133,8 @@ async fn get_pr(owner: &str, repo: &str, pr_number: &str) -> Result<PullRequest>
     Ok(pr)
 }
 
-/// Fetch reviews submitted after a given time
-async fn get_reviews_since(
-    owner: &str,
-    repo: &str,
-    pr_number: &str,
-    since: DateTime<Utc>,
-) -> Result<Vec<Review>> {
+/// Fetch all reviews for a PR
+async fn get_all_reviews(owner: &str, repo: &str, pr_number: &str) -> Result<Vec<Review>> {
     let output = tokio::process::Command::new("gh")
         .args([
             "api",
@@ -137,16 +146,28 @@ async fn get_reviews_since(
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("Failed to fetch reviews: {}", stderr);
+        anyhow::bail!("Failed to fetch reviews for PR #{}: {}", pr_number, stderr);
     }
 
     let reviews: Vec<Review> =
         serde_json::from_slice(&output.stdout).context("Failed to parse reviews JSON response")?;
 
-    // Filter to reviews submitted after 'since'
+    Ok(reviews)
+}
+
+/// Fetch reviews submitted after a given time
+async fn get_reviews_since(
+    owner: &str,
+    repo: &str,
+    pr_number: &str,
+    since: DateTime<Utc>,
+) -> Result<Vec<Review>> {
+    let reviews = get_all_reviews(owner, repo, pr_number).await?;
+
+    // Filter to reviews submitted at or after 'since' (use >= to avoid missing exact timestamps)
     let new_reviews: Vec<Review> = reviews
         .into_iter()
-        .filter(|r| r.submitted_at > since)
+        .filter(|r| r.submitted_at >= since)
         .collect();
 
     Ok(new_reviews)
