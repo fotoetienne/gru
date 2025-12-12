@@ -13,13 +13,14 @@ use tokio::fs::OpenOptions;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command as TokioCommand;
 use tokio::time::{timeout, Duration};
+use uuid::Uuid;
 
 /// Timeout in seconds for each line read from Claude's output stream
 /// Set to 5 minutes to accommodate long-running LLM operations
 const STREAM_TIMEOUT_SECS: u64 = 300;
 
-/// Duration of inactivity before warning the user
-const INACTIVITY_WARNING_SECS: u64 = 300; // 5 minutes
+/// Duration of inactivity before displaying a warning to the user (5 minutes)
+const INACTIVITY_WARNING_SECS: u64 = 300;
 
 /// Duration of inactivity before considering the task stuck
 const INACTIVITY_STUCK_SECS: u64 = 900; // 15 minutes
@@ -47,7 +48,7 @@ async fn log_event(worktree_path: &Path, event: &stream::StreamOutput) -> Result
     Ok(())
 }
 
-/// Handles the review command by setting up workspace and delegating to the Claude CLI
+/// Handles the review command by setting up workspace and spawning autonomous Claude agent with stream parsing
 /// Returns the exit code from the claude process
 pub async fn handle_review(pr_arg: Option<String>) -> Result<i32> {
     // Resolve PR information from various input formats
@@ -114,10 +115,15 @@ pub async fn handle_review(pr_arg: Option<String>) -> Result<i32> {
     };
     let progress = ProgressDisplay::new(config);
 
+    // Generate a unique session ID for conversation continuity
+    let session_id = Uuid::new_v4();
+
     // Build the command with flags for autonomous stream-json output
     let mut cmd = TokioCommand::new("claude");
     cmd.arg("--print")
         .arg("--verbose")
+        .arg("--session-id")
+        .arg(session_id.to_string())
         .arg("--output-format")
         .arg("stream-json")
         .arg("--include-partial-messages")
@@ -145,7 +151,7 @@ pub async fn handle_review(pr_arg: Option<String>) -> Result<i32> {
     // Process stream output asynchronously with timeout and error handling
     let stream_result = async {
         let mut last_event_time = Instant::now();
-        let mut warned_at_5min = false;
+        let mut inactivity_warning_shown = false;
 
         loop {
             // Check inactivity - time since last event
@@ -161,12 +167,12 @@ pub async fn handle_review(pr_arg: Option<String>) -> Result<i32> {
                     "No activity for {} minutes - review appears stuck",
                     INACTIVITY_STUCK_SECS / 60
                 ));
-            } else if inactivity.as_secs() >= INACTIVITY_WARNING_SECS && !warned_at_5min {
+            } else if inactivity.as_secs() >= INACTIVITY_WARNING_SECS && !inactivity_warning_shown {
                 eprintln!(
                     "⚠️  No activity for {} minutes",
                     INACTIVITY_WARNING_SECS / 60
                 );
-                warned_at_5min = true;
+                inactivity_warning_shown = true;
             }
 
             // Read next line with timeout
@@ -190,7 +196,7 @@ pub async fn handle_review(pr_arg: Option<String>) -> Result<i32> {
 
                     // Reset warning flag only on actual events (not raw output lines)
                     if matches!(output, stream::StreamOutput::Event(_)) {
-                        warned_at_5min = false;
+                        inactivity_warning_shown = false;
                     }
 
                     // Display progress

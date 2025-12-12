@@ -14,6 +14,7 @@ use tokio::fs::OpenOptions;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command as TokioCommand;
 use tokio::time::{timeout, Duration};
+use uuid::Uuid;
 
 /// Timeout in seconds for each line read from Claude's output stream
 /// Set to 5 minutes to accommodate long-running LLM operations
@@ -395,10 +396,15 @@ pub async fn handle_fix(issue: &str, timeout_opt: Option<String>, quiet: bool) -
         }
     }
 
+    // Generate a unique session ID for conversation continuity
+    let session_id = Uuid::new_v4();
+
     // Build the command with flags for non-interactive stream-json output
     let mut cmd = TokioCommand::new("claude");
     cmd.arg("--print")
         .arg("--verbose")
+        .arg("--session-id")
+        .arg(session_id.to_string())
         .arg("--output-format")
         .arg("stream-json")
         .arg("--include-partial-messages")
@@ -437,7 +443,7 @@ pub async fn handle_fix(issue: &str, timeout_opt: Option<String>, quiet: bool) -
     // Process stream output asynchronously with timeout and error handling
     let stream_result = async {
         let mut last_event_time = Instant::now();
-        let mut warned_at_5min = false;
+        let mut inactivity_warning_shown = false;
         let mut raw_output_buffer = String::new();
 
         loop {
@@ -467,12 +473,12 @@ pub async fn handle_fix(issue: &str, timeout_opt: Option<String>, quiet: bool) -
                     "No activity for {} minutes - task appears stuck",
                     INACTIVITY_STUCK_SECS / 60
                 ));
-            } else if inactivity.as_secs() >= INACTIVITY_WARNING_SECS && !warned_at_5min {
+            } else if inactivity.as_secs() >= INACTIVITY_WARNING_SECS && !inactivity_warning_shown {
                 eprintln!(
                     "⚠️  No activity for {} minutes",
                     INACTIVITY_WARNING_SECS / 60
                 );
-                warned_at_5min = true;
+                inactivity_warning_shown = true;
             }
 
             // Handle timeout first, then flatten the stream result
@@ -496,7 +502,7 @@ pub async fn handle_fix(issue: &str, timeout_opt: Option<String>, quiet: bool) -
 
                     // Reset warning flag only on actual events (not raw output lines)
                     if matches!(output, stream::StreamOutput::Event(_)) {
-                        warned_at_5min = false;
+                        inactivity_warning_shown = false;
                     }
 
                     // Buffer raw output for test detection
