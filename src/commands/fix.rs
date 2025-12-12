@@ -147,9 +147,16 @@ async fn create_pr_for_issue(
 
     // Check if work is complete (description file exists)
     let description_path = worktree_path.join("PR_DESCRIPTION.md");
-    let should_mark_ready = tokio::fs::try_exists(&description_path)
-        .await
-        .unwrap_or(false);
+    let should_mark_ready = match tokio::fs::try_exists(&description_path).await {
+        Ok(exists) => exists,
+        Err(e) => {
+            eprintln!(
+                "⚠️  Warning: Failed to check if PR_DESCRIPTION.md exists: {}",
+                e
+            );
+            false
+        }
+    };
 
     let (pr_title, pr_body) = if should_mark_ready {
         // Read the description file

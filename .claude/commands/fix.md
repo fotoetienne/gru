@@ -76,7 +76,8 @@ Gru will handle:
 
 When your implementation is complete and ready for human review:
 
-1. Write `PR_DESCRIPTION.md` in the root of the repository with this format:
+1. **Commit your implementation changes** with a descriptive commit message
+2. Write `PR_DESCRIPTION.md` in the root of the repository with this format:
    ```markdown
    ## Summary
    - Key change 1
@@ -91,8 +92,8 @@ When your implementation is complete and ready for human review:
    - Follow-up work if any
    ```
 
-2. Commit all changes including `PR_DESCRIPTION.md`
-3. Push the branch to the remote repository
+3. Commit `PR_DESCRIPTION.md` (can be separate commit or combined with step 1)
+4. Push the branch to the remote repository
 
 Gru will read this file, create a PR with your description, and mark it ready for review.
 
