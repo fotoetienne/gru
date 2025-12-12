@@ -73,6 +73,26 @@ async fn is_branch_pushed(worktree_path: &Path, branch_name: &str) -> Result<boo
     Ok(output.status.success())
 }
 
+/// Helper function to create a WIP PR template
+fn create_wip_template(minion_id: &str, issue_num: &str, issue_title: &str) -> (String, String) {
+    let pr_title = format!("[WIP] Fixes #{}: {}", issue_num, issue_title);
+    let pr_body = format!(
+        r#"This PR is being worked on by Minion {}
+
+## Status
+Work in progress - I'll update this when ready for review.
+
+## Changes
+- [ ] Initial implementation
+- [ ] Writing tests
+- [ ] Documentation
+
+Fixes #{}"#,
+        minion_id, issue_num
+    );
+    (pr_title, pr_body)
+}
+
 /// Creates a draft PR for the given branch
 async fn create_pr_for_issue(
     owner: &str,
@@ -127,7 +147,9 @@ async fn create_pr_for_issue(
 
     // Check if work is complete (description file exists)
     let description_path = worktree_path.join("PR_DESCRIPTION.md");
-    let should_mark_ready = description_path.exists();
+    let should_mark_ready = tokio::fs::try_exists(&description_path)
+        .await
+        .unwrap_or(false);
 
     let (pr_title, pr_body) = if should_mark_ready {
         // Read the description file
@@ -141,42 +163,12 @@ async fn create_pr_for_issue(
             _ => {
                 // File exists but couldn't be read or is empty - treat as WIP
                 eprintln!("⚠️  Warning: PR_DESCRIPTION.md exists but couldn't be read or is empty");
-                let pr_title = format!("[WIP] Fixes #{}: {}", issue_num, issue_title);
-                let pr_body = format!(
-                    r#"This PR is being worked on by Minion {}
-
-## Status
-Work in progress - I'll update this when ready for review.
-
-## Changes
-- [ ] Initial implementation
-- [ ] Writing tests
-- [ ] Documentation
-
-Fixes #{}"#,
-                    minion_id, issue_num
-                );
-                (pr_title, pr_body)
+                create_wip_template(minion_id, issue_num, &issue_title)
             }
         }
     } else {
         // No description file - work in progress
-        let pr_title = format!("[WIP] Fixes #{}: {}", issue_num, issue_title);
-        let pr_body = format!(
-            r#"This PR is being worked on by Minion {}
-
-## Status
-Work in progress - I'll update this when ready for review.
-
-## Changes
-- [ ] Initial implementation
-- [ ] Writing tests
-- [ ] Documentation
-
-Fixes #{}"#,
-            minion_id, issue_num
-        );
-        (pr_title, pr_body)
+        create_wip_template(minion_id, issue_num, &issue_title)
     };
 
     // Create the draft PR using gh CLI (PR operations always use CLI)
