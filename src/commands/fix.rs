@@ -40,6 +40,10 @@ const EXIT_CODE_SIGNAL_TERMINATED: i32 = 128;
 /// Reviews can take longer than fixes due to analysis depth
 const DEFAULT_REVIEW_TIMEOUT_SECS: u64 = 1800;
 
+/// Maximum number of review rounds to handle automatically
+/// After this limit, the user must handle additional reviews manually
+const MAX_REVIEW_ROUNDS: usize = 5;
+
 /// Logs an event to events.jsonl in the worktree directory
 async fn log_event(worktree_path: &Path, event: &stream::StreamOutput) -> Result<()> {
     let events_file = worktree_path.join("events.jsonl");
@@ -276,6 +280,11 @@ fn parse_timeout(timeout_str: &str) -> Result<Duration> {
 ///
 /// This function spawns Claude with a custom prompt containing review comments.
 /// It reuses the same session ID to maintain context from the original implementation.
+///
+/// This function handles timeout detection and inactivity monitoring. If a timeout is specified
+/// via the `timeout_opt` parameter, the function will terminate if the operation exceeds the
+/// given duration. The function also monitors for inactivity (no output) and will fail if there
+/// is no activity for an extended period (15 minutes by default).
 async fn invoke_claude_for_reviews(
     worktree_path: &Path,
     session_id: &Uuid,
@@ -893,6 +902,7 @@ pub async fn handle_fix(issue: &str, timeout_opt: Option<String>, quiet: bool) -
                     println!("   Press Ctrl+C to stop monitoring\n");
 
                     // Keep monitoring in a loop to handle multiple rounds of reviews
+                    let mut review_round = 0;
                     loop {
                         match pr_monitor::monitor_pr(&owner, &repo, &pr_number, &worktree_path)
                             .await
@@ -910,14 +920,40 @@ pub async fn handle_fix(issue: &str, timeout_opt: Option<String>, quiet: bool) -
                                 break;
                             }
                             Ok(MonitorResult::NewReviews(comments)) => {
+                                review_round += 1;
                                 let count = comments.len();
                                 println!(
-                                    "💬 Detected {} new review comment(s) on PR #{}",
-                                    count, pr_number
+                                    "💬 Detected {} new review comment(s) on PR #{} (review round {}/{})",
+                                    count, pr_number, review_round, MAX_REVIEW_ROUNDS
                                 );
 
+                                // Check if we've hit the maximum review rounds limit
+                                if review_round > MAX_REVIEW_ROUNDS {
+                                    println!(
+                                        "⚠️  Reached maximum review rounds limit ({})",
+                                        MAX_REVIEW_ROUNDS
+                                    );
+                                    println!("   Additional reviews will need manual handling");
+                                    println!(
+                                        "   View PR: https://github.com/{}/{}/pull/{}",
+                                        owner, repo, pr_number
+                                    );
+                                    break;
+                                }
+
                                 // Format the review prompt with detailed comments
-                                let issue_number = issue_num.parse::<u64>().unwrap_or(0);
+                                let issue_number = match issue_num.parse::<u64>() {
+                                    Ok(num) => num,
+                                    Err(e) => {
+                                        eprintln!(
+                                            "⚠️  Failed to parse issue number '{}': {}",
+                                            issue_num, e
+                                        );
+                                        eprintln!("   Cannot format review prompt without a valid issue number");
+                                        break;
+                                    }
+                                };
+
                                 let review_prompt = pr_monitor::format_review_prompt(
                                     issue_number,
                                     &pr_number,
@@ -939,6 +975,12 @@ pub async fn handle_fix(issue: &str, timeout_opt: Option<String>, quiet: bool) -
                                         println!("\n✅ Finished addressing review comments");
                                         println!("🔄 Continuing to monitor PR...\n");
                                         // Continue monitoring for more reviews
+                                        //
+                                        // Note: monitor_pr re-initializes last_check_time from existing reviews
+                                        // on each call, so it will pick up from the most recent review timestamp.
+                                        // This mitigates (but doesn't completely eliminate) the race condition
+                                        // where the same reviews could be re-detected. A more robust solution
+                                        // would track processed review IDs or return last_check_time from monitor_pr.
                                     }
                                     Err(e) => {
                                         eprintln!("⚠️  Failed to address review comments: {}", e);

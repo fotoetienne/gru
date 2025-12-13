@@ -22,7 +22,8 @@ struct Head {
 struct Review {
     id: u64,
     submitted_at: DateTime<Utc>,
-    #[allow(dead_code)] // Used for future features like tracking reviewer identity
+    #[allow(dead_code)]
+    // Available for future use; currently only id and submitted_at are accessed
     user: User,
 }
 
@@ -211,6 +212,7 @@ async fn get_review_comments(
     reviews: &[Review],
 ) -> Result<Vec<ReviewComment>> {
     let mut all_comments = Vec::new();
+    let mut failed_reviews = 0;
 
     for review in reviews {
         // Fetch comments for this specific review
@@ -233,6 +235,7 @@ async fn get_review_comments(
                 "Warning: Failed to fetch comments for review {}: {}",
                 review.id, stderr
             );
+            failed_reviews += 1;
             continue;
         }
 
@@ -250,13 +253,22 @@ async fn get_review_comments(
         }
     }
 
+    // Log summary if any reviews failed to fetch
+    if failed_reviews > 0 {
+        eprintln!(
+            "⚠️  Failed to fetch comments from {} out of {} review(s)",
+            failed_reviews,
+            reviews.len()
+        );
+    }
+
     Ok(all_comments)
 }
 
 /// Format review comments into a prompt for Claude
 pub fn format_review_prompt(issue_num: u64, pr_number: &str, comments: &[ReviewComment]) -> String {
     let mut prompt = format!(
-        "You previously implemented a fix for issue #{}. A reviewer has left feedback \
+        "You previously implemented a fix for issue #{}. Review feedback has been provided \
         on PR #{}. Please address the following comments:\n\n",
         issue_num, pr_number
     );
