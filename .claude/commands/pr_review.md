@@ -65,8 +65,7 @@ Review a GitHub pull request: fetch details, analyze changes, and provide feedba
   - Use `gh pr view $ARGUMENTS --json author --jq '.author.login'` to get the PR author
   - Use `gh api user --jq '.login'` to get your GitHub username
   - If they match, you CANNOT use `--approve` or `--request-changes` (GitHub will reject it)
-- Ask the user: "Would you like me to submit this review as comments on the PR?"
-- If yes, use `gh pr review $ARGUMENTS` with:
+- Use `gh pr review $ARGUMENTS` with:
   - `--comment -b "review content"` for general feedback (use this for your own PRs)
   - `--approve -b "review content"` if explicitly approving AND it's not your own PR
   - `--request-changes -b "review content"` if changes are required AND it's not your own PR
