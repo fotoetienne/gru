@@ -132,7 +132,7 @@ async fn create_pr_for_issue(
     // Get issue title from GitHub API or CLI
     let issue_number: u64 = issue_num.parse().context("Failed to parse issue number")?;
 
-    let issue_title = if let Some(github_client) = GitHubClient::try_from_env() {
+    let issue_title = if let Some(github_client) = GitHubClient::try_from_env(owner, repo).await {
         // Use API if token is available
         let issue = github_client
             .get_issue(owner, repo, issue_number)
@@ -141,7 +141,7 @@ async fn create_pr_for_issue(
         issue.title
     } else {
         // Fall back to gh CLI
-        println!("ℹ️  GRU_GITHUB_TOKEN not set, using gh CLI for GitHub operations");
+        println!("ℹ️  No GitHub authentication found, using gh CLI for GitHub operations");
         let issue = crate::github::get_issue_via_cli(owner, repo, issue_number)
             .await
             .context(
@@ -198,7 +198,7 @@ async fn create_pr_for_issue(
     // Mark ready if description was provided
     if should_mark_ready {
         // Use GitHub client to mark PR ready
-        if let Some(github_client) = GitHubClient::try_from_env() {
+        if let Some(github_client) = GitHubClient::try_from_env(owner, repo).await {
             match github_client.mark_pr_ready(owner, repo, &pr_number).await {
                 Ok(_) => {
                     println!("✅ PR #{} marked ready for review", pr_number);
@@ -212,7 +212,9 @@ async fn create_pr_for_issue(
                 }
             }
         } else {
-            eprintln!("⚠️  Warning: GRU_GITHUB_TOKEN not set - cannot mark PR ready automatically");
+            eprintln!(
+                "⚠️  Warning: No GitHub authentication found - cannot mark PR ready automatically"
+            );
             eprintln!(
                 "   You can mark PR #{} ready with: gh pr ready {}",
                 pr_number, pr_number
@@ -585,9 +587,9 @@ pub async fn handle_fix(issue: &str, timeout_opt: Option<String>, quiet: bool) -
     let mut progress_tracker = ProgressCommentTracker::new(minion_id.clone());
 
     // Initialize GitHub client (optional - only if token is available)
-    let github_client = GitHubClient::from_env().ok();
+    let github_client = GitHubClient::from_env(&owner, &repo).await.ok();
     if github_client.is_none() {
-        println!("⚠️  GRU_GITHUB_TOKEN not set - progress comments will not be posted");
+        println!("⚠️  No GitHub authentication found - progress comments will not be posted");
     }
 
     // Claim the issue by adding in-progress label (fire-and-forget)

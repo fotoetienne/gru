@@ -1,6 +1,100 @@
 use anyhow::{anyhow, Context, Result};
 use octocrab::{models, Octocrab};
 use std::env;
+use tokio::process::Command;
+
+// ============================================================================
+// Token Extraction Helpers
+// ============================================================================
+
+/// Try to extract GitHub token from gh/ghe CLI
+///
+/// # Arguments
+/// * `owner` - Repository owner (used to infer hostname)
+/// * `repo` - Repository name (currently unused, but available for future enhancements)
+///
+/// Returns the token if successfully extracted, or None if gh/ghe is not available
+async fn try_get_token_from_cli(owner: &str, _repo: &str) -> Option<String> {
+    // Infer which CLI to use based on hostname
+    let host = infer_github_host(owner);
+    let gh_cmd = if host.contains("ghe.") { "ghe" } else { "gh" };
+
+    // Try to get token from CLI
+    let output = Command::new(gh_cmd)
+        .args(["auth", "token", "--hostname", host])
+        .output()
+        .await
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let token = String::from_utf8(output.stdout).ok()?;
+    let token = token.trim().to_string();
+
+    if token.is_empty() {
+        return None;
+    }
+
+    Some(token)
+}
+
+/// Infer GitHub hostname from repository owner
+///
+/// # Arguments
+/// * `owner` - Repository owner (user or organization)
+///
+/// Returns the appropriate GitHub hostname (github.com or ghe.netflix.net)
+fn infer_github_host(owner: &str) -> &'static str {
+    // Future enhancement: Parse from git remote URL
+    // For now, use simple heuristic
+    if owner == "netflix" || owner.contains("netflix") {
+        "ghe.netflix.net"
+    } else {
+        "github.com"
+    }
+}
+
+/// Get GitHub token with automatic fallback logic
+///
+/// Priority order:
+/// 1. Try gh/ghe CLI (respects existing authentication)
+/// 2. Fall back to GRU_GITHUB_TOKEN environment variable
+/// 3. Return error with helpful message
+///
+/// # Arguments
+/// * `owner` - Repository owner (used to infer hostname)
+/// * `repo` - Repository name
+async fn get_github_token(owner: &str, repo: &str) -> Result<String> {
+    // Try CLI first
+    if let Some(token) = try_get_token_from_cli(owner, repo).await {
+        return Ok(token);
+    }
+
+    // Fall back to environment variable
+    if let Ok(token) = env::var("GRU_GITHUB_TOKEN") {
+        if !token.is_empty() {
+            return Ok(token);
+        }
+    }
+
+    // Provide helpful error message
+    let host = infer_github_host(owner);
+    let gh_cmd = if host.contains("ghe.") { "ghe" } else { "gh" };
+
+    Err(anyhow!(
+        "No GitHub authentication found.\n\n\
+         To authenticate, choose one option:\n\n\
+         1. Use {} CLI (recommended):\n   \
+            {} auth login\n\n\
+         2. Set environment variable:\n   \
+            export GRU_GITHUB_TOKEN=\"ghp_xxxx\"\n\n\
+         Need help? https://cli.github.com/manual/gh_auth_login",
+        gh_cmd,
+        gh_cmd
+    ))
+}
 
 // ============================================================================
 // Octocrab API Client
@@ -34,23 +128,32 @@ impl GitHubClient {
         Ok(Self { client })
     }
 
-    /// Initialize a new GitHub client with token from environment
+    /// Initialize a new GitHub client with token from environment or gh/ghe CLI
     ///
-    /// Reads `GRU_GITHUB_TOKEN` from environment variables.
-    /// Returns an error if the token is missing or invalid.
-    pub fn from_env() -> Result<Self> {
-        let token = env::var("GRU_GITHUB_TOKEN")
-            .context("GRU_GITHUB_TOKEN environment variable not set")?;
-
+    /// Priority order:
+    /// 1. Try gh/ghe CLI (respects existing authentication)
+    /// 2. Fall back to GRU_GITHUB_TOKEN environment variable
+    ///
+    /// # Arguments
+    /// * `owner` - Repository owner (used to infer hostname)
+    /// * `repo` - Repository name
+    ///
+    /// Returns an error if no authentication is found.
+    pub async fn from_env(owner: &str, repo: &str) -> Result<Self> {
+        let token = get_github_token(owner, repo).await?;
         Self::new(token)
     }
 
-    /// Try to initialize a new GitHub client with token from environment
+    /// Try to initialize a new GitHub client with token from environment or gh/ghe CLI
     ///
-    /// Returns `None` if the token is not set, instead of an error.
+    /// Returns `None` if no authentication is found, instead of an error.
     /// This allows graceful fallback to CLI methods.
-    pub fn try_from_env() -> Option<Self> {
-        let token = env::var("GRU_GITHUB_TOKEN").ok()?;
+    ///
+    /// # Arguments
+    /// * `owner` - Repository owner (used to infer hostname)
+    /// * `repo` - Repository name
+    pub async fn try_from_env(owner: &str, repo: &str) -> Option<Self> {
+        let token = get_github_token(owner, repo).await.ok()?;
         Self::new(token).ok()
     }
 
@@ -627,17 +730,23 @@ mod tests {
         assert!(result.is_ok());
     }
 
-    #[test]
+    #[tokio::test]
     #[serial]
-    fn test_from_env_without_token() {
+    async fn test_from_env_without_token() {
         // Save and remove the token
         let original_token = env::var("GRU_GITHUB_TOKEN").ok();
         env::remove_var("GRU_GITHUB_TOKEN");
 
-        // Should fail with missing token
-        let result = GitHubClient::from_env();
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("GRU_GITHUB_TOKEN"));
+        // Try to get client - will succeed if gh CLI is authenticated, fail otherwise
+        let result = GitHubClient::from_env("test-owner", "test-repo").await;
+
+        // If gh CLI is authenticated, the result will succeed
+        // If gh CLI is not authenticated, the result should fail with a helpful error
+        if result.is_err() {
+            let err_msg = result.unwrap_err().to_string();
+            assert!(err_msg.contains("No GitHub authentication found") || err_msg.contains("auth"));
+        }
+        // If result.is_ok(), that's also fine - it means gh CLI provided a token
 
         // Restore original token if it existed
         if let Some(token) = original_token {
@@ -650,7 +759,9 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn test_get_issue() {
-        let client = GitHubClient::from_env().expect("Failed to create client");
+        let client = GitHubClient::from_env("octocat", "Hello-World")
+            .await
+            .expect("Failed to create client");
 
         // Test against a known public issue
         let issue = client
@@ -664,7 +775,9 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn test_post_comment() {
-        let client = GitHubClient::from_env().expect("Failed to create client");
+        let client = GitHubClient::from_env("your-username", "your-test-repo")
+            .await
+            .expect("Failed to create client");
 
         // This test requires write access to a repository
         // You should replace these with your own test repo details
@@ -684,11 +797,13 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn test_add_and_remove_label() {
-        let client = GitHubClient::from_env().expect("Failed to create client");
-
-        // This test requires write access to a repository
         let owner = "your-username";
         let repo = "your-test-repo";
+        let client = GitHubClient::from_env(owner, repo)
+            .await
+            .expect("Failed to create client");
+
+        // This test requires write access to a repository
         let issue = 1;
         let label = "test-label";
 
