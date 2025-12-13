@@ -239,16 +239,16 @@ mod tests {
     #[test]
     fn test_parse_current_dir() {
         let result = parse_repo_source(".").unwrap();
-        matches!(result, RepoSource::CurrentDir);
+        assert!(matches!(result, RepoSource::CurrentDir));
     }
 
     #[test]
     fn test_parse_local_path() {
         let result = parse_repo_source("./path/to/repo").unwrap();
-        matches!(result, RepoSource::LocalPath(_));
+        assert!(matches!(result, RepoSource::LocalPath(_)));
 
         let result = parse_repo_source("/absolute/path").unwrap();
-        matches!(result, RepoSource::LocalPath(_));
+        assert!(matches!(result, RepoSource::LocalPath(_)));
     }
 
     #[test]
