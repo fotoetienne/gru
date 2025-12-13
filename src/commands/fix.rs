@@ -40,6 +40,10 @@ const EXIT_CODE_SIGNAL_TERMINATED: i32 = 128;
 /// Reviews can take longer than fixes due to analysis depth
 const DEFAULT_REVIEW_TIMEOUT_SECS: u64 = 1800;
 
+/// Maximum number of review rounds to handle automatically
+/// After this limit, the user must handle additional reviews manually
+const MAX_REVIEW_ROUNDS: usize = 5;
+
 /// Logs an event to events.jsonl in the worktree directory
 async fn log_event(worktree_path: &Path, event: &stream::StreamOutput) -> Result<()> {
     let events_file = worktree_path.join("events.jsonl");
@@ -270,6 +274,156 @@ fn parse_timeout(timeout_str: &str) -> Result<Duration> {
             unit
         ),
     }
+}
+
+/// Invokes Claude to address review comments
+///
+/// This function spawns Claude with a custom prompt containing review comments.
+/// It reuses the same session ID to maintain context from the original implementation.
+///
+/// This function handles timeout detection and inactivity monitoring. If a timeout is specified
+/// via the `timeout_opt` parameter, the function will terminate if the operation exceeds the
+/// given duration. The function also monitors for inactivity (no output) and will fail if there
+/// is no activity for an extended period (15 minutes by default).
+async fn invoke_claude_for_reviews(
+    worktree_path: &Path,
+    session_id: &Uuid,
+    prompt: &str,
+    timeout_opt: Option<&str>,
+) -> Result<()> {
+    // Build the command with flags for non-interactive stream-json output
+    let mut cmd = TokioCommand::new("claude");
+    cmd.arg("--print")
+        .arg("--verbose")
+        .arg("--session-id")
+        .arg(session_id.to_string())
+        .arg("--output-format")
+        .arg("stream-json")
+        .arg("--include-partial-messages")
+        .arg("--dangerously-skip-permissions")
+        .arg(prompt)
+        .stdin(std::process::Stdio::inherit())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::inherit())
+        .current_dir(worktree_path);
+
+    // Spawn the command
+    let mut child = cmd.spawn().context(
+        "claude command not found. Install from: https://github.com/anthropics/claude-code",
+    )?;
+
+    // Get the stdout handle
+    let stdout = child
+        .stdout
+        .take()
+        .context("Failed to capture stdout from claude process")?;
+
+    // Create event stream reader
+    let mut stream = EventStream::from_stdout(stdout);
+
+    // Parse timeout if provided
+    let max_timeout = if let Some(timeout_str) = timeout_opt {
+        Some(parse_timeout(timeout_str)?)
+    } else {
+        None
+    };
+
+    // Track task start time for overall timeout
+    let task_start = Instant::now();
+
+    // Process stream output asynchronously with timeout and error handling
+    let stream_result = async {
+        let mut last_event_time = Instant::now();
+        let mut inactivity_warning_shown = false;
+
+        loop {
+            // Check overall task timeout
+            if let Some(max_duration) = max_timeout {
+                let elapsed = task_start.elapsed();
+                if elapsed >= max_duration {
+                    eprintln!("⏱️  Task timeout reached ({:?})", max_duration);
+                    eprintln!("📝 Events saved to events.jsonl");
+                    return Err(anyhow::anyhow!(
+                        "Task exceeded maximum timeout of {:?}",
+                        max_duration
+                    ));
+                }
+            }
+
+            // Check inactivity - time since last event
+            let inactivity = last_event_time.elapsed();
+
+            if inactivity.as_secs() >= INACTIVITY_STUCK_SECS {
+                eprintln!(
+                    "❌ Task appears stuck (no activity for {} minutes)",
+                    INACTIVITY_STUCK_SECS / 60
+                );
+                eprintln!("📝 Events saved to events.jsonl");
+                return Err(anyhow::anyhow!(
+                    "No activity for {} minutes - task appears stuck",
+                    INACTIVITY_STUCK_SECS / 60
+                ));
+            } else if inactivity.as_secs() >= INACTIVITY_WARNING_SECS && !inactivity_warning_shown {
+                eprintln!(
+                    "⚠️  No activity for {} minutes",
+                    INACTIVITY_WARNING_SECS / 60
+                );
+                inactivity_warning_shown = true;
+            }
+
+            // Try to read next line with timeout
+            let line_result = timeout(Duration::from_secs(STREAM_TIMEOUT_SECS), stream.next_line())
+                .await
+                .map_err(|_| {
+                    anyhow::anyhow!(
+                        "Timeout: Process hasn't produced output in {} seconds",
+                        STREAM_TIMEOUT_SECS
+                    )
+                })?;
+
+            // Handle the stream result
+            match line_result? {
+                Some(output) => {
+                    // Log the event to events.jsonl
+                    log_event(worktree_path, &output).await?;
+
+                    // Update last event time for any output
+                    last_event_time = Instant::now();
+
+                    // Reset warning flag only on actual events (not raw output lines)
+                    if matches!(output, stream::StreamOutput::Event(_)) {
+                        inactivity_warning_shown = false;
+                    }
+                }
+                None => {
+                    // Stream ended normally
+                    break;
+                }
+            }
+        }
+
+        Ok(())
+    }
+    .await;
+
+    // Handle stream errors
+    if let Err(e) = stream_result {
+        let _ = child.kill().await;
+        return Err(e);
+    }
+
+    // Wait for the child process to finish
+    let status = child.wait().await.context("Failed to wait for child")?;
+
+    if !status.success() {
+        let exit_code = status.code().unwrap_or(EXIT_CODE_SIGNAL_TERMINATED);
+        return Err(anyhow::anyhow!(
+            "Review response process exited with code {}",
+            exit_code
+        ));
+    }
+
+    Ok(())
 }
 
 /// Triggers an automated PR review by spawning a separate gru review command
@@ -747,41 +901,114 @@ pub async fn handle_fix(issue: &str, timeout_opt: Option<String>, quiet: bool) -
                     println!("\n👀 Monitoring PR for updates (polling every 30s)...");
                     println!("   Press Ctrl+C to stop monitoring\n");
 
-                    match pr_monitor::monitor_pr(&owner, &repo, &pr_number, &worktree_path).await {
-                        Ok(MonitorResult::Merged) => {
-                            println!("✅ PR #{} was merged successfully!", pr_number);
-                            println!("🎉 Issue {} is complete!", issue_num);
-                        }
-                        Ok(MonitorResult::Closed) => {
-                            println!("⚠️  PR #{} was closed without merging", pr_number);
-                            println!(
-                                "   The issue may need to be reopened or addressed differently"
-                            );
-                        }
-                        Ok(MonitorResult::NewReviews(count)) => {
-                            println!(
-                                "💬 Detected {} new review comment(s) on PR #{}",
-                                count, pr_number
-                            );
-                            println!("   Use: gru review {} to respond to feedback", pr_number);
-                        }
-                        Ok(MonitorResult::FailedChecks(count)) => {
-                            println!(
-                                "❌ Detected {} failed CI check(s) on PR #{}",
-                                count, pr_number
-                            );
-                            println!(
-                                "   Review the checks at: https://github.com/{}/{}/pull/{}/checks",
-                                owner, repo, pr_number
-                            );
-                            println!("   Fix issues and push updates to the branch");
-                        }
-                        Err(e) => {
-                            eprintln!("⚠️  PR monitoring failed: {}", e);
-                            eprintln!(
-                                "   You can monitor manually at: https://github.com/{}/{}/pull/{}",
-                                owner, repo, pr_number
-                            );
+                    // Keep monitoring in a loop to handle multiple rounds of reviews
+                    let mut review_round = 0;
+                    loop {
+                        match pr_monitor::monitor_pr(&owner, &repo, &pr_number, &worktree_path)
+                            .await
+                        {
+                            Ok(MonitorResult::Merged) => {
+                                println!("✅ PR #{} was merged successfully!", pr_number);
+                                println!("🎉 Issue {} is complete!", issue_num);
+                                break;
+                            }
+                            Ok(MonitorResult::Closed) => {
+                                println!("⚠️  PR #{} was closed without merging", pr_number);
+                                println!(
+                                    "   The issue may need to be reopened or addressed differently"
+                                );
+                                break;
+                            }
+                            Ok(MonitorResult::NewReviews(comments)) => {
+                                review_round += 1;
+                                let count = comments.len();
+                                println!(
+                                    "💬 Detected {} new review comment(s) on PR #{} (review round {}/{})",
+                                    count, pr_number, review_round, MAX_REVIEW_ROUNDS
+                                );
+
+                                // Check if we've hit the maximum review rounds limit
+                                if review_round > MAX_REVIEW_ROUNDS {
+                                    println!(
+                                        "⚠️  Reached maximum review rounds limit ({})",
+                                        MAX_REVIEW_ROUNDS
+                                    );
+                                    println!("   Additional reviews will need manual handling");
+                                    println!(
+                                        "   View PR: https://github.com/{}/{}/pull/{}",
+                                        owner, repo, pr_number
+                                    );
+                                    break;
+                                }
+
+                                // Format the review prompt with detailed comments
+                                let issue_number = match issue_num.parse::<u64>() {
+                                    Ok(num) => num,
+                                    Err(e) => {
+                                        eprintln!(
+                                            "⚠️  Failed to parse issue number '{}': {}",
+                                            issue_num, e
+                                        );
+                                        eprintln!("   Cannot format review prompt without a valid issue number");
+                                        break;
+                                    }
+                                };
+
+                                let review_prompt = pr_monitor::format_review_prompt(
+                                    issue_number,
+                                    &pr_number,
+                                    &comments,
+                                );
+
+                                println!("🔄 Re-invoking to address review feedback...\n");
+
+                                // Re-invoke Claude with the same session ID to maintain context
+                                match invoke_claude_for_reviews(
+                                    &worktree_path,
+                                    &session_id,
+                                    &review_prompt,
+                                    timeout_opt.as_deref(),
+                                )
+                                .await
+                                {
+                                    Ok(()) => {
+                                        println!("\n✅ Finished addressing review comments");
+                                        println!("🔄 Continuing to monitor PR...\n");
+                                        // Continue monitoring for more reviews
+                                        //
+                                        // Note: monitor_pr re-initializes last_check_time from existing reviews
+                                        // on each call, so it will pick up from the most recent review timestamp.
+                                        // This mitigates (but doesn't completely eliminate) the race condition
+                                        // where the same reviews could be re-detected. A more robust solution
+                                        // would track processed review IDs or return last_check_time from monitor_pr.
+                                    }
+                                    Err(e) => {
+                                        eprintln!("⚠️  Failed to address review comments: {}", e);
+                                        eprintln!("   You can address them manually");
+                                        break;
+                                    }
+                                }
+                            }
+                            Ok(MonitorResult::FailedChecks(count)) => {
+                                println!(
+                                    "❌ Detected {} failed CI check(s) on PR #{}",
+                                    count, pr_number
+                                );
+                                println!(
+                                    "   Review the checks at: https://github.com/{}/{}/pull/{}/checks",
+                                    owner, repo, pr_number
+                                );
+                                println!("   Fix issues and push updates to the branch");
+                                break;
+                            }
+                            Err(e) => {
+                                eprintln!("⚠️  PR monitoring failed: {}", e);
+                                eprintln!(
+                                    "   You can monitor manually at: https://github.com/{}/{}/pull/{}",
+                                    owner, repo, pr_number
+                                );
+                                break;
+                            }
                         }
                     }
                 }
