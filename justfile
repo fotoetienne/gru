@@ -17,6 +17,10 @@ build-release:
 install:
     cargo install --path .
 
+# Update binary
+update:
+    git pull && just install
+
 # Run all tests
 test:
     cargo test
