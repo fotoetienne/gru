@@ -26,5 +26,12 @@ Respond to all comments and reviews on a GitHub pull request.
 - Acknowledge suggestions and indicate if/how they'll be addressed
 
 ## 4. Post Responses
-- Ask the user: "Would you like me to post these responses to the PR?"
-- If yes, use `gh pr comment $ARGUMENTS -b "response content"` for each response
+- Use `gh pr comment $ARGUMENTS -b "response content"` for each response
+
+## 5. Update Code
+- For each response, update the code accordingly
+- Commit changes with a descriptive message
+- Push changes to the branch
+
+## 6. Post follow-up
+- After commiting updates, use `gh pr comment $ARGUMENTS -b "update content"` to post a follow-up comment
