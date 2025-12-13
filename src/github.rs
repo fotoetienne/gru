@@ -434,6 +434,117 @@ impl GitHubClient {
 
         Ok(())
     }
+
+    /// Get the authenticated user information
+    ///
+    /// Used for validating that the GitHub token is valid and has appropriate access.
+    ///
+    /// # Returns
+    /// The authenticated user's information
+    pub async fn get_authenticated_user(&self) -> Result<models::Author> {
+        self.client
+            .current()
+            .user()
+            .await
+            .context("Failed to fetch authenticated user information")
+    }
+
+    /// Create a label in a repository
+    ///
+    /// # Arguments
+    /// * `owner` - Repository owner
+    /// * `repo` - Repository name
+    /// * `name` - Label name
+    /// * `color` - Hex color code (without # prefix)
+    /// * `description` - Label description
+    ///
+    /// # Returns
+    /// * `Ok(true)` - Label was created
+    /// * `Ok(false)` - Label already exists (idempotent)
+    /// * `Err(_)` - Failed to create label
+    pub async fn create_label(
+        &self,
+        owner: &str,
+        repo: &str,
+        name: &str,
+        color: &str,
+        description: &str,
+    ) -> Result<bool> {
+        // Try to create the label
+        match self
+            .client
+            .issues(owner, repo)
+            .create_label(name, color, description)
+            .await
+        {
+            Ok(_) => Ok(true),
+            Err(e) => {
+                // Check if the error is because the label already exists
+                let err_str = e.to_string();
+                if err_str.contains("already_exists") || err_str.contains("already exists") {
+                    Ok(false)
+                } else {
+                    Err(anyhow!(
+                        "Failed to create label '{}' in {}/{}: {}",
+                        name,
+                        owner,
+                        repo,
+                        e
+                    ))
+                }
+            }
+        }
+    }
+
+    /// List all issues with a specific label
+    ///
+    /// # Arguments
+    /// * `owner` - Repository owner
+    /// * `repo` - Repository name
+    /// * `label` - Label name to filter by
+    ///
+    /// # Returns
+    /// List of issues with the specified label
+    pub async fn list_issues_with_label(
+        &self,
+        owner: &str,
+        repo: &str,
+        label: &str,
+    ) -> Result<Vec<models::issues::Issue>> {
+        let mut issues = Vec::new();
+        let mut page = 1u32;
+
+        loop {
+            let page_result = self
+                .client
+                .issues(owner, repo)
+                .list()
+                .labels(&[label.to_string()])
+                .state(octocrab::params::State::Open)
+                .per_page(100)
+                .page(page)
+                .send()
+                .await
+                .context(format!(
+                    "Failed to list issues with label '{}' in {}/{}",
+                    label, owner, repo
+                ))?;
+
+            if page_result.items.is_empty() {
+                break;
+            }
+
+            issues.extend(page_result.items);
+
+            if page_result.next.is_none() {
+                break;
+            }
+
+            page += 1;
+        }
+
+        Ok(issues)
+    }
 }
 
 // ============================================================================
