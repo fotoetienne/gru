@@ -109,6 +109,30 @@ impl EventLogger {
         })
     }
 
+    /// Creates a new EventLogger with a custom workspace (for testing only).
+    ///
+    /// This constructor allows tests to use temporary directories instead of
+    /// polluting the production `~/.gru/` directory.
+    ///
+    /// # Arguments
+    ///
+    /// * `minion_id` - Unique minion identifier
+    /// * `workspace` - Custom workspace instance (typically with temp directory root)
+    #[cfg(test)]
+    pub fn new_with_workspace(minion_id: impl Into<String>, workspace: &Workspace) -> Result<Self> {
+        let minion_id = minion_id.into();
+
+        let archive_dir = workspace
+            .archive_dir(&minion_id)
+            .context("Invalid minion_id")?;
+        let log_path = archive_dir.join("events.jsonl");
+
+        Ok(Self {
+            minion_id,
+            log_path,
+        })
+    }
+
     /// Gets the log path for a given minion_id
     /// Returns ~/.gru/archive/<minion-id>/events.jsonl
     ///
@@ -182,34 +206,23 @@ mod tests {
     use super::*;
     use std::fs;
     use std::io::{BufRead, BufReader};
-    use std::sync::atomic::{AtomicU64, Ordering};
-
-    static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-    fn unique_minion_id(prefix: &str) -> String {
-        let counter = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
-        format!(
-            "{}_{}_{}",
-            prefix,
-            Utc::now().timestamp_nanos_opt().unwrap(),
-            counter
-        )
-    }
 
     #[test]
     fn test_event_logger_new() {
-        let minion_id = unique_minion_id("M_TEST_NEW");
-        let logger = EventLogger::new(&minion_id).unwrap();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::new_with_root(temp_dir.path().to_path_buf()).unwrap();
+        let logger = EventLogger::new_with_workspace("M_TEST_NEW", &workspace).unwrap();
 
-        assert_eq!(logger.minion_id(), minion_id);
+        assert_eq!(logger.minion_id(), "M_TEST_NEW");
         assert!(logger.log_path().to_string_lossy().contains("archive"));
         assert!(logger.log_path().to_string_lossy().contains("events.jsonl"));
     }
 
     #[test]
     fn test_log_event_creates_file() {
-        let minion_id = unique_minion_id("M_TEST_CREATE");
-        let logger = EventLogger::new(&minion_id).unwrap();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::new_with_root(temp_dir.path().to_path_buf()).unwrap();
+        let logger = EventLogger::new_with_workspace("M_TEST_CREATE", &workspace).unwrap();
 
         // Log a test event
         let event = ClaudeEvent::Thinking {
@@ -219,18 +232,13 @@ mod tests {
 
         // Verify file exists
         assert!(logger.log_path().exists());
-
-        // Clean up - only remove file, leave directory structure
-        fs::remove_file(logger.log_path()).ok();
     }
 
     #[test]
     fn test_log_event_appends_to_file() {
-        let minion_id = unique_minion_id("M_TEST_APPEND");
-        let logger = EventLogger::new(&minion_id).unwrap();
-
-        // Clean up any existing file from previous test runs
-        fs::remove_file(logger.log_path()).ok();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::new_with_root(temp_dir.path().to_path_buf()).unwrap();
+        let logger = EventLogger::new_with_workspace("M_TEST_APPEND", &workspace).unwrap();
 
         // Log multiple events
         logger
@@ -255,21 +263,16 @@ mod tests {
         // Verify each line is valid JSON
         for line in &lines {
             let logged_event: LoggedEvent = serde_json::from_str(line).unwrap();
-            assert_eq!(logged_event.minion_id, minion_id);
+            assert_eq!(logged_event.minion_id, "M_TEST_APPEND");
             assert!(logged_event.timestamp <= Utc::now());
         }
-
-        // Clean up - only remove file, leave directory structure
-        fs::remove_file(logger.log_path()).ok();
     }
 
     #[test]
     fn test_log_event_includes_timestamp_and_minion_id() {
-        let minion_id = unique_minion_id("M_TEST_TIMESTAMP");
-        let logger = EventLogger::new(&minion_id).unwrap();
-
-        // Clean up any existing file from previous test runs
-        fs::remove_file(logger.log_path()).ok();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::new_with_root(temp_dir.path().to_path_buf()).unwrap();
+        let logger = EventLogger::new_with_workspace("M_TEST_TIMESTAMP", &workspace).unwrap();
 
         let event = ClaudeEvent::ToolUse {
             name: "bash".to_string(),
@@ -283,7 +286,7 @@ mod tests {
         let line = reader.lines().next().unwrap().unwrap();
         let logged_event: LoggedEvent = serde_json::from_str(&line).unwrap();
 
-        assert_eq!(logged_event.minion_id, minion_id);
+        assert_eq!(logged_event.minion_id, "M_TEST_TIMESTAMP");
         assert!(logged_event.timestamp <= Utc::now());
 
         match logged_event.event {
@@ -292,9 +295,6 @@ mod tests {
             }
             _ => panic!("Expected ToolUse event"),
         }
-
-        // Clean up - only remove file, leave directory structure
-        fs::remove_file(logger.log_path()).ok();
     }
 
     #[test]
@@ -332,8 +332,9 @@ mod tests {
 
     #[test]
     fn test_rejects_oversized_content() {
-        let minion_id = unique_minion_id("M_TEST_SIZE");
-        let logger = EventLogger::new(&minion_id).unwrap();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::new_with_root(temp_dir.path().to_path_buf()).unwrap();
+        let logger = EventLogger::new_with_workspace("M_TEST_SIZE", &workspace).unwrap();
 
         // Create content that exceeds MAX_CONTENT_LENGTH
         let large_content = "A".repeat(MAX_CONTENT_LENGTH + 1);
@@ -343,15 +344,13 @@ mod tests {
 
         // Should fail validation
         assert!(logger.log_event(event).is_err());
-
-        // Cleanup
-        fs::remove_file(logger.log_path()).ok();
     }
 
     #[test]
     fn test_rejects_oversized_tool_input() {
-        let minion_id = unique_minion_id("M_TEST_TOOL_SIZE");
-        let logger = EventLogger::new(&minion_id).unwrap();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::new_with_root(temp_dir.path().to_path_buf()).unwrap();
+        let logger = EventLogger::new_with_workspace("M_TEST_TOOL_SIZE", &workspace).unwrap();
 
         // Create a tool input that's too large when serialized
         // Each string "x" takes about 3 bytes in JSON: "x",
@@ -364,15 +363,13 @@ mod tests {
 
         // Should fail validation
         assert!(logger.log_event(event).is_err());
-
-        // Cleanup
-        fs::remove_file(logger.log_path()).ok();
     }
 
     #[test]
     fn test_rejects_oversized_tool_name() {
-        let minion_id = unique_minion_id("M_TEST_TOOL_NAME");
-        let logger = EventLogger::new(&minion_id).unwrap();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::new_with_root(temp_dir.path().to_path_buf()).unwrap();
+        let logger = EventLogger::new_with_workspace("M_TEST_TOOL_NAME", &workspace).unwrap();
 
         // Create a tool name that's too long
         let long_name = "A".repeat(MAX_TOOL_NAME_LENGTH + 1);
@@ -383,8 +380,5 @@ mod tests {
 
         // Should fail validation
         assert!(logger.log_event(event).is_err());
-
-        // Cleanup
-        fs::remove_file(logger.log_path()).ok();
     }
 }
