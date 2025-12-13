@@ -20,7 +20,32 @@ struct Head {
 
 #[derive(Debug, Deserialize)]
 struct Review {
+    id: u64,
     submitted_at: DateTime<Utc>,
+    #[allow(dead_code)] // Used for future features like tracking reviewer identity
+    user: User,
+}
+
+#[derive(Debug, Deserialize)]
+struct User {
+    login: String,
+}
+
+/// A review comment with file location and content
+#[derive(Debug, Clone)]
+pub struct ReviewComment {
+    pub file: String,
+    pub line: Option<u64>,
+    pub body: String,
+    pub reviewer: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApiReviewComment {
+    path: String,
+    line: Option<u64>,
+    body: String,
+    user: User,
 }
 
 #[derive(Debug, Deserialize)]
@@ -76,7 +101,9 @@ pub async fn monitor_pr(
         // Check for new reviews (use >= to avoid missing reviews at exact timestamp)
         let reviews = get_reviews_since(owner, repo, pr_number, last_check_time).await?;
         if !reviews.is_empty() {
-            return Ok(MonitorResult::NewReviews(reviews.len()));
+            // Fetch detailed comments for the new reviews
+            let comments = get_review_comments(owner, repo, pr_number, &reviews).await?;
+            return Ok(MonitorResult::NewReviews(comments));
         }
 
         // Check for failed CI runs - include all error states
@@ -111,8 +138,8 @@ pub enum MonitorResult {
     Merged,
     /// PR was closed without merging
     Closed,
-    /// New review comments detected (count)
-    NewReviews(usize),
+    /// New review comments detected with details
+    NewReviews(Vec<ReviewComment>),
     /// CI checks failed (count)
     FailedChecks(usize),
 }
@@ -176,6 +203,80 @@ async fn get_reviews_since(
     Ok(new_reviews)
 }
 
+/// Fetch review comments for specific reviews
+async fn get_review_comments(
+    owner: &str,
+    repo: &str,
+    pr_number: &str,
+    reviews: &[Review],
+) -> Result<Vec<ReviewComment>> {
+    let mut all_comments = Vec::new();
+
+    for review in reviews {
+        // Fetch comments for this specific review
+        let output = tokio::process::Command::new("gh")
+            .args([
+                "api",
+                &format!(
+                    "repos/{owner}/{repo}/pulls/{pr_number}/reviews/{}/comments",
+                    review.id
+                ),
+            ])
+            .output()
+            .await
+            .context("Failed to execute gh api command for review comments")?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            // Log error but continue processing other reviews
+            eprintln!(
+                "Warning: Failed to fetch comments for review {}: {}",
+                review.id, stderr
+            );
+            continue;
+        }
+
+        let api_comments: Vec<ApiReviewComment> = serde_json::from_slice(&output.stdout)
+            .context("Failed to parse review comments JSON response")?;
+
+        // Convert API comments to our format
+        for comment in api_comments {
+            all_comments.push(ReviewComment {
+                file: comment.path,
+                line: comment.line,
+                body: comment.body,
+                reviewer: comment.user.login,
+            });
+        }
+    }
+
+    Ok(all_comments)
+}
+
+/// Format review comments into a prompt for Claude
+pub fn format_review_prompt(issue_num: u64, pr_number: &str, comments: &[ReviewComment]) -> String {
+    let mut prompt = format!(
+        "You previously implemented a fix for issue #{}. A reviewer has left feedback \
+        on PR #{}. Please address the following comments:\n\n",
+        issue_num, pr_number
+    );
+
+    for (i, comment) in comments.iter().enumerate() {
+        prompt.push_str(&format!("## Review Comment {}\n", i + 1));
+        prompt.push_str(&format!("**File:** {}", comment.file));
+        if let Some(line) = comment.line {
+            prompt.push_str(&format!(":{}", line));
+        }
+        prompt.push('\n');
+        prompt.push_str(&format!("**Reviewer:** @{}\n", comment.reviewer));
+        prompt.push_str(&format!("**Comment:** {}\n\n", comment.body));
+    }
+
+    prompt.push_str("Please make the requested changes, run tests, and commit.\n");
+
+    prompt
+}
+
 /// Fetch check runs for a given commit SHA
 async fn get_check_runs(owner: &str, repo: &str, sha: &str) -> Result<Vec<CheckRun>> {
     let output = tokio::process::Command::new("gh")
@@ -211,10 +312,89 @@ mod tests {
         let closed = MonitorResult::Closed;
         assert_eq!(format!("{:?}", closed), "Closed");
 
-        let reviews = MonitorResult::NewReviews(3);
-        assert_eq!(format!("{:?}", reviews), "NewReviews(3)");
+        let reviews = MonitorResult::NewReviews(vec![]);
+        assert!(format!("{:?}", reviews).starts_with("NewReviews("));
 
         let checks = MonitorResult::FailedChecks(2);
         assert_eq!(format!("{:?}", checks), "FailedChecks(2)");
+    }
+
+    #[test]
+    fn test_format_review_prompt_single_comment() {
+        let comments = vec![ReviewComment {
+            file: "src/main.rs".to_string(),
+            line: Some(45),
+            body: "This function needs error handling for null inputs.".to_string(),
+            reviewer: "alice".to_string(),
+        }];
+
+        let prompt = format_review_prompt(123, "456", &comments);
+
+        assert!(prompt.contains("issue #123"));
+        assert!(prompt.contains("PR #456"));
+        assert!(prompt.contains("## Review Comment 1"));
+        assert!(prompt.contains("**File:** src/main.rs:45"));
+        assert!(prompt.contains("**Reviewer:** @alice"));
+        assert!(prompt.contains("This function needs error handling for null inputs."));
+        assert!(prompt.contains("Please make the requested changes, run tests, and commit."));
+    }
+
+    #[test]
+    fn test_format_review_prompt_multiple_comments() {
+        let comments = vec![
+            ReviewComment {
+                file: "src/main.rs".to_string(),
+                line: Some(45),
+                body: "Add error handling.".to_string(),
+                reviewer: "alice".to_string(),
+            },
+            ReviewComment {
+                file: "tests/test_main.rs".to_string(),
+                line: Some(12),
+                body: "Add a test case for the edge case.".to_string(),
+                reviewer: "bob".to_string(),
+            },
+        ];
+
+        let prompt = format_review_prompt(123, "456", &comments);
+
+        assert!(prompt.contains("## Review Comment 1"));
+        assert!(prompt.contains("## Review Comment 2"));
+        assert!(prompt.contains("**File:** src/main.rs:45"));
+        assert!(prompt.contains("**File:** tests/test_main.rs:12"));
+        assert!(prompt.contains("@alice"));
+        assert!(prompt.contains("@bob"));
+    }
+
+    #[test]
+    fn test_format_review_prompt_no_line_number() {
+        let comments = vec![ReviewComment {
+            file: "README.md".to_string(),
+            line: None,
+            body: "Update the documentation.".to_string(),
+            reviewer: "charlie".to_string(),
+        }];
+
+        let prompt = format_review_prompt(123, "456", &comments);
+
+        // Should not have a colon if line is None
+        assert!(prompt.contains("**File:** README.md\n"));
+        assert!(!prompt.contains("README.md:"));
+    }
+
+    #[test]
+    fn test_review_comment_clone() {
+        let comment = ReviewComment {
+            file: "src/lib.rs".to_string(),
+            line: Some(100),
+            body: "Consider using a more efficient algorithm.".to_string(),
+            reviewer: "dave".to_string(),
+        };
+
+        let cloned = comment.clone();
+        assert_eq!(comment.file, cloned.file);
+        assert_eq!(comment.line, cloned.line);
+        assert_eq!(comment.body, cloned.body);
+        assert_eq!(comment.reviewer, cloned.reviewer);
     }
 }
