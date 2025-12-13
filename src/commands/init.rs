@@ -87,7 +87,7 @@ pub async fn handle_init(repo_arg: String) -> Result<i32> {
 
     // 1. Verify GitHub access
     println!("🔐 Verifying GitHub access...");
-    let github_client = match GitHubClient::from_env() {
+    let github_client = match GitHubClient::from_env(&owner, &repo).await {
         Ok(client) => client,
         Err(_) => {
             eprintln!("\n❌ GitHub token not found or invalid\n");
