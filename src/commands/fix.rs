@@ -1,6 +1,7 @@
 use crate::git;
 use crate::github::GitHubClient;
 use crate::minion;
+use crate::pr_monitor::{self, MonitorResult};
 use crate::pr_state::PrState;
 use crate::progress::{ProgressConfig, ProgressDisplay};
 use crate::progress_comments::{MinionPhase, ProgressCommentTracker};
@@ -739,6 +740,48 @@ pub async fn handle_fix(issue: &str, timeout_opt: Option<String>, quiet: bool) -
                         Err(e) => {
                             eprintln!("⚠️  Failed to run PR review: {}", e);
                             eprintln!("   You can review manually with: gru review {}", pr_number);
+                        }
+                    }
+
+                    // Start monitoring the PR for review comments, CI failures, and merge/close events
+                    println!("\n👀 Monitoring PR for updates (polling every 30s)...");
+                    println!("   Press Ctrl+C to stop monitoring\n");
+
+                    match pr_monitor::monitor_pr(&owner, &repo, &pr_number, &worktree_path).await {
+                        Ok(MonitorResult::Merged) => {
+                            println!("✅ PR #{} was merged successfully!", pr_number);
+                            println!("🎉 Issue {} is complete!", issue_num);
+                        }
+                        Ok(MonitorResult::Closed) => {
+                            println!("⚠️  PR #{} was closed without merging", pr_number);
+                            println!(
+                                "   The issue may need to be reopened or addressed differently"
+                            );
+                        }
+                        Ok(MonitorResult::NewReviews(count)) => {
+                            println!(
+                                "💬 Detected {} new review comment(s) on PR #{}",
+                                count, pr_number
+                            );
+                            println!("   Use: gru review {} to respond to feedback", pr_number);
+                        }
+                        Ok(MonitorResult::FailedChecks(count)) => {
+                            println!(
+                                "❌ Detected {} failed CI check(s) on PR #{}",
+                                count, pr_number
+                            );
+                            println!(
+                                "   Review the checks at: https://github.com/{}/{}/pull/{}/checks",
+                                owner, repo, pr_number
+                            );
+                            println!("   Fix issues and push updates to the branch");
+                        }
+                        Err(e) => {
+                            eprintln!("⚠️  PR monitoring failed: {}", e);
+                            eprintln!(
+                                "   You can monitor manually at: https://github.com/{}/{}/pull/{}",
+                                owner, repo, pr_number
+                            );
                         }
                     }
                 }
