@@ -1,0 +1,280 @@
+use anyhow::{bail, Context, Result};
+use std::path::PathBuf;
+
+use crate::git::GitRepo;
+use crate::github::GitHubClient;
+use crate::workspace::Workspace;
+
+/// Repository source type for initialization
+#[derive(Debug, Clone)]
+pub enum RepoSource {
+    /// GitHub repository in "owner/repo" format
+    GitHub(String),
+    /// Local filesystem path (not yet implemented)
+    #[allow(dead_code)]
+    LocalPath(PathBuf),
+    /// Current directory (detect from git remote)
+    CurrentDir,
+}
+
+/// Parse repository source from command line argument
+pub fn parse_repo_source(arg: &str) -> Result<RepoSource> {
+    // Explicit path markers
+    if arg.starts_with("./") || arg.starts_with("../") || arg.starts_with('/') {
+        return Ok(RepoSource::LocalPath(PathBuf::from(arg)));
+    }
+
+    // Current directory
+    if arg == "." {
+        return Ok(RepoSource::CurrentDir);
+    }
+
+    // GitHub owner/repo format (exactly one slash, no dots)
+    if arg.matches('/').count() == 1 && !arg.contains("..") {
+        // Validate that it looks like owner/repo format
+        let parts: Vec<&str> = arg.split('/').collect();
+        if parts.len() == 2 && !parts[0].is_empty() && !parts[1].is_empty() {
+            return Ok(RepoSource::GitHub(arg.to_string()));
+        }
+    }
+
+    // Ambiguous case
+    bail!(
+        "Ambiguous repository path: {}\n\n\
+        Did you mean:\n\
+        • Local path: gru init ./{}\n\
+        • GitHub repo: gru init owner/repo\n\n\
+        Tip: Use ./ prefix for local paths, or specify owner/repo for GitHub.",
+        arg,
+        arg
+    );
+}
+
+/// Labels to create during initialization
+const REQUIRED_LABELS: &[(&str, &str, &str)] = &[
+    (
+        "ready-for-minion",
+        "0e8a16",
+        "Issue ready for autonomous agent",
+    ),
+    ("in-progress", "fbca04", "Agent actively working"),
+    ("minion:done", "0e8a16", "Agent completed successfully"),
+    ("minion:failed", "d73a4a", "Agent encountered failure"),
+    ("minion:blocked", "b60205", "Agent blocked, needs human"),
+];
+
+/// Initialize a repository for use with Gru
+pub async fn handle_init(repo_arg: String) -> Result<i32> {
+    // Parse repository source
+    let repo_source = parse_repo_source(&repo_arg)?;
+
+    // Resolve to owner/repo format
+    let (owner, repo) = match repo_source {
+        RepoSource::GitHub(github_repo) => {
+            let parts: Vec<&str> = github_repo.split('/').collect();
+            (parts[0].to_string(), parts[1].to_string())
+        }
+        RepoSource::CurrentDir => {
+            println!("🔍 Detecting repository from current directory...");
+            detect_current_repo()?
+        }
+        RepoSource::LocalPath(_) => {
+            bail!("Local path repositories are not yet supported. Please use GitHub repositories in owner/repo format.");
+        }
+    };
+
+    println!("Initializing repository: {}/{}\n", owner, repo);
+
+    // 1. Verify GitHub access
+    println!("🔐 Verifying GitHub access...");
+    let github_client = match GitHubClient::from_env() {
+        Ok(client) => client,
+        Err(_) => {
+            eprintln!("\n❌ GitHub token not found or invalid\n");
+            eprintln!(
+                "To use Gru, you need a GitHub personal access token with the following scopes:"
+            );
+            eprintln!("  • repo (Full control of private repositories)");
+            eprintln!("  • read:org (Read org and team membership)\n");
+            eprintln!("Create a token at: https://github.com/settings/tokens\n");
+            eprintln!("Then set it as an environment variable:");
+            eprintln!("  export GRU_GITHUB_TOKEN=ghp_xxxxxxxxxxxx\n");
+            return Ok(1);
+        }
+    };
+
+    // Validate token by fetching current user
+    match github_client.get_authenticated_user().await {
+        Ok(user) => {
+            println!("✓ Authenticated as: {}", user.login);
+        }
+        Err(e) => {
+            eprintln!("\n❌ Failed to authenticate with GitHub: {}", e);
+            eprintln!("\nPlease check that your GRU_GITHUB_TOKEN is valid.");
+            return Ok(1);
+        }
+    }
+
+    // 2. Initialize workspace
+    println!("\n📁 Setting up workspace...");
+    let workspace = Workspace::new().context("Failed to initialize workspace")?;
+
+    // 3. Clone/update bare repository
+    println!("\n📦 Setting up repository mirror...");
+    let bare_repo_path = workspace.repos().join(&owner).join(format!("{}.git", repo));
+    let git_repo = GitRepo::new(&owner, &repo, bare_repo_path.clone());
+
+    match git_repo.ensure_bare_clone() {
+        Ok(()) => {
+            println!("✓ Bare repository ready: {}", bare_repo_path.display());
+        }
+        Err(e) => {
+            eprintln!("\n❌ Failed to clone repository: {:#}", e);
+            eprintln!("\nPlease check that:");
+            eprintln!("  • The repository {}/{} exists on GitHub", owner, repo);
+            eprintln!("  • You have read access to the repository");
+            eprintln!("  • Your network connection is working");
+            return Ok(1);
+        }
+    }
+
+    // 4. Create required labels
+    println!("\n🏷️  Configuring labels...");
+    let mut labels_failed = Vec::new();
+
+    for (name, color, description) in REQUIRED_LABELS {
+        match github_client
+            .create_label(&owner, &repo, name, color, description)
+            .await
+        {
+            Ok(created) => {
+                if created {
+                    println!("  ✓ Created: {}", name);
+                } else {
+                    println!("  • Exists: {}", name);
+                }
+            }
+            Err(e) => {
+                labels_failed.push(name.to_string());
+                eprintln!("  ✗ Failed to create {}: {}", name, e);
+            }
+        }
+    }
+
+    if !labels_failed.is_empty() {
+        eprintln!(
+            "\n⚠️  Warning: Failed to create {} label(s). You may need write access to the repository.",
+            labels_failed.len()
+        );
+    }
+
+    // 5. Check for ready issues
+    println!("\n🔍 Checking for ready issues...");
+    match github_client
+        .list_issues_with_label(&owner, &repo, "ready-for-minion")
+        .await
+    {
+        Ok(issues) => {
+            if issues.is_empty() {
+                println!("  No issues labeled 'ready-for-minion' yet");
+            } else {
+                println!(
+                    "✓ Found {} issue(s) labeled 'ready-for-minion'",
+                    issues.len()
+                );
+            }
+        }
+        Err(e) => {
+            eprintln!("  ⚠️  Could not check for issues: {}", e);
+        }
+    }
+
+    // Summary
+    println!("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    println!("✓ Repository is ready!\n");
+    println!("Next steps:");
+    println!("  1. Mark an issue as ready:");
+    println!("     gh issue edit 42 --add-label ready-for-minion");
+    println!("  2. Start a Minion:");
+    println!("     gru fix {}/{}#42", owner, repo);
+    println!("  3. Check status:");
+    println!("     gru status");
+    println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+
+    Ok(0)
+}
+
+/// Detect repository from current directory's git remote
+fn detect_current_repo() -> Result<(String, String)> {
+    use crate::git::{detect_git_repo, get_github_remote, parse_github_remote};
+
+    // Check if we're in a git repo
+    let _git_dir = detect_git_repo().context("Not in a git repository")?;
+
+    // Get the remote URL (function doesn't need git_dir - it uses current directory)
+    let remote_url = get_github_remote().context("No GitHub remote found in current repository")?;
+
+    // Parse owner/repo from remote URL
+    let (owner, repo) = parse_github_remote(&remote_url)
+        .context("Could not parse GitHub owner/repo from remote URL")?;
+
+    println!("  Detected: {}/{}", owner, repo);
+
+    Ok((owner, repo))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_github_repo() {
+        let result = parse_repo_source("owner/repo").unwrap();
+        match result {
+            RepoSource::GitHub(repo) => assert_eq!(repo, "owner/repo"),
+            _ => panic!("Expected GitHub source"),
+        }
+    }
+
+    #[test]
+    fn test_parse_current_dir() {
+        let result = parse_repo_source(".").unwrap();
+        matches!(result, RepoSource::CurrentDir);
+    }
+
+    #[test]
+    fn test_parse_local_path() {
+        let result = parse_repo_source("./path/to/repo").unwrap();
+        matches!(result, RepoSource::LocalPath(_));
+
+        let result = parse_repo_source("/absolute/path").unwrap();
+        matches!(result, RepoSource::LocalPath(_));
+    }
+
+    #[test]
+    fn test_parse_ambiguous_fails() {
+        let result = parse_repo_source("ambiguous");
+        assert!(result.is_err());
+
+        let result = parse_repo_source("path/to/repo/subdir");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_invalid_github_format() {
+        // No slash
+        let result = parse_repo_source("noslash");
+        assert!(result.is_err());
+
+        // Too many slashes
+        let result = parse_repo_source("owner/repo/extra");
+        assert!(result.is_err());
+
+        // Empty parts
+        let result = parse_repo_source("/repo");
+        matches!(result.unwrap(), RepoSource::LocalPath(_));
+
+        let result = parse_repo_source("owner/");
+        assert!(result.is_err());
+    }
+}

@@ -15,7 +15,7 @@ mod workspace;
 mod worktree_scanner;
 
 use clap::{Parser, Subcommand};
-use commands::{clean, fix, path, prompt, resume, review, status};
+use commands::{clean, fix, init, path, prompt, resume, review, status};
 
 /// CLI structure for the Gru agent orchestrator
 #[derive(Parser)]
@@ -34,6 +34,13 @@ struct Cli {
 /// Available commands for Gru
 #[derive(Subcommand)]
 enum Commands {
+    #[command(about = "Initialize a repository for use with Gru")]
+    Init {
+        #[arg(
+            help = "Repository to initialize: 'owner/repo' for GitHub, '.' for current directory, or a path"
+        )]
+        repo: String,
+    },
     #[command(about = "Fix a GitHub issue")]
     Fix {
         #[arg(help = "Issue number or URL to fix")]
@@ -102,6 +109,7 @@ async fn main() {
     let cli = Cli::parse();
 
     let result = match cli.command {
+        Commands::Init { repo } => init::handle_init(repo).await,
         Commands::Fix { issue, timeout } => fix::handle_fix(&issue, timeout, cli.quiet).await,
         Commands::Review { pr } => review::handle_review(pr).await,
         Commands::Path { id, issue, pr } => path::handle_path(id, issue, pr).await,

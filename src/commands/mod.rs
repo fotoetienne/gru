@@ -1,5 +1,6 @@
 pub mod clean;
 pub mod fix;
+pub mod init;
 pub mod path;
 pub mod prompt;
 pub mod resume;
