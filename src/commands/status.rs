@@ -95,6 +95,28 @@ pub async fn handle_status(id: Option<String>) -> Result<i32> {
         // Get all minions from registry
         let registry_minions = registry.list();
 
+        // Check for stale entries (worktrees that no longer exist)
+        let mut stale_ids = Vec::new();
+        for (minion_id, info) in &registry_minions {
+            if !info.worktree.exists() {
+                stale_ids.push(minion_id.clone());
+            }
+        }
+
+        // Remove stale entries from registry
+        if !stale_ids.is_empty() {
+            for minion_id in &stale_ids {
+                registry.remove(minion_id)?;
+            }
+            eprintln!(
+                "🗑️  Removed {} stale Minion(s) from registry",
+                stale_ids.len()
+            );
+        }
+
+        // Get updated registry after cleanup
+        let registry_minions = registry.list();
+
         // Convert to enhanced info with current status from filesystem
         let enhanced: Vec<EnhancedMinionInfo> = registry_minions
             .into_iter()

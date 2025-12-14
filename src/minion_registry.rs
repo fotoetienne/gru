@@ -1,9 +1,10 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
+use fs2::FileExt;
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
@@ -51,11 +52,15 @@ struct RegistryData {
 ///
 /// The registry is stored at `~/.gru/state/minions.json` and uses atomic
 /// writes (temp file + rename) to prevent corruption.
+///
+/// File locking ensures that concurrent access to the registry is properly serialized.
 pub struct MinionRegistry {
     /// Path to the registry file
     registry_path: PathBuf,
     /// In-memory registry data
     data: RegistryData,
+    /// Lock file handle - holding this keeps the exclusive lock
+    _lock_file: File,
 }
 
 impl MinionRegistry {
@@ -87,6 +92,21 @@ impl MinionRegistry {
         };
 
         let registry_path = state_path.join("minions.json");
+        let lock_path = state_path.join("minions.json.lock");
+
+        // Open or create lock file
+        let lock_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .with_context(|| format!("Failed to open lock file: {:?}", lock_path))?;
+
+        // Acquire exclusive lock - this will block if another process holds the lock
+        lock_file
+            .lock_exclusive()
+            .with_context(|| format!("Failed to acquire exclusive lock on {:?}", lock_path))?;
 
         // Load existing registry or create new one
         let data = if registry_path.exists() {
@@ -104,6 +124,7 @@ impl MinionRegistry {
         Ok(MinionRegistry {
             registry_path,
             data,
+            _lock_file: lock_file,
         })
     }
 
@@ -244,14 +265,30 @@ impl MinionRegistry {
     ///
     /// For migrated Minions, the command is set to "unknown" and status to "idle".
     ///
+    /// After a successful migration, a `.migrated` marker file is created to prevent
+    /// repeated expensive filesystem scans on subsequent calls.
+    ///
+    /// Worktrees with git issues (e.g., missing branches, corrupted state) are skipped
+    /// with warning messages. The migration continues even if some worktrees fail.
+    ///
     /// # Errors
     ///
     /// Returns an error if:
     /// - The workspace cannot be initialized
     /// - The work directory cannot be scanned
-    /// - Git operations fail
     /// - The registry cannot be saved
     pub fn migrate_from_worktrees(&mut self) -> Result<usize> {
+        // Check for migration marker file to avoid repeated scans
+        let state_path = self
+            .registry_path
+            .parent()
+            .context("Invalid registry path")?;
+        let marker_path = state_path.join(".migrated");
+
+        if marker_path.exists() {
+            return Ok(0);
+        }
+
         let workspace = WORKSPACE.as_ref().map_err(|e| {
             io::Error::new(e.kind(), format!("Failed to initialize workspace: {}", e))
         })?;
@@ -308,29 +345,74 @@ impl MinionRegistry {
                     }
 
                     // Get branch name
-                    let branch_output = std::process::Command::new("git")
+                    let branch_output = match std::process::Command::new("git")
                         .arg("-C")
                         .arg(&minion_path)
                         .arg("branch")
                         .arg("--show-current")
                         .output()
-                        .context("Failed to get branch name")?;
+                    {
+                        Ok(output) => output,
+                        Err(e) => {
+                            eprintln!(
+                                "Warning: Failed to run git command for {}: {}. Skipping worktree.",
+                                minion_path.display(),
+                                e
+                            );
+                            continue;
+                        }
+                    };
+
+                    // Check if git command succeeded
+                    if !branch_output.status.success() {
+                        eprintln!(
+                            "Warning: Git command failed for {} (exit code: {}). Skipping worktree.",
+                            minion_path.display(),
+                            branch_output.status
+                        );
+                        continue;
+                    }
 
                     let branch = String::from_utf8_lossy(&branch_output.stdout)
                         .trim()
                         .to_string();
 
+                    // Skip if branch name is empty
+                    if branch.is_empty() {
+                        eprintln!(
+                            "Warning: No branch found for {}. Skipping worktree.",
+                            minion_path.display()
+                        );
+                        continue;
+                    }
+
                     // Parse issue number from branch (format: minion/issue-<num>-<id>)
                     let issue = parse_issue_from_branch(&branch).unwrap_or(0);
 
                     // Get worktree creation time as started_at
-                    let metadata = std::fs::metadata(&minion_path)
-                        .context("Failed to get worktree metadata")?;
-                    let started_at = metadata
-                        .created()
-                        .or_else(|_| metadata.modified())
-                        .context("Failed to get worktree creation time")?
-                        .into();
+                    let metadata = match std::fs::metadata(&minion_path) {
+                        Ok(md) => md,
+                        Err(e) => {
+                            eprintln!(
+                                "Warning: Failed to get metadata for {}: {}. Skipping worktree.",
+                                minion_path.display(),
+                                e
+                            );
+                            continue;
+                        }
+                    };
+
+                    let started_at = match metadata.created().or_else(|_| metadata.modified()) {
+                        Ok(time) => time.into(),
+                        Err(e) => {
+                            eprintln!(
+                                "Warning: Failed to get creation time for {}: {}. Skipping worktree.",
+                                minion_path.display(),
+                                e
+                            );
+                            continue;
+                        }
+                    };
 
                     // Build repo name
                     let owner = owner_entry.file_name().to_string_lossy().to_string();
@@ -361,6 +443,14 @@ impl MinionRegistry {
         if migrated_count > 0 {
             self.save()
                 .context("Failed to save registry after migration")?;
+
+            // Create migration marker file with timestamp
+            let timestamp = Utc::now().to_rfc3339();
+            fs::write(
+                &marker_path,
+                format!("Migration completed at {}\n", timestamp),
+            )
+            .with_context(|| format!("Failed to create migration marker: {:?}", marker_path))?;
         }
 
         Ok(migrated_count)
