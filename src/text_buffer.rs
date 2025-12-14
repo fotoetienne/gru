@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 const MAX_BUFFER_SIZE: usize = 1000;
 
 /// Time-based text buffer for grouping streaming text fragments
-/// Flushes after a timeout or on newline characters
+/// Flushes on: newline characters, sentence boundaries (. ! ?), timeout, or buffer full
 pub struct TextBuffer {
     buffer: Arc<Mutex<BufferState>>,
 }
@@ -64,6 +64,10 @@ impl TextBuffer {
         // Check if newly added text contains newline or ends with sentence boundary
         // (more efficient than scanning entire buffer)
         let has_newline = text.contains('\n');
+        // Note: We only check the new text fragment, not the entire buffer.
+        // This is optimal for streaming scenarios where sentence boundaries
+        // are typically sent together (e.g., ". " arrives as one fragment).
+        // The timeout flush will catch any edge cases where boundaries span fragments.
         let has_sentence_end = text.ends_with(". ") || text.ends_with("! ") || text.ends_with("? ");
 
         // Flush if newline, sentence boundary, or buffer is getting full
@@ -220,11 +224,12 @@ mod tests {
     }
 
     #[test]
-    fn test_abbreviation_does_not_trigger_flush() {
+    fn test_abbreviation_triggers_flush_acceptable() {
         let buffer = TextBuffer::new(Duration::from_millis(150));
 
-        // "Dr." followed by space but part of a name should not trigger flush
-        // However, this will trigger flush - that's acceptable per issue notes
+        // "Dr." followed by space triggers flush even though it's an abbreviation.
+        // This is acceptable per issue #106 - we prioritize simplicity and performance
+        // over handling all edge cases. The timeout will eventually flush anyway.
         let result = buffer.add("Dr. ");
         assert_eq!(result, Some("Dr. ".to_string()));
     }
