@@ -1,8 +1,10 @@
 use crate::minion;
+use crate::minion_registry::{MinionInfo as RegistryMinionInfo, MinionRegistry};
 use crate::progress::{ProgressConfig, ProgressDisplay};
 use crate::stream::{self, EventStream};
 use crate::workspace;
 use anyhow::{Context, Result};
+use chrono::Utc;
 use std::path::Path;
 use std::time::Instant;
 use tokio::fs::OpenOptions;
@@ -132,6 +134,25 @@ pub async fn handle_prompt(prompt: &str, timeout_opt: Option<String>, quiet: boo
         .context("Failed to save prompt to workspace")?;
 
     println!("📂 Workspace: {}", workspace_path.display());
+
+    // Register minion in registry
+    let registry_info = RegistryMinionInfo {
+        repo: "ad-hoc".to_string(), // Special repo name for prompts
+        issue: 0,                   // Prompts don't have issues
+        command: "prompt".to_string(),
+        prompt: prompt.to_string(),
+        started_at: Utc::now(),
+        branch: String::new(), // Prompts don't have branches
+        worktree: workspace_path.clone(),
+        status: "active".to_string(),
+        pr: None, // Prompts don't have PRs
+    };
+
+    let mut registry = MinionRegistry::load(None).context("Failed to load Minion registry")?;
+    registry
+        .register(minion_id.clone(), registry_info)
+        .context("Failed to register prompt Minion in registry")?;
+
     println!("🤖 Launching Claude...\n");
 
     // Create progress display
@@ -265,6 +286,11 @@ pub async fn handle_prompt(prompt: &str, timeout_opt: Option<String>, quiet: boo
 
     // Now check if there was a stream error
     stream_result?;
+
+    // Remove minion from registry (best effort - don't fail if this errors)
+    if let Ok(mut registry) = MinionRegistry::load(None) {
+        let _ = registry.remove(&minion_id);
+    }
 
     // Finish the progress display and return appropriate exit code
     if status.success() {
