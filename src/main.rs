@@ -17,7 +17,7 @@ mod workspace;
 mod worktree_scanner;
 
 use clap::{Parser, Subcommand};
-use commands::{clean, fix, init, lab, path, prompt, resume, review, status};
+use commands::{attach, clean, fix, init, lab, path, prompt, resume, review, status};
 
 /// CLI structure for the Gru agent orchestrator
 #[derive(Parser)]
@@ -72,6 +72,11 @@ enum Commands {
 
         #[arg(long, help = "[DEPRECATED] Resolve from PR number")]
         pr: Option<u64>,
+    },
+    #[command(about = "Attach to a Minion's Claude session")]
+    Attach {
+        #[arg(help = "Minion ID, issue number, or PR number (e.g., M0tk, 42)")]
+        id: String,
     },
     #[command(about = "Resume a Minion's Claude session")]
     Resume {
@@ -134,6 +139,7 @@ async fn main() {
         Commands::Fix { issue, timeout } => fix::handle_fix(&issue, timeout, cli.quiet).await,
         Commands::Review { pr } => review::handle_review(pr).await,
         Commands::Path { id, issue, pr } => path::handle_path(id, issue, pr).await,
+        Commands::Attach { id } => attach::handle_attach(id).await,
         Commands::Resume { id } => resume::handle_resume(id).await,
         Commands::Clean {
             dry_run,

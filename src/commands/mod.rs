@@ -1,3 +1,4 @@
+pub mod attach;
 pub mod clean;
 pub mod fix;
 pub mod init;

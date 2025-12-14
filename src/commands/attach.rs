@@ -1,10 +1,13 @@
 use crate::minion_resolver;
 use anyhow::{Context, Result};
 
-/// Handles the resume command to resume a Minion's Claude session
+/// Handles the attach command to attach to a Minion's Claude session
 /// Returns 0 on success, 1 on error
 ///
-/// This command is a convenience wrapper equivalent to:
+/// This command attaches to a running or paused Minion's session,
+/// allowing you to see live output and send keyboard input.
+///
+/// It is functionally equivalent to:
 /// ```bash
 /// cd $(gru path <id>) && claude -r
 /// ```
@@ -17,7 +20,11 @@ use anyhow::{Context, Result};
 ///
 /// On Unix systems, this command replaces the current process with claude.
 /// On Windows, it spawns claude and waits for completion.
-pub async fn handle_resume(id: String) -> Result<i32> {
+///
+/// Note: This command is identical to `gru resume` - both attach to the
+/// same Claude session interactively. The `attach` name is used for
+/// consistency with documentation and expected UX.
+pub async fn handle_attach(id: String) -> Result<i32> {
     // Reuse exact same resolution as gru path
     let minion = minion_resolver::resolve_minion(&id).await?;
 
@@ -30,7 +37,7 @@ pub async fn handle_resume(id: String) -> Result<i32> {
         );
     }
 
-    println!("▶️  Resuming Minion {}...", minion.minion_id);
+    println!("🔌 Attaching to Minion {}...", minion.minion_id);
     println!("📂 Workspace: {}", minion.worktree_path.display());
 
     // Unix: exec() replaces the current process
@@ -71,10 +78,10 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn test_handle_resume_with_invalid_id() {
-        // Test that handle_resume returns an error for an invalid ID
+    async fn test_handle_attach_with_invalid_id() {
+        // Test that handle_attach returns an error for an invalid ID
         // This verifies the minion_resolver integration works correctly
-        let result = handle_resume("nonexistent-minion-xyz".to_string()).await;
+        let result = handle_attach("nonexistent-minion-xyz".to_string()).await;
         assert!(result.is_err());
 
         // Verify the error message suggests using gru status
