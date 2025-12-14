@@ -4,6 +4,7 @@ use crate::minion_registry::MinionRegistry;
 use anyhow::{Context, Result};
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::time::Duration;
 use tokio::time::sleep;
 
 /// Handles the lab daemon command
@@ -17,7 +18,20 @@ pub async fn handle_lab(
     let config = if let Some(path) = config_path {
         LabConfig::load(&path)?
     } else {
-        LabConfig::load_or_default()?
+        let default_path = LabConfig::default_path()?;
+        if default_path.exists() {
+            LabConfig::load(&default_path)?
+        } else if repos.is_none() {
+            eprintln!("⚠️  No config file found at {}", default_path.display());
+            eprintln!("   Use --repos flag or create a config file");
+            eprintln!();
+            eprintln!("Example:");
+            eprintln!("  gru lab --repos owner/repo1,owner/repo2 --slots 2");
+            eprintln!();
+            anyhow::bail!("No repositories configured");
+        } else {
+            LabConfig::default()
+        }
     };
 
     // Apply CLI overrides
@@ -44,6 +58,12 @@ pub async fn handle_lab(
     println!("Press Ctrl-C to stop...");
     println!();
 
+    // Perform initial poll immediately for faster feedback
+    if let Err(e) = poll_and_spawn(&config).await {
+        eprintln!("⚠️  Initial polling error: {}", e);
+        eprintln!("   Continuing to poll...");
+    }
+
     // Main polling loop
     loop {
         tokio::select! {
@@ -65,8 +85,9 @@ pub async fn handle_lab(
 
 /// Poll GitHub for ready issues and spawn Minions if slots are available
 async fn poll_and_spawn(config: &LabConfig) -> Result<()> {
-    // Check available slots
-    let available = available_slots(config.daemon.max_slots).await?;
+    // Calculate available slots once at the start to avoid race conditions
+    // Track spawned count within this function to maintain accurate slot availability
+    let mut available = available_slots(config.daemon.max_slots).await?;
 
     if available == 0 {
         // All slots occupied, skip this poll
@@ -77,7 +98,7 @@ async fn poll_and_spawn(config: &LabConfig) -> Result<()> {
 
     // Poll each configured repository
     for repo_spec in &config.daemon.repos {
-        if available_slots(config.daemon.max_slots).await? == 0 {
+        if available == 0 {
             break;
         }
 
@@ -116,7 +137,7 @@ async fn poll_and_spawn(config: &LabConfig) -> Result<()> {
 
         // Try to spawn a Minion for each ready issue
         for issue in issues {
-            if available_slots(config.daemon.max_slots).await? == 0 {
+            if available == 0 {
                 break;
             }
 
@@ -136,6 +157,7 @@ async fn poll_and_spawn(config: &LabConfig) -> Result<()> {
                                 repo_spec, issue.number
                             );
                             spawned += 1;
+                            available -= 1; // Decrement available slots after successful spawn
                         }
                         Err(e) => {
                             eprintln!(
@@ -213,7 +235,7 @@ async fn spawn_minion(repo: &str, issue_number: u64) -> Result<()> {
     let exe = std::env::current_exe().context("Failed to get current executable path")?;
 
     // Spawn `gru fix <issue>` as a background process
-    let child = tokio::process::Command::new(exe)
+    let mut child = tokio::process::Command::new(exe)
         .arg("fix")
         .arg(&issue_ref)
         .stdin(Stdio::null())
@@ -222,7 +244,25 @@ async fn spawn_minion(repo: &str, issue_number: u64) -> Result<()> {
         .spawn()
         .context("Failed to spawn gru fix command")?;
 
-    // Don't wait for the child process - let it run independently
+    // Give the process a moment to fail if there are startup issues
+    // This prevents phantom slot occupancy from processes that immediately fail
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Check if the process is still running
+    if let Ok(Some(status)) = child.try_wait() {
+        anyhow::bail!(
+            "Spawned process for {}/issues/{} exited immediately with status: {:?}",
+            repo,
+            issue_number,
+            status
+        );
+    }
+
+    // Intentionally drop the Child handle to allow the spawned process to run independently.
+    // This is a deliberate use of the fire-and-forget pattern: we do not wait for the process
+    // to complete, and dropping the handle here ensures it is detached. The spawned `gru fix`
+    // command will register itself in the Minion registry and manage its own lifecycle.
+    // Future maintainers: this is intentional and not an oversight.
     drop(child);
 
     Ok(())

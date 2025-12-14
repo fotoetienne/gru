@@ -75,6 +75,7 @@ impl LabConfig {
     }
 
     /// Load from default path if it exists, otherwise return default config
+    #[allow(dead_code)]
     pub fn load_or_default() -> Result<Self> {
         let path = Self::default_path()?;
 
@@ -103,7 +104,8 @@ impl LabConfig {
 
         // Validate repo format (owner/repo)
         for repo in &self.daemon.repos {
-            if !repo.contains('/') {
+            let parts: Vec<&str> = repo.split('/').collect();
+            if parts.len() != 2 || parts[0].is_empty() || parts[1].is_empty() {
                 anyhow::bail!("Invalid repo format: '{}'. Expected 'owner/repo'", repo);
             }
         }
