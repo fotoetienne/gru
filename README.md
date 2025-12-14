@@ -184,3 +184,6 @@ Contributions are welcome! Please feel free to submit issues and pull requests.
 
 - [Claude Code](https://github.com/anthropics/claude-code) - Official CLI for Claude
 - [Claude Agent SDK](https://github.com/anthropics/claude-agent-sdk) - Agent protocol implementation
+- [Happy](https://happy.engineering/) - Mobile client for controlling Claude Code remotely
+- [Emdash](https://github.com/generalaction/emdash) - Coding agent orchestration layer supporting 15+ CLIs with parallel execution
+- [Code Conductor](https://github.com/ryanmac/code-conductor) - Run multiple Claude Code sub-agents in parallel with GitHub-native orchestration
