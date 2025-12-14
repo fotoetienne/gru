@@ -116,7 +116,7 @@ pub async fn handle_review(pr_arg: Option<String>) -> Result<i32> {
     // Register minion in registry
     let registry_info = RegistryMinionInfo {
         repo: format!("{}/{}", owner, repo),
-        issue: 0, // Reviews don't have issues
+        issue: 0, // Reviews are associated with PR numbers, not issue numbers; set to 0 to indicate not applicable
         command: "review".to_string(),
         prompt: format!("/pr_review {}", pr_num),
         started_at: Utc::now(),

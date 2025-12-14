@@ -279,7 +279,9 @@ pub async fn handle_clean(dry_run: bool, force: bool, base_branch: &str) -> Resu
             // Remove from registry (best effort - extract minion ID from worktree path)
             // ASSUMPTION: Worktree directory name equals minion ID (e.g., M001)
             // This works for all newly created minions but won't clean legacy worktrees
-            // that used branch names as directory names (e.g., minion/issue-42-M001)
+            // that used branch names as directory names (e.g., minion/issue-42-M001).
+            // For legacy worktrees where the directory name does not match any minion ID,
+            // the minion will not be removed from the registry. This is a known limitation.
             if let Some(dir_name) = wt.path.file_name() {
                 if let Some(dir_str) = dir_name.to_str() {
                     // Try to remove from registry (ignore errors if not in registry)

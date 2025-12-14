@@ -136,8 +136,15 @@ pub async fn handle_prompt(prompt: &str, timeout_opt: Option<String>, quiet: boo
     println!("📂 Workspace: {}", workspace_path.display());
 
     // Register minion in registry
+    // The "ad-hoc" repo name is a special reserved value used in the MinionRegistry
+    // to represent prompt minions that are not associated with any real repository.
+    // This allows us to leverage the existing registry and workspace mechanisms for
+    // tracking, displaying, and managing prompt-based minions, while clearly
+    // distinguishing them from repo-based minions. Any code that filters, displays,
+    // or processes minions by repo should be aware that "ad-hoc" is a special case
+    // and may require different handling (e.g., prompts have no issues, branches, or PRs).
     let registry_info = RegistryMinionInfo {
-        repo: "ad-hoc".to_string(), // Special repo name for prompts
+        repo: "ad-hoc".to_string(), // Special reserved value for prompt minions
         issue: 0,                   // Prompts don't have issues
         command: "prompt".to_string(),
         prompt: prompt.to_string(),
