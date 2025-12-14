@@ -130,7 +130,7 @@ When creating GitHub issues:
 2. **Write user-focused titles**: "User can X" not "Implement Y"
 3. **Include acceptance criteria** (testable outcomes)
 4. **Call out dependencies** explicitly
-5. **Label appropriately**: phase (P0/P1/P2), type (feature/bug/refactor)
+5. **Label appropriately**: priority (priority:medium,priority:high), type (feature/bug/refactor/enhancement)
 
 **Issue template**:
 ```markdown
