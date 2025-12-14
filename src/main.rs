@@ -1,4 +1,5 @@
 mod commands;
+mod config;
 mod git;
 mod github;
 mod logger;
@@ -16,7 +17,7 @@ mod workspace;
 mod worktree_scanner;
 
 use clap::{Parser, Subcommand};
-use commands::{clean, fix, init, path, prompt, resume, review, status};
+use commands::{clean, fix, init, lab, path, prompt, resume, review, status};
 
 /// CLI structure for the Gru agent orchestrator
 #[derive(Parser)]
@@ -103,6 +104,25 @@ enum Commands {
         )]
         timeout: Option<String>,
     },
+    #[command(about = "Run Gru Lab in daemon mode to automatically work on issues")]
+    Lab {
+        #[arg(long, help = "Path to config file (default: ~/.gru/config.toml)")]
+        config: Option<std::path::PathBuf>,
+
+        #[arg(
+            long,
+            help = "Repositories to monitor (comma-separated, e.g., owner/repo1,owner/repo2)",
+            value_delimiter = ',',
+            num_args = 1..
+        )]
+        repos: Option<Vec<String>>,
+
+        #[arg(long, help = "Polling interval in seconds (overrides config)")]
+        poll_interval: Option<u64>,
+
+        #[arg(long, help = "Maximum concurrent Minion slots (overrides config)")]
+        slots: Option<usize>,
+    },
 }
 
 #[tokio::main]
@@ -124,6 +144,12 @@ async fn main() {
         Commands::Prompt { prompt, timeout } => {
             prompt::handle_prompt(&prompt, timeout, cli.quiet).await
         }
+        Commands::Lab {
+            config,
+            repos,
+            poll_interval,
+            slots,
+        } => lab::handle_lab(config, repos, poll_interval, slots).await,
     };
 
     // Handle any errors that occurred
