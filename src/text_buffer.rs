@@ -61,14 +61,14 @@ impl TextBuffer {
             state.last_update = Some(Instant::now());
         }
 
-        // Check if newly added text contains newline or ends with sentence boundary
+        // Check if newly added text contains newline or buffer ends with sentence boundary
         // (more efficient than scanning entire buffer)
         let has_newline = text.contains('\n');
-        // Note: We only check the new text fragment, not the entire buffer.
-        // This is optimal for streaming scenarios where sentence boundaries
-        // are typically sent together (e.g., ". " arrives as one fragment).
-        // The timeout flush will catch any edge cases where boundaries span fragments.
-        let has_sentence_end = text.ends_with(". ") || text.ends_with("! ") || text.ends_with("? ");
+        // Check the full buffer state for sentence boundaries to ensure consistent behavior
+        // regardless of how the stream is chunked. This handles cases where ". " arrives
+        // split across multiple add() calls (e.g., "text." followed by " more text").
+        let has_sentence_end =
+            state.text.ends_with(". ") || state.text.ends_with("! ") || state.text.ends_with("? ");
 
         // Flush if newline, sentence boundary, or buffer is getting full
         if has_newline || has_sentence_end || state.text.len() > MAX_BUFFER_SIZE {
@@ -262,5 +262,22 @@ mod tests {
         // Verify buffer still contains the text
         let flushed = buffer.flush();
         assert_eq!(flushed, Some("Hello world.".to_string()));
+    }
+
+    #[test]
+    fn test_sentence_boundary_split_across_fragments() {
+        let buffer = TextBuffer::new(Duration::from_millis(150));
+
+        // Add text with period but no space
+        let result = buffer.add("Hello world.");
+        assert!(result.is_none());
+
+        // Add space - should trigger flush because buffer now ends with ". "
+        let result = buffer.add(" ");
+        assert_eq!(result, Some("Hello world. ".to_string()));
+
+        // Buffer should be empty now
+        let flushed = buffer.flush();
+        assert!(flushed.is_none());
     }
 }
