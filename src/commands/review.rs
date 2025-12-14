@@ -114,12 +114,13 @@ pub async fn handle_review(pr_arg: Option<String>) -> Result<i32> {
     };
 
     // Fetch the issue number linked to this PR (if any)
-    let linked_issue = find_issue_for_pr(&pr_num)
-        .await
-        .unwrap_or_else(|e| {
-            eprintln!("Warning: Failed to fetch linked issue for PR #{}: {}", pr_num, e);
-            0
-        });
+    let linked_issue = find_issue_for_pr(&pr_num).await.unwrap_or_else(|e| {
+        eprintln!(
+            "Warning: Failed to fetch linked issue for PR #{}: {}",
+            pr_num, e
+        );
+        0
+    });
 
     // Register minion in registry
     let registry_info = RegistryMinionInfo {

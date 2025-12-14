@@ -66,6 +66,309 @@ async fn log_event(worktree_path: &Path, event: &stream::StreamOutput) -> Result
     Ok(())
 }
 
+/// Builds a standard Claude command with common flags
+///
+/// This helper creates a TokioCommand configured for non-interactive stream-json output.
+/// Callers can further customize the command before passing it to run_claude_with_stream_monitoring.
+fn build_claude_command(worktree_path: &Path, session_id: &Uuid, prompt: &str) -> TokioCommand {
+    let mut cmd = TokioCommand::new("claude");
+    cmd.arg("--print")
+        .arg("--verbose")
+        .arg("--session-id")
+        .arg(session_id.to_string())
+        .arg("--output-format")
+        .arg("stream-json")
+        .arg("--include-partial-messages")
+        .arg("--dangerously-skip-permissions")
+        .arg(prompt)
+        .stdin(std::process::Stdio::inherit())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::inherit())
+        .current_dir(worktree_path);
+    cmd
+}
+
+/// Runs Claude with stream monitoring and timeout detection
+///
+/// This function encapsulates the common stream parsing logic used by both
+/// the main fix flow and review response flow. It handles:
+/// - Claude CLI process spawning with stream-json output
+/// - Event stream parsing with EventStream::from_stdout
+/// - Timeout detection (overall task timeout)
+/// - Inactivity monitoring (warning at 5 mins, stuck at 15 mins)
+/// - Stream timeout (5 minutes per line)
+/// - Event logging to events.jsonl
+/// - Exit code handling
+///
+/// # Arguments
+/// * `cmd` - Pre-configured TokioCommand ready to spawn
+/// * `worktree_path` - Path to the worktree directory (for event logging)
+/// * `timeout_opt` - Optional timeout string (e.g., "10m", "1h")
+/// * `output_callback` - Optional callback for custom output processing
+///
+/// # Returns
+/// Ok(()) if the process completed successfully, Err otherwise
+async fn run_claude_with_stream_monitoring<F>(
+    mut cmd: TokioCommand,
+    worktree_path: &Path,
+    timeout_opt: Option<&str>,
+    mut output_callback: Option<F>,
+) -> Result<()>
+where
+    F: FnMut(&stream::StreamOutput),
+{
+    // Spawn the command
+    let mut child = cmd.spawn().context(
+        "claude command not found. Install from: https://github.com/anthropics/claude-code",
+    )?;
+
+    // Get the stdout handle
+    let stdout = child
+        .stdout
+        .take()
+        .context("Failed to capture stdout from claude process")?;
+
+    // Create event stream reader
+    let mut stream = EventStream::from_stdout(stdout);
+
+    // Parse timeout if provided
+    let max_timeout = if let Some(timeout_str) = timeout_opt {
+        Some(parse_timeout(timeout_str)?)
+    } else {
+        None
+    };
+
+    // Track task start time for overall timeout
+    let task_start = Instant::now();
+
+    // Process stream output asynchronously with timeout and error handling
+    let stream_result = async {
+        let mut last_event_time = Instant::now();
+        let mut inactivity_warning_shown = false;
+
+        loop {
+            // Check overall task timeout
+            if let Some(max_duration) = max_timeout {
+                let elapsed = task_start.elapsed();
+                if elapsed >= max_duration {
+                    eprintln!("⏱️  Task timeout reached ({:?})", max_duration);
+                    eprintln!("📝 Events saved to events.jsonl");
+                    return Err(anyhow::anyhow!(
+                        "Task exceeded maximum timeout of {:?}",
+                        max_duration
+                    ));
+                }
+            }
+
+            // Check inactivity - time since last event
+            let inactivity = last_event_time.elapsed();
+
+            if inactivity.as_secs() >= INACTIVITY_STUCK_SECS {
+                eprintln!(
+                    "❌ Task appears stuck (no activity for {} minutes)",
+                    INACTIVITY_STUCK_SECS / 60
+                );
+                eprintln!("📝 Events saved to events.jsonl");
+                return Err(anyhow::anyhow!(
+                    "No activity for {} minutes - task appears stuck",
+                    INACTIVITY_STUCK_SECS / 60
+                ));
+            } else if inactivity.as_secs() >= INACTIVITY_WARNING_SECS && !inactivity_warning_shown {
+                eprintln!(
+                    "⚠️  No activity for {} minutes",
+                    INACTIVITY_WARNING_SECS / 60
+                );
+                inactivity_warning_shown = true;
+            }
+
+            // Try to read next line with timeout
+            let line_result = timeout(Duration::from_secs(STREAM_TIMEOUT_SECS), stream.next_line())
+                .await
+                .map_err(|_| {
+                    anyhow::anyhow!(
+                        "Timeout: Process hasn't produced output in {} seconds",
+                        STREAM_TIMEOUT_SECS
+                    )
+                })?;
+
+            // Handle the stream result
+            match line_result? {
+                Some(output) => {
+                    // Log the event to events.jsonl
+                    log_event(worktree_path, &output).await?;
+
+                    // Update last event time for any output
+                    last_event_time = Instant::now();
+
+                    // Reset warning flag only on actual events (not raw output lines)
+                    if matches!(output, stream::StreamOutput::Event(_)) {
+                        inactivity_warning_shown = false;
+                    }
+
+                    // Call custom callback if provided
+                    if let Some(ref mut callback) = output_callback {
+                        callback(&output);
+                    }
+                }
+                None => {
+                    // Stream ended normally
+                    break;
+                }
+            }
+        }
+
+        Ok(())
+    }
+    .await;
+
+    // Handle stream errors
+    if let Err(e) = stream_result {
+        let _ = child.kill().await;
+        return Err(e);
+    }
+
+    // Wait for the child process to finish
+    let status = child.wait().await.context("Failed to wait for child")?;
+
+    if !status.success() {
+        let exit_code = status.code().unwrap_or(EXIT_CODE_SIGNAL_TERMINATED);
+        return Err(anyhow::anyhow!(
+            "Claude process exited with code {}",
+            exit_code
+        ));
+    }
+
+    Ok(())
+}
+
+/// Runs Claude with stream monitoring and returns the exit status
+///
+/// This is a variant of run_claude_with_stream_monitoring that returns the exit status
+/// instead of converting it to a Result. This is useful when the caller needs to inspect
+/// the exit code for success/failure handling.
+async fn run_claude_with_stream_monitoring_status<F>(
+    mut cmd: TokioCommand,
+    worktree_path: &Path,
+    timeout_opt: Option<&str>,
+    mut output_callback: Option<F>,
+) -> Result<std::process::ExitStatus>
+where
+    F: FnMut(&stream::StreamOutput),
+{
+    // Spawn the command
+    let mut child = cmd.spawn().context(
+        "claude command not found. Install from: https://github.com/anthropics/claude-code",
+    )?;
+
+    // Get the stdout handle
+    let stdout = child
+        .stdout
+        .take()
+        .context("Failed to capture stdout from claude process")?;
+
+    // Create event stream reader
+    let mut stream = EventStream::from_stdout(stdout);
+
+    // Parse timeout if provided
+    let max_timeout = if let Some(timeout_str) = timeout_opt {
+        Some(parse_timeout(timeout_str)?)
+    } else {
+        None
+    };
+
+    // Track task start time for overall timeout
+    let task_start = Instant::now();
+
+    // Process stream output asynchronously with timeout and error handling
+    let stream_result = async {
+        let mut last_event_time = Instant::now();
+        let mut inactivity_warning_shown = false;
+
+        loop {
+            // Check overall task timeout
+            if let Some(max_duration) = max_timeout {
+                let elapsed = task_start.elapsed();
+                if elapsed >= max_duration {
+                    eprintln!("⏱️  Task timeout reached ({:?})", max_duration);
+                    eprintln!("📝 Events saved to events.jsonl");
+                    return Err(anyhow::anyhow!(
+                        "Task exceeded maximum timeout of {:?}",
+                        max_duration
+                    ));
+                }
+            }
+
+            // Check inactivity - time since last event
+            let inactivity = last_event_time.elapsed();
+
+            if inactivity.as_secs() >= INACTIVITY_STUCK_SECS {
+                eprintln!(
+                    "❌ Task appears stuck (no activity for {} minutes)",
+                    INACTIVITY_STUCK_SECS / 60
+                );
+                eprintln!("📝 Events saved to events.jsonl");
+                return Err(anyhow::anyhow!(
+                    "No activity for {} minutes - task appears stuck",
+                    INACTIVITY_STUCK_SECS / 60
+                ));
+            } else if inactivity.as_secs() >= INACTIVITY_WARNING_SECS && !inactivity_warning_shown {
+                eprintln!(
+                    "⚠️  No activity for {} minutes",
+                    INACTIVITY_WARNING_SECS / 60
+                );
+                inactivity_warning_shown = true;
+            }
+
+            // Try to read next line with timeout
+            let line_result = timeout(Duration::from_secs(STREAM_TIMEOUT_SECS), stream.next_line())
+                .await
+                .map_err(|_| {
+                    anyhow::anyhow!(
+                        "Timeout: Process hasn't produced output in {} seconds",
+                        STREAM_TIMEOUT_SECS
+                    )
+                })?;
+
+            // Handle the stream result
+            match line_result? {
+                Some(output) => {
+                    // Log the event to events.jsonl
+                    log_event(worktree_path, &output).await?;
+
+                    // Update last event time for any output
+                    last_event_time = Instant::now();
+
+                    // Reset warning flag only on actual events (not raw output lines)
+                    if matches!(output, stream::StreamOutput::Event(_)) {
+                        inactivity_warning_shown = false;
+                    }
+
+                    // Call custom callback if provided
+                    if let Some(ref mut callback) = output_callback {
+                        callback(&output);
+                    }
+                }
+                None => {
+                    // Stream ended normally
+                    break;
+                }
+            }
+        }
+
+        Ok(())
+    }
+    .await;
+
+    // Always wait for the process
+    let status = child.wait().await.context("Failed to wait for child")?;
+
+    // Now check if there was a stream error
+    stream_result?;
+
+    // Return the exit status
+    Ok(status)
+}
+
 /// Checks if a branch has been pushed to the remote
 async fn is_branch_pushed(worktree_path: &Path, branch_name: &str) -> Result<bool> {
     let output = TokioCommand::new("git")
@@ -295,139 +598,17 @@ async fn invoke_claude_for_reviews(
     prompt: &str,
     timeout_opt: Option<&str>,
 ) -> Result<()> {
-    // Build the command with flags for non-interactive stream-json output
-    let mut cmd = TokioCommand::new("claude");
-    cmd.arg("--print")
-        .arg("--verbose")
-        .arg("--session-id")
-        .arg(session_id.to_string())
-        .arg("--output-format")
-        .arg("stream-json")
-        .arg("--include-partial-messages")
-        .arg("--dangerously-skip-permissions")
-        .arg(prompt)
-        .stdin(std::process::Stdio::inherit())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::inherit())
-        .current_dir(worktree_path);
+    // Build the command
+    let cmd = build_claude_command(worktree_path, session_id, prompt);
 
-    // Spawn the command
-    let mut child = cmd.spawn().context(
-        "claude command not found. Install from: https://github.com/anthropics/claude-code",
-    )?;
-
-    // Get the stdout handle
-    let stdout = child
-        .stdout
-        .take()
-        .context("Failed to capture stdout from claude process")?;
-
-    // Create event stream reader
-    let mut stream = EventStream::from_stdout(stdout);
-
-    // Parse timeout if provided
-    let max_timeout = if let Some(timeout_str) = timeout_opt {
-        Some(parse_timeout(timeout_str)?)
-    } else {
-        None
-    };
-
-    // Track task start time for overall timeout
-    let task_start = Instant::now();
-
-    // Process stream output asynchronously with timeout and error handling
-    let stream_result = async {
-        let mut last_event_time = Instant::now();
-        let mut inactivity_warning_shown = false;
-
-        loop {
-            // Check overall task timeout
-            if let Some(max_duration) = max_timeout {
-                let elapsed = task_start.elapsed();
-                if elapsed >= max_duration {
-                    eprintln!("⏱️  Task timeout reached ({:?})", max_duration);
-                    eprintln!("📝 Events saved to events.jsonl");
-                    return Err(anyhow::anyhow!(
-                        "Task exceeded maximum timeout of {:?}",
-                        max_duration
-                    ));
-                }
-            }
-
-            // Check inactivity - time since last event
-            let inactivity = last_event_time.elapsed();
-
-            if inactivity.as_secs() >= INACTIVITY_STUCK_SECS {
-                eprintln!(
-                    "❌ Task appears stuck (no activity for {} minutes)",
-                    INACTIVITY_STUCK_SECS / 60
-                );
-                eprintln!("📝 Events saved to events.jsonl");
-                return Err(anyhow::anyhow!(
-                    "No activity for {} minutes - task appears stuck",
-                    INACTIVITY_STUCK_SECS / 60
-                ));
-            } else if inactivity.as_secs() >= INACTIVITY_WARNING_SECS && !inactivity_warning_shown {
-                eprintln!(
-                    "⚠️  No activity for {} minutes",
-                    INACTIVITY_WARNING_SECS / 60
-                );
-                inactivity_warning_shown = true;
-            }
-
-            // Try to read next line with timeout
-            let line_result = timeout(Duration::from_secs(STREAM_TIMEOUT_SECS), stream.next_line())
-                .await
-                .map_err(|_| {
-                    anyhow::anyhow!(
-                        "Timeout: Process hasn't produced output in {} seconds",
-                        STREAM_TIMEOUT_SECS
-                    )
-                })?;
-
-            // Handle the stream result
-            match line_result? {
-                Some(output) => {
-                    // Log the event to events.jsonl
-                    log_event(worktree_path, &output).await?;
-
-                    // Update last event time for any output
-                    last_event_time = Instant::now();
-
-                    // Reset warning flag only on actual events (not raw output lines)
-                    if matches!(output, stream::StreamOutput::Event(_)) {
-                        inactivity_warning_shown = false;
-                    }
-                }
-                None => {
-                    // Stream ended normally
-                    break;
-                }
-            }
-        }
-
-        Ok(())
-    }
-    .await;
-
-    // Handle stream errors
-    if let Err(e) = stream_result {
-        let _ = child.kill().await;
-        return Err(e);
-    }
-
-    // Wait for the child process to finish
-    let status = child.wait().await.context("Failed to wait for child")?;
-
-    if !status.success() {
-        let exit_code = status.code().unwrap_or(EXIT_CODE_SIGNAL_TERMINATED);
-        return Err(anyhow::anyhow!(
-            "Review response process exited with code {}",
-            exit_code
-        ));
-    }
-
-    Ok(())
+    // Delegate to the shared stream monitoring function
+    run_claude_with_stream_monitoring(
+        cmd,
+        worktree_path,
+        timeout_opt,
+        None::<fn(&stream::StreamOutput)>,
+    )
+    .await
 }
 
 /// Triggers an automated PR review by spawning a separate gru review command
@@ -650,192 +831,81 @@ pub async fn handle_fix(issue: &str, timeout_opt: Option<String>, quiet: bool) -
     // Generate a unique session ID for conversation continuity
     let session_id = Uuid::new_v4();
 
-    // Build the command with flags for non-interactive stream-json output
-    let mut cmd = TokioCommand::new("claude");
-    cmd.arg("--print")
-        .arg("--verbose")
-        .arg("--session-id")
-        .arg(session_id.to_string())
-        .arg("--output-format")
-        .arg("stream-json")
-        .arg("--include-partial-messages")
-        .arg("--dangerously-skip-permissions")
-        .arg(format!("/fix {}", issue_num))
-        .stdin(std::process::Stdio::inherit())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::inherit())
-        .current_dir(&worktree_path)
-        .env("GRU_WORKSPACE", &minion_id);
+    // Build the command with custom environment variable for main fix flow
+    let mut cmd = build_claude_command(&worktree_path, &session_id, &format!("/fix {}", issue_num));
+    cmd.env("GRU_WORKSPACE", &minion_id);
 
-    // Spawn the command
-    let mut child = cmd.spawn().context(
-        "claude command not found. Install from: https://github.com/anthropics/claude-code",
-    )?;
+    // Create state for the callback
+    // Note: GitHub comment posting is omitted from the callback because it requires async operations
+    // which aren't easily supported in the synchronous callback. The refactoring trades
+    // this feature for code simplification and DRY principles.
+    struct CallbackState<'a> {
+        raw_output_buffer: String,
+        progress: &'a ProgressDisplay,
+        progress_tracker: &'a mut ProgressCommentTracker,
+    }
 
-    // Get the stdout handle
-    let stdout = child
-        .stdout
-        .take()
-        .context("Failed to capture stdout from claude process")?;
-
-    // Create event stream reader
-    let mut stream = EventStream::from_stdout(stdout);
-
-    // Parse timeout if provided
-    let max_timeout = if let Some(ref timeout_str) = timeout_opt {
-        Some(parse_timeout(timeout_str)?)
-    } else {
-        None
+    let mut callback_state = CallbackState {
+        raw_output_buffer: String::new(),
+        progress: &progress,
+        progress_tracker: &mut progress_tracker,
     };
 
-    // Track task start time for overall timeout
-    let task_start = Instant::now();
-
-    // Process stream output asynchronously with timeout and error handling
-    let stream_result = async {
-        let mut last_event_time = Instant::now();
-        let mut inactivity_warning_shown = false;
-        let mut raw_output_buffer = String::new();
-
-        loop {
-            // Check overall task timeout
-            if let Some(max_duration) = max_timeout {
-                let elapsed = task_start.elapsed();
-                if elapsed >= max_duration {
-                    eprintln!("⏱️  Task timeout reached ({:?})", max_duration);
-                    eprintln!("📝 Events saved to events.jsonl");
-                    return Err(anyhow::anyhow!(
-                        "Task exceeded maximum timeout of {:?}",
-                        max_duration
-                    ));
+    let callback = |output: &stream::StreamOutput| {
+        // Buffer raw output for test detection
+        if let stream::StreamOutput::RawLine(ref line) = output {
+            callback_state.raw_output_buffer.push_str(line);
+            // Keep buffer size reasonable
+            if callback_state.raw_output_buffer.len() > MAX_OUTPUT_BUFFER_SIZE {
+                // Ensure we split at a valid UTF-8 character boundary to avoid panics
+                // Find the largest valid UTF-8 boundary at or before TRIM_OUTPUT_BUFFER_SIZE
+                let mut trim_pos = TRIM_OUTPUT_BUFFER_SIZE;
+                while trim_pos > 0 && !callback_state.raw_output_buffer.is_char_boundary(trim_pos) {
+                    trim_pos -= 1;
                 }
-            }
-
-            // Check inactivity - time since last event (not overall time)
-            let inactivity = last_event_time.elapsed();
-
-            if inactivity.as_secs() >= INACTIVITY_STUCK_SECS {
-                eprintln!(
-                    "❌ Task appears stuck (no activity for {} minutes)",
-                    INACTIVITY_STUCK_SECS / 60
-                );
-                eprintln!("📝 Events saved to events.jsonl");
-                return Err(anyhow::anyhow!(
-                    "No activity for {} minutes - task appears stuck",
-                    INACTIVITY_STUCK_SECS / 60
-                ));
-            } else if inactivity.as_secs() >= INACTIVITY_WARNING_SECS && !inactivity_warning_shown {
-                eprintln!(
-                    "⚠️  No activity for {} minutes",
-                    INACTIVITY_WARNING_SECS / 60
-                );
-                inactivity_warning_shown = true;
-            }
-
-            // Handle timeout first, then flatten the stream result
-            let line_result = timeout(Duration::from_secs(STREAM_TIMEOUT_SECS), stream.next_line())
-                .await
-                .map_err(|_| {
-                    anyhow::anyhow!(
-                        "Timeout: Claude process hasn't produced output in {} seconds",
-                        STREAM_TIMEOUT_SECS
-                    )
-                })?;
-
-            // Now handle the stream result
-            match line_result? {
-                Some(output) => {
-                    // Log the event to events.jsonl
-                    log_event(&worktree_path, &output).await?;
-
-                    // Update last event time for any output
-                    last_event_time = Instant::now();
-
-                    // Reset warning flag only on actual events (not raw output lines)
-                    if matches!(output, stream::StreamOutput::Event(_)) {
-                        inactivity_warning_shown = false;
-                    }
-
-                    // Buffer raw output for test detection
-                    if let stream::StreamOutput::RawLine(ref line) = output {
-                        raw_output_buffer.push_str(line);
-                        // Keep buffer size reasonable
-                        if raw_output_buffer.len() > MAX_OUTPUT_BUFFER_SIZE {
-                            // Ensure we split at a valid UTF-8 character boundary to avoid panics
-                            // Find the largest valid UTF-8 boundary at or before TRIM_OUTPUT_BUFFER_SIZE
-                            let mut trim_pos = TRIM_OUTPUT_BUFFER_SIZE;
-                            while trim_pos > 0 && !raw_output_buffer.is_char_boundary(trim_pos) {
-                                trim_pos -= 1;
-                            }
-                            raw_output_buffer = raw_output_buffer.split_off(trim_pos);
-                        }
-                    }
-
-                    // Display progress
-                    progress.handle_output(&output);
-
-                    // Check for milestones and update tracker
-                    if let stream::StreamOutput::RawLine(ref line) = output {
-                        // Detect phase transitions from output and post progress comments
-                        let previous_phase = progress_tracker.current_phase();
-                        let mut phase_changed = false;
-
-                        if line.contains("Plan") || line.contains("plan") {
-                            if previous_phase != MinionPhase::Planning {
-                                progress_tracker.set_phase(MinionPhase::Planning);
-                                phase_changed = true;
-                            }
-                        } else if (line.contains("Implement") || line.contains("Writing"))
-                            && previous_phase != MinionPhase::Implementing
-                        {
-                            progress_tracker.set_phase(MinionPhase::Implementing);
-                            phase_changed = true;
-                        } else if (line.contains("test") || line.contains("Test"))
-                            && previous_phase != MinionPhase::Testing
-                        {
-                            progress_tracker.set_phase(MinionPhase::Testing);
-                            phase_changed = true;
-                        }
-
-                        // Post progress comment if phase changed and rate limiting allows
-                        if phase_changed {
-                            if let Some(ref client) = github_client {
-                                if progress_tracker.can_post_comment() {
-                                    let message = format!(
-                                        "Now in {} phase.",
-                                        progress_tracker.current_phase().as_str()
-                                    );
-                                    let update = progress_tracker.create_update(message);
-                                    let comment_body = update.format_comment();
-
-                                    if try_post_progress_comment(
-                                        client,
-                                        &owner,
-                                        &repo,
-                                        &issue_num,
-                                        &comment_body,
-                                    )
-                                    .await
-                                    {
-                                        progress_tracker.mark_comment_posted();
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                None => break, // Stream ended normally
+                callback_state.raw_output_buffer =
+                    callback_state.raw_output_buffer.split_off(trim_pos);
             }
         }
-        Ok::<_, anyhow::Error>(())
-    }
-    .await;
 
-    // Always wait for the process, regardless of stream errors
-    let status = child.wait().await?;
+        // Display progress
+        callback_state.progress.handle_output(output);
 
-    // Now check if there was a stream error
-    stream_result?;
+        // Check for milestones and update tracker
+        if let stream::StreamOutput::RawLine(ref line) = output {
+            // Detect phase transitions from output
+            let previous_phase = callback_state.progress_tracker.current_phase();
+
+            if line.contains("Plan") || line.contains("plan") {
+                if previous_phase != MinionPhase::Planning {
+                    callback_state
+                        .progress_tracker
+                        .set_phase(MinionPhase::Planning);
+                }
+            } else if (line.contains("Implement") || line.contains("Writing"))
+                && previous_phase != MinionPhase::Implementing
+            {
+                callback_state
+                    .progress_tracker
+                    .set_phase(MinionPhase::Implementing);
+            } else if (line.contains("test") || line.contains("Test"))
+                && previous_phase != MinionPhase::Testing
+            {
+                callback_state
+                    .progress_tracker
+                    .set_phase(MinionPhase::Testing);
+            }
+        }
+    };
+
+    // Run Claude with stream monitoring and get the exit status
+    let status = run_claude_with_stream_monitoring_status(
+        cmd,
+        &worktree_path,
+        timeout_opt.as_deref(),
+        Some(callback),
+    )
+    .await?;
 
     // Post final completion comment
     if let Some(ref client) = github_client {

@@ -2,6 +2,9 @@ use chrono::{DateTime, Utc};
 use std::time::{Duration, Instant};
 
 /// Minimum time between progress comments (5 minutes)
+/// Note: Currently unused after refactoring to remove GitHub comment posting from stream callback.
+/// Kept for potential future use if async callbacks are implemented.
+#[allow(dead_code)]
 const MIN_COMMENT_INTERVAL: Duration = Duration::from_secs(300);
 
 /// Represents the phase of Minion execution
@@ -62,6 +65,9 @@ impl ProgressUpdate {
 /// Tracks progress and manages comment posting with rate limiting
 pub struct ProgressCommentTracker {
     minion_id: String,
+    /// Note: Currently unused after refactoring to remove GitHub comment posting from stream callback.
+    /// Kept for potential future use if async callbacks are implemented.
+    #[allow(dead_code)]
     last_comment_time: Option<Instant>,
     current_phase: MinionPhase,
 }
@@ -82,6 +88,9 @@ impl ProgressCommentTracker {
     }
 
     /// Check if enough time has passed since the last comment
+    /// Note: Currently unused after refactoring to remove GitHub comment posting from stream callback.
+    /// Kept for potential future use if async callbacks are implemented.
+    #[allow(dead_code)]
     pub fn can_post_comment(&self) -> bool {
         match self.last_comment_time {
             None => true,
@@ -100,6 +109,9 @@ impl ProgressCommentTracker {
     }
 
     /// Mark that a comment was posted
+    /// Note: Currently unused after refactoring to remove GitHub comment posting from stream callback.
+    /// Kept for potential future use if async callbacks are implemented.
+    #[allow(dead_code)]
     pub fn mark_comment_posted(&mut self) {
         self.last_comment_time = Some(Instant::now());
     }
