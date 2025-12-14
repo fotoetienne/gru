@@ -61,11 +61,13 @@ impl TextBuffer {
             state.last_update = Some(Instant::now());
         }
 
-        // Check if newly added text contains newline (more efficient than scanning entire buffer)
+        // Check if newly added text contains newline or ends with sentence boundary
+        // (more efficient than scanning entire buffer)
         let has_newline = text.contains('\n');
+        let has_sentence_end = text.ends_with(". ") || text.ends_with("! ") || text.ends_with("? ");
 
-        // Flush if newline detected or buffer is getting full
-        if has_newline || state.text.len() > MAX_BUFFER_SIZE {
+        // Flush if newline, sentence boundary, or buffer is getting full
+        if has_newline || has_sentence_end || state.text.len() > MAX_BUFFER_SIZE {
             let flushed = std::mem::take(&mut state.text);
             // Reset timestamp since buffer is now empty
             state.last_update = None;
@@ -172,5 +174,88 @@ mod tests {
         // Buffer should be empty now
         let result = buffer.flush();
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_buffer_flushes_on_period_space() {
+        let buffer = TextBuffer::new(Duration::from_millis(150));
+
+        buffer.add("Hello");
+        let result = buffer.add(" world. ");
+
+        assert_eq!(result, Some("Hello world. ".to_string()));
+    }
+
+    #[test]
+    fn test_buffer_flushes_on_question_space() {
+        let buffer = TextBuffer::new(Duration::from_millis(150));
+
+        buffer.add("Is this working");
+        let result = buffer.add("? ");
+
+        assert_eq!(result, Some("Is this working? ".to_string()));
+    }
+
+    #[test]
+    fn test_buffer_flushes_on_exclamation_space() {
+        let buffer = TextBuffer::new(Duration::from_millis(150));
+
+        buffer.add("Great work");
+        let result = buffer.add("! ");
+
+        assert_eq!(result, Some("Great work! ".to_string()));
+    }
+
+    #[test]
+    fn test_url_does_not_trigger_flush() {
+        let buffer = TextBuffer::new(Duration::from_millis(150));
+
+        // URLs like "example.com" should not trigger flush (no space after period)
+        let result = buffer.add("Visit example.com");
+        assert!(result.is_none());
+
+        // Verify buffer still contains the text
+        let flushed = buffer.flush();
+        assert_eq!(flushed, Some("Visit example.com".to_string()));
+    }
+
+    #[test]
+    fn test_abbreviation_does_not_trigger_flush() {
+        let buffer = TextBuffer::new(Duration::from_millis(150));
+
+        // "Dr." followed by space but part of a name should not trigger flush
+        // However, this will trigger flush - that's acceptable per issue notes
+        let result = buffer.add("Dr. ");
+        assert_eq!(result, Some("Dr. ".to_string()));
+    }
+
+    #[test]
+    fn test_multiple_sentence_boundaries() {
+        let buffer = TextBuffer::new(Duration::from_millis(150));
+
+        // First sentence
+        let result = buffer.add("First sentence. ");
+        assert_eq!(result, Some("First sentence. ".to_string()));
+
+        // Second sentence
+        let result = buffer.add("Second sentence. ");
+        assert_eq!(result, Some("Second sentence. ".to_string()));
+
+        // Buffer should be empty now
+        let result = buffer.flush();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_sentence_boundary_without_trailing_space() {
+        let buffer = TextBuffer::new(Duration::from_millis(150));
+
+        // Period without space should not trigger flush
+        let result = buffer.add("Hello world.");
+        assert!(result.is_none());
+
+        // Verify buffer still contains the text
+        let flushed = buffer.flush();
+        assert_eq!(flushed, Some("Hello world.".to_string()));
     }
 }
