@@ -1,3 +1,4 @@
+use crate::minion_registry::MinionRegistry;
 use crate::workspace;
 use crate::worktree_scanner;
 use anyhow::{Context, Result};
@@ -273,6 +274,29 @@ pub async fn handle_clean(dry_run: bool, force: bool, base_branch: &str) -> Resu
 
             if let Err(e) = branch_result {
                 eprintln!("  Warning: Failed to delete branch: {}", e);
+            }
+
+            // Remove from registry (best effort - extract minion ID from worktree path)
+            // ASSUMPTION: Worktree directory name equals minion ID (e.g., M001)
+            // This works for all newly created minions but won't clean legacy worktrees
+            // that used branch names as directory names (e.g., minion/issue-42-M001).
+            // For legacy worktrees where the directory name does not match any minion ID,
+            // the minion will not be removed from the registry. This is a known limitation.
+            if let Some(dir_name) = wt.path.file_name() {
+                if let Some(dir_str) = dir_name.to_str() {
+                    // Try to remove from registry (ignore errors if not in registry)
+                    if let Ok(mut registry) = MinionRegistry::load(None) {
+                        if let Err(e) = registry.remove(dir_str) {
+                            // Only log if it looks like a minion ID (starts with M)
+                            if dir_str.starts_with('M') {
+                                eprintln!(
+                                    "  Warning: Failed to remove minion {} from registry: {}",
+                                    dir_str, e
+                                );
+                            }
+                        }
+                    }
+                }
             }
         } else {
             println!("✗");

@@ -1,4 +1,6 @@
 use crate::git;
+use crate::minion;
+use crate::minion_registry::{MinionInfo as RegistryMinionInfo, MinionRegistry};
 use crate::minion_resolver;
 use crate::pr_state::PrState;
 use crate::progress::{ProgressConfig, ProgressDisplay};
@@ -6,6 +8,7 @@ use crate::stream::{self, EventStream};
 use crate::url_utils::parse_pr_info;
 use crate::workspace;
 use anyhow::{Context, Result};
+use chrono::Utc;
 use std::env;
 use std::path::Path;
 use std::time::Instant;
@@ -65,6 +68,10 @@ pub async fn handle_review(pr_arg: Option<String>) -> Result<i32> {
     // Initialize workspace
     let workspace = workspace::Workspace::new().context("Failed to initialize Gru workspace")?;
 
+    // Generate minion ID for registry tracking
+    let minion_id =
+        minion::generate_minion_id().context("Failed to generate Minion ID for review")?;
+
     // Create bare repository path
     let bare_path = workspace.repos().join(&owner).join(format!("{}.git", repo));
     let git_repo = git::GitRepo::new(&owner, &repo, bare_path);
@@ -93,8 +100,9 @@ pub async fn handle_review(pr_arg: Option<String>) -> Result<i32> {
             .with_context(|| format!("Failed to fetch PR branch '{}'", branch))?;
 
         let repo_name = format!("{}/{}", owner, repo);
+        // Use minion ID for worktree path instead of branch name
         let new_worktree_path = workspace
-            .work_dir(&repo_name, &branch)
+            .work_dir(&repo_name, &minion_id)
             .context("Failed to compute worktree path")?;
 
         println!("🌿 Creating worktree for branch: {}", branch);
@@ -105,11 +113,29 @@ pub async fn handle_review(pr_arg: Option<String>) -> Result<i32> {
         new_worktree_path
     };
 
+    // Register minion in registry
+    let registry_info = RegistryMinionInfo {
+        repo: format!("{}/{}", owner, repo),
+        issue: 0, // Reviews are associated with PR numbers, not issue numbers; set to 0 to indicate not applicable
+        command: "review".to_string(),
+        prompt: format!("/pr_review {}", pr_num),
+        started_at: Utc::now(),
+        branch: branch.clone(),
+        worktree: worktree_path.clone(),
+        status: "active".to_string(),
+        pr: Some(pr_num.clone()),
+    };
+
+    let mut registry = MinionRegistry::load(None).context("Failed to load Minion registry")?;
+    registry
+        .register(minion_id.clone(), registry_info)
+        .context("Failed to register review Minion in registry")?;
+
     println!("🤖 Launching autonomous review agent...\n");
 
     // Create progress display for review
     let config = ProgressConfig {
-        minion_id: format!("Review-{}", pr_num),
+        minion_id: minion_id.clone(),
         issue: pr_num.clone(),
         quiet: false,
     };
@@ -214,6 +240,16 @@ pub async fn handle_review(pr_arg: Option<String>) -> Result<i32> {
 
     // Now check if there was a stream error
     stream_result?;
+
+    // Remove minion from registry (best effort - don't fail if this errors)
+    if let Ok(mut registry) = MinionRegistry::load(None) {
+        if let Err(e) = registry.remove(&minion_id) {
+            eprintln!(
+                "Warning: Failed to remove minion {} from registry: {}",
+                minion_id, e
+            );
+        }
+    }
 
     // Finish the progress display
     if status.success() {
