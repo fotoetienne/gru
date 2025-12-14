@@ -1,6 +1,7 @@
 use crate::git;
 use crate::github::GitHubClient;
 use crate::minion;
+use crate::minion_registry::{MinionInfo as RegistryMinionInfo, MinionRegistry};
 use crate::pr_monitor::{self, MonitorResult};
 use crate::pr_state::PrState;
 use crate::progress::{ProgressConfig, ProgressDisplay};
@@ -9,6 +10,7 @@ use crate::stream::{self, EventStream};
 use crate::url_utils::parse_issue_info;
 use crate::workspace;
 use anyhow::{Context, Result};
+use chrono::Utc;
 use std::path::Path;
 use std::time::Instant;
 use tokio::fs::OpenOptions;
@@ -573,6 +575,31 @@ pub async fn handle_fix(issue: &str, timeout_opt: Option<String>, quiet: bool) -
         .context("Failed to create worktree")?;
 
     println!("📂 Workspace created at: {}", worktree_path.display());
+
+    // Register the Minion in the registry
+    let issue_num_u64: u64 = issue_num.parse().context("Failed to parse issue number")?;
+    let registry_info = RegistryMinionInfo {
+        repo: repo_name.clone(),
+        issue: issue_num_u64,
+        command: "fix".to_string(),
+        prompt: format!("/fix {}", issue_num),
+        started_at: Utc::now(),
+        branch: branch_name.clone(),
+        worktree: worktree_path.clone(),
+        status: "active".to_string(),
+        pr: None,
+    };
+
+    // Load registry and register the Minion (spawn_blocking to avoid blocking the async runtime)
+    let minion_id_clone = minion_id.clone();
+    tokio::task::spawn_blocking(move || {
+        let mut registry = MinionRegistry::load(None)?;
+        registry.register(minion_id_clone, registry_info)
+    })
+    .await
+    .context("Failed to spawn blocking task for registry registration")??;
+
+    println!("📝 Registered Minion {} in registry", minion_id);
     println!("🤖 Launching Claude...\n");
 
     // Create progress display
@@ -854,6 +881,19 @@ pub async fn handle_fix(issue: &str, timeout_opt: Option<String>, quiet: bool) -
                     pr_state
                         .save(&worktree_path)
                         .context("Failed to save PR state")?;
+
+                    // Update registry with PR number (spawn_blocking to avoid blocking)
+                    let minion_id_clone = minion_id.clone();
+                    let pr_number_clone = pr_number.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let mut registry = MinionRegistry::load(None)?;
+                        registry.update(&minion_id_clone, |info| {
+                            info.pr = Some(pr_number_clone);
+                            info.status = "idle".to_string();
+                        })
+                    })
+                    .await
+                    .context("Failed to spawn blocking task for registry update")??;
 
                     println!("✅ Draft PR created: #{}", pr_number);
                     println!(

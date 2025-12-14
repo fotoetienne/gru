@@ -13,6 +13,7 @@ static ISSUE_LINK_REGEX: Lazy<Regex> = Lazy::new(|| {
 
 /// Information about a resolved Minion worktree
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct MinionInfo {
     pub minion_id: String,
     pub issue_number: Option<u64>,
