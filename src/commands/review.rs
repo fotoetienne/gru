@@ -433,9 +433,9 @@ async fn find_issue_for_pr(pr_num: &str) -> Result<u64> {
             "view",
             pr_num,
             "--json",
-            "closesIssueReferences",
+            "closingIssuesReferences",
             "--jq",
-            ".closesIssueReferences[0].number",
+            ".closingIssuesReferences[0].number",
         ])
         .output()
         .await
