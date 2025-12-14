@@ -113,10 +113,18 @@ pub async fn handle_review(pr_arg: Option<String>) -> Result<i32> {
         new_worktree_path
     };
 
+    // Fetch the issue number linked to this PR (if any)
+    let linked_issue = find_issue_for_pr(&pr_num)
+        .await
+        .unwrap_or_else(|e| {
+            eprintln!("Warning: Failed to fetch linked issue for PR #{}: {}", pr_num, e);
+            0
+        });
+
     // Register minion in registry
     let registry_info = RegistryMinionInfo {
         repo: format!("{}/{}", owner, repo),
-        issue: 0, // Reviews are associated with PR numbers, not issue numbers; set to 0 to indicate not applicable
+        issue: linked_issue,
         command: "review".to_string(),
         prompt: format!("/pr_review {}", pr_num),
         started_at: Utc::now(),
@@ -412,6 +420,52 @@ async fn find_pr_for_issue(issue_num: u64) -> Result<String> {
         .context("PR number is not a valid integer")?;
 
     Ok(pr_num.to_string())
+}
+
+/// Finds issue numbers linked to a PR
+/// Uses gh CLI to fetch issues that this PR closes/fixes
+/// Returns the first linked issue number, or 0 if no issues are linked
+async fn find_issue_for_pr(pr_num: &str) -> Result<u64> {
+    // Safe: pr_num is already validated as a number earlier in the call chain
+    let output = TokioCommand::new("gh")
+        .args([
+            "pr",
+            "view",
+            pr_num,
+            "--json",
+            "closesIssueReferences",
+            "--jq",
+            ".closesIssueReferences[0].number",
+        ])
+        .output()
+        .await
+        .context("Failed to execute gh pr view. Is GitHub CLI installed?")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        eprintln!(
+            "Warning: Failed to fetch linked issues for PR #{}: {}",
+            pr_num, stderr
+        );
+        return Ok(0);
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let trimmed = stdout.trim();
+
+    // If the output is "null" or empty, no issue is linked
+    if trimmed.is_empty() || trimmed == "null" {
+        return Ok(0);
+    }
+
+    // Parse the issue number
+    trimmed
+        .parse::<u64>()
+        .context("Failed to parse issue number from PR")
+        .or_else(|e| {
+            eprintln!("Warning: {}", e);
+            Ok(0)
+        })
 }
 
 #[cfg(test)]
