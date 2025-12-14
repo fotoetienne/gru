@@ -289,7 +289,12 @@ pub async fn handle_prompt(prompt: &str, timeout_opt: Option<String>, quiet: boo
 
     // Remove minion from registry (best effort - don't fail if this errors)
     if let Ok(mut registry) = MinionRegistry::load(None) {
-        let _ = registry.remove(&minion_id);
+        if let Err(e) = registry.remove(&minion_id) {
+            eprintln!(
+                "Warning: Failed to remove minion {} from registry: {}",
+                minion_id, e
+            );
+        }
     }
 
     // Finish the progress display and return appropriate exit code

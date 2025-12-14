@@ -243,7 +243,12 @@ pub async fn handle_review(pr_arg: Option<String>) -> Result<i32> {
 
     // Remove minion from registry (best effort - don't fail if this errors)
     if let Ok(mut registry) = MinionRegistry::load(None) {
-        let _ = registry.remove(&minion_id);
+        if let Err(e) = registry.remove(&minion_id) {
+            eprintln!(
+                "Warning: Failed to remove minion {} from registry: {}",
+                minion_id, e
+            );
+        }
     }
 
     // Finish the progress display
