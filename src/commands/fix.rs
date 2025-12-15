@@ -90,163 +90,9 @@ fn build_claude_command(worktree_path: &Path, session_id: &Uuid, prompt: &str) -
 
 /// Runs Claude with stream monitoring and timeout detection
 ///
-/// This function encapsulates the common stream parsing logic used by both
-/// the main fix flow and review response flow. It handles:
-/// - Claude CLI process spawning with stream-json output
-/// - Event stream parsing with EventStream::from_stdout
-/// - Timeout detection (overall task timeout)
-/// - Inactivity monitoring (warning at 5 mins, stuck at 15 mins)
-/// - Stream timeout (5 minutes per line)
-/// - Event logging to events.jsonl
-/// - Exit code handling
-///
-/// # Arguments
-/// * `cmd` - Pre-configured TokioCommand ready to spawn
-/// * `worktree_path` - Path to the worktree directory (for event logging)
-/// * `timeout_opt` - Optional timeout string (e.g., "10m", "1h")
-/// * `output_callback` - Optional callback for custom output processing
-///
-/// # Returns
-/// Ok(()) if the process completed successfully, Err otherwise
+/// Returns the exit status for the caller to inspect. Caller is responsible for
+/// checking if the process succeeded and handling errors appropriately.
 async fn run_claude_with_stream_monitoring<F>(
-    mut cmd: TokioCommand,
-    worktree_path: &Path,
-    timeout_opt: Option<&str>,
-    mut output_callback: Option<F>,
-) -> Result<()>
-where
-    F: FnMut(&stream::StreamOutput),
-{
-    // Spawn the command
-    let mut child = cmd.spawn().context(
-        "claude command not found. Install from: https://github.com/anthropics/claude-code",
-    )?;
-
-    // Get the stdout handle
-    let stdout = child
-        .stdout
-        .take()
-        .context("Failed to capture stdout from claude process")?;
-
-    // Create event stream reader
-    let mut stream = EventStream::from_stdout(stdout);
-
-    // Parse timeout if provided
-    let max_timeout = if let Some(timeout_str) = timeout_opt {
-        Some(parse_timeout(timeout_str)?)
-    } else {
-        None
-    };
-
-    // Track task start time for overall timeout
-    let task_start = Instant::now();
-
-    // Process stream output asynchronously with timeout and error handling
-    let stream_result = async {
-        let mut last_event_time = Instant::now();
-        let mut inactivity_warning_shown = false;
-
-        loop {
-            // Check overall task timeout
-            if let Some(max_duration) = max_timeout {
-                let elapsed = task_start.elapsed();
-                if elapsed >= max_duration {
-                    eprintln!("⏱️  Task timeout reached ({:?})", max_duration);
-                    eprintln!("📝 Events saved to events.jsonl");
-                    return Err(anyhow::anyhow!(
-                        "Task exceeded maximum timeout of {:?}",
-                        max_duration
-                    ));
-                }
-            }
-
-            // Check inactivity - time since last event
-            let inactivity = last_event_time.elapsed();
-
-            if inactivity.as_secs() >= INACTIVITY_STUCK_SECS {
-                eprintln!(
-                    "❌ Task appears stuck (no activity for {} minutes)",
-                    INACTIVITY_STUCK_SECS / 60
-                );
-                eprintln!("📝 Events saved to events.jsonl");
-                return Err(anyhow::anyhow!(
-                    "No activity for {} minutes - task appears stuck",
-                    INACTIVITY_STUCK_SECS / 60
-                ));
-            } else if inactivity.as_secs() >= INACTIVITY_WARNING_SECS && !inactivity_warning_shown {
-                eprintln!(
-                    "⚠️  No activity for {} minutes",
-                    INACTIVITY_WARNING_SECS / 60
-                );
-                inactivity_warning_shown = true;
-            }
-
-            // Try to read next line with timeout
-            let line_result = timeout(Duration::from_secs(STREAM_TIMEOUT_SECS), stream.next_line())
-                .await
-                .map_err(|_| {
-                    anyhow::anyhow!(
-                        "Timeout: Process hasn't produced output in {} seconds",
-                        STREAM_TIMEOUT_SECS
-                    )
-                })?;
-
-            // Handle the stream result
-            match line_result? {
-                Some(output) => {
-                    // Log the event to events.jsonl
-                    log_event(worktree_path, &output).await?;
-
-                    // Update last event time for any output
-                    last_event_time = Instant::now();
-
-                    // Reset warning flag only on actual events (not raw output lines)
-                    if matches!(output, stream::StreamOutput::Event(_)) {
-                        inactivity_warning_shown = false;
-                    }
-
-                    // Call custom callback if provided
-                    if let Some(ref mut callback) = output_callback {
-                        callback(&output);
-                    }
-                }
-                None => {
-                    // Stream ended normally
-                    break;
-                }
-            }
-        }
-
-        Ok(())
-    }
-    .await;
-
-    // Handle stream errors
-    if let Err(e) = stream_result {
-        let _ = child.kill().await;
-        return Err(e);
-    }
-
-    // Wait for the child process to finish
-    let status = child.wait().await.context("Failed to wait for child")?;
-
-    if !status.success() {
-        let exit_code = status.code().unwrap_or(EXIT_CODE_SIGNAL_TERMINATED);
-        return Err(anyhow::anyhow!(
-            "Claude process exited with code {}",
-            exit_code
-        ));
-    }
-
-    Ok(())
-}
-
-/// Runs Claude with stream monitoring and returns the exit status
-///
-/// This is a variant of run_claude_with_stream_monitoring that returns the exit status
-/// instead of converting it to a Result. This is useful when the caller needs to inspect
-/// the exit code for success/failure handling.
-async fn run_claude_with_stream_monitoring_status<F>(
     mut cmd: TokioCommand,
     worktree_path: &Path,
     timeout_opt: Option<&str>,
@@ -365,7 +211,7 @@ where
     // Now check if there was a stream error
     stream_result?;
 
-    // Return the exit status
+    // Return the exit status for caller to handle
     Ok(status)
 }
 
@@ -584,31 +430,30 @@ fn parse_timeout(timeout_str: &str) -> Result<Duration> {
 }
 
 /// Invokes Claude to address review comments
-///
-/// This function spawns Claude with a custom prompt containing review comments.
-/// It reuses the same session ID to maintain context from the original implementation.
-///
-/// This function handles timeout detection and inactivity monitoring. If a timeout is specified
-/// via the `timeout_opt` parameter, the function will terminate if the operation exceeds the
-/// given duration. The function also monitors for inactivity (no output) and will fail if there
-/// is no activity for an extended period (15 minutes by default).
 async fn invoke_claude_for_reviews(
     worktree_path: &Path,
     session_id: &Uuid,
     prompt: &str,
     timeout_opt: Option<&str>,
 ) -> Result<()> {
-    // Build the command
     let cmd = build_claude_command(worktree_path, session_id, prompt);
-
-    // Delegate to the shared stream monitoring function
-    run_claude_with_stream_monitoring(
+    let status = run_claude_with_stream_monitoring(
         cmd,
         worktree_path,
         timeout_opt,
         None::<fn(&stream::StreamOutput)>,
     )
-    .await
+    .await?;
+
+    if !status.success() {
+        let exit_code = status.code().unwrap_or(EXIT_CODE_SIGNAL_TERMINATED);
+        return Err(anyhow::anyhow!(
+            "Review response process exited with code {}",
+            exit_code
+        ));
+    }
+
+    Ok(())
 }
 
 /// Triggers an automated PR review by spawning a separate gru review command
@@ -899,7 +744,7 @@ pub async fn handle_fix(issue: &str, timeout_opt: Option<String>, quiet: bool) -
     };
 
     // Run Claude with stream monitoring and get the exit status
-    let status = run_claude_with_stream_monitoring_status(
+    let status = run_claude_with_stream_monitoring(
         cmd,
         &worktree_path,
         timeout_opt.as_deref(),
