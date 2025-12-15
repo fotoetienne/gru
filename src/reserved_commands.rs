@@ -13,9 +13,14 @@ use anyhow::{bail, Result};
 /// List of reserved command names that cannot be used for custom prompts
 ///
 /// From issue #79 and CUSTOM_PROMPTS_PRD.md resolution order:
-/// 1. Reserved system commands (this list)
+/// 1. Reserved system commands (this list) - CANNOT be overridden
 /// 2. Quoted strings → ad-hoc prompts
-/// 3. Unquoted strings → prompt file lookup
+/// 3. Unquoted strings → prompt file lookup (can override built-ins)
+///
+/// **Important**: Commands like `fix`, `review`, `init`, etc. are NOT in this list
+/// because they are built-in prompts (Phase 4) that teams can override with
+/// custom versions in `.gru/prompts/`. Reserved commands are truly protected
+/// system commands that must always resolve to their hardcoded CLI behavior.
 ///
 /// This will be used by the prompt file loader (Phase 2) to validate that
 /// `.gru/prompts/*.md` files don't use these reserved names.
