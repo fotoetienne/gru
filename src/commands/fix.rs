@@ -700,11 +700,80 @@ pub async fn handle_fix(issue: &str, timeout_opt: Option<String>, quiet: bool) -
         }
     }
 
+    // Fetch issue details to include in the prompt
+    let issue_details = if let Some(ref client) = github_client {
+        match issue_num.parse::<u64>() {
+            Ok(issue_number) => {
+                // Try to fetch using API
+                match client.get_issue(&owner, &repo, issue_number).await {
+                    Ok(issue) => {
+                        let labels = issue
+                            .labels
+                            .iter()
+                            .map(|l| l.name.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        let body = issue.body.unwrap_or_default();
+                        Some((issue.title, body, labels))
+                    }
+                    Err(e) => {
+                        eprintln!("⚠️  Failed to fetch issue details: {}", e);
+                        None
+                    }
+                }
+            }
+            Err(_) => None,
+        }
+    } else {
+        // Fall back to gh CLI if no API client
+        match issue_num.parse::<u64>() {
+            Ok(issue_number) => {
+                match crate::github::get_issue_via_cli(&owner, &repo, issue_number).await {
+                    Ok(issue_info) => {
+                        // CLI version doesn't include labels, but we can still provide title and body
+                        let body = issue_info.body.unwrap_or_default();
+                        Some((issue_info.title, body, String::new()))
+                    }
+                    Err(e) => {
+                        eprintln!("⚠️  Failed to fetch issue details via CLI: {}", e);
+                        None
+                    }
+                }
+            }
+            Err(_) => None,
+        }
+    };
+
     // Generate a unique session ID for conversation continuity
     let session_id = Uuid::new_v4();
 
+    // Format the prompt with issue details
+    let prompt = if let Some((title, body, labels)) = issue_details {
+        let labels_section = if labels.is_empty() {
+            String::new()
+        } else {
+            format!("\nLabels: {}", labels)
+        };
+
+        format!(
+            r#"Fix this GitHub issue:
+
+Issue #{}: {}
+URL: https://github.com/{}/{}/issues/{}{}
+
+Description:
+{}
+
+Please implement a fix for this issue."#,
+            issue_num, title, owner, repo, issue_num, labels_section, body
+        )
+    } else {
+        // Fall back to simple prompt if we couldn't fetch issue details
+        format!("/fix {}", issue_num)
+    };
+
     // Build the command with custom environment variable for main fix flow
-    let mut cmd = build_claude_command(&worktree_path, &session_id, &format!("/fix {}", issue_num));
+    let mut cmd = build_claude_command(&worktree_path, &session_id, &prompt);
     cmd.env("GRU_WORKSPACE", &minion_id);
 
     // Create state for the callback
