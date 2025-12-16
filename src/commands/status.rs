@@ -48,6 +48,36 @@ fn calculate_uptime(started_at: chrono::DateTime<chrono::Utc>) -> String {
     }
 }
 
+/// Gets the current branch name from a worktree
+/// Returns the actual branch name, or a placeholder for special cases:
+/// - "(detached)" if HEAD is detached
+/// - "(deleted)" if the branch from registry doesn't match current branch
+/// - "(error)" if git command fails
+fn get_current_branch(worktree_path: &std::path::Path, registry_branch: &str) -> String {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(worktree_path)
+        .arg("branch")
+        .arg("--show-current")
+        .output();
+
+    match output {
+        Ok(out) if out.status.success() => {
+            let branch = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if branch.is_empty() {
+                // Empty output means detached HEAD
+                "(detached)".to_string()
+            } else if branch != registry_branch {
+                // Branch changed from what was registered
+                format!("{} (!)", branch)
+            } else {
+                branch
+            }
+        }
+        _ => "(error)".to_string(),
+    }
+}
+
 /// Determines if a Minion is Active or Idle based on git index modification time
 fn determine_status(worktree_path: &std::path::Path) -> String {
     // Use git rev-parse to get the actual git directory path
@@ -169,6 +199,8 @@ pub async fn handle_status(id: Option<String>) -> Result<i32> {
                 // Get current status from filesystem (active/idle detection)
                 let status = determine_status(&basic.worktree);
                 let uptime = calculate_uptime(basic.started_at);
+                // Get current branch from worktree (checks for detached HEAD, branch changes, etc.)
+                let branch = get_current_branch(&basic.worktree, &basic.branch);
 
                 EnhancedMinionInfo {
                     minion_id: basic.minion_id,
@@ -176,7 +208,7 @@ pub async fn handle_status(id: Option<String>) -> Result<i32> {
                     issue: basic.issue,
                     task: basic.task,
                     pr: basic.pr,
-                    branch: basic.branch,
+                    branch,
                     status,
                     uptime,
                 }
@@ -229,7 +261,7 @@ pub async fn handle_status(id: Option<String>) -> Result<i32> {
 
     // Print table header
     println!(
-        "{:<8} {:<20} {:<8} {:<10} {:<8} {:<25} {:<10} {:<8}",
+        "{:<8} {:<20} {:<8} {:<10} {:<8} {:<30} {:<10} {:<8}",
         "MINION", "REPO", "ISSUE", "TASK", "PR", "BRANCH", "STATUS", "UPTIME"
     );
 
@@ -243,7 +275,7 @@ pub async fn handle_status(id: Option<String>) -> Result<i32> {
             .unwrap_or_else(|| "-".to_string());
 
         println!(
-            "{:<8} {:<20} {:<8} {:<10} {:<8} {:<25} {:<10} {:<8}",
+            "{:<8} {:<20} {:<8} {:<10} {:<8} {:<30} {:<10} {:<8}",
             minion.minion_id,
             minion.repo,
             issue_display,
