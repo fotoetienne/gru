@@ -88,6 +88,33 @@ fn build_claude_command(worktree_path: &Path, session_id: &Uuid, prompt: &str) -
     cmd
 }
 
+/// Builds a Claude command to resume an existing session
+///
+/// This is used when continuing a conversation from a previous session,
+/// such as when addressing review comments after the initial fix.
+/// Uses --resume instead of --session-id to avoid "session already in use" errors.
+fn build_claude_resume_command(
+    worktree_path: &Path,
+    session_id: &Uuid,
+    prompt: &str,
+) -> TokioCommand {
+    let mut cmd = TokioCommand::new("claude");
+    cmd.arg("--print")
+        .arg("--verbose")
+        .arg("--resume")
+        .arg(session_id.to_string())
+        .arg("--output-format")
+        .arg("stream-json")
+        .arg("--include-partial-messages")
+        .arg("--dangerously-skip-permissions")
+        .arg(prompt)
+        .stdin(std::process::Stdio::inherit())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::inherit())
+        .current_dir(worktree_path);
+    cmd
+}
+
 /// Runs Claude with stream monitoring and timeout detection
 ///
 /// Returns the exit status for the caller to inspect. Caller is responsible for
@@ -436,7 +463,7 @@ async fn invoke_claude_for_reviews(
     prompt: &str,
     timeout_opt: Option<&str>,
 ) -> Result<()> {
-    let cmd = build_claude_command(worktree_path, session_id, prompt);
+    let cmd = build_claude_resume_command(worktree_path, session_id, prompt);
     let status = run_claude_with_stream_monitoring(
         cmd,
         worktree_path,
