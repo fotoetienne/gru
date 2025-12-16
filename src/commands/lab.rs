@@ -22,12 +22,12 @@ pub async fn handle_lab(
         if default_path.exists() {
             LabConfig::load(&default_path)?
         } else if repos.is_none() {
-            eprintln!("⚠️  No config file found at {}", default_path.display());
-            eprintln!("   Use --repos flag or create a config file");
-            eprintln!();
-            eprintln!("Example:");
-            eprintln!("  gru lab --repos owner/repo1,owner/repo2 --slots 2");
-            eprintln!();
+            log::warn!("⚠️  No config file found at {}", default_path.display());
+            log::warn!("   Use --repos flag or create a config file");
+            log::warn!("");
+            log::warn!("Example:");
+            log::warn!("  gru lab --repos owner/repo1,owner/repo2 --slots 2");
+            log::warn!("");
             anyhow::bail!("No repositories configured");
         } else {
             LabConfig::default()
@@ -60,8 +60,8 @@ pub async fn handle_lab(
 
     // Perform initial poll immediately for faster feedback
     if let Err(e) = poll_and_spawn(&config).await {
-        eprintln!("⚠️  Initial polling error: {}", e);
-        eprintln!("   Continuing to poll...");
+        log::warn!("⚠️  Initial polling error: {}", e);
+        log::warn!("   Continuing to poll...");
     }
 
     // Main polling loop
@@ -73,8 +73,8 @@ pub async fn handle_lab(
             }
             _ = sleep(config.poll_interval()) => {
                 if let Err(e) = poll_and_spawn(&config).await {
-                    eprintln!("⚠️  Polling error: {}", e);
-                    eprintln!("   Continuing to poll...");
+                    log::warn!("⚠️  Polling error: {}", e);
+                    log::warn!("   Continuing to poll...");
                 }
             }
         }
@@ -105,7 +105,7 @@ async fn poll_and_spawn(config: &LabConfig) -> Result<()> {
         // Parse owner/repo
         let parts: Vec<&str> = repo_spec.split('/').collect();
         if parts.len() != 2 {
-            eprintln!("⚠️  Invalid repo format: '{}', skipping", repo_spec);
+            log::warn!("⚠️  Invalid repo format: '{}', skipping", repo_spec);
             continue;
         }
 
@@ -115,9 +115,10 @@ async fn poll_and_spawn(config: &LabConfig) -> Result<()> {
         let client = match GitHubClient::from_env(owner, repo).await {
             Ok(client) => client,
             Err(e) => {
-                eprintln!(
+                log::warn!(
                     "⚠️  Failed to create GitHub client for {}: {}",
-                    repo_spec, e
+                    repo_spec,
+                    e
                 );
                 continue;
             }
@@ -130,7 +131,7 @@ async fn poll_and_spawn(config: &LabConfig) -> Result<()> {
         {
             Ok(issues) => issues,
             Err(e) => {
-                eprintln!("⚠️  Failed to fetch issues for {}: {}", repo_spec, e);
+                log::warn!("⚠️  Failed to fetch issues for {}: {}", repo_spec, e);
                 continue;
             }
         };
@@ -160,16 +161,18 @@ async fn poll_and_spawn(config: &LabConfig) -> Result<()> {
                             available -= 1; // Decrement available slots after successful spawn
                         }
                         Err(e) => {
-                            eprintln!(
+                            log::warn!(
                                 "⚠️  Failed to spawn Minion for {}/issues/{}: {}",
-                                repo_spec, issue.number, e
+                                repo_spec,
+                                issue.number,
+                                e
                             );
                             // Unclaim the issue since we failed to spawn
                             if let Err(e) = client
                                 .remove_label(owner, repo, issue.number, "in-progress")
                                 .await
                             {
-                                eprintln!("⚠️  Failed to remove in-progress label: {}", e);
+                                log::warn!("⚠️  Failed to remove in-progress label: {}", e);
                             }
                         }
                     }
@@ -179,9 +182,11 @@ async fn poll_and_spawn(config: &LabConfig) -> Result<()> {
                     continue;
                 }
                 Err(e) => {
-                    eprintln!(
+                    log::warn!(
                         "⚠️  Failed to claim issue {}/issues/{}: {}",
-                        repo_spec, issue.number, e
+                        repo_spec,
+                        issue.number,
+                        e
                     );
                     continue;
                 }

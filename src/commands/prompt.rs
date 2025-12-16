@@ -224,8 +224,8 @@ pub async fn handle_prompt(prompt: &str, timeout_opt: Option<String>, quiet: boo
             if let Some(max_duration) = max_timeout {
                 let elapsed = task_start.elapsed();
                 if elapsed >= max_duration {
-                    eprintln!("⏱️  Task timeout reached ({:?})", max_duration);
-                    eprintln!("📝 Events saved to events.jsonl");
+                    log::info!("⏱️  Task timeout reached ({:?})", max_duration);
+                    log::info!("📝 Events saved to events.jsonl");
                     return Err(anyhow::anyhow!(
                         "Task exceeded maximum timeout of {:?}",
                         max_duration
@@ -237,17 +237,17 @@ pub async fn handle_prompt(prompt: &str, timeout_opt: Option<String>, quiet: boo
             let inactivity = last_event_time.elapsed();
 
             if inactivity.as_secs() >= INACTIVITY_STUCK_SECS {
-                eprintln!(
+                log::info!(
                     "❌ Task appears stuck (no activity for {} minutes)",
                     INACTIVITY_STUCK_SECS / 60
                 );
-                eprintln!("📝 Events saved to events.jsonl");
+                log::info!("📝 Events saved to events.jsonl");
                 return Err(anyhow::anyhow!(
                     "No activity for {} minutes - task appears stuck",
                     INACTIVITY_STUCK_SECS / 60
                 ));
             } else if inactivity.as_secs() >= INACTIVITY_WARNING_SECS && !warned_at_5min {
-                eprintln!(
+                log::info!(
                     "⚠️  No activity for {} minutes",
                     INACTIVITY_WARNING_SECS / 60
                 );
@@ -297,9 +297,10 @@ pub async fn handle_prompt(prompt: &str, timeout_opt: Option<String>, quiet: boo
     // Remove minion from registry (best effort - don't fail if this errors)
     if let Ok(mut registry) = MinionRegistry::load(None) {
         if let Err(e) = registry.remove(&minion_id) {
-            eprintln!(
+            log::info!(
                 "Warning: Failed to remove minion {} from registry: {}",
-                minion_id, e
+                minion_id,
+                e
             );
         }
     }

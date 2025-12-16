@@ -116,7 +116,7 @@ impl Worktree {
 
         if !fetch_output.status.success() {
             // If fetch fails, be conservative and assume branch exists
-            eprintln!(
+            log::warn!(
                 "Warning: Failed to fetch from remote: {}",
                 String::from_utf8_lossy(&fetch_output.stderr)
             );
@@ -148,7 +148,7 @@ impl Worktree {
         if self
             .check_merged(base_branch)
             .map_err(|e| {
-                eprintln!("Warning: Failed to check if branch is merged: {}", e);
+                log::warn!("Warning: Failed to check if branch is merged: {}", e);
                 e
             })
             .unwrap_or(false)
@@ -160,7 +160,7 @@ impl Worktree {
         if let Some(true) = self
             .check_issue_closed()
             .map_err(|e| {
-                eprintln!("Warning: Failed to check issue status: {}", e);
+                log::warn!("Warning: Failed to check issue status: {}", e);
                 e
             })
             .unwrap_or(None)
@@ -172,7 +172,7 @@ impl Worktree {
         if self
             .check_remote_deleted()
             .map_err(|e| {
-                eprintln!("Warning: Failed to check remote status: {}", e);
+                log::warn!("Warning: Failed to check remote status: {}", e);
                 e
             })
             .unwrap_or(false)
@@ -200,7 +200,7 @@ pub fn discover_worktrees(repos_dir: &Path) -> Result<Vec<Worktree>> {
         let repo_name = match extract_repo_from_git_config(&bare_repo_path) {
             Ok(name) => name,
             Err(e) => {
-                eprintln!(
+                log::warn!(
                     "Warning: Failed to extract repo name from {}: {}",
                     bare_repo_path.display(),
                     e
@@ -223,7 +223,7 @@ pub fn discover_worktrees(repos_dir: &Path) -> Result<Vec<Worktree>> {
         let output = match output {
             Ok(out) => out,
             Err(e) => {
-                eprintln!(
+                log::warn!(
                     "Warning: Failed to list worktrees for {}: {}",
                     bare_repo_path.display(),
                     e
@@ -254,7 +254,7 @@ fn find_bare_repos(dir: &Path) -> Result<Vec<PathBuf>> {
         let entries = match std::fs::read_dir(&current_dir) {
             Ok(entries) => entries,
             Err(e) => {
-                eprintln!(
+                log::warn!(
                     "Warning: Failed to read directory {}: {}",
                     current_dir.display(),
                     e

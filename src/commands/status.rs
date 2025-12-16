@@ -127,7 +127,7 @@ pub async fn handle_status(id: Option<String>) -> Result<i32> {
             for minion_id in &stale_ids {
                 registry.remove(minion_id)?;
             }
-            eprintln!(
+            log::warn!(
                 "🗑️  Removed {} stale Minion(s) from registry",
                 stale_ids.len()
             );
@@ -204,7 +204,7 @@ pub async fn handle_status(id: Option<String>) -> Result<i32> {
         };
 
         if filtered.is_empty() {
-            eprintln!("No Minions found matching '{}'", filter_id);
+            log::warn!("No Minions found matching '{}'", filter_id);
             return Ok(1);
         }
         minions = filtered;

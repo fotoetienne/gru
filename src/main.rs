@@ -136,6 +136,17 @@ enum Commands {
 async fn main() {
     let cli = Cli::parse();
 
+    // Initialize logger based on quiet flag
+    if cli.quiet {
+        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("error"))
+            .format_timestamp(None)
+            .init();
+    } else {
+        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn"))
+            .format_timestamp(None)
+            .init();
+    }
+
     let result = match cli.command {
         Commands::Init { repo } => init::handle_init(repo).await,
         Commands::Fix { issue, timeout } => fix::handle_fix(&issue, timeout, cli.quiet).await,
@@ -164,7 +175,7 @@ async fn main() {
     match result {
         Ok(exit_code) => std::process::exit(exit_code),
         Err(e) => {
-            eprintln!("Error: {:#}", e);
+            log::error!("{:#}", e);
             std::process::exit(1);
         }
     }

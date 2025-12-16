@@ -115,9 +115,10 @@ pub async fn handle_review(pr_arg: Option<String>) -> Result<i32> {
 
     // Fetch the issue number linked to this PR (if any)
     let linked_issue = find_issue_for_pr(&pr_num).await.unwrap_or_else(|e| {
-        eprintln!(
+        log::warn!(
             "Warning: Failed to fetch linked issue for PR #{}: {}",
-            pr_num, e
+            pr_num,
+            e
         );
         0
     });
@@ -202,17 +203,17 @@ pub async fn handle_review(pr_arg: Option<String>) -> Result<i32> {
             let inactivity = last_event_time.elapsed();
 
             if inactivity.as_secs() >= INACTIVITY_STUCK_SECS {
-                eprintln!(
+                log::warn!(
                     "❌ Review appears stuck (no activity for {} minutes)",
                     INACTIVITY_STUCK_SECS / 60
                 );
-                eprintln!("📝 Events saved to events.jsonl");
+                log::info!("📝 Events saved to events.jsonl");
                 return Err(anyhow::anyhow!(
                     "No activity for {} minutes - review appears stuck",
                     INACTIVITY_STUCK_SECS / 60
                 ));
             } else if inactivity.as_secs() >= INACTIVITY_WARNING_SECS && !inactivity_warning_shown {
-                eprintln!(
+                log::warn!(
                     "⚠️  No activity for {} minutes",
                     INACTIVITY_WARNING_SECS / 60
                 );
@@ -262,9 +263,10 @@ pub async fn handle_review(pr_arg: Option<String>) -> Result<i32> {
     // Remove minion from registry (best effort - don't fail if this errors)
     if let Ok(mut registry) = MinionRegistry::load(None) {
         if let Err(e) = registry.remove(&minion_id) {
-            eprintln!(
+            log::warn!(
                 "Warning: Failed to remove minion {} from registry: {}",
-                minion_id, e
+                minion_id,
+                e
             );
         }
     }
@@ -453,9 +455,10 @@ async fn find_issue_for_pr(pr_num: &str) -> Result<u64> {
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        eprintln!(
+        log::warn!(
             "Warning: Failed to fetch linked issues for PR #{}: {}",
-            pr_num, stderr
+            pr_num,
+            stderr
         );
         return Ok(0);
     }
@@ -473,7 +476,7 @@ async fn find_issue_for_pr(pr_num: &str) -> Result<u64> {
         .parse::<u64>()
         .context("Failed to parse issue number from PR")
         .or_else(|e| {
-            eprintln!("Warning: {}", e);
+            log::warn!("Warning: {}", e);
             Ok(0)
         })
 }

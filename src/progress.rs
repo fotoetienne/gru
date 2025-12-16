@@ -115,7 +115,7 @@ impl ProgressDisplay {
                     .get("message")
                     .and_then(|m| m.as_str())
                     .unwrap_or("Unknown error");
-                eprintln!("Error: {}", error_msg);
+                log::error!("{}", error_msg);
             }
             return;
         }
@@ -140,7 +140,7 @@ impl ProgressDisplay {
             let names = match self.tool_names.lock() {
                 Ok(guard) => guard,
                 Err(poisoned) => {
-                    eprintln!("Warning: Tool names mutex poisoned, recovering");
+                    log::warn!("Tool names mutex poisoned, recovering");
                     poisoned.into_inner()
                 }
             };
@@ -325,7 +325,7 @@ impl ProgressDisplay {
                                 let mut names = match self.tool_names.lock() {
                                     Ok(guard) => guard,
                                     Err(poisoned) => {
-                                        eprintln!("Warning: Tool names mutex poisoned, recovering");
+                                        log::warn!("Tool names mutex poisoned, recovering");
                                         poisoned.into_inner()
                                     }
                                 };
@@ -336,7 +336,7 @@ impl ProgressDisplay {
                             let mut tracker = match self.tool_tracker.lock() {
                                 Ok(guard) => guard,
                                 Err(poisoned) => {
-                                    eprintln!("Warning: Tool tracker mutex poisoned, recovering");
+                                    log::warn!("Tool tracker mutex poisoned, recovering");
                                     poisoned.into_inner()
                                 }
                             };
@@ -372,9 +372,7 @@ impl ProgressDisplay {
                                 let mut tracker = match self.tool_tracker.lock() {
                                     Ok(guard) => guard,
                                     Err(poisoned) => {
-                                        eprintln!(
-                                            "Warning: Tool tracker mutex poisoned, recovering"
-                                        );
+                                        log::warn!("Tool tracker mutex poisoned, recovering");
                                         poisoned.into_inner()
                                     }
                                 };
@@ -392,7 +390,7 @@ impl ProgressDisplay {
                 let mut tracker = match self.tool_tracker.lock() {
                     Ok(guard) => guard,
                     Err(poisoned) => {
-                        eprintln!("Warning: Tool tracker mutex poisoned, recovering");
+                        log::warn!("Tool tracker mutex poisoned, recovering");
                         poisoned.into_inner()
                     }
                 };
@@ -446,7 +444,7 @@ impl ProgressDisplay {
                     .and_then(|m| m.as_str())
                     .unwrap_or("Unknown error");
                 self.print_event(&format!("[{}] Error: {}", timestamp, error_msg));
-                eprintln!("Error: {}", error_msg);
+                log::error!("{}", error_msg);
             }
             ClaudeEvent::Ping => {
                 // Keepalive ping - no action needed, spinner ticks below
