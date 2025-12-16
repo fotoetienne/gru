@@ -10,6 +10,7 @@ mod pr_monitor;
 mod pr_state;
 mod progress;
 mod progress_comments;
+mod reserved_commands;
 mod stream;
 mod text_buffer;
 mod url_utils;
