@@ -146,8 +146,9 @@ pub async fn handle_clean(dry_run: bool, force: bool, base_branch: &str) -> Resu
     // Note: There's a narrow race condition where a minion could start between registry load
     // and worktree checks. This is acceptable given the trade-offs and typical usage patterns.
     let registry = MinionRegistry::load(None).context(
-        "Failed to load minion registry. This may be due to a missing or corrupt registry file, \
-         or insufficient file permissions. Check that ~/.gru/state/minions.json exists and is accessible."
+        "Failed to load minion registry from the default location. This may be due to a missing \
+         or corrupt registry file, or insufficient file permissions. The default registry is \
+         typically located at ~/.gru/state/minions.json."
     )?;
 
     // Build a set of active minion worktree paths for O(1) lookup
@@ -155,10 +156,10 @@ pub async fn handle_clean(dry_run: bool, force: bool, base_branch: &str) -> Resu
     let active_minion_worktrees: HashSet<_> = registry
         .list()
         .into_iter()
-        .filter_map(|(_, info)| {
+        .map(|(_, info)| {
             // Canonicalize if path exists, otherwise use the original path
             // This handles symlinks (e.g., /var -> /private/var on macOS) and path normalization
-            info.worktree.canonicalize().ok().or(Some(info.worktree))
+            info.worktree.canonicalize().unwrap_or(info.worktree)
         })
         .collect();
 
