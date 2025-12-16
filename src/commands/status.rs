@@ -10,6 +10,7 @@ struct EnhancedMinionInfo {
     issue: u64,
     task: String,
     pr: Option<String>,
+    branch: String,
     status: String,
     uptime: String,
 }
@@ -22,6 +23,7 @@ struct BasicMinionData {
     issue: u64,
     task: String,
     pr: Option<String>,
+    branch: String,
     started_at: chrono::DateTime<chrono::Utc>,
     worktree: std::path::PathBuf,
 }
@@ -145,6 +147,7 @@ pub async fn handle_status(id: Option<String>) -> Result<i32> {
                 issue: info.issue,
                 task: info.command,
                 pr: info.pr,
+                branch: info.branch,
                 started_at: info.started_at,
                 worktree: info.worktree,
             })
@@ -173,6 +176,7 @@ pub async fn handle_status(id: Option<String>) -> Result<i32> {
                     issue: basic.issue,
                     task: basic.task,
                     pr: basic.pr,
+                    branch: basic.branch,
                     status,
                     uptime,
                 }
@@ -225,8 +229,8 @@ pub async fn handle_status(id: Option<String>) -> Result<i32> {
 
     // Print table header
     println!(
-        "{:<8} {:<20} {:<8} {:<10} {:<8} {:<10} {:<8}",
-        "MINION", "REPO", "ISSUE", "TASK", "PR", "STATUS", "UPTIME"
+        "{:<8} {:<20} {:<8} {:<10} {:<8} {:<25} {:<10} {:<8}",
+        "MINION", "REPO", "ISSUE", "TASK", "PR", "BRANCH", "STATUS", "UPTIME"
     );
 
     // Print each minion
@@ -239,12 +243,13 @@ pub async fn handle_status(id: Option<String>) -> Result<i32> {
             .unwrap_or_else(|| "-".to_string());
 
         println!(
-            "{:<8} {:<20} {:<8} {:<10} {:<8} {:<10} {:<8}",
+            "{:<8} {:<20} {:<8} {:<10} {:<8} {:<25} {:<10} {:<8}",
             minion.minion_id,
             minion.repo,
             issue_display,
             minion.task,
             pr_display,
+            minion.branch,
             minion.status,
             minion.uptime
         );
