@@ -135,10 +135,14 @@ pub async fn handle_review(pr_arg: Option<String>) -> Result<i32> {
         pr: Some(pr_num.clone()),
     };
 
-    let mut registry = MinionRegistry::load(None).context("Failed to load Minion registry")?;
-    registry
-        .register(minion_id.clone(), registry_info)
-        .context("Failed to register review Minion in registry")?;
+    // Load registry and register the Minion (spawn_blocking to avoid holding lock during review)
+    let minion_id_clone = minion_id.clone();
+    tokio::task::spawn_blocking(move || {
+        let mut registry = MinionRegistry::load(None)?;
+        registry.register(minion_id_clone, registry_info)
+    })
+    .await
+    .context("Failed to spawn blocking task for registry registration")??;
 
     println!("🤖 Launching autonomous review agent...\n");
 
