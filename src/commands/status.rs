@@ -98,7 +98,7 @@ fn determine_status(worktree_path: &std::path::Path) -> String {
 ///
 /// To minimize registry lock hold time and prevent blocking other minions:
 ///
-/// **Phase 1 (with lock):** Load registry, migrate worktrees, clean up stale entries,
+/// **Phase 1 (with lock):** Load registry, clean up stale entries,
 /// extract basic minion data, then release lock by dropping the registry.
 ///
 /// **Phase 2 (no lock):** Perform expensive git operations via `determine_status()`
