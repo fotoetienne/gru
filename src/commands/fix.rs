@@ -284,6 +284,7 @@ async fn create_pr_for_issue(
     issue_num: &str,
     minion_id: &str,
     worktree_path: &Path,
+    issue_title_opt: Option<&str>,
 ) -> Result<String> {
     // Get the default branch (usually main or master)
     let base_branch_output = TokioCommand::new("git")
@@ -307,25 +308,30 @@ async fn create_pr_for_issue(
 
     println!("📌 Creating PR targeting base branch: {}", base_branch);
 
-    // Get issue title from GitHub API or CLI
-    let issue_number: u64 = issue_num.parse().context("Failed to parse issue number")?;
-
-    let issue_title = if let Some(github_client) = GitHubClient::try_from_env(owner, repo).await {
-        // Use API if token is available
-        let issue = github_client
-            .get_issue(owner, repo, issue_number)
-            .await
-            .context("Failed to fetch issue from GitHub API")?;
-        issue.title
+    // Get issue title - use provided title if available, otherwise fetch
+    let issue_title = if let Some(title) = issue_title_opt {
+        title.to_string()
     } else {
-        // Fall back to gh CLI
-        println!("ℹ️  No GitHub authentication found, using gh CLI for GitHub operations");
-        let issue = crate::github::get_issue_via_cli(owner, repo, issue_number)
-            .await
-            .context(
-                "Failed to fetch issue using gh CLI. Make sure gh is installed and authenticated.",
-            )?;
-        issue.title
+        // Fetch issue title if not provided
+        let issue_number: u64 = issue_num.parse().context("Failed to parse issue number")?;
+
+        if let Some(github_client) = GitHubClient::try_from_env(owner, repo).await {
+            // Use API if token is available
+            let issue = github_client
+                .get_issue(owner, repo, issue_number)
+                .await
+                .context("Failed to fetch issue from GitHub API")?;
+            issue.title
+        } else {
+            // Fall back to gh CLI
+            println!("ℹ️  No GitHub authentication found, using gh CLI for GitHub operations");
+            let issue = crate::github::get_issue_via_cli(owner, repo, issue_number)
+                .await
+                .context(
+                    "Failed to fetch issue using gh CLI. Make sure gh is installed and authenticated.",
+                )?;
+            issue.title
+        }
     };
 
     // Check if work is complete (description file exists)
@@ -407,6 +413,25 @@ async fn create_pr_for_issue(
     }
 
     Ok(pr_number)
+}
+
+/// Handles the result of fetching issue details via CLI
+/// Returns Some with (title, body, empty labels) on success, None on failure
+async fn handle_cli_fetch_result(
+    result: Result<crate::github::IssueInfo>,
+) -> Option<(String, String, String)> {
+    match result {
+        Ok(issue_info) => {
+            // CLI version doesn't include labels, but we can still provide title and body
+            let body = issue_info.body.unwrap_or_default();
+            Some((issue_info.title, body, String::new()))
+        }
+        Err(e) => {
+            eprintln!("⚠️  Failed to fetch issue details via CLI: {}", e);
+            eprintln!("   Continuing with basic prompt format");
+            None
+        }
+    }
 }
 
 /// Parses a timeout string into a Duration
@@ -700,11 +725,84 @@ pub async fn handle_fix(issue: &str, timeout_opt: Option<String>, quiet: bool) -
         }
     }
 
+    // Parse issue number once for reuse
+    let issue_number_opt = issue_num.parse::<u64>().ok();
+
+    // Fetch issue details to include in the prompt
+    let issue_details = if let Some(issue_number) = issue_number_opt {
+        if let Some(ref client) = github_client {
+            // Try to fetch using API
+            match client.get_issue(&owner, &repo, issue_number).await {
+                Ok(issue) => {
+                    let labels = issue
+                        .labels
+                        .iter()
+                        .map(|l| l.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let body = issue.body.unwrap_or_default();
+                    Some((issue.title, body, labels))
+                }
+                Err(e) => {
+                    eprintln!("⚠️  Failed to fetch issue details via API: {}", e);
+                    eprintln!("   Falling back to gh CLI...");
+                    // Try CLI fallback
+                    let cli_result =
+                        crate::github::get_issue_via_cli(&owner, &repo, issue_number).await;
+                    let result = handle_cli_fetch_result(cli_result).await;
+
+                    // Only show auth guidance if both API and CLI failed
+                    if result.is_none() {
+                        eprintln!("   Fix authentication with: gh auth login");
+                    }
+                    result
+                }
+            }
+        } else {
+            // No API client - try CLI directly
+            let cli_result = crate::github::get_issue_via_cli(&owner, &repo, issue_number).await;
+            let result = handle_cli_fetch_result(cli_result).await;
+
+            // Show auth guidance when CLI fails and we have no API client
+            if result.is_none() {
+                eprintln!("   Fix authentication with: gh auth login");
+            }
+            result
+        }
+    } else {
+        None
+    };
+
     // Generate a unique session ID for conversation continuity
     let session_id = Uuid::new_v4();
 
+    // Format the prompt with issue details
+    let prompt = if let Some((title, body, labels)) = issue_details.as_ref() {
+        let labels_section = if labels.is_empty() {
+            String::new()
+        } else {
+            format!("\nLabels: {}", labels)
+        };
+
+        format!(
+            r#"Fix this GitHub issue:
+
+Issue #{}: {}
+URL: https://github.com/{}/{}/issues/{}{}
+
+Description:
+{}
+
+Please implement a fix for this issue."#,
+            issue_num, title, owner, repo, issue_num, labels_section, body
+        )
+    } else {
+        // Fall back to simple prompt if we couldn't fetch issue details
+        format!("/fix {}", issue_num)
+    };
+
     // Build the command with custom environment variable for main fix flow
-    let mut cmd = build_claude_command(&worktree_path, &session_id, &format!("/fix {}", issue_num));
+    let mut cmd = build_claude_command(&worktree_path, &session_id, &prompt);
     cmd.env("GRU_WORKSPACE", &minion_id);
 
     // Create state for the callback
@@ -807,6 +905,9 @@ pub async fn handle_fix(issue: &str, timeout_opt: Option<String>, quiet: bool) -
         if branch_pushed {
             println!("📋 Branch was pushed, creating pull request...");
 
+            // Pass the cached issue title to avoid duplicate fetching
+            let issue_title_cached = issue_details.as_ref().map(|(title, _, _)| title.as_str());
+
             match create_pr_for_issue(
                 &owner,
                 &repo,
@@ -814,6 +915,7 @@ pub async fn handle_fix(issue: &str, timeout_opt: Option<String>, quiet: bool) -
                 &issue_num,
                 &minion_id,
                 &worktree_path,
+                issue_title_cached,
             )
             .await
             {
