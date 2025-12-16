@@ -38,6 +38,9 @@ const TRIM_OUTPUT_BUFFER_SIZE: usize = 5000;
 /// Exit code returned when a process is terminated by a signal (shell convention)
 const EXIT_CODE_SIGNAL_TERMINATED: i32 = 128;
 
+/// Delay in seconds before retrying a session that's reported as "already in use"
+const SESSION_RETRY_DELAY_SECS: u64 = 5;
+
 /// Default timeout for review process in seconds (30 minutes)
 /// Reviews can take longer than fixes due to analysis depth
 const DEFAULT_REVIEW_TIMEOUT_SECS: u64 = 1800;
@@ -920,7 +923,8 @@ pub async fn handle_fix(issue: &str, timeout_opt: Option<String>, quiet: bool) -
                                 println!("🔄 Re-invoking to address review feedback...\n");
 
                                 // Re-invoke Claude with the same session ID to maintain context
-                                match invoke_claude_for_reviews(
+                                // Try with original session, retry with delay if locked, fallback to new session if needed
+                                let result = match invoke_claude_for_reviews(
                                     &worktree_path,
                                     &session_id,
                                     &review_prompt,
@@ -928,6 +932,48 @@ pub async fn handle_fix(issue: &str, timeout_opt: Option<String>, quiet: bool) -
                                 )
                                 .await
                                 {
+                                    Err(e) if e.to_string().contains("already in use") => {
+                                        println!(
+                                            "⏳ Session temporarily locked, waiting {} seconds...",
+                                            SESSION_RETRY_DELAY_SECS
+                                        );
+                                        tokio::time::sleep(Duration::from_secs(
+                                            SESSION_RETRY_DELAY_SECS,
+                                        ))
+                                        .await;
+
+                                        // Retry with original session
+                                        match invoke_claude_for_reviews(
+                                            &worktree_path,
+                                            &session_id,
+                                            &review_prompt,
+                                            timeout_opt.as_deref(),
+                                        )
+                                        .await
+                                        {
+                                            Ok(()) => Ok(()),
+                                            Err(retry_err)
+                                                if retry_err
+                                                    .to_string()
+                                                    .contains("already in use") =>
+                                            {
+                                                println!("⚠️  Session still locked, using fresh session (context will be limited)");
+                                                let new_session = Uuid::new_v4();
+                                                invoke_claude_for_reviews(
+                                                    &worktree_path,
+                                                    &new_session,
+                                                    &review_prompt,
+                                                    timeout_opt.as_deref(),
+                                                )
+                                                .await
+                                            }
+                                            Err(other_err) => Err(other_err),
+                                        }
+                                    }
+                                    result => result,
+                                };
+
+                                match result {
                                     Ok(()) => {
                                         println!("\n✅ Finished addressing review comments");
                                         println!("🔄 Continuing to monitor PR...\n");
