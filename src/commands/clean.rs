@@ -2,6 +2,7 @@ use crate::minion_registry::MinionRegistry;
 use crate::workspace;
 use crate::worktree_scanner;
 use anyhow::{Context, Result};
+use std::collections::HashSet;
 use std::io::Write;
 use std::path::Path;
 use tokio::io::AsyncBufReadExt;
@@ -142,11 +143,23 @@ pub async fn handle_clean(dry_run: bool, force: bool, base_branch: &str) -> Resu
     println!("Found {} worktrees. Checking status...\n", worktrees.len());
 
     // Load registry and get active minion worktrees
-    let registry = MinionRegistry::load(None).context("Failed to load minion registry")?;
-    let active_minion_worktrees: std::collections::HashSet<_> = registry
+    // Note: There's a narrow race condition where a minion could start between registry load
+    // and worktree checks. This is acceptable given the trade-offs and typical usage patterns.
+    let registry = MinionRegistry::load(None).context(
+        "Failed to load minion registry. This may be due to a missing or corrupt registry file, \
+         or insufficient file permissions. Check that ~/.gru/state/minions.json exists and is accessible."
+    )?;
+
+    // Build a set of active minion worktree paths for O(1) lookup
+    // Canonicalize paths to handle symlinks and different path representations
+    let active_minion_worktrees: HashSet<_> = registry
         .list()
         .into_iter()
-        .map(|(_, info)| info.worktree)
+        .filter_map(|(_, info)| {
+            // Canonicalize if path exists, otherwise use the original path
+            // This handles symlinks (e.g., /var -> /private/var on macOS) and path normalization
+            info.worktree.canonicalize().ok().or(Some(info.worktree))
+        })
         .collect();
 
     // Check status of each worktree
@@ -154,7 +167,9 @@ pub async fn handle_clean(dry_run: bool, force: bool, base_branch: &str) -> Resu
     let mut skipped_active_minions = Vec::new();
     for wt in worktrees {
         // Skip if this worktree has an active minion
-        if active_minion_worktrees.contains(&wt.path) {
+        // Canonicalize the worktree path for reliable comparison
+        let canonical_wt_path = wt.path.canonicalize().unwrap_or_else(|_| wt.path.clone());
+        if active_minion_worktrees.contains(&canonical_wt_path) {
             skipped_active_minions.push(wt);
             continue;
         }
