@@ -10,6 +10,7 @@ mod pr_monitor;
 mod pr_state;
 mod progress;
 mod progress_comments;
+mod prompt_loader;
 mod reserved_commands;
 mod stream;
 mod text_buffer;
