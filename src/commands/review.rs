@@ -145,7 +145,7 @@ pub async fn handle_review(pr_arg: Option<String>) -> Result<i32> {
     // Create progress display for review
     let config = ProgressConfig {
         minion_id: minion_id.clone(),
-        issue: pr_num.clone(),
+        issue: linked_issue.to_string(),
         quiet: false,
     };
     let progress = ProgressDisplay::new(config);
