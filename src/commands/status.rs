@@ -51,7 +51,7 @@ fn calculate_uptime(started_at: chrono::DateTime<chrono::Utc>) -> String {
 /// Gets the current branch name from a worktree
 /// Returns the actual branch name, or a placeholder for special cases:
 /// - "(detached)" if HEAD is detached
-/// - "(deleted)" if the branch from registry doesn't match current branch
+/// - "{branch} (!)" if the branch differs from what was registered (e.g., changed or registry is stale)
 /// - "(error)" if git command fails
 fn get_current_branch(worktree_path: &std::path::Path, registry_branch: &str) -> String {
     let output = std::process::Command::new("git")
