@@ -18,6 +18,7 @@ Review a GitHub pull request: fetch details, analyze changes, and provide feedba
 - Understand the scope and intent of the PR, and any prior discussion
 - The code should already be checked out in the current directory
 - If this PR is addressing an Issue, read Issue details to understand the problem and context. Does this PR address the issue completely? Are there any missing details or assumptions?
+- You don't need to run tests - CI will handle that.
 
 ## 2. Analyze the Changes
 - Review each file changed in the diff
