@@ -2,6 +2,7 @@ use crate::minion_registry::MinionRegistry;
 use crate::workspace;
 use crate::worktree_scanner;
 use anyhow::{Context, Result};
+use std::collections::HashSet;
 use std::io::Write;
 use std::path::Path;
 use tokio::io::AsyncBufReadExt;
@@ -141,9 +142,64 @@ pub async fn handle_clean(dry_run: bool, force: bool, base_branch: &str) -> Resu
 
     println!("Found {} worktrees. Checking status...\n", worktrees.len());
 
+    // Load registry and get active minion worktrees
+    // Note: There's a narrow race condition where a minion could start between registry load
+    // and worktree checks. This is acceptable given the trade-offs and typical usage patterns.
+    let registry = MinionRegistry::load(None).context(
+        "Failed to load minion registry from the default location. This may be due to a missing \
+         or corrupt registry file, or insufficient file permissions. The default registry is \
+         typically located at ~/.gru/state/minions.json.",
+    )?;
+
+    // Build a set of active minion worktree paths for O(1) lookup
+    // Canonicalize paths to handle symlinks and different path representations
+    let active_minion_worktrees: HashSet<_> = registry
+        .list()
+        .into_iter()
+        .map(|(minion_id, info)| {
+            // Canonicalize if possible, otherwise use the original path
+            // This handles symlinks (e.g., /var -> /private/var on macOS) and path normalization
+            match info.worktree.canonicalize() {
+                Ok(canonical) => canonical,
+                Err(e) => {
+                    // Log canonicalization failures to help diagnose potential path matching issues
+                    eprintln!(
+                        "Warning: Failed to canonicalize worktree path for minion {}: {} (error: {})",
+                        minion_id,
+                        info.worktree.display(),
+                        e
+                    );
+                    eprintln!("         Using original path, but this may cause comparison mismatches.");
+                    info.worktree
+                }
+            }
+        })
+        .collect();
+
     // Check status of each worktree
     let mut cleanable = Vec::new();
+    let mut skipped_active_minions = Vec::new();
     for wt in worktrees {
+        // Skip if this worktree has an active minion
+        // Canonicalize the worktree path for reliable comparison
+        let canonical_wt_path = match wt.path.canonicalize() {
+            Ok(canonical) => canonical,
+            Err(e) => {
+                eprintln!(
+                    "Warning: Failed to canonicalize worktree path: {} (error: {})",
+                    wt.path.display(),
+                    e
+                );
+                eprintln!("         Using original path for comparison.");
+                wt.path.clone()
+            }
+        };
+
+        if active_minion_worktrees.contains(&canonical_wt_path) {
+            skipped_active_minions.push(wt);
+            continue;
+        }
+
         let status = wt
             .status(base_branch)
             .with_context(|| format!("Failed to check status of {}", wt.path.display()))?;
@@ -153,8 +209,28 @@ pub async fn handle_clean(dry_run: bool, force: bool, base_branch: &str) -> Resu
         }
     }
 
+    // Display skipped worktrees with active minions
+    if !skipped_active_minions.is_empty() {
+        println!(
+            "Skipped {} worktree(s) with active minions:\n",
+            skipped_active_minions.len()
+        );
+        for wt in &skipped_active_minions {
+            println!("  {} (active minion)", wt.path.display());
+            println!("    Branch: {}", wt.branch);
+            println!("    Repo: {}", wt.repo);
+            println!();
+        }
+    }
+
     if cleanable.is_empty() {
-        println!("No worktrees to clean.");
+        if skipped_active_minions.is_empty() {
+            println!("No worktrees to clean.");
+        } else {
+            println!(
+                "No cleanable worktrees found (all worktrees were skipped due to active minions)."
+            );
+        }
         return Ok(0);
     }
 
