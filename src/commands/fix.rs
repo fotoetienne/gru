@@ -631,7 +631,7 @@ pub async fn handle_fix(issue: &str, timeout_opt: Option<String>, quiet: bool) -
     // Create progress display
     let config = ProgressConfig {
         minion_id: minion_id.clone(),
-        issue: issue.to_string(),
+        issue: issue_num.to_string(),
         quiet,
     };
     let progress = ProgressDisplay::new(config);
