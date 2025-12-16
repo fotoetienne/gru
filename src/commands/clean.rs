@@ -227,8 +227,6 @@ pub async fn handle_clean(dry_run: bool, force: bool, base_branch: &str) -> Resu
         if skipped_active_minions.is_empty() {
             println!("No worktrees to clean.");
         } else {
-            println!("No cleanable worktrees found (some were skipped due to active minions).");
-        } else {
             println!(
                 "No cleanable worktrees found (all worktrees were skipped due to active minions)."
             );
