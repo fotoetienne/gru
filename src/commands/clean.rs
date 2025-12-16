@@ -163,13 +163,13 @@ pub async fn handle_clean(dry_run: bool, force: bool, base_branch: &str) -> Resu
                 Ok(canonical) => canonical,
                 Err(e) => {
                     // Log canonicalization failures to help diagnose potential path matching issues
-                    eprintln!(
+                    log::warn!(
                         "Warning: Failed to canonicalize worktree path for minion {}: {} (error: {})",
                         minion_id,
                         info.worktree.display(),
                         e
                     );
-                    eprintln!("         Using original path, but this may cause comparison mismatches.");
+                    log::warn!("         Using original path, but this may cause comparison mismatches.");
                     info.worktree
                 }
             }
@@ -185,12 +185,12 @@ pub async fn handle_clean(dry_run: bool, force: bool, base_branch: &str) -> Resu
         let canonical_wt_path = match wt.path.canonicalize() {
             Ok(canonical) => canonical,
             Err(e) => {
-                eprintln!(
+                log::warn!(
                     "Warning: Failed to canonicalize worktree path: {} (error: {})",
                     wt.path.display(),
                     e
                 );
-                eprintln!("         Using original path for comparison.");
+                log::warn!("         Using original path for comparison.");
                 wt.path.clone()
             }
         };
@@ -301,7 +301,7 @@ pub async fn handle_clean(dry_run: bool, force: bool, base_branch: &str) -> Resu
             Ok(result) => result,
             Err(e) => {
                 println!("✗");
-                eprintln!("  Error checking worktree status: {}", e);
+                log::error!("  Error checking worktree status: {}", e);
                 failed += 1;
                 continue;
             }
@@ -349,7 +349,7 @@ pub async fn handle_clean(dry_run: bool, force: bool, base_branch: &str) -> Resu
                 .output();
 
             if let Err(e) = branch_result {
-                eprintln!("  Warning: Failed to delete branch: {}", e);
+                log::warn!("  Warning: Failed to delete branch: {}", e);
             }
 
             // Remove from registry (best effort - extract minion ID from worktree path)
@@ -365,9 +365,10 @@ pub async fn handle_clean(dry_run: bool, force: bool, base_branch: &str) -> Resu
                         if let Err(e) = registry.remove(dir_str) {
                             // Only log if it looks like a minion ID (starts with M)
                             if dir_str.starts_with('M') {
-                                eprintln!(
+                                log::warn!(
                                     "  Warning: Failed to remove minion {} from registry: {}",
-                                    dir_str, e
+                                    dir_str,
+                                    e
                                 );
                             }
                         }
@@ -377,15 +378,15 @@ pub async fn handle_clean(dry_run: bool, force: bool, base_branch: &str) -> Resu
         } else {
             println!("✗");
             let stderr = String::from_utf8_lossy(&status.stderr);
-            eprintln!("  Error: {}", stderr);
+            log::error!("  Error: {}", stderr);
 
             // If removal failed due to important files, provide helpful message
             if has_modified
                 && !only_ephemeral
                 && stderr.contains("contains modified or untracked files")
             {
-                eprintln!("  Worktree contains important uncommitted changes.");
-                eprintln!("  Run 'gru clean --force' or manually clean the worktree first.");
+                log::warn!("  Worktree contains important uncommitted changes.");
+                log::warn!("  Run 'gru clean --force' or manually clean the worktree first.");
             }
 
             failed += 1;

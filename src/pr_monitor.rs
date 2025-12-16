@@ -231,9 +231,10 @@ async fn get_review_comments(
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             // Log error but continue processing other reviews
-            eprintln!(
+            log::warn!(
                 "Warning: Failed to fetch comments for review {}: {}",
-                review.id, stderr
+                review.id,
+                stderr
             );
             failed_reviews += 1;
             continue;
@@ -255,7 +256,7 @@ async fn get_review_comments(
 
     // Log summary if any reviews failed to fetch
     if failed_reviews > 0 {
-        eprintln!(
+        log::warn!(
             "⚠️  Failed to fetch comments from {} out of {} review(s)",
             failed_reviews,
             reviews.len()

@@ -162,8 +162,8 @@ where
             if let Some(max_duration) = max_timeout {
                 let elapsed = task_start.elapsed();
                 if elapsed >= max_duration {
-                    eprintln!("⏱️  Task timeout reached ({:?})", max_duration);
-                    eprintln!("📝 Events saved to events.jsonl");
+                    log::info!("⏱️  Task timeout reached ({:?})", max_duration);
+                    log::info!("📝 Events saved to events.jsonl");
                     return Err(anyhow::anyhow!(
                         "Task exceeded maximum timeout of {:?}",
                         max_duration
@@ -175,17 +175,17 @@ where
             let inactivity = last_event_time.elapsed();
 
             if inactivity.as_secs() >= INACTIVITY_STUCK_SECS {
-                eprintln!(
+                log::error!(
                     "❌ Task appears stuck (no activity for {} minutes)",
                     INACTIVITY_STUCK_SECS / 60
                 );
-                eprintln!("📝 Events saved to events.jsonl");
+                log::info!("📝 Events saved to events.jsonl");
                 return Err(anyhow::anyhow!(
                     "No activity for {} minutes - task appears stuck",
                     INACTIVITY_STUCK_SECS / 60
                 ));
             } else if inactivity.as_secs() >= INACTIVITY_WARNING_SECS && !inactivity_warning_shown {
-                eprintln!(
+                log::warn!(
                     "⚠️  No activity for {} minutes",
                     INACTIVITY_WARNING_SECS / 60
                 );
@@ -302,7 +302,7 @@ async fn create_pr_for_issue(
             .trim_start_matches("refs/remotes/origin/")
             .to_string()
     } else {
-        eprintln!("⚠️  Could not detect default branch, using 'main'");
+        log::warn!("⚠️  Could not detect default branch, using 'main'");
         "main".to_string() // Fallback to main
     };
 
@@ -339,7 +339,7 @@ async fn create_pr_for_issue(
     let should_mark_ready = match tokio::fs::try_exists(&description_path).await {
         Ok(exists) => exists,
         Err(e) => {
-            eprintln!(
+            log::warn!(
                 "⚠️  Warning: Failed to check if PR_DESCRIPTION.md exists: {}",
                 e
             );
@@ -358,7 +358,9 @@ async fn create_pr_for_issue(
             }
             _ => {
                 // File exists but couldn't be read or is empty - treat as WIP
-                eprintln!("⚠️  Warning: PR_DESCRIPTION.md exists but couldn't be read or is empty");
+                log::warn!(
+                    "⚠️  Warning: PR_DESCRIPTION.md exists but couldn't be read or is empty"
+                );
                 create_wip_template(minion_id, issue_num, &issue_title)
             }
         }
@@ -388,27 +390,28 @@ async fn create_pr_for_issue(
                     println!("✅ PR #{} marked ready for review", pr_number);
                 }
                 Err(e) => {
-                    eprintln!("⚠️  Warning: Failed to mark PR ready: {}", e);
-                    eprintln!(
+                    log::warn!("⚠️  Warning: Failed to mark PR ready: {}", e);
+                    log::warn!(
                         "   PR #{} created as draft - you can mark it ready manually",
                         pr_number
                     );
                 }
             }
         } else {
-            eprintln!(
+            log::warn!(
                 "⚠️  Warning: No GitHub authentication found - cannot mark PR ready automatically"
             );
-            eprintln!(
+            log::warn!(
                 "   You can mark PR #{} ready with: gh pr ready {}",
-                pr_number, pr_number
+                pr_number,
+                pr_number
             );
         }
 
         // Clean up description file
         if let Err(e) = tokio::fs::remove_file(&description_path).await {
-            eprintln!("⚠️  Warning: Failed to remove PR_DESCRIPTION.md: {}", e);
-            eprintln!("   File will be cleaned up by 'gru clean'");
+            log::warn!("⚠️  Warning: Failed to remove PR_DESCRIPTION.md: {}", e);
+            log::warn!("   File will be cleaned up by 'gru clean'");
         }
     }
 
@@ -597,13 +600,13 @@ async fn try_post_progress_comment(
             {
                 Ok(_) => true,
                 Err(e) => {
-                    eprintln!("⚠️  Failed to post progress comment: {}", e);
+                    log::warn!("⚠️  Failed to post progress comment: {}", e);
                     false
                 }
             }
         }
         Err(_) => {
-            eprintln!("⚠️  Invalid issue number format: {}", issue_num);
+            log::warn!("⚠️  Invalid issue number format: {}", issue_num);
             false
         }
     }
@@ -705,20 +708,20 @@ pub async fn handle_fix(issue: &str, timeout_opt: Option<String>, quiet: bool) -
                     println!("🏷️  Added 'in-progress' label to issue #{}", issue_num);
                 }
                 Ok(false) => {
-                    eprintln!(
+                    log::warn!(
                         "⚠️  Issue #{} is already claimed by another Minion",
                         issue_num
                     );
-                    eprintln!("   This may indicate a race condition or multiple gru instances.");
-                    eprintln!("   Continuing anyway (worktree already created)...");
+                    log::warn!("   This may indicate a race condition or multiple gru instances.");
+                    log::warn!("   Continuing anyway (worktree already created)...");
                 }
                 Err(e) => {
-                    eprintln!("⚠️  Failed to add label to issue: {}", e);
-                    eprintln!("   Continuing anyway...");
+                    log::warn!("⚠️  Failed to add label to issue: {}", e);
+                    log::warn!("   Continuing anyway...");
                 }
             }
         } else {
-            eprintln!(
+            log::warn!(
                 "⚠️  Invalid issue number '{}', cannot update labels",
                 issue_num
             );
@@ -953,11 +956,11 @@ Please implement a fix for this issue."#,
                                     println!("🏷️  Updated issue label to 'minion:done'");
                                 }
                                 Err(e) => {
-                                    eprintln!("⚠️  Failed to update issue label: {}", e);
+                                    log::warn!("⚠️  Failed to update issue label: {}", e);
                                 }
                             }
                         } else {
-                            eprintln!(
+                            log::warn!(
                                 "⚠️  Invalid issue number '{}', cannot update labels",
                                 issue_num
                             );
@@ -971,15 +974,15 @@ Please implement a fix for this issue."#,
                             if review_exit_code == 0 {
                                 println!("✅ PR review completed successfully");
                             } else {
-                                eprintln!(
+                                log::warn!(
                                     "⚠️  PR review completed with exit code: {}",
                                     review_exit_code
                                 );
                             }
                         }
                         Err(e) => {
-                            eprintln!("⚠️  Failed to run PR review: {}", e);
-                            eprintln!("   You can review manually with: gru review {}", pr_number);
+                            log::warn!("⚠️  Failed to run PR review: {}", e);
+                            log::warn!("   You can review manually with: gru review {}", pr_number);
                         }
                     }
 
@@ -1031,11 +1034,12 @@ Please implement a fix for this issue."#,
                                 let issue_number = match issue_num.parse::<u64>() {
                                     Ok(num) => num,
                                     Err(e) => {
-                                        eprintln!(
+                                        log::warn!(
                                             "⚠️  Failed to parse issue number '{}': {}",
-                                            issue_num, e
+                                            issue_num,
+                                            e
                                         );
-                                        eprintln!("   Cannot format review prompt without a valid issue number");
+                                        log::warn!("   Cannot format review prompt without a valid issue number");
                                         break;
                                     }
                                 };
@@ -1069,8 +1073,8 @@ Please implement a fix for this issue."#,
                                         // would track processed review IDs or return last_check_time from monitor_pr.
                                     }
                                     Err(e) => {
-                                        eprintln!("⚠️  Failed to address review comments: {}", e);
-                                        eprintln!("   You can address them manually");
+                                        log::warn!("⚠️  Failed to address review comments: {}", e);
+                                        log::warn!("   You can address them manually");
                                         break;
                                     }
                                 }
@@ -1088,8 +1092,8 @@ Please implement a fix for this issue."#,
                                 break;
                             }
                             Err(e) => {
-                                eprintln!("⚠️  PR monitoring failed: {}", e);
-                                eprintln!(
+                                log::warn!("⚠️  PR monitoring failed: {}", e);
+                                log::warn!(
                                     "   You can monitor manually at: https://github.com/{}/{}/pull/{}",
                                     owner, repo, pr_number
                                 );
@@ -1103,17 +1107,17 @@ Please implement a fix for this issue."#,
                     if err_msg.contains("already exists")
                         || err_msg.contains("A pull request for branch")
                     {
-                        eprintln!("ℹ️  A PR already exists for branch '{}'", branch_name);
-                        eprintln!("   Check: https://github.com/{}/{}/pulls", owner, repo);
+                        log::info!("ℹ️  A PR already exists for branch '{}'", branch_name);
+                        log::info!("   Check: https://github.com/{}/{}/pulls", owner, repo);
                     } else if err_msg.contains("branch not found")
                         || err_msg.contains("does not exist")
                     {
-                        eprintln!("⚠️  Branch was pushed but is no longer available.");
-                        eprintln!("   It may have been deleted or force-pushed.");
+                        log::warn!("⚠️  Branch was pushed but is no longer available.");
+                        log::warn!("   It may have been deleted or force-pushed.");
                     } else {
-                        eprintln!("⚠️  Failed to create PR: {}", e);
+                        log::warn!("⚠️  Failed to create PR: {}", e);
                     }
-                    eprintln!("   You can create the PR manually if needed.");
+                    log::warn!("   You can create the PR manually if needed.");
                 }
             }
         } else {
@@ -1131,11 +1135,11 @@ Please implement a fix for this issue."#,
                         println!("🏷️  Updated issue label to 'minion:failed'");
                     }
                     Err(e) => {
-                        eprintln!("⚠️  Failed to update issue label: {}", e);
+                        log::warn!("⚠️  Failed to update issue label: {}", e);
                     }
                 }
             } else {
-                eprintln!(
+                log::warn!(
                     "⚠️  Invalid issue number '{}', cannot update labels",
                     issue_num
                 );

@@ -233,7 +233,7 @@ fn load_prompts_internal(
         for (name, path) in global_files {
             // Validate against reserved commands
             if let Err(e) = reserved_commands::validate_not_reserved(&name) {
-                eprintln!("Warning: Skipping global prompt '{}': {}", name, e);
+                log::warn!("Warning: Skipping global prompt '{}': {}", name, e);
                 continue;
             }
 
@@ -242,7 +242,7 @@ fn load_prompts_internal(
                     prompts.insert(name, prompt);
                 }
                 Err(e) => {
-                    eprintln!("Warning: Failed to load global prompt '{}': {}", name, e);
+                    log::warn!("Warning: Failed to load global prompt '{}': {}", name, e);
                 }
             }
         }
@@ -259,7 +259,7 @@ fn load_prompts_internal(
         for (name, path) in repo_files {
             // Validate against reserved commands
             if let Err(e) = reserved_commands::validate_not_reserved(&name) {
-                eprintln!("Warning: Skipping repo prompt '{}': {}", name, e);
+                log::warn!("Warning: Skipping repo prompt '{}': {}", name, e);
                 continue;
             }
 
@@ -269,7 +269,7 @@ fn load_prompts_internal(
                     prompts.insert(name, prompt);
                 }
                 Err(e) => {
-                    eprintln!("Warning: Failed to load repo prompt '{}': {}", name, e);
+                    log::warn!("Warning: Failed to load repo prompt '{}': {}", name, e);
                 }
             }
         }

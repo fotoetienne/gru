@@ -90,15 +90,15 @@ pub async fn handle_init(repo_arg: String) -> Result<i32> {
     let github_client = match GitHubClient::from_env(&owner, &repo).await {
         Ok(client) => client,
         Err(_) => {
-            eprintln!("\n❌ GitHub token not found or invalid\n");
-            eprintln!(
+            log::error!("\n❌ GitHub token not found or invalid\n");
+            log::warn!(
                 "To use Gru, you need a GitHub personal access token with the following scopes:"
             );
-            eprintln!("  • repo (Full control of private repositories)");
-            eprintln!("  • read:org (Read org and team membership)\n");
-            eprintln!("Create a token at: https://github.com/settings/tokens\n");
-            eprintln!("Then set it as an environment variable:");
-            eprintln!("  export GRU_GITHUB_TOKEN=ghp_xxxxxxxxxxxx\n");
+            log::error!("  • repo (Full control of private repositories)");
+            log::error!("  • read:org (Read org and team membership)\n");
+            log::error!("Create a token at: https://github.com/settings/tokens\n");
+            log::error!("Then set it as an environment variable:");
+            log::error!("  export GRU_GITHUB_TOKEN=ghp_xxxxxxxxxxxx\n");
             return Ok(1);
         }
     };
@@ -109,8 +109,8 @@ pub async fn handle_init(repo_arg: String) -> Result<i32> {
             println!("✓ Authenticated as: {}", user.login);
         }
         Err(e) => {
-            eprintln!("\n❌ Failed to authenticate with GitHub: {}", e);
-            eprintln!("\nPlease check that your GRU_GITHUB_TOKEN is valid.");
+            log::error!("\n❌ Failed to authenticate with GitHub: {}", e);
+            log::error!("\nPlease check that your GRU_GITHUB_TOKEN is valid.");
             return Ok(1);
         }
     }
@@ -129,11 +129,11 @@ pub async fn handle_init(repo_arg: String) -> Result<i32> {
             println!("✓ Bare repository ready: {}", bare_repo_path.display());
         }
         Err(e) => {
-            eprintln!("\n❌ Failed to clone repository: {:#}", e);
-            eprintln!("\nPlease check that:");
-            eprintln!("  • The repository {}/{} exists on GitHub", owner, repo);
-            eprintln!("  • You have read access to the repository");
-            eprintln!("  • Your network connection is working");
+            log::error!("\n❌ Failed to clone repository: {:#}", e);
+            log::error!("\nPlease check that:");
+            log::error!("  • The repository {}/{} exists on GitHub", owner, repo);
+            log::error!("  • You have read access to the repository");
+            log::error!("  • Your network connection is working");
             return Ok(1);
         }
     }
@@ -156,13 +156,13 @@ pub async fn handle_init(repo_arg: String) -> Result<i32> {
             }
             Err(e) => {
                 labels_failed.push(name.to_string());
-                eprintln!("  ✗ Failed to create {}: {}", name, e);
+                log::error!("  ✗ Failed to create {}: {}", name, e);
             }
         }
     }
 
     if !labels_failed.is_empty() {
-        eprintln!(
+        log::warn!(
             "\n⚠️  Warning: Failed to create {} label(s). You may need write access to the repository.",
             labels_failed.len()
         );
@@ -185,7 +185,7 @@ pub async fn handle_init(repo_arg: String) -> Result<i32> {
             }
         }
         Err(e) => {
-            eprintln!("  ⚠️  Could not check for issues: {}", e);
+            log::warn!("  ⚠️  Could not check for issues: {}", e);
         }
     }
 
