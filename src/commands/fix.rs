@@ -488,7 +488,7 @@ async fn invoke_with_session_retry(
     /// Helper to check if an error is a session lock error
     fn is_session_lock_error(error: &anyhow::Error) -> bool {
         let error_msg = error.to_string().to_lowercase();
-        error_msg.contains("session") && error_msg.contains("already in use")
+        error_msg.contains("session already in use")
     }
 
     // First attempt with original session
