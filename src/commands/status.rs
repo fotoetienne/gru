@@ -267,6 +267,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    #[ignore] // Integration test - performs real I/O and git operations
     async fn test_handle_status_no_filter() {
         // This test verifies that handle_status succeeds without filtering
         let result = handle_status(None).await;
