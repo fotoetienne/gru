@@ -394,13 +394,13 @@ mod tests {
 
         // Simulate LLM token stream that might break mid-word
         buffer.add("Comple");
-        buffer.add("xity Asse");
+        buffer.add("xity Ass");
 
         // Wait for timeout
         thread::sleep(Duration::from_millis(60));
 
         // Add more text - should flush at word boundary
-        let result = buffer.add("ssment");
+        let result = buffer.add("essment");
 
         // Should flush "Complexity " (up to last space), keeping "Assessment" in buffer
         assert_eq!(result, Some("Complexity ".to_string()));
