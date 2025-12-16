@@ -14,6 +14,18 @@ struct EnhancedMinionInfo {
     uptime: String,
 }
 
+/// Intermediate Minion data extracted from registry (without expensive status checks)
+#[derive(Debug, Clone)]
+struct BasicMinionData {
+    minion_id: String,
+    repo: String,
+    issue: u64,
+    task: String,
+    pr: Option<String>,
+    started_at: chrono::DateTime<chrono::Utc>,
+    worktree: std::path::PathBuf,
+}
+
 /// Calculates uptime from a timestamp
 fn calculate_uptime(started_at: chrono::DateTime<chrono::Utc>) -> String {
     let now = chrono::Utc::now();
@@ -81,9 +93,22 @@ fn determine_status(worktree_path: &std::path::Path) -> String {
 
 /// Handles the status command by displaying active Minions
 /// Optionally filters by a specific ID (minion ID, issue number, or PR number)
+///
+/// # Two-Phase Approach
+///
+/// To minimize registry lock hold time and prevent blocking other minions:
+///
+/// **Phase 1 (with lock):** Load registry, migrate worktrees, clean up stale entries,
+/// extract basic minion data, then release lock by dropping the registry.
+///
+/// **Phase 2 (no lock):** Perform expensive git operations via `determine_status()`
+/// for each worktree to determine active/idle status.
+///
+/// This ensures the lock is only held for the minimum time needed to read/write
+/// the registry file, not for I/O operations.
 pub async fn handle_status(id: Option<String>) -> Result<i32> {
-    // Load registry and run migration if needed (spawn_blocking to avoid blocking the async runtime)
-    let mut minions = tokio::task::spawn_blocking(|| {
+    // Phase 1: Load registry, migrate, clean up (with lock held)
+    let basic_minions = tokio::task::spawn_blocking(|| {
         let mut registry = MinionRegistry::load(None)?;
 
         // Run migration on first status call
@@ -117,30 +142,51 @@ pub async fn handle_status(id: Option<String>) -> Result<i32> {
         // Get updated registry after cleanup
         let registry_minions = registry.list();
 
-        // Convert to enhanced info with current status from filesystem
-        let enhanced: Vec<EnhancedMinionInfo> = registry_minions
+        // Extract basic data without expensive operations
+        let basic: Vec<BasicMinionData> = registry_minions
             .into_iter()
-            .map(|(minion_id, info)| {
+            .map(|(minion_id, info)| BasicMinionData {
+                minion_id,
+                repo: info.repo,
+                issue: info.issue,
+                task: info.command,
+                pr: info.pr,
+                started_at: info.started_at,
+                worktree: info.worktree,
+            })
+            .collect();
+
+        Ok::<Vec<BasicMinionData>, anyhow::Error>(basic)
+        // Registry is dropped here, releasing the lock
+    })
+    .await
+    .context("Failed to spawn blocking task for loading registry")??;
+
+    // Phase 2: Perform expensive status checks (no lock held)
+    let mut minions = tokio::task::spawn_blocking(move || {
+        basic_minions
+            .into_iter()
+            // Filter out worktrees that were removed between Phase 1 and Phase 2
+            .filter(|basic| basic.worktree.exists())
+            .map(|basic| {
                 // Get current status from filesystem (active/idle detection)
-                let status = determine_status(&info.worktree);
-                let uptime = calculate_uptime(info.started_at);
+                let status = determine_status(&basic.worktree);
+                let uptime = calculate_uptime(basic.started_at);
 
                 EnhancedMinionInfo {
-                    minion_id,
-                    repo: info.repo,
-                    issue: info.issue,
-                    task: info.command,
-                    pr: info.pr,
+                    minion_id: basic.minion_id,
+                    repo: basic.repo,
+                    issue: basic.issue,
+                    task: basic.task,
+                    pr: basic.pr,
                     status,
                     uptime,
                 }
             })
-            .collect();
-
-        Ok::<Vec<EnhancedMinionInfo>, anyhow::Error>(enhanced)
+            .collect::<Vec<EnhancedMinionInfo>>()
     })
     .await
-    .context("Failed to spawn blocking task for loading registry")??;
+    .context("Failed to complete status checks for minions")?;
 
     // Filter by ID if provided
     if let Some(filter_id) = id {
