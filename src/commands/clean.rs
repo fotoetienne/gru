@@ -156,10 +156,23 @@ pub async fn handle_clean(dry_run: bool, force: bool, base_branch: &str) -> Resu
     let active_minion_worktrees: HashSet<_> = registry
         .list()
         .into_iter()
-        .map(|(_, info)| {
-            // Canonicalize if path exists, otherwise use the original path
+        .map(|(minion_id, info)| {
+            // Canonicalize if possible, otherwise use the original path
             // This handles symlinks (e.g., /var -> /private/var on macOS) and path normalization
-            info.worktree.canonicalize().unwrap_or(info.worktree)
+            match info.worktree.canonicalize() {
+                Ok(canonical) => canonical,
+                Err(e) => {
+                    // Log canonicalization failures to help diagnose potential path matching issues
+                    eprintln!(
+                        "Warning: Failed to canonicalize worktree path for minion {}: {} (error: {})",
+                        minion_id,
+                        info.worktree.display(),
+                        e
+                    );
+                    eprintln!("         Using original path, but this may cause comparison mismatches.");
+                    info.worktree
+                }
+            }
         })
         .collect();
 
@@ -169,7 +182,19 @@ pub async fn handle_clean(dry_run: bool, force: bool, base_branch: &str) -> Resu
     for wt in worktrees {
         // Skip if this worktree has an active minion
         // Canonicalize the worktree path for reliable comparison
-        let canonical_wt_path = wt.path.canonicalize().unwrap_or_else(|_| wt.path.clone());
+        let canonical_wt_path = match wt.path.canonicalize() {
+            Ok(canonical) => canonical,
+            Err(e) => {
+                eprintln!(
+                    "Warning: Failed to canonicalize worktree path: {} (error: {})",
+                    wt.path.display(),
+                    e
+                );
+                eprintln!("         Using original path for comparison.");
+                wt.path.clone()
+            }
+        };
+
         if active_minion_worktrees.contains(&canonical_wt_path) {
             skipped_active_minions.push(wt);
             continue;
