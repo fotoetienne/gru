@@ -93,6 +93,19 @@ fn determine_status(worktree_path: &std::path::Path) -> String {
 
 /// Handles the status command by displaying active Minions
 /// Optionally filters by a specific ID (minion ID, issue number, or PR number)
+///
+/// # Two-Phase Approach
+///
+/// To minimize registry lock hold time and prevent blocking other minions:
+///
+/// **Phase 1 (with lock):** Load registry, migrate worktrees, clean up stale entries,
+/// extract basic minion data, then release lock by dropping the registry.
+///
+/// **Phase 2 (no lock):** Perform expensive git operations via `determine_status()`
+/// for each worktree to determine active/idle status.
+///
+/// This ensures the lock is only held for the minimum time needed to read/write
+/// the registry file, not for I/O operations.
 pub async fn handle_status(id: Option<String>) -> Result<i32> {
     // Phase 1: Load registry, migrate, clean up (with lock held)
     let basic_minions = tokio::task::spawn_blocking(|| {
@@ -153,6 +166,8 @@ pub async fn handle_status(id: Option<String>) -> Result<i32> {
     let mut minions = tokio::task::spawn_blocking(move || {
         basic_minions
             .into_iter()
+            // Filter out worktrees that were removed between Phase 1 and Phase 2
+            .filter(|basic| basic.worktree.exists())
             .map(|basic| {
                 // Get current status from filesystem (active/idle detection)
                 let status = determine_status(&basic.worktree);
@@ -171,7 +186,7 @@ pub async fn handle_status(id: Option<String>) -> Result<i32> {
             .collect::<Vec<EnhancedMinionInfo>>()
     })
     .await
-    .context("Failed to spawn blocking task for status checks")?;
+    .context("Failed to complete status checks for minions")?;
 
     // Filter by ID if provided
     if let Some(filter_id) = id {
