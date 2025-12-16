@@ -45,11 +45,12 @@ impl TextBuffer {
             false
         };
 
-        // If timeout expired and we have buffered text, flush it before adding new text
+        // If timeout expired and we have buffered text, flush at word boundary
         if should_flush_timeout && !state.text.is_empty() {
-            let flushed = std::mem::take(&mut state.text);
+            // Flush at last word boundary to avoid mid-word breaks
+            let flushed = Self::flush_at_word_boundary(&mut state.text);
             state.text.push_str(text);
-            // Start timing new buffer with the just-added text
+            // Start timing new buffer with the remaining text + just-added text
             state.last_update = Some(Instant::now());
             return Some(flushed);
         }
@@ -70,14 +71,54 @@ impl TextBuffer {
         let has_sentence_end =
             state.text.ends_with(". ") || state.text.ends_with("! ") || state.text.ends_with("? ");
 
-        // Flush if newline, sentence boundary, or buffer is getting full
-        if has_newline || has_sentence_end || state.text.len() > MAX_BUFFER_SIZE {
+        // Flush if newline or sentence boundary (natural boundaries)
+        if has_newline || has_sentence_end {
             let flushed = std::mem::take(&mut state.text);
             // Reset timestamp since buffer is now empty
             state.last_update = None;
             Some(flushed)
+        } else if state.text.len() > MAX_BUFFER_SIZE {
+            // Buffer is full - flush at word boundary to avoid mid-word breaks
+            let flushed = Self::flush_at_word_boundary(&mut state.text);
+            // Reset timestamp and keep remaining partial word in buffer
+            state.last_update = if state.text.is_empty() {
+                None
+            } else {
+                Some(Instant::now())
+            };
+            Some(flushed)
         } else {
             None
+        }
+    }
+
+    /// Flush buffer at the last word boundary (space or newline)
+    /// Returns flushed text, leaving any partial word in the buffer
+    ///
+    /// # UTF-8 Safety
+    /// This function is UTF-8 safe because:
+    /// - `rfind()` returns byte indices at UTF-8 character boundaries
+    /// - We use `char_indices()` to find the next character boundary after the whitespace
+    /// - All string slicing operations occur at valid UTF-8 boundaries
+    fn flush_at_word_boundary(buffer: &mut String) -> String {
+        // Find last space or newline to avoid breaking mid-word
+        if let Some(last_boundary) = buffer.rfind(|c: char| c.is_whitespace()) {
+            // Find the start of the next character after the whitespace boundary
+            // This ensures we don't split multi-byte UTF-8 characters
+            let next_char_start = buffer[last_boundary..]
+                .char_indices()
+                .nth(1)
+                .map(|(idx, _)| last_boundary + idx)
+                .unwrap_or(buffer.len());
+
+            // Split at the safe boundary, keeping the partial word in the buffer
+            let flushed = buffer[..next_char_start].to_string();
+            *buffer = buffer[next_char_start..].to_string();
+            flushed
+        } else {
+            // No word boundary found - flush everything to avoid blocking
+            // This can happen with very long words or non-text content
+            std::mem::take(buffer)
         }
     }
 
@@ -129,16 +170,16 @@ mod tests {
     fn test_buffer_flushes_on_timeout() {
         let buffer = TextBuffer::new(Duration::from_millis(50));
 
-        // Add text
-        let result = buffer.add("Hello");
+        // Add text with a space to create a word boundary
+        let result = buffer.add("Hello ");
         assert!(result.is_none());
 
         // Wait for timeout
         thread::sleep(Duration::from_millis(60));
 
-        // Next add should flush due to timeout
-        let result = buffer.add(" world");
-        assert_eq!(result, Some("Hello".to_string()));
+        // Next add should flush due to timeout at word boundary
+        let result = buffer.add("world");
+        assert_eq!(result, Some("Hello ".to_string()));
     }
 
     #[test]
@@ -279,5 +320,169 @@ mod tests {
         // Buffer should be empty now
         let flushed = buffer.flush();
         assert!(flushed.is_none());
+    }
+
+    #[test]
+    fn test_timeout_flushes_at_word_boundary() {
+        let buffer = TextBuffer::new(Duration::from_millis(50));
+
+        // Add text that contains multiple words
+        let result = buffer.add("The quick brown");
+        assert!(result.is_none());
+
+        // Wait for timeout
+        thread::sleep(Duration::from_millis(60));
+
+        // Add more text - should flush up to last space, keeping "brown" in buffer
+        let result = buffer.add(" fox");
+        assert_eq!(result, Some("The quick ".to_string()));
+
+        // Verify "brown fox" is still in buffer
+        let flushed = buffer.flush();
+        assert_eq!(flushed, Some("brown fox".to_string()));
+    }
+
+    #[test]
+    fn test_timeout_with_no_word_boundary() {
+        let buffer = TextBuffer::new(Duration::from_millis(50));
+
+        // Add text without any spaces (no word boundary)
+        let result = buffer.add("Supercalifragilisticexpialidocious");
+        assert!(result.is_none());
+
+        // Wait for timeout
+        thread::sleep(Duration::from_millis(60));
+
+        // Add more text - should flush everything since no word boundary exists
+        let result = buffer.add("text");
+        assert_eq!(
+            result,
+            Some("Supercalifragilisticexpialidocious".to_string())
+        );
+
+        // Verify new text is in buffer
+        let flushed = buffer.flush();
+        assert_eq!(flushed, Some("text".to_string()));
+    }
+
+    #[test]
+    fn test_buffer_full_flushes_at_word_boundary() {
+        let buffer = TextBuffer::new(Duration::from_millis(150));
+
+        // Create text that will exceed MAX_BUFFER_SIZE when combined
+        // Each repetition is 5 characters ("word "), so repeat enough to exceed MAX_BUFFER_SIZE
+        let long_text = "word ".repeat((MAX_BUFFER_SIZE / 5) + 100);
+
+        // Add text that exceeds MAX_BUFFER_SIZE
+        let result = buffer.add(&long_text);
+
+        // Should flush at word boundary (not mid-word)
+        assert!(result.is_some());
+        let flushed = result.unwrap();
+
+        // Verify flushed text doesn't end mid-word (should end with space)
+        assert!(
+            flushed.ends_with(' ') || flushed.ends_with('\n'),
+            "Flushed text should end at word boundary, got: '{}'",
+            &flushed[flushed.len().saturating_sub(20)..]
+        );
+    }
+
+    #[test]
+    fn test_no_mid_word_breaks_on_partial_fragments() {
+        let buffer = TextBuffer::new(Duration::from_millis(50));
+
+        // Simulate LLM token stream that might break mid-word
+        buffer.add("Comple");
+        buffer.add("xity Asse");
+
+        // Wait for timeout
+        thread::sleep(Duration::from_millis(60));
+
+        // Add more text - should flush at word boundary
+        let result = buffer.add("ssment");
+
+        // Should flush "Complexity " (up to last space), keeping "Assessment" in buffer
+        assert_eq!(result, Some("Complexity ".to_string()));
+
+        // Verify remaining text
+        let remaining = buffer.flush();
+        assert_eq!(remaining, Some("Assessment".to_string()));
+    }
+
+    #[test]
+    fn test_multibyte_unicode_after_boundary() {
+        let buffer = TextBuffer::new(Duration::from_millis(50));
+
+        // Add text with multi-byte Unicode characters (Chinese) after a space
+        buffer.add("Hello 世界");
+
+        // Wait for timeout
+        thread::sleep(Duration::from_millis(60));
+
+        // Add more text - should flush at word boundary without breaking Unicode
+        let result = buffer.add("test");
+        assert_eq!(result, Some("Hello ".to_string()));
+
+        // Verify the multi-byte characters were kept intact
+        let remaining = buffer.flush();
+        assert_eq!(remaining, Some("世界test".to_string()));
+    }
+
+    #[test]
+    fn test_emoji_after_word_boundary() {
+        let buffer = TextBuffer::new(Duration::from_millis(50));
+
+        // Add text with emoji (multi-byte UTF-8) after a space
+        buffer.add("Great work 🎉");
+
+        // Wait for timeout
+        thread::sleep(Duration::from_millis(60));
+
+        // Add more text - should flush at word boundary without breaking emoji
+        let result = buffer.add(" more");
+        assert_eq!(result, Some("Great work ".to_string()));
+
+        // Verify emoji was kept intact
+        let remaining = buffer.flush();
+        assert_eq!(remaining, Some("🎉 more".to_string()));
+    }
+
+    #[test]
+    fn test_unicode_whitespace_boundary() {
+        let buffer = TextBuffer::new(Duration::from_millis(50));
+
+        // Use non-breaking space (U+00A0) - a Unicode whitespace character
+        buffer.add("Hello\u{00A0}world");
+
+        // Wait for timeout
+        thread::sleep(Duration::from_millis(60));
+
+        // Add more text - should flush at the non-breaking space
+        let result = buffer.add("!");
+        assert_eq!(result, Some("Hello\u{00A0}".to_string()));
+
+        // Verify remaining text
+        let remaining = buffer.flush();
+        assert_eq!(remaining, Some("world!".to_string()));
+    }
+
+    #[test]
+    fn test_flush_when_ending_with_whitespace() {
+        let buffer = TextBuffer::new(Duration::from_millis(50));
+
+        // Add text ending with space
+        buffer.add("Hello ");
+
+        // Wait for timeout
+        thread::sleep(Duration::from_millis(60));
+
+        // Add more text - should flush everything up to and including the space
+        let result = buffer.add("world");
+        assert_eq!(result, Some("Hello ".to_string()));
+
+        // Verify remaining text
+        let remaining = buffer.flush();
+        assert_eq!(remaining, Some("world".to_string()));
     }
 }
