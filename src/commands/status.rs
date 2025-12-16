@@ -107,15 +107,9 @@ fn determine_status(worktree_path: &std::path::Path) -> String {
 /// This ensures the lock is only held for the minimum time needed to read/write
 /// the registry file, not for I/O operations.
 pub async fn handle_status(id: Option<String>) -> Result<i32> {
-    // Phase 1: Load registry, migrate, clean up (with lock held)
+    // Phase 1: Load registry and clean up (with lock held)
     let basic_minions = tokio::task::spawn_blocking(|| {
         let mut registry = MinionRegistry::load(None)?;
-
-        // Run migration on first status call
-        let migrated = registry.migrate_from_worktrees()?;
-        if migrated > 0 {
-            eprintln!("📦 Migrated {} existing Minion(s) to registry", migrated);
-        }
 
         // Get all minions from registry
         let registry_minions = registry.list();
