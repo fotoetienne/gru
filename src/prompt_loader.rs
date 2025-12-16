@@ -199,20 +199,35 @@ fn scan_prompt_directory(dir: &Path) -> Result<HashMap<String, PathBuf>> {
     Ok(prompts)
 }
 
-/// Loads prompts with proper resolution order: repo → built-in → global
+/// Loads prompts with proper resolution priority: repo → built-in → global
 ///
-/// Resolution order per CUSTOM_PROMPTS_PRD.md:
-/// 1. Reserved system commands (validated separately, not loaded)
-/// 2. Repo-specific: `.gru/prompts/<name>.md`
-/// 3. Built-in prompts: hardcoded defaults
-/// 4. Global: `~/.gru/prompts/<name>.md`
+/// **Priority order** (higher priority overrides lower priority):
+/// 1. Repo-specific: `.gru/prompts/<name>.md` (highest priority)
+/// 2. Built-in prompts: hardcoded defaults
+/// 3. Global: `~/.gru/prompts/<name>.md` (lowest priority)
+///
+/// **Implementation note**: Loads in reverse order (global → built-in → repo)
+/// where later entries override earlier ones in the HashMap. This achieves the
+/// correct priority while being efficient (no need to check existence before insert).
+///
+/// Reserved system commands are validated separately and never loaded.
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn load_prompts(repo_root: Option<&Path>) -> Result<HashMap<String, Prompt>> {
+    load_prompts_internal(repo_root, dirs::home_dir().as_deref())
+}
+
+/// Internal function for loading prompts with explicit global directory path.
+/// Used by public `load_prompts()` and for testing.
+#[cfg_attr(not(test), allow(dead_code))]
+fn load_prompts_internal(
+    repo_root: Option<&Path>,
+    global_root: Option<&Path>,
+) -> Result<HashMap<String, Prompt>> {
     let mut prompts = HashMap::new();
 
     // 1. Load global prompts (~/.gru/prompts/)
-    if let Some(home_dir) = dirs::home_dir() {
-        let global_dir = home_dir.join(".gru").join("prompts");
+    if let Some(global_root) = global_root {
+        let global_dir = global_root.join(".gru").join("prompts");
         let global_files = scan_prompt_directory(&global_dir)?;
 
         for (name, path) in global_files {
@@ -489,7 +504,8 @@ Content"#,
         let temp_dir = TempDir::new().unwrap();
 
         // Create global prompt
-        let global_dir = temp_dir.path().join("global").join(".gru").join("prompts");
+        let global_root = temp_dir.path().join("global");
+        let global_dir = global_root.join(".gru").join("prompts");
         fs::create_dir_all(&global_dir).unwrap();
         fs::write(
             global_dir.join("test.md"),
@@ -501,7 +517,8 @@ Global content"#,
         .unwrap();
 
         // Create repo prompt with same name
-        let repo_dir = temp_dir.path().join("repo").join(".gru").join("prompts");
+        let repo_root = temp_dir.path().join("repo");
+        let repo_dir = repo_root.join(".gru").join("prompts");
         fs::create_dir_all(&repo_dir).unwrap();
         fs::write(
             repo_dir.join("test.md"),
@@ -512,15 +529,15 @@ Repo content"#,
         )
         .unwrap();
 
-        // Note: This test needs modification to properly test the override
-        // since load_prompts uses dirs::home_dir() for global prompts
-        // For now, we'll test that repo prompts load correctly
-        let prompts = load_prompts(Some(&temp_dir.path().join("repo"))).unwrap();
+        // Test that repo prompt overrides global prompt
+        let prompts = load_prompts_internal(Some(&repo_root), Some(&global_root)).unwrap();
 
         assert_eq!(prompts.len(), 1);
         let prompt = &prompts["test"];
         assert_eq!(prompt.metadata.description, Some("Repo prompt".to_string()));
         assert_eq!(prompt.content, "Repo content");
+        // Verify the source is from repo, not global
+        assert!(matches!(prompt.source, PromptSource::Repo(_)));
     }
 
     #[test]
