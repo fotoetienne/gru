@@ -39,6 +39,10 @@ const TRIM_OUTPUT_BUFFER_SIZE: usize = 5000;
 const EXIT_CODE_SIGNAL_TERMINATED: i32 = 128;
 
 /// Delay in seconds before retrying a session that's reported as "already in use"
+///
+/// This value was chosen to allow Claude CLI sufficient time to release session locks
+/// after process exit. Based on observed behavior, locks are typically released within 2-3 seconds,
+/// so 5 seconds provides a reasonable buffer without adding excessive latency.
 const SESSION_RETRY_DELAY_SECS: u64 = 5;
 
 /// Default timeout for review process in seconds (30 minutes)
@@ -457,6 +461,64 @@ async fn invoke_claude_for_reviews(
     }
 
     Ok(())
+}
+
+/// Attempts to invoke Claude for reviews with session lock retry logic
+///
+/// This function implements a retry-with-delay-and-fallback strategy:
+/// 1. First attempt: Use original session ID to preserve context
+/// 2. If locked: Wait SESSION_RETRY_DELAY_SECS seconds and retry with original session
+/// 3. If still locked: Fall back to new session (warns about limited context)
+///
+/// # Arguments
+/// * `worktree_path` - Path to the worktree where Claude should run
+/// * `session_id` - The original session ID to attempt reusing
+/// * `review_prompt` - The prompt to send to Claude
+/// * `timeout_opt` - Optional timeout for the Claude invocation
+///
+/// # Returns
+/// Ok(()) if Claude successfully addressed the review comments
+/// Err if all attempts fail with non-lock errors
+async fn invoke_with_session_retry(
+    worktree_path: &Path,
+    session_id: &Uuid,
+    review_prompt: &str,
+    timeout_opt: Option<&str>,
+) -> Result<()> {
+    /// Helper to check if an error is a session lock error
+    fn is_session_lock_error(error: &anyhow::Error) -> bool {
+        let error_msg = error.to_string().to_lowercase();
+        error_msg.contains("session") && error_msg.contains("already in use")
+    }
+
+    // First attempt with original session
+    match invoke_claude_for_reviews(worktree_path, session_id, review_prompt, timeout_opt).await {
+        Ok(()) => return Ok(()),
+        Err(e) if !is_session_lock_error(&e) => return Err(e),
+        Err(e) => {
+            // Session locked, log and retry
+            eprintln!("🔍 Debug: Detected session lock error: {}", e);
+            println!(
+                "⏳ Session temporarily locked, waiting {} seconds...",
+                SESSION_RETRY_DELAY_SECS
+            );
+            tokio::time::sleep(Duration::from_secs(SESSION_RETRY_DELAY_SECS)).await;
+        }
+    }
+
+    // Second attempt with same session
+    match invoke_claude_for_reviews(worktree_path, session_id, review_prompt, timeout_opt).await {
+        Ok(()) => Ok(()),
+        Err(e) if !is_session_lock_error(&e) => Err(e),
+        Err(_) => {
+            // Still locked, fallback to new session
+            eprintln!("⚠️  Session {} still locked after retry", session_id);
+            println!("⚠️ Using fresh session (context will be limited)");
+            let new_session = Uuid::new_v4();
+            eprintln!("🔍 Debug: Fallback to new session {}", new_session);
+            invoke_claude_for_reviews(worktree_path, &new_session, review_prompt, timeout_opt).await
+        }
+    }
 }
 
 /// Triggers an automated PR review by spawning a separate gru review command
@@ -922,9 +984,8 @@ pub async fn handle_fix(issue: &str, timeout_opt: Option<String>, quiet: bool) -
 
                                 println!("🔄 Re-invoking to address review feedback...\n");
 
-                                // Re-invoke Claude with the same session ID to maintain context
-                                // Try with original session, retry with delay if locked, fallback to new session if needed
-                                let result = match invoke_claude_for_reviews(
+                                // Re-invoke Claude with session retry logic to maintain context
+                                match invoke_with_session_retry(
                                     &worktree_path,
                                     &session_id,
                                     &review_prompt,
@@ -932,48 +993,6 @@ pub async fn handle_fix(issue: &str, timeout_opt: Option<String>, quiet: bool) -
                                 )
                                 .await
                                 {
-                                    Err(e) if e.to_string().contains("already in use") => {
-                                        println!(
-                                            "⏳ Session temporarily locked, waiting {} seconds...",
-                                            SESSION_RETRY_DELAY_SECS
-                                        );
-                                        tokio::time::sleep(Duration::from_secs(
-                                            SESSION_RETRY_DELAY_SECS,
-                                        ))
-                                        .await;
-
-                                        // Retry with original session
-                                        match invoke_claude_for_reviews(
-                                            &worktree_path,
-                                            &session_id,
-                                            &review_prompt,
-                                            timeout_opt.as_deref(),
-                                        )
-                                        .await
-                                        {
-                                            Ok(()) => Ok(()),
-                                            Err(retry_err)
-                                                if retry_err
-                                                    .to_string()
-                                                    .contains("already in use") =>
-                                            {
-                                                println!("⚠️  Session still locked, using fresh session (context will be limited)");
-                                                let new_session = Uuid::new_v4();
-                                                invoke_claude_for_reviews(
-                                                    &worktree_path,
-                                                    &new_session,
-                                                    &review_prompt,
-                                                    timeout_opt.as_deref(),
-                                                )
-                                                .await
-                                            }
-                                            Err(other_err) => Err(other_err),
-                                        }
-                                    }
-                                    result => result,
-                                };
-
-                                match result {
                                     Ok(()) => {
                                         println!("\n✅ Finished addressing review comments");
                                         println!("🔄 Continuing to monitor PR...\n");
