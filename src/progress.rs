@@ -302,7 +302,7 @@ impl ProgressDisplay {
         match event {
             ClaudeEvent::MessageStart { .. } => {
                 self.update_status("💭 Thinking...");
-                self.print_event(&format!("[{}] Message started", timestamp));
+                self.print_event(&format!("[{}] ▶︎", timestamp));
             }
             ClaudeEvent::ContentBlockStart { content_block, .. } => {
                 // Check if this is a tool_use block
