@@ -148,7 +148,7 @@ pub async fn handle_clean(dry_run: bool, force: bool, base_branch: &str) -> Resu
     let registry = MinionRegistry::load(None).context(
         "Failed to load minion registry from the default location. This may be due to a missing \
          or corrupt registry file, or insufficient file permissions. The default registry is \
-         typically located at ~/.gru/state/minions.json."
+         typically located at ~/.gru/state/minions.json.",
     )?;
 
     // Build a set of active minion worktree paths for O(1) lookup
