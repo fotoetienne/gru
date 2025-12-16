@@ -143,9 +143,14 @@ pub async fn handle_review(pr_arg: Option<String>) -> Result<i32> {
     println!("🤖 Launching autonomous review agent...\n");
 
     // Create progress display for review
+    // If there's no linked issue (linked_issue == 0), display the PR number instead
     let config = ProgressConfig {
         minion_id: minion_id.clone(),
-        issue: linked_issue.to_string(),
+        issue: if linked_issue == 0 {
+            format!("PR {}", pr_num)
+        } else {
+            linked_issue.to_string()
+        },
         quiet: false,
     };
     let progress = ProgressDisplay::new(config);
