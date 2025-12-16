@@ -141,9 +141,24 @@ pub async fn handle_clean(dry_run: bool, force: bool, base_branch: &str) -> Resu
 
     println!("Found {} worktrees. Checking status...\n", worktrees.len());
 
+    // Load registry and get active minion worktrees
+    let registry = MinionRegistry::load(None).context("Failed to load minion registry")?;
+    let active_minion_worktrees: std::collections::HashSet<_> = registry
+        .list()
+        .into_iter()
+        .map(|(_, info)| info.worktree)
+        .collect();
+
     // Check status of each worktree
     let mut cleanable = Vec::new();
+    let mut skipped_active_minions = Vec::new();
     for wt in worktrees {
+        // Skip if this worktree has an active minion
+        if active_minion_worktrees.contains(&wt.path) {
+            skipped_active_minions.push(wt);
+            continue;
+        }
+
         let status = wt
             .status(base_branch)
             .with_context(|| format!("Failed to check status of {}", wt.path.display()))?;
@@ -153,8 +168,24 @@ pub async fn handle_clean(dry_run: bool, force: bool, base_branch: &str) -> Resu
         }
     }
 
+    // Display skipped worktrees with active minions
+    if !skipped_active_minions.is_empty() {
+        println!(
+            "Skipped {} worktree(s) with active minions:\n",
+            skipped_active_minions.len()
+        );
+        for wt in &skipped_active_minions {
+            println!("  {} (active minion)", wt.path.display());
+            println!("    Branch: {}", wt.branch);
+            println!("    Repo: {}", wt.repo);
+            println!();
+        }
+    }
+
     if cleanable.is_empty() {
-        println!("No worktrees to clean.");
+        if skipped_active_minions.is_empty() {
+            println!("No worktrees to clean.");
+        }
         return Ok(0);
     }
 
