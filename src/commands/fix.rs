@@ -415,6 +415,25 @@ async fn create_pr_for_issue(
     Ok(pr_number)
 }
 
+/// Handles the result of fetching issue details via CLI
+/// Returns Some with (title, body, empty labels) on success, None on failure
+async fn handle_cli_fetch_result(
+    result: Result<crate::github::IssueInfo>,
+) -> Option<(String, String, String)> {
+    match result {
+        Ok(issue_info) => {
+            // CLI version doesn't include labels, but we can still provide title and body
+            let body = issue_info.body.unwrap_or_default();
+            Some((issue_info.title, body, String::new()))
+        }
+        Err(e) => {
+            eprintln!("⚠️  Failed to fetch issue details via CLI: {}", e);
+            eprintln!("   Continuing with basic prompt format");
+            None
+        }
+    }
+}
+
 /// Parses a timeout string into a Duration
 /// Supports formats like "10s", "5m", "1h", "30"
 fn parse_timeout(timeout_str: &str) -> Result<Duration> {
@@ -728,36 +747,27 @@ pub async fn handle_fix(issue: &str, timeout_opt: Option<String>, quiet: bool) -
                     eprintln!("⚠️  Failed to fetch issue details via API: {}", e);
                     eprintln!("   Falling back to gh CLI...");
                     // Try CLI fallback
-                    match crate::github::get_issue_via_cli(&owner, &repo, issue_number).await {
-                        Ok(issue_info) => {
-                            // CLI version doesn't include labels, but we can still provide title and body
-                            let body = issue_info.body.unwrap_or_default();
-                            Some((issue_info.title, body, String::new()))
-                        }
-                        Err(cli_err) => {
-                            eprintln!("⚠️  Failed to fetch issue details via CLI: {}", cli_err);
-                            eprintln!("   Continuing with basic prompt format");
-                            eprintln!("   Fix authentication with: gh auth login");
-                            None
-                        }
+                    let cli_result =
+                        crate::github::get_issue_via_cli(&owner, &repo, issue_number).await;
+                    let result = handle_cli_fetch_result(cli_result).await;
+
+                    // Only show auth guidance if both API and CLI failed
+                    if result.is_none() {
+                        eprintln!("   Fix authentication with: gh auth login");
                     }
+                    result
                 }
             }
         } else {
             // No API client - try CLI directly
-            match crate::github::get_issue_via_cli(&owner, &repo, issue_number).await {
-                Ok(issue_info) => {
-                    // CLI version doesn't include labels, but we can still provide title and body
-                    let body = issue_info.body.unwrap_or_default();
-                    Some((issue_info.title, body, String::new()))
-                }
-                Err(e) => {
-                    eprintln!("⚠️  Failed to fetch issue details via CLI: {}", e);
-                    eprintln!("   Continuing with basic prompt format");
-                    eprintln!("   Fix authentication with: gh auth login");
-                    None
-                }
+            let cli_result = crate::github::get_issue_via_cli(&owner, &repo, issue_number).await;
+            let result = handle_cli_fetch_result(cli_result).await;
+
+            // Show auth guidance when CLI fails and we have no API client
+            if result.is_none() {
+                eprintln!("   Fix authentication with: gh auth login");
             }
+            result
         }
     } else {
         None
