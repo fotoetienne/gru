@@ -19,7 +19,7 @@ mod workspace;
 mod worktree_scanner;
 
 use clap::{Parser, Subcommand};
-use commands::{attach, clean, fix, init, lab, path, prompt, resume, review, status};
+use commands::{attach, clean, fix, init, lab, path, prompt, resume, review, status, stop};
 
 /// CLI structure for the Gru agent orchestrator
 #[derive(Parser)]
@@ -99,6 +99,11 @@ enum Commands {
         #[arg(help = "Optional ID to filter by (minion ID, issue number, or PR number)")]
         id: Option<String>,
     },
+    #[command(about = "Stop a running Minion")]
+    Stop {
+        #[arg(help = "Minion ID, issue number, or PR number (e.g., M0tk, 42)")]
+        id: String,
+    },
     #[command(about = "Run an ad-hoc prompt with Claude")]
     Prompt {
         #[arg(help = "Prompt text to send to Claude")]
@@ -160,6 +165,7 @@ async fn main() {
             base_branch,
         } => clean::handle_clean(dry_run, force, &base_branch).await,
         Commands::Status { id } => status::handle_status(id).await,
+        Commands::Stop { id } => stop::handle_stop(id).await,
         Commands::Prompt { prompt, timeout } => {
             prompt::handle_prompt(&prompt, timeout, cli.quiet).await
         }

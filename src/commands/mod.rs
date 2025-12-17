@@ -8,3 +8,4 @@ pub mod prompt;
 pub mod resume;
 pub mod review;
 pub mod status;
+pub mod stop;
