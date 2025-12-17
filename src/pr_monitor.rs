@@ -565,4 +565,583 @@ mod tests {
         assert!(is_retryable_error("Rate Limit"));
         assert!(is_retryable_error("SERVICE UNAVAILABLE"));
     }
+
+    // ========================================================================
+    // JSON Deserialization Tests
+    // ========================================================================
+
+    #[test]
+    fn test_pull_request_deserialize_merged() {
+        let json = r#"{
+            "state": "closed",
+            "merged": true,
+            "head": {
+                "sha": "abc123def456"
+            }
+        }"#;
+
+        let pr: PullRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(pr.state, "closed");
+        assert!(pr.merged);
+        assert_eq!(pr.head.sha, "abc123def456");
+    }
+
+    #[test]
+    fn test_pull_request_deserialize_closed_not_merged() {
+        let json = r#"{
+            "state": "closed",
+            "merged": false,
+            "head": {
+                "sha": "abc123def456"
+            }
+        }"#;
+
+        let pr: PullRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(pr.state, "closed");
+        assert!(!pr.merged);
+    }
+
+    #[test]
+    fn test_pull_request_deserialize_open() {
+        let json = r#"{
+            "state": "open",
+            "merged": false,
+            "head": {
+                "sha": "abc123def456"
+            }
+        }"#;
+
+        let pr: PullRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(pr.state, "open");
+        assert!(!pr.merged);
+    }
+
+    #[test]
+    fn test_pull_request_deserialize_with_extra_fields() {
+        // Real API responses contain many more fields - ensure we handle them gracefully
+        let json = r#"{
+            "state": "open",
+            "merged": false,
+            "head": {
+                "sha": "abc123def456",
+                "ref": "feature-branch",
+                "repo": {"full_name": "owner/repo"}
+            },
+            "title": "My PR",
+            "number": 42,
+            "user": {"login": "author"},
+            "created_at": "2024-01-01T00:00:00Z"
+        }"#;
+
+        let pr: PullRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(pr.state, "open");
+        assert!(!pr.merged);
+        assert_eq!(pr.head.sha, "abc123def456");
+    }
+
+    #[test]
+    fn test_review_deserialize() {
+        let json = r#"{
+            "id": 12345,
+            "submitted_at": "2024-06-15T10:30:00Z",
+            "user": {
+                "login": "reviewer"
+            }
+        }"#;
+
+        let review: Review = serde_json::from_str(json).unwrap();
+        assert_eq!(review.id, 12345);
+        assert_eq!(review.user.login, "reviewer");
+    }
+
+    #[test]
+    fn test_review_deserialize_with_extra_fields() {
+        let json = r#"{
+            "id": 12345,
+            "submitted_at": "2024-06-15T10:30:00Z",
+            "user": {
+                "login": "reviewer",
+                "id": 999,
+                "avatar_url": "https://example.com/avatar.png"
+            },
+            "state": "CHANGES_REQUESTED",
+            "body": "Please fix this",
+            "html_url": "https://github.com/owner/repo/pull/1#pullrequestreview-12345"
+        }"#;
+
+        let review: Review = serde_json::from_str(json).unwrap();
+        assert_eq!(review.id, 12345);
+        assert_eq!(review.user.login, "reviewer");
+    }
+
+    #[test]
+    fn test_review_list_deserialize() {
+        let json = r#"[
+            {
+                "id": 1,
+                "submitted_at": "2024-06-15T10:30:00Z",
+                "user": {"login": "alice"}
+            },
+            {
+                "id": 2,
+                "submitted_at": "2024-06-15T11:30:00Z",
+                "user": {"login": "bob"}
+            }
+        ]"#;
+
+        let reviews: Vec<Review> = serde_json::from_str(json).unwrap();
+        assert_eq!(reviews.len(), 2);
+        assert_eq!(reviews[0].id, 1);
+        assert_eq!(reviews[0].user.login, "alice");
+        assert_eq!(reviews[1].id, 2);
+        assert_eq!(reviews[1].user.login, "bob");
+    }
+
+    #[test]
+    fn test_review_list_empty() {
+        let json = "[]";
+        let reviews: Vec<Review> = serde_json::from_str(json).unwrap();
+        assert!(reviews.is_empty());
+    }
+
+    #[test]
+    fn test_check_run_deserialize_failure() {
+        let json = r#"{
+            "conclusion": "failure"
+        }"#;
+
+        let check: CheckRun = serde_json::from_str(json).unwrap();
+        assert_eq!(check.conclusion, Some("failure".to_string()));
+    }
+
+    #[test]
+    fn test_check_run_deserialize_success() {
+        let json = r#"{
+            "conclusion": "success"
+        }"#;
+
+        let check: CheckRun = serde_json::from_str(json).unwrap();
+        assert_eq!(check.conclusion, Some("success".to_string()));
+    }
+
+    #[test]
+    fn test_check_run_deserialize_null_conclusion() {
+        // In-progress checks have null conclusion
+        let json = r#"{
+            "conclusion": null
+        }"#;
+
+        let check: CheckRun = serde_json::from_str(json).unwrap();
+        assert!(check.conclusion.is_none());
+    }
+
+    #[test]
+    fn test_check_run_deserialize_with_extra_fields() {
+        let json = r#"{
+            "id": 123456,
+            "name": "build",
+            "status": "completed",
+            "conclusion": "success",
+            "started_at": "2024-06-15T10:00:00Z",
+            "completed_at": "2024-06-15T10:05:00Z"
+        }"#;
+
+        let check: CheckRun = serde_json::from_str(json).unwrap();
+        assert_eq!(check.conclusion, Some("success".to_string()));
+    }
+
+    #[test]
+    fn test_check_runs_response_deserialize() {
+        let json = r#"{
+            "total_count": 3,
+            "check_runs": [
+                {"conclusion": "success"},
+                {"conclusion": "failure"},
+                {"conclusion": null}
+            ]
+        }"#;
+
+        let response: CheckRunsResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(response.check_runs.len(), 3);
+        assert_eq!(
+            response.check_runs[0].conclusion,
+            Some("success".to_string())
+        );
+        assert_eq!(
+            response.check_runs[1].conclusion,
+            Some("failure".to_string())
+        );
+        assert!(response.check_runs[2].conclusion.is_none());
+    }
+
+    #[test]
+    fn test_check_runs_response_empty() {
+        let json = r#"{
+            "total_count": 0,
+            "check_runs": []
+        }"#;
+
+        let response: CheckRunsResponse = serde_json::from_str(json).unwrap();
+        assert!(response.check_runs.is_empty());
+    }
+
+    #[test]
+    fn test_api_review_comment_deserialize() {
+        let json = r#"{
+            "path": "src/main.rs",
+            "line": 42,
+            "body": "This needs refactoring",
+            "user": {"login": "reviewer"}
+        }"#;
+
+        let comment: ApiReviewComment = serde_json::from_str(json).unwrap();
+        assert_eq!(comment.path, "src/main.rs");
+        assert_eq!(comment.line, Some(42));
+        assert_eq!(comment.body, "This needs refactoring");
+        assert_eq!(comment.user.login, "reviewer");
+    }
+
+    #[test]
+    fn test_api_review_comment_deserialize_null_line() {
+        // File-level comments don't have a line number
+        let json = r#"{
+            "path": "README.md",
+            "line": null,
+            "body": "Update documentation",
+            "user": {"login": "reviewer"}
+        }"#;
+
+        let comment: ApiReviewComment = serde_json::from_str(json).unwrap();
+        assert_eq!(comment.path, "README.md");
+        assert!(comment.line.is_none());
+    }
+
+    // ========================================================================
+    // PR State Detection Tests
+    // ========================================================================
+
+    /// Helper to simulate PR state checking logic
+    fn determine_pr_terminal_state(state: &str, merged: bool) -> Option<MonitorResult> {
+        if state == "closed" {
+            if merged {
+                Some(MonitorResult::Merged)
+            } else {
+                Some(MonitorResult::Closed)
+            }
+        } else {
+            None
+        }
+    }
+
+    #[test]
+    fn test_merged_pr_returns_merged_result() {
+        let result = determine_pr_terminal_state("closed", true);
+        assert!(matches!(result, Some(MonitorResult::Merged)));
+    }
+
+    #[test]
+    fn test_closed_not_merged_returns_closed_result() {
+        let result = determine_pr_terminal_state("closed", false);
+        assert!(matches!(result, Some(MonitorResult::Closed)));
+    }
+
+    #[test]
+    fn test_open_pr_returns_none() {
+        let result = determine_pr_terminal_state("open", false);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_merged_takes_precedence_over_closed() {
+        // A merged PR has state="closed" AND merged=true
+        // Verify that merged is detected, not just closed
+        let result = determine_pr_terminal_state("closed", true);
+        assert!(
+            matches!(result, Some(MonitorResult::Merged)),
+            "Merged PR should return Merged, not Closed"
+        );
+    }
+
+    // ========================================================================
+    // CI Check Failure Detection Tests
+    // ========================================================================
+
+    /// Helper to count failed checks (mirrors the logic in monitor_pr)
+    fn count_failed_checks(check_runs: &[CheckRun]) -> usize {
+        check_runs
+            .iter()
+            .filter(|c| {
+                matches!(
+                    c.conclusion.as_deref(),
+                    Some("failure")
+                        | Some("cancelled")
+                        | Some("timed_out")
+                        | Some("action_required")
+                )
+            })
+            .count()
+    }
+
+    #[test]
+    fn test_failed_check_detection_failure() {
+        let checks = vec![CheckRun {
+            conclusion: Some("failure".to_string()),
+        }];
+        assert_eq!(count_failed_checks(&checks), 1);
+    }
+
+    #[test]
+    fn test_failed_check_detection_cancelled() {
+        let checks = vec![CheckRun {
+            conclusion: Some("cancelled".to_string()),
+        }];
+        assert_eq!(count_failed_checks(&checks), 1);
+    }
+
+    #[test]
+    fn test_failed_check_detection_timed_out() {
+        let checks = vec![CheckRun {
+            conclusion: Some("timed_out".to_string()),
+        }];
+        assert_eq!(count_failed_checks(&checks), 1);
+    }
+
+    #[test]
+    fn test_failed_check_detection_action_required() {
+        let checks = vec![CheckRun {
+            conclusion: Some("action_required".to_string()),
+        }];
+        assert_eq!(count_failed_checks(&checks), 1);
+    }
+
+    #[test]
+    fn test_successful_check_not_counted_as_failure() {
+        let checks = vec![CheckRun {
+            conclusion: Some("success".to_string()),
+        }];
+        assert_eq!(count_failed_checks(&checks), 0);
+    }
+
+    #[test]
+    fn test_skipped_check_not_counted_as_failure() {
+        let checks = vec![CheckRun {
+            conclusion: Some("skipped".to_string()),
+        }];
+        assert_eq!(count_failed_checks(&checks), 0);
+    }
+
+    #[test]
+    fn test_neutral_check_not_counted_as_failure() {
+        let checks = vec![CheckRun {
+            conclusion: Some("neutral".to_string()),
+        }];
+        assert_eq!(count_failed_checks(&checks), 0);
+    }
+
+    #[test]
+    fn test_in_progress_check_not_counted_as_failure() {
+        let checks = vec![CheckRun { conclusion: None }];
+        assert_eq!(count_failed_checks(&checks), 0);
+    }
+
+    #[test]
+    fn test_multiple_checks_mixed_results() {
+        let checks = vec![
+            CheckRun {
+                conclusion: Some("success".to_string()),
+            },
+            CheckRun {
+                conclusion: Some("failure".to_string()),
+            },
+            CheckRun { conclusion: None },
+            CheckRun {
+                conclusion: Some("cancelled".to_string()),
+            },
+            CheckRun {
+                conclusion: Some("success".to_string()),
+            },
+        ];
+        assert_eq!(count_failed_checks(&checks), 2); // failure + cancelled
+    }
+
+    #[test]
+    fn test_all_failure_states_detected() {
+        let checks = vec![
+            CheckRun {
+                conclusion: Some("failure".to_string()),
+            },
+            CheckRun {
+                conclusion: Some("cancelled".to_string()),
+            },
+            CheckRun {
+                conclusion: Some("timed_out".to_string()),
+            },
+            CheckRun {
+                conclusion: Some("action_required".to_string()),
+            },
+        ];
+        assert_eq!(count_failed_checks(&checks), 4);
+    }
+
+    #[test]
+    fn test_empty_check_runs_no_failures() {
+        let checks: Vec<CheckRun> = vec![];
+        assert_eq!(count_failed_checks(&checks), 0);
+    }
+
+    // ========================================================================
+    // Review Timestamp Filtering Tests
+    // ========================================================================
+
+    /// Helper to filter reviews by timestamp (mirrors get_reviews_since logic)
+    fn filter_reviews_since(reviews: Vec<Review>, since: DateTime<Utc>) -> Vec<Review> {
+        reviews
+            .into_iter()
+            .filter(|r| r.submitted_at >= since)
+            .collect()
+    }
+
+    fn make_review(id: u64, timestamp: &str) -> Review {
+        Review {
+            id,
+            submitted_at: timestamp.parse().unwrap(),
+            user: User {
+                login: "reviewer".to_string(),
+            },
+        }
+    }
+
+    #[test]
+    fn test_reviews_after_timestamp_included() {
+        let since: DateTime<Utc> = "2024-06-15T10:00:00Z".parse().unwrap();
+        let reviews = vec![
+            make_review(1, "2024-06-15T09:00:00Z"), // Before - excluded
+            make_review(2, "2024-06-15T11:00:00Z"), // After - included
+        ];
+
+        let filtered = filter_reviews_since(reviews, since);
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].id, 2);
+    }
+
+    #[test]
+    fn test_reviews_at_exact_timestamp_included() {
+        // Edge case: review at exactly the since timestamp should be included
+        let since: DateTime<Utc> = "2024-06-15T10:00:00Z".parse().unwrap();
+        let reviews = vec![make_review(1, "2024-06-15T10:00:00Z")];
+
+        let filtered = filter_reviews_since(reviews, since);
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].id, 1);
+    }
+
+    #[test]
+    fn test_reviews_before_timestamp_excluded() {
+        let since: DateTime<Utc> = "2024-06-15T10:00:00Z".parse().unwrap();
+        let reviews = vec![
+            make_review(1, "2024-06-15T09:00:00Z"),
+            make_review(2, "2024-06-15T09:59:59Z"),
+        ];
+
+        let filtered = filter_reviews_since(reviews, since);
+        assert!(filtered.is_empty());
+    }
+
+    #[test]
+    fn test_empty_review_list_returns_empty() {
+        let since: DateTime<Utc> = "2024-06-15T10:00:00Z".parse().unwrap();
+        let reviews: Vec<Review> = vec![];
+
+        let filtered = filter_reviews_since(reviews, since);
+        assert!(filtered.is_empty());
+    }
+
+    #[test]
+    fn test_all_reviews_after_timestamp() {
+        let since: DateTime<Utc> = "2024-06-15T10:00:00Z".parse().unwrap();
+        let reviews = vec![
+            make_review(1, "2024-06-15T10:00:01Z"),
+            make_review(2, "2024-06-15T11:00:00Z"),
+            make_review(3, "2024-06-16T10:00:00Z"),
+        ];
+
+        let filtered = filter_reviews_since(reviews, since);
+        assert_eq!(filtered.len(), 3);
+    }
+
+    // ========================================================================
+    // JSON Parsing Error Tests
+    // ========================================================================
+
+    #[test]
+    fn test_pull_request_missing_required_field_fails() {
+        // Missing 'merged' field
+        let json = r#"{
+            "state": "open",
+            "head": {"sha": "abc123"}
+        }"#;
+
+        let result: Result<PullRequest, _> = serde_json::from_str(json);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_pull_request_missing_head_fails() {
+        let json = r#"{
+            "state": "open",
+            "merged": false
+        }"#;
+
+        let result: Result<PullRequest, _> = serde_json::from_str(json);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_review_missing_submitted_at_fails() {
+        let json = r#"{
+            "id": 12345,
+            "user": {"login": "reviewer"}
+        }"#;
+
+        let result: Result<Review, _> = serde_json::from_str(json);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_review_invalid_timestamp_fails() {
+        let json = r#"{
+            "id": 12345,
+            "submitted_at": "not-a-timestamp",
+            "user": {"login": "reviewer"}
+        }"#;
+
+        let result: Result<Review, _> = serde_json::from_str(json);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_check_runs_response_missing_check_runs_fails() {
+        let json = r#"{
+            "total_count": 0
+        }"#;
+
+        let result: Result<CheckRunsResponse, _> = serde_json::from_str(json);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_malformed_json_fails() {
+        let json = r#"{ this is not valid json }"#;
+
+        let result: Result<PullRequest, _> = serde_json::from_str(json);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_empty_json_object_fails_for_pr() {
+        let json = "{}";
+
+        let result: Result<PullRequest, _> = serde_json::from_str(json);
+        assert!(result.is_err());
+    }
 }
