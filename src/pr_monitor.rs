@@ -2,9 +2,112 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use std::path::Path;
+use std::process::Output;
 use tokio::time::{sleep, Duration};
 
 const POLL_INTERVAL_SECS: u64 = 30;
+// Use 5 retries for PR monitoring (lower than CLAUDE.md's 10-15 guideline)
+// because we poll every 30 seconds anyway. Total sleep time: ~62 seconds max
+// (2+4+8+16+32=62s between retries, not including API call duration).
+const DEFAULT_MAX_RETRIES: u32 = 5;
+const BASE_DELAY_SECS: u64 = 2;
+const MAX_DELAY_SECS: u64 = 60; // Cap exponential backoff at 60 seconds
+
+/// Check if an error message indicates a transient failure that should be retried.
+/// Transient failures include network issues, rate limiting, and temporary server errors.
+fn is_retryable_error(stderr: &str) -> bool {
+    // All patterns must be lowercase for case-insensitive matching
+    let retryable_patterns = [
+        // HTTP status codes
+        "502",
+        "503",
+        "504",
+        "429",
+        // Network errors
+        "timeout",
+        "timed out",
+        "connection reset",
+        "connection refused",
+        "network unreachable",
+        "network error",
+        "etimedout",
+        "econnreset",
+        "econnrefused",
+        // DNS errors
+        "resolve host",
+        "name resolution",
+        // Rate limiting
+        "rate limit",
+        "rate-limit",
+        "too many requests",
+        // Server errors
+        "internal server error",
+        "service unavailable",
+        "bad gateway",
+        "gateway timeout",
+        // Generic transient
+        "temporary",
+        "try again",
+    ];
+
+    let lower_stderr = stderr.to_lowercase();
+    retryable_patterns
+        .iter()
+        .any(|pattern| lower_stderr.contains(pattern))
+}
+
+/// Execute a gh API command with retry logic and exponential backoff.
+///
+/// # Arguments
+/// * `args` - The arguments to pass to `gh` command
+/// * `max_retries` - Maximum number of retry attempts (default: 5)
+///
+/// # Returns
+/// The command output on success, or an error after all retries are exhausted.
+async fn gh_api_with_retry(args: &[&str], max_retries: u32) -> Result<Output> {
+    let mut attempts = 0;
+    let args_str = args.join(" ");
+
+    loop {
+        let output = tokio::process::Command::new("gh")
+            .args(args)
+            .output()
+            .await
+            .with_context(|| format!("Failed to execute: gh {}", args_str))?;
+
+        if output.status.success() {
+            if attempts > 0 {
+                log::info!(
+                    "GitHub API call succeeded after {} retries: gh {}",
+                    attempts,
+                    args_str
+                );
+            }
+            return Ok(output);
+        }
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        // Check if this is a retryable error
+        if attempts < max_retries && is_retryable_error(&stderr) {
+            attempts += 1;
+            // Cap delay at MAX_DELAY_SECS to prevent extreme waits
+            let delay_secs = std::cmp::min(BASE_DELAY_SECS.pow(attempts), MAX_DELAY_SECS);
+            let delay = Duration::from_secs(delay_secs);
+            log::warn!(
+                "GitHub API call failed (retry {}/{}): {}. Waiting {:?}...",
+                attempts,
+                max_retries,
+                stderr.trim(),
+                delay
+            );
+            sleep(delay).await;
+        } else {
+            // Either not retryable or max retries exceeded
+            return Ok(output);
+        }
+    }
+}
 
 #[derive(Debug, Deserialize)]
 struct PullRequest {
@@ -145,13 +248,10 @@ pub enum MonitorResult {
     FailedChecks(usize),
 }
 
-/// Fetch PR details using gh CLI
+/// Fetch PR details using gh CLI with retry logic for transient failures
 async fn get_pr(owner: &str, repo: &str, pr_number: &str) -> Result<PullRequest> {
-    let output = tokio::process::Command::new("gh")
-        .args(["api", &format!("repos/{owner}/{repo}/pulls/{pr_number}")])
-        .output()
-        .await
-        .context("Failed to execute gh api command")?;
+    let endpoint = format!("repos/{owner}/{repo}/pulls/{pr_number}");
+    let output = gh_api_with_retry(&["api", &endpoint], DEFAULT_MAX_RETRIES).await?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -164,16 +264,10 @@ async fn get_pr(owner: &str, repo: &str, pr_number: &str) -> Result<PullRequest>
     Ok(pr)
 }
 
-/// Fetch all reviews for a PR
+/// Fetch all reviews for a PR with retry logic for transient failures
 async fn get_all_reviews(owner: &str, repo: &str, pr_number: &str) -> Result<Vec<Review>> {
-    let output = tokio::process::Command::new("gh")
-        .args([
-            "api",
-            &format!("repos/{owner}/{repo}/pulls/{pr_number}/reviews"),
-        ])
-        .output()
-        .await
-        .context("Failed to execute gh api command")?;
+    let endpoint = format!("repos/{owner}/{repo}/pulls/{pr_number}/reviews");
+    let output = gh_api_with_retry(&["api", &endpoint], DEFAULT_MAX_RETRIES).await?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -204,7 +298,7 @@ async fn get_reviews_since(
     Ok(new_reviews)
 }
 
-/// Fetch review comments for specific reviews
+/// Fetch review comments for specific reviews with retry logic for transient failures
 async fn get_review_comments(
     owner: &str,
     repo: &str,
@@ -215,18 +309,12 @@ async fn get_review_comments(
     let mut failed_reviews = 0;
 
     for review in reviews {
-        // Fetch comments for this specific review
-        let output = tokio::process::Command::new("gh")
-            .args([
-                "api",
-                &format!(
-                    "repos/{owner}/{repo}/pulls/{pr_number}/reviews/{}/comments",
-                    review.id
-                ),
-            ])
-            .output()
-            .await
-            .context("Failed to execute gh api command for review comments")?;
+        // Fetch comments for this specific review with retry
+        let endpoint = format!(
+            "repos/{owner}/{repo}/pulls/{pr_number}/reviews/{}/comments",
+            review.id
+        );
+        let output = gh_api_with_retry(&["api", &endpoint], DEFAULT_MAX_RETRIES).await?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -290,16 +378,10 @@ pub fn format_review_prompt(issue_num: u64, pr_number: &str, comments: &[ReviewC
     prompt
 }
 
-/// Fetch check runs for a given commit SHA
+/// Fetch check runs for a given commit SHA with retry logic for transient failures
 async fn get_check_runs(owner: &str, repo: &str, sha: &str) -> Result<Vec<CheckRun>> {
-    let output = tokio::process::Command::new("gh")
-        .args([
-            "api",
-            &format!("repos/{owner}/{repo}/commits/{sha}/check-runs"),
-        ])
-        .output()
-        .await
-        .context("Failed to execute gh api command")?;
+    let endpoint = format!("repos/{owner}/{repo}/commits/{sha}/check-runs");
+    let output = gh_api_with_retry(&["api", &endpoint], DEFAULT_MAX_RETRIES).await?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -409,5 +491,78 @@ mod tests {
         assert_eq!(comment.line, cloned.line);
         assert_eq!(comment.body, cloned.body);
         assert_eq!(comment.reviewer, cloned.reviewer);
+    }
+
+    #[test]
+    fn test_is_retryable_error_http_status_codes() {
+        // HTTP 5xx errors should be retryable
+        assert!(is_retryable_error("HTTP 502 Bad Gateway"));
+        assert!(is_retryable_error("error: 503 Service Unavailable"));
+        assert!(is_retryable_error("status: 504 Gateway Timeout"));
+
+        // Rate limiting should be retryable
+        assert!(is_retryable_error("HTTP 429 Too Many Requests"));
+    }
+
+    #[test]
+    fn test_is_retryable_error_network_errors() {
+        // Network-related errors should be retryable
+        assert!(is_retryable_error("connection timed out"));
+        assert!(is_retryable_error("ETIMEDOUT")); // uppercase - should match via case-insensitive
+        assert!(is_retryable_error("connection reset by peer"));
+        assert!(is_retryable_error("ECONNRESET")); // uppercase - should match via case-insensitive
+        assert!(is_retryable_error("connection refused"));
+        assert!(is_retryable_error("ECONNREFUSED")); // uppercase - should match via case-insensitive
+        assert!(is_retryable_error("network unreachable"));
+    }
+
+    #[test]
+    fn test_is_retryable_error_dns_errors() {
+        // DNS errors should be retryable
+        assert!(is_retryable_error("could not resolve host"));
+        assert!(is_retryable_error("name resolution failed"));
+    }
+
+    #[test]
+    fn test_is_retryable_error_server_errors() {
+        // Server error messages should be retryable
+        assert!(is_retryable_error("Internal Server Error"));
+        assert!(is_retryable_error("Service Unavailable"));
+        assert!(is_retryable_error("Bad Gateway"));
+        assert!(is_retryable_error("Gateway Timeout"));
+    }
+
+    #[test]
+    fn test_is_retryable_error_generic_transient() {
+        // Generic transient messages should be retryable
+        assert!(is_retryable_error("temporary failure"));
+        assert!(is_retryable_error("please try again later"));
+        assert!(is_retryable_error("rate limit exceeded"));
+        assert!(is_retryable_error("rate-limit"));
+    }
+
+    #[test]
+    fn test_is_retryable_error_non_retryable() {
+        // Non-retryable errors should not match
+        assert!(!is_retryable_error("not found"));
+        assert!(!is_retryable_error("HTTP 404"));
+        assert!(!is_retryable_error("unauthorized"));
+        assert!(!is_retryable_error("HTTP 401"));
+        assert!(!is_retryable_error("forbidden"));
+        assert!(!is_retryable_error("HTTP 403"));
+        assert!(!is_retryable_error("bad request"));
+        assert!(!is_retryable_error("HTTP 400"));
+        assert!(!is_retryable_error("invalid token"));
+        assert!(!is_retryable_error("permission denied"));
+    }
+
+    #[test]
+    fn test_is_retryable_error_case_insensitive() {
+        // Should match regardless of case
+        assert!(is_retryable_error("TIMEOUT"));
+        assert!(is_retryable_error("Timeout"));
+        assert!(is_retryable_error("RATE LIMIT"));
+        assert!(is_retryable_error("Rate Limit"));
+        assert!(is_retryable_error("SERVICE UNAVAILABLE"));
     }
 }
