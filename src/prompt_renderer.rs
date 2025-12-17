@@ -70,6 +70,8 @@ pub struct PromptContext {
     pub pr_number: Option<u64>,
     /// GitHub PR title
     pub pr_title: Option<String>,
+    /// GitHub PR body/description
+    pub pr_body: Option<String>,
 
     // Git context
     /// Path to the worktree directory
@@ -129,6 +131,9 @@ impl PromptContext {
         }
         if let Some(ref s) = self.pr_title {
             vars.insert("pr_title".to_string(), s.clone());
+        }
+        if let Some(ref s) = self.pr_body {
+            vars.insert("pr_body".to_string(), s.clone());
         }
 
         // Git context
@@ -209,13 +214,15 @@ pub fn render_prompt(prompt: &Prompt, context: &PromptContext) -> String {
 /// A vector of unique variable names found in the template
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn extract_variables(template: &str) -> Vec<String> {
-    let mut vars: Vec<String> = VARIABLE_PATTERN
+    use std::collections::HashSet;
+
+    let vars: HashSet<String> = VARIABLE_PATTERN
         .captures_iter(template)
         .map(|caps| caps[1].to_string())
         .collect();
-    vars.sort();
-    vars.dedup();
-    vars
+    let mut result: Vec<_> = vars.into_iter().collect();
+    result.sort();
+    result
 }
 
 #[cfg(test)]
@@ -389,6 +396,7 @@ feature/add-thing"#;
             issue_body: Some("Issue description".to_string()),
             pr_number: Some(100),
             pr_title: Some("Test PR".to_string()),
+            pr_body: Some("PR description".to_string()),
             worktree_path: Some(PathBuf::from("/path/to/worktree")),
             branch_name: Some("feature/test".to_string()),
             base_branch: Some("main".to_string()),
@@ -408,6 +416,7 @@ feature/add-thing"#;
         );
         assert_eq!(vars.get("pr_number"), Some(&"100".to_string()));
         assert_eq!(vars.get("pr_title"), Some(&"Test PR".to_string()));
+        assert_eq!(vars.get("pr_body"), Some(&"PR description".to_string()));
         assert_eq!(
             vars.get("worktree_path"),
             Some(&"/path/to/worktree".to_string())
