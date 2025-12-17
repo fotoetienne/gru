@@ -137,7 +137,7 @@ async fn terminate_claude_in_worktree(worktree_path: &Path) -> Result<usize> {
         };
 
         // Check if this process is associated with our worktree
-        // We do this by checking if the process's current directory matches
+        // We do this by checking if any files opened by the process are within the worktree path
         let cwd_check = Command::new("lsof")
             .args(["-p", &pid.to_string(), "-Fn"])
             .output()
@@ -150,13 +150,15 @@ async fn terminate_claude_in_worktree(worktree_path: &Path) -> Result<usize> {
             }
             Err(_) => {
                 // lsof might not be available or process might have exited
-                // Fall back to checking if the session ID matches the minion ID
+                // Fall back to checking if the process command line references the worktree path
                 line.contains(&*worktree_str)
             }
         };
 
         if is_in_worktree {
             // Send SIGTERM to the process
+            // Note: There's a race condition where the process could exit between the ps/lsof
+            // check and the kill call. This is handled gracefully - we warn but don't fail.
             let kill_result = Command::new("kill")
                 .args(["-TERM", &pid.to_string()])
                 .output()
