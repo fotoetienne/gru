@@ -788,15 +788,90 @@ pub async fn handle_fix(issue: &str, timeout_opt: Option<String>, quiet: bool) -
         };
 
         format!(
-            r#"Fix this GitHub issue:
+            r#"
+# Issue #{}: {}
 
-Issue #{}: {}
 URL: https://github.com/{}/{}/issues/{}{}
 
-Description:
+## Description:
 {}
 
-Please implement a fix for this issue."#,
+# Instructions
+
+## 1. Check if Decomposition is Needed
+- Assess the issue's complexity:
+  - Does it involve multiple distinct components or systems?
+  - Does it have multiple acceptance criteria?
+  - Would it take more than a few hours to complete?
+  - Does it mix different types of work (backend + frontend + docs)?
+
+- **If the issue is complex and should be broken down:**
+  - Recommend to the user: "This issue seems complex. Run `/decompose $ARGUMENTS` to break it into smaller sub-issues first."
+  - Stop the fix workflow here - wait for user to decompose
+
+- **If the issue is focused and ready to fix:**
+  - Proceed to the next step
+
+## 2. Plan the Fix
+- Explore the codebase to understand the relevant code
+- Create a detailed plan using TodoWrite with specific steps to fix the issue
+- Consider tests that need to be added or updated
+
+## 3. Implement the Fix
+- Work through each todo item
+- Write clean, minimal code changes
+- Add or update tests as needed
+- Check CLAUDE.md for project-specific build/test commands
+- Run tests to verify the fix
+
+## 4. Code Review
+- Make a commit with the changes
+- Use the Task tool with `subagent_type='code-reviewer'` to perform an autonomous code review
+- The code-reviewer agent will analyze the changes for:
+  - Code correctness and logic errors
+  - Security vulnerabilities
+  - Error handling gaps
+  - Edge cases
+  - Adherence to project conventions (check CLAUDE.md)
+  - Test coverage
+- Address any issues raised by the code-reviewer before proceeding
+- If the review identifies significant problems, iterate on the implementation
+
+## 5. Finish Your Work
+
+When your implementation is complete and ready for human review:
+
+1. **Commit your implementation changes** with a descriptive commit message
+2. **Push the branch** to the remote repository
+3. Write `PR_DESCRIPTION.md` in the root of the repository with this format:
+   ```markdown
+   ## Summary
+   - Key change 1
+   - Key change 2
+
+   ## Test plan
+   - How you tested this
+   - Commands run: cargo test, just check, etc.
+
+   ## Notes
+   - Context reviewers should know
+   - Follow-up work if any
+   ```
+
+**DO NOT commit PR_DESCRIPTION.md** - Gru will read this file locally from your worktree, use it to create the PR description, mark the PR ready, and then delete it automatically.
+
+**IMPORTANT:** Only write `PR_DESCRIPTION.md` when work is truly complete and ready for human review. If work is still in progress, don't create this file - Gru will create a draft PR instead.
+
+## 6. Iterate on Feedback
+- Look at CI check results
+- Address any issues raised by the CI checks
+- Read review comments
+- Determine which comments require changes. Sometimes reviewers are wrong!
+- Make the necessary changes
+- For any comments that you've determined don't require changes, acknowledge them
+- Make a reply that addresses each comment and includes a summary of the changes made
+- Repeat until the PR is ready to merge
+"#,
             issue_num, title, owner, repo, issue_num, labels_section, body
         )
     } else {
