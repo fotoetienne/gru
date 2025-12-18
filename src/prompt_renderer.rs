@@ -13,7 +13,8 @@
 ///
 /// Variable names must:
 /// - Start with a letter (a-z, A-Z) or underscore (_)
-/// - Contain only alphanumeric characters, underscores, or hyphens
+/// - After the initial character, contain only alphanumeric characters (a-z, A-Z, 0-9),
+///   underscores (_), or hyphens (-)
 /// - Be case-sensitive (e.g., `Name` and `name` are different)
 ///
 /// # Security Considerations
@@ -598,12 +599,12 @@ Targeting {{ base_branch }} in {{ repo_owner }}/{{ repo_name }}."#;
     fn test_value_with_special_characters() {
         // Values can contain any characters, including shell metacharacters
         let mut vars = HashMap::new();
-        vars.insert("cmd".to_string(), "$(rm -rf /)".to_string());
+        vars.insert("cmd".to_string(), "$(echo test)".to_string());
         vars.insert("backticks".to_string(), "`whoami`".to_string());
         vars.insert("quotes".to_string(), "\"hello\" 'world'".to_string());
 
         // Values are preserved exactly as-is (no escaping)
-        assert_eq!(render_template("{{ cmd }}", &vars), "$(rm -rf /)");
+        assert_eq!(render_template("{{ cmd }}", &vars), "$(echo test)");
         assert_eq!(render_template("{{ backticks }}", &vars), "`whoami`");
         assert_eq!(render_template("{{ quotes }}", &vars), "\"hello\" 'world'");
     }
