@@ -187,3 +187,4 @@ Contributions are welcome! Please feel free to submit issues and pull requests.
 - [Happy](https://happy.engineering/) - Mobile client for controlling Claude Code remotely
 - [Emdash](https://github.com/generalaction/emdash) - Coding agent orchestration layer supporting 15+ CLIs with parallel execution
 - [Code Conductor](https://github.com/ryanmac/code-conductor) - Run multiple Claude Code sub-agents in parallel with GitHub-native orchestration
+- [Beads](https://github.com/steveyegge/beads) - Git-backed issue tracker giving coding agents persistent memory across sessions
