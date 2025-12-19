@@ -208,11 +208,24 @@ impl GitRepo {
 
             if !output.status.success() {
                 let stderr = String::from_utf8_lossy(&output.stderr);
-                anyhow::bail!(
-                    "git fetch failed with exit code {:?}: {}",
-                    output.status.code(),
-                    stderr
-                );
+                // If fetch fails because a branch is checked out in a worktree,
+                // that's OK - the specific branch fetch will handle what we need.
+                // This happens when doing a blanket fetch and some unrelated branch
+                // is checked out in a worktree.
+                if stderr.contains("refusing to fetch into branch")
+                    && stderr.contains("checked out at")
+                {
+                    log::warn!(
+                        "Skipping full fetch due to worktree conflict (will fetch specific branch later): {}",
+                        stderr.trim()
+                    );
+                } else {
+                    anyhow::bail!(
+                        "git fetch failed with exit code {:?}: {}",
+                        output.status.code(),
+                        stderr
+                    );
+                }
             }
         } else {
             // Clone as bare repository
