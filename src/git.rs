@@ -2,8 +2,14 @@ use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// Default branch names to try when creating new worktrees, in priority order
-const DEFAULT_BRANCHES: &[&str] = &["origin/main", "origin/master"];
+/// Default branch names to try when creating new worktrees, in priority order.
+///
+/// Bare repositories may store branches either:
+/// - Directly (e.g., "main") - newer repos cloned with --bare
+/// - With remote prefix (e.g., "origin/main") - repos with mirror-style refspec
+///
+/// We try both patterns to handle existing repos with different configurations.
+const DEFAULT_BRANCHES: &[&str] = &["main", "origin/main", "master", "origin/master"];
 
 /// Detects if the current directory is within a git repository
 /// Returns the root path of the git repository
@@ -189,11 +195,14 @@ impl GitRepo {
         // Check if the bare repository already exists
         if self.bare_path.exists() {
             // Repository exists, fetch latest changes
+            // Use explicit refspec to update local branches directly (bare repos store
+            // branches without remote prefix, so we need to map refs/heads/* to refs/heads/*)
             let output = Command::new("git")
                 .arg("-C")
                 .arg(&self.bare_path)
                 .arg("fetch")
-                .arg("--all")
+                .arg("origin")
+                .arg("+refs/heads/*:refs/heads/*")
                 .output()
                 .context("Failed to execute git fetch")?;
 
@@ -244,6 +253,26 @@ impl GitRepo {
                     stderr
                 );
             }
+
+            // Configure fetch refspec so future fetches update local branches directly
+            // (git clone --bare doesn't set this by default)
+            let output = Command::new("git")
+                .arg("-C")
+                .arg(&self.bare_path)
+                .arg("config")
+                .arg("remote.origin.fetch")
+                .arg("+refs/heads/*:refs/heads/*")
+                .output()
+                .context("Failed to execute git config for remote.origin.fetch")?;
+
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                anyhow::bail!(
+                    "git config remote.origin.fetch failed with exit code {:?}: {}",
+                    output.status.code(),
+                    stderr
+                );
+            }
         }
 
         Ok(())
@@ -284,11 +313,28 @@ impl GitRepo {
             let stdout = String::from_utf8_lossy(&output.stdout);
             // Parse: "ref: refs/heads/main\tHEAD"
             if let Some(line) = stdout.lines().next() {
-                if let Some(ref_path) = line
+                if let Some(branch_name) = line
                     .strip_prefix("ref: refs/heads/")
                     .and_then(|s| s.split('\t').next())
                 {
-                    return Ok(format!("origin/{}", ref_path));
+                    // Bare repos may store branches either directly ("main") or with
+                    // remote prefix ("origin/main") depending on how they were cloned.
+                    // Try both patterns and return whichever exists.
+                    for candidate in [branch_name.to_string(), format!("origin/{}", branch_name)] {
+                        let check = Command::new("git")
+                            .arg("-C")
+                            .arg(&self.bare_path)
+                            .arg("rev-parse")
+                            .arg("--verify")
+                            .arg(&candidate)
+                            .output();
+
+                        if let Ok(result) = check {
+                            if result.status.success() {
+                                return Ok(candidate);
+                            }
+                        }
+                    }
                 }
             }
         }
