@@ -157,6 +157,17 @@ struct CheckRun {
     conclusion: Option<String>,
 }
 
+/// Check if a CI check run conclusion indicates a failure.
+///
+/// Failed states include: failure, cancelled, timed_out, action_required.
+/// Non-failed states include: success, skipped, neutral, and in-progress (None).
+fn is_failed_check(check_run: &CheckRun) -> bool {
+    matches!(
+        check_run.conclusion.as_deref(),
+        Some("failure") | Some("cancelled") | Some("timed_out") | Some("action_required")
+    )
+}
+
 #[derive(Debug, Deserialize)]
 struct CheckRunsResponse {
     check_runs: Vec<CheckRun>,
@@ -212,18 +223,7 @@ pub async fn monitor_pr(
 
         // Check for failed CI runs - include all error states
         let check_runs = get_check_runs(owner, repo, &pr.head.sha).await?;
-        let failed_checks = check_runs
-            .iter()
-            .filter(|c| {
-                matches!(
-                    c.conclusion.as_deref(),
-                    Some("failure")
-                        | Some("cancelled")
-                        | Some("timed_out")
-                        | Some("action_required")
-                )
-            })
-            .count();
+        let failed_checks = check_runs.iter().filter(|c| is_failed_check(c)).count();
 
         if failed_checks > 0 {
             return Ok(MonitorResult::FailedChecks(failed_checks));
@@ -865,88 +865,73 @@ mod tests {
     // ========================================================================
     // CI Check Failure Detection Tests
     // ========================================================================
-
-    /// Helper to count failed checks (mirrors the logic in monitor_pr)
-    fn count_failed_checks(check_runs: &[CheckRun]) -> usize {
-        check_runs
-            .iter()
-            .filter(|c| {
-                matches!(
-                    c.conclusion.as_deref(),
-                    Some("failure")
-                        | Some("cancelled")
-                        | Some("timed_out")
-                        | Some("action_required")
-                )
-            })
-            .count()
-    }
+    // These tests use the shared is_failed_check function from production code
 
     #[test]
     fn test_failed_check_detection_failure() {
-        let checks = vec![CheckRun {
+        let check = CheckRun {
             conclusion: Some("failure".to_string()),
-        }];
-        assert_eq!(count_failed_checks(&checks), 1);
+        };
+        assert!(is_failed_check(&check));
     }
 
     #[test]
     fn test_failed_check_detection_cancelled() {
-        let checks = vec![CheckRun {
+        let check = CheckRun {
             conclusion: Some("cancelled".to_string()),
-        }];
-        assert_eq!(count_failed_checks(&checks), 1);
+        };
+        assert!(is_failed_check(&check));
     }
 
     #[test]
     fn test_failed_check_detection_timed_out() {
-        let checks = vec![CheckRun {
+        let check = CheckRun {
             conclusion: Some("timed_out".to_string()),
-        }];
-        assert_eq!(count_failed_checks(&checks), 1);
+        };
+        assert!(is_failed_check(&check));
     }
 
     #[test]
     fn test_failed_check_detection_action_required() {
-        let checks = vec![CheckRun {
+        let check = CheckRun {
             conclusion: Some("action_required".to_string()),
-        }];
-        assert_eq!(count_failed_checks(&checks), 1);
+        };
+        assert!(is_failed_check(&check));
     }
 
     #[test]
     fn test_successful_check_not_counted_as_failure() {
-        let checks = vec![CheckRun {
+        let check = CheckRun {
             conclusion: Some("success".to_string()),
-        }];
-        assert_eq!(count_failed_checks(&checks), 0);
+        };
+        assert!(!is_failed_check(&check));
     }
 
     #[test]
     fn test_skipped_check_not_counted_as_failure() {
-        let checks = vec![CheckRun {
+        let check = CheckRun {
             conclusion: Some("skipped".to_string()),
-        }];
-        assert_eq!(count_failed_checks(&checks), 0);
+        };
+        assert!(!is_failed_check(&check));
     }
 
     #[test]
     fn test_neutral_check_not_counted_as_failure() {
-        let checks = vec![CheckRun {
+        let check = CheckRun {
             conclusion: Some("neutral".to_string()),
-        }];
-        assert_eq!(count_failed_checks(&checks), 0);
+        };
+        assert!(!is_failed_check(&check));
     }
 
     #[test]
     fn test_in_progress_check_not_counted_as_failure() {
-        let checks = vec![CheckRun { conclusion: None }];
-        assert_eq!(count_failed_checks(&checks), 0);
+        let check = CheckRun { conclusion: None };
+        assert!(!is_failed_check(&check));
     }
 
     #[test]
     fn test_multiple_checks_mixed_results() {
-        let checks = vec![
+        let checks = [
             CheckRun {
                 conclusion: Some("success".to_string()),
             },
@@ -961,12 +946,13 @@ mod tests {
                 conclusion: Some("success".to_string()),
             },
         ];
-        assert_eq!(count_failed_checks(&checks), 2); // failure + cancelled
+        let failed_count = checks.iter().filter(|c| is_failed_check(c)).count();
+        assert_eq!(failed_count, 2); // failure + cancelled
     }
 
     #[test]
     fn test_all_failure_states_detected() {
-        let checks = vec![
+        let checks = [
             CheckRun {
                 conclusion: Some("failure".to_string()),
             },
@@ -980,13 +966,14 @@ mod tests {
                 conclusion: Some("action_required".to_string()),
             },
         ];
-        assert_eq!(count_failed_checks(&checks), 4);
+        assert!(checks.iter().all(is_failed_check));
     }
 
     #[test]
     fn test_empty_check_runs_no_failures() {
         let checks: Vec<CheckRun> = vec![];
-        assert_eq!(count_failed_checks(&checks), 0);
+        let failed_count = checks.iter().filter(|c| is_failed_check(c)).count();
+        assert_eq!(failed_count, 0);
     }
 
     // ========================================================================
