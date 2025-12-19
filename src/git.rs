@@ -256,13 +256,23 @@ impl GitRepo {
 
             // Configure fetch refspec so future fetches update local branches directly
             // (git clone --bare doesn't set this by default)
-            let _ = Command::new("git")
+            let output = Command::new("git")
                 .arg("-C")
                 .arg(&self.bare_path)
                 .arg("config")
                 .arg("remote.origin.fetch")
                 .arg("+refs/heads/*:refs/heads/*")
-                .output();
+                .output()
+                .context("Failed to execute git config for remote.origin.fetch")?;
+
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                anyhow::bail!(
+                    "git config remote.origin.fetch failed with exit code {:?}: {}",
+                    output.status.code(),
+                    stderr
+                );
+            }
         }
 
         Ok(())
