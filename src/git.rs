@@ -209,16 +209,45 @@ impl GitRepo {
             if !output.status.success() {
                 let stderr = String::from_utf8_lossy(&output.stderr);
                 // If fetch fails because a branch is checked out in a worktree,
-                // that's OK - the specific branch fetch will handle what we need.
-                // This happens when doing a blanket fetch and some unrelated branch
-                // is checked out in a worktree.
+                // fall back to fetching just the default branch (e.g. main) so
+                // new worktrees aren't created from stale refs.
                 if stderr.contains("refusing to fetch into branch")
                     && stderr.contains("checked out at")
                 {
                     log::warn!(
-                        "Skipping full fetch due to worktree conflict (will fetch specific branch later): {}",
+                        "Full fetch failed due to worktree conflict: {}",
                         stderr.trim()
                     );
+                    log::warn!(
+                        "Stale worktrees are preventing a full fetch. \
+                         Run `gru clean` to remove merged/closed worktrees."
+                    );
+
+                    // Fetch just the default branch so new worktrees are up to date
+                    let default_branch = self.query_default_branch_name()?;
+                    let fallback = Command::new("git")
+                        .arg("-C")
+                        .arg(&self.bare_path)
+                        .arg("fetch")
+                        .arg("origin")
+                        .arg(format!(
+                            "+refs/heads/{}:refs/heads/{}",
+                            default_branch, default_branch
+                        ))
+                        .output()
+                        .context("Failed to execute fallback git fetch for default branch")?;
+
+                    if !fallback.status.success() {
+                        let fallback_stderr = String::from_utf8_lossy(&fallback.stderr);
+                        // If even the default branch fetch fails (e.g. it's checked out
+                        // in a worktree too), warn but don't fail — the repo still exists
+                        // and may have a recent-enough copy.
+                        log::warn!(
+                            "Could not fetch default branch '{}' either: {}",
+                            default_branch,
+                            fallback_stderr.trim()
+                        );
+                    }
                 } else {
                     anyhow::bail!(
                         "git fetch failed with exit code {:?}: {}",
@@ -291,6 +320,38 @@ impl GitRepo {
         Ok(())
     }
 
+    /// Queries the remote to discover the default branch name (e.g. "main", "master").
+    ///
+    /// Returns just the branch name as it appears on the remote (without any
+    /// "origin/" prefix or "refs/heads/" prefix). Falls back to "main" if the
+    /// remote query fails or can't be parsed.
+    fn query_default_branch_name(&self) -> Result<String> {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&self.bare_path)
+            .arg("ls-remote")
+            .arg("--symref")
+            .arg("origin")
+            .arg("HEAD")
+            .output()
+            .context("Failed to query remote for default branch")?;
+
+        if output.status.success() {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            // Parse: "ref: refs/heads/main\tHEAD"
+            if let Some(line) = stdout.lines().next() {
+                if let Some(branch_name) = line
+                    .strip_prefix("ref: refs/heads/")
+                    .and_then(|s| s.split('\t').next())
+                {
+                    return Ok(branch_name.to_string());
+                }
+            }
+        }
+
+        Ok("main".to_string())
+    }
+
     /// Determines the default branch to use as base for new worktrees
     ///
     /// Queries the remote repository to discover the actual default branch dynamically.
@@ -312,42 +373,23 @@ impl GitRepo {
         }
 
         // Query the remote to discover the default branch
-        let output = Command::new("git")
-            .arg("-C")
-            .arg(&self.bare_path)
-            .arg("ls-remote")
-            .arg("--symref")
-            .arg("origin")
-            .arg("HEAD")
-            .output()
-            .context("Failed to query remote for default branch")?;
+        let default_branch = self.query_default_branch_name()?;
 
-        if output.status.success() {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            // Parse: "ref: refs/heads/main\tHEAD"
-            if let Some(line) = stdout.lines().next() {
-                if let Some(branch_name) = line
-                    .strip_prefix("ref: refs/heads/")
-                    .and_then(|s| s.split('\t').next())
-                {
-                    // Bare repos may store branches either directly ("main") or with
-                    // remote prefix ("origin/main") depending on how they were cloned.
-                    // Try both patterns and return whichever exists.
-                    for candidate in [branch_name.to_string(), format!("origin/{}", branch_name)] {
-                        let check = Command::new("git")
-                            .arg("-C")
-                            .arg(&self.bare_path)
-                            .arg("rev-parse")
-                            .arg("--verify")
-                            .arg(&candidate)
-                            .output();
+        // Bare repos may store branches either directly ("main") or with
+        // remote prefix ("origin/main") depending on how they were cloned.
+        // Try both patterns and return whichever exists.
+        for candidate in [default_branch.clone(), format!("origin/{}", default_branch)] {
+            let check = Command::new("git")
+                .arg("-C")
+                .arg(&self.bare_path)
+                .arg("rev-parse")
+                .arg("--verify")
+                .arg(&candidate)
+                .output();
 
-                        if let Ok(result) = check {
-                            if result.status.success() {
-                                return Ok(candidate);
-                            }
-                        }
-                    }
+            if let Ok(result) = check {
+                if result.status.success() {
+                    return Ok(candidate);
                 }
             }
         }
