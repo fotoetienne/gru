@@ -223,8 +223,10 @@ impl GitRepo {
                          Run `gru clean` to remove merged/closed worktrees."
                     );
 
-                    // Fetch just the default branch so new worktrees are up to date
-                    let default_branch = self.query_default_branch_name()?;
+                    // Fetch just the default branch so new worktrees are up to date.
+                    // Read the local HEAD symref (set at clone time) to avoid a
+                    // network round-trip — the bare repo already knows its default branch.
+                    let default_branch = self.local_default_branch_name()?;
                     let fallback = Command::new("git")
                         .arg("-C")
                         .arg(&self.bare_path)
@@ -318,6 +320,32 @@ impl GitRepo {
         }
 
         Ok(())
+    }
+
+    /// Reads the local HEAD symref from the bare repository to determine the default
+    /// branch name (e.g. "main", "master"). This is a local operation with no network
+    /// access, making it suitable for fallback paths where speed matters.
+    ///
+    /// Falls back to "main" if the symref can't be read or parsed.
+    fn local_default_branch_name(&self) -> Result<String> {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&self.bare_path)
+            .arg("symbolic-ref")
+            .arg("HEAD")
+            .output()
+            .context("Failed to read symbolic HEAD from bare repo")?;
+
+        if output.status.success() {
+            let raw = String::from_utf8_lossy(&output.stdout);
+            // Output is "refs/heads/main\n" — strip prefix and trim
+            if let Some(branch) = raw.trim().strip_prefix("refs/heads/") {
+                return Ok(branch.to_string());
+            }
+        }
+
+        log::warn!("Could not read local HEAD symref, falling back to 'main'");
+        Ok("main".to_string())
     }
 
     /// Queries the remote to discover the default branch name (e.g. "main", "master").
