@@ -11,6 +11,7 @@ use tokio::fs::OpenOptions;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command as TokioCommand;
 use tokio::time::{timeout, Duration};
+use uuid::Uuid;
 
 /// Timeout in seconds for each line read from Claude's output stream
 /// Set to 5 minutes to accommodate long-running LLM operations
@@ -160,6 +161,9 @@ pub async fn handle_prompt(prompt: &str, timeout_opt: Option<String>, quiet: boo
         .register(minion_id.clone(), registry_info)
         .context("Failed to register prompt Minion in registry")?;
 
+    // Generate a unique session ID (UUID) for Claude's --session-id flag
+    let session_id = Uuid::new_v4();
+
     println!("🤖 Launching Claude...\n");
 
     // Create progress display
@@ -178,7 +182,7 @@ pub async fn handle_prompt(prompt: &str, timeout_opt: Option<String>, quiet: boo
     cmd.arg("--print")
         .arg("--verbose")
         .arg("--session-id")
-        .arg(&minion_id) // Enable session persistence
+        .arg(session_id.to_string()) // Claude requires a valid UUID for --session-id
         .arg("--output-format")
         .arg("stream-json")
         .arg("--include-partial-messages")
