@@ -277,13 +277,9 @@ pub async fn handle_review(pr_arg: Option<String>) -> Result<i32> {
     // Always wait for the process, regardless of stream errors
     let status = child.wait().await?;
 
-    // Always clear PID and remove from registry, regardless of stream errors.
-    // This prevents stale PIDs from lingering after timeouts/crashes.
+    // Remove minion from registry (best effort - don't fail if this errors).
+    // No need to update PID/mode first since the entry is being deleted.
     if let Ok(mut registry) = MinionRegistry::load(None) {
-        let _ = registry.update(&minion_id, |info| {
-            info.pid = None;
-            info.mode = MinionMode::Stopped;
-        });
         if let Err(e) = registry.remove(&minion_id) {
             log::warn!(
                 "Warning: Failed to remove minion {} from registry: {}",

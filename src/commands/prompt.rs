@@ -200,15 +200,20 @@ pub async fn handle_prompt(prompt: &str, timeout_opt: Option<String>, quiet: boo
         "claude command not found. Install from: https://github.com/anthropics/claude-code",
     )?;
 
-    // Record child PID in the registry for status tracking
+    // Record child PID in the registry for status tracking (spawn_blocking to avoid
+    // blocking the async executor with file lock + disk I/O)
     if let Some(pid) = child.id() {
         let pid_minion_id = minion_id.clone();
-        if let Ok(mut registry) = MinionRegistry::load(None) {
-            let _ = registry.update(&pid_minion_id, |info| {
-                info.pid = Some(pid);
-                info.last_activity = Utc::now();
-            });
-        }
+        tokio::task::spawn_blocking(move || {
+            if let Ok(mut registry) = MinionRegistry::load(None) {
+                let _ = registry.update(&pid_minion_id, |info| {
+                    info.pid = Some(pid);
+                    info.last_activity = Utc::now();
+                });
+            }
+        })
+        .await
+        .context("Failed to update registry with PID")?;
     }
 
     // Get the stdout handle
@@ -307,13 +312,9 @@ pub async fn handle_prompt(prompt: &str, timeout_opt: Option<String>, quiet: boo
     // Always wait for the process, regardless of stream errors
     let status = child.wait().await?;
 
-    // Always clear PID and remove from registry, regardless of stream errors.
-    // This prevents stale PIDs from lingering after timeouts/crashes.
+    // Remove minion from registry (best effort - don't fail if this errors).
+    // No need to update PID/mode first since the entry is being deleted.
     if let Ok(mut registry) = MinionRegistry::load(None) {
-        let _ = registry.update(&minion_id, |info| {
-            info.pid = None;
-            info.mode = MinionMode::Stopped;
-        });
         if let Err(e) = registry.remove(&minion_id) {
             log::info!(
                 "Warning: Failed to remove minion {} from registry: {}",
