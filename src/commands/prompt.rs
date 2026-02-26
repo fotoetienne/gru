@@ -307,11 +307,8 @@ pub async fn handle_prompt(prompt: &str, timeout_opt: Option<String>, quiet: boo
     // Always wait for the process, regardless of stream errors
     let status = child.wait().await?;
 
-    // Now check if there was a stream error
-    stream_result?;
-
-    // Update registry: process has exited, clear PID and set mode to Stopped
-    // Then remove minion from registry (best effort - don't fail if this errors)
+    // Always clear PID and remove from registry, regardless of stream errors.
+    // This prevents stale PIDs from lingering after timeouts/crashes.
     if let Ok(mut registry) = MinionRegistry::load(None) {
         let _ = registry.update(&minion_id, |info| {
             info.pid = None;
@@ -325,6 +322,9 @@ pub async fn handle_prompt(prompt: &str, timeout_opt: Option<String>, quiet: boo
             );
         }
     }
+
+    // Now check if there was a stream error (after cleanup)
+    stream_result?;
 
     // Finish the progress display and return appropriate exit code
     if status.success() {

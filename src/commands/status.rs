@@ -96,8 +96,8 @@ fn determine_status(pid: Option<u32>) -> String {
 /// **Phase 1 (with lock):** Load registry, clean up stale entries,
 /// extract basic minion data, then release lock by dropping the registry.
 ///
-/// **Phase 2 (no lock):** Perform expensive git operations via `determine_status()`
-/// for each worktree to determine active/idle status.
+/// **Phase 2 (no lock):** Perform PID-based liveness checks and git branch
+/// detection for each worktree.
 ///
 /// This ensures the lock is only held for the minimum time needed to read/write
 /// the registry file, not for I/O operations.

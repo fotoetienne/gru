@@ -75,12 +75,17 @@ pub struct MinionInfo {
 
 /// Checks whether a process with the given PID is still alive.
 ///
-/// Uses `kill(pid, 0)` on Unix (signal 0 checks existence without sending a signal).
+/// Uses `kill(pid, 0)` on Unix (signal 0 checks process existence without delivering a signal).
+/// Returns `true` if the process exists and is owned by the current user.
+/// Returns `false` if the process does not exist, or exists but is owned by a different user
+/// (EPERM). Since Gru spawns Claude processes as the same user, EPERM is not expected in practice.
 pub fn is_process_alive(pid: u32) -> bool {
     #[cfg(unix)]
     {
-        // Signal 0 doesn't send a signal but checks if the process exists
-        // and we have permission to send it signals.
+        // SAFETY: On Linux and macOS, valid PIDs are positive integers well below i32::MAX
+        // (typically max ~4 million). The cast from u32 is safe for all realistic PID values.
+        // kill(pid, 0) is always safe to call — it performs a permission check without
+        // delivering any signal.
         unsafe { libc::kill(pid as i32, 0) == 0 }
     }
 

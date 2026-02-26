@@ -137,7 +137,8 @@ where
         "claude command not found. Install from: https://github.com/anthropics/claude-code",
     )?;
 
-    // Report the child PID to the caller if a callback was provided
+    // Report the child PID to the caller if a callback was provided.
+    // The callback fires a spawn_blocking task for registry I/O.
     if let Some(callback) = on_spawn {
         if let Some(pid) = child.id() {
             callback(pid);
@@ -963,29 +964,33 @@ When your implementation is complete and ready for human review:
         }
     };
 
-    // Build on_spawn callback to record the child PID in the registry
+    // Build on_spawn callback to record the child PID in the registry.
+    // Uses spawn_blocking (fire-and-forget) to avoid blocking the async executor.
     let pid_minion_id = minion_id.clone();
     let on_spawn: Box<dyn FnOnce(u32) + Send> = Box::new(move |pid: u32| {
-        // Synchronous registry update is acceptable here - brief file I/O
-        if let Ok(mut registry) = MinionRegistry::load(None) {
-            let _ = registry.update(&pid_minion_id, |info| {
-                info.pid = Some(pid);
-                info.last_activity = Utc::now();
-            });
-        }
+        tokio::task::spawn_blocking(move || {
+            if let Ok(mut registry) = MinionRegistry::load(None) {
+                let _ = registry.update(&pid_minion_id, |info| {
+                    info.pid = Some(pid);
+                    info.last_activity = Utc::now();
+                });
+            }
+        });
     });
 
-    // Run Claude with stream monitoring and get the exit status
-    let status = run_claude_with_stream_monitoring(
+    // Run Claude with stream monitoring and get the exit status.
+    // Store the result to ensure cleanup runs even on error paths.
+    let run_result = run_claude_with_stream_monitoring(
         cmd,
         &worktree_path,
         timeout_opt.as_deref(),
         Some(callback),
         Some(on_spawn),
     )
-    .await?;
+    .await;
 
-    // Update registry: process has exited, clear PID and set mode to Stopped
+    // Always clear PID and set mode to Stopped, regardless of success or error.
+    // This prevents stale PIDs from lingering in the registry after timeouts/crashes.
     let exit_minion_id = minion_id.clone();
     tokio::task::spawn_blocking(move || {
         if let Ok(mut registry) = MinionRegistry::load(None) {
@@ -997,6 +1002,9 @@ When your implementation is complete and ready for human review:
     })
     .await
     .context("Failed to update registry after process exit")?;
+
+    // Now propagate the original error if the stream monitoring failed
+    let status = run_result?;
 
     // Post final completion comment
     if let Some(ref client) = github_client {
