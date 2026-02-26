@@ -1,3 +1,4 @@
+use crate::ci;
 use crate::git;
 use crate::github::GitHubClient;
 use crate::minion;
@@ -1220,10 +1221,46 @@ When your implementation is complete and ready for human review:
                 );
             }
         }
+
+        // If Claude failed, don't attempt CI monitoring
+        return Ok(status.code().unwrap_or(EXIT_CODE_SIGNAL_TERMINATED));
+    }
+
+    // CI monitoring: check if a PR exists and monitor its CI checks
+    let ci_passed = monitor_ci_after_fix(&owner, &repo, &branch_name, &worktree_path).await;
+    match ci_passed {
+        Ok(true) => log::info!("✅ CI checks passed"),
+        Ok(false) => log::warn!("⚠️  CI checks failed or were escalated"),
+        Err(e) => log::warn!("⚠️  CI monitoring error (non-fatal): {}", e),
     }
 
     // Return the exit code from the claude process
     Ok(status.code().unwrap_or(EXIT_CODE_SIGNAL_TERMINATED))
+}
+
+/// Monitors CI after the initial fix and attempts auto-fixes if checks fail.
+/// Returns Ok(true) if CI passed, Ok(false) if escalated/failed.
+async fn monitor_ci_after_fix(
+    owner: &str,
+    repo: &str,
+    branch: &str,
+    worktree_path: &Path,
+) -> Result<bool> {
+    // Check if a PR exists for this branch
+    let pr_number = match ci::get_pr_number(owner, repo, branch).await? {
+        Some(num) => num,
+        None => {
+            eprintln!(
+                "ℹ️  No PR found for branch {}, skipping CI monitoring",
+                branch
+            );
+            return Ok(true);
+        }
+    };
+
+    eprintln!("🔍 Monitoring CI for PR #{}", pr_number);
+
+    ci::monitor_and_fix_ci(owner, repo, pr_number, branch, worktree_path).await
 }
 
 #[cfg(test)]
