@@ -377,6 +377,7 @@ impl GitRepo {
             }
         }
 
+        log::warn!("Could not determine default branch from remote, falling back to 'main'");
         Ok("main".to_string())
     }
 
