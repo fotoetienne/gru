@@ -1,3 +1,4 @@
+use crate::ci;
 use crate::git;
 use crate::github::GitHubClient;
 use crate::minion;
@@ -641,15 +642,15 @@ pub async fn handle_fix(issue: &str, timeout_opt: Option<String>, quiet: bool) -
         .ensure_bare_clone()
         .context("Failed to clone or update repository")?;
 
-    // Create worktree path
-    let repo_name = format!("{}/{}", owner, repo);
-    let worktree_path = workspace
-        .work_dir(&repo_name, &minion_id)
-        .context("Failed to compute worktree path")?;
-
-    // Create worktree with branch name: minion/issue-<num>-<id>
+    // Create branch name first: minion/issue-<num>-<id>
     let branch_name = format!("minion/issue-{}-{}", issue_num, minion_id);
     println!("🌿 Creating worktree with branch: {}", branch_name);
+
+    // Create worktree path using branch name
+    let repo_name = format!("{}/{}", owner, repo);
+    let worktree_path = workspace
+        .work_dir(&repo_name, &branch_name)
+        .context("Failed to compute worktree path")?;
 
     git_repo
         .create_worktree(&branch_name, &worktree_path)
@@ -1220,10 +1221,46 @@ When your implementation is complete and ready for human review:
                 );
             }
         }
+
+        // If Claude failed, don't attempt CI monitoring
+        return Ok(status.code().unwrap_or(EXIT_CODE_SIGNAL_TERMINATED));
+    }
+
+    // CI monitoring: check if a PR exists and monitor its CI checks
+    let ci_passed = monitor_ci_after_fix(&owner, &repo, &branch_name, &worktree_path).await;
+    match ci_passed {
+        Ok(true) => log::info!("✅ CI checks passed"),
+        Ok(false) => log::warn!("⚠️  CI checks failed or were escalated"),
+        Err(e) => log::warn!("⚠️  CI monitoring error (non-fatal): {}", e),
     }
 
     // Return the exit code from the claude process
     Ok(status.code().unwrap_or(EXIT_CODE_SIGNAL_TERMINATED))
+}
+
+/// Monitors CI after the initial fix and attempts auto-fixes if checks fail.
+/// Returns Ok(true) if CI passed, Ok(false) if escalated/failed.
+async fn monitor_ci_after_fix(
+    owner: &str,
+    repo: &str,
+    branch: &str,
+    worktree_path: &Path,
+) -> Result<bool> {
+    // Check if a PR exists for this branch
+    let pr_number = match ci::get_pr_number(owner, repo, branch).await? {
+        Some(num) => num,
+        None => {
+            eprintln!(
+                "ℹ️  No PR found for branch {}, skipping CI monitoring",
+                branch
+            );
+            return Ok(true);
+        }
+    };
+
+    eprintln!("🔍 Monitoring CI for PR #{}", pr_number);
+
+    ci::monitor_and_fix_ci(owner, repo, pr_number, branch, worktree_path).await
 }
 
 #[cfg(test)]
