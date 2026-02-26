@@ -13,6 +13,29 @@ use crate::workspace::Workspace;
 /// Cached workspace instance for production state directory access.
 static WORKSPACE: Lazy<io::Result<Workspace>> = Lazy::new(Workspace::new);
 
+/// The execution mode of a Minion session
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum MinionMode {
+    /// Autonomous operation via `gru fix` or `gru resume` - stream monitoring
+    Autonomous,
+    /// Interactive operation via `gru attach` - user in terminal
+    Interactive,
+    /// Process not running (pid is None)
+    #[default]
+    Stopped,
+}
+
+/// Generates a default session ID for backwards compatibility
+fn default_session_id() -> String {
+    uuid::Uuid::new_v4().to_string()
+}
+
+/// Generates a default last_activity timestamp for backwards compatibility
+fn default_last_activity() -> DateTime<Utc> {
+    Utc::now()
+}
+
 /// Metadata about a Minion tracked by the Lab
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MinionInfo {
@@ -34,6 +57,38 @@ pub struct MinionInfo {
     pub status: String,
     /// PR number associated with this Minion (if any)
     pub pr: Option<String>,
+
+    // Session lifecycle fields
+    /// Claude Code session UUID for resume/attach operations
+    #[serde(default = "default_session_id")]
+    pub session_id: String,
+    /// Process ID of the Claude Code process (None when not running)
+    #[serde(default)]
+    pub pid: Option<u32>,
+    /// Current execution mode of the Minion
+    #[serde(default)]
+    pub mode: MinionMode,
+    /// Timestamp of the last observed activity (for stuck detection)
+    #[serde(default = "default_last_activity")]
+    pub last_activity: DateTime<Utc>,
+}
+
+/// Checks whether a process with the given PID is still alive.
+///
+/// Uses `kill(pid, 0)` on Unix (signal 0 checks existence without sending a signal).
+pub fn is_process_alive(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        // Signal 0 doesn't send a signal but checks if the process exists
+        // and we have permission to send it signals.
+        unsafe { libc::kill(pid as i32, 0) == 0 }
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        false
+    }
 }
 
 /// Root structure for the minions registry file
@@ -264,6 +319,26 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
+    /// Creates a test MinionInfo with sensible defaults
+    fn test_minion_info() -> MinionInfo {
+        let now = Utc::now();
+        MinionInfo {
+            repo: "fotoetienne/gru".to_string(),
+            issue: 42,
+            command: "fix".to_string(),
+            prompt: "Fix issue #42".to_string(),
+            started_at: now,
+            branch: "minion/issue-42-M001".to_string(),
+            worktree: PathBuf::from("/tmp/test"),
+            status: "active".to_string(),
+            pr: None,
+            session_id: uuid::Uuid::new_v4().to_string(),
+            pid: None,
+            mode: MinionMode::Autonomous,
+            last_activity: now,
+        }
+    }
+
     #[test]
     fn test_load_creates_empty_registry() {
         let temp_dir = tempdir().unwrap();
@@ -276,18 +351,7 @@ mod tests {
         let temp_dir = tempdir().unwrap();
         let mut registry = MinionRegistry::load(Some(temp_dir.path())).unwrap();
 
-        let info = MinionInfo {
-            repo: "fotoetienne/gru".to_string(),
-            issue: 42,
-            command: "fix".to_string(),
-            prompt: "Fix issue #42".to_string(),
-            started_at: Utc::now(),
-            branch: "minion/issue-42-M001".to_string(),
-            worktree: PathBuf::from("/tmp/test"),
-            status: "active".to_string(),
-            pr: None,
-        };
-
+        let info = test_minion_info();
         registry.register("M001".to_string(), info.clone()).unwrap();
 
         let list = registry.list();
@@ -302,18 +366,7 @@ mod tests {
         let temp_dir = tempdir().unwrap();
         let mut registry = MinionRegistry::load(Some(temp_dir.path())).unwrap();
 
-        let info = MinionInfo {
-            repo: "fotoetienne/gru".to_string(),
-            issue: 42,
-            command: "fix".to_string(),
-            prompt: "Fix issue #42".to_string(),
-            started_at: Utc::now(),
-            branch: "minion/issue-42-M001".to_string(),
-            worktree: PathBuf::from("/tmp/test"),
-            status: "active".to_string(),
-            pr: None,
-        };
-
+        let info = test_minion_info();
         registry.register("M001".to_string(), info.clone()).unwrap();
         let result = registry.register("M001".to_string(), info);
         assert!(result.is_err());
@@ -324,18 +377,7 @@ mod tests {
         let temp_dir = tempdir().unwrap();
         let mut registry = MinionRegistry::load(Some(temp_dir.path())).unwrap();
 
-        let info = MinionInfo {
-            repo: "fotoetienne/gru".to_string(),
-            issue: 42,
-            command: "fix".to_string(),
-            prompt: "Fix issue #42".to_string(),
-            started_at: Utc::now(),
-            branch: "minion/issue-42-M001".to_string(),
-            worktree: PathBuf::from("/tmp/test"),
-            status: "active".to_string(),
-            pr: None,
-        };
-
+        let info = test_minion_info();
         registry.register("M001".to_string(), info).unwrap();
 
         registry
@@ -365,17 +407,7 @@ mod tests {
     fn test_persistence() {
         let temp_dir = tempdir().unwrap();
 
-        let info = MinionInfo {
-            repo: "fotoetienne/gru".to_string(),
-            issue: 42,
-            command: "fix".to_string(),
-            prompt: "Fix issue #42".to_string(),
-            started_at: Utc::now(),
-            branch: "minion/issue-42-M001".to_string(),
-            worktree: PathBuf::from("/tmp/test"),
-            status: "active".to_string(),
-            pr: None,
-        };
+        let info = test_minion_info();
 
         // Create registry and register a minion
         {
@@ -400,18 +432,7 @@ mod tests {
 
         assert!(!registry.exists("M001"));
 
-        let info = MinionInfo {
-            repo: "fotoetienne/gru".to_string(),
-            issue: 42,
-            command: "fix".to_string(),
-            prompt: "Fix issue #42".to_string(),
-            started_at: Utc::now(),
-            branch: "minion/issue-42-M001".to_string(),
-            worktree: PathBuf::from("/tmp/test"),
-            status: "active".to_string(),
-            pr: None,
-        };
-
+        let info = test_minion_info();
         registry.register("M001".to_string(), info).unwrap();
         assert!(registry.exists("M001"));
     }
@@ -423,18 +444,7 @@ mod tests {
 
         assert!(registry.get("M001").is_none());
 
-        let info = MinionInfo {
-            repo: "fotoetienne/gru".to_string(),
-            issue: 42,
-            command: "fix".to_string(),
-            prompt: "Fix issue #42".to_string(),
-            started_at: Utc::now(),
-            branch: "minion/issue-42-M001".to_string(),
-            worktree: PathBuf::from("/tmp/test"),
-            status: "active".to_string(),
-            pr: None,
-        };
-
+        let info = test_minion_info();
         registry.register("M001".to_string(), info).unwrap();
         let retrieved = registry.get("M001").unwrap();
         assert_eq!(retrieved.repo, "fotoetienne/gru");
@@ -446,17 +456,7 @@ mod tests {
         let temp_dir = tempdir().unwrap();
         let mut registry = MinionRegistry::load(Some(temp_dir.path())).unwrap();
 
-        let info = MinionInfo {
-            repo: "fotoetienne/gru".to_string(),
-            issue: 42,
-            command: "fix".to_string(),
-            prompt: "Fix issue #42".to_string(),
-            started_at: Utc::now(),
-            branch: "minion/issue-42-M001".to_string(),
-            worktree: PathBuf::from("/tmp/test"),
-            status: "active".to_string(),
-            pr: None,
-        };
+        let info = test_minion_info();
 
         registry.register("M001".to_string(), info).unwrap();
         assert!(registry.exists("M001"));
@@ -468,5 +468,128 @@ mod tests {
         // Removing again should return None
         let removed2 = registry.remove("M001").unwrap();
         assert!(removed2.is_none());
+    }
+
+    #[test]
+    fn test_session_lifecycle_fields_persisted() {
+        let temp_dir = tempdir().unwrap();
+        let session_id = uuid::Uuid::new_v4().to_string();
+
+        let info = MinionInfo {
+            session_id: session_id.clone(),
+            pid: Some(12345),
+            mode: MinionMode::Autonomous,
+            ..test_minion_info()
+        };
+
+        {
+            let mut registry = MinionRegistry::load(Some(temp_dir.path())).unwrap();
+            registry.register("M001".to_string(), info).unwrap();
+        }
+
+        // Reload and verify lifecycle fields persisted
+        {
+            let registry = MinionRegistry::load(Some(temp_dir.path())).unwrap();
+            let retrieved = registry.get("M001").unwrap();
+            assert_eq!(retrieved.session_id, session_id);
+            assert_eq!(retrieved.pid, Some(12345));
+            assert_eq!(retrieved.mode, MinionMode::Autonomous);
+        }
+    }
+
+    #[test]
+    fn test_update_lifecycle_fields() {
+        let temp_dir = tempdir().unwrap();
+        let mut registry = MinionRegistry::load(Some(temp_dir.path())).unwrap();
+
+        let info = MinionInfo {
+            pid: Some(9999),
+            mode: MinionMode::Autonomous,
+            ..test_minion_info()
+        };
+
+        registry.register("M001".to_string(), info).unwrap();
+
+        // Simulate process exit: clear PID and set mode to Stopped
+        registry
+            .update("M001", |info| {
+                info.pid = None;
+                info.mode = MinionMode::Stopped;
+            })
+            .unwrap();
+
+        let updated = registry.get("M001").unwrap();
+        assert_eq!(updated.pid, None);
+        assert_eq!(updated.mode, MinionMode::Stopped);
+    }
+
+    #[test]
+    fn test_backwards_compatibility_missing_fields() {
+        let temp_dir = tempdir().unwrap();
+        let registry_path = temp_dir.path().join("minions.json");
+
+        // Write a registry JSON without the new fields (simulating old format)
+        let old_json = r#"{
+            "minions": {
+                "M001": {
+                    "repo": "fotoetienne/gru",
+                    "issue": 42,
+                    "command": "fix",
+                    "prompt": "Fix issue #42",
+                    "started_at": "2024-01-01T00:00:00Z",
+                    "branch": "minion/issue-42-M001",
+                    "worktree": "/tmp/test",
+                    "status": "active",
+                    "pr": null
+                }
+            }
+        }"#;
+        fs::write(&registry_path, old_json).unwrap();
+
+        // Loading should succeed with defaults applied
+        let registry = MinionRegistry::load(Some(temp_dir.path())).unwrap();
+        let info = registry.get("M001").unwrap();
+
+        assert_eq!(info.repo, "fotoetienne/gru");
+        assert_eq!(info.pid, None);
+        assert_eq!(info.mode, MinionMode::Stopped);
+        // session_id should get a default UUID
+        assert!(!info.session_id.is_empty());
+    }
+
+    #[test]
+    fn test_minion_mode_serialization() {
+        // Verify MinionMode serializes to lowercase strings
+        let autonomous = serde_json::to_string(&MinionMode::Autonomous).unwrap();
+        assert_eq!(autonomous, r#""autonomous""#);
+
+        let interactive = serde_json::to_string(&MinionMode::Interactive).unwrap();
+        assert_eq!(interactive, r#""interactive""#);
+
+        let stopped = serde_json::to_string(&MinionMode::Stopped).unwrap();
+        assert_eq!(stopped, r#""stopped""#);
+
+        // Verify deserialization
+        let mode: MinionMode = serde_json::from_str(r#""autonomous""#).unwrap();
+        assert_eq!(mode, MinionMode::Autonomous);
+    }
+
+    #[test]
+    fn test_is_process_alive_with_current_process() {
+        // Our own process should be alive
+        let our_pid = std::process::id();
+        assert!(is_process_alive(our_pid));
+    }
+
+    #[test]
+    fn test_is_process_alive_with_nonexistent_pid() {
+        // Use a high but valid PID (won't overflow i32 to -1 or 0)
+        // PID 4194304 exceeds the typical Linux/macOS PID max
+        assert!(!is_process_alive(4_194_304));
+    }
+
+    #[test]
+    fn test_minion_mode_default() {
+        assert_eq!(MinionMode::default(), MinionMode::Stopped);
     }
 }

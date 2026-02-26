@@ -1,6 +1,5 @@
-use crate::minion_registry::MinionRegistry;
+use crate::minion_registry::{is_process_alive, MinionRegistry};
 use anyhow::{Context, Result};
-use std::time::SystemTime;
 
 /// Combined Minion information from registry and filesystem scanning
 #[derive(Debug, Clone)]
@@ -26,6 +25,7 @@ struct BasicMinionData {
     branch: String,
     started_at: chrono::DateTime<chrono::Utc>,
     worktree: std::path::PathBuf,
+    pid: Option<u32>,
 }
 
 /// Calculates uptime from a timestamp
@@ -78,48 +78,11 @@ fn get_current_branch(worktree_path: &std::path::Path, registry_branch: &str) ->
     }
 }
 
-/// Determines if a Minion is Active or Idle based on git index modification time
-fn determine_status(worktree_path: &std::path::Path) -> String {
-    // Use git rev-parse to get the actual git directory path
-    let git_dir_output = std::process::Command::new("git")
-        .arg("-C")
-        .arg(worktree_path)
-        .arg("rev-parse")
-        .arg("--git-dir")
-        .output();
-
-    let git_dir_output = match git_dir_output {
-        Ok(output) if output.status.success() => output,
-        _ => return "Idle".to_string(),
-    };
-
-    let git_dir = String::from_utf8_lossy(&git_dir_output.stdout)
-        .trim()
-        .to_string();
-    let git_index = std::path::PathBuf::from(git_dir).join("index");
-
-    if !git_index.exists() {
-        return "Idle".to_string();
-    }
-
-    let metadata = match std::fs::metadata(&git_index) {
-        Ok(m) => m,
-        Err(_) => return "Idle".to_string(),
-    };
-
-    let modified = match metadata.modified() {
-        Ok(m) => m,
-        Err(_) => return "Idle".to_string(),
-    };
-
-    let now = SystemTime::now();
-    let elapsed = now.duration_since(modified).unwrap_or_default();
-
-    // Consider active if modified within the last 5 minutes
-    if elapsed.as_secs() < 300 {
-        "Active".to_string()
-    } else {
-        "Idle".to_string()
+/// Determines if a Minion is Active or Stopped based on its registered PID
+fn determine_status(pid: Option<u32>) -> String {
+    match pid {
+        Some(pid) if is_process_alive(pid) => "Active".to_string(),
+        _ => "Stopped".to_string(),
     }
 }
 
@@ -180,6 +143,7 @@ pub async fn handle_status(id: Option<String>) -> Result<i32> {
                 branch: info.branch,
                 started_at: info.started_at,
                 worktree: info.worktree,
+                pid: info.pid,
             })
             .collect();
 
@@ -189,15 +153,15 @@ pub async fn handle_status(id: Option<String>) -> Result<i32> {
     .await
     .context("Failed to spawn blocking task for loading registry")??;
 
-    // Phase 2: Perform expensive status checks (no lock held)
+    // Phase 2: Perform status checks and git operations (no lock held)
     let mut minions = tokio::task::spawn_blocking(move || {
         basic_minions
             .into_iter()
             // Filter out worktrees that were removed between Phase 1 and Phase 2
             .filter(|basic| basic.worktree.exists())
             .map(|basic| {
-                // Get current status from filesystem (active/idle detection)
-                let status = determine_status(&basic.worktree);
+                // Determine status from PID (accurate, no 5min lag)
+                let status = determine_status(basic.pid);
                 let uptime = calculate_uptime(basic.started_at);
                 // Get current branch from worktree (checks for detached HEAD, branch changes, etc.)
                 let branch = get_current_branch(&basic.worktree, &basic.branch);
@@ -251,11 +215,10 @@ pub async fn handle_status(id: Option<String>) -> Result<i32> {
         return Ok(0);
     }
 
-    // Sort by: status (active first), then started_at (newest first)
-    // Since we don't have started_at directly, we'll sort by status and then minion_id
+    // Sort by: status (active first), then minion_id
     minions.sort_by(|a, b| match (a.status.as_str(), b.status.as_str()) {
-        ("Active", "Idle") => std::cmp::Ordering::Less,
-        ("Idle", "Active") => std::cmp::Ordering::Greater,
+        ("Active", "Stopped") => std::cmp::Ordering::Less,
+        ("Stopped", "Active") => std::cmp::Ordering::Greater,
         _ => a.minion_id.cmp(&b.minion_id),
     });
 

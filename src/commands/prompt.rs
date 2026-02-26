@@ -1,5 +1,5 @@
 use crate::minion;
-use crate::minion_registry::{MinionInfo as RegistryMinionInfo, MinionRegistry};
+use crate::minion_registry::{MinionInfo as RegistryMinionInfo, MinionMode, MinionRegistry};
 use crate::progress::{ProgressConfig, ProgressDisplay};
 use crate::stream::{self, EventStream};
 use crate::workspace;
@@ -143,16 +143,21 @@ pub async fn handle_prompt(prompt: &str, timeout_opt: Option<String>, quiet: boo
     // distinguishing them from repo-based minions. Any code that filters, displays,
     // or processes minions by repo should be aware that "ad-hoc" is a special case
     // and may require different handling (e.g., prompts have no issues, branches, or PRs).
+    let now = Utc::now();
     let registry_info = RegistryMinionInfo {
         repo: "ad-hoc".to_string(), // Special reserved value for prompt minions
         issue: 0,                   // Prompts don't have issues
         command: "prompt".to_string(),
         prompt: prompt.to_string(),
-        started_at: Utc::now(),
+        started_at: now,
         branch: String::new(), // Prompts don't have branches
         worktree: workspace_path.clone(),
         status: "active".to_string(),
-        pr: None, // Prompts don't have PRs
+        pr: None,                      // Prompts don't have PRs
+        session_id: minion_id.clone(), // Prompts use minion_id as session_id
+        pid: None,
+        mode: MinionMode::Autonomous,
+        last_activity: now,
     };
 
     let mut registry = MinionRegistry::load(None).context("Failed to load Minion registry")?;
@@ -194,6 +199,17 @@ pub async fn handle_prompt(prompt: &str, timeout_opt: Option<String>, quiet: boo
     let mut child = cmd.spawn().context(
         "claude command not found. Install from: https://github.com/anthropics/claude-code",
     )?;
+
+    // Record child PID in the registry for status tracking
+    if let Some(pid) = child.id() {
+        let pid_minion_id = minion_id.clone();
+        if let Ok(mut registry) = MinionRegistry::load(None) {
+            let _ = registry.update(&pid_minion_id, |info| {
+                info.pid = Some(pid);
+                info.last_activity = Utc::now();
+            });
+        }
+    }
 
     // Get the stdout handle
     let stdout = child
@@ -294,8 +310,13 @@ pub async fn handle_prompt(prompt: &str, timeout_opt: Option<String>, quiet: boo
     // Now check if there was a stream error
     stream_result?;
 
-    // Remove minion from registry (best effort - don't fail if this errors)
+    // Update registry: process has exited, clear PID and set mode to Stopped
+    // Then remove minion from registry (best effort - don't fail if this errors)
     if let Ok(mut registry) = MinionRegistry::load(None) {
+        let _ = registry.update(&minion_id, |info| {
+            info.pid = None;
+            info.mode = MinionMode::Stopped;
+        });
         if let Err(e) = registry.remove(&minion_id) {
             log::info!(
                 "Warning: Failed to remove minion {} from registry: {}",

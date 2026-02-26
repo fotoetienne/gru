@@ -1,6 +1,6 @@
 use crate::git;
 use crate::minion;
-use crate::minion_registry::{MinionInfo as RegistryMinionInfo, MinionRegistry};
+use crate::minion_registry::{MinionInfo as RegistryMinionInfo, MinionMode, MinionRegistry};
 use crate::minion_resolver;
 use crate::pr_state::PrState;
 use crate::progress::{ProgressConfig, ProgressDisplay};
@@ -123,17 +123,25 @@ pub async fn handle_review(pr_arg: Option<String>) -> Result<i32> {
         0
     });
 
+    // Generate a unique session ID for conversation continuity
+    let session_id = Uuid::new_v4();
+
     // Register minion in registry
+    let now = Utc::now();
     let registry_info = RegistryMinionInfo {
         repo: format!("{}/{}", owner, repo),
         issue: linked_issue,
         command: "review".to_string(),
         prompt: format!("/pr_review {}", pr_num),
-        started_at: Utc::now(),
+        started_at: now,
         branch: branch.clone(),
         worktree: worktree_path.clone(),
         status: "active".to_string(),
         pr: Some(pr_num.clone()),
+        session_id: session_id.to_string(),
+        pid: None,
+        mode: MinionMode::Autonomous,
+        last_activity: now,
     };
 
     // Load registry and register the Minion (spawn_blocking to avoid holding lock during review)
@@ -160,9 +168,6 @@ pub async fn handle_review(pr_arg: Option<String>) -> Result<i32> {
     };
     let progress = ProgressDisplay::new(config);
 
-    // Generate a unique session ID for conversation continuity
-    let session_id = Uuid::new_v4();
-
     // Build the command with flags for autonomous stream-json output
     let mut cmd = TokioCommand::new("claude");
     cmd.arg("--print")
@@ -183,6 +188,21 @@ pub async fn handle_review(pr_arg: Option<String>) -> Result<i32> {
     let mut child = cmd.spawn().context(
         "claude command not found. Install from: https://github.com/anthropics/claude-code",
     )?;
+
+    // Record child PID in the registry for status tracking
+    if let Some(pid) = child.id() {
+        let pid_minion_id = minion_id.clone();
+        tokio::task::spawn_blocking(move || {
+            if let Ok(mut registry) = MinionRegistry::load(None) {
+                let _ = registry.update(&pid_minion_id, |info| {
+                    info.pid = Some(pid);
+                    info.last_activity = Utc::now();
+                });
+            }
+        })
+        .await
+        .context("Failed to update registry with PID")?;
+    }
 
     // Get the stdout handle
     let stdout = child
@@ -260,8 +280,13 @@ pub async fn handle_review(pr_arg: Option<String>) -> Result<i32> {
     // Now check if there was a stream error
     stream_result?;
 
-    // Remove minion from registry (best effort - don't fail if this errors)
+    // Update registry: process has exited, clear PID and set mode to Stopped
+    // Then remove minion from registry (best effort - don't fail if this errors)
     if let Ok(mut registry) = MinionRegistry::load(None) {
+        let _ = registry.update(&minion_id, |info| {
+            info.pid = None;
+            info.mode = MinionMode::Stopped;
+        });
         if let Err(e) = registry.remove(&minion_id) {
             log::warn!(
                 "Warning: Failed to remove minion {} from registry: {}",
