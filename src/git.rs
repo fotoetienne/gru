@@ -326,7 +326,8 @@ impl GitRepo {
     /// branch name (e.g. "main", "master"). This is a local operation with no network
     /// access, making it suitable for fallback paths where speed matters.
     ///
-    /// Falls back to "main" if the symref can't be read or parsed.
+    /// Falls back to "main" if the symref can't be parsed or the command returns non-zero.
+    /// Returns an error if git cannot be executed.
     fn local_default_branch_name(&self) -> Result<String> {
         let output = Command::new("git")
             .arg("-C")
@@ -352,7 +353,8 @@ impl GitRepo {
     ///
     /// Returns just the branch name as it appears on the remote (without any
     /// "origin/" prefix or "refs/heads/" prefix). Falls back to "main" if the
-    /// remote query fails or can't be parsed.
+    /// remote query returns non-zero or can't be parsed. Returns an error if git
+    /// cannot be executed.
     fn query_default_branch_name(&self) -> Result<String> {
         let output = Command::new("git")
             .arg("-C")
