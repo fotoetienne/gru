@@ -160,7 +160,8 @@ pub async fn handle_clean(dry_run: bool, force: bool, base_branch: &str) -> Resu
     let mut stopped_minion_ids: Vec<(String, std::path::PathBuf)> = Vec::new();
 
     for (minion_id, info) in registry.list() {
-        let is_alive = matches!(info.pid, Some(pid) if crate::minion_registry::is_process_alive(pid));
+        let is_alive =
+            matches!(info.pid, Some(pid) if crate::minion_registry::is_process_alive(pid));
         let canonical = match info.worktree.canonicalize() {
             Ok(c) => c,
             Err(e) => {
@@ -170,7 +171,9 @@ pub async fn handle_clean(dry_run: bool, force: bool, base_branch: &str) -> Resu
                     info.worktree.display(),
                     e
                 );
-                log::warn!("         Using original path, but this may cause comparison mismatches.");
+                log::warn!(
+                    "         Using original path, but this may cause comparison mismatches."
+                );
                 info.worktree
             }
         };
