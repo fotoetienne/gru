@@ -2,7 +2,7 @@ use crate::ci;
 use crate::git;
 use crate::github::GitHubClient;
 use crate::minion;
-use crate::minion_registry::{MinionInfo as RegistryMinionInfo, MinionRegistry};
+use crate::minion_registry::{MinionInfo as RegistryMinionInfo, MinionMode, MinionRegistry};
 use crate::pr_monitor::{self, MonitorResult};
 use crate::pr_state::PrState;
 use crate::progress::{ProgressConfig, ProgressDisplay};
@@ -120,11 +120,15 @@ fn build_claude_resume_command(
 ///
 /// Returns the exit status for the caller to inspect. Caller is responsible for
 /// checking if the process succeeded and handling errors appropriately.
+///
+/// `on_spawn` is called with the child PID immediately after the process is spawned,
+/// allowing callers to record the PID (e.g., in the Minion registry) for status tracking.
 async fn run_claude_with_stream_monitoring<F>(
     mut cmd: TokioCommand,
     worktree_path: &Path,
     timeout_opt: Option<&str>,
     mut output_callback: Option<F>,
+    on_spawn: Option<Box<dyn FnOnce(u32) + Send>>,
 ) -> Result<std::process::ExitStatus>
 where
     F: FnMut(&stream::StreamOutput),
@@ -133,6 +137,14 @@ where
     let mut child = cmd.spawn().context(
         "claude command not found. Install from: https://github.com/anthropics/claude-code",
     )?;
+
+    // Report the child PID to the caller if a callback was provided.
+    // The callback fires a spawn_blocking task for registry I/O.
+    if let Some(callback) = on_spawn {
+        if let Some(pid) = child.id() {
+            callback(pid);
+        }
+    }
 
     // Get the stdout handle
     let stdout = child
@@ -498,6 +510,7 @@ async fn invoke_claude_for_reviews(
         worktree_path,
         timeout_opt,
         None::<fn(&stream::StreamOutput)>,
+        None,
     )
     .await?;
 
@@ -658,18 +671,26 @@ pub async fn handle_fix(issue: &str, timeout_opt: Option<String>, quiet: bool) -
 
     println!("📂 Workspace created at: {}", worktree_path.display());
 
+    // Generate a unique session ID for conversation continuity
+    let session_id = Uuid::new_v4();
+
     // Register the Minion in the registry
     let issue_num_u64: u64 = issue_num.parse().context("Failed to parse issue number")?;
+    let now = Utc::now();
     let registry_info = RegistryMinionInfo {
         repo: repo_name.clone(),
         issue: issue_num_u64,
         command: "fix".to_string(),
         prompt: format!("/fix {}", issue_num),
-        started_at: Utc::now(),
+        started_at: now,
         branch: branch_name.clone(),
         worktree: worktree_path.clone(),
         status: "active".to_string(),
         pr: None,
+        session_id: session_id.to_string(),
+        pid: None,
+        mode: MinionMode::Autonomous,
+        last_activity: now,
     };
 
     // Load registry and register the Minion (spawn_blocking to avoid blocking the async runtime)
@@ -776,9 +797,6 @@ pub async fn handle_fix(issue: &str, timeout_opt: Option<String>, quiet: bool) -
     } else {
         None
     };
-
-    // Generate a unique session ID for conversation continuity
-    let session_id = Uuid::new_v4();
 
     // Format the prompt with issue details
     let prompt = if let Some((title, body, labels)) = issue_details.as_ref() {
@@ -947,14 +965,46 @@ When your implementation is complete and ready for human review:
         }
     };
 
-    // Run Claude with stream monitoring and get the exit status
-    let status = run_claude_with_stream_monitoring(
+    // Build on_spawn callback to record the child PID in the registry.
+    // Runs synchronously to ensure the PID is recorded before stream processing begins,
+    // avoiding a race where short-lived processes exit before the PID is persisted.
+    let pid_minion_id = minion_id.clone();
+    let on_spawn: Box<dyn FnOnce(u32) + Send> = Box::new(move |pid: u32| {
+        if let Ok(mut registry) = MinionRegistry::load(None) {
+            let _ = registry.update(&pid_minion_id, |info| {
+                info.pid = Some(pid);
+                info.last_activity = Utc::now();
+            });
+        }
+    });
+
+    // Run Claude with stream monitoring and get the exit status.
+    // Store the result to ensure cleanup runs even on error paths.
+    let run_result = run_claude_with_stream_monitoring(
         cmd,
         &worktree_path,
         timeout_opt.as_deref(),
         Some(callback),
+        Some(on_spawn),
     )
-    .await?;
+    .await;
+
+    // Always clear PID and set mode to Stopped, regardless of success or error.
+    // This prevents stale PIDs from lingering in the registry after timeouts/crashes.
+    let exit_minion_id = minion_id.clone();
+    tokio::task::spawn_blocking(move || {
+        if let Ok(mut registry) = MinionRegistry::load(None) {
+            let _ = registry.update(&exit_minion_id, |info| {
+                info.pid = None;
+                info.mode = MinionMode::Stopped;
+            });
+        }
+    })
+    .await
+    .context("Failed to update registry after process exit")?;
+
+    // Now propagate the original error if the stream monitoring failed
+    let status = run_result?;
 
     // Post final completion comment
     if let Some(ref client) = github_client {

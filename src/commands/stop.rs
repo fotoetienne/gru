@@ -1,4 +1,4 @@
-use crate::minion_registry::MinionRegistry;
+use crate::minion_registry::{MinionMode, MinionRegistry};
 use crate::minion_resolver;
 use anyhow::{Context, Result};
 use std::path::Path;
@@ -63,6 +63,8 @@ pub async fn handle_stop(id: String) -> Result<i32> {
         let mut registry = MinionRegistry::load(None)?;
         registry.update(&minion_id, |info| {
             info.status = "stopped".to_string();
+            info.pid = None;
+            info.mode = MinionMode::Stopped;
         })
     })
     .await
