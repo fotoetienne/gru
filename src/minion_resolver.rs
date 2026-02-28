@@ -36,13 +36,14 @@ pub struct MinionInfo {
 /// 3. Parse as number, search local minions by issue number
 /// 4. Fallback to GitHub API for PRs (if online)
 pub async fn resolve_minion(id: &str) -> Result<MinionInfo> {
-    // Load minions from registry first (primary source of truth, consistent with gru status)
+    // Load minions from registry (primary source, consistent with gru status).
+    // Returns empty vec on error — registry is best-effort, errors logged at debug level.
     let registry_minions = tokio::task::spawn_blocking(load_from_registry)
         .await
         .context("Failed to spawn blocking task for loading registry")?;
 
     // Try registry-based resolution first
-    if let Some(info) = try_resolve_from_list(id, &registry_minions).await {
+    if let Some(info) = try_resolve_from_list(id, &registry_minions) {
         return Ok(info);
     }
 
@@ -51,8 +52,20 @@ pub async fn resolve_minion(id: &str) -> Result<MinionInfo> {
         .await
         .context("Failed to spawn blocking task for scanning minions")??;
 
-    if let Some(info) = try_resolve_from_list(id, &fs_minions).await {
+    if let Some(info) = try_resolve_from_list(id, &fs_minions) {
         return Ok(info);
+    }
+
+    // Last resort: try as PR number (single network call), search both sources
+    if let Ok(num) = id.parse::<u64>() {
+        if let Ok(issue_num) = resolve_issue_from_pr(num).await {
+            if let Some(info) = find_by_issue_number_from_list(issue_num, &registry_minions) {
+                return Ok(info);
+            }
+            if let Some(info) = find_by_issue_number_from_list(issue_num, &fs_minions) {
+                return Ok(info);
+            }
+        }
     }
 
     anyhow::bail!(
@@ -68,9 +81,9 @@ pub async fn resolve_minion(id: &str) -> Result<MinionInfo> {
     )
 }
 
-/// Tries all resolution strategies against a list of minions.
+/// Tries local resolution strategies against a list of minions (no network calls).
 /// Returns Some(MinionInfo) if found, None otherwise.
-async fn try_resolve_from_list(id: &str, minions: &[MinionInfo]) -> Option<MinionInfo> {
+fn try_resolve_from_list(id: &str, minions: &[MinionInfo]) -> Option<MinionInfo> {
     // Strategy 1: Try as exact minion ID
     if let Some(info) = find_by_minion_id_from_list(id, minions) {
         return Some(info);
@@ -83,17 +96,10 @@ async fn try_resolve_from_list(id: &str, minions: &[MinionInfo]) -> Option<Minio
         }
     }
 
-    // Strategy 3: Try as issue/PR number
+    // Strategy 3: Try as issue number
     if let Ok(num) = id.parse::<u64>() {
         if let Some(info) = find_by_issue_number_from_list(num, minions) {
             return Some(info);
-        }
-
-        // Try to resolve as PR - extract linked issue and search locally
-        if let Ok(issue_num) = resolve_issue_from_pr(num).await {
-            if let Some(info) = find_by_issue_number_from_list(issue_num, minions) {
-                return Some(info);
-            }
         }
     }
 
@@ -111,10 +117,12 @@ fn load_from_registry() -> Vec<MinionInfo> {
         }
     };
 
+    // Don't filter by worktree.exists() here — callers (attach, stop, etc.) already
+    // handle missing worktrees gracefully, and filtering would silently hide entries
+    // that gru status shows.
     registry
         .list()
         .into_iter()
-        .filter(|(_, info)| info.worktree.exists())
         .map(|(minion_id, info)| {
             let issue_number = if info.issue > 0 {
                 Some(info.issue)
@@ -434,46 +442,46 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn test_try_resolve_by_exact_minion_id() {
+    #[test]
+    fn test_try_resolve_by_exact_minion_id() {
         let minions = vec![
             test_minion("M001", Some(42), "owner/repo"),
             test_minion("M002", Some(99), "owner/repo"),
         ];
-        let result = try_resolve_from_list("M001", &minions).await;
+        let result = try_resolve_from_list("M001", &minions);
         assert!(result.is_some());
         assert_eq!(result.unwrap().minion_id, "M001");
     }
 
-    #[tokio::test]
-    async fn test_try_resolve_with_m_prefix() {
+    #[test]
+    fn test_try_resolve_with_m_prefix() {
         let minions = vec![test_minion("M42", Some(10), "owner/repo")];
-        let result = try_resolve_from_list("42", &minions).await;
+        let result = try_resolve_from_list("42", &minions);
         assert!(result.is_some());
         assert_eq!(result.unwrap().minion_id, "M42");
     }
 
-    #[tokio::test]
-    async fn test_try_resolve_by_issue_number() {
+    #[test]
+    fn test_try_resolve_by_issue_number() {
         let minions = vec![
             test_minion("M001", Some(42), "owner/repo"),
             test_minion("M002", Some(99), "owner/repo"),
         ];
-        let result = try_resolve_from_list("99", &minions).await;
+        let result = try_resolve_from_list("99", &minions);
         assert!(result.is_some());
         assert_eq!(result.unwrap().minion_id, "M002");
     }
 
-    #[tokio::test]
-    async fn test_try_resolve_not_found() {
+    #[test]
+    fn test_try_resolve_not_found() {
         let minions = vec![test_minion("M001", Some(42), "owner/repo")];
-        let result = try_resolve_from_list("M999", &minions).await;
+        let result = try_resolve_from_list("M999", &minions);
         assert!(result.is_none());
     }
 
-    #[tokio::test]
-    async fn test_try_resolve_empty_list() {
-        let result = try_resolve_from_list("M001", &[]).await;
+    #[test]
+    fn test_try_resolve_empty_list() {
+        let result = try_resolve_from_list("M001", &[]);
         assert!(result.is_none());
     }
 }
