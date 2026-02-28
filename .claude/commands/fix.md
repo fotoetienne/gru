@@ -6,9 +6,8 @@ argument-hint: "<issue# or URL>"
 
 Implement a fix for a GitHub issue.
 
-**Prerequisites:** Run `/setup-worktree $ARGUMENTS` first, then launch Claude in that directory.
-
-**Issue:** $ARGUMENTS
+**Issue:**
+$ARGUMENTS
 
 ## When Running Under Gru
 
