@@ -200,26 +200,18 @@ pub async fn handle_clean(dry_run: bool, force: bool, base_branch: &str) -> Resu
     drop(registry);
 
     // Prune stale worktree references (directory no longer exists on disk)
-    // Collect bare repos that need pruning, then prune after the loop to avoid
-    // modifying state while iterating.
+    let (stale, worktrees): (Vec<_>, Vec<_>) =
+        worktrees.into_iter().partition(|wt| !wt.path.exists());
+
     let mut bare_repos_to_prune = HashSet::new();
-    let mut pruned_count = 0;
-    let worktrees: Vec<_> = worktrees
-        .into_iter()
-        .filter(|wt| {
-            if !wt.path.exists() {
-                println!(
-                    "Pruning stale worktree reference: {} (directory missing)",
-                    wt.path.display()
-                );
-                bare_repos_to_prune.insert(wt.bare_repo_path.clone());
-                pruned_count += 1;
-                false
-            } else {
-                true
-            }
-        })
-        .collect();
+    for wt in &stale {
+        println!(
+            "Pruning stale worktree reference: {} (directory missing)",
+            wt.path.display()
+        );
+        bare_repos_to_prune.insert(wt.bare_repo_path.clone());
+    }
+    let pruned_count = stale.len();
 
     for bare_repo in &bare_repos_to_prune {
         let output = std::process::Command::new("git")
@@ -249,8 +241,11 @@ pub async fn handle_clean(dry_run: bool, force: bool, base_branch: &str) -> Resu
         println!("Pruned {} stale worktree reference(s).\n", pruned_count);
     }
 
-    // Save discovered worktree paths for orphan detection later
-    let worktrees_discovered: Vec<_> = worktrees.iter().map(|wt| wt.path.clone()).collect();
+    // Build set of discovered worktree paths for orphan detection later
+    let discovered_paths: HashSet<_> = worktrees
+        .iter()
+        .filter_map(|wt| wt.path.canonicalize().ok())
+        .collect();
 
     // Check status of each worktree
     let mut cleanable = Vec::new();
@@ -291,11 +286,6 @@ pub async fn handle_clean(dry_run: bool, force: bool, base_branch: &str) -> Resu
 
     // Find orphaned registry entries (stopped minions not discovered as git worktrees)
     // These are entries like ad-hoc prompts that have a work directory but no bare repo.
-    let discovered_paths: HashSet<_> = worktrees_discovered
-        .iter()
-        .filter_map(|p| p.canonicalize().ok())
-        .collect();
-
     let orphaned_minions: Vec<_> = stopped_minion_ids
         .into_iter()
         .filter(|(_id, path)| !discovered_paths.contains(path))
@@ -335,7 +325,9 @@ pub async fn handle_clean(dry_run: bool, force: bool, base_branch: &str) -> Resu
                 worktree_scanner::WorktreeStatus::IssueClosed => "issue closed",
                 worktree_scanner::WorktreeStatus::RemoteDeleted => "remote deleted",
                 worktree_scanner::WorktreeStatus::MinionStopped => "minion stopped",
-                worktree_scanner::WorktreeStatus::Active => unreachable!(),
+                worktree_scanner::WorktreeStatus::Active => {
+                    unreachable!("Active worktree should not be in cleanable list")
+                }
             };
             println!("  {} ({})", wt.path.display(), reason);
             println!("    Branch: {}", wt.branch);
@@ -398,6 +390,8 @@ pub async fn handle_clean(dry_run: bool, force: bool, base_branch: &str) -> Resu
     println!("\nRemoving worktrees...");
     let mut removed = 0;
     let mut failed = 0;
+    // Collect minion IDs to remove from registry in a single batch
+    let mut registry_ids_to_remove: Vec<String> = Vec::new();
 
     for (wt, _) in cleanable {
         print!("Removing {}... ", wt.path.display());
@@ -459,27 +453,11 @@ pub async fn handle_clean(dry_run: bool, force: bool, base_branch: &str) -> Resu
                 log::warn!("  Warning: Failed to delete branch: {}", e);
             }
 
-            // Remove from registry (best effort - extract minion ID from worktree path)
+            // Queue minion ID for batch registry removal
             // ASSUMPTION: Worktree directory name equals minion ID (e.g., M001)
-            // This works for all newly created minions but won't clean legacy worktrees
-            // that used branch names as directory names (e.g., minion/issue-42-M001).
-            // For legacy worktrees where the directory name does not match any minion ID,
-            // the minion will not be removed from the registry. This is a known limitation.
             if let Some(dir_name) = wt.path.file_name() {
                 if let Some(dir_str) = dir_name.to_str() {
-                    // Try to remove from registry (ignore errors if not in registry)
-                    if let Ok(mut registry) = MinionRegistry::load(None) {
-                        if let Err(e) = registry.remove(dir_str) {
-                            // Only log if it looks like a minion ID (starts with M)
-                            if dir_str.starts_with('M') {
-                                log::warn!(
-                                    "  Warning: Failed to remove minion {} from registry: {}",
-                                    dir_str,
-                                    e
-                                );
-                            }
-                        }
-                    }
+                    registry_ids_to_remove.push(dir_str.to_string());
                 }
             }
         } else {
@@ -529,15 +507,18 @@ pub async fn handle_clean(dry_run: bool, force: bool, base_branch: &str) -> Resu
                 }
             }
 
-            // Remove from registry
-            if let Ok(mut registry) = MinionRegistry::load(None) {
-                if let Err(e) = registry.remove(minion_id) {
-                    log::warn!("  Warning: Failed to remove from registry: {}", e);
-                }
-            }
-
+            registry_ids_to_remove.push(minion_id.clone());
             println!("✓");
             removed += 1;
+        }
+    }
+
+    // Batch-remove all cleaned minions from the registry in a single load/save cycle
+    if !registry_ids_to_remove.is_empty() {
+        if let Ok(mut registry) = MinionRegistry::load(None) {
+            for id in &registry_ids_to_remove {
+                let _ = registry.remove(id);
+            }
         }
     }
 
