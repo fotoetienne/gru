@@ -303,10 +303,11 @@ impl MinionRegistry {
         self.data.minions.get(minion_id)
     }
 
-    /// Finds Minions working on a specific issue in a specific repo
+    /// Finds all Minions associated with a specific issue in a specific repo
     ///
-    /// Returns all matching Minions as (minion_id, MinionInfo) pairs,
-    /// useful for detecting duplicate work before creating a new Minion.
+    /// Returns all matching Minions as (minion_id, MinionInfo) pairs regardless
+    /// of mode or PID status (including stopped entries). Callers should check
+    /// `is_process_alive` to determine which Minions are actually running.
     pub fn find_by_issue(&self, repo: &str, issue: u64) -> Vec<(String, MinionInfo)> {
         self.data
             .minions

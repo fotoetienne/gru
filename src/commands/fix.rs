@@ -640,13 +640,12 @@ pub async fn handle_fix(
     let (owner, repo, issue_num) = parse_issue_info(issue)?;
 
     // Check for existing Minions on this issue before creating a new one
-    let issue_num_for_check: u64 = issue_num
-        .parse()
-        .context("Failed to parse issue number for duplicate check")?;
-
     if !force_new {
+        let issue_num_for_check: u64 = issue_num
+            .parse()
+            .context("Failed to parse issue number for duplicate check")?;
         let repo_for_check = format!("{}/{}", owner, repo);
-        let existing = tokio::task::spawn_blocking(move || {
+        let mut existing = tokio::task::spawn_blocking(move || {
             let registry = MinionRegistry::load(None)?;
             Ok::<_, anyhow::Error>(registry.find_by_issue(&repo_for_check, issue_num_for_check))
         })
@@ -654,6 +653,17 @@ pub async fn handle_fix(
         .context("Failed to spawn blocking task for duplicate check")??;
 
         if !existing.is_empty() {
+            // Sort deterministically: running Minions first, then by most recent start time.
+            // is_process_alive is a single syscall (kill(pid, 0)) that completes in
+            // microseconds, so calling it outside spawn_blocking is acceptable.
+            existing.sort_by(|(_, a), (_, b)| {
+                let a_running = a.pid.map(is_process_alive).unwrap_or(false);
+                let b_running = b.pid.map(is_process_alive).unwrap_or(false);
+                b_running
+                    .cmp(&a_running)
+                    .then_with(|| b.last_activity.cmp(&a.last_activity))
+            });
+
             eprintln!(
                 "Error: {} existing Minion(s) found for issue {}:\n",
                 existing.len(),
@@ -661,9 +671,6 @@ pub async fn handle_fix(
             );
 
             for (minion_id, info) in &existing {
-                // Check if the process is actually still alive (stale PID detection).
-                // is_process_alive is a single syscall (kill(pid, 0)) that completes in
-                // microseconds, so calling it outside spawn_blocking is acceptable.
                 let actually_running = info.pid.map(is_process_alive).unwrap_or(false);
 
                 let status_msg = if actually_running {
@@ -680,16 +687,16 @@ pub async fn handle_fix(
                 eprintln!("  {} - status: {}", minion_id, status_msg);
             }
 
-            // Show options based on the most recent (last) Minion
-            let (last_id, last_info) = existing.last().unwrap();
-            let last_running = last_info.pid.map(is_process_alive).unwrap_or(false);
+            // Suggest options for the best candidate (first after sort: running > most recent)
+            let (best_id, best_info) = existing.first().unwrap();
+            let best_running = best_info.pid.map(is_process_alive).unwrap_or(false);
 
             eprintln!("\nOptions:");
-            if last_running {
-                eprintln!("  - Attach interactively: gru attach {}", last_id);
+            if best_running {
+                eprintln!("  - Attach interactively: gru attach {}", best_id);
             } else {
-                eprintln!("  - Resume work:          gru resume {}", last_id);
-                eprintln!("  - Attach interactively: gru attach {}", last_id);
+                eprintln!("  - Resume work:          gru resume {}", best_id);
+                eprintln!("  - Attach interactively: gru attach {}", best_id);
             }
             eprintln!(
                 "  - Create new session:   gru fix {} --force-new",
