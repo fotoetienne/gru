@@ -188,3 +188,6 @@ Contributions are welcome! Please feel free to submit issues and pull requests.
 - [Emdash](https://github.com/generalaction/emdash) - Coding agent orchestration layer supporting 15+ CLIs with parallel execution
 - [Code Conductor](https://github.com/ryanmac/code-conductor) - Run multiple Claude Code sub-agents in parallel with GitHub-native orchestration
 - [Beads](https://github.com/steveyegge/beads) - Git-backed issue tracker giving coding agents persistent memory across sessions
+- [Worktree CLI](https://github.com/agenttools/worktree) - Git worktree management for coding agents with isolated workspaces
+- [Vibe Kanban](https://www.vibekanban.com/) - Local orchestration platform for running multiple AI coding agents in parallel with kanban-style task management
+- [Cowork](https://support.claude.com/en/articles/13345190-getting-started-with-cowork) - Claude Desktop feature for autonomous multi-step task execution
