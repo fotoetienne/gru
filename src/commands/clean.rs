@@ -161,20 +161,9 @@ pub async fn handle_clean(dry_run: bool, force: bool, base_branch: &str) -> Resu
 
     for (minion_id, info) in registry.list() {
         let is_alive = match info.pid {
-            Some(pid) => {
-                // On Unix, check process liveness via kill(pid, 0).
-                // On non-Unix, conservatively assume a recorded PID is alive
-                // since is_process_alive always returns false there.
-                #[cfg(unix)]
-                {
-                    crate::minion_registry::is_process_alive(pid)
-                }
-                #[cfg(not(unix))]
-                {
-                    let _ = pid;
-                    true
-                }
-            }
+            // On non-Unix, is_process_alive always returns false, so we conservatively
+            // assume a recorded PID is alive to avoid cleaning active worktrees.
+            Some(pid) => cfg!(not(unix)) || crate::minion_registry::is_process_alive(pid),
             // No PID recorded: trust the mode field. Legacy entries (pre-PID) default
             // to Stopped, so they won't block cleanup. But if mode says the minion is
             // running, be conservative and protect the worktree.
@@ -506,9 +495,13 @@ pub async fn handle_clean(dry_run: bool, force: bool, base_branch: &str) -> Resu
 
             // Safety: only remove directories inside the workspace work directory
             // to guard against corrupt or hand-edited registry entries.
+            // Canonicalize work_dir to match the canonical paths from the registry.
             if path.exists() {
-                let work_dir = ws.work();
-                if !path.starts_with(work_dir) {
+                let work_dir = ws
+                    .work()
+                    .canonicalize()
+                    .unwrap_or_else(|_| ws.work().to_path_buf());
+                if !path.starts_with(&work_dir) {
                     println!("✗");
                     log::warn!(
                         "  Skipping removal: path {} is outside workspace ({})",
@@ -534,9 +527,14 @@ pub async fn handle_clean(dry_run: bool, force: bool, base_branch: &str) -> Resu
 
     // Batch-remove all cleaned minions from the registry in a single load/save cycle
     if !registry_ids_to_remove.is_empty() {
-        if let Ok(mut registry) = MinionRegistry::load(None) {
-            for id in &registry_ids_to_remove {
-                let _ = registry.remove(id);
+        match MinionRegistry::load(None) {
+            Ok(mut registry) => {
+                if let Err(e) = registry.remove_batch(&registry_ids_to_remove) {
+                    log::warn!("Warning: Failed to update registry after cleanup: {}", e);
+                }
+            }
+            Err(e) => {
+                log::warn!("Warning: Failed to load registry for cleanup: {}", e);
             }
         }
     }

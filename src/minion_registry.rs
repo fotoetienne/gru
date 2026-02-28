@@ -317,6 +317,27 @@ impl MinionRegistry {
         }
         Ok(removed)
     }
+
+    /// Removes multiple Minions from the registry in a single save operation.
+    ///
+    /// Returns the number of minions actually removed (i.e., that existed in the registry).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the registry cannot be saved to disk
+    pub fn remove_batch(&mut self, minion_ids: &[String]) -> Result<usize> {
+        let mut count = 0;
+        for id in minion_ids {
+            if self.data.minions.remove(id).is_some() {
+                count += 1;
+            }
+        }
+        if count > 0 {
+            self.save()
+                .context("Failed to save registry after batch removal")?;
+        }
+        Ok(count)
+    }
 }
 
 #[cfg(test)]
@@ -473,6 +494,47 @@ mod tests {
         // Removing again should return None
         let removed2 = registry.remove("M001").unwrap();
         assert!(removed2.is_none());
+    }
+
+    #[test]
+    fn test_remove_batch() {
+        let temp_dir = tempdir().unwrap();
+        let mut registry = MinionRegistry::load(Some(temp_dir.path())).unwrap();
+
+        let info = test_minion_info();
+        registry.register("M001".to_string(), info.clone()).unwrap();
+        registry.register("M002".to_string(), info.clone()).unwrap();
+        registry.register("M003".to_string(), info).unwrap();
+        assert_eq!(registry.list().len(), 3);
+
+        // Batch remove two existing and one non-existent
+        let count = registry
+            .remove_batch(&["M001".to_string(), "M003".to_string(), "M999".to_string()])
+            .unwrap();
+        assert_eq!(count, 2);
+        assert!(!registry.exists("M001"));
+        assert!(registry.exists("M002"));
+        assert!(!registry.exists("M003"));
+
+        // Verify persistence
+        drop(registry);
+        let registry = MinionRegistry::load(Some(temp_dir.path())).unwrap();
+        assert_eq!(registry.list().len(), 1);
+        assert!(registry.exists("M002"));
+    }
+
+    #[test]
+    fn test_remove_batch_empty() {
+        let temp_dir = tempdir().unwrap();
+        let mut registry = MinionRegistry::load(Some(temp_dir.path())).unwrap();
+
+        let info = test_minion_info();
+        registry.register("M001".to_string(), info).unwrap();
+
+        // Batch remove with empty list should be a no-op
+        let count = registry.remove_batch(&[]).unwrap();
+        assert_eq!(count, 0);
+        assert!(registry.exists("M001"));
     }
 
     #[test]
