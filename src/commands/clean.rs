@@ -495,23 +495,36 @@ pub async fn handle_clean(dry_run: bool, force: bool, base_branch: &str) -> Resu
 
             // Safety: only remove directories inside the workspace work directory
             // to guard against corrupt or hand-edited registry entries.
-            // Canonicalize work_dir to match the canonical paths from the registry.
+            // Canonicalize both paths to prevent traversal attacks (e.g., "work/../../etc").
             if path.exists() {
+                let canonical_path = match path.canonicalize() {
+                    Ok(p) => p,
+                    Err(e) => {
+                        println!("✗");
+                        log::warn!(
+                            "  Skipping removal: failed to canonicalize {} ({})",
+                            path.display(),
+                            e
+                        );
+                        failed += 1;
+                        continue;
+                    }
+                };
                 let work_dir = ws
                     .work()
                     .canonicalize()
                     .unwrap_or_else(|_| ws.work().to_path_buf());
-                if !path.starts_with(&work_dir) {
+                if !canonical_path.starts_with(&work_dir) {
                     println!("✗");
                     log::warn!(
                         "  Skipping removal: path {} is outside workspace ({})",
-                        path.display(),
+                        canonical_path.display(),
                         work_dir.display()
                     );
                     failed += 1;
                     continue;
                 }
-                if let Err(e) = std::fs::remove_dir_all(path) {
+                if let Err(e) = std::fs::remove_dir_all(&canonical_path) {
                     println!("✗");
                     log::error!("  Error removing directory: {}", e);
                     failed += 1;
