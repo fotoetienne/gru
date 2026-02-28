@@ -24,6 +24,8 @@ pub enum WorktreeStatus {
     IssueClosed,
     /// Branch has been deleted on remote
     RemoteDeleted,
+    /// Minion process is stopped (no live process in registry)
+    MinionStopped,
     /// Worktree is still active and should not be cleaned
     Active,
 }

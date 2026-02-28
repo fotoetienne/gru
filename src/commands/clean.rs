@@ -151,30 +151,94 @@ pub async fn handle_clean(dry_run: bool, force: bool, base_branch: &str) -> Resu
          typically located at ~/.gru/state/minions.json.",
     )?;
 
-    // Build a set of active minion worktree paths for O(1) lookup
-    // Canonicalize paths to handle symlinks and different path representations
-    let active_minion_worktrees: HashSet<_> = registry
-        .list()
+    // Partition registry into active (live process) and stopped minion worktree paths.
+    // Active minions are protected from cleanup; stopped minions are cleanable as a fallback
+    // even when git status checks (merged/closed/remote-deleted) find nothing.
+    let mut active_minion_worktrees = HashSet::new();
+    let mut stopped_minion_worktrees = HashSet::new();
+    // Track stopped minions by ID for orphan cleanup (registry entries with no git worktree)
+    let mut stopped_minion_ids: Vec<(String, std::path::PathBuf)> = Vec::new();
+
+    for (minion_id, info) in registry.list() {
+        let is_alive = matches!(info.pid, Some(pid) if crate::minion_registry::is_process_alive(pid));
+        let canonical = match info.worktree.canonicalize() {
+            Ok(c) => c,
+            Err(e) => {
+                log::warn!(
+                    "Warning: Failed to canonicalize worktree path for minion {}: {} (error: {})",
+                    minion_id,
+                    info.worktree.display(),
+                    e
+                );
+                log::warn!("         Using original path, but this may cause comparison mismatches.");
+                info.worktree
+            }
+        };
+
+        if is_alive {
+            active_minion_worktrees.insert(canonical);
+        } else {
+            stopped_minion_worktrees.insert(canonical.clone());
+            stopped_minion_ids.push((minion_id, canonical));
+        }
+    }
+
+    // Release the registry lock so the cleanup loop can re-acquire it
+    // when removing minions from the registry.
+    drop(registry);
+
+    // Prune stale worktree references (directory no longer exists on disk)
+    // Collect bare repos that need pruning, then prune after the loop to avoid
+    // modifying state while iterating.
+    let mut bare_repos_to_prune = HashSet::new();
+    let mut pruned_count = 0;
+    let worktrees: Vec<_> = worktrees
         .into_iter()
-        .map(|(minion_id, info)| {
-            // Canonicalize if possible, otherwise use the original path
-            // This handles symlinks (e.g., /var -> /private/var on macOS) and path normalization
-            match info.worktree.canonicalize() {
-                Ok(canonical) => canonical,
-                Err(e) => {
-                    // Log canonicalization failures to help diagnose potential path matching issues
-                    log::warn!(
-                        "Warning: Failed to canonicalize worktree path for minion {}: {} (error: {})",
-                        minion_id,
-                        info.worktree.display(),
-                        e
-                    );
-                    log::warn!("         Using original path, but this may cause comparison mismatches.");
-                    info.worktree
-                }
+        .filter(|wt| {
+            if !wt.path.exists() {
+                println!(
+                    "Pruning stale worktree reference: {} (directory missing)",
+                    wt.path.display()
+                );
+                bare_repos_to_prune.insert(wt.bare_repo_path.clone());
+                pruned_count += 1;
+                false
+            } else {
+                true
             }
         })
         .collect();
+
+    for bare_repo in &bare_repos_to_prune {
+        let output = std::process::Command::new("git")
+            .args(["-C", &bare_repo.to_string_lossy(), "worktree", "prune"])
+            .output();
+
+        match output {
+            Ok(result) if result.status.success() => {}
+            Ok(result) => {
+                log::warn!(
+                    "Warning: git worktree prune failed for {}: {}",
+                    bare_repo.display(),
+                    String::from_utf8_lossy(&result.stderr)
+                );
+            }
+            Err(e) => {
+                log::warn!(
+                    "Warning: Failed to run git worktree prune for {}: {}",
+                    bare_repo.display(),
+                    e
+                );
+            }
+        }
+    }
+
+    if pruned_count > 0 {
+        println!("Pruned {} stale worktree reference(s).\n", pruned_count);
+    }
+
+    // Save discovered worktree paths for orphan detection later
+    let worktrees_discovered: Vec<_> = worktrees.iter().map(|wt| wt.path.clone()).collect();
 
     // Check status of each worktree
     let mut cleanable = Vec::new();
@@ -206,8 +270,24 @@ pub async fn handle_clean(dry_run: bool, force: bool, base_branch: &str) -> Resu
 
         if status != worktree_scanner::WorktreeStatus::Active {
             cleanable.push((wt, status));
+        } else if stopped_minion_worktrees.contains(&canonical_wt_path) {
+            // Git status says "active" but the minion process is stopped —
+            // this worktree is orphaned and should be cleanable.
+            cleanable.push((wt, worktree_scanner::WorktreeStatus::MinionStopped));
         }
     }
+
+    // Find orphaned registry entries (stopped minions not discovered as git worktrees)
+    // These are entries like ad-hoc prompts that have a work directory but no bare repo.
+    let discovered_paths: HashSet<_> = worktrees_discovered
+        .iter()
+        .filter_map(|p| p.canonicalize().ok())
+        .collect();
+
+    let orphaned_minions: Vec<_> = stopped_minion_ids
+        .into_iter()
+        .filter(|(_id, path)| !discovered_paths.contains(path))
+        .collect();
 
     // Display skipped worktrees with active minions
     if !skipped_active_minions.is_empty() {
@@ -223,7 +303,7 @@ pub async fn handle_clean(dry_run: bool, force: bool, base_branch: &str) -> Resu
         }
     }
 
-    if cleanable.is_empty() {
+    if cleanable.is_empty() && orphaned_minions.is_empty() {
         if skipped_active_minions.is_empty() {
             println!("No worktrees to clean.");
         } else {
@@ -235,44 +315,59 @@ pub async fn handle_clean(dry_run: bool, force: bool, base_branch: &str) -> Resu
     }
 
     // Display cleanable worktrees
-    println!("Cleanable worktrees:\n");
-    for (wt, status) in &cleanable {
-        let reason = match status {
-            worktree_scanner::WorktreeStatus::Merged => "branch merged",
-            worktree_scanner::WorktreeStatus::IssueClosed => "issue closed",
-            worktree_scanner::WorktreeStatus::RemoteDeleted => "remote deleted",
-            worktree_scanner::WorktreeStatus::Active => unreachable!(),
-        };
-        println!("  {} ({})", wt.path.display(), reason);
-        println!("    Branch: {}", wt.branch);
-        println!("    Repo: {}", wt.repo);
+    if !cleanable.is_empty() {
+        println!("Cleanable worktrees:\n");
+        for (wt, status) in &cleanable {
+            let reason = match status {
+                worktree_scanner::WorktreeStatus::Merged => "branch merged",
+                worktree_scanner::WorktreeStatus::IssueClosed => "issue closed",
+                worktree_scanner::WorktreeStatus::RemoteDeleted => "remote deleted",
+                worktree_scanner::WorktreeStatus::MinionStopped => "minion stopped",
+                worktree_scanner::WorktreeStatus::Active => unreachable!(),
+            };
+            println!("  {} ({})", wt.path.display(), reason);
+            println!("    Branch: {}", wt.branch);
+            println!("    Repo: {}", wt.repo);
 
-        // Check worktree dirty status to inform user what will happen
-        match check_worktree_files(&wt.path) {
-            Ok((has_modified, only_ephemeral)) => {
-                if !has_modified {
-                    println!("    Status: clean");
-                } else if only_ephemeral {
-                    println!("    Status: dirty (ephemeral files only - will auto-force)");
-                } else {
-                    println!("    Status: dirty (important files - requires --force)");
+            // Check worktree dirty status to inform user what will happen
+            match check_worktree_files(&wt.path) {
+                Ok((has_modified, only_ephemeral)) => {
+                    if !has_modified {
+                        println!("    Status: clean");
+                    } else if only_ephemeral {
+                        println!("    Status: dirty (ephemeral files only - will auto-force)");
+                    } else {
+                        println!("    Status: dirty (important files - requires --force)");
+                    }
+                }
+                Err(_) => {
+                    println!("    Status: unknown (unable to check)");
                 }
             }
-            Err(_) => {
-                println!("    Status: unknown (unable to check)");
-            }
+            println!();
         }
-        println!();
     }
 
+    // Display orphaned registry entries
+    if !orphaned_minions.is_empty() {
+        println!("Orphaned registry entries:\n");
+        for (minion_id, path) in &orphaned_minions {
+            println!("  {} (minion stopped, no git worktree)", minion_id);
+            println!("    Path: {}", path.display());
+            println!();
+        }
+    }
+
+    let total_cleanable = cleanable.len() + orphaned_minions.len();
+
     if dry_run {
-        println!("Dry run mode - no worktrees were removed.");
+        println!("Dry run mode - nothing was removed.");
         return Ok(0);
     }
 
     // Confirm removal unless force flag is set
     if !force {
-        print!("Remove {} worktrees? [y/N]: ", cleanable.len());
+        print!("Remove {} item(s)? [y/N]: ", total_cleanable);
         std::io::stdout().flush()?;
 
         let mut input = String::new();
@@ -390,6 +485,35 @@ pub async fn handle_clean(dry_run: bool, force: bool, base_branch: &str) -> Resu
             }
 
             failed += 1;
+        }
+    }
+
+    // Clean up orphaned registry entries
+    if !orphaned_minions.is_empty() {
+        println!("\nCleaning orphaned registry entries...");
+        for (minion_id, path) in &orphaned_minions {
+            print!("  Removing {} ({})... ", minion_id, path.display());
+            std::io::stdout().flush()?;
+
+            // Remove the work directory if it exists
+            if path.exists() {
+                if let Err(e) = std::fs::remove_dir_all(path) {
+                    println!("✗");
+                    log::error!("  Error removing directory: {}", e);
+                    failed += 1;
+                    continue;
+                }
+            }
+
+            // Remove from registry
+            if let Ok(mut registry) = MinionRegistry::load(None) {
+                if let Err(e) = registry.remove(minion_id) {
+                    log::warn!("  Warning: Failed to remove from registry: {}", e);
+                }
+            }
+
+            println!("✓");
+            removed += 1;
         }
     }
 
