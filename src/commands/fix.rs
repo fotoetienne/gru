@@ -653,33 +653,43 @@ pub async fn handle_fix(
         .await
         .context("Failed to spawn blocking task for duplicate check")??;
 
-        if let Some((minion_id, info)) = existing.into_iter().next() {
-            // Check if the process is actually still alive (stale PID detection).
-            // is_process_alive is a single syscall (kill(pid, 0)) that completes in
-            // microseconds, so calling it outside spawn_blocking is acceptable.
-            let actually_running = info.pid.map(is_process_alive).unwrap_or(false);
-
-            let status_msg = if actually_running {
-                match info.mode {
-                    MinionMode::Autonomous => "running (autonomous)",
-                    MinionMode::Interactive => "running (interactive)",
-                    // Process is alive but mode wasn't updated — treat as running
-                    MinionMode::Stopped => "running",
-                }
-            } else {
-                "stopped"
-            };
-
+        if !existing.is_empty() {
             eprintln!(
-                "Error: Minion {} is already working on issue {} (status: {})",
-                minion_id, issue_num, status_msg
+                "Error: {} existing Minion(s) found for issue {}:\n",
+                existing.len(),
+                issue_num
             );
+
+            for (minion_id, info) in &existing {
+                // Check if the process is actually still alive (stale PID detection).
+                // is_process_alive is a single syscall (kill(pid, 0)) that completes in
+                // microseconds, so calling it outside spawn_blocking is acceptable.
+                let actually_running = info.pid.map(is_process_alive).unwrap_or(false);
+
+                let status_msg = if actually_running {
+                    match info.mode {
+                        MinionMode::Autonomous => "running (autonomous)",
+                        MinionMode::Interactive => "running (interactive)",
+                        // Process is alive but mode wasn't updated — treat as running
+                        MinionMode::Stopped => "running",
+                    }
+                } else {
+                    "stopped"
+                };
+
+                eprintln!("  {} - status: {}", minion_id, status_msg);
+            }
+
+            // Show options based on the most recent (last) Minion
+            let (last_id, last_info) = existing.last().unwrap();
+            let last_running = last_info.pid.map(is_process_alive).unwrap_or(false);
+
             eprintln!("\nOptions:");
-            if actually_running {
-                eprintln!("  - Attach interactively: gru attach {}", minion_id);
+            if last_running {
+                eprintln!("  - Attach interactively: gru attach {}", last_id);
             } else {
-                eprintln!("  - Resume work:          gru resume {}", minion_id);
-                eprintln!("  - Attach interactively: gru attach {}", minion_id);
+                eprintln!("  - Resume work:          gru resume {}", last_id);
+                eprintln!("  - Attach interactively: gru attach {}", last_id);
             }
             eprintln!(
                 "  - Create new session:   gru fix {} --force-new",
