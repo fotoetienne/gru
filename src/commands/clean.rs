@@ -160,8 +160,17 @@ pub async fn handle_clean(dry_run: bool, force: bool, base_branch: &str) -> Resu
     let mut stopped_minion_ids: Vec<(String, std::path::PathBuf)> = Vec::new();
 
     for (minion_id, info) in registry.list() {
-        let is_alive =
-            matches!(info.pid, Some(pid) if crate::minion_registry::is_process_alive(pid));
+        let is_alive = match info.pid {
+            Some(pid) => crate::minion_registry::is_process_alive(pid),
+            // No PID recorded: trust the mode field. Legacy entries (pre-PID) default
+            // to Stopped, so they won't block cleanup. But if mode says the minion is
+            // running, be conservative and protect the worktree.
+            None => matches!(
+                info.mode,
+                crate::minion_registry::MinionMode::Autonomous
+                    | crate::minion_registry::MinionMode::Interactive
+            ),
+        };
         let canonical = match info.worktree.canonicalize() {
             Ok(c) => c,
             Err(e) => {
@@ -498,8 +507,20 @@ pub async fn handle_clean(dry_run: bool, force: bool, base_branch: &str) -> Resu
             print!("  Removing {} ({})... ", minion_id, path.display());
             std::io::stdout().flush()?;
 
-            // Remove the work directory if it exists
+            // Safety: only remove directories inside the workspace work directory
+            // to guard against corrupt or hand-edited registry entries.
             if path.exists() {
+                let work_dir = ws.work();
+                if !path.starts_with(work_dir) {
+                    println!("✗");
+                    log::warn!(
+                        "  Skipping removal: path {} is outside workspace ({})",
+                        path.display(),
+                        work_dir.display()
+                    );
+                    failed += 1;
+                    continue;
+                }
                 if let Err(e) = std::fs::remove_dir_all(path) {
                     println!("✗");
                     log::error!("  Error removing directory: {}", e);
