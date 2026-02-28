@@ -133,9 +133,10 @@ fn load_from_registry() -> Vec<MinionInfo> {
             let uptime = {
                 let now = chrono::Utc::now();
                 let duration = now.signed_duration_since(info.started_at);
-                let minutes = duration.num_minutes();
-                let hours = duration.num_hours();
-                let days = duration.num_days();
+                // Guard against clock skew (started_at in the future)
+                let minutes = duration.num_minutes().max(0);
+                let hours = duration.num_hours().max(0);
+                let days = duration.num_days().max(0);
                 if days > 0 {
                     format!("{}d", days)
                 } else if hours > 0 {
