@@ -965,17 +965,16 @@ When your implementation is complete and ready for human review:
     };
 
     // Build on_spawn callback to record the child PID in the registry.
-    // Uses spawn_blocking (fire-and-forget) to avoid blocking the async executor.
+    // Runs synchronously to ensure the PID is recorded before stream processing begins,
+    // avoiding a race where short-lived processes exit before the PID is persisted.
     let pid_minion_id = minion_id.clone();
     let on_spawn: Box<dyn FnOnce(u32) + Send> = Box::new(move |pid: u32| {
-        tokio::task::spawn_blocking(move || {
-            if let Ok(mut registry) = MinionRegistry::load(None) {
-                let _ = registry.update(&pid_minion_id, |info| {
-                    info.pid = Some(pid);
-                    info.last_activity = Utc::now();
-                });
-            }
-        });
+        if let Ok(mut registry) = MinionRegistry::load(None) {
+            let _ = registry.update(&pid_minion_id, |info| {
+                info.pid = Some(pid);
+                info.last_activity = Utc::now();
+            });
+        }
     });
 
     // Run Claude with stream monitoring and get the exit status.
