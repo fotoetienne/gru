@@ -161,7 +161,20 @@ pub async fn handle_clean(dry_run: bool, force: bool, base_branch: &str) -> Resu
 
     for (minion_id, info) in registry.list() {
         let is_alive = match info.pid {
-            Some(pid) => crate::minion_registry::is_process_alive(pid),
+            Some(pid) => {
+                // On Unix, check process liveness via kill(pid, 0).
+                // On non-Unix, conservatively assume a recorded PID is alive
+                // since is_process_alive always returns false there.
+                #[cfg(unix)]
+                {
+                    crate::minion_registry::is_process_alive(pid)
+                }
+                #[cfg(not(unix))]
+                {
+                    let _ = pid;
+                    true
+                }
+            }
             // No PID recorded: trust the mode field. Legacy entries (pre-PID) default
             // to Stopped, so they won't block cleanup. But if mode says the minion is
             // running, be conservative and protect the worktree.
@@ -203,48 +216,54 @@ pub async fn handle_clean(dry_run: bool, force: bool, base_branch: &str) -> Resu
     let (stale, worktrees): (Vec<_>, Vec<_>) =
         worktrees.into_iter().partition(|wt| !wt.path.exists());
 
-    let mut bare_repos_to_prune = HashSet::new();
-    for wt in &stale {
-        println!(
-            "Pruning stale worktree reference: {} (directory missing)",
-            wt.path.display()
-        );
-        bare_repos_to_prune.insert(wt.bare_repo_path.clone());
-    }
-    let pruned_count = stale.len();
+    if !stale.is_empty() {
+        let mut bare_repos_to_prune = HashSet::new();
+        for wt in &stale {
+            println!(
+                "Stale worktree reference: {} (directory missing)",
+                wt.path.display()
+            );
+            bare_repos_to_prune.insert(wt.bare_repo_path.clone());
+        }
 
-    for bare_repo in &bare_repos_to_prune {
-        let output = std::process::Command::new("git")
-            .args(["-C", &bare_repo.to_string_lossy(), "worktree", "prune"])
-            .output();
+        if !dry_run {
+            for bare_repo in &bare_repos_to_prune {
+                let output = std::process::Command::new("git")
+                    .args(["-C", &bare_repo.to_string_lossy(), "worktree", "prune"])
+                    .output();
 
-        match output {
-            Ok(result) if result.status.success() => {}
-            Ok(result) => {
-                log::warn!(
-                    "Warning: git worktree prune failed for {}: {}",
-                    bare_repo.display(),
-                    String::from_utf8_lossy(&result.stderr)
-                );
+                match output {
+                    Ok(result) if result.status.success() => {}
+                    Ok(result) => {
+                        log::warn!(
+                            "Warning: git worktree prune failed for {}: {}",
+                            bare_repo.display(),
+                            String::from_utf8_lossy(&result.stderr)
+                        );
+                    }
+                    Err(e) => {
+                        log::warn!(
+                            "Warning: Failed to run git worktree prune for {}: {}",
+                            bare_repo.display(),
+                            e
+                        );
+                    }
+                }
             }
-            Err(e) => {
-                log::warn!(
-                    "Warning: Failed to run git worktree prune for {}: {}",
-                    bare_repo.display(),
-                    e
-                );
-            }
+            println!("Pruned {} stale worktree reference(s).\n", stale.len());
+        } else {
+            println!(
+                "Found {} stale worktree reference(s) to prune.\n",
+                stale.len()
+            );
         }
     }
 
-    if pruned_count > 0 {
-        println!("Pruned {} stale worktree reference(s).\n", pruned_count);
-    }
-
-    // Build set of discovered worktree paths for orphan detection later
+    // Build set of discovered worktree paths for orphan detection later.
+    // Use fallback-to-original on canonicalize failure for consistent path comparison.
     let discovered_paths: HashSet<_> = worktrees
         .iter()
-        .filter_map(|wt| wt.path.canonicalize().ok())
+        .map(|wt| wt.path.canonicalize().unwrap_or_else(|_| wt.path.clone()))
         .collect();
 
     // Check status of each worktree
