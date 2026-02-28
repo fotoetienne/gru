@@ -303,6 +303,19 @@ impl MinionRegistry {
         self.data.minions.get(minion_id)
     }
 
+    /// Finds Minions working on a specific issue in a specific repo
+    ///
+    /// Returns all matching Minions as (minion_id, MinionInfo) pairs,
+    /// useful for detecting duplicate work before creating a new Minion.
+    pub fn find_by_issue(&self, repo: &str, issue: u64) -> Vec<(String, MinionInfo)> {
+        self.data
+            .minions
+            .iter()
+            .filter(|(_, info)| info.repo == repo && info.issue == issue)
+            .map(|(id, info)| (id.clone(), info.clone()))
+            .collect()
+    }
+
     /// Removes a Minion from the registry
     ///
     /// # Errors
@@ -596,5 +609,62 @@ mod tests {
     #[test]
     fn test_minion_mode_default() {
         assert_eq!(MinionMode::default(), MinionMode::Stopped);
+    }
+
+    #[test]
+    fn test_find_by_issue_returns_matching_minions() {
+        let temp_dir = tempdir().unwrap();
+        let mut registry = MinionRegistry::load(Some(temp_dir.path())).unwrap();
+
+        let info1 = MinionInfo {
+            issue: 42,
+            repo: "owner/repo".to_string(),
+            ..test_minion_info()
+        };
+        let info2 = MinionInfo {
+            issue: 42,
+            repo: "owner/repo".to_string(),
+            ..test_minion_info()
+        };
+        let info3 = MinionInfo {
+            issue: 99,
+            repo: "owner/repo".to_string(),
+            ..test_minion_info()
+        };
+
+        registry.register("M001".to_string(), info1).unwrap();
+        registry.register("M002".to_string(), info2).unwrap();
+        registry.register("M003".to_string(), info3).unwrap();
+
+        let results = registry.find_by_issue("owner/repo", 42);
+        assert_eq!(results.len(), 2);
+        assert!(results.iter().any(|(id, _)| id == "M001"));
+        assert!(results.iter().any(|(id, _)| id == "M002"));
+    }
+
+    #[test]
+    fn test_find_by_issue_no_match() {
+        let temp_dir = tempdir().unwrap();
+        let mut registry = MinionRegistry::load(Some(temp_dir.path())).unwrap();
+
+        let info = MinionInfo {
+            issue: 42,
+            repo: "owner/repo".to_string(),
+            ..test_minion_info()
+        };
+        registry.register("M001".to_string(), info).unwrap();
+
+        // Different issue number
+        assert!(registry.find_by_issue("owner/repo", 99).is_empty());
+
+        // Different repo
+        assert!(registry.find_by_issue("other/repo", 42).is_empty());
+    }
+
+    #[test]
+    fn test_find_by_issue_empty_registry() {
+        let temp_dir = tempdir().unwrap();
+        let registry = MinionRegistry::load(Some(temp_dir.path())).unwrap();
+        assert!(registry.find_by_issue("owner/repo", 42).is_empty());
     }
 }

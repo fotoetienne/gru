@@ -58,6 +58,12 @@ enum Commands {
             help = "Maximum duration for the task (e.g., '10s', '5m', '1h'). Exits with error if exceeded."
         )]
         timeout: Option<String>,
+
+        #[arg(
+            long,
+            help = "Create a new Minion even if one already exists for this issue"
+        )]
+        force_new: bool,
     },
     #[command(about = "Review a GitHub pull request")]
     Review {
@@ -156,7 +162,11 @@ async fn main() {
 
     let result = match cli.command {
         Commands::Init { repo } => init::handle_init(repo).await,
-        Commands::Fix { issue, timeout } => fix::handle_fix(&issue, timeout, cli.quiet).await,
+        Commands::Fix {
+            issue,
+            timeout,
+            force_new,
+        } => fix::handle_fix(&issue, timeout, cli.quiet, force_new).await,
         Commands::Review { pr } => review::handle_review(pr).await,
         Commands::Path { id, issue, pr } => path::handle_path(id, issue, pr).await,
         Commands::Attach { id } => attach::handle_attach(id).await,
