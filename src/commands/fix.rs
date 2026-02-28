@@ -2,7 +2,9 @@ use crate::ci;
 use crate::git;
 use crate::github::GitHubClient;
 use crate::minion;
-use crate::minion_registry::{MinionInfo as RegistryMinionInfo, MinionMode, MinionRegistry};
+use crate::minion_registry::{
+    is_process_alive, MinionInfo as RegistryMinionInfo, MinionMode, MinionRegistry,
+};
 use crate::pr_monitor::{self, MonitorResult};
 use crate::pr_state::PrState;
 use crate::progress::{ProgressConfig, ProgressDisplay};
@@ -628,9 +630,81 @@ async fn try_post_progress_comment(
 
 /// Handles the fix command by delegating to the Claude CLI
 /// Returns the exit code from the claude process
-pub async fn handle_fix(issue: &str, timeout_opt: Option<String>, quiet: bool) -> Result<i32> {
+pub async fn handle_fix(
+    issue: &str,
+    timeout_opt: Option<String>,
+    quiet: bool,
+    force_new: bool,
+) -> Result<i32> {
     // Parse issue information (auto-detects repo from current directory if plain number)
     let (owner, repo, issue_num) = parse_issue_info(issue)?;
+
+    // Check for existing Minions on this issue before creating a new one
+    if !force_new {
+        let issue_num_for_check: u64 = issue_num
+            .parse()
+            .context("Failed to parse issue number for duplicate check")?;
+        let repo_for_check = format!("{}/{}", owner, repo);
+        let mut existing = tokio::task::spawn_blocking(move || {
+            let registry = MinionRegistry::load(None)?;
+            Ok::<_, anyhow::Error>(registry.find_by_issue(&repo_for_check, issue_num_for_check))
+        })
+        .await
+        .context("Failed to spawn blocking task for duplicate check")??;
+
+        if !existing.is_empty() {
+            // Sort deterministically: running Minions first, then by most recent start time.
+            // is_process_alive is a single syscall (kill(pid, 0)) that completes in
+            // microseconds, so calling it outside spawn_blocking is acceptable.
+            existing.sort_by(|(_, a), (_, b)| {
+                let a_running = a.pid.map(is_process_alive).unwrap_or(false);
+                let b_running = b.pid.map(is_process_alive).unwrap_or(false);
+                b_running
+                    .cmp(&a_running)
+                    .then_with(|| b.last_activity.cmp(&a.last_activity))
+            });
+
+            eprintln!(
+                "Error: {} existing Minion(s) found for issue {}:\n",
+                existing.len(),
+                issue_num
+            );
+
+            for (minion_id, info) in &existing {
+                let actually_running = info.pid.map(is_process_alive).unwrap_or(false);
+
+                let status_msg = if actually_running {
+                    match info.mode {
+                        MinionMode::Autonomous => "running (autonomous)",
+                        MinionMode::Interactive => "running (interactive)",
+                        // Process is alive but mode wasn't updated — treat as running
+                        MinionMode::Stopped => "running",
+                    }
+                } else {
+                    "stopped"
+                };
+
+                eprintln!("  {} - status: {}", minion_id, status_msg);
+            }
+
+            // Suggest options for the best candidate (first after sort: running > most recent)
+            let (best_id, best_info) = existing.first().unwrap();
+            let best_running = best_info.pid.map(is_process_alive).unwrap_or(false);
+
+            eprintln!("\nOptions:");
+            if best_running {
+                eprintln!("  - Attach interactively: gru attach {}", best_id);
+            } else {
+                eprintln!("  - Resume work:          gru resume {}", best_id);
+                eprintln!("  - Attach interactively: gru attach {}", best_id);
+            }
+            eprintln!(
+                "  - Create new session:   gru fix {} --force-new",
+                issue_num
+            );
+            return Ok(1);
+        }
+    }
 
     // Always generate a unique minion ID
     let minion_id = minion::generate_minion_id().context("Failed to generate Minion ID")?;
