@@ -194,69 +194,82 @@ impl GitRepo {
 
         // Check if the bare repository already exists
         if self.bare_path.exists() {
-            // Repository exists, fetch latest changes
-            // Use explicit refspec to update local branches directly (bare repos store
-            // branches without remote prefix, so we need to map refs/heads/* to refs/heads/*)
-            let output = Command::new("git")
-                .arg("-C")
-                .arg(&self.bare_path)
-                .arg("fetch")
-                .arg("origin")
-                .arg("+refs/heads/*:refs/heads/*")
-                .output()
-                .context("Failed to execute git fetch")?;
+            // Fetch only the default branch to keep it up to date for new worktree creation.
+            // We avoid fetching all branches (refs/heads/*) because git refuses to update
+            // any ref that is checked out in a worktree, causing the entire fetch to fail.
+            // Feature branches are fetched on demand via fetch_branch().
+            let mut fetched = false;
+            for branch in DEFAULT_BRANCHES {
+                // Skip origin/-prefixed entries; we fetch from origin by branch name
+                if branch.starts_with("origin/") {
+                    continue;
+                }
 
-            if !output.status.success() {
+                let mut cmd = Command::new("git");
+                if let Some(ref token) = token {
+                    let safe_token = token.replace('\'', "'\\''");
+                    cmd.arg("-c").arg(format!(
+                        "credential.helper=!f() {{ echo username=oauth2; echo password='{}'; }}; f",
+                        safe_token
+                    ));
+                }
+                let output = cmd
+                    .arg("-C")
+                    .arg(&self.bare_path)
+                    .arg("fetch")
+                    .arg("origin")
+                    .arg(format!("+refs/heads/{}:refs/heads/{}", branch, branch))
+                    .output()
+                    .context("Failed to execute git fetch")?;
+
+                if output.status.success() {
+                    fetched = true;
+                    break;
+                }
+
                 let stderr = String::from_utf8_lossy(&output.stderr);
-                // If fetch fails because a branch is checked out in a worktree,
-                // fall back to fetching just the default branch (e.g. main) so
-                // new worktrees aren't created from stale refs.
+
+                // If the default branch is checked out in a worktree, git refuses
+                // to update it. Treat this like a missing branch and try the next.
                 if stderr.contains("refusing to fetch into branch")
                     && stderr.contains("checked out at")
                 {
-                    log::warn!(
-                        "Full fetch failed due to worktree conflict: {}",
+                    log::debug!(
+                        "Branch '{}' is checked out in a worktree, skipping fetch",
+                        branch
+                    );
+                    continue;
+                }
+
+                // Only continue to the next candidate if this branch doesn't exist on remote.
+                // Different git versions may produce different messages, so check several.
+                // For any other failure (auth, network, etc.), propagate the error immediately.
+                let is_missing_ref = stderr.contains("couldn't find remote ref")
+                    || stderr.contains("could not find remote ref")
+                    || stderr.contains("no such ref")
+                    || stderr.contains("unknown revision");
+
+                if !is_missing_ref {
+                    anyhow::bail!(
+                        "git fetch failed for branch '{}' with exit code {:?}: {}",
+                        branch,
+                        output.status.code(),
                         stderr.trim()
                     );
-                    log::warn!(
-                        "Stale worktrees are preventing a full fetch. \
-                         Run `gru clean` to remove merged/closed worktrees."
-                    );
-
-                    // Fetch just the default branch so new worktrees are up to date.
-                    // Read the local HEAD symref (set at clone time) to avoid a
-                    // network round-trip — the bare repo already knows its default branch.
-                    let default_branch = self.local_default_branch_name()?;
-                    let fallback = Command::new("git")
-                        .arg("-C")
-                        .arg(&self.bare_path)
-                        .arg("fetch")
-                        .arg("origin")
-                        .arg(format!(
-                            "+refs/heads/{}:refs/heads/{}",
-                            default_branch, default_branch
-                        ))
-                        .output()
-                        .context("Failed to execute fallback git fetch for default branch")?;
-
-                    if !fallback.status.success() {
-                        let fallback_stderr = String::from_utf8_lossy(&fallback.stderr);
-                        // If even the default branch fetch fails (e.g. it's checked out
-                        // in a worktree too), warn but don't fail — the repo still exists
-                        // and may have a recent-enough copy.
-                        log::warn!(
-                            "Could not fetch default branch '{}' either: {}",
-                            default_branch,
-                            fallback_stderr.trim()
-                        );
-                    }
-                } else {
-                    anyhow::bail!(
-                        "git fetch failed with exit code {:?}: {}",
-                        output.status.code(),
-                        stderr
-                    );
                 }
+            }
+
+            if !fetched {
+                log::warn!(
+                    "Could not fetch any default branch ({}). \
+                     The local copy may be stale, but feature branches will be fetched on demand.",
+                    DEFAULT_BRANCHES
+                        .iter()
+                        .filter(|b| !b.starts_with("origin/"))
+                        .copied()
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
             }
         } else {
             // Clone as bare repository
@@ -322,67 +335,6 @@ impl GitRepo {
         Ok(())
     }
 
-    /// Reads the local HEAD symref from the bare repository to determine the default
-    /// branch name (e.g. "main", "master"). This is a local operation with no network
-    /// access, making it suitable for fallback paths where speed matters.
-    ///
-    /// Falls back to "main" if the symref can't be parsed or the command returns non-zero.
-    /// Returns an error if git cannot be executed.
-    fn local_default_branch_name(&self) -> Result<String> {
-        let output = Command::new("git")
-            .arg("-C")
-            .arg(&self.bare_path)
-            .arg("symbolic-ref")
-            .arg("HEAD")
-            .output()
-            .context("Failed to read symbolic HEAD from bare repo")?;
-
-        if output.status.success() {
-            let raw = String::from_utf8_lossy(&output.stdout);
-            // Output is "refs/heads/main\n" — strip prefix and trim
-            if let Some(branch) = raw.trim().strip_prefix("refs/heads/") {
-                return Ok(branch.to_string());
-            }
-        }
-
-        log::warn!("Could not read local HEAD symref, falling back to 'main'");
-        Ok("main".to_string())
-    }
-
-    /// Queries the remote to discover the default branch name (e.g. "main", "master").
-    ///
-    /// Returns just the branch name as it appears on the remote (without any
-    /// "origin/" prefix or "refs/heads/" prefix). Falls back to "main" if the
-    /// remote query returns non-zero or can't be parsed. Returns an error if git
-    /// cannot be executed.
-    fn query_default_branch_name(&self) -> Result<String> {
-        let output = Command::new("git")
-            .arg("-C")
-            .arg(&self.bare_path)
-            .arg("ls-remote")
-            .arg("--symref")
-            .arg("origin")
-            .arg("HEAD")
-            .output()
-            .context("Failed to query remote for default branch")?;
-
-        if output.status.success() {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            // Parse: "ref: refs/heads/main\tHEAD"
-            if let Some(line) = stdout.lines().next() {
-                if let Some(branch_name) = line
-                    .strip_prefix("ref: refs/heads/")
-                    .and_then(|s| s.split('\t').next())
-                {
-                    return Ok(branch_name.to_string());
-                }
-            }
-        }
-
-        log::warn!("Could not determine default branch from remote, falling back to 'main'");
-        Ok("main".to_string())
-    }
-
     /// Determines the default branch to use as base for new worktrees
     ///
     /// Queries the remote repository to discover the actual default branch dynamically.
@@ -404,23 +356,42 @@ impl GitRepo {
         }
 
         // Query the remote to discover the default branch
-        let default_branch = self.query_default_branch_name()?;
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&self.bare_path)
+            .arg("ls-remote")
+            .arg("--symref")
+            .arg("origin")
+            .arg("HEAD")
+            .output()
+            .context("Failed to query remote for default branch")?;
 
-        // Bare repos may store branches either directly ("main") or with
-        // remote prefix ("origin/main") depending on how they were cloned.
-        // Try both patterns and return whichever exists.
-        for candidate in [default_branch.clone(), format!("origin/{}", default_branch)] {
-            let check = Command::new("git")
-                .arg("-C")
-                .arg(&self.bare_path)
-                .arg("rev-parse")
-                .arg("--verify")
-                .arg(&candidate)
-                .output();
+        if output.status.success() {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            // Parse: "ref: refs/heads/main\tHEAD"
+            if let Some(line) = stdout.lines().next() {
+                if let Some(branch_name) = line
+                    .strip_prefix("ref: refs/heads/")
+                    .and_then(|s| s.split('\t').next())
+                {
+                    // Bare repos may store branches either directly ("main") or with
+                    // remote prefix ("origin/main") depending on how they were cloned.
+                    // Try both patterns and return whichever exists.
+                    for candidate in [branch_name.to_string(), format!("origin/{}", branch_name)] {
+                        let check = Command::new("git")
+                            .arg("-C")
+                            .arg(&self.bare_path)
+                            .arg("rev-parse")
+                            .arg("--verify")
+                            .arg(&candidate)
+                            .output();
 
-            if let Ok(result) = check {
-                if result.status.success() {
-                    return Ok(candidate);
+                        if let Ok(result) = check {
+                            if result.status.success() {
+                                return Ok(candidate);
+                            }
+                        }
+                    }
                 }
             }
         }
