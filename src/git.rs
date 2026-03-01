@@ -155,7 +155,7 @@ pub fn parse_github_remote(url: &str) -> Result<(String, String)> {
 }
 
 /// Represents a single entry from `git worktree list --porcelain` output.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorktreeEntry {
     /// Filesystem path to the worktree
     pub path: PathBuf,
@@ -165,9 +165,13 @@ pub struct WorktreeEntry {
 
 /// Parses `git worktree list --porcelain` output into structured entries.
 ///
-/// This is the single source of truth for porcelain parsing. Both
-/// `GitRepo::find_worktree_for_branch` and `worktree_scanner::parse_worktree_list`
-/// delegate to this function.
+/// This is the single source of truth for porcelain parsing, used by both
+/// `GitRepo::find_worktree_for_branch` and the worktree scanner module.
+///
+/// Assumes well-formed porcelain output where each stanza is terminated by a
+/// blank line. If a `worktree` line appears without a preceding blank line,
+/// the in-progress entry is silently discarded (consistent with git's guarantee
+/// for `--porcelain` output).
 pub fn parse_porcelain_worktrees(output: &str) -> Vec<WorktreeEntry> {
     let mut entries = Vec::new();
     let mut current_path: Option<PathBuf> = None;
