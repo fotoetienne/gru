@@ -88,6 +88,12 @@ enum Commands {
     Attach {
         #[arg(help = "Minion ID, issue number, or PR number (e.g., M0tk, 42)")]
         id: String,
+
+        #[arg(
+            long,
+            help = "Skip permission prompts (adds --dangerously-skip-permissions)"
+        )]
+        yolo: bool,
     },
     #[command(about = "Resume a Minion's Claude session")]
     Resume {
@@ -191,7 +197,7 @@ async fn main() {
         } => fix::handle_fix(&issue, timeout, cli.quiet, force_new).await,
         Commands::Review { pr } => review::handle_review(pr).await,
         Commands::Path { id, issue, pr } => path::handle_path(id, issue, pr).await,
-        Commands::Attach { id } => attach::handle_attach(id).await,
+        Commands::Attach { id, yolo } => attach::handle_attach(id, yolo).await,
         Commands::Resume { id } => resume::handle_resume(id).await,
         Commands::Clean {
             dry_run,
