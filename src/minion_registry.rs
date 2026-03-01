@@ -26,6 +26,26 @@ pub enum MinionMode {
     Stopped,
 }
 
+/// Tracks which phase of the fix orchestration a Minion has reached.
+/// Used to resume interrupted sessions from the correct phase.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum OrchestrationPhase {
+    /// Initial state - worktree setup in progress or not started
+    #[default]
+    Setup,
+    /// Worktree created, Claude session running
+    RunningClaude,
+    /// Claude completed, PR creation in progress
+    CreatingPr,
+    /// PR created, monitoring lifecycle (reviews, CI)
+    MonitoringPr,
+    /// All phases completed successfully
+    Completed,
+    /// Task failed
+    Failed,
+}
+
 /// Generates a default session ID for backwards compatibility
 fn default_session_id() -> String {
     uuid::Uuid::new_v4().to_string()
@@ -71,6 +91,9 @@ pub struct MinionInfo {
     /// Timestamp of the last observed activity (for stuck detection)
     #[serde(default = "default_last_activity")]
     pub last_activity: DateTime<Utc>,
+    /// Which orchestration phase this minion has reached (for resume after interruption)
+    #[serde(default)]
+    pub orchestration_phase: OrchestrationPhase,
 }
 
 /// Checks whether a process with the given PID is still alive.
@@ -376,6 +399,7 @@ mod tests {
             pid: None,
             mode: MinionMode::Autonomous,
             last_activity: now,
+            orchestration_phase: OrchestrationPhase::Setup,
         }
     }
 
@@ -729,5 +753,92 @@ mod tests {
         let temp_dir = tempdir().unwrap();
         let registry = MinionRegistry::load(Some(temp_dir.path())).unwrap();
         assert!(registry.find_by_issue("owner/repo", 42).is_empty());
+    }
+
+    #[test]
+    fn test_orchestration_phase_serialization() {
+        let setup = serde_json::to_string(&OrchestrationPhase::Setup).unwrap();
+        assert_eq!(setup, r#""setup""#);
+
+        let running = serde_json::to_string(&OrchestrationPhase::RunningClaude).unwrap();
+        assert_eq!(running, r#""running_claude""#);
+
+        let creating_pr = serde_json::to_string(&OrchestrationPhase::CreatingPr).unwrap();
+        assert_eq!(creating_pr, r#""creating_pr""#);
+
+        let monitoring = serde_json::to_string(&OrchestrationPhase::MonitoringPr).unwrap();
+        assert_eq!(monitoring, r#""monitoring_pr""#);
+
+        let completed = serde_json::to_string(&OrchestrationPhase::Completed).unwrap();
+        assert_eq!(completed, r#""completed""#);
+
+        let failed = serde_json::to_string(&OrchestrationPhase::Failed).unwrap();
+        assert_eq!(failed, r#""failed""#);
+
+        // Verify deserialization
+        let phase: OrchestrationPhase = serde_json::from_str(r#""running_claude""#).unwrap();
+        assert_eq!(phase, OrchestrationPhase::RunningClaude);
+    }
+
+    #[test]
+    fn test_orchestration_phase_default() {
+        assert_eq!(OrchestrationPhase::default(), OrchestrationPhase::Setup);
+    }
+
+    #[test]
+    fn test_orchestration_phase_persisted() {
+        let temp_dir = tempdir().unwrap();
+
+        let info = MinionInfo {
+            orchestration_phase: OrchestrationPhase::RunningClaude,
+            ..test_minion_info()
+        };
+
+        {
+            let mut registry = MinionRegistry::load(Some(temp_dir.path())).unwrap();
+            registry.register("M001".to_string(), info).unwrap();
+        }
+
+        // Reload and verify
+        {
+            let registry = MinionRegistry::load(Some(temp_dir.path())).unwrap();
+            let retrieved = registry.get("M001").unwrap();
+            assert_eq!(
+                retrieved.orchestration_phase,
+                OrchestrationPhase::RunningClaude
+            );
+        }
+    }
+
+    #[test]
+    fn test_orchestration_phase_backwards_compat() {
+        let temp_dir = tempdir().unwrap();
+        let registry_path = temp_dir.path().join("minions.json");
+
+        // Write a registry JSON without orchestration_phase (simulating old format)
+        let old_json = r#"{
+            "minions": {
+                "M001": {
+                    "repo": "fotoetienne/gru",
+                    "issue": 42,
+                    "command": "fix",
+                    "prompt": "Fix issue #42",
+                    "started_at": "2024-01-01T00:00:00Z",
+                    "branch": "minion/issue-42-M001",
+                    "worktree": "/tmp/test",
+                    "status": "active",
+                    "pr": null,
+                    "session_id": "550e8400-e29b-41d4-a716-446655440000",
+                    "pid": null,
+                    "mode": "stopped",
+                    "last_activity": "2024-01-01T00:00:00Z"
+                }
+            }
+        }"#;
+        fs::write(&registry_path, old_json).unwrap();
+
+        let registry = MinionRegistry::load(Some(temp_dir.path())).unwrap();
+        let info = registry.get("M001").unwrap();
+        assert_eq!(info.orchestration_phase, OrchestrationPhase::Setup);
     }
 }
