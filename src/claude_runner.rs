@@ -162,7 +162,7 @@ where
     )?;
 
     // Report the child PID to the caller if a callback was provided.
-    // The callback fires a spawn_blocking task for registry I/O.
+    // The callback runs synchronously on the current thread (see doc comment above).
     if let Some(callback) = on_spawn {
         if let Some(pid) = child.id() {
             callback(pid);
@@ -233,7 +233,7 @@ where
                 .await
                 .map_err(|_| {
                     anyhow::anyhow!(
-                        "Timeout: Process hasn't produced output in {} seconds",
+                        "Timeout: Claude process hasn't produced output in {} seconds",
                         STREAM_TIMEOUT_SECS
                     )
                 })?;
