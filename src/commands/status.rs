@@ -275,4 +275,90 @@ mod tests {
         let result = handle_status(None).await;
         assert!(result.is_ok());
     }
+
+    // --- calculate_uptime tests ---
+
+    #[test]
+    fn test_calculate_uptime_seconds() {
+        let started = chrono::Utc::now() - chrono::Duration::seconds(30);
+        assert_eq!(calculate_uptime(started), "< 1m");
+    }
+
+    #[test]
+    fn test_calculate_uptime_minutes() {
+        let started = chrono::Utc::now() - chrono::Duration::minutes(5);
+        assert_eq!(calculate_uptime(started), "5m");
+    }
+
+    #[test]
+    fn test_calculate_uptime_hours() {
+        let started = chrono::Utc::now() - chrono::Duration::hours(3);
+        assert_eq!(calculate_uptime(started), "3h");
+    }
+
+    #[test]
+    fn test_calculate_uptime_days() {
+        let started = chrono::Utc::now() - chrono::Duration::days(2);
+        assert_eq!(calculate_uptime(started), "2d");
+    }
+
+    #[test]
+    fn test_calculate_uptime_just_now() {
+        let started = chrono::Utc::now();
+        assert_eq!(calculate_uptime(started), "< 1m");
+    }
+
+    #[test]
+    fn test_calculate_uptime_boundary_59_minutes() {
+        let started = chrono::Utc::now() - chrono::Duration::minutes(59);
+        assert_eq!(calculate_uptime(started), "59m");
+    }
+
+    #[test]
+    fn test_calculate_uptime_boundary_60_minutes() {
+        let started = chrono::Utc::now() - chrono::Duration::minutes(60);
+        assert_eq!(calculate_uptime(started), "1h");
+    }
+
+    #[test]
+    fn test_calculate_uptime_boundary_23_hours() {
+        let started = chrono::Utc::now() - chrono::Duration::hours(23);
+        assert_eq!(calculate_uptime(started), "23h");
+    }
+
+    #[test]
+    fn test_calculate_uptime_boundary_24_hours() {
+        let started = chrono::Utc::now() - chrono::Duration::hours(24);
+        assert_eq!(calculate_uptime(started), "1d");
+    }
+
+    #[test]
+    fn test_calculate_uptime_future_timestamp() {
+        // Handles clock skew: started_at in the future results in negative duration,
+        // which makes num_minutes/hours/days return 0 or negative, falling through to "< 1m"
+        let started = chrono::Utc::now() + chrono::Duration::minutes(5);
+        assert_eq!(calculate_uptime(started), "< 1m");
+    }
+
+    // --- determine_status tests ---
+
+    #[test]
+    fn test_determine_status_no_pid() {
+        assert_eq!(determine_status(None), "Stopped");
+    }
+
+    #[test]
+    fn test_determine_status_current_process() {
+        // Our own PID should be alive
+        let pid = std::process::id();
+        assert_eq!(determine_status(Some(pid)), "Active");
+    }
+
+    #[test]
+    fn test_determine_status_dead_pid() {
+        // Use a very high PID that's still valid as i32 (positive) but almost certainly
+        // doesn't exist. Avoid u32::MAX which wraps to -1 as i32, causing kill(-1,0)
+        // to signal all processes.
+        assert_eq!(determine_status(Some(i32::MAX as u32)), "Stopped");
+    }
 }

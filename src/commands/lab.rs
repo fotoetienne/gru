@@ -175,6 +175,19 @@ async fn shutdown_children(children: &mut [Child]) {
     }
 }
 
+/// Parse a repository spec in "owner/repo" format.
+/// Returns `Some((owner, repo))` if valid, `None` otherwise.
+fn parse_repo_spec(spec: &str) -> Option<(&str, &str)> {
+    let mut parts = spec.splitn(3, '/');
+    let owner = parts.next().filter(|s| !s.is_empty())?;
+    let repo = parts.next().filter(|s| !s.is_empty())?;
+    // Reject specs with more than one slash (e.g., "a/b/c")
+    if parts.next().is_some() {
+        return None;
+    }
+    Some((owner, repo))
+}
+
 /// Poll GitHub for ready issues and spawn Minions if slots are available
 async fn poll_and_spawn(config: &LabConfig, children: &mut Vec<Child>) -> Result<()> {
     // Prune stale registry entries (worktrees that no longer exist)
@@ -197,13 +210,13 @@ async fn poll_and_spawn(config: &LabConfig, children: &mut Vec<Child>) -> Result
         }
 
         // Parse owner/repo
-        let parts: Vec<&str> = repo_spec.split('/').collect();
-        if parts.len() != 2 {
-            log::warn!("⚠️  Invalid repo format: '{}', skipping", repo_spec);
-            continue;
-        }
-
-        let (owner, repo) = (parts[0], parts[1]);
+        let (owner, repo) = match parse_repo_spec(repo_spec) {
+            Some(parsed) => parsed,
+            None => {
+                log::warn!("⚠️  Invalid repo format: '{}', skipping", repo_spec);
+                continue;
+            }
+        };
 
         // Create GitHub client for this repo
         let client = match GitHubClient::from_env(owner, repo).await {
@@ -416,5 +429,42 @@ mod tests {
         let safe_repo = "owner/repo".replace('/', "-");
         let log_name = format!("{}-issue-{}.log", safe_repo, 42);
         assert_eq!(log_name, "owner-repo-issue-42.log");
+    }
+
+    // --- parse_repo_spec tests ---
+
+    #[test]
+    fn test_parse_repo_spec_valid() {
+        assert_eq!(parse_repo_spec("owner/repo"), Some(("owner", "repo")));
+    }
+
+    #[test]
+    fn test_parse_repo_spec_with_hyphens() {
+        assert_eq!(
+            parse_repo_spec("my-org/my-repo"),
+            Some(("my-org", "my-repo"))
+        );
+    }
+
+    #[test]
+    fn test_parse_repo_spec_no_slash() {
+        assert_eq!(parse_repo_spec("justrepo"), None);
+    }
+
+    #[test]
+    fn test_parse_repo_spec_too_many_slashes() {
+        assert_eq!(parse_repo_spec("a/b/c"), None);
+    }
+
+    #[test]
+    fn test_parse_repo_spec_empty() {
+        assert_eq!(parse_repo_spec(""), None);
+    }
+
+    #[test]
+    fn test_parse_repo_spec_empty_parts() {
+        assert_eq!(parse_repo_spec("/repo"), None);
+        assert_eq!(parse_repo_spec("owner/"), None);
+        assert_eq!(parse_repo_spec("/"), None);
     }
 }
