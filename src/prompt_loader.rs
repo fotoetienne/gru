@@ -286,6 +286,18 @@ fn load_prompts_internal(
     Ok(prompts)
 }
 
+/// Collects required parameters that are missing or have empty/whitespace-only values
+fn collect_missing_params<'a>(
+    metadata: &'a PromptMetadata,
+    provided: &HashMap<String, String>,
+) -> Vec<&'a PromptParam> {
+    metadata
+        .params
+        .iter()
+        .filter(|p| p.required && provided.get(&p.name).map_or(true, |v| v.trim().is_empty()))
+        .collect()
+}
+
 /// Validates that all required parameters declared in a prompt's frontmatter are provided
 ///
 /// Returns a helpful error message listing all missing required parameters with their
@@ -305,18 +317,6 @@ fn load_prompts_internal(
 /// // Missing "component" param → returns error
 /// validate_required_params(&metadata, &provided)?;
 /// ```
-/// Collects required parameters that are missing or have empty/whitespace-only values
-fn collect_missing_params<'a>(
-    metadata: &'a PromptMetadata,
-    provided: &HashMap<String, String>,
-) -> Vec<&'a PromptParam> {
-    metadata
-        .params
-        .iter()
-        .filter(|p| p.required && provided.get(&p.name).map_or(true, |v| v.trim().is_empty()))
-        .collect()
-}
-
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn validate_required_params(
     metadata: &PromptMetadata,
