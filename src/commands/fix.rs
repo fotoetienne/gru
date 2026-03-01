@@ -56,6 +56,15 @@ impl std::fmt::Display for FixError {
     }
 }
 
+/// Returns true if the error indicates the task is stuck or timed out,
+/// meaning it should be labeled `minion:blocked` instead of `minion:failed`.
+fn is_stuck_or_timeout_error(err: &anyhow::Error) -> bool {
+    let msg = err.to_string();
+    msg.contains("task appears stuck")
+        || msg.contains("Task exceeded maximum timeout")
+        || msg.contains("hasn't produced output in")
+}
+
 impl std::error::Error for FixError {}
 
 // ---------------------------------------------------------------------------
@@ -1171,7 +1180,28 @@ pub async fn handle_fix(
 
     // Phase 3: Run Claude
     let claude_result =
-        run_claude_session(&issue_ctx, &wt_ctx, quiet, timeout_opt.as_deref()).await?;
+        match run_claude_session(&issue_ctx, &wt_ctx, quiet, timeout_opt.as_deref()).await {
+            Ok(result) => result,
+            Err(e) if is_stuck_or_timeout_error(&e) => {
+                // Task is stuck or timed out — mark as blocked for human review
+                log::error!("🚨 {}", e);
+                if let Some(ref client) = issue_ctx.github_client {
+                    match client
+                        .mark_issue_blocked(&issue_ctx.owner, &issue_ctx.repo, issue_ctx.issue_num)
+                        .await
+                    {
+                        Ok(()) => {
+                            println!("🏷️  Updated issue label to 'minion:blocked'");
+                        }
+                        Err(label_err) => {
+                            log::warn!("⚠️  Failed to update issue label: {}", label_err);
+                        }
+                    }
+                }
+                return Ok(1);
+            }
+            Err(e) => return Err(e),
+        };
 
     if !claude_result.status.success() {
         // Mark issue as failed (fire-and-forget)
@@ -1213,7 +1243,23 @@ pub async fn handle_fix(
     .await;
     match ci_passed {
         Ok(true) => log::info!("✅ CI checks passed"),
-        Ok(false) => log::warn!("⚠️  CI checks failed or were escalated"),
+        Ok(false) => {
+            // CI fix attempts exhausted — mark issue as blocked for human review
+            log::warn!("⚠️  CI checks failed or were escalated");
+            if let Some(ref client) = issue_ctx.github_client {
+                match client
+                    .mark_issue_blocked(&issue_ctx.owner, &issue_ctx.repo, issue_ctx.issue_num)
+                    .await
+                {
+                    Ok(()) => {
+                        println!("🏷️  Updated issue label to 'minion:blocked'");
+                    }
+                    Err(e) => {
+                        log::warn!("⚠️  Failed to update issue label: {}", e);
+                    }
+                }
+            }
+        }
         Err(e) => log::warn!("⚠️  CI monitoring error (non-fatal): {}", e),
     }
 
@@ -1313,5 +1359,29 @@ mod tests {
             err.downcast_ref::<FixError>(),
             Some(&FixError::ExistingMinionFound)
         );
+    }
+
+    #[test]
+    fn test_is_stuck_or_timeout_error_stuck() {
+        let err = anyhow::anyhow!("No activity for 15 minutes - task appears stuck");
+        assert!(is_stuck_or_timeout_error(&err));
+    }
+
+    #[test]
+    fn test_is_stuck_or_timeout_error_task_timeout() {
+        let err = anyhow::anyhow!("Task exceeded maximum timeout of 600s");
+        assert!(is_stuck_or_timeout_error(&err));
+    }
+
+    #[test]
+    fn test_is_stuck_or_timeout_error_stream_timeout() {
+        let err = anyhow::anyhow!("Timeout: Claude process hasn't produced output in 300 seconds");
+        assert!(is_stuck_or_timeout_error(&err));
+    }
+
+    #[test]
+    fn test_is_stuck_or_timeout_error_other_error() {
+        let err = anyhow::anyhow!("Failed to spawn claude process");
+        assert!(!is_stuck_or_timeout_error(&err));
     }
 }

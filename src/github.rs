@@ -327,6 +327,25 @@ impl GitHubClient {
         Ok(())
     }
 
+    /// Mark an issue as blocked by transitioning from in-progress to minion:blocked
+    ///
+    /// Used when a minion is stuck (inactivity timeout), the task times out,
+    /// or CI fix attempts are exhausted. Signals that human intervention is needed.
+    ///
+    /// # Arguments
+    /// * `owner` - Repository owner
+    /// * `repo` - Repository name
+    /// * `issue` - Issue number
+    pub async fn mark_issue_blocked(&self, owner: &str, repo: &str, issue: u64) -> Result<()> {
+        // Remove in-progress label (ignore errors - may not exist)
+        let _ = self.remove_label(owner, repo, issue, "in-progress").await;
+
+        // Add minion:blocked label
+        self.add_label(owner, repo, issue, "minion:blocked").await?;
+
+        Ok(())
+    }
+
     /// Create a draft pull request using gh CLI
     ///
     /// # Arguments
