@@ -29,6 +29,7 @@ impl Workspace {
     /// Returns a reference to the global cached Workspace instance.
     ///
     /// Initialized once on first call. Subsequent calls return the same instance.
+    /// If initialization fails, the error is permanently cached for the process lifetime.
     pub fn global() -> io::Result<&'static Workspace> {
         GLOBAL_WORKSPACE
             .as_ref()
