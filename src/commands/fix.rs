@@ -115,8 +115,10 @@ async fn is_branch_pushed(worktree_path: &Path, branch_name: &str) -> Result<boo
 fn create_wip_template(minion_id: &str, issue_num: u64, issue_title: &str) -> (String, String) {
     let title = format!("[{}] Fixes #{}: {}", minion_id, issue_num, issue_title);
     let body = format!(
-        "## Summary\nAutomated fix for #{} by Minion {}\n\n## Status\n- [ ] Implementation\n- [ ] Tests\n- [ ] Review\n",
-        issue_num, minion_id
+        "## Summary\nAutomated fix for #{} by Minion {}\n\n\
+         ## Status\n- [ ] Implementation\n- [ ] Tests\n- [ ] Review\n\n\
+         Fixes #{}\n",
+        issue_num, minion_id, issue_num,
     );
     (title, body)
 }
@@ -185,14 +187,26 @@ async fn create_pr_for_issue(
             Ok(content) if !content.trim().is_empty() => {
                 // Work is complete - use description and mark ready
                 let pr_title = format!("Fixes #{}: {}", issue_num, issue_title);
-                let pr_body = format!("{}\n\nFixes #{}", content.trim(), issue_num);
+                let closing_line = format!("Fixes #{}", issue_num);
+                let mut pr_body = content.trim().to_string();
+                // Append closing keyword if not already present
+                if !pr_body.contains(&closing_line) {
+                    if !pr_body.ends_with('\n') {
+                        pr_body.push('\n');
+                    }
+                    pr_body.push('\n');
+                    pr_body.push_str(&closing_line);
+                }
                 (pr_title, pr_body)
             }
-            _ => {
-                // File exists but couldn't be read or is empty - treat as WIP
-                log::warn!(
-                    "⚠️  Warning: PR_DESCRIPTION.md exists but couldn't be read or is empty"
-                );
+            Ok(_) => {
+                // File exists but is empty - treat as WIP
+                log::warn!("⚠️  Warning: PR_DESCRIPTION.md exists but is empty");
+                create_wip_template(minion_id, issue_num, &issue_title)
+            }
+            Err(e) => {
+                // File couldn't be read - treat as WIP
+                log::warn!("⚠️  Failed to read PR_DESCRIPTION.md: {}", e);
                 create_wip_template(minion_id, issue_num, &issue_title)
             }
         }
@@ -375,10 +389,15 @@ async fn resolve_issue(issue: &str, force_new: bool) -> Result<IssueContext> {
     }
 
     // Initialize GitHub client (optional - only if token is available)
-    let github_client = GitHubClient::try_from_env(&owner, &repo).await;
-    if github_client.is_none() {
-        println!("⚠️  No GitHub authentication found - progress comments will not be posted");
-    }
+    let github_client = match GitHubClient::from_env(&owner, &repo).await {
+        Ok(client) => Some(client),
+        Err(err) => {
+            eprintln!(
+                "⚠️  GitHub authentication error - progress comments will not be posted: {err}"
+            );
+            None
+        }
+    };
 
     // Fetch issue details
     let details = fetch_issue_details(&owner, &repo, issue_num, &github_client).await;
@@ -466,7 +485,7 @@ async fn claim_issue(client: &GitHubClient, owner: &str, repo: &str, issue_num: 
                 issue_num
             );
             log::warn!("   This may indicate a race condition or multiple gru instances.");
-            log::warn!("   Continuing anyway (worktree already created)...");
+            log::warn!("   Continuing anyway; will proceed to create or reuse a worktree...");
         }
         Err(e) => {
             log::warn!("⚠️  Failed to add label to issue: {}", e);
@@ -1282,6 +1301,7 @@ mod tests {
         assert_eq!(title, "[M042] Fixes #123: Fix login bug");
         assert!(body.contains("Automated fix for #123 by Minion M042"));
         assert!(body.contains("- [ ] Implementation"));
+        assert!(body.contains("Fixes #123"));
     }
 
     #[test]
