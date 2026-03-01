@@ -179,6 +179,7 @@ pub fn parse_porcelain_worktrees(output: &str) -> Vec<WorktreeEntry> {
 
     for line in output.lines() {
         if line.starts_with("worktree ") {
+            current_branch = None; // reset stale branch from prior incomplete stanza
             current_path = Some(PathBuf::from(line.strip_prefix("worktree ").unwrap()));
         } else if line.starts_with("branch ") {
             let branch_ref = line.strip_prefix("branch ").unwrap();
