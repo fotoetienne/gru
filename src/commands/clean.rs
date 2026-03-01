@@ -58,12 +58,10 @@ fn is_ephemeral_file(path: &Path) -> bool {
 /// Returns (has_modified_files, only_ephemeral)
 async fn check_worktree_files(worktree_path: &Path) -> Result<(bool, bool)> {
     let output = Command::new("git")
-        .args([
-            "-C",
-            &worktree_path.to_string_lossy(),
-            "status",
-            "--porcelain",
-        ])
+        .arg("-C")
+        .arg(worktree_path)
+        .arg("status")
+        .arg("--porcelain")
         .output()
         .await
         .context("Failed to check git status")?;
@@ -221,7 +219,10 @@ pub async fn handle_clean(dry_run: bool, force: bool, base_branch: &str) -> Resu
         if !dry_run {
             for bare_repo in &bare_repos_to_prune {
                 let output = Command::new("git")
-                    .args(["-C", &bare_repo.to_string_lossy(), "worktree", "prune"])
+                    .arg("-C")
+                    .arg(bare_repo.as_path())
+                    .arg("worktree")
+                    .arg("prune")
                     .output()
                     .await;
 
@@ -439,7 +440,14 @@ pub async fn handle_clean(dry_run: bool, force: bool, base_branch: &str) -> Resu
         cmd.arg(&wt.path);
 
         // Remove the worktree
-        let status = cmd.output().await?;
+        let status = cmd.output().await.with_context(|| {
+            format!(
+                "failed to run `git worktree remove{}` for path {} (bare repo: {})",
+                if force_needed { " --force" } else { "" },
+                wt.path.display(),
+                wt.bare_repo_path.display(),
+            )
+        })?;
 
         if status.status.success() {
             if force_needed && !force {
@@ -453,13 +461,11 @@ pub async fn handle_clean(dry_run: bool, force: bool, base_branch: &str) -> Resu
 
             // Also remove the branch from the bare repository
             let branch_result = Command::new("git")
-                .args([
-                    "-C",
-                    &wt.bare_repo_path.to_string_lossy(),
-                    "branch",
-                    "-D",
-                    &wt.branch,
-                ])
+                .arg("-C")
+                .arg(&wt.bare_repo_path)
+                .arg("branch")
+                .arg("-D")
+                .arg(&wt.branch)
                 .output()
                 .await;
 
