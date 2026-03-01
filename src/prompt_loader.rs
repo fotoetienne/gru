@@ -166,7 +166,6 @@ fn parse_frontmatter(content: &str) -> Result<(PromptMetadata, String)> {
 }
 
 /// Loads a single prompt file from disk
-#[cfg_attr(not(test), allow(dead_code))]
 fn load_prompt_file(path: &Path, name: &str, source: PromptSource) -> Result<Prompt> {
     let content = fs::read_to_string(path)
         .with_context(|| format!("Failed to read prompt file: {}", path.display()))?;
@@ -182,7 +181,6 @@ fn load_prompt_file(path: &Path, name: &str, source: PromptSource) -> Result<Pro
 }
 
 /// Scans a directory for .md prompt files
-#[cfg_attr(not(test), allow(dead_code))]
 fn scan_prompt_directory(dir: &Path) -> Result<HashMap<String, PathBuf>> {
     let mut prompts = HashMap::new();
 
@@ -344,7 +342,8 @@ pub fn list_prompts_by_source(repo_root: Option<&Path>) -> Result<PromptsBySourc
 }
 
 /// Internal function for listing prompts by source with explicit global directory path.
-fn list_prompts_by_source_internal(
+/// Used by public `list_prompts_by_source()` and for testing with controlled paths.
+pub(crate) fn list_prompts_by_source_internal(
     repo_root: Option<&Path>,
     global_root: Option<&Path>,
 ) -> Result<PromptsBySource> {

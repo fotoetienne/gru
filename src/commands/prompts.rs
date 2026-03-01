@@ -97,7 +97,11 @@ mod tests {
     #[test]
     fn test_list_prompts_by_source_empty_dirs() {
         let temp_dir = TempDir::new().unwrap();
-        let result = prompt_loader::list_prompts_by_source(Some(temp_dir.path()));
+        // Use _internal to avoid reading real ~/.gru/prompts/
+        let result = prompt_loader::list_prompts_by_source_internal(
+            Some(temp_dir.path()),
+            Some(temp_dir.path()),
+        );
         assert!(result.is_ok());
 
         let prompts = result.unwrap();
@@ -118,7 +122,10 @@ mod tests {
         )
         .unwrap();
 
-        let result = prompt_loader::list_prompts_by_source(Some(temp_dir.path()));
+        let result = prompt_loader::list_prompts_by_source_internal(
+            Some(temp_dir.path()),
+            Some(temp_dir.path()),
+        );
         assert!(result.is_ok());
 
         let prompts = result.unwrap();
@@ -143,7 +150,10 @@ mod tests {
         )
         .unwrap();
 
-        let result = prompt_loader::list_prompts_by_source(Some(temp_dir.path()));
+        let result = prompt_loader::list_prompts_by_source_internal(
+            Some(temp_dir.path()),
+            Some(temp_dir.path()),
+        );
         assert!(result.is_ok());
 
         let prompts = result.unwrap();
@@ -177,7 +187,10 @@ mod tests {
         )
         .unwrap();
 
-        let result = prompt_loader::list_prompts_by_source(Some(temp_dir.path()));
+        let result = prompt_loader::list_prompts_by_source_internal(
+            Some(temp_dir.path()),
+            Some(temp_dir.path()),
+        );
         assert!(result.is_ok());
 
         let prompts = result.unwrap();
