@@ -4,7 +4,6 @@ mod commands;
 mod config;
 mod git;
 mod github;
-mod logger;
 mod minion;
 mod minion_registry;
 mod minion_resolver;

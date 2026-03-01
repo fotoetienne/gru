@@ -14,14 +14,21 @@ static ISSUE_LINK_REGEX: Lazy<Regex> = Lazy::new(|| {
 
 /// Information about a resolved Minion worktree
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct MinionInfo {
     pub minion_id: String,
     pub issue_number: Option<u64>,
+    #[allow(dead_code)]
+    // Populated by resolver; callers currently only use minion_id/worktree_path
     pub repo_name: String,
+    #[allow(dead_code)]
+    // Populated by resolver; callers currently only use minion_id/worktree_path
     pub branch: String,
     pub worktree_path: PathBuf,
+    #[allow(dead_code)]
+    // Populated by resolver; callers currently only use minion_id/worktree_path
     pub status: String,
+    #[allow(dead_code)]
+    // Populated by resolver; callers currently only use minion_id/worktree_path
     pub uptime: String,
 }
 

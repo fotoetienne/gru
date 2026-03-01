@@ -181,39 +181,6 @@ pub async fn parse_pr_info(pr: &str) -> Result<(String, String, String, String)>
     Ok((owner, repo, pr_num, branch))
 }
 
-/// Normalizes a Minion ID by adding the 'M' prefix if missing
-/// Validates that the ID contains only alphanumeric characters to prevent path traversal
-#[allow(dead_code)]
-pub fn normalize_minion_id(id: &str) -> Result<String> {
-    // Validate against path traversal and invalid characters
-    if id.contains('/') || id.contains('\\') || id.contains("..") {
-        anyhow::bail!(
-            "Invalid Minion ID '{}': contains path separators or parent directory references",
-            id
-        );
-    }
-
-    if id.contains('\0') {
-        anyhow::bail!("Invalid Minion ID '{}': contains null bytes", id);
-    }
-
-    let normalized = if id.starts_with('M') {
-        id.to_string()
-    } else {
-        format!("M{}", id)
-    };
-
-    // Additional validation: ensure only alphanumeric characters
-    if !normalized.chars().all(|c| c.is_alphanumeric()) {
-        anyhow::bail!(
-            "Invalid Minion ID '{}': must contain only alphanumeric characters",
-            id
-        );
-    }
-
-    Ok(normalized)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -381,42 +348,5 @@ mod tests {
             "Expected specific error for issue URL given to PR parser, got: {}",
             msg
         );
-    }
-
-    // --- normalize_minion_id tests ---
-
-    #[test]
-    fn test_normalize_minion_id_with_prefix() {
-        assert_eq!(normalize_minion_id("M42").unwrap(), "M42");
-        assert_eq!(normalize_minion_id("M001").unwrap(), "M001");
-        assert_eq!(normalize_minion_id("M0ZZ").unwrap(), "M0ZZ");
-    }
-
-    #[test]
-    fn test_normalize_minion_id_without_prefix() {
-        assert_eq!(normalize_minion_id("42").unwrap(), "M42");
-        assert_eq!(normalize_minion_id("001").unwrap(), "M001");
-        assert_eq!(normalize_minion_id("0ZZ").unwrap(), "M0ZZ");
-    }
-
-    #[test]
-    fn test_normalize_minion_id_rejects_path_traversal() {
-        // Test parent directory references
-        assert!(normalize_minion_id("M../../etc").is_err());
-        assert!(normalize_minion_id("M42/../evil").is_err());
-        assert!(normalize_minion_id("../M42").is_err());
-
-        // Test path separators
-        assert!(normalize_minion_id("M/etc/passwd").is_err());
-        assert!(normalize_minion_id("M42/subdir").is_err());
-        assert!(normalize_minion_id(r"M42\subdir").is_err());
-
-        // Test null bytes
-        assert!(normalize_minion_id("M42\0").is_err());
-
-        // Test non-alphanumeric characters
-        assert!(normalize_minion_id("M42!").is_err());
-        assert!(normalize_minion_id("M42@evil").is_err());
-        assert!(normalize_minion_id("M42-test").is_err());
     }
 }

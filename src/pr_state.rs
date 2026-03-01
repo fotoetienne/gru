@@ -77,14 +77,6 @@ impl PrState {
 
         Ok(())
     }
-
-    /// Mark the PR as ready for review
-    ///
-    /// Note: Reserved for future use when marking PRs ready after completion
-    #[allow(dead_code)]
-    pub fn mark_ready(&mut self) {
-        self.status = PrStatus::ReadyForReview;
-    }
 }
 
 #[cfg(test)]
@@ -98,15 +90,6 @@ mod tests {
         assert_eq!(state.pr_number, "42");
         assert_eq!(state.issue_number, "15");
         assert_eq!(state.status, PrStatus::Draft);
-    }
-
-    #[test]
-    fn test_pr_state_mark_ready() {
-        let mut state = PrState::new("42".to_string(), "15".to_string());
-        assert_eq!(state.status, PrStatus::Draft);
-
-        state.mark_ready();
-        assert_eq!(state.status, PrStatus::ReadyForReview);
     }
 
     #[test]

@@ -15,17 +15,16 @@ static GLOBAL_WORKSPACE: OnceCell<Workspace> = OnceCell::new();
 /// - `work`: Active working directories for minions
 /// - `archive`: Completed or archived minion workspaces
 /// - `state`: State files (e.g., minion ID counter)
-// Allow dead code for now - workspace module will be integrated in future issues
-#[allow(dead_code)]
 pub struct Workspace {
+    #[allow(dead_code)] // Accessed via root() in tests
     root: PathBuf,
     repos: PathBuf,
     work: PathBuf,
+    #[allow(dead_code)] // Accessed via archive()/archive_dir() in tests
     archive: PathBuf,
     state: PathBuf,
 }
 
-#[allow(dead_code)]
 impl Workspace {
     /// Returns a reference to the global cached Workspace instance.
     ///
@@ -91,26 +90,8 @@ impl Workspace {
         Self::init(home.join(".gru"))
     }
 
-    /// Creates a workspace with a custom root directory (for testing only).
-    ///
-    /// This constructor allows tests to use temporary directories instead of
-    /// polluting the production `~/.gru/` directory.
-    ///
-    /// # Arguments
-    ///
-    /// * `root` - Custom root directory path (typically from `tempfile::tempdir()`)
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if:
-    /// - Directory creation fails due to permissions or I/O errors
-    /// - Setting directory permissions fails (Unix only)
-    #[cfg(test)]
-    pub fn new_with_root(root: PathBuf) -> io::Result<Self> {
-        Self::init(root)
-    }
-
     /// Returns a reference to the workspace root directory path (`~/.gru`).
+    #[cfg(test)]
     pub fn root(&self) -> &Path {
         &self.root
     }
@@ -126,6 +107,7 @@ impl Workspace {
     }
 
     /// Returns a reference to the archive directory path (`~/.gru/archive`).
+    #[cfg(test)]
     pub fn archive(&self) -> &Path {
         &self.archive
     }
@@ -216,6 +198,7 @@ impl Workspace {
     /// # Note
     ///
     /// This method validates inputs and computes the path, but does not create the directory.
+    #[cfg(test)]
     pub fn archive_dir(&self, minion_id: &str) -> io::Result<PathBuf> {
         if minion_id.contains('/') || minion_id.contains('\\') || minion_id.contains("..") {
             return Err(io::Error::new(

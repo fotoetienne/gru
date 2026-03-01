@@ -102,12 +102,10 @@ async fn get_github_token(owner: &str, repo: &str) -> Result<String> {
 
 /// GitHub API client wrapper using octocrab
 #[derive(Debug)]
-#[allow(dead_code)]
 pub struct GitHubClient {
     client: Octocrab,
 }
 
-#[allow(dead_code)]
 impl GitHubClient {
     /// Initialize a new GitHub client with the provided token
     ///
@@ -363,67 +361,6 @@ impl GitHubClient {
     ///
     /// Returns the PR number as a string
     ///
-    /// Note: This method uses gh CLI (not the GitHub API) because:
-    /// - The gh CLI handles authentication edge cases better
-    /// - CLI provides better error messages for PR creation failures
-    /// - Consistent with pre-existing implementation pattern
-    pub async fn create_draft_pr(
-        &self,
-        owner: &str,
-        repo: &str,
-        branch: &str,
-        base: &str,
-        title: &str,
-        body: &str,
-    ) -> Result<String> {
-        // Delegate to CLI implementation (same behavior whether API token is set or not)
-        create_draft_pr_via_cli(owner, repo, branch, base, title, body).await
-    }
-
-    /// Update the body/description of an existing pull request
-    ///
-    /// # Arguments
-    /// * `owner` - Repository owner
-    /// * `repo` - Repository name
-    /// * `pr_number` - PR number
-    /// * `body` - New PR description body (markdown supported)
-    pub async fn update_pr_body(
-        &self,
-        owner: &str,
-        repo: &str,
-        pr_number: &str,
-        body: &str,
-    ) -> Result<()> {
-        use tokio::process::Command;
-
-        let output = Command::new("gh")
-            .args([
-                "pr",
-                "edit",
-                pr_number,
-                "--repo",
-                &format!("{}/{}", owner, repo),
-                "--body",
-                body,
-            ])
-            .output()
-            .await
-            .context("Failed to execute gh pr edit command")?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(anyhow!(
-                "Failed to update PR #{} in {}/{}: {}",
-                pr_number,
-                owner,
-                repo,
-                stderr
-            ));
-        }
-
-        Ok(())
-    }
-
     /// Mark a draft PR as ready for review
     ///
     /// # Arguments
@@ -619,129 +556,10 @@ pub async fn get_issue_via_cli(owner: &str, repo: &str, number: u64) -> Result<I
     Ok(issue)
 }
 
-/// Post a comment on an issue using gh CLI
-///
-/// # Arguments
-/// * `owner` - Repository owner
-/// * `repo` - Repository name
-/// * `issue` - Issue number
-/// * `body` - Comment body (markdown supported)
-#[allow(dead_code)] // Part of public API for CLI fallback, will be used in future phases
-pub async fn post_comment_via_cli(owner: &str, repo: &str, issue: u64, body: &str) -> Result<()> {
-    use tokio::process::Command;
-
-    let output = Command::new("gh")
-        .args([
-            "issue",
-            "comment",
-            &issue.to_string(),
-            "--repo",
-            &format!("{}/{}", owner, repo),
-            "--body",
-            body,
-        ])
-        .output()
-        .await
-        .context("Failed to execute gh issue comment command")?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(anyhow!(
-            "Failed to post comment on issue #{} in {}/{}: {}",
-            issue,
-            owner,
-            repo,
-            stderr
-        ));
-    }
-
-    Ok(())
-}
-
-/// Add a label to an issue using gh CLI
-///
-/// # Arguments
-/// * `owner` - Repository owner
-/// * `repo` - Repository name
-/// * `issue` - Issue number
-/// * `label` - Label name to add
-#[allow(dead_code)] // Part of public API for CLI fallback, will be used in future phases
-pub async fn add_label_via_cli(owner: &str, repo: &str, issue: u64, label: &str) -> Result<()> {
-    use tokio::process::Command;
-
-    let output = Command::new("gh")
-        .args([
-            "issue",
-            "edit",
-            &issue.to_string(),
-            "--repo",
-            &format!("{}/{}", owner, repo),
-            "--add-label",
-            label,
-        ])
-        .output()
-        .await
-        .context("Failed to execute gh issue edit command")?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(anyhow!(
-            "Failed to add label '{}' to issue #{} in {}/{}: {}",
-            label,
-            issue,
-            owner,
-            repo,
-            stderr
-        ));
-    }
-
-    Ok(())
-}
-
-/// Remove a label from an issue using gh CLI
-///
-/// # Arguments
-/// * `owner` - Repository owner
-/// * `repo` - Repository name
-/// * `issue` - Issue number
-/// * `label` - Label name to remove
-#[allow(dead_code)] // Part of public API for CLI fallback, will be used in future phases
-pub async fn remove_label_via_cli(owner: &str, repo: &str, issue: u64, label: &str) -> Result<()> {
-    use tokio::process::Command;
-
-    let output = Command::new("gh")
-        .args([
-            "issue",
-            "edit",
-            &issue.to_string(),
-            "--repo",
-            &format!("{}/{}", owner, repo),
-            "--remove-label",
-            label,
-        ])
-        .output()
-        .await
-        .context("Failed to execute gh issue edit command")?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(anyhow!(
-            "Failed to remove label '{}' from issue #{} in {}/{}: {}",
-            label,
-            issue,
-            owner,
-            repo,
-            stderr
-        ));
-    }
-
-    Ok(())
-}
-
 /// Simple struct to hold issue information from gh CLI
 #[derive(Debug, serde::Deserialize)]
-#[allow(dead_code)] // Part of public API, fields will be used in future phases
 pub struct IssueInfo {
+    #[allow(dead_code)] // Included for serde completeness; callers use .title and .body
     pub number: u64,
     pub title: String,
     pub body: Option<String>,
