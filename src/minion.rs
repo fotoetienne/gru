@@ -3,13 +3,8 @@ use std::io::{self, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 
 use fs2::FileExt;
-use once_cell::sync::Lazy;
 
 use crate::workspace::Workspace;
-
-/// Cached workspace instance for production state directory access.
-/// Initialized once on first use to avoid repeated directory creation checks.
-static WORKSPACE: Lazy<io::Result<Workspace>> = Lazy::new(Workspace::new);
 
 /// Represents a Minion workspace for working on a specific GitHub issue
 #[allow(dead_code)]
@@ -44,10 +39,7 @@ pub fn generate_minion_id_with_state(state_dir: Option<&Path>) -> io::Result<Str
         custom_dir.to_path_buf()
     } else {
         // Production path: use cached workspace (directory already created by Workspace::new)
-        let workspace = WORKSPACE.as_ref().map_err(|e| {
-            io::Error::new(e.kind(), format!("Failed to initialize workspace: {}", e))
-        })?;
-        workspace.state().to_path_buf()
+        Workspace::global()?.state().to_path_buf()
     };
 
     let counter_path = state_path.join("next_id.txt");
