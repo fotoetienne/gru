@@ -305,16 +305,24 @@ fn load_prompts_internal(
 /// // Missing "component" param → returns error
 /// validate_required_params(&metadata, &provided)?;
 /// ```
+/// Collects required parameters that are missing or have empty/whitespace-only values
+fn collect_missing_params<'a>(
+    metadata: &'a PromptMetadata,
+    provided: &HashMap<String, String>,
+) -> Vec<&'a PromptParam> {
+    metadata
+        .params
+        .iter()
+        .filter(|p| p.required && provided.get(&p.name).map_or(true, |v| v.trim().is_empty()))
+        .collect()
+}
+
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn validate_required_params(
     metadata: &PromptMetadata,
     provided: &HashMap<String, String>,
 ) -> Result<()> {
-    let missing: Vec<&PromptParam> = metadata
-        .params
-        .iter()
-        .filter(|p| p.required && provided.get(&p.name).map_or(true, |v| v.trim().is_empty()))
-        .collect();
+    let missing = collect_missing_params(metadata, provided);
 
     if missing.is_empty() {
         return Ok(());
@@ -436,7 +444,7 @@ pub fn validate_requires(
             }
             _ => {
                 log::warn!(
-                    "Unknown requirement '{}' in prompt frontmatter. Values must be lowercase (known: {:?})",
+                    "Unknown requirement '{}' in prompt frontmatter (known: {:?})",
                     req,
                     KNOWN_REQUIREMENTS
                 );
@@ -466,17 +474,7 @@ pub fn validate_prompt_requirements(
     provided_params: &HashMap<String, String>,
 ) -> Result<()> {
     let missing_requires = validate_requires(&metadata.requires, issue_provided, pr_provided);
-
-    let missing_params: Vec<&PromptParam> = metadata
-        .params
-        .iter()
-        .filter(|p| {
-            p.required
-                && provided_params
-                    .get(&p.name)
-                    .map_or(true, |v| v.trim().is_empty())
-        })
-        .collect();
+    let missing_params = collect_missing_params(metadata, provided_params);
 
     if missing_requires.is_empty() && missing_params.is_empty() {
         return Ok(());
