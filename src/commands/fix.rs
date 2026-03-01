@@ -38,13 +38,33 @@ const DEFAULT_REVIEW_TIMEOUT_SECS: u64 = 1800;
 /// After this limit, the user must handle additional reviews manually
 const MAX_REVIEW_ROUNDS: usize = 5;
 
+/// Errors specific to the fix workflow that need special handling in the orchestrator.
+#[derive(Debug, PartialEq)]
+enum FixError {
+    /// An existing minion was found for this issue. The user has been shown
+    /// options (attach/resume/force-new) and we should exit with code 1.
+    ExistingMinionFound,
+}
+
+impl std::fmt::Display for FixError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FixError::ExistingMinionFound => {
+                write!(f, "existing minion found for this issue")
+            }
+        }
+    }
+}
+
+impl std::error::Error for FixError {}
+
 // ---------------------------------------------------------------------------
 // Phase context structs
 // ---------------------------------------------------------------------------
 
 /// Result of resolving an issue argument into validated context.
 /// Contains the parsed issue number as `u64`, eliminating repeated string parsing.
-pub struct IssueContext {
+pub(crate) struct IssueContext {
     pub owner: String,
     pub repo: String,
     pub issue_num: u64,
@@ -54,14 +74,14 @@ pub struct IssueContext {
 }
 
 /// Fetched issue metadata from GitHub.
-pub struct IssueDetails {
+pub(crate) struct IssueDetails {
     pub title: String,
     pub body: String,
     pub labels: String,
 }
 
 /// Result of setting up a worktree for a minion.
-pub struct WorktreeContext {
+pub(crate) struct WorktreeContext {
     pub minion_id: String,
     pub branch_name: String,
     pub worktree_path: PathBuf,
@@ -69,7 +89,7 @@ pub struct WorktreeContext {
 }
 
 /// Result of running a Claude session.
-pub struct ClaudeResult {
+pub(crate) struct ClaudeResult {
     pub status: ExitStatus,
 }
 
@@ -138,14 +158,21 @@ async fn create_pr_for_issue(
 
     // Check for PR_DESCRIPTION.md to determine if work is complete
     let desc_path = worktree_path.join("PR_DESCRIPTION.md");
-    let (final_title, final_body, is_ready) = if desc_path.exists() {
+    let is_ready = match tokio::fs::try_exists(&desc_path).await {
+        Ok(exists) => exists,
+        Err(e) => {
+            log::warn!("⚠️  Failed to check PR_DESCRIPTION.md: {}", e);
+            false
+        }
+    };
+    let (final_title, final_body) = if is_ready {
         let desc_content = tokio::fs::read_to_string(&desc_path)
             .await
             .unwrap_or_default();
         let ready_title = format!("Fixes #{}: {}", issue_num, issue_title);
-        (ready_title, desc_content, true)
+        (ready_title, desc_content)
     } else {
-        (title, body, false)
+        (title, body)
     };
 
     // Create draft PR via gh CLI
@@ -224,7 +251,7 @@ async fn invoke_claude_for_reviews(
 ) -> Result<()> {
     let cmd = build_claude_resume_command(worktree_path, session_id, prompt);
 
-    run_claude_with_stream_monitoring(
+    let status = run_claude_with_stream_monitoring(
         cmd,
         worktree_path,
         timeout_opt,
@@ -232,6 +259,11 @@ async fn invoke_claude_for_reviews(
         None::<Box<dyn FnOnce(u32) + Send>>,
     )
     .await?;
+
+    if !status.success() {
+        let exit_code = status.code().unwrap_or(EXIT_CODE_SIGNAL_TERMINATED);
+        anyhow::bail!("Review response process exited with code {}", exit_code);
+    }
     Ok(())
 }
 
@@ -387,8 +419,7 @@ async fn check_existing_minions(owner: &str, repo: &str, issue_num: u64) -> Resu
         issue_num
     );
 
-    // Return a special exit-code error that handle_fix can map to Ok(1)
-    anyhow::bail!("existing_minion_found");
+    Err(FixError::ExistingMinionFound.into())
 }
 
 /// Claims an issue by adding the in-progress label.
@@ -1067,7 +1098,9 @@ pub async fn handle_fix(
     // Phase 1: Resolve issue
     let issue_ctx = match resolve_issue(issue, force_new).await {
         Ok(ctx) => ctx,
-        Err(e) if e.to_string() == "existing_minion_found" => return Ok(1),
+        Err(e) if e.downcast_ref::<FixError>() == Some(&FixError::ExistingMinionFound) => {
+            return Ok(1)
+        }
         Err(e) => return Err(e),
     };
 
@@ -1209,16 +1242,13 @@ mod tests {
     }
 
     #[test]
-    fn test_issue_context_typed_issue_num() {
-        // Verify that IssueContext uses u64, not String
-        let ctx = IssueContext {
-            owner: "owner".to_string(),
-            repo: "repo".to_string(),
-            issue_num: 42,
-            details: None,
-            github_client: None,
-        };
-        // The issue_num is already a u64 - no parsing needed
-        assert_eq!(ctx.issue_num, 42u64);
+    fn test_fix_error_downcast() {
+        // Verify that FixError can be downcast from anyhow::Error,
+        // which is how the orchestrator detects the ExistingMinionFound case.
+        let err: anyhow::Error = FixError::ExistingMinionFound.into();
+        assert_eq!(
+            err.downcast_ref::<FixError>(),
+            Some(&FixError::ExistingMinionFound)
+        );
     }
 }
