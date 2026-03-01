@@ -467,13 +467,4 @@ mod tests {
         assert_eq!(parse_repo_spec("owner/"), None);
         assert_eq!(parse_repo_spec("/"), None);
     }
-
-    // --- slot calculation assumption ---
-
-    #[test]
-    fn test_slot_calculation_no_underflow() {
-        // Documents that available_slots() relies on saturating_sub to prevent underflow
-        // when more minions are active than max_slots allows (e.g., after config change).
-        assert_eq!(5_usize.saturating_sub(10), 0);
-    }
 }

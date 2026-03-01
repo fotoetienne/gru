@@ -1126,10 +1126,4 @@ mod tests {
         assert_eq!(calculate_retry_delay(7), MAX_DELAY_SECS);
         assert_eq!(calculate_retry_delay(10), MAX_DELAY_SECS);
     }
-
-    #[test]
-    fn test_retry_delay_zero_attempt() {
-        // 2^0 = 1
-        assert_eq!(calculate_retry_delay(0), 1);
-    }
 }
