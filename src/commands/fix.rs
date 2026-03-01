@@ -18,7 +18,8 @@ use crate::url_utils::parse_issue_info;
 use crate::workspace;
 use anyhow::{Context, Result};
 use chrono::Utc;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::process::ExitStatus;
 use tokio::process::Command as TokioCommand;
 use tokio::time::{timeout, Duration};
 use uuid::Uuid;
@@ -37,6 +38,65 @@ const DEFAULT_REVIEW_TIMEOUT_SECS: u64 = 1800;
 /// After this limit, the user must handle additional reviews manually
 const MAX_REVIEW_ROUNDS: usize = 5;
 
+/// Errors specific to the fix workflow that need special handling in the orchestrator.
+#[derive(Debug, PartialEq)]
+enum FixError {
+    /// An existing minion was found for this issue. The user has been shown
+    /// options (attach/resume/force-new) and we should exit with code 1.
+    ExistingMinionFound,
+}
+
+impl std::fmt::Display for FixError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FixError::ExistingMinionFound => {
+                write!(f, "existing minion found for this issue")
+            }
+        }
+    }
+}
+
+impl std::error::Error for FixError {}
+
+// ---------------------------------------------------------------------------
+// Phase context structs
+// ---------------------------------------------------------------------------
+
+/// Result of resolving an issue argument into validated context.
+/// Contains the parsed issue number as `u64`, eliminating repeated string parsing.
+pub(crate) struct IssueContext {
+    pub owner: String,
+    pub repo: String,
+    pub issue_num: u64,
+    /// Fetched issue details: (title, body, labels). None if fetch failed.
+    pub details: Option<IssueDetails>,
+    pub github_client: Option<GitHubClient>,
+}
+
+/// Fetched issue metadata from GitHub.
+pub(crate) struct IssueDetails {
+    pub title: String,
+    pub body: String,
+    pub labels: String,
+}
+
+/// Result of setting up a worktree for a minion.
+pub(crate) struct WorktreeContext {
+    pub minion_id: String,
+    pub branch_name: String,
+    pub worktree_path: PathBuf,
+    pub session_id: Uuid,
+}
+
+/// Result of running a Claude session.
+pub(crate) struct ClaudeResult {
+    pub status: ExitStatus,
+}
+
+// ---------------------------------------------------------------------------
+// Helper functions (unchanged from original)
+// ---------------------------------------------------------------------------
+
 /// Checks if a branch has been pushed to the remote
 async fn is_branch_pushed(worktree_path: &Path, branch_name: &str) -> Result<bool> {
     let output = TokioCommand::new("git")
@@ -51,81 +111,60 @@ async fn is_branch_pushed(worktree_path: &Path, branch_name: &str) -> Result<boo
     Ok(output.status.success())
 }
 
-/// Helper function to create a WIP PR template
-fn create_wip_template(minion_id: &str, issue_num: &str, issue_title: &str) -> (String, String) {
-    let pr_title = format!("[WIP] Fixes #{}: {}", issue_num, issue_title);
-    let pr_body = format!(
-        r#"This PR is being worked on by Minion {}
-
-## Status
-Work in progress - I'll update this when ready for review.
-
-## Changes
-- [ ] Initial implementation
-- [ ] Writing tests
-- [ ] Documentation
-
-Fixes #{}"#,
-        minion_id, issue_num
+/// Creates a WIP PR title and body template
+fn create_wip_template(minion_id: &str, issue_num: u64, issue_title: &str) -> (String, String) {
+    let title = format!("[{}] Fixes #{}: {}", minion_id, issue_num, issue_title);
+    let body = format!(
+        "## Summary\nAutomated fix for #{} by Minion {}\n\n\
+         ## Status\n- [ ] Implementation\n- [ ] Tests\n- [ ] Review\n\n\
+         Fixes #{}\n",
+        issue_num, minion_id, issue_num,
     );
-    (pr_title, pr_body)
+    (title, body)
 }
 
-/// Creates a draft PR for the given branch
+/// Creates a PR for the given issue, returning the PR number
 async fn create_pr_for_issue(
     owner: &str,
     repo: &str,
     branch_name: &str,
-    issue_num: &str,
+    issue_num: u64,
     minion_id: &str,
     worktree_path: &Path,
     issue_title_opt: Option<&str>,
 ) -> Result<String> {
-    // Get the default branch (usually main or master)
-    let base_branch_output = TokioCommand::new("git")
+    // Detect base branch
+    let base_output = TokioCommand::new("git")
         .arg("-C")
         .arg(worktree_path)
         .arg("symbolic-ref")
         .arg("refs/remotes/origin/HEAD")
         .output()
         .await
-        .context("Failed to get default branch")?;
+        .context("Failed to detect base branch")?;
 
-    let base_branch = if base_branch_output.status.success() {
-        String::from_utf8_lossy(&base_branch_output.stdout)
-            .trim()
-            .trim_start_matches("refs/remotes/origin/")
+    let base_branch = if base_output.status.success() {
+        let raw = String::from_utf8_lossy(&base_output.stdout);
+        raw.trim()
+            .strip_prefix("refs/remotes/origin/")
+            .unwrap_or("main")
             .to_string()
     } else {
-        log::warn!("⚠️  Could not detect default branch, using 'main'");
-        "main".to_string() // Fallback to main
+        "main".to_string()
     };
-
-    println!("📌 Creating PR targeting base branch: {}", base_branch);
 
     // Get issue title - use provided title if available, otherwise fetch
     let issue_title = if let Some(title) = issue_title_opt {
         title.to_string()
+    } else if let Some(github_client) = GitHubClient::try_from_env(owner, repo).await {
+        match github_client.get_issue(owner, repo, issue_num).await {
+            Ok(issue) => issue.title,
+            Err(_) => "Fix issue".to_string(),
+        }
     } else {
-        // Fetch issue title if not provided
-        let issue_number: u64 = issue_num.parse().context("Failed to parse issue number")?;
-
-        if let Some(github_client) = GitHubClient::try_from_env(owner, repo).await {
-            // Use API if token is available
-            let issue = github_client
-                .get_issue(owner, repo, issue_number)
-                .await
-                .context("Failed to fetch issue from GitHub API")?;
-            issue.title
-        } else {
-            // Fall back to gh CLI
-            println!("ℹ️  No GitHub authentication found, using gh CLI for GitHub operations");
-            let issue = crate::github::get_issue_via_cli(owner, repo, issue_number)
-                .await
-                .context(
-                    "Failed to fetch issue using gh CLI. Make sure gh is installed and authenticated.",
-                )?;
-            issue.title
+        match crate::github::get_issue_via_cli(owner, repo, issue_num).await {
+            Ok(info) => info.title,
+            Err(_) => "Fix issue".to_string(),
         }
     };
 
@@ -148,14 +187,26 @@ async fn create_pr_for_issue(
             Ok(content) if !content.trim().is_empty() => {
                 // Work is complete - use description and mark ready
                 let pr_title = format!("Fixes #{}: {}", issue_num, issue_title);
-                let pr_body = format!("{}\n\nFixes #{}", content.trim(), issue_num);
+                let closing_line = format!("Fixes #{}", issue_num);
+                let mut pr_body = content.trim().to_string();
+                // Append closing keyword if not already present
+                if !pr_body.contains(&closing_line) {
+                    if !pr_body.ends_with('\n') {
+                        pr_body.push('\n');
+                    }
+                    pr_body.push('\n');
+                    pr_body.push_str(&closing_line);
+                }
                 (pr_title, pr_body)
             }
-            _ => {
-                // File exists but couldn't be read or is empty - treat as WIP
-                log::warn!(
-                    "⚠️  Warning: PR_DESCRIPTION.md exists but couldn't be read or is empty"
-                );
+            Ok(_) => {
+                // File exists but is empty - treat as WIP
+                log::warn!("⚠️  Warning: PR_DESCRIPTION.md exists but is empty");
+                create_wip_template(minion_id, issue_num, &issue_title)
+            }
+            Err(e) => {
+                // File couldn't be read - treat as WIP
+                log::warn!("⚠️  Failed to read PR_DESCRIPTION.md: {}", e);
                 create_wip_template(minion_id, issue_num, &issue_title)
             }
         }
@@ -164,7 +215,7 @@ async fn create_pr_for_issue(
         create_wip_template(minion_id, issue_num, &issue_title)
     };
 
-    // Create the draft PR using gh CLI (PR operations always use CLI)
+    // Create the draft PR using gh CLI (with URL validation)
     let pr_number = crate::github::create_draft_pr_via_cli(
         owner,
         repo,
@@ -178,7 +229,6 @@ async fn create_pr_for_issue(
 
     // Mark ready if description was provided
     if should_mark_ready {
-        // Use GitHub client to mark PR ready
         if let Some(github_client) = GitHubClient::try_from_env(owner, repo).await {
             match github_client.mark_pr_ready(owner, repo, &pr_number).await {
                 Ok(_) => {
@@ -213,26 +263,22 @@ async fn create_pr_for_issue(
     Ok(pr_number)
 }
 
-/// Handles the result of fetching issue details via CLI
-/// Returns Some with (title, body, empty labels) on success, None on failure
-async fn handle_cli_fetch_result(
-    result: Result<crate::github::IssueInfo>,
-) -> Option<(String, String, String)> {
+/// Handles GitHub CLI fetch result with fallback
+async fn handle_cli_fetch_result(result: Result<crate::github::IssueInfo>) -> Option<IssueDetails> {
     match result {
-        Ok(issue_info) => {
-            // CLI version doesn't include labels, but we can still provide title and body
-            let body = issue_info.body.unwrap_or_default();
-            Some((issue_info.title, body, String::new()))
-        }
+        Ok(info) => Some(IssueDetails {
+            title: info.title,
+            body: info.body.unwrap_or_default(),
+            labels: String::new(), // CLI doesn't return labels in IssueInfo
+        }),
         Err(e) => {
             eprintln!("⚠️  Failed to fetch issue details via CLI: {}", e);
-            eprintln!("   Continuing with basic prompt format");
             None
         }
     }
 }
 
-/// Invokes Claude to address review comments
+/// Invokes Claude to address review comments using the same session
 async fn invoke_claude_for_reviews(
     worktree_path: &Path,
     session_id: &Uuid,
@@ -240,46 +286,24 @@ async fn invoke_claude_for_reviews(
     timeout_opt: Option<&str>,
 ) -> Result<()> {
     let cmd = build_claude_resume_command(worktree_path, session_id, prompt);
+
     let status = run_claude_with_stream_monitoring(
         cmd,
         worktree_path,
         timeout_opt,
         None::<fn(&stream::StreamOutput)>,
-        None,
+        None::<Box<dyn FnOnce(u32) + Send>>,
     )
     .await?;
 
     if !status.success() {
         let exit_code = status.code().unwrap_or(EXIT_CODE_SIGNAL_TERMINATED);
-        return Err(anyhow::anyhow!(
-            "Review response process exited with code {}",
-            exit_code
-        ));
+        anyhow::bail!("Review response process exited with code {}", exit_code);
     }
-
     Ok(())
 }
 
-/// Triggers an automated PR review by spawning a separate gru review command
-///
-/// This function spawns `gru review` as a completely separate process with a fresh
-/// Claude session context. This ensures the review is unbiased and not influenced
-/// by the implementation process.
-///
-/// # Arguments
-/// * `pr_number` - The PR number to review (must be a valid number)
-/// * `worktree_path` - Path to the worktree where the review should run
-/// * `review_timeout` - Optional timeout duration for the review process
-///
-/// # Returns
-/// The exit code from the review process (0 for success, non-zero for failure)
-///
-/// # Errors
-/// Returns an error if:
-/// - The PR number is not a valid numeric value
-/// - The gru command fails to spawn (e.g., not in PATH)
-/// - The process cannot be waited on
-/// - The review process exceeds the timeout
+/// Trigger a PR review as a separate process, with a timeout
 async fn trigger_pr_review(
     pr_number: &str,
     worktree_path: &Path,
@@ -290,11 +314,9 @@ async fn trigger_pr_review(
         .parse::<u64>()
         .with_context(|| format!("Invalid PR number format: '{}'", pr_number))?;
 
-    // Use provided timeout or default
     let timeout_duration =
         review_timeout.unwrap_or_else(|| Duration::from_secs(DEFAULT_REVIEW_TIMEOUT_SECS));
 
-    // Spawn gru review as a separate process
     let mut child = TokioCommand::new("gru")
         .arg("review")
         .arg(pr_number)
@@ -310,7 +332,6 @@ async fn trigger_pr_review(
             )
         })?;
 
-    // Wait for the process with timeout
     match timeout(timeout_duration, child.wait()).await {
         Ok(status) => {
             let status = status.with_context(|| {
@@ -319,8 +340,7 @@ async fn trigger_pr_review(
             Ok(status.code().unwrap_or(EXIT_CODE_SIGNAL_TERMINATED))
         }
         Err(_) => {
-            // Timeout occurred - kill the child process to prevent orphaned process
-            let _ = child.kill().await; // Ignore kill errors, already timing out
+            let _ = child.kill().await;
             Err(anyhow::anyhow!(
                 "Review process timed out after {} minutes. PR #{} review may be stuck.",
                 timeout_duration.as_secs() / 60,
@@ -330,144 +350,226 @@ async fn trigger_pr_review(
     }
 }
 
-/// Helper function to post a progress comment to a GitHub issue
-/// Returns true if the comment was posted successfully, false otherwise
+/// Posts a progress comment to the issue (fire-and-forget).
 async fn try_post_progress_comment(
     client: &GitHubClient,
     owner: &str,
     repo: &str,
-    issue_num: &str,
-    comment_body: &str,
+    issue_num: u64,
+    body: &str,
 ) -> bool {
-    // Parse issue number to u64
-    match issue_num.parse::<u64>() {
-        Ok(issue_num_u64) => {
-            // Post comment (fire and forget - don't block on errors)
-            match client
-                .post_comment(owner, repo, issue_num_u64, comment_body)
-                .await
-            {
-                Ok(_) => true,
-                Err(e) => {
-                    log::warn!("⚠️  Failed to post progress comment: {}", e);
-                    false
-                }
-            }
-        }
-        Err(_) => {
-            log::warn!("⚠️  Invalid issue number format: {}", issue_num);
+    match client.post_comment(owner, repo, issue_num, body).await {
+        Ok(_) => true,
+        Err(e) => {
+            log::warn!("⚠️  Failed to post progress comment: {}", e);
             false
         }
     }
 }
 
-/// Handles the fix command by delegating to the Claude CLI
-/// Returns the exit code from the claude process
-pub async fn handle_fix(
-    issue: &str,
-    timeout_opt: Option<String>,
-    quiet: bool,
-    force_new: bool,
-) -> Result<i32> {
-    // Parse issue information (auto-detects repo from current directory if plain number)
-    let (owner, repo, issue_num) = parse_issue_info(issue)?;
+// ---------------------------------------------------------------------------
+// Phase 1: Resolve Issue
+// ---------------------------------------------------------------------------
 
-    // Check for existing Minions on this issue before creating a new one
+/// Resolves an issue argument into validated context.
+///
+/// Parses the issue string, checks for existing minions (unless `force_new`),
+/// initializes the GitHub client, and fetches issue details.
+/// Note: Does NOT claim the issue — that happens after worktree setup to avoid
+/// marking issues as in-progress when setup fails.
+async fn resolve_issue(issue: &str, force_new: bool) -> Result<IssueContext> {
+    let (owner, repo, issue_num_str) = parse_issue_info(issue)?;
+    let issue_num: u64 = issue_num_str
+        .parse()
+        .context("Failed to parse issue number")?;
+
+    // Check for existing Minions on this issue
     if !force_new {
-        let issue_num_for_check: u64 = issue_num
-            .parse()
-            .context("Failed to parse issue number for duplicate check")?;
-        let repo_for_check = format!("{}/{}", owner, repo);
-        let mut existing = tokio::task::spawn_blocking(move || {
-            let registry = MinionRegistry::load(None)?;
-            Ok::<_, anyhow::Error>(registry.find_by_issue(&repo_for_check, issue_num_for_check))
-        })
-        .await
-        .context("Failed to spawn blocking task for duplicate check")??;
-
-        if !existing.is_empty() {
-            // Sort deterministically: running Minions first, then by most recent start time.
-            // is_process_alive is a single syscall (kill(pid, 0)) that completes in
-            // microseconds, so calling it outside spawn_blocking is acceptable.
-            existing.sort_by(|(_, a), (_, b)| {
-                let a_running = a.pid.map(is_process_alive).unwrap_or(false);
-                let b_running = b.pid.map(is_process_alive).unwrap_or(false);
-                b_running
-                    .cmp(&a_running)
-                    .then_with(|| b.last_activity.cmp(&a.last_activity))
-            });
-
-            eprintln!(
-                "Error: {} existing Minion(s) found for issue {}:\n",
-                existing.len(),
-                issue_num
-            );
-
-            for (minion_id, info) in &existing {
-                let actually_running = info.pid.map(is_process_alive).unwrap_or(false);
-
-                let status_msg = if actually_running {
-                    match info.mode {
-                        MinionMode::Autonomous => "running (autonomous)",
-                        MinionMode::Interactive => "running (interactive)",
-                        // Process is alive but mode wasn't updated — treat as running
-                        MinionMode::Stopped => "running",
-                    }
-                } else {
-                    "stopped"
-                };
-
-                eprintln!("  {} - status: {}", minion_id, status_msg);
-            }
-
-            // Suggest options for the best candidate (first after sort: running > most recent)
-            let (best_id, best_info) = existing.first().unwrap();
-            let best_running = best_info.pid.map(is_process_alive).unwrap_or(false);
-
-            eprintln!("\nOptions:");
-            if best_running {
-                eprintln!("  - Attach interactively: gru attach {}", best_id);
-            } else {
-                eprintln!("  - Resume work:          gru resume {}", best_id);
-                eprintln!("  - Attach interactively: gru attach {}", best_id);
-            }
-            eprintln!(
-                "  - Create new session:   gru fix {} --force-new",
-                issue_num
-            );
-            return Ok(1);
-        }
+        check_existing_minions(&owner, &repo, issue_num).await?;
     }
 
-    // Always generate a unique minion ID
+    // Initialize GitHub client (optional - only if token is available)
+    let github_client = match GitHubClient::from_env(&owner, &repo).await {
+        Ok(client) => Some(client),
+        Err(err) => {
+            eprintln!(
+                "⚠️  GitHub authentication error - progress comments will not be posted: {err}"
+            );
+            None
+        }
+    };
+
+    // Fetch issue details
+    let details = fetch_issue_details(&owner, &repo, issue_num, &github_client).await;
+
+    Ok(IssueContext {
+        owner,
+        repo,
+        issue_num,
+        details,
+        github_client,
+    })
+}
+
+/// Checks if there are existing minions working on this issue and returns an
+/// error with suggestions if so.
+async fn check_existing_minions(owner: &str, repo: &str, issue_num: u64) -> Result<()> {
+    let repo_for_check = format!("{}/{}", owner, repo);
+    let mut existing = tokio::task::spawn_blocking(move || {
+        let registry = MinionRegistry::load(None)?;
+        Ok::<_, anyhow::Error>(registry.find_by_issue(&repo_for_check, issue_num))
+    })
+    .await
+    .context("Failed to spawn blocking task for duplicate check")??;
+
+    if existing.is_empty() {
+        return Ok(());
+    }
+
+    // Sort deterministically: running Minions first, then by most recent start time.
+    existing.sort_by(|(_, a), (_, b)| {
+        let a_running = a.pid.map(is_process_alive).unwrap_or(false);
+        let b_running = b.pid.map(is_process_alive).unwrap_or(false);
+        b_running
+            .cmp(&a_running)
+            .then_with(|| b.last_activity.cmp(&a.last_activity))
+    });
+
+    eprintln!(
+        "Error: {} existing Minion(s) found for issue {}:\n",
+        existing.len(),
+        issue_num
+    );
+
+    for (minion_id, info) in &existing {
+        let actually_running = info.pid.map(is_process_alive).unwrap_or(false);
+        let status_msg = if actually_running {
+            match info.mode {
+                MinionMode::Autonomous => "running (autonomous)",
+                MinionMode::Interactive => "running (interactive)",
+                MinionMode::Stopped => "running",
+            }
+        } else {
+            "stopped"
+        };
+        eprintln!("  {} - status: {}", minion_id, status_msg);
+    }
+
+    let (best_id, best_info) = existing.first().unwrap();
+    let best_running = best_info.pid.map(is_process_alive).unwrap_or(false);
+
+    eprintln!("\nOptions:");
+    if best_running {
+        eprintln!("  - Attach interactively: gru attach {}", best_id);
+    } else {
+        eprintln!("  - Resume work:          gru resume {}", best_id);
+        eprintln!("  - Attach interactively: gru attach {}", best_id);
+    }
+    eprintln!(
+        "  - Create new session:   gru fix {} --force-new",
+        issue_num
+    );
+
+    Err(FixError::ExistingMinionFound.into())
+}
+
+/// Claims an issue by adding the in-progress label.
+async fn claim_issue(client: &GitHubClient, owner: &str, repo: &str, issue_num: u64) {
+    match client.claim_issue(owner, repo, issue_num).await {
+        Ok(true) => {
+            println!("🏷️  Added 'in-progress' label to issue #{}", issue_num);
+        }
+        Ok(false) => {
+            log::warn!(
+                "⚠️  Issue #{} is already claimed by another Minion",
+                issue_num
+            );
+            log::warn!("   This may indicate a race condition or multiple gru instances.");
+            log::warn!("   Continuing anyway; will proceed to create or reuse a worktree...");
+        }
+        Err(e) => {
+            log::warn!("⚠️  Failed to add label to issue: {}", e);
+            log::warn!("   Continuing anyway...");
+        }
+    }
+}
+
+/// Fetches issue details from GitHub API with CLI fallback.
+async fn fetch_issue_details(
+    owner: &str,
+    repo: &str,
+    issue_num: u64,
+    github_client: &Option<GitHubClient>,
+) -> Option<IssueDetails> {
+    if let Some(ref client) = github_client {
+        match client.get_issue(owner, repo, issue_num).await {
+            Ok(issue) => {
+                let labels = issue
+                    .labels
+                    .iter()
+                    .map(|l| l.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let body = issue.body.unwrap_or_default();
+                Some(IssueDetails {
+                    title: issue.title,
+                    body,
+                    labels,
+                })
+            }
+            Err(e) => {
+                eprintln!("⚠️  Failed to fetch issue details via API: {}", e);
+                eprintln!("   Falling back to gh CLI...");
+                let cli_result = crate::github::get_issue_via_cli(owner, repo, issue_num).await;
+                let result = handle_cli_fetch_result(cli_result).await;
+                if result.is_none() {
+                    eprintln!("   Fix authentication with: gh auth login");
+                }
+                result
+            }
+        }
+    } else {
+        let cli_result = crate::github::get_issue_via_cli(owner, repo, issue_num).await;
+        let result = handle_cli_fetch_result(cli_result).await;
+        if result.is_none() {
+            eprintln!("   Fix authentication with: gh auth login");
+        }
+        result
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2: Setup Worktree
+// ---------------------------------------------------------------------------
+
+/// Sets up the workspace: generates minion ID, clones repo, creates worktree,
+/// registers the minion in the registry.
+async fn setup_worktree(ctx: &IssueContext) -> Result<WorktreeContext> {
     let minion_id = minion::generate_minion_id().context("Failed to generate Minion ID")?;
     println!("📋 Generated Minion ID: {}", minion_id);
 
-    // Create workspace and launch Claude
     println!(
         "🚀 Setting up workspace for {}/{}#{}",
-        owner, repo, issue_num
+        ctx.owner, ctx.repo, ctx.issue_num
     );
 
-    // Initialize workspace
     let workspace = workspace::Workspace::new().context("Failed to initialize Gru workspace")?;
 
-    // Create bare repository path
-    let bare_path = workspace.repos().join(&owner).join(format!("{}.git", repo));
-    let git_repo = git::GitRepo::new(&owner, &repo, bare_path);
+    let bare_path = workspace
+        .repos()
+        .join(&ctx.owner)
+        .join(format!("{}.git", ctx.repo));
+    let git_repo = git::GitRepo::new(&ctx.owner, &ctx.repo, bare_path);
 
-    // Ensure bare repository is cloned/updated
     println!("📦 Ensuring repository is cloned...");
     git_repo
         .ensure_bare_clone()
         .context("Failed to clone or update repository")?;
 
-    // Create branch name first: minion/issue-<num>-<id>
-    let branch_name = format!("minion/issue-{}-{}", issue_num, minion_id);
+    let branch_name = format!("minion/issue-{}-{}", ctx.issue_num, minion_id);
     println!("🌿 Creating worktree with branch: {}", branch_name);
 
-    // Create worktree path using branch name
-    let repo_name = format!("{}/{}", owner, repo);
+    let repo_name = format!("{}/{}", ctx.owner, ctx.repo);
     let worktree_path = workspace
         .work_dir(&repo_name, &branch_name)
         .context("Failed to compute worktree path")?;
@@ -478,17 +580,15 @@ pub async fn handle_fix(
 
     println!("📂 Workspace created at: {}", worktree_path.display());
 
-    // Generate a unique session ID for conversation continuity
     let session_id = Uuid::new_v4();
 
     // Register the Minion in the registry
-    let issue_num_u64: u64 = issue_num.parse().context("Failed to parse issue number")?;
     let now = Utc::now();
     let registry_info = RegistryMinionInfo {
         repo: repo_name.clone(),
-        issue: issue_num_u64,
+        issue: ctx.issue_num,
         command: "fix".to_string(),
-        prompt: format!("/fix {}", issue_num),
+        prompt: format!("/fix {}", ctx.issue_num),
         started_at: now,
         branch: branch_name.clone(),
         worktree: worktree_path.clone(),
@@ -500,7 +600,6 @@ pub async fn handle_fix(
         last_activity: now,
     };
 
-    // Load registry and register the Minion (spawn_blocking to avoid blocking the async runtime)
     let minion_id_clone = minion_id.clone();
     tokio::task::spawn_blocking(move || {
         let mut registry = MinionRegistry::load(None)?;
@@ -510,107 +609,26 @@ pub async fn handle_fix(
     .context("Failed to spawn blocking task for registry registration")??;
 
     println!("📝 Registered Minion {} in registry", minion_id);
-    println!("🤖 Launching Claude...\n");
 
-    // Create progress display
-    let config = ProgressConfig {
-        minion_id: minion_id.clone(),
-        issue: issue_num.to_string(),
-        quiet,
-    };
-    let progress = ProgressDisplay::new(config);
+    Ok(WorktreeContext {
+        minion_id,
+        branch_name,
+        worktree_path,
+        session_id,
+    })
+}
 
-    // Initialize progress comment tracker
-    let mut progress_tracker = ProgressCommentTracker::new(minion_id.clone());
+// ---------------------------------------------------------------------------
+// Phase 3: Run Claude
+// ---------------------------------------------------------------------------
 
-    // Initialize GitHub client (optional - only if token is available)
-    let github_client = GitHubClient::from_env(&owner, &repo).await.ok();
-    if github_client.is_none() {
-        println!("⚠️  No GitHub authentication found - progress comments will not be posted");
-    }
-
-    // Claim the issue by adding in-progress label (fire-and-forget)
-    if let Some(ref client) = github_client {
-        if let Ok(issue_number) = issue_num.parse::<u64>() {
-            match client.claim_issue(&owner, &repo, issue_number).await {
-                Ok(true) => {
-                    println!("🏷️  Added 'in-progress' label to issue #{}", issue_num);
-                }
-                Ok(false) => {
-                    log::warn!(
-                        "⚠️  Issue #{} is already claimed by another Minion",
-                        issue_num
-                    );
-                    log::warn!("   This may indicate a race condition or multiple gru instances.");
-                    log::warn!("   Continuing anyway (worktree already created)...");
-                }
-                Err(e) => {
-                    log::warn!("⚠️  Failed to add label to issue: {}", e);
-                    log::warn!("   Continuing anyway...");
-                }
-            }
-        } else {
-            log::warn!(
-                "⚠️  Invalid issue number '{}', cannot update labels",
-                issue_num
-            );
-        }
-    }
-
-    // Parse issue number once for reuse
-    let issue_number_opt = issue_num.parse::<u64>().ok();
-
-    // Fetch issue details to include in the prompt
-    let issue_details = if let Some(issue_number) = issue_number_opt {
-        if let Some(ref client) = github_client {
-            // Try to fetch using API
-            match client.get_issue(&owner, &repo, issue_number).await {
-                Ok(issue) => {
-                    let labels = issue
-                        .labels
-                        .iter()
-                        .map(|l| l.name.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    let body = issue.body.unwrap_or_default();
-                    Some((issue.title, body, labels))
-                }
-                Err(e) => {
-                    eprintln!("⚠️  Failed to fetch issue details via API: {}", e);
-                    eprintln!("   Falling back to gh CLI...");
-                    // Try CLI fallback
-                    let cli_result =
-                        crate::github::get_issue_via_cli(&owner, &repo, issue_number).await;
-                    let result = handle_cli_fetch_result(cli_result).await;
-
-                    // Only show auth guidance if both API and CLI failed
-                    if result.is_none() {
-                        eprintln!("   Fix authentication with: gh auth login");
-                    }
-                    result
-                }
-            }
-        } else {
-            // No API client - try CLI directly
-            let cli_result = crate::github::get_issue_via_cli(&owner, &repo, issue_number).await;
-            let result = handle_cli_fetch_result(cli_result).await;
-
-            // Show auth guidance when CLI fails and we have no API client
-            if result.is_none() {
-                eprintln!("   Fix authentication with: gh auth login");
-            }
-            result
-        }
-    } else {
-        None
-    };
-
-    // Format the prompt with issue details
-    let prompt = if let Some((title, body, labels)) = issue_details.as_ref() {
-        let labels_section = if labels.is_empty() {
+/// Builds the prompt string from issue context.
+fn build_fix_prompt(ctx: &IssueContext) -> String {
+    if let Some(ref details) = ctx.details {
+        let labels_section = if details.labels.is_empty() {
             String::new()
         } else {
-            format!("\nLabels: {}", labels)
+            format!("\nLabels: {}", details.labels)
         };
 
         format!(
@@ -698,21 +716,45 @@ When your implementation is complete and ready for human review:
 - Make a reply that addresses each comment and includes a summary of the changes made
 - Repeat until the PR is ready to merge
 "#,
-            issue_num, title, owner, repo, issue_num, labels_section, body
+            ctx.issue_num,
+            details.title,
+            ctx.owner,
+            ctx.repo,
+            ctx.issue_num,
+            labels_section,
+            details.body
         )
     } else {
-        // Fall back to simple prompt if we couldn't fetch issue details
-        format!("/fix {}", issue_num)
+        format!("/fix {}", ctx.issue_num)
+    }
+}
+
+/// Runs a Claude session with stream monitoring and progress tracking.
+///
+/// Spawns the Claude CLI, tracks progress, records PID in registry,
+/// and cleans up on exit (success or failure).
+async fn run_claude_session(
+    issue_ctx: &IssueContext,
+    wt_ctx: &WorktreeContext,
+    quiet: bool,
+    timeout_opt: Option<&str>,
+) -> Result<ClaudeResult> {
+    println!("🤖 Launching Claude...\n");
+
+    let prompt = build_fix_prompt(issue_ctx);
+
+    let mut cmd = build_claude_command(&wt_ctx.worktree_path, &wt_ctx.session_id, &prompt);
+    cmd.env("GRU_WORKSPACE", &wt_ctx.minion_id);
+
+    let config = ProgressConfig {
+        minion_id: wt_ctx.minion_id.clone(),
+        issue: issue_ctx.issue_num.to_string(),
+        quiet,
     };
+    let progress = ProgressDisplay::new(config);
 
-    // Build the command with custom environment variable for main fix flow
-    let mut cmd = build_claude_command(&worktree_path, &session_id, &prompt);
-    cmd.env("GRU_WORKSPACE", &minion_id);
+    let mut progress_tracker = ProgressCommentTracker::new(wt_ctx.minion_id.clone());
 
-    // Create state for the callback
-    // Note: GitHub comment posting is omitted from the callback because it requires async operations
-    // which aren't easily supported in the synchronous callback. The refactoring trades
-    // this feature for code simplification and DRY principles.
     struct CallbackState<'a> {
         raw_output_buffer: String,
         progress: &'a ProgressDisplay,
@@ -726,13 +768,9 @@ When your implementation is complete and ready for human review:
     };
 
     let callback = |output: &stream::StreamOutput| {
-        // Buffer raw output for test detection
         if let stream::StreamOutput::RawLine(ref line) = output {
             callback_state.raw_output_buffer.push_str(line);
-            // Keep buffer size reasonable
             if callback_state.raw_output_buffer.len() > MAX_OUTPUT_BUFFER_SIZE {
-                // Ensure we split at a valid UTF-8 character boundary to avoid panics
-                // Find the largest valid UTF-8 boundary at or before TRIM_OUTPUT_BUFFER_SIZE
                 let mut trim_pos = TRIM_OUTPUT_BUFFER_SIZE;
                 while trim_pos > 0 && !callback_state.raw_output_buffer.is_char_boundary(trim_pos) {
                     trim_pos -= 1;
@@ -742,12 +780,9 @@ When your implementation is complete and ready for human review:
             }
         }
 
-        // Display progress
         callback_state.progress.handle_output(output);
 
-        // Check for milestones and update tracker
         if let stream::StreamOutput::RawLine(ref line) = output {
-            // Detect phase transitions from output
             let previous_phase = callback_state.progress_tracker.current_phase();
 
             if line.contains("Plan") || line.contains("plan") {
@@ -772,10 +807,7 @@ When your implementation is complete and ready for human review:
         }
     };
 
-    // Build on_spawn callback to record the child PID in the registry.
-    // Runs synchronously to ensure the PID is recorded before stream processing begins,
-    // avoiding a race where short-lived processes exit before the PID is persisted.
-    let pid_minion_id = minion_id.clone();
+    let pid_minion_id = wt_ctx.minion_id.clone();
     let on_spawn: Box<dyn FnOnce(u32) + Send> = Box::new(move |pid: u32| {
         if let Ok(mut registry) = MinionRegistry::load(None) {
             let _ = registry.update(&pid_minion_id, |info| {
@@ -785,20 +817,17 @@ When your implementation is complete and ready for human review:
         }
     });
 
-    // Run Claude with stream monitoring and get the exit status.
-    // Store the result to ensure cleanup runs even on error paths.
     let run_result = run_claude_with_stream_monitoring(
         cmd,
-        &worktree_path,
-        timeout_opt.as_deref(),
+        &wt_ctx.worktree_path,
+        timeout_opt,
         Some(callback),
         Some(on_spawn),
     )
     .await;
 
-    // Always clear PID and set mode to Stopped, regardless of success or error.
-    // This prevents stale PIDs from lingering in the registry after timeouts/crashes.
-    let exit_minion_id = minion_id.clone();
+    // Always clear PID and set mode to Stopped, regardless of success or error
+    let exit_minion_id = wt_ctx.minion_id.clone();
     tokio::task::spawn_blocking(move || {
         if let Ok(mut registry) = MinionRegistry::load(None) {
             let _ = registry.update(&exit_minion_id, |info| {
@@ -810,11 +839,10 @@ When your implementation is complete and ready for human review:
     .await
     .context("Failed to update registry after process exit")?;
 
-    // Now propagate the original error if the stream monitoring failed
     let status = run_result?;
 
     // Post final completion comment
-    if let Some(ref client) = github_client {
+    if let Some(ref client) = issue_ctx.github_client {
         progress_tracker.set_phase(MinionPhase::Completed);
 
         let final_message = if status.success() {
@@ -826,273 +854,254 @@ When your implementation is complete and ready for human review:
         let update = progress_tracker.create_update(final_message);
         let comment_body = update.format_comment();
 
-        // Post final comment (ignore rate limiting for completion)
-        try_post_progress_comment(client, &owner, &repo, &issue_num, &comment_body).await;
+        try_post_progress_comment(
+            client,
+            &issue_ctx.owner,
+            &issue_ctx.repo,
+            issue_ctx.issue_num,
+            &comment_body,
+        )
+        .await;
     }
 
     // Finish the progress display
     if status.success() {
-        progress.finish_with_message(&format!("✅ Completed issue {}", issue));
-
-        // Check if a PR should be created
-        println!("\n🔍 Checking if branch was pushed...");
-        let branch_pushed = is_branch_pushed(&worktree_path, &branch_name).await?;
-
-        if branch_pushed {
-            println!("📋 Branch was pushed, creating pull request...");
-
-            // Pass the cached issue title to avoid duplicate fetching
-            let issue_title_cached = issue_details.as_ref().map(|(title, _, _)| title.as_str());
-
-            match create_pr_for_issue(
-                &owner,
-                &repo,
-                &branch_name,
-                &issue_num,
-                &minion_id,
-                &worktree_path,
-                issue_title_cached,
-            )
-            .await
-            {
-                Ok(pr_number) => {
-                    // Save PR state
-                    let pr_state = PrState::new(pr_number.clone(), issue_num.clone());
-                    pr_state
-                        .save(&worktree_path)
-                        .context("Failed to save PR state")?;
-
-                    // Update registry with PR number (spawn_blocking to avoid blocking)
-                    let minion_id_clone = minion_id.clone();
-                    let pr_number_clone = pr_number.clone();
-                    tokio::task::spawn_blocking(move || {
-                        let mut registry = MinionRegistry::load(None)?;
-                        registry.update(&minion_id_clone, |info| {
-                            info.pr = Some(pr_number_clone);
-                            info.status = "idle".to_string();
-                        })
-                    })
-                    .await
-                    .context("Failed to spawn blocking task for registry update")??;
-
-                    println!("✅ Draft PR created: #{}", pr_number);
-                    println!(
-                        "🔗 View PR at: https://github.com/{}/{}/pull/{}",
-                        owner, repo, pr_number
-                    );
-
-                    // Mark issue as done (fire-and-forget)
-                    if let Some(ref client) = github_client {
-                        if let Ok(issue_number) = issue_num.parse::<u64>() {
-                            match client.mark_issue_done(&owner, &repo, issue_number).await {
-                                Ok(()) => {
-                                    println!("🏷️  Updated issue label to 'minion:done'");
-                                }
-                                Err(e) => {
-                                    log::warn!("⚠️  Failed to update issue label: {}", e);
-                                }
-                            }
-                        } else {
-                            log::warn!(
-                                "⚠️  Invalid issue number '{}', cannot update labels",
-                                issue_num
-                            );
-                        }
-                    }
-
-                    // Auto-trigger review for Minion-created PRs
-                    println!("\n🔍 Starting automated PR review...");
-                    match trigger_pr_review(&pr_number, &worktree_path, None).await {
-                        Ok(review_exit_code) => {
-                            if review_exit_code == 0 {
-                                println!("✅ PR review completed successfully");
-                            } else {
-                                log::warn!(
-                                    "⚠️  PR review completed with exit code: {}",
-                                    review_exit_code
-                                );
-                            }
-                        }
-                        Err(e) => {
-                            log::warn!("⚠️  Failed to run PR review: {}", e);
-                            log::warn!("   You can review manually with: gru review {}", pr_number);
-                        }
-                    }
-
-                    // Start monitoring the PR for review comments, CI failures, and merge/close events
-                    println!("\n👀 Monitoring PR for updates (polling every 30s)...");
-                    println!("   Press Ctrl+C to stop monitoring\n");
-
-                    // Keep monitoring in a loop to handle multiple rounds of reviews
-                    let mut review_round = 0;
-                    loop {
-                        match pr_monitor::monitor_pr(&owner, &repo, &pr_number, &worktree_path)
-                            .await
-                        {
-                            Ok(MonitorResult::Merged) => {
-                                println!("✅ PR #{} was merged successfully!", pr_number);
-                                println!("🎉 Issue {} is complete!", issue_num);
-                                break;
-                            }
-                            Ok(MonitorResult::Closed) => {
-                                println!("⚠️  PR #{} was closed without merging", pr_number);
-                                println!(
-                                    "   The issue may need to be reopened or addressed differently"
-                                );
-                                break;
-                            }
-                            Ok(MonitorResult::NewReviews(comments)) => {
-                                review_round += 1;
-                                let count = comments.len();
-                                println!(
-                                    "💬 Detected {} new review comment(s) on PR #{} (review round {}/{})",
-                                    count, pr_number, review_round, MAX_REVIEW_ROUNDS
-                                );
-
-                                // Check if we've hit the maximum review rounds limit
-                                if review_round > MAX_REVIEW_ROUNDS {
-                                    println!(
-                                        "⚠️  Reached maximum review rounds limit ({})",
-                                        MAX_REVIEW_ROUNDS
-                                    );
-                                    println!("   Additional reviews will need manual handling");
-                                    println!(
-                                        "   View PR: https://github.com/{}/{}/pull/{}",
-                                        owner, repo, pr_number
-                                    );
-                                    break;
-                                }
-
-                                // Format the review prompt with detailed comments
-                                let issue_number = match issue_num.parse::<u64>() {
-                                    Ok(num) => num,
-                                    Err(e) => {
-                                        log::warn!(
-                                            "⚠️  Failed to parse issue number '{}': {}",
-                                            issue_num,
-                                            e
-                                        );
-                                        log::warn!("   Cannot format review prompt without a valid issue number");
-                                        break;
-                                    }
-                                };
-
-                                let review_prompt = pr_monitor::format_review_prompt(
-                                    issue_number,
-                                    &pr_number,
-                                    &comments,
-                                );
-
-                                println!("🔄 Re-invoking to address review feedback...\n");
-
-                                // Re-invoke Claude with the same session ID to maintain context
-                                match invoke_claude_for_reviews(
-                                    &worktree_path,
-                                    &session_id,
-                                    &review_prompt,
-                                    timeout_opt.as_deref(),
-                                )
-                                .await
-                                {
-                                    Ok(()) => {
-                                        println!("\n✅ Finished addressing review comments");
-                                        println!("🔄 Continuing to monitor PR...\n");
-                                        // Continue monitoring for more reviews
-                                        //
-                                        // Note: monitor_pr re-initializes last_check_time from existing reviews
-                                        // on each call, so it will pick up from the most recent review timestamp.
-                                        // This mitigates (but doesn't completely eliminate) the race condition
-                                        // where the same reviews could be re-detected. A more robust solution
-                                        // would track processed review IDs or return last_check_time from monitor_pr.
-                                    }
-                                    Err(e) => {
-                                        log::warn!("⚠️  Failed to address review comments: {}", e);
-                                        log::warn!("   You can address them manually");
-                                        break;
-                                    }
-                                }
-                            }
-                            Ok(MonitorResult::FailedChecks(count)) => {
-                                println!(
-                                    "❌ Detected {} failed CI check(s) on PR #{}",
-                                    count, pr_number
-                                );
-                                println!(
-                                    "   Review the checks at: https://github.com/{}/{}/pull/{}/checks",
-                                    owner, repo, pr_number
-                                );
-                                println!("   Fix issues and push updates to the branch");
-                                break;
-                            }
-                            Err(e) => {
-                                log::warn!("⚠️  PR monitoring failed: {}", e);
-                                log::warn!(
-                                    "   You can monitor manually at: https://github.com/{}/{}/pull/{}",
-                                    owner, repo, pr_number
-                                );
-                                break;
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    let err_msg = e.to_string();
-                    if err_msg.contains("already exists")
-                        || err_msg.contains("A pull request for branch")
-                    {
-                        log::info!("ℹ️  A PR already exists for branch '{}'", branch_name);
-                        log::info!("   Check: https://github.com/{}/{}/pulls", owner, repo);
-                    } else if err_msg.contains("branch not found")
-                        || err_msg.contains("does not exist")
-                    {
-                        log::warn!("⚠️  Branch was pushed but is no longer available.");
-                        log::warn!("   It may have been deleted or force-pushed.");
-                    } else {
-                        log::warn!("⚠️  Failed to create PR: {}", e);
-                    }
-                    log::warn!("   You can create the PR manually if needed.");
-                }
-            }
-        } else {
-            println!("ℹ️  Branch was not pushed. No PR will be created.");
-            println!("   Push your changes with: git push origin {}", branch_name);
-        }
+        progress.finish_with_message(&format!("✅ Completed issue {}", issue_ctx.issue_num));
     } else {
-        progress.finish_with_message(&format!("❌ Failed to fix issue {}", issue));
+        progress.finish_with_message(&format!("❌ Failed to fix issue {}", issue_ctx.issue_num));
+    }
 
-        // Mark issue as failed (fire-and-forget)
-        if let Some(ref client) = github_client {
-            if let Ok(issue_number) = issue_num.parse::<u64>() {
-                match client.mark_issue_failed(&owner, &repo, issue_number).await {
+    Ok(ClaudeResult { status })
+}
+
+// ---------------------------------------------------------------------------
+// Phase 4: Create PR
+// ---------------------------------------------------------------------------
+
+/// Creates a PR for the branch and updates labels/registry.
+/// Returns the PR number if successful.
+async fn handle_pr_creation(
+    issue_ctx: &IssueContext,
+    wt_ctx: &WorktreeContext,
+) -> Result<Option<String>> {
+    println!("\n🔍 Checking if branch was pushed...");
+    let branch_pushed = is_branch_pushed(&wt_ctx.worktree_path, &wt_ctx.branch_name).await?;
+
+    if !branch_pushed {
+        println!("ℹ️  Branch was not pushed. No PR will be created.");
+        println!(
+            "   Push your changes with: git push origin {}",
+            wt_ctx.branch_name
+        );
+        return Ok(None);
+    }
+
+    println!("📋 Branch was pushed, creating pull request...");
+
+    let issue_title_cached = issue_ctx.details.as_ref().map(|d| d.title.as_str());
+
+    match create_pr_for_issue(
+        &issue_ctx.owner,
+        &issue_ctx.repo,
+        &wt_ctx.branch_name,
+        issue_ctx.issue_num,
+        &wt_ctx.minion_id,
+        &wt_ctx.worktree_path,
+        issue_title_cached,
+    )
+    .await
+    {
+        Ok(pr_number) => {
+            // Save PR state
+            let pr_state = PrState::new(pr_number.clone(), issue_ctx.issue_num.to_string());
+            pr_state
+                .save(&wt_ctx.worktree_path)
+                .context("Failed to save PR state")?;
+
+            // Update registry with PR number
+            let minion_id_clone = wt_ctx.minion_id.clone();
+            let pr_number_clone = pr_number.clone();
+            tokio::task::spawn_blocking(move || {
+                let mut registry = MinionRegistry::load(None)?;
+                registry.update(&minion_id_clone, |info| {
+                    info.pr = Some(pr_number_clone);
+                    info.status = "idle".to_string();
+                })
+            })
+            .await
+            .context("Failed to spawn blocking task for registry update")??;
+
+            println!("✅ Draft PR created: #{}", pr_number);
+            println!(
+                "🔗 View PR at: https://github.com/{}/{}/pull/{}",
+                issue_ctx.owner, issue_ctx.repo, pr_number
+            );
+
+            // Mark issue as done (fire-and-forget)
+            if let Some(ref client) = issue_ctx.github_client {
+                match client
+                    .mark_issue_done(&issue_ctx.owner, &issue_ctx.repo, issue_ctx.issue_num)
+                    .await
+                {
                     Ok(()) => {
-                        println!("🏷️  Updated issue label to 'minion:failed'");
+                        println!("🏷️  Updated issue label to 'minion:done'");
                     }
                     Err(e) => {
                         log::warn!("⚠️  Failed to update issue label: {}", e);
                     }
                 }
+            }
+
+            Ok(Some(pr_number))
+        }
+        Err(e) => {
+            let err_msg = e.to_string();
+            if err_msg.contains("already exists") || err_msg.contains("A pull request for branch") {
+                log::info!(
+                    "ℹ️  A PR already exists for branch '{}'",
+                    wt_ctx.branch_name
+                );
+                log::info!(
+                    "   Check: https://github.com/{}/{}/pulls",
+                    issue_ctx.owner,
+                    issue_ctx.repo
+                );
+            } else if err_msg.contains("branch not found") || err_msg.contains("does not exist") {
+                log::warn!("⚠️  Branch was pushed but is no longer available.");
+                log::warn!("   It may have been deleted or force-pushed.");
+            } else {
+                log::warn!("⚠️  Failed to create PR: {}", e);
+            }
+            log::warn!("   You can create the PR manually if needed.");
+            Ok(None)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 5: Monitor PR lifecycle
+// ---------------------------------------------------------------------------
+
+/// Monitors a PR for reviews, CI failures, and merge/close events.
+/// Handles automatic review rounds up to MAX_REVIEW_ROUNDS.
+async fn monitor_pr_lifecycle(
+    issue_ctx: &IssueContext,
+    wt_ctx: &WorktreeContext,
+    pr_number: &str,
+    timeout_opt: Option<&str>,
+) {
+    // Auto-trigger review for Minion-created PRs
+    println!("\n🔍 Starting automated PR review...");
+    match trigger_pr_review(pr_number, &wt_ctx.worktree_path, None).await {
+        Ok(review_exit_code) => {
+            if review_exit_code == 0 {
+                println!("✅ PR review completed successfully");
             } else {
                 log::warn!(
-                    "⚠️  Invalid issue number '{}', cannot update labels",
-                    issue_num
+                    "⚠️  PR review completed with exit code: {}",
+                    review_exit_code
                 );
             }
         }
-
-        // If Claude failed, don't attempt CI monitoring
-        return Ok(status.code().unwrap_or(EXIT_CODE_SIGNAL_TERMINATED));
+        Err(e) => {
+            log::warn!("⚠️  Failed to run PR review: {}", e);
+            log::warn!("   You can review manually with: gru review {}", pr_number);
+        }
     }
 
-    // CI monitoring: check if a PR exists and monitor its CI checks
-    let ci_passed = monitor_ci_after_fix(&owner, &repo, &branch_name, &worktree_path).await;
-    match ci_passed {
-        Ok(true) => log::info!("✅ CI checks passed"),
-        Ok(false) => log::warn!("⚠️  CI checks failed or were escalated"),
-        Err(e) => log::warn!("⚠️  CI monitoring error (non-fatal): {}", e),
-    }
+    // Start monitoring the PR for review comments, CI failures, and merge/close events
+    println!("\n👀 Monitoring PR for updates (polling every 30s)...");
+    println!("   Press Ctrl+C to stop monitoring\n");
 
-    // Return the exit code from the claude process
-    Ok(status.code().unwrap_or(EXIT_CODE_SIGNAL_TERMINATED))
+    let mut review_round = 0;
+    loop {
+        match pr_monitor::monitor_pr(
+            &issue_ctx.owner,
+            &issue_ctx.repo,
+            pr_number,
+            &wt_ctx.worktree_path,
+        )
+        .await
+        {
+            Ok(MonitorResult::Merged) => {
+                println!("✅ PR #{} was merged successfully!", pr_number);
+                println!("🎉 Issue {} is complete!", issue_ctx.issue_num);
+                break;
+            }
+            Ok(MonitorResult::Closed) => {
+                println!("⚠️  PR #{} was closed without merging", pr_number);
+                println!("   The issue may need to be reopened or addressed differently");
+                break;
+            }
+            Ok(MonitorResult::NewReviews(comments)) => {
+                review_round += 1;
+                let count = comments.len();
+                println!(
+                    "💬 Detected {} new review comment(s) on PR #{} (review round {}/{})",
+                    count, pr_number, review_round, MAX_REVIEW_ROUNDS
+                );
+
+                if review_round > MAX_REVIEW_ROUNDS {
+                    println!(
+                        "⚠️  Reached maximum review rounds limit ({})",
+                        MAX_REVIEW_ROUNDS
+                    );
+                    println!("   Additional reviews will need manual handling");
+                    println!(
+                        "   View PR: https://github.com/{}/{}/pull/{}",
+                        issue_ctx.owner, issue_ctx.repo, pr_number
+                    );
+                    break;
+                }
+
+                let review_prompt =
+                    pr_monitor::format_review_prompt(issue_ctx.issue_num, pr_number, &comments);
+
+                println!("🔄 Re-invoking to address review feedback...\n");
+
+                match invoke_claude_for_reviews(
+                    &wt_ctx.worktree_path,
+                    &wt_ctx.session_id,
+                    &review_prompt,
+                    timeout_opt,
+                )
+                .await
+                {
+                    Ok(()) => {
+                        println!("\n✅ Finished addressing review comments");
+                        println!("🔄 Continuing to monitor PR...\n");
+                    }
+                    Err(e) => {
+                        log::warn!("⚠️  Failed to address review comments: {}", e);
+                        log::warn!("   You can address them manually");
+                        break;
+                    }
+                }
+            }
+            Ok(MonitorResult::FailedChecks(count)) => {
+                println!(
+                    "❌ Detected {} failed CI check(s) on PR #{}",
+                    count, pr_number
+                );
+                println!(
+                    "   Review the checks at: https://github.com/{}/{}/pull/{}/checks",
+                    issue_ctx.owner, issue_ctx.repo, pr_number
+                );
+                println!("   Fix issues and push updates to the branch");
+                break;
+            }
+            Err(e) => {
+                log::warn!("⚠️  PR monitoring failed: {}", e);
+                log::warn!(
+                    "   You can monitor manually at: https://github.com/{}/{}/pull/{}",
+                    issue_ctx.owner,
+                    issue_ctx.repo,
+                    pr_number
+                );
+                break;
+            }
+        }
+    }
 }
 
 /// Monitors CI after the initial fix and attempts auto-fixes if checks fail.
@@ -1103,7 +1112,6 @@ async fn monitor_ci_after_fix(
     branch: &str,
     worktree_path: &Path,
 ) -> Result<bool> {
-    // Check if a PR exists for this branch
     let pr_number = match ci::get_pr_number(owner, repo, branch).await? {
         Some(num) => num,
         None => {
@@ -1116,8 +1124,103 @@ async fn monitor_ci_after_fix(
     };
 
     eprintln!("🔍 Monitoring CI for PR #{}", pr_number);
-
     ci::monitor_and_fix_ci(owner, repo, pr_number, branch, worktree_path).await
+}
+
+// ---------------------------------------------------------------------------
+// Orchestrator
+// ---------------------------------------------------------------------------
+
+/// Handles the fix command by delegating to the Claude CLI.
+/// Returns the exit code from the claude process.
+///
+/// Orchestrates 5 phases:
+/// 1. `resolve_issue` - Parse issue, check duplicates, fetch details
+/// 2. `setup_worktree` - Clone repo, create worktree, register minion
+/// 3. `run_claude_session` - Build prompt, run Claude, track progress
+/// 4. `handle_pr_creation` - Push check, create PR, update labels
+/// 5. `monitor_pr_lifecycle` - Review, poll for updates, handle feedback
+pub async fn handle_fix(
+    issue: &str,
+    timeout_opt: Option<String>,
+    quiet: bool,
+    force_new: bool,
+) -> Result<i32> {
+    // Phase 1: Resolve issue
+    let issue_ctx = match resolve_issue(issue, force_new).await {
+        Ok(ctx) => ctx,
+        Err(e) if e.downcast_ref::<FixError>() == Some(&FixError::ExistingMinionFound) => {
+            return Ok(1)
+        }
+        Err(e) => return Err(e),
+    };
+
+    // Phase 2: Setup worktree
+    let wt_ctx = setup_worktree(&issue_ctx).await?;
+
+    // Claim the issue now that worktree is set up (fire-and-forget)
+    if let Some(ref client) = issue_ctx.github_client {
+        claim_issue(
+            client,
+            &issue_ctx.owner,
+            &issue_ctx.repo,
+            issue_ctx.issue_num,
+        )
+        .await;
+    }
+
+    // Phase 3: Run Claude
+    let claude_result =
+        run_claude_session(&issue_ctx, &wt_ctx, quiet, timeout_opt.as_deref()).await?;
+
+    if !claude_result.status.success() {
+        // Mark issue as failed (fire-and-forget)
+        if let Some(ref client) = issue_ctx.github_client {
+            match client
+                .mark_issue_failed(&issue_ctx.owner, &issue_ctx.repo, issue_ctx.issue_num)
+                .await
+            {
+                Ok(()) => {
+                    println!("🏷️  Updated issue label to 'minion:failed'");
+                }
+                Err(e) => {
+                    log::warn!("⚠️  Failed to update issue label: {}", e);
+                }
+            }
+        }
+
+        return Ok(claude_result
+            .status
+            .code()
+            .unwrap_or(EXIT_CODE_SIGNAL_TERMINATED));
+    }
+
+    // Phase 4: Create PR
+    let pr_number = handle_pr_creation(&issue_ctx, &wt_ctx).await?;
+
+    // Phase 5: Monitor PR lifecycle (review + polling)
+    if let Some(ref pr_num) = pr_number {
+        monitor_pr_lifecycle(&issue_ctx, &wt_ctx, pr_num, timeout_opt.as_deref()).await;
+    }
+
+    // CI monitoring
+    let ci_passed = monitor_ci_after_fix(
+        &issue_ctx.owner,
+        &issue_ctx.repo,
+        &wt_ctx.branch_name,
+        &wt_ctx.worktree_path,
+    )
+    .await;
+    match ci_passed {
+        Ok(true) => log::info!("✅ CI checks passed"),
+        Ok(false) => log::warn!("⚠️  CI checks failed or were escalated"),
+        Err(e) => log::warn!("⚠️  CI monitoring error (non-fatal): {}", e),
+    }
+
+    Ok(claude_result
+        .status
+        .code()
+        .unwrap_or(EXIT_CODE_SIGNAL_TERMINATED))
 }
 
 #[cfg(test)]
@@ -1135,5 +1238,80 @@ mod tests {
         // Git command will fail, but we return Ok(false) to indicate branch is not pushed
         assert!(result.is_ok());
         assert!(!result.unwrap());
+    }
+
+    #[test]
+    fn test_build_fix_prompt_with_details() {
+        let ctx = IssueContext {
+            owner: "octocat".to_string(),
+            repo: "hello-world".to_string(),
+            issue_num: 42,
+            details: Some(IssueDetails {
+                title: "Fix the widget".to_string(),
+                body: "The widget is broken".to_string(),
+                labels: "bug, priority:high".to_string(),
+            }),
+            github_client: None,
+        };
+
+        let prompt = build_fix_prompt(&ctx);
+        assert!(prompt.contains("# Issue #42: Fix the widget"));
+        assert!(prompt.contains("octocat/hello-world/issues/42"));
+        assert!(prompt.contains("The widget is broken"));
+        assert!(prompt.contains("Labels: bug, priority:high"));
+        assert!(prompt.contains("## 1. Check if Decomposition is Needed"));
+    }
+
+    #[test]
+    fn test_build_fix_prompt_without_details() {
+        let ctx = IssueContext {
+            owner: "octocat".to_string(),
+            repo: "hello-world".to_string(),
+            issue_num: 42,
+            details: None,
+            github_client: None,
+        };
+
+        let prompt = build_fix_prompt(&ctx);
+        assert_eq!(prompt, "/fix 42");
+    }
+
+    #[test]
+    fn test_build_fix_prompt_empty_labels() {
+        let ctx = IssueContext {
+            owner: "octocat".to_string(),
+            repo: "hello-world".to_string(),
+            issue_num: 7,
+            details: Some(IssueDetails {
+                title: "Add feature".to_string(),
+                body: "Please add this feature".to_string(),
+                labels: String::new(),
+            }),
+            github_client: None,
+        };
+
+        let prompt = build_fix_prompt(&ctx);
+        assert!(prompt.contains("# Issue #7: Add feature"));
+        assert!(!prompt.contains("Labels:"));
+    }
+
+    #[test]
+    fn test_create_wip_template() {
+        let (title, body) = create_wip_template("M042", 123, "Fix login bug");
+        assert_eq!(title, "[M042] Fixes #123: Fix login bug");
+        assert!(body.contains("Automated fix for #123 by Minion M042"));
+        assert!(body.contains("- [ ] Implementation"));
+        assert!(body.contains("Fixes #123"));
+    }
+
+    #[test]
+    fn test_fix_error_downcast() {
+        // Verify that FixError can be downcast from anyhow::Error,
+        // which is how the orchestrator detects the ExistingMinionFound case.
+        let err: anyhow::Error = FixError::ExistingMinionFound.into();
+        assert_eq!(
+            err.downcast_ref::<FixError>(),
+            Some(&FixError::ExistingMinionFound)
+        );
     }
 }
