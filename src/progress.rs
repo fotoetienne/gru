@@ -1,4 +1,4 @@
-use crate::stream::{ClaudeEvent, StreamOutput};
+use crate::stream::{ClaudeEvent, ContentBlock, ContentDelta, StreamOutput};
 use crate::text_buffer::TextBuffer;
 use chrono::Local;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
@@ -111,11 +111,12 @@ impl ProgressDisplay {
         if self.config.quiet {
             // In quiet mode, only show errors
             if let StreamOutput::Event(ClaudeEvent::Error { error }) = output {
-                let error_msg = error
-                    .get("message")
-                    .and_then(|m| m.as_str())
-                    .unwrap_or("Unknown error");
-                log::error!("{}", error_msg);
+                let message = if error.message.is_empty() {
+                    "Unknown error"
+                } else {
+                    &error.message
+                };
+                log::error!("{}", message);
             }
             return;
         }
@@ -305,82 +306,59 @@ impl ProgressDisplay {
                 self.print_event(&format!("[{}] ▶︎", timestamp));
             }
             ClaudeEvent::ContentBlockStart { content_block, .. } => {
-                // Check if this is a tool_use block
-                if let Some(block_type) = content_block.get("type").and_then(|t| t.as_str()) {
-                    match block_type {
-                        "tool_use" => {
-                            let tool_name = content_block
-                                .get("name")
-                                .and_then(|n| n.as_str())
-                                .unwrap_or("unknown");
-                            let tool_id = content_block
-                                .get("id")
-                                .and_then(|id| id.as_str())
-                                .unwrap_or("");
+                match content_block {
+                    ContentBlock::ToolUse { name, id } => {
+                        let display_name = if name.is_empty() { "unknown" } else { name };
+                        self.update_status(&format!("🔧 Using tool: {}", display_name));
 
-                            self.update_status(&format!("🔧 Using tool: {}", tool_name));
-
-                            // Store tool name for later reference when tool completes
-                            if !tool_id.is_empty() {
-                                let mut names = match self.tool_names.lock() {
-                                    Ok(guard) => guard,
-                                    Err(poisoned) => {
-                                        log::warn!("Tool names mutex poisoned, recovering");
-                                        poisoned.into_inner()
-                                    }
-                                };
-                                names.insert(tool_id.to_string(), tool_name.to_string());
-                            }
-
-                            // Start tracking this tool's input
-                            let mut tracker = match self.tool_tracker.lock() {
+                        // Store tool name for later reference when tool completes
+                        if !id.is_empty() {
+                            let mut names = match self.tool_names.lock() {
                                 Ok(guard) => guard,
                                 Err(poisoned) => {
-                                    log::warn!("Tool tracker mutex poisoned, recovering");
+                                    log::warn!("Tool names mutex poisoned, recovering");
                                     poisoned.into_inner()
                                 }
                             };
-                            tracker.start_tool(tool_name.to_string());
+                            names.insert(id.clone(), name.clone());
                         }
-                        "text" => {
-                            self.update_status("📝 Responding...");
-                        }
-                        _ => {}
+
+                        // Start tracking this tool's input
+                        let mut tracker = match self.tool_tracker.lock() {
+                            Ok(guard) => guard,
+                            Err(poisoned) => {
+                                log::warn!("Tool tracker mutex poisoned, recovering");
+                                poisoned.into_inner()
+                            }
+                        };
+                        tracker.start_tool(name.clone());
                     }
+                    ContentBlock::Text { .. } => {
+                        self.update_status("📝 Responding...");
+                    }
+                    ContentBlock::Unknown => {}
                 }
             }
             ClaudeEvent::ContentBlockDelta { delta, .. } => {
-                // Handle different types of deltas
-                if let Some(delta_type) = delta.get("type").and_then(|t| t.as_str()) {
-                    match delta_type {
-                        "text_delta" => {
-                            // Handle text deltas with buffering
-                            if let Some(text) = delta.get("text").and_then(|t| t.as_str()) {
-                                // Add text to buffer; flush if ready
-                                if let Some(flushed_text) = self.text_buffer.add(text) {
-                                    let truncated =
-                                        Self::truncate_string(&flushed_text, MAX_DISPLAY_CHARS);
-                                    self.print_event(&truncated);
-                                }
-                            }
+                match delta {
+                    ContentDelta::TextDelta { text } => {
+                        // Add text to buffer; flush if ready
+                        if let Some(flushed_text) = self.text_buffer.add(text) {
+                            let truncated = Self::truncate_string(&flushed_text, MAX_DISPLAY_CHARS);
+                            self.print_event(&truncated);
                         }
-                        "input_json_delta" => {
-                            // Accumulate tool input JSON
-                            if let Some(partial_json) =
-                                delta.get("partial_json").and_then(|p| p.as_str())
-                            {
-                                let mut tracker = match self.tool_tracker.lock() {
-                                    Ok(guard) => guard,
-                                    Err(poisoned) => {
-                                        log::warn!("Tool tracker mutex poisoned, recovering");
-                                        poisoned.into_inner()
-                                    }
-                                };
-                                tracker.add_input_chunk(partial_json);
-                            }
-                        }
-                        _ => {}
                     }
+                    ContentDelta::InputJsonDelta { partial_json } => {
+                        let mut tracker = match self.tool_tracker.lock() {
+                            Ok(guard) => guard,
+                            Err(poisoned) => {
+                                log::warn!("Tool tracker mutex poisoned, recovering");
+                                poisoned.into_inner()
+                            }
+                        };
+                        tracker.add_input_chunk(partial_json);
+                    }
+                    ContentDelta::Unknown => {}
                 }
             }
             ClaudeEvent::ContentBlockStop { .. } => {
@@ -409,9 +387,8 @@ impl ProgressDisplay {
                 }
             }
             ClaudeEvent::MessageDelta { delta } => {
-                // Check for stop_reason to detect completion
-                if let Some(stop_reason) = delta.get("stop_reason").and_then(|r| r.as_str()) {
-                    match stop_reason {
+                if let Some(stop_reason) = &delta.stop_reason {
+                    match stop_reason.as_str() {
                         "end_turn" => {
                             self.update_status("✅ Complete");
                             self.print_event(&format!("[{}] Complete", timestamp));
@@ -439,12 +416,19 @@ impl ProgressDisplay {
                 }
 
                 self.update_status("❌ Error");
-                let error_msg = error
-                    .get("message")
-                    .and_then(|m| m.as_str())
-                    .unwrap_or("Unknown error");
-                self.print_event(&format!("[{}] Error: {}", timestamp, error_msg));
-                log::error!("{}", error_msg);
+                let error_text = if error.message.is_empty() {
+                    if error.error_type.is_empty() {
+                        "Unknown error".to_string()
+                    } else {
+                        format!("Unknown error (type: {})", error.error_type)
+                    }
+                } else if error.error_type.is_empty() {
+                    error.message.clone()
+                } else {
+                    format!("{} ({})", error.message, error.error_type)
+                };
+                self.print_event(&format!("[{}] Error: {}", timestamp, error_text));
+                log::error!("{}", error_text);
             }
             ClaudeEvent::Ping => {
                 // Keepalive ping - no action needed, spinner ticks below
@@ -497,7 +481,7 @@ mod tests {
 
         // In quiet mode, non-error events shouldn't be printed
         let message_start = StreamOutput::Event(ClaudeEvent::MessageStart {
-            message: serde_json::json!({}),
+            message: Default::default(),
         });
 
         display.handle_output(&message_start);
