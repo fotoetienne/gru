@@ -705,6 +705,95 @@ mod tests {
         }
     }
 
+    // --- infer_github_host tests ---
+
+    #[test]
+    fn test_infer_github_host_netflix_org() {
+        assert_eq!(infer_github_host("netflix"), "ghe.netflix.net");
+    }
+
+    #[test]
+    fn test_infer_github_host_netflix_substring() {
+        assert_eq!(infer_github_host("netflix-oss"), "ghe.netflix.net");
+    }
+
+    #[test]
+    fn test_infer_github_host_public_owner() {
+        assert_eq!(infer_github_host("octocat"), "github.com");
+    }
+
+    #[test]
+    fn test_infer_github_host_empty() {
+        assert_eq!(infer_github_host(""), "github.com");
+    }
+
+    // --- gh_command_for_repo tests ---
+
+    #[test]
+    fn test_gh_command_for_repo_netflix() {
+        assert_eq!(gh_command_for_repo("netflix/some-repo"), "ghe");
+    }
+
+    #[test]
+    fn test_gh_command_for_repo_public() {
+        assert_eq!(gh_command_for_repo("octocat/hello-world"), "gh");
+    }
+
+    #[test]
+    fn test_gh_command_for_repo_no_slash() {
+        // Edge case: no owner/repo separator
+        assert_eq!(gh_command_for_repo("just-a-string"), "gh");
+    }
+
+    #[test]
+    fn test_gh_command_for_repo_empty() {
+        assert_eq!(gh_command_for_repo(""), "gh");
+    }
+
+    // --- IssueInfo deserialization tests ---
+
+    #[test]
+    fn test_issue_info_deserialize_full() {
+        let json = r#"{"number": 42, "title": "Fix the bug", "body": "Details here"}"#;
+        let info: IssueInfo = serde_json::from_str(json).unwrap();
+        assert_eq!(info.number, 42);
+        assert_eq!(info.title, "Fix the bug");
+        assert_eq!(info.body.as_deref(), Some("Details here"));
+    }
+
+    #[test]
+    fn test_issue_info_deserialize_null_body() {
+        let json = r#"{"number": 1, "title": "No body", "body": null}"#;
+        let info: IssueInfo = serde_json::from_str(json).unwrap();
+        assert_eq!(info.number, 1);
+        assert_eq!(info.title, "No body");
+        assert!(info.body.is_none());
+    }
+
+    #[test]
+    fn test_issue_info_deserialize_missing_body() {
+        // serde treats a missing Option<T> field as None by default
+        let json = r#"{"number": 5, "title": "Minimal"}"#;
+        let info: IssueInfo = serde_json::from_str(json).unwrap();
+        assert_eq!(info.number, 5);
+        assert!(info.body.is_none());
+    }
+
+    #[test]
+    fn test_issue_info_deserialize_extra_fields() {
+        let json = r#"{"number": 10, "title": "Has extras", "body": "body", "labels": [], "url": "https://example.com"}"#;
+        let info: IssueInfo = serde_json::from_str(json).unwrap();
+        assert_eq!(info.number, 10);
+        assert_eq!(info.title, "Has extras");
+    }
+
+    #[test]
+    fn test_issue_info_deserialize_missing_required_field() {
+        let json = r#"{"title": "No number"}"#;
+        let result: Result<IssueInfo, _> = serde_json::from_str(json);
+        assert!(result.is_err());
+    }
+
     // Integration tests that require a real GitHub token
     // Run with: cargo test github_client -- --ignored
     #[tokio::test]

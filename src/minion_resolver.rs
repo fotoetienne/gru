@@ -476,4 +476,126 @@ mod tests {
         let result = try_resolve_from_list("M001", &[]);
         assert!(result.is_none());
     }
+
+    // --- ISSUE_LINK_REGEX tests ---
+
+    #[test]
+    fn test_issue_link_regex_fixes() {
+        let caps = ISSUE_LINK_REGEX.captures("Fixes #42");
+        assert!(caps.is_some());
+        assert_eq!(&caps.unwrap()[1], "42");
+    }
+
+    #[test]
+    fn test_issue_link_regex_closes() {
+        let caps = ISSUE_LINK_REGEX.captures("Closes #123");
+        assert!(caps.is_some());
+        assert_eq!(&caps.unwrap()[1], "123");
+    }
+
+    #[test]
+    fn test_issue_link_regex_resolves() {
+        let caps = ISSUE_LINK_REGEX.captures("Resolves #7");
+        assert!(caps.is_some());
+        assert_eq!(&caps.unwrap()[1], "7");
+    }
+
+    #[test]
+    fn test_issue_link_regex_case_insensitive() {
+        let caps = ISSUE_LINK_REGEX.captures("fixes #99");
+        assert!(caps.is_some());
+        assert_eq!(&caps.unwrap()[1], "99");
+
+        let caps = ISSUE_LINK_REGEX.captures("FIXES #99");
+        assert!(caps.is_some());
+    }
+
+    #[test]
+    fn test_issue_link_regex_in_body() {
+        let body = "This PR implements the feature.\n\nFixes #42\n\nMore details here.";
+        let caps = ISSUE_LINK_REGEX.captures(body);
+        assert!(caps.is_some());
+        assert_eq!(&caps.unwrap()[1], "42");
+    }
+
+    #[test]
+    fn test_issue_link_regex_no_match() {
+        assert!(ISSUE_LINK_REGEX
+            .captures("No issue reference here")
+            .is_none());
+        assert!(ISSUE_LINK_REGEX.captures("See #42").is_none()); // "See" is not a closing keyword
+        assert!(ISSUE_LINK_REGEX.captures("Fixes without number").is_none());
+    }
+
+    #[test]
+    fn test_issue_link_regex_no_space_does_not_match() {
+        // \s+ requires at least one space between keyword and #
+        assert!(ISSUE_LINK_REGEX.captures("Fixes#42").is_none());
+        assert!(ISSUE_LINK_REGEX.captures("Closes#123").is_none());
+    }
+
+    // --- find_by_minion_id_from_list tests ---
+
+    #[test]
+    fn test_find_by_minion_id_found() {
+        let minions = vec![
+            test_minion("M001", Some(42), "owner/repo"),
+            test_minion("M002", Some(99), "owner/repo"),
+        ];
+        let result = find_by_minion_id_from_list("M002", &minions);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().minion_id, "M002");
+    }
+
+    #[test]
+    fn test_find_by_minion_id_not_found() {
+        let minions = vec![test_minion("M001", Some(42), "owner/repo")];
+        assert!(find_by_minion_id_from_list("M999", &minions).is_none());
+    }
+
+    #[test]
+    fn test_find_by_minion_id_empty_list() {
+        assert!(find_by_minion_id_from_list("M001", &[]).is_none());
+    }
+
+    // --- find_by_issue_number_from_list tests ---
+
+    #[test]
+    fn test_find_by_issue_number_found() {
+        let minions = vec![
+            test_minion("M001", Some(42), "owner/repo"),
+            test_minion("M002", Some(99), "owner/repo"),
+        ];
+        let result = find_by_issue_number_from_list(99, &minions);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().minion_id, "M002");
+    }
+
+    #[test]
+    fn test_find_by_issue_number_not_found() {
+        let minions = vec![test_minion("M001", Some(42), "owner/repo")];
+        assert!(find_by_issue_number_from_list(999, &minions).is_none());
+    }
+
+    #[test]
+    fn test_find_by_issue_number_none_issue() {
+        let minions = vec![test_minion("M001", None, "owner/repo")];
+        assert!(find_by_issue_number_from_list(42, &minions).is_none());
+    }
+
+    // --- parse_issue_from_branch edge cases ---
+
+    #[test]
+    fn test_parse_issue_from_branch_large_number() {
+        assert_eq!(
+            parse_issue_from_branch("minion/issue-999999-M0ab"),
+            Some(999999)
+        );
+    }
+
+    #[test]
+    fn test_parse_issue_from_branch_no_minion_id() {
+        // Missing the trailing ID part after number-hyphen
+        assert_eq!(parse_issue_from_branch("minion/issue-42"), None);
+    }
 }

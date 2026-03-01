@@ -56,6 +56,14 @@ fn is_retryable_error(stderr: &str) -> bool {
         .any(|pattern| lower_stderr.contains(pattern))
 }
 
+/// Calculate retry delay with exponential backoff capped at MAX_DELAY_SECS.
+///
+/// Uses `BASE_DELAY_SECS^attempt` formula, capped at `MAX_DELAY_SECS`.
+/// Attempt numbers are 1-indexed (first retry = attempt 1).
+fn calculate_retry_delay(attempt: u32) -> u64 {
+    std::cmp::min(BASE_DELAY_SECS.pow(attempt), MAX_DELAY_SECS)
+}
+
 /// Execute a gh API command with retry logic and exponential backoff.
 ///
 /// # Arguments
@@ -91,8 +99,7 @@ async fn gh_api_with_retry(args: &[&str], max_retries: u32) -> Result<Output> {
         // Check if this is a retryable error
         if attempts < max_retries && is_retryable_error(&stderr) {
             attempts += 1;
-            // Cap delay at MAX_DELAY_SECS to prevent extreme waits
-            let delay_secs = std::cmp::min(BASE_DELAY_SECS.pow(attempts), MAX_DELAY_SECS);
+            let delay_secs = calculate_retry_delay(attempts);
             let delay = Duration::from_secs(delay_secs);
             log::warn!(
                 "GitHub API call failed (retry {}/{}): {}. Waiting {:?}...",
@@ -1098,5 +1105,31 @@ mod tests {
 
         let result: Result<PullRequest, _> = serde_json::from_str(json);
         assert!(result.is_err());
+    }
+
+    // --- calculate_retry_delay tests ---
+
+    #[test]
+    fn test_retry_delay_progression() {
+        // BASE_DELAY_SECS = 2, so 2^attempt: 2, 4, 8, 16, 32
+        assert_eq!(calculate_retry_delay(1), 2);
+        assert_eq!(calculate_retry_delay(2), 4);
+        assert_eq!(calculate_retry_delay(3), 8);
+        assert_eq!(calculate_retry_delay(4), 16);
+        assert_eq!(calculate_retry_delay(5), 32);
+    }
+
+    #[test]
+    fn test_retry_delay_caps_at_max() {
+        // 2^6 = 64 > MAX_DELAY_SECS (60), so it should be capped
+        assert_eq!(calculate_retry_delay(6), MAX_DELAY_SECS);
+        assert_eq!(calculate_retry_delay(7), MAX_DELAY_SECS);
+        assert_eq!(calculate_retry_delay(10), MAX_DELAY_SECS);
+    }
+
+    #[test]
+    fn test_retry_delay_zero_attempt() {
+        // 2^0 = 1
+        assert_eq!(calculate_retry_delay(0), 1);
     }
 }
