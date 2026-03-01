@@ -2,6 +2,7 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 
+use fs2::FileExt;
 use once_cell::sync::Lazy;
 
 use crate::workspace::Workspace;
@@ -60,7 +61,6 @@ pub fn generate_minion_id_with_state(state_dir: Option<&Path>) -> io::Result<Str
         .open(&counter_path)?;
 
     // Lock the file for exclusive access
-    use fs2::FileExt;
     file.lock_exclusive()?;
 
     // Read current counter value

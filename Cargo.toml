@@ -26,7 +26,6 @@ fs2 = "0.4"
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
-
 [dev-dependencies]
 serial_test = "3.4"
 tempfile = "3.26"
