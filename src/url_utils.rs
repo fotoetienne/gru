@@ -2,128 +2,87 @@ use crate::git;
 use anyhow::{Context, Result};
 use tokio::process::Command;
 
-/// Validates that the issue argument is either a number or a valid GitHub URL
-pub fn validate_issue_format(issue: &str) -> Result<()> {
-    // Check if it's a number
-    if issue.parse::<u32>().is_ok() {
-        return Ok(());
-    }
-
-    // Check if it's a GitHub URL with proper format
-    // Expected: https://github.com/owner/repo/issues/123
-    if issue.starts_with("https://github.com/") {
-        // Strip query parameters and fragments
-        let url = issue
-            .split('?')
-            .next()
-            .unwrap()
-            .split('#')
-            .next()
-            .unwrap()
-            .trim_end_matches('/');
-
-        let parts: Vec<&str> = url
-            .strip_prefix("https://github.com/")
-            .unwrap()
-            .split('/')
-            .collect();
-
-        if parts.len() == 4
-            && !parts[0].is_empty() // owner
-            && !parts[1].is_empty() // repo
-            && parts[2] == "issues"
-            && parts[3].parse::<u32>().is_ok()
-        // issue number
-        {
-            return Ok(());
-        }
-    }
-
-    anyhow::bail!(
-        "Invalid issue format. Expected: <number> or <github-url>\n\
-         Examples:\n\
-         - gru fix 42\n\
-         - gru fix https://github.com/owner/repo/issues/42"
-    );
+/// The type of resource referenced in a GitHub URL
+#[derive(Debug, Clone, PartialEq)]
+pub enum GitHubResourceType {
+    Issue,
+    Pull,
 }
 
-/// Validates that the PR argument is either a number or a valid GitHub URL
-pub fn validate_pr_format(pr: &str) -> Result<()> {
-    // Check if it's a number
-    if pr.parse::<u32>().is_ok() {
-        return Ok(());
-    }
-
-    // Check if it's a GitHub URL with proper format
-    // Expected: https://github.com/owner/repo/pull/123
-    if pr.starts_with("https://github.com/") {
-        // Strip query parameters and fragments
-        let url = pr
-            .split('?')
-            .next()
-            .unwrap()
-            .split('#')
-            .next()
-            .unwrap()
-            .trim_end_matches('/');
-
-        let parts: Vec<&str> = url
-            .strip_prefix("https://github.com/")
-            .unwrap()
-            .split('/')
-            .collect();
-
-        if parts.len() == 4
-            && !parts[0].is_empty() // owner
-            && !parts[1].is_empty() // repo
-            && parts[2] == "pull"
-            && parts[3].parse::<u32>().is_ok()
-        // PR number
-        {
-            return Ok(());
-        }
-    }
-
-    anyhow::bail!(
-        "Invalid PR format. Expected: <number> or <github-url>\n\
-         Examples:\n\
-         - gru review 42\n\
-         - gru review https://github.com/owner/repo/pull/42"
-    );
+/// Parsed components of a GitHub URL
+#[derive(Debug, Clone)]
+pub struct GitHubUrl {
+    pub owner: String,
+    pub repo: String,
+    pub resource_type: GitHubResourceType,
+    pub number: u32,
 }
 
-/// Extracts owner, repo, and issue number from an issue argument
-/// Supports both plain issue numbers (auto-detects from current directory) and GitHub URLs
+/// Cleans a URL by stripping query parameters, fragments, and trailing slashes.
+fn clean_url(url: &str) -> &str {
+    url.split('?')
+        .next()
+        .unwrap()
+        .split('#')
+        .next()
+        .unwrap()
+        .trim_end_matches('/')
+}
+
+/// Parses a GitHub issue or PR URL into its components.
+///
+/// Handles URLs like:
+/// - `https://github.com/owner/repo/issues/42`
+/// - `https://github.com/owner/repo/pull/42`
+/// - URLs with query params, fragments, and trailing slashes
+///
+/// Returns `None` if the URL is not a valid GitHub issue/PR URL.
+pub fn parse_github_url(url: &str) -> Option<GitHubUrl> {
+    if !url.starts_with("https://github.com/") {
+        return None;
+    }
+
+    let cleaned = clean_url(url);
+    let path = cleaned.strip_prefix("https://github.com/")?;
+    let parts: Vec<&str> = path.split('/').collect();
+
+    if parts.len() != 4 {
+        return None;
+    }
+
+    let owner = parts[0];
+    let repo = parts[1];
+    let resource_type_str = parts[2];
+    let number_str = parts[3];
+
+    if owner.is_empty() || repo.is_empty() {
+        return None;
+    }
+
+    let resource_type = match resource_type_str {
+        "issues" => GitHubResourceType::Issue,
+        "pull" => GitHubResourceType::Pull,
+        _ => return None,
+    };
+
+    let number = number_str.parse::<u32>().ok()?;
+
+    Some(GitHubUrl {
+        owner: owner.to_string(),
+        repo: repo.to_string(),
+        resource_type,
+        number,
+    })
+}
+
+/// Extracts owner, repo, and issue number from an issue argument.
+///
+/// Supports both plain issue numbers (auto-detects from current directory) and GitHub URLs.
+/// Validates the input format as part of parsing (no separate validation step needed).
 pub async fn parse_issue_info(issue: &str) -> Result<(String, String, String)> {
-    // First validate the format
-    validate_issue_format(issue)?;
-
-    // Check if it's a GitHub URL
-    if issue.starts_with("https://github.com/") {
-        // Strip query parameters and fragments
-        let url = issue
-            .split('?')
-            .next()
-            .unwrap()
-            .split('#')
-            .next()
-            .unwrap()
-            .trim_end_matches('/');
-
-        let parts: Vec<&str> = url
-            .strip_prefix("https://github.com/")
-            .unwrap()
-            .split('/')
-            .collect();
-
-        // parts[0] = owner, parts[1] = repo, parts[2] = "issues", parts[3] = number
-        let owner = parts[0].to_string();
-        let repo = parts[1].to_string();
-        let issue_num = parts[3].to_string();
-
-        Ok((owner, repo, issue_num))
-    } else {
-        // Plain issue number - auto-detect repository from current directory
+    // Check if it's a plain number
+    if let Ok(num) = issue.parse::<u32>() {
+        // Auto-detect repository from current directory
         git::detect_git_repo()
             .await
             .context("Failed to detect git repository")?;
@@ -135,41 +94,54 @@ pub async fn parse_issue_info(issue: &str) -> Result<(String, String, String)> {
         let (owner, repo) =
             git::parse_github_remote(&remote_url).context("Failed to parse GitHub remote URL")?;
 
-        Ok((owner, repo, issue.to_string()))
+        return Ok((owner, repo, num.to_string()));
     }
+
+    // Try parsing as a GitHub URL
+    if let Some(parsed) = parse_github_url(issue) {
+        if parsed.resource_type == GitHubResourceType::Issue {
+            return Ok((parsed.owner, parsed.repo, parsed.number.to_string()));
+        }
+        // Parsed successfully but wrong resource type (e.g., PR URL given for issue command)
+        anyhow::bail!(
+            "Expected a GitHub issue URL, but got a pull request URL.\n\
+             Did you mean to use `gru review` instead?"
+        );
+    }
+
+    anyhow::bail!(
+        "Invalid issue format. Expected: <number> or <github-url>\n\
+         Examples:\n\
+         - gru fix 42\n\
+         - gru fix https://github.com/owner/repo/issues/42"
+    );
 }
 
-/// Extracts owner, repo, PR number, and branch name from a PR argument
-/// Supports both plain PR numbers and GitHub URLs
-/// For plain numbers, fetches metadata from GitHub to get branch info
+/// Extracts owner, repo, PR number, and branch name from a PR argument.
+///
+/// Supports both plain PR numbers and GitHub URLs.
+/// For plain numbers, fetches metadata from GitHub to get branch info.
+/// Validates the input format as part of parsing (no separate validation step needed).
 pub async fn parse_pr_info(pr: &str) -> Result<(String, String, String, String)> {
-    // First validate the format
-    validate_pr_format(pr)?;
-
-    // Extract PR number
+    // Extract PR number, validating the format along the way
     let pr_num = if pr.parse::<u32>().is_ok() {
         pr.to_string()
-    } else if pr.starts_with("https://github.com/") {
-        // Strip query parameters and fragments
-        let url = pr
-            .split('?')
-            .next()
-            .unwrap()
-            .split('#')
-            .next()
-            .unwrap()
-            .trim_end_matches('/');
-
-        let parts: Vec<&str> = url
-            .strip_prefix("https://github.com/")
-            .unwrap()
-            .split('/')
-            .collect();
-
-        // parts[0] = owner, parts[1] = repo, parts[2] = "pull", parts[3] = number
-        parts[3].to_string()
+    } else if let Some(parsed) = parse_github_url(pr) {
+        if parsed.resource_type != GitHubResourceType::Pull {
+            // Parsed successfully but wrong resource type (e.g., issue URL given for review command)
+            anyhow::bail!(
+                "Expected a GitHub pull request URL, but got an issue URL.\n\
+                 Did you mean to use `gru fix` instead?"
+            );
+        }
+        parsed.number.to_string()
     } else {
-        anyhow::bail!("Invalid PR format");
+        anyhow::bail!(
+            "Invalid PR format. Expected: <number> or <github-url>\n\
+             Examples:\n\
+             - gru review 42\n\
+             - gru review https://github.com/owner/repo/pull/42"
+        );
     };
 
     // Fetch PR metadata from GitHub to get branch and repo info
@@ -246,121 +218,117 @@ pub fn normalize_minion_id(id: &str) -> Result<String> {
 mod tests {
     use super::*;
 
+    // --- parse_github_url tests ---
+
     #[test]
-    fn test_validate_issue_format_with_number() {
-        assert!(validate_issue_format("42").is_ok());
-        assert!(validate_issue_format("1").is_ok());
-        assert!(validate_issue_format("999999").is_ok());
+    fn test_parse_github_url_issue() {
+        let result = parse_github_url("https://github.com/fotoetienne/gru/issues/42").unwrap();
+        assert_eq!(result.owner, "fotoetienne");
+        assert_eq!(result.repo, "gru");
+        assert_eq!(result.resource_type, GitHubResourceType::Issue);
+        assert_eq!(result.number, 42);
     }
 
     #[test]
-    fn test_validate_issue_format_with_valid_url() {
-        assert!(validate_issue_format("https://github.com/fotoetienne/gru/issues/42").is_ok());
-        assert!(validate_issue_format("https://github.com/owner/repo-name/issues/123").is_ok());
+    fn test_parse_github_url_pull() {
+        let result = parse_github_url("https://github.com/owner/repo-name/pull/123").unwrap();
+        assert_eq!(result.owner, "owner");
+        assert_eq!(result.repo, "repo-name");
+        assert_eq!(result.resource_type, GitHubResourceType::Pull);
+        assert_eq!(result.number, 123);
     }
 
     #[test]
-    fn test_validate_issue_format_rejects_invalid_input() {
-        assert!(validate_issue_format("not-a-number").is_err());
-        assert!(validate_issue_format("https://example.com/issues/42").is_err());
-        assert!(validate_issue_format("https://github.com/issues/").is_err());
-        assert!(validate_issue_format("https://github.com/owner/issues/").is_err());
-        assert!(validate_issue_format("https://github.com/owner/repo/issues/").is_err());
-        assert!(validate_issue_format("").is_err());
+    fn test_parse_github_url_strips_query_params() {
+        let result = parse_github_url("https://github.com/owner/repo/issues/42?foo=bar").unwrap();
+        assert_eq!(result.number, 42);
     }
 
     #[test]
-    fn test_validate_issue_format_rejects_negative_numbers() {
-        assert!(validate_issue_format("-42").is_err());
+    fn test_parse_github_url_strips_fragments() {
+        let result =
+            parse_github_url("https://github.com/owner/repo/issues/42#comment-123").unwrap();
+        assert_eq!(result.number, 42);
     }
 
     #[test]
-    fn test_validate_issue_format_handles_edge_cases() {
-        // Trailing slashes should be handled
-        assert!(validate_issue_format("https://github.com/owner/repo/issues/42/").is_ok());
-        // Query parameters should be ignored
-        assert!(validate_issue_format("https://github.com/owner/repo/issues/42?foo=bar").is_ok());
-        // Fragments should be ignored
-        assert!(
-            validate_issue_format("https://github.com/owner/repo/issues/42#comment-123").is_ok()
-        );
-        // Combined edge cases
-        assert!(
-            validate_issue_format("https://github.com/owner/repo/issues/42/?foo=bar#comment")
-                .is_ok()
-        );
+    fn test_parse_github_url_strips_trailing_slash() {
+        let result = parse_github_url("https://github.com/owner/repo/pull/42/").unwrap();
+        assert_eq!(result.number, 42);
     }
 
     #[test]
-    fn test_validate_issue_format_rejects_empty_owner_or_repo() {
-        // Empty owner
-        assert!(validate_issue_format("https://github.com//repo/issues/42").is_err());
-        // Empty repo
-        assert!(validate_issue_format("https://github.com/owner//issues/42").is_err());
-        // Both empty
-        assert!(validate_issue_format("https://github.com///issues/42").is_err());
+    fn test_parse_github_url_combined_edge_cases() {
+        let result =
+            parse_github_url("https://github.com/owner/repo/issues/42/?foo=bar#comment").unwrap();
+        assert_eq!(result.owner, "owner");
+        assert_eq!(result.repo, "repo");
+        assert_eq!(result.number, 42);
     }
 
     #[test]
-    fn test_validate_pr_format_with_number() {
-        assert!(validate_pr_format("42").is_ok());
-        assert!(validate_pr_format("1").is_ok());
-        assert!(validate_pr_format("999999").is_ok());
+    fn test_parse_github_url_rejects_non_github() {
+        assert!(parse_github_url("https://example.com/issues/42").is_none());
     }
 
     #[test]
-    fn test_validate_pr_format_with_valid_url() {
-        assert!(validate_pr_format("https://github.com/fotoetienne/gru/pull/42").is_ok());
-        assert!(validate_pr_format("https://github.com/owner/repo-name/pull/123").is_ok());
+    fn test_parse_github_url_rejects_http() {
+        // parse_github_url only accepts https:// web URLs;
+        // use git::parse_github_remote for git remote URLs (which accept http:// and SSH)
+        assert!(parse_github_url("http://github.com/owner/repo/issues/42").is_none());
     }
 
     #[test]
-    fn test_validate_pr_format_rejects_invalid_input() {
-        assert!(validate_pr_format("not-a-number").is_err());
-        assert!(validate_pr_format("https://example.com/pull/42").is_err());
-        assert!(validate_pr_format("https://github.com/pull/").is_err());
-        assert!(validate_pr_format("https://github.com/owner/pull/").is_err());
-        assert!(validate_pr_format("https://github.com/owner/repo/pull/").is_err());
-        assert!(validate_pr_format("").is_err());
+    fn test_parse_github_url_rejects_empty_owner() {
+        assert!(parse_github_url("https://github.com//repo/issues/42").is_none());
     }
 
     #[test]
-    fn test_validate_pr_format_rejects_negative_numbers() {
-        assert!(validate_pr_format("-42").is_err());
+    fn test_parse_github_url_rejects_empty_repo() {
+        assert!(parse_github_url("https://github.com/owner//issues/42").is_none());
     }
 
     #[test]
-    fn test_validate_pr_format_handles_edge_cases() {
-        // Trailing slashes should be handled
-        assert!(validate_pr_format("https://github.com/owner/repo/pull/42/").is_ok());
-        // Query parameters should be ignored
-        assert!(validate_pr_format("https://github.com/owner/repo/pull/42?foo=bar").is_ok());
-        // Fragments should be ignored
-        assert!(validate_pr_format("https://github.com/owner/repo/pull/42#comment-123").is_ok());
-        // Combined edge cases
-        assert!(
-            validate_pr_format("https://github.com/owner/repo/pull/42/?foo=bar#comment").is_ok()
-        );
+    fn test_parse_github_url_rejects_missing_number() {
+        assert!(parse_github_url("https://github.com/owner/repo/issues/").is_none());
     }
 
     #[test]
-    fn test_validate_pr_format_rejects_empty_owner_or_repo() {
-        // Empty owner
-        assert!(validate_pr_format("https://github.com//repo/pull/42").is_err());
-        // Empty repo
-        assert!(validate_pr_format("https://github.com/owner//pull/42").is_err());
-        // Both empty
-        assert!(validate_pr_format("https://github.com///pull/42").is_err());
+    fn test_parse_github_url_rejects_non_numeric_number() {
+        assert!(parse_github_url("https://github.com/owner/repo/issues/abc").is_none());
     }
+
+    #[test]
+    fn test_parse_github_url_rejects_unknown_resource_type() {
+        assert!(parse_github_url("https://github.com/owner/repo/wiki/42").is_none());
+    }
+
+    #[test]
+    fn test_parse_github_url_rejects_incomplete_path() {
+        assert!(parse_github_url("https://github.com/owner/repo").is_none());
+        assert!(parse_github_url("https://github.com/owner").is_none());
+        assert!(parse_github_url("https://github.com/issues/").is_none());
+    }
+
+    // --- parse_issue_info tests (URL paths only; plain numbers need git context) ---
 
     #[tokio::test]
     async fn test_parse_issue_info_with_url() {
         let result = parse_issue_info("https://github.com/fotoetienne/gru/issues/42")
             .await
             .unwrap();
-        assert_eq!(result.0, "fotoetienne".to_string());
-        assert_eq!(result.1, "gru".to_string());
-        assert_eq!(result.2, "42".to_string());
+        assert_eq!(result.0, "fotoetienne");
+        assert_eq!(result.1, "gru");
+        assert_eq!(result.2, "42");
+    }
+
+    #[tokio::test]
+    async fn test_parse_issue_info_url_normalizes_number() {
+        // Leading zeros are normalized by parsing through u32
+        let result = parse_issue_info("https://github.com/owner/repo/issues/042")
+            .await
+            .unwrap();
+        assert_eq!(result.2, "42");
     }
 
     #[tokio::test]
@@ -368,10 +336,54 @@ mod tests {
         let result = parse_issue_info("https://github.com/owner/repo/issues/123?foo=bar")
             .await
             .unwrap();
-        assert_eq!(result.0, "owner".to_string());
-        assert_eq!(result.1, "repo".to_string());
-        assert_eq!(result.2, "123".to_string());
+        assert_eq!(result.0, "owner");
+        assert_eq!(result.1, "repo");
+        assert_eq!(result.2, "123");
     }
+
+    #[tokio::test]
+    async fn test_parse_issue_info_rejects_invalid() {
+        assert!(parse_issue_info("not-a-number").await.is_err());
+        assert!(parse_issue_info("").await.is_err());
+        assert!(parse_issue_info("-42").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_parse_issue_info_rejects_pr_url_with_specific_message() {
+        let err = parse_issue_info("https://github.com/owner/repo/pull/42")
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("pull request URL"),
+            "Expected specific error for PR URL given to issue parser, got: {}",
+            msg
+        );
+    }
+
+    // --- parse_pr_info validation tests (only format validation; gh calls need network) ---
+
+    #[tokio::test]
+    async fn test_parse_pr_info_rejects_invalid() {
+        assert!(parse_pr_info("not-a-number").await.is_err());
+        assert!(parse_pr_info("").await.is_err());
+        assert!(parse_pr_info("-42").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_parse_pr_info_rejects_issue_url_with_specific_message() {
+        let err = parse_pr_info("https://github.com/owner/repo/issues/42")
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("issue URL"),
+            "Expected specific error for issue URL given to PR parser, got: {}",
+            msg
+        );
+    }
+
+    // --- normalize_minion_id tests ---
 
     #[test]
     fn test_normalize_minion_id_with_prefix() {

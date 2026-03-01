@@ -1,3 +1,4 @@
+use crate::git;
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 use tokio::process::Command;
@@ -317,6 +318,7 @@ async fn find_bare_repos(dir: &Path) -> Result<Vec<PathBuf>> {
 
 /// Extract repository identifier from git config
 /// Uses `git config remote.origin.url` to get the actual repo URL and parses it
+/// via `git::parse_github_remote` to avoid duplicating URL parsing logic.
 /// Example: https://github.com/owner/repo.git -> "owner/repo"
 ///          git@github.com:owner/repo.git -> "owner/repo"
 async fn extract_repo_from_git_config(path: &Path) -> Result<String> {
@@ -336,31 +338,9 @@ async fn extract_repo_from_git_config(path: &Path) -> Result<String> {
 
     let url = String::from_utf8_lossy(&output.stdout).trim().to_string();
 
-    // Parse the URL to extract owner/repo
-    parse_repo_from_url(&url).context("Failed to parse repo from URL")
-}
-
-/// Parse owner/repo from a git URL
-/// Handles both HTTPS and SSH formats
-fn parse_repo_from_url(url: &str) -> Result<String> {
-    // Handle HTTPS format: https://github.com/owner/repo.git
-    if url.starts_with("https://") || url.starts_with("http://") {
-        let parts: Vec<&str> = url.split('/').collect();
-        if parts.len() >= 2 {
-            let owner = parts[parts.len() - 2];
-            let repo = parts[parts.len() - 1].trim_end_matches(".git");
-            return Ok(format!("{}/{}", owner, repo));
-        }
-    }
-    // Handle SSH format: git@github.com:owner/repo.git
-    else if url.contains(':') {
-        if let Some(path_part) = url.split(':').nth(1) {
-            let repo = path_part.trim_end_matches(".git");
-            return Ok(repo.to_string());
-        }
-    }
-
-    anyhow::bail!("Unable to parse repo from URL: {}", url)
+    let (owner, repo) =
+        git::parse_github_remote(&url).context("Failed to parse repo from remote URL")?;
+    Ok(format!("{}/{}", owner, repo))
 }
 
 /// Parse git worktree list --porcelain output
@@ -446,43 +426,6 @@ mod tests {
             bare_repo_path: PathBuf::from("/tmp/repo.git"),
         };
         assert_eq!(wt.extract_issue_number(), None);
-    }
-
-    #[test]
-    fn test_parse_repo_from_url() {
-        // HTTPS format
-        assert_eq!(
-            parse_repo_from_url("https://github.com/fotoetienne/gru.git").unwrap(),
-            "fotoetienne/gru"
-        );
-
-        assert_eq!(
-            parse_repo_from_url("https://github.com/owner/repo.git").unwrap(),
-            "owner/repo"
-        );
-
-        // Without .git suffix
-        assert_eq!(
-            parse_repo_from_url("https://github.com/owner/repo").unwrap(),
-            "owner/repo"
-        );
-
-        // SSH format
-        assert_eq!(
-            parse_repo_from_url("git@github.com:fotoetienne/gru.git").unwrap(),
-            "fotoetienne/gru"
-        );
-
-        assert_eq!(
-            parse_repo_from_url("git@github.com:owner/repo.git").unwrap(),
-            "owner/repo"
-        );
-
-        // Without .git suffix
-        assert_eq!(
-            parse_repo_from_url("git@github.com:owner/repo").unwrap(),
-            "owner/repo"
-        );
     }
 
     #[test]
