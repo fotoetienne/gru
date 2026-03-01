@@ -1,4 +1,5 @@
 use crate::minion_registry::{is_process_alive, with_registry};
+use crate::stream::TokenUsage;
 use anyhow::{Context, Result};
 
 /// Combined Minion information from registry and filesystem scanning
@@ -12,6 +13,7 @@ struct EnhancedMinionInfo {
     branch: String,
     status: String,
     uptime: String,
+    token_usage: Option<TokenUsage>,
 }
 
 /// Intermediate Minion data extracted from registry (without expensive status checks)
@@ -26,6 +28,7 @@ struct BasicMinionData {
     started_at: chrono::DateTime<chrono::Utc>,
     worktree: std::path::PathBuf,
     pid: Option<u32>,
+    token_usage: Option<TokenUsage>,
 }
 
 /// Calculates uptime from a timestamp
@@ -142,6 +145,7 @@ pub async fn handle_status(id: Option<String>) -> Result<i32> {
                 started_at: info.started_at,
                 worktree: info.worktree,
                 pid: info.pid,
+                token_usage: info.token_usage,
             })
             .collect();
 
@@ -172,6 +176,7 @@ pub async fn handle_status(id: Option<String>) -> Result<i32> {
                     branch,
                     status,
                     uptime,
+                    token_usage: basic.token_usage,
                 }
             })
             .collect::<Vec<EnhancedMinionInfo>>()
@@ -221,8 +226,8 @@ pub async fn handle_status(id: Option<String>) -> Result<i32> {
 
     // Print table header
     println!(
-        "{:<8} {:<20} {:<8} {:<10} {:<8} {:<30} {:<10} {:<8}",
-        "MINION", "REPO", "ISSUE", "TASK", "PR", "BRANCH", "STATUS", "UPTIME"
+        "{:<8} {:<20} {:<8} {:<10} {:<8} {:<30} {:<10} {:<8} {:<20}",
+        "MINION", "REPO", "ISSUE", "TASK", "PR", "BRANCH", "STATUS", "UPTIME", "TOKENS"
     );
 
     // Print each minion
@@ -233,9 +238,14 @@ pub async fn handle_status(id: Option<String>) -> Result<i32> {
             .as_ref()
             .map(|pr| format!("#{}", pr))
             .unwrap_or_else(|| "-".to_string());
+        let tokens_display = minion
+            .token_usage
+            .as_ref()
+            .map(|u| u.display_compact())
+            .unwrap_or_else(|| "-".to_string());
 
         println!(
-            "{:<8} {:<20} {:<8} {:<10} {:<8} {:<30} {:<10} {:<8}",
+            "{:<8} {:<20} {:<8} {:<10} {:<8} {:<30} {:<10} {:<8} {:<20}",
             minion.minion_id,
             minion.repo,
             issue_display,
@@ -243,7 +253,8 @@ pub async fn handle_status(id: Option<String>) -> Result<i32> {
             pr_display,
             minion.branch,
             minion.status,
-            minion.uptime
+            minion.uptime,
+            tokens_display
         );
     }
 

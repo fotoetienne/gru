@@ -3,6 +3,19 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::ChildStdout;
 
+/// Token usage information from stream events
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct Usage {
+    #[serde(default)]
+    pub input_tokens: u64,
+    #[serde(default)]
+    pub output_tokens: u64,
+    #[serde(default)]
+    pub cache_creation_input_tokens: Option<u64>,
+    #[serde(default)]
+    pub cache_read_input_tokens: Option<u64>,
+}
+
 /// Information about a message in a MessageStart event
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct MessageInfo {
@@ -10,6 +23,8 @@ pub struct MessageInfo {
     pub id: Option<String>,
     #[serde(default)]
     pub role: Option<String>,
+    #[serde(default)]
+    pub usage: Option<Usage>,
 }
 
 /// A content block within a message (text or tool_use)
@@ -61,6 +76,13 @@ pub struct MessageDeltaBody {
     pub stop_reason: Option<String>,
 }
 
+/// Usage information that appears alongside MessageDelta events
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct MessageDeltaUsage {
+    #[serde(default)]
+    pub output_tokens: u64,
+}
+
 /// Error information from the API
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct ErrorInfo {
@@ -107,11 +129,13 @@ pub enum ClaudeEvent {
         index: usize,
     },
 
-    /// Delta/update to the message (e.g., stop_reason)
+    /// Delta/update to the message (e.g., stop_reason, usage)
     #[serde(rename = "message_delta")]
     MessageDelta {
         #[serde(default)]
         delta: MessageDeltaBody,
+        #[serde(default)]
+        usage: Option<MessageDeltaUsage>,
     },
 
     /// End of the message stream
@@ -165,6 +189,58 @@ pub enum StreamOutput {
     ToolResult(ToolResult),
     /// A raw line that wasn't a JSON event
     RawLine(String),
+}
+
+/// Accumulated token usage across a session
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct TokenUsage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_creation_input_tokens: u64,
+    pub cache_read_input_tokens: u64,
+}
+
+impl TokenUsage {
+    /// Update from a message_start event's usage field
+    pub fn add_message_start(&mut self, usage: &Usage) {
+        self.input_tokens += usage.input_tokens;
+        if let Some(cache_creation) = usage.cache_creation_input_tokens {
+            self.cache_creation_input_tokens += cache_creation;
+        }
+        if let Some(cache_read) = usage.cache_read_input_tokens {
+            self.cache_read_input_tokens += cache_read;
+        }
+    }
+
+    /// Update from a message_delta event's usage field
+    pub fn add_message_delta(&mut self, usage: &MessageDeltaUsage) {
+        self.output_tokens += usage.output_tokens;
+    }
+
+    /// Returns total tokens (input + output)
+    pub fn total_tokens(&self) -> u64 {
+        self.input_tokens + self.output_tokens
+    }
+
+    /// Format as a compact display string (e.g., "12.3k in / 4.5k out")
+    pub fn display_compact(&self) -> String {
+        format!(
+            "{} in / {} out",
+            format_token_count(self.input_tokens),
+            format_token_count(self.output_tokens)
+        )
+    }
+}
+
+/// Format a token count in a human-readable way (e.g., 1234 -> "1.2k", 1234567 -> "1.2M")
+fn format_token_count(count: u64) -> String {
+    if count >= 1_000_000 {
+        format!("{:.1}M", count as f64 / 1_000_000.0)
+    } else if count >= 1_000 {
+        format!("{:.1}k", count as f64 / 1_000.0)
+    } else {
+        format!("{}", count)
+    }
 }
 
 /// Async event stream reader for Claude Code output
@@ -300,7 +376,7 @@ mod tests {
         let json = r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"}}"#;
         let event: ClaudeEvent = serde_json::from_str(json).unwrap();
         match event {
-            ClaudeEvent::MessageDelta { delta } => {
+            ClaudeEvent::MessageDelta { delta, .. } => {
                 assert_eq!(delta.stop_reason.as_deref(), Some("end_turn"));
             }
             _ => panic!("Expected MessageDelta event"),
@@ -518,5 +594,137 @@ mod tests {
             }
             _ => panic!("Expected Text content block"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_parse_message_start_with_usage() {
+        let json = r#"{"type":"message_start","message":{"id":"msg_123","role":"assistant","usage":{"input_tokens":100,"output_tokens":0,"cache_creation_input_tokens":50,"cache_read_input_tokens":25}}}"#;
+        let event: ClaudeEvent = serde_json::from_str(json).unwrap();
+        match event {
+            ClaudeEvent::MessageStart { message } => {
+                let usage = message.usage.unwrap();
+                assert_eq!(usage.input_tokens, 100);
+                assert_eq!(usage.output_tokens, 0);
+                assert_eq!(usage.cache_creation_input_tokens, Some(50));
+                assert_eq!(usage.cache_read_input_tokens, Some(25));
+            }
+            _ => panic!("Expected MessageStart event"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_parse_message_start_without_usage() {
+        let json = r#"{"type":"message_start","message":{"id":"msg_123","role":"assistant"}}"#;
+        let event: ClaudeEvent = serde_json::from_str(json).unwrap();
+        match event {
+            ClaudeEvent::MessageStart { message } => {
+                assert!(message.usage.is_none());
+            }
+            _ => panic!("Expected MessageStart event"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_parse_message_delta_with_usage() {
+        let json = r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":500}}"#;
+        let event: ClaudeEvent = serde_json::from_str(json).unwrap();
+        match event {
+            ClaudeEvent::MessageDelta { delta, usage } => {
+                assert_eq!(delta.stop_reason.as_deref(), Some("end_turn"));
+                let usage = usage.unwrap();
+                assert_eq!(usage.output_tokens, 500);
+            }
+            _ => panic!("Expected MessageDelta event"),
+        }
+    }
+
+    #[test]
+    fn test_token_usage_accumulation() {
+        let mut usage = TokenUsage::default();
+        assert_eq!(usage.total_tokens(), 0);
+
+        // Simulate message_start with input tokens
+        usage.add_message_start(&Usage {
+            input_tokens: 1000,
+            output_tokens: 0,
+            cache_creation_input_tokens: Some(200),
+            cache_read_input_tokens: Some(100),
+        });
+        assert_eq!(usage.input_tokens, 1000);
+        assert_eq!(usage.cache_creation_input_tokens, 200);
+        assert_eq!(usage.cache_read_input_tokens, 100);
+
+        // Simulate message_delta with output tokens
+        usage.add_message_delta(&MessageDeltaUsage { output_tokens: 500 });
+        assert_eq!(usage.output_tokens, 500);
+        assert_eq!(usage.total_tokens(), 1500);
+
+        // Simulate another round (second message)
+        usage.add_message_start(&Usage {
+            input_tokens: 2000,
+            output_tokens: 0,
+            cache_creation_input_tokens: None,
+            cache_read_input_tokens: Some(500),
+        });
+        usage.add_message_delta(&MessageDeltaUsage { output_tokens: 300 });
+
+        assert_eq!(usage.input_tokens, 3000);
+        assert_eq!(usage.output_tokens, 800);
+        assert_eq!(usage.cache_creation_input_tokens, 200);
+        assert_eq!(usage.cache_read_input_tokens, 600);
+        assert_eq!(usage.total_tokens(), 3800);
+    }
+
+    #[test]
+    fn test_token_usage_display_compact() {
+        let usage = TokenUsage {
+            input_tokens: 1234,
+            output_tokens: 567,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+        };
+        assert_eq!(usage.display_compact(), "1.2k in / 567 out");
+
+        let large_usage = TokenUsage {
+            input_tokens: 1_500_000,
+            output_tokens: 50_000,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+        };
+        assert_eq!(large_usage.display_compact(), "1.5M in / 50.0k out");
+    }
+
+    #[test]
+    fn test_format_token_count() {
+        assert_eq!(format_token_count(0), "0");
+        assert_eq!(format_token_count(999), "999");
+        assert_eq!(format_token_count(1000), "1.0k");
+        assert_eq!(format_token_count(1500), "1.5k");
+        assert_eq!(format_token_count(999_999), "1000.0k");
+        assert_eq!(format_token_count(1_000_000), "1.0M");
+        assert_eq!(format_token_count(2_500_000), "2.5M");
+    }
+
+    #[test]
+    fn test_token_usage_serialization() {
+        let usage = TokenUsage {
+            input_tokens: 1000,
+            output_tokens: 500,
+            cache_creation_input_tokens: 200,
+            cache_read_input_tokens: 100,
+        };
+        let json = serde_json::to_string(&usage).unwrap();
+        let deserialized: TokenUsage = serde_json::from_str(&json).unwrap();
+        assert_eq!(usage, deserialized);
+    }
+
+    #[test]
+    fn test_token_usage_default() {
+        let usage = TokenUsage::default();
+        assert_eq!(usage.input_tokens, 0);
+        assert_eq!(usage.output_tokens, 0);
+        assert_eq!(usage.cache_creation_input_tokens, 0);
+        assert_eq!(usage.cache_read_input_tokens, 0);
+        assert_eq!(usage.total_tokens(), 0);
     }
 }

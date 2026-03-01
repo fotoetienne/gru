@@ -7,6 +7,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+use crate::stream::TokenUsage;
 use crate::workspace::Workspace;
 
 /// Async helper that loads the registry inside `spawn_blocking`, runs the
@@ -122,6 +123,9 @@ pub struct MinionInfo {
     /// Which orchestration phase this minion has reached (for resume after interruption)
     #[serde(default)]
     pub orchestration_phase: OrchestrationPhase,
+    /// Accumulated token usage for this minion's session
+    #[serde(default)]
+    pub token_usage: Option<TokenUsage>,
 }
 
 /// Checks whether a process with the given PID is still alive.
@@ -423,6 +427,7 @@ mod tests {
             mode: MinionMode::Autonomous,
             last_activity: now,
             orchestration_phase: OrchestrationPhase::Setup,
+            token_usage: None,
         }
     }
 

@@ -263,7 +263,7 @@ async fn invoke_claude_for_reviews(
 ) -> Result<()> {
     let cmd = build_claude_resume_command(worktree_path, session_id, prompt);
 
-    let status = run_claude_with_stream_monitoring(
+    let result = run_claude_with_stream_monitoring(
         cmd,
         worktree_path,
         timeout_opt,
@@ -272,8 +272,8 @@ async fn invoke_claude_for_reviews(
     )
     .await?;
 
-    if !status.success() {
-        let exit_code = status.code().unwrap_or(EXIT_CODE_SIGNAL_TERMINATED);
+    if !result.status.success() {
+        let exit_code = result.status.code().unwrap_or(EXIT_CODE_SIGNAL_TERMINATED);
         anyhow::bail!("Review response process exited with code {}", exit_code);
     }
     Ok(())
@@ -661,6 +661,7 @@ async fn setup_worktree(ctx: &IssueContext) -> Result<WorktreeContext> {
         mode: MinionMode::Autonomous,
         last_activity: now,
         orchestration_phase: OrchestrationPhase::Setup,
+        token_usage: None,
     };
 
     let minion_id_clone = minion_id.clone();
@@ -915,25 +916,32 @@ async fn run_claude_session_inner(
     )
     .await;
 
-    // Best-effort cleanup: clear PID and set mode to Stopped.
+    // Best-effort cleanup: clear PID, set mode to Stopped, and save token usage.
     // Errors are intentionally discarded so registry issues don't mask the real run result.
+    let token_usage = run_result.as_ref().ok().map(|r| r.token_usage.clone());
     let exit_minion_id = wt_ctx.minion_id.clone();
     let _ = with_registry(move |registry| {
         registry.update(&exit_minion_id, |info| {
             info.pid = None;
             info.mode = MinionMode::Stopped;
+            if let Some(usage) = token_usage {
+                info.token_usage = Some(usage);
+            }
         })
     })
     .await;
 
-    let status = run_result?;
+    let claude_run = run_result?;
 
     // Post final completion comment
     if let Some(ref client) = issue_ctx.github_client {
         progress_tracker.set_phase(MinionPhase::Completed);
 
-        let final_message = if status.success() {
-            "✅ Task completed successfully!".to_string()
+        let final_message = if claude_run.status.success() {
+            format!(
+                "✅ Task completed successfully! (tokens: {})",
+                claude_run.token_usage.display_compact()
+            )
         } else {
             "❌ Task failed.".to_string()
         };
@@ -952,13 +960,15 @@ async fn run_claude_session_inner(
     }
 
     // Finish the progress display
-    if status.success() {
+    if claude_run.status.success() {
         progress.finish_with_message(&format!("✅ Completed issue {}", issue_ctx.issue_num));
     } else {
         progress.finish_with_message(&format!("❌ Failed to fix issue {}", issue_ctx.issue_num));
     }
 
-    Ok(ClaudeResult { status })
+    Ok(ClaudeResult {
+        status: claude_run.status,
+    })
 }
 
 // ---------------------------------------------------------------------------

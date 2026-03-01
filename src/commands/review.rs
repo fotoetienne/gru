@@ -114,6 +114,7 @@ pub async fn handle_review(pr_arg: Option<String>) -> Result<i32> {
         mode: MinionMode::Autonomous,
         last_activity: now,
         orchestration_phase: OrchestrationPhase::RunningClaude,
+        token_usage: None,
     };
 
     // Register the Minion (spawn_blocking to avoid holding lock during review)
@@ -185,7 +186,16 @@ pub async fn handle_review(pr_arg: Option<String>) -> Result<i32> {
     }
 
     // Now check if there was a stream error (after cleanup)
-    let status = run_result?;
+    let claude_run = run_result?;
+    let status = claude_run.status;
+
+    // Log token usage
+    if claude_run.token_usage.total_tokens() > 0 {
+        log::info!(
+            "📊 Token usage: {}",
+            claude_run.token_usage.display_compact()
+        );
+    }
 
     // Finish the progress display
     if status.success() {

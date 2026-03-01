@@ -247,6 +247,7 @@ pub async fn handle_prompt(
         mode: MinionMode::Autonomous,
         last_activity: now,
         orchestration_phase: OrchestrationPhase::RunningClaude,
+        token_usage: None,
     };
 
     let minion_id_clone = minion_id.clone();
@@ -318,7 +319,16 @@ pub async fn handle_prompt(
     }
 
     // Now check if there was a stream error (after cleanup)
-    let status = run_result?;
+    let claude_run = run_result?;
+    let status = claude_run.status;
+
+    // Log token usage
+    if claude_run.token_usage.total_tokens() > 0 {
+        log::info!(
+            "📊 Token usage: {}",
+            claude_run.token_usage.display_compact()
+        );
+    }
 
     // Finish the progress display and return appropriate exit code
     if status.success() {
