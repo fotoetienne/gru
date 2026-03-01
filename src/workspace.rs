@@ -1,10 +1,11 @@
-use once_cell::sync::Lazy;
+use once_cell::sync::OnceCell;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-/// Cached workspace instance initialized once on first use.
-static GLOBAL_WORKSPACE: Lazy<io::Result<Workspace>> = Lazy::new(Workspace::new);
+/// Cached workspace instance initialized once on first successful call.
+/// Uses OnceCell so transient failures don't get permanently cached.
+static GLOBAL_WORKSPACE: OnceCell<Workspace> = OnceCell::new();
 
 /// Manages the Gru workspace directory structure at `~/.gru`.
 ///
@@ -28,12 +29,10 @@ pub struct Workspace {
 impl Workspace {
     /// Returns a reference to the global cached Workspace instance.
     ///
-    /// Initialized once on first call. Subsequent calls return the same instance.
-    /// If initialization fails, the error is permanently cached for the process lifetime.
+    /// Initialized on first successful call. Subsequent calls return the same instance.
+    /// If initialization fails, the next call will retry (transient errors are not cached).
     pub fn global() -> io::Result<&'static Workspace> {
-        GLOBAL_WORKSPACE
-            .as_ref()
-            .map_err(|e| io::Error::new(e.kind(), format!("Failed to initialize workspace: {}", e)))
+        GLOBAL_WORKSPACE.get_or_try_init(Workspace::new)
     }
 
     /// Creates directories with appropriate permissions (0755 on Unix).
