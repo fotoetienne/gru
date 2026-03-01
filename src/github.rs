@@ -349,53 +349,6 @@ impl GitHubClient {
         Ok(())
     }
 
-    /// Create a draft pull request using gh CLI
-    ///
-    /// # Arguments
-    /// * `owner` - Repository owner
-    /// * `repo` - Repository name
-    /// * `branch` - Head branch name (source)
-    /// * `base` - Base branch name (target, usually "main")
-    /// * `title` - PR title
-    /// * `body` - PR description body (markdown supported)
-    ///
-    /// Returns the PR number as a string
-    ///
-    /// Mark a draft PR as ready for review
-    ///
-    /// # Arguments
-    /// * `owner` - Repository owner
-    /// * `repo` - Repository name
-    /// * `pr_number` - PR number
-    pub async fn mark_pr_ready(&self, owner: &str, repo: &str, pr_number: &str) -> Result<()> {
-        use tokio::process::Command;
-
-        let output = Command::new("gh")
-            .args([
-                "pr",
-                "ready",
-                pr_number,
-                "--repo",
-                &format!("{}/{}", owner, repo),
-            ])
-            .output()
-            .await
-            .context("Failed to execute gh pr ready command")?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(anyhow!(
-                "Failed to mark PR #{} as ready in {}/{}: {}",
-                pr_number,
-                owner,
-                repo,
-                stderr
-            ));
-        }
-
-        Ok(())
-    }
-
     /// Get the authenticated user information
     ///
     /// Used for validating that the GitHub token is valid and has appropriate access.
@@ -515,6 +468,39 @@ impl GitHubClient {
 // simpler auto-detection from current directory. They may be re-added in
 // future phases when implementing multi-Lab coordination.
 
+/// Mark a draft PR as ready for review using gh CLI
+///
+/// # Arguments
+/// * `owner` - Repository owner
+/// * `repo` - Repository name
+/// * `pr_number` - PR number
+pub async fn mark_pr_ready_via_cli(owner: &str, repo: &str, pr_number: &str) -> Result<()> {
+    let output = Command::new("gh")
+        .args([
+            "pr",
+            "ready",
+            pr_number,
+            "--repo",
+            &format!("{}/{}", owner, repo),
+        ])
+        .output()
+        .await
+        .context("Failed to execute gh pr ready command")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow!(
+            "Failed to mark PR #{} as ready in {}/{}: {}",
+            pr_number,
+            owner,
+            repo,
+            stderr
+        ));
+    }
+
+    Ok(())
+}
+
 /// Fetch issue details using gh CLI
 ///
 /// # Arguments
@@ -522,8 +508,6 @@ impl GitHubClient {
 /// * `repo` - Repository name
 /// * `number` - Issue number
 pub async fn get_issue_via_cli(owner: &str, repo: &str, number: u64) -> Result<IssueInfo> {
-    use tokio::process::Command;
-
     let output = Command::new("gh")
         .args([
             "issue",
@@ -584,8 +568,6 @@ pub async fn create_draft_pr_via_cli(
     title: &str,
     body: &str,
 ) -> Result<String> {
-    use tokio::process::Command;
-
     let output = Command::new("gh")
         .args([
             "pr",

@@ -216,28 +216,17 @@ async fn create_pr_for_issue(
 
     // Mark ready if description was provided
     if should_mark_ready {
-        if let Some(github_client) = GitHubClient::try_from_env(owner, repo).await {
-            match github_client.mark_pr_ready(owner, repo, &pr_number).await {
-                Ok(_) => {
-                    println!("✅ PR #{} marked ready for review", pr_number);
-                }
-                Err(e) => {
-                    log::warn!("⚠️  Warning: Failed to mark PR ready: {}", e);
-                    log::warn!(
-                        "   PR #{} created as draft - you can mark it ready manually",
-                        pr_number
-                    );
-                }
+        match crate::github::mark_pr_ready_via_cli(owner, repo, &pr_number).await {
+            Ok(_) => {
+                println!("✅ PR #{} marked ready for review", pr_number);
             }
-        } else {
-            log::warn!(
-                "⚠️  Warning: No GitHub authentication found - cannot mark PR ready automatically"
-            );
-            log::warn!(
-                "   You can mark PR #{} ready with: gh pr ready {}",
-                pr_number,
-                pr_number
-            );
+            Err(e) => {
+                log::warn!("⚠️  Warning: Failed to mark PR ready: {}", e);
+                log::warn!(
+                    "   PR #{} created as draft - you can mark it ready manually",
+                    pr_number
+                );
+            }
         }
 
         // Clean up description file
