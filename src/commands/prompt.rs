@@ -358,6 +358,7 @@ pub async fn handle_prompt(
             let run_dir =
                 std::env::current_dir().context("Failed to get current working directory")?;
             let wt_path = run_dir.clone();
+            context.worktree_path = Some(wt_path.clone());
             context.branch_name = Some(branch.to_string());
             (wt_path, branch.to_string(), run_dir)
         }
@@ -367,6 +368,7 @@ pub async fn handle_prompt(
         println!("ℹ️  Running without worktree - Claude will work in the current directory");
         let run_dir = std::env::current_dir().context("Failed to get current working directory")?;
         let wt_path = run_dir.clone();
+        context.worktree_path = Some(wt_path.clone());
         // Preserve PR branch name for registry and template context
         let branch = pr_branch.clone().unwrap_or_default();
         if !branch.is_empty() {
