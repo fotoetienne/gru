@@ -17,14 +17,20 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_resume_with_invalid_id() {
-        // Test that handle_resume returns an error for an invalid ID
-        // This verifies the minion_resolver integration works correctly
         let result = handle_resume("nonexistent-minion-xyz".to_string(), false).await;
         assert!(result.is_err());
 
-        // Verify the error message suggests using gru status
         let err_msg = format!("{:#}", result.unwrap_err());
         assert!(err_msg.contains("Could not resolve ID"));
         assert!(err_msg.contains("gru status"));
+    }
+
+    #[tokio::test]
+    async fn test_handle_resume_yolo_with_invalid_id() {
+        let result = handle_resume("nonexistent-minion-xyz".to_string(), true).await;
+        assert!(result.is_err());
+
+        let err_msg = format!("{:#}", result.unwrap_err());
+        assert!(err_msg.contains("Could not resolve ID"));
     }
 }

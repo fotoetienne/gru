@@ -926,7 +926,8 @@ async fn run_claude_session_inner(
     )
     .await;
 
-    // Always clear PID and set mode to Stopped, regardless of success or error
+    // Best-effort cleanup: clear PID and set mode to Stopped.
+    // Errors are intentionally discarded so registry issues don't mask the real run result.
     let exit_minion_id = wt_ctx.minion_id.clone();
     let _ = with_registry(move |registry| {
         registry.update(&exit_minion_id, |info| {
