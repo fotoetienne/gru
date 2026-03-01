@@ -1194,7 +1194,7 @@ pub async fn handle_fix(
             Ok(result) => result,
             Err(e) if is_stuck_or_timeout_error(&e) => {
                 // Task is stuck or timed out — mark as blocked for human review
-                log::error!("🚨 {}", e);
+                log::error!("🚨 {:#}", e);
                 if let Some(ref client) = issue_ctx.github_client {
                     try_mark_issue_blocked(
                         client,
@@ -1261,6 +1261,7 @@ pub async fn handle_fix(
                 )
                 .await;
             }
+            return Ok(1);
         }
         Err(e) => log::warn!("⚠️  CI monitoring error (non-fatal): {}", e),
     }
