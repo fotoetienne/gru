@@ -24,7 +24,7 @@ use anyhow::{Context, Result};
 /// Note: This command is identical to `gru resume` - both attach to the
 /// same Claude session interactively. The `attach` name is used for
 /// consistency with documentation and expected UX.
-pub async fn handle_attach(id: String) -> Result<i32> {
+pub async fn handle_attach(id: String, yolo: bool) -> Result<i32> {
     // Reuse exact same resolution as gru path
     let minion = minion_resolver::resolve_minion(&id).await?;
 
@@ -38,6 +38,9 @@ pub async fn handle_attach(id: String) -> Result<i32> {
     }
 
     println!("🔌 Attaching to Minion {}...", minion.minion_id);
+    if yolo {
+        println!("⚡ YOLO mode: skipping permission prompts");
+    }
     println!("📂 Workspace: {}", minion.worktree_path.display());
 
     // Unix: exec() replaces the current process
@@ -45,10 +48,12 @@ pub async fn handle_attach(id: String) -> Result<i32> {
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
-        let err = std::process::Command::new("claude")
-            .arg("-r")
-            .current_dir(&minion.worktree_path)
-            .exec(); // Replaces current process
+        let mut cmd = std::process::Command::new("claude");
+        cmd.arg("-r");
+        if yolo {
+            cmd.arg("--dangerously-skip-permissions");
+        }
+        let err = cmd.current_dir(&minion.worktree_path).exec(); // Replaces current process
 
         // If we reach here, exec failed
         Err(err).context(
@@ -59,15 +64,15 @@ pub async fn handle_attach(id: String) -> Result<i32> {
 
     #[cfg(not(unix))]
     {
-        // On Windows, spawn the process and wait for it to complete
-        let status = std::process::Command::new("claude")
-            .arg("-r")
-            .current_dir(&minion.worktree_path)
-            .status()
-            .context(
-                "Failed to run claude. Is Claude CLI installed and in your PATH?\n\
+        let mut cmd = std::process::Command::new("claude");
+        cmd.arg("-r");
+        if yolo {
+            cmd.arg("--dangerously-skip-permissions");
+        }
+        let status = cmd.current_dir(&minion.worktree_path).status().context(
+            "Failed to run claude. Is Claude CLI installed and in your PATH?\n\
                  See: https://claude.com/claude-code",
-            )?;
+        )?;
 
         Ok(if status.success() { 0 } else { 1 })
     }
@@ -81,12 +86,22 @@ mod tests {
     async fn test_handle_attach_with_invalid_id() {
         // Test that handle_attach returns an error for an invalid ID
         // This verifies the minion_resolver integration works correctly
-        let result = handle_attach("nonexistent-minion-xyz".to_string()).await;
+        let result = handle_attach("nonexistent-minion-xyz".to_string(), false).await;
         assert!(result.is_err());
 
         // Verify the error message suggests using gru status
         let err_msg = format!("{:#}", result.unwrap_err());
         assert!(err_msg.contains("Could not resolve ID"));
         assert!(err_msg.contains("gru status"));
+    }
+
+    #[tokio::test]
+    async fn test_handle_attach_yolo_with_invalid_id() {
+        // Test that handle_attach with yolo=true still validates the ID
+        let result = handle_attach("nonexistent-minion-xyz".to_string(), true).await;
+        assert!(result.is_err());
+
+        let err_msg = format!("{:#}", result.unwrap_err());
+        assert!(err_msg.contains("Could not resolve ID"));
     }
 }
