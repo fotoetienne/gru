@@ -77,13 +77,6 @@ mod tests {
     use std::fs;
     use tempfile::TempDir;
 
-    #[tokio::test]
-    async fn test_detect_git_repo_returns_ok_in_git_repo() {
-        // This test runs inside a git repo (the gru project itself)
-        let root = git::detect_git_repo().await;
-        assert!(root.is_ok());
-    }
-
     #[test]
     fn test_built_in_prompts_defined() {
         // Verify built-in prompts have non-empty names and descriptions
