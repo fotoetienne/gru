@@ -16,7 +16,7 @@ const MAX_TOOL_NAME_LENGTH: usize = 1_000;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 #[allow(dead_code)] // Module will be used in future issues
-pub enum ClaudeEvent {
+pub enum LogEvent {
     #[serde(rename = "thinking")]
     Thinking { content: String },
 
@@ -36,13 +36,13 @@ pub enum ClaudeEvent {
     Error { message: String },
 }
 
-impl ClaudeEvent {
+impl LogEvent {
     /// Validates the event content to prevent disk exhaustion and log injection attacks
     fn validate(&self) -> Result<()> {
         match self {
-            ClaudeEvent::Thinking { content }
-            | ClaudeEvent::Message { content }
-            | ClaudeEvent::Error { message: content } => {
+            LogEvent::Thinking { content }
+            | LogEvent::Message { content }
+            | LogEvent::Error { message: content } => {
                 if content.len() > MAX_CONTENT_LENGTH {
                     anyhow::bail!(
                         "Event content exceeds maximum length of {} bytes",
@@ -50,7 +50,7 @@ impl ClaudeEvent {
                     );
                 }
             }
-            ClaudeEvent::ToolUse { name, input } => {
+            LogEvent::ToolUse { name, input } => {
                 if name.len() > MAX_TOOL_NAME_LENGTH {
                     anyhow::bail!(
                         "Tool name exceeds maximum length of {} bytes",
@@ -67,7 +67,7 @@ impl ClaudeEvent {
                     );
                 }
             }
-            ClaudeEvent::Complete => {}
+            LogEvent::Complete => {}
         }
         Ok(())
     }
@@ -80,7 +80,7 @@ pub struct LoggedEvent {
     pub timestamp: DateTime<Utc>,
     pub minion_id: String,
     #[serde(flatten)]
-    pub event: ClaudeEvent,
+    pub event: LogEvent,
 }
 
 /// EventLogger manages writing events to a JSONL file
@@ -154,7 +154,7 @@ impl EventLogger {
     ///
     /// Event content is validated to prevent disk exhaustion attacks.
     /// Content exceeding 1MB will be rejected.
-    pub fn log_event(&self, event: ClaudeEvent) -> Result<()> {
+    pub fn log_event(&self, event: LogEvent) -> Result<()> {
         // Validate event content before logging
         event.validate().context("Event validation failed")?;
 
@@ -225,7 +225,7 @@ mod tests {
         let logger = EventLogger::new_with_workspace("M_TEST_CREATE", &workspace).unwrap();
 
         // Log a test event
-        let event = ClaudeEvent::Thinking {
+        let event = LogEvent::Thinking {
             content: "Test thinking".to_string(),
         };
         logger.log_event(event).unwrap();
@@ -242,16 +242,16 @@ mod tests {
 
         // Log multiple events
         logger
-            .log_event(ClaudeEvent::Thinking {
+            .log_event(LogEvent::Thinking {
                 content: "First thought".to_string(),
             })
             .unwrap();
         logger
-            .log_event(ClaudeEvent::Message {
+            .log_event(LogEvent::Message {
                 content: "First message".to_string(),
             })
             .unwrap();
-        logger.log_event(ClaudeEvent::Complete).unwrap();
+        logger.log_event(LogEvent::Complete).unwrap();
 
         // Read the file and verify all events are present
         let file = fs::File::open(logger.log_path()).unwrap();
@@ -274,7 +274,7 @@ mod tests {
         let workspace = Workspace::new_with_root(temp_dir.path().to_path_buf()).unwrap();
         let logger = EventLogger::new_with_workspace("M_TEST_TIMESTAMP", &workspace).unwrap();
 
-        let event = ClaudeEvent::ToolUse {
+        let event = LogEvent::ToolUse {
             name: "bash".to_string(),
             input: serde_json::json!({"command": "ls -la"}),
         };
@@ -290,7 +290,7 @@ mod tests {
         assert!(logged_event.timestamp <= Utc::now());
 
         match logged_event.event {
-            ClaudeEvent::ToolUse { name, .. } => {
+            LogEvent::ToolUse { name, .. } => {
                 assert_eq!(name, "bash");
             }
             _ => panic!("Expected ToolUse event"),
@@ -299,7 +299,7 @@ mod tests {
 
     #[test]
     fn test_logged_event_serialization() {
-        let event = ClaudeEvent::Error {
+        let event = LogEvent::Error {
             message: "Test error".to_string(),
         };
         let logged_event = LoggedEvent {
@@ -313,7 +313,7 @@ mod tests {
 
         assert_eq!(deserialized.minion_id, "M042");
         match deserialized.event {
-            ClaudeEvent::Error { message } => {
+            LogEvent::Error { message } => {
                 assert_eq!(message, "Test error");
             }
             _ => panic!("Expected Error event"),
@@ -338,7 +338,7 @@ mod tests {
 
         // Create content that exceeds MAX_CONTENT_LENGTH
         let large_content = "A".repeat(MAX_CONTENT_LENGTH + 1);
-        let event = ClaudeEvent::Thinking {
+        let event = LogEvent::Thinking {
             content: large_content,
         };
 
@@ -356,7 +356,7 @@ mod tests {
         // Each string "x" takes about 3 bytes in JSON: "x",
         // So we need about 350,000 strings to exceed 1MB
         let large_array = vec![String::from("x"); 350_000];
-        let event = ClaudeEvent::ToolUse {
+        let event = LogEvent::ToolUse {
             name: "test".to_string(),
             input: serde_json::json!(large_array),
         };
@@ -373,7 +373,7 @@ mod tests {
 
         // Create a tool name that's too long
         let long_name = "A".repeat(MAX_TOOL_NAME_LENGTH + 1);
-        let event = ClaudeEvent::ToolUse {
+        let event = LogEvent::ToolUse {
             name: long_name,
             input: serde_json::json!({}),
         };

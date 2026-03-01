@@ -3,6 +3,65 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{ChildStderr, ChildStdout};
 
+/// Information about a message in a MessageStart event
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct MessageInfo {
+    #[serde(default)]
+    pub id: Option<String>,
+    #[serde(default)]
+    pub role: Option<String>,
+}
+
+/// A content block within a message (text or tool_use)
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "type")]
+pub enum ContentBlock {
+    #[serde(rename = "tool_use")]
+    ToolUse {
+        #[serde(default)]
+        name: String,
+        #[serde(default)]
+        id: String,
+    },
+    #[serde(rename = "text")]
+    Text {
+        #[serde(default)]
+        text: String,
+    },
+    /// Catch-all for unknown block types
+    #[serde(other)]
+    Unknown,
+}
+
+/// A delta update within a content block
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "type")]
+pub enum ContentDelta {
+    #[serde(rename = "text_delta")]
+    TextDelta { text: String },
+    #[serde(rename = "input_json_delta")]
+    InputJsonDelta { partial_json: String },
+    /// Catch-all for unknown delta types
+    #[serde(other)]
+    Unknown,
+}
+
+/// The body of a MessageDelta event (e.g., stop_reason)
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct MessageDeltaBody {
+    #[serde(default)]
+    pub stop_reason: Option<String>,
+}
+
+/// Error information from the API
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct ErrorInfo {
+    #[serde(rename = "type", default)]
+    pub error_type: String,
+    #[serde(default)]
+    pub message: String,
+}
+
 /// Represents the different types of events that can be emitted by Claude Code
 /// in stream-json mode. These follow the Anthropic Messages API streaming format.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -12,7 +71,7 @@ pub enum ClaudeEvent {
     #[serde(rename = "message_start")]
     MessageStart {
         #[serde(default)]
-        message: serde_json::Value,
+        message: MessageInfo,
     },
 
     /// Start of a content block (text or tool_use)
@@ -20,8 +79,7 @@ pub enum ClaudeEvent {
     ContentBlockStart {
         #[serde(default)]
         index: usize,
-        #[serde(default)]
-        content_block: serde_json::Value,
+        content_block: ContentBlock,
     },
 
     /// Delta/update to a content block
@@ -29,8 +87,7 @@ pub enum ClaudeEvent {
     ContentBlockDelta {
         #[serde(default)]
         index: usize,
-        #[serde(default)]
-        delta: serde_json::Value,
+        delta: ContentDelta,
     },
 
     /// End of a content block
@@ -42,10 +99,7 @@ pub enum ClaudeEvent {
 
     /// Delta/update to the message (e.g., stop_reason)
     #[serde(rename = "message_delta")]
-    MessageDelta {
-        #[serde(default)]
-        delta: serde_json::Value,
-    },
+    MessageDelta { delta: MessageDeltaBody },
 
     /// End of the message stream
     #[serde(rename = "message_stop")]
@@ -53,10 +107,7 @@ pub enum ClaudeEvent {
 
     /// Error event
     #[serde(rename = "error")]
-    Error {
-        #[serde(default)]
-        error: serde_json::Value,
-    },
+    Error { error: ErrorInfo },
 
     /// Ping event (keepalive)
     #[serde(rename = "ping")]
@@ -201,7 +252,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_parse_content_block_start_event() {
-        let json = r#"{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","name":"Bash"}}"#;
+        let json = r#"{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","name":"Bash","id":"toolu_1"}}"#;
         let event: ClaudeEvent = serde_json::from_str(json).unwrap();
         match event {
             ClaudeEvent::ContentBlockStart {
@@ -209,14 +260,13 @@ mod tests {
                 content_block,
             } => {
                 assert_eq!(index, 0);
-                assert_eq!(
-                    content_block.get("type").and_then(|t| t.as_str()),
-                    Some("tool_use")
-                );
-                assert_eq!(
-                    content_block.get("name").and_then(|n| n.as_str()),
-                    Some("Bash")
-                );
+                match content_block {
+                    ContentBlock::ToolUse { name, id } => {
+                        assert_eq!(name, "Bash");
+                        assert_eq!(id, "toolu_1");
+                    }
+                    _ => panic!("Expected ToolUse content block"),
+                }
             }
             _ => panic!("Expected ContentBlockStart event"),
         }
@@ -229,11 +279,10 @@ mod tests {
         match event {
             ClaudeEvent::ContentBlockDelta { index, delta } => {
                 assert_eq!(index, 0);
-                assert_eq!(
-                    delta.get("type").and_then(|t| t.as_str()),
-                    Some("text_delta")
-                );
-                assert_eq!(delta.get("text").and_then(|t| t.as_str()), Some("Hello"));
+                match delta {
+                    ContentDelta::TextDelta { text } => assert_eq!(text, "Hello"),
+                    _ => panic!("Expected TextDelta"),
+                }
             }
             _ => panic!("Expected ContentBlockDelta event"),
         }
@@ -245,10 +294,7 @@ mod tests {
         let event: ClaudeEvent = serde_json::from_str(json).unwrap();
         match event {
             ClaudeEvent::MessageDelta { delta } => {
-                assert_eq!(
-                    delta.get("stop_reason").and_then(|r| r.as_str()),
-                    Some("end_turn")
-                );
+                assert_eq!(delta.stop_reason.as_deref(), Some("end_turn"));
             }
             _ => panic!("Expected MessageDelta event"),
         }
@@ -268,10 +314,8 @@ mod tests {
         let event: ClaudeEvent = serde_json::from_str(json).unwrap();
         match event {
             ClaudeEvent::Error { error } => {
-                assert_eq!(
-                    error.get("message").and_then(|m| m.as_str()),
-                    Some("Something went wrong")
-                );
+                assert_eq!(error.error_type, "api_error");
+                assert_eq!(error.message, "Something went wrong");
             }
             _ => panic!("Expected Error event"),
         }
