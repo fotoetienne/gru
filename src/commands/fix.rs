@@ -8,6 +8,7 @@ use crate::github::GitHubClient;
 use crate::minion;
 use crate::minion_registry::{
     is_process_alive, MinionInfo as RegistryMinionInfo, MinionMode, MinionRegistry,
+    OrchestrationPhase,
 };
 use crate::pr_monitor::{self, MonitorResult};
 use crate::pr_state::PrState;
@@ -38,31 +39,11 @@ const DEFAULT_REVIEW_TIMEOUT_SECS: u64 = 1800;
 /// After this limit, the user must handle additional reviews manually
 const MAX_REVIEW_ROUNDS: usize = 5;
 
-/// Errors specific to the fix workflow that need special handling in the orchestrator.
-#[derive(Debug, PartialEq)]
-enum FixError {
-    /// An existing minion was found for this issue. The user has been shown
-    /// options (attach/resume/force-new) and we should exit with code 1.
-    ExistingMinionFound,
-}
-
-impl std::fmt::Display for FixError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            FixError::ExistingMinionFound => {
-                write!(f, "existing minion found for this issue")
-            }
-        }
-    }
-}
-
 /// Returns true if the error indicates the task is stuck or timed out,
 /// meaning it should be labeled `minion:blocked` instead of `minion:failed`.
 fn is_stuck_or_timeout_error(err: &anyhow::Error) -> bool {
     err.downcast_ref::<ClaudeRunnerError>().is_some()
 }
-
-impl std::error::Error for FixError {}
 
 // ---------------------------------------------------------------------------
 // Phase context structs
@@ -369,6 +350,36 @@ async fn try_mark_issue_blocked(client: &GitHubClient, owner: &str, repo: &str, 
     }
 }
 
+/// Updates the orchestration phase for a minion in the registry.
+/// Logs a warning if the update fails, since phase tracking is important for resume correctness.
+async fn update_orchestration_phase(minion_id: &str, phase: OrchestrationPhase) {
+    let minion_id_owned = minion_id.to_string();
+    let phase_name = format!("{:?}", phase);
+    let minion_id_for_log = minion_id_owned.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let mut registry = MinionRegistry::load(None)?;
+        registry.update(&minion_id_owned, |info| {
+            info.orchestration_phase = phase;
+        })
+    })
+    .await;
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => log::warn!(
+            "⚠️  Failed to update orchestration phase for {} to {}: {}",
+            minion_id_for_log,
+            phase_name,
+            e
+        ),
+        Err(e) => log::warn!(
+            "⚠️  Failed to spawn phase update task for {} to {}: {}",
+            minion_id_for_log,
+            phase_name,
+            e
+        ),
+    }
+}
+
 /// Posts a progress comment to the issue (fire-and-forget).
 async fn try_post_progress_comment(
     client: &GitHubClient,
@@ -392,20 +403,15 @@ async fn try_post_progress_comment(
 
 /// Resolves an issue argument into validated context.
 ///
-/// Parses the issue string, checks for existing minions (unless `force_new`),
-/// initializes the GitHub client, and fetches issue details.
+/// Parses the issue string, initializes the GitHub client, and fetches issue details.
 /// Note: Does NOT claim the issue — that happens after worktree setup to avoid
 /// marking issues as in-progress when setup fails.
-async fn resolve_issue(issue: &str, force_new: bool) -> Result<IssueContext> {
+/// Note: Existing minion check is done in `handle_fix` to support resume logic.
+async fn resolve_issue(issue: &str) -> Result<IssueContext> {
     let (owner, repo, issue_num_str) = parse_issue_info(issue).await?;
     let issue_num: u64 = issue_num_str
         .parse()
         .context("Failed to parse issue number")?;
-
-    // Check for existing Minions on this issue
-    if !force_new {
-        check_existing_minions(&owner, &repo, issue_num).await?;
-    }
 
     // Initialize GitHub client (optional - only if token is available)
     let github_client = match GitHubClient::from_env(&owner, &repo).await {
@@ -430,9 +436,26 @@ async fn resolve_issue(issue: &str, force_new: bool) -> Result<IssueContext> {
     })
 }
 
-/// Checks if there are existing minions working on this issue and returns an
-/// error with suggestions if so.
-async fn check_existing_minions(owner: &str, repo: &str, issue_num: u64) -> Result<()> {
+/// Result of checking for existing minions on an issue.
+enum ExistingMinionCheck {
+    /// No existing minions found, proceed with new session.
+    None,
+    /// Found a stopped minion that can be resumed.
+    Resumable(String, Box<RegistryMinionInfo>),
+    /// Found running minion(s), user shown options and should exit.
+    AlreadyRunning,
+}
+
+/// Checks if there are existing minions working on this issue.
+///
+/// Returns `Resumable` when a stopped minion is found (for auto-resume),
+/// `AlreadyRunning` when a running minion is found (with suggestions printed),
+/// or `None` when no minions exist.
+async fn check_existing_minions(
+    owner: &str,
+    repo: &str,
+    issue_num: u64,
+) -> Result<ExistingMinionCheck> {
     let repo_for_check = format!("{}/{}", owner, repo);
     let mut existing = tokio::task::spawn_blocking(move || {
         let registry = MinionRegistry::load(None)?;
@@ -442,7 +465,7 @@ async fn check_existing_minions(owner: &str, repo: &str, issue_num: u64) -> Resu
     .context("Failed to spawn blocking task for duplicate check")??;
 
     if existing.is_empty() {
-        return Ok(());
+        return Ok(ExistingMinionCheck::None);
     }
 
     // Sort deterministically: running Minions first, then by most recent start time.
@@ -454,42 +477,83 @@ async fn check_existing_minions(owner: &str, repo: &str, issue_num: u64) -> Resu
             .then_with(|| b.last_activity.cmp(&a.last_activity))
     });
 
-    eprintln!(
-        "Error: {} existing Minion(s) found for issue {}:\n",
-        existing.len(),
-        issue_num
-    );
+    // Check if any minion is actually running
+    let any_running = existing
+        .iter()
+        .any(|(_, info)| info.pid.map(is_process_alive).unwrap_or(false));
 
-    for (minion_id, info) in &existing {
-        let actually_running = info.pid.map(is_process_alive).unwrap_or(false);
-        let status_msg = if actually_running {
-            match info.mode {
-                MinionMode::Autonomous => "running (autonomous)",
-                MinionMode::Interactive => "running (interactive)",
-                MinionMode::Stopped => "running",
-            }
-        } else {
-            "stopped"
-        };
-        eprintln!("  {} - status: {}", minion_id, status_msg);
+    if any_running {
+        // A minion is actively running - show error with suggestions
+        eprintln!(
+            "Error: {} existing Minion(s) found for issue {}:\n",
+            existing.len(),
+            issue_num
+        );
+
+        for (minion_id, info) in &existing {
+            let actually_running = info.pid.map(is_process_alive).unwrap_or(false);
+            let status_msg = if actually_running {
+                match info.mode {
+                    MinionMode::Autonomous => "running (autonomous)",
+                    MinionMode::Interactive => "running (interactive)",
+                    MinionMode::Stopped => "running",
+                }
+            } else {
+                "stopped"
+            };
+            eprintln!("  {} - status: {}", minion_id, status_msg);
+        }
+
+        let (best_id, _) = existing.first().unwrap();
+        eprintln!("\nOptions:");
+        eprintln!("  - Attach interactively: gru attach {}", best_id);
+        eprintln!(
+            "  - Create new session:   gru fix https://github.com/{}/{}/issues/{} --force-new",
+            owner, repo, issue_num
+        );
+
+        return Ok(ExistingMinionCheck::AlreadyRunning);
     }
 
-    let (best_id, best_info) = existing.first().unwrap();
-    let best_running = best_info.pid.map(is_process_alive).unwrap_or(false);
+    // All minions are stopped - find the best candidate for resume.
+    // Look for one that hasn't completed/failed and whose worktree still exists.
+    let resumable = existing.iter().find(|(_, info)| {
+        !matches!(
+            info.orchestration_phase,
+            OrchestrationPhase::Completed | OrchestrationPhase::Failed
+        ) && info.worktree.exists()
+    });
 
-    eprintln!("\nOptions:");
-    if best_running {
-        eprintln!("  - Attach interactively: gru attach {}", best_id);
-    } else {
-        eprintln!("  - Resume work:          gru resume {}", best_id);
-        eprintln!("  - Attach interactively: gru attach {}", best_id);
+    if let Some((minion_id, info)) = resumable {
+        return Ok(ExistingMinionCheck::Resumable(
+            minion_id.clone(),
+            Box::new(info.clone()),
+        ));
     }
-    eprintln!(
-        "  - Create new session:   gru fix {} --force-new",
-        issue_num
-    );
 
-    Err(FixError::ExistingMinionFound.into())
+    // Check if any minion failed — require --force-new to prevent silent retry
+    let has_failed = existing
+        .iter()
+        .any(|(_, info)| matches!(info.orchestration_phase, OrchestrationPhase::Failed));
+
+    if has_failed {
+        let (failed_id, _) = existing
+            .iter()
+            .find(|(_, info)| matches!(info.orchestration_phase, OrchestrationPhase::Failed))
+            .unwrap();
+        eprintln!(
+            "Error: Minion {} previously failed for issue {}.",
+            failed_id, issue_num
+        );
+        eprintln!("\nOptions:");
+        eprintln!(
+            "  - Create new session:   gru fix https://github.com/{}/{}/issues/{} --force-new",
+            owner, repo, issue_num
+        );
+        return Ok(ExistingMinionCheck::AlreadyRunning);
+    }
+
+    Ok(ExistingMinionCheck::None)
 }
 
 /// Claims an issue by adding the in-progress label.
@@ -619,6 +683,7 @@ async fn setup_worktree(ctx: &IssueContext) -> Result<WorktreeContext> {
         pid: None,
         mode: MinionMode::Autonomous,
         last_activity: now,
+        orchestration_phase: OrchestrationPhase::Setup,
     };
 
     let minion_id_clone = minion_id.clone();
@@ -761,12 +826,42 @@ async fn run_claude_session(
     timeout_opt: Option<&str>,
 ) -> Result<ClaudeResult> {
     println!("🤖 Launching Claude...\n");
-
     let prompt = build_fix_prompt(issue_ctx);
-
     let mut cmd = build_claude_command(&wt_ctx.worktree_path, &wt_ctx.session_id, &prompt);
     cmd.env("GRU_WORKSPACE", &wt_ctx.minion_id);
+    run_claude_session_inner(issue_ctx, wt_ctx, cmd, quiet, timeout_opt).await
+}
 
+/// Runs a resumed Claude session, continuing from a previous interrupted session.
+///
+/// Uses `--resume` instead of `--session-id` to continue the existing conversation.
+async fn resume_claude_session(
+    issue_ctx: &IssueContext,
+    wt_ctx: &WorktreeContext,
+    quiet: bool,
+    timeout_opt: Option<&str>,
+) -> Result<ClaudeResult> {
+    println!("🔄 Resuming Claude session...\n");
+    let prompt = format!(
+        "Continue working on issue #{}. Pick up where you left off. \
+         If you've already completed the implementation, proceed to push and write PR_DESCRIPTION.md.",
+        issue_ctx.issue_num
+    );
+    let mut cmd = build_claude_resume_command(&wt_ctx.worktree_path, &wt_ctx.session_id, &prompt);
+    cmd.env("GRU_WORKSPACE", &wt_ctx.minion_id);
+    run_claude_session_inner(issue_ctx, wt_ctx, cmd, quiet, timeout_opt).await
+}
+
+/// Shared implementation for running a Claude session (new or resumed).
+///
+/// Handles stream monitoring, progress tracking, PID registration, and cleanup.
+async fn run_claude_session_inner(
+    issue_ctx: &IssueContext,
+    wt_ctx: &WorktreeContext,
+    cmd: TokioCommand,
+    quiet: bool,
+    timeout_opt: Option<&str>,
+) -> Result<ClaudeResult> {
     let config = ProgressConfig {
         minion_id: wt_ctx.minion_id.clone(),
         issue: issue_ctx.issue_num.to_string(),
@@ -833,6 +928,7 @@ async fn run_claude_session(
         if let Ok(mut registry) = MinionRegistry::load(None) {
             let _ = registry.update(&pid_minion_id, |info| {
                 info.pid = Some(pid);
+                info.mode = MinionMode::Autonomous;
                 info.last_activity = Utc::now();
             });
         }
@@ -1161,41 +1257,82 @@ async fn monitor_ci_after_fix(
 /// 3. `run_claude_session` - Build prompt, run Claude, track progress
 /// 4. `handle_pr_creation` - Push check, create PR, update labels
 /// 5. `monitor_pr_lifecycle` - Review, poll for updates, handle feedback
+///
+/// If a previous session for the same issue was interrupted, it will
+/// automatically resume from the last completed phase.
 pub async fn handle_fix(
     issue: &str,
     timeout_opt: Option<String>,
     quiet: bool,
     force_new: bool,
 ) -> Result<i32> {
-    // Phase 1: Resolve issue
-    let issue_ctx = match resolve_issue(issue, force_new).await {
-        Ok(ctx) => ctx,
-        Err(e) if e.downcast_ref::<FixError>() == Some(&FixError::ExistingMinionFound) => {
-            return Ok(1)
+    // Phase 1: Resolve issue (always runs - need fresh issue details)
+    let issue_ctx = resolve_issue(issue).await?;
+
+    // Determine whether to resume an existing session or start fresh
+    let (wt_ctx, resume_phase) = if force_new {
+        (setup_worktree(&issue_ctx).await?, None)
+    } else {
+        match check_existing_minions(&issue_ctx.owner, &issue_ctx.repo, issue_ctx.issue_num).await?
+        {
+            ExistingMinionCheck::None => (setup_worktree(&issue_ctx).await?, None),
+            ExistingMinionCheck::Resumable(minion_id, info) => {
+                let phase = info.orchestration_phase.clone();
+                println!(
+                    "🔄 Resuming interrupted session {} (phase: {:?})",
+                    minion_id, phase
+                );
+                let session_id = Uuid::parse_str(&info.session_id)
+                    .context("Failed to parse session ID from registry")?;
+                let wt_ctx = WorktreeContext {
+                    minion_id,
+                    branch_name: info.branch,
+                    worktree_path: info.worktree,
+                    session_id,
+                };
+                (wt_ctx, Some(phase))
+            }
+            ExistingMinionCheck::AlreadyRunning => return Ok(1),
         }
-        Err(e) => return Err(e),
     };
 
-    // Phase 2: Setup worktree
-    let wt_ctx = setup_worktree(&issue_ctx).await?;
+    // Determine the starting phase for the orchestration
+    let is_resume = resume_phase.is_some();
+    let start_phase = resume_phase.unwrap_or(OrchestrationPhase::Setup);
 
-    // Claim the issue now that worktree is set up (fire-and-forget)
-    if let Some(ref client) = issue_ctx.github_client {
-        claim_issue(
-            client,
-            &issue_ctx.owner,
-            &issue_ctx.repo,
-            issue_ctx.issue_num,
-        )
-        .await;
+    // Claim the issue on fresh starts (skip on resume — already claimed)
+    if !is_resume {
+        if let Some(ref client) = issue_ctx.github_client {
+            claim_issue(
+                client,
+                &issue_ctx.owner,
+                &issue_ctx.repo,
+                issue_ctx.issue_num,
+            )
+            .await;
+        }
     }
 
-    // Phase 3: Run Claude
-    let claude_result =
-        match run_claude_session(&issue_ctx, &wt_ctx, quiet, timeout_opt.as_deref()).await {
-            Ok(result) => result,
+    // Phase 3: Run Claude (skip if already past this phase)
+    let claude_result = if start_phase <= OrchestrationPhase::RunningClaude {
+        update_orchestration_phase(&wt_ctx.minion_id, OrchestrationPhase::RunningClaude).await;
+
+        // Only use --resume if we're resuming a session that actually ran Claude.
+        // If interrupted during Setup (before Claude ever ran), the session ID was
+        // never used, so `claude --resume <uuid>` would fail.
+        let use_resume = is_resume && start_phase > OrchestrationPhase::Setup;
+        let result = if use_resume {
+            resume_claude_session(&issue_ctx, &wt_ctx, quiet, timeout_opt.as_deref()).await
+        } else {
+            run_claude_session(&issue_ctx, &wt_ctx, quiet, timeout_opt.as_deref()).await
+        };
+
+        match result {
+            Ok(result) => Some(result),
             Err(e) if is_stuck_or_timeout_error(&e) => {
-                // Task is stuck or timed out — mark as blocked for human review
+                // Mark as Failed so the next `gru fix` won't retry indefinitely.
+                // The user can explicitly `--force-new` to start a fresh session.
+                update_orchestration_phase(&wt_ctx.minion_id, OrchestrationPhase::Failed).await;
                 log::error!("🚨 {:#}", e);
                 if let Some(ref client) = issue_ctx.github_client {
                     try_mark_issue_blocked(
@@ -1209,35 +1346,63 @@ pub async fn handle_fix(
                 return Ok(1);
             }
             Err(e) => return Err(e),
-        };
+        }
+    } else {
+        // Skipping Claude phase — already completed in a previous run
+        println!("⏭️  Skipping Claude session (already completed)");
+        None
+    };
 
-    if !claude_result.status.success() {
-        // Mark issue as failed (fire-and-forget)
-        if let Some(ref client) = issue_ctx.github_client {
-            match client
-                .mark_issue_failed(&issue_ctx.owner, &issue_ctx.repo, issue_ctx.issue_num)
-                .await
-            {
-                Ok(()) => {
-                    println!("🏷️  Updated issue label to 'minion:failed'");
-                }
-                Err(e) => {
-                    log::warn!("⚠️  Failed to update issue label: {}", e);
+    // Check Claude result if we ran it
+    if let Some(ref result) = claude_result {
+        if !result.status.success() {
+            update_orchestration_phase(&wt_ctx.minion_id, OrchestrationPhase::Failed).await;
+
+            if let Some(ref client) = issue_ctx.github_client {
+                match client
+                    .mark_issue_failed(&issue_ctx.owner, &issue_ctx.repo, issue_ctx.issue_num)
+                    .await
+                {
+                    Ok(()) => {
+                        println!("🏷️  Updated issue label to 'minion:failed'");
+                    }
+                    Err(e) => {
+                        log::warn!("⚠️  Failed to update issue label: {}", e);
+                    }
                 }
             }
-        }
 
-        return Ok(claude_result
-            .status
-            .code()
-            .unwrap_or(EXIT_CODE_SIGNAL_TERMINATED));
+            return Ok(result.status.code().unwrap_or(EXIT_CODE_SIGNAL_TERMINATED));
+        }
     }
 
-    // Phase 4: Create PR
-    let pr_number = handle_pr_creation(&issue_ctx, &wt_ctx).await?;
+    // Phase 4: Create PR (skip if already past this phase)
+    let pr_number = if start_phase <= OrchestrationPhase::CreatingPr {
+        update_orchestration_phase(&wt_ctx.minion_id, OrchestrationPhase::CreatingPr).await;
+        handle_pr_creation(&issue_ctx, &wt_ctx).await?
+    } else {
+        // Already past PR creation — look up the PR from registry
+        println!("⏭️  Skipping PR creation (already completed)");
+        let minion_id = wt_ctx.minion_id.clone();
+        let existing_pr = tokio::task::spawn_blocking(move || {
+            let registry = MinionRegistry::load(None)?;
+            Ok::<_, anyhow::Error>(registry.get(&minion_id).and_then(|info| info.pr.clone()))
+        })
+        .await
+        .context("Failed to look up PR from registry")??;
+
+        if existing_pr.is_some() {
+            existing_pr
+        } else {
+            // PR number not found in registry (crash during PR creation) — re-run
+            log::info!("ℹ️  PR not found in registry, retrying PR creation");
+            handle_pr_creation(&issue_ctx, &wt_ctx).await?
+        }
+    };
 
     // Phase 5: Monitor PR lifecycle (review + polling)
     if let Some(ref pr_num) = pr_number {
+        update_orchestration_phase(&wt_ctx.minion_id, OrchestrationPhase::MonitoringPr).await;
         monitor_pr_lifecycle(&issue_ctx, &wt_ctx, pr_num, timeout_opt.as_deref()).await;
     }
 
@@ -1252,7 +1417,6 @@ pub async fn handle_fix(
     match ci_passed {
         Ok(true) => log::info!("✅ CI checks passed"),
         Ok(false) => {
-            // CI fix attempts exhausted — mark issue as blocked for human review
             log::warn!("⚠️  CI checks failed or were escalated");
             if let Some(ref client) = issue_ctx.github_client {
                 try_mark_issue_blocked(
@@ -1268,10 +1432,13 @@ pub async fn handle_fix(
         Err(e) => log::warn!("⚠️  CI monitoring error (non-fatal): {}", e),
     }
 
-    Ok(claude_result
-        .status
-        .code()
-        .unwrap_or(EXIT_CODE_SIGNAL_TERMINATED))
+    update_orchestration_phase(&wt_ctx.minion_id, OrchestrationPhase::Completed).await;
+
+    let exit_code = claude_result
+        .map(|r| r.status.code().unwrap_or(EXIT_CODE_SIGNAL_TERMINATED))
+        .unwrap_or(0);
+
+    Ok(exit_code)
 }
 
 #[cfg(test)]
@@ -1353,17 +1520,6 @@ mod tests {
         assert!(body.contains("Automated fix for #123 by Minion M042"));
         assert!(body.contains("- [ ] Implementation"));
         assert!(body.contains("Fixes #123"));
-    }
-
-    #[test]
-    fn test_fix_error_downcast() {
-        // Verify that FixError can be downcast from anyhow::Error,
-        // which is how the orchestrator detects the ExistingMinionFound case.
-        let err: anyhow::Error = FixError::ExistingMinionFound.into();
-        assert_eq!(
-            err.downcast_ref::<FixError>(),
-            Some(&FixError::ExistingMinionFound)
-        );
     }
 
     #[test]

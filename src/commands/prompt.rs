@@ -4,7 +4,9 @@ use crate::claude_runner::{
 use crate::git;
 use crate::github::GitHubClient;
 use crate::minion;
-use crate::minion_registry::{MinionInfo as RegistryMinionInfo, MinionMode, MinionRegistry};
+use crate::minion_registry::{
+    MinionInfo as RegistryMinionInfo, MinionMode, MinionRegistry, OrchestrationPhase,
+};
 use crate::progress::{ProgressConfig, ProgressDisplay};
 use crate::prompt_renderer::{render_template, PromptContext};
 use crate::stream;
@@ -244,6 +246,7 @@ pub async fn handle_prompt(
         pid: None,
         mode: MinionMode::Autonomous,
         last_activity: now,
+        orchestration_phase: OrchestrationPhase::RunningClaude,
     };
 
     let mut registry = MinionRegistry::load(None).context("Failed to load Minion registry")?;

@@ -3,7 +3,9 @@ use crate::claude_runner::{
 };
 use crate::git;
 use crate::minion;
-use crate::minion_registry::{MinionInfo as RegistryMinionInfo, MinionMode, MinionRegistry};
+use crate::minion_registry::{
+    MinionInfo as RegistryMinionInfo, MinionMode, MinionRegistry, OrchestrationPhase,
+};
 use crate::minion_resolver;
 use crate::pr_state::PrState;
 use crate::progress::{ProgressConfig, ProgressDisplay};
@@ -111,6 +113,7 @@ pub async fn handle_review(pr_arg: Option<String>) -> Result<i32> {
         pid: None,
         mode: MinionMode::Autonomous,
         last_activity: now,
+        orchestration_phase: OrchestrationPhase::RunningClaude,
     };
 
     // Load registry and register the Minion (spawn_blocking to avoid holding lock during review)
