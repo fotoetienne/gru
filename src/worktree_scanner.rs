@@ -32,27 +32,19 @@ pub enum WorktreeStatus {
 }
 
 impl Worktree {
-    /// Extract issue number from branch name
-    /// Supports formats like "issue-36", "gru/issue-36", "fix/issue-36"
+    /// Extract issue number from branch name.
+    ///
+    /// Splits the branch by `/`, then looks for a segment starting with `issue-`
+    /// and parses the number immediately after the prefix. This correctly handles
+    /// branches like `minion/issue-42-M001` and avoids false positives on
+    /// branches like `issue-fix-42`.
     fn extract_issue_number(&self) -> Option<u32> {
-        // Look for "issue-" or "issues/" followed by a number
-        for part in self.branch.split(&['/', '-', '_']) {
-            if part == "issue" || part == "issues" {
-                // The next part might be the number
-                continue;
-            }
-            // Check if this part comes after "issue"
-            if self.branch.contains(&format!("issue-{}", part))
-                || self.branch.contains(&format!("issue/{}", part))
-                || self.branch.contains(&format!("issues-{}", part))
-                || self.branch.contains(&format!("issues/{}", part))
-            {
-                if let Ok(num) = part.parse::<u32>() {
-                    return Some(num);
-                }
-            }
-        }
-        None
+        self.branch.split('/').find_map(|segment| {
+            segment
+                .strip_prefix("issue-")
+                .and_then(|rest| rest.split('-').next())
+                .and_then(|num_str| num_str.parse().ok())
+        })
     }
 
     /// Check if the worktree's branch has been merged into the base branch
@@ -249,7 +241,7 @@ pub async fn discover_worktrees(repos_dir: &Path) -> Result<Vec<Worktree>> {
 
         // Parse worktree list output
         let stdout = String::from_utf8_lossy(&output.stdout);
-        let discovered = parse_worktree_list(&stdout, &repo_name, &bare_repo_path)?;
+        let discovered = parse_worktree_list(&stdout, &repo_name, &bare_repo_path);
         worktrees.extend(discovered);
     }
 
@@ -343,50 +335,27 @@ async fn extract_repo_from_git_config(path: &Path) -> Result<String> {
     Ok(format!("{}/{}", owner, repo))
 }
 
-/// Parse git worktree list --porcelain output
-fn parse_worktree_list(output: &str, repo: &str, bare_repo_path: &Path) -> Result<Vec<Worktree>> {
-    let mut worktrees = Vec::new();
-    let mut current_path: Option<PathBuf> = None;
-    let mut current_branch: Option<String> = None;
-
-    for line in output.lines() {
-        if line.starts_with("worktree ") {
-            current_path = Some(PathBuf::from(line.strip_prefix("worktree ").unwrap()));
-        } else if line.starts_with("branch ") {
-            let branch_ref = line.strip_prefix("branch ").unwrap();
-            // Extract branch name from refs/heads/branch-name
-            current_branch = branch_ref
-                .strip_prefix("refs/heads/")
-                .map(|s| s.to_string());
-        } else if line.is_empty() {
-            // End of worktree entry
-            if let (Some(path), Some(branch)) = (current_path.take(), current_branch.take()) {
-                // Skip the main bare repo worktree
-                if path != bare_repo_path {
-                    worktrees.push(Worktree {
-                        path,
-                        branch,
-                        repo: repo.to_string(),
-                        bare_repo_path: bare_repo_path.to_path_buf(),
-                    });
-                }
+/// Parse git worktree list --porcelain output.
+///
+/// Delegates to `git::parse_porcelain_worktrees` for the actual parsing,
+/// then enriches entries with repo metadata and filters out the bare repo itself.
+fn parse_worktree_list(output: &str, repo: &str, bare_repo_path: &Path) -> Vec<Worktree> {
+    git::parse_porcelain_worktrees(output)
+        .into_iter()
+        .filter_map(|entry| {
+            // Skip the bare repo entry and entries without a branch
+            if entry.path == bare_repo_path {
+                return None;
             }
-        }
-    }
-
-    // Handle last entry if file doesn't end with newline
-    if let (Some(path), Some(branch)) = (current_path, current_branch) {
-        if path != bare_repo_path {
-            worktrees.push(Worktree {
-                path,
+            let branch = entry.branch?;
+            Some(Worktree {
+                path: entry.path,
                 branch,
                 repo: repo.to_string(),
                 bare_repo_path: bare_repo_path.to_path_buf(),
-            });
-        }
-    }
-
-    Ok(worktrees)
+            })
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -426,13 +395,31 @@ mod tests {
             bare_repo_path: PathBuf::from("/tmp/repo.git"),
         };
         assert_eq!(wt.extract_issue_number(), None);
+
+        // Minion branch format: minion/issue-42-M001
+        let wt = Worktree {
+            path: PathBuf::from("/tmp/work"),
+            branch: "minion/issue-42-M001".to_string(),
+            repo: "owner/repo".to_string(),
+            bare_repo_path: PathBuf::from("/tmp/repo.git"),
+        };
+        assert_eq!(wt.extract_issue_number(), Some(42));
+
+        // Should NOT false-positive on "issue-fix-42"
+        let wt = Worktree {
+            path: PathBuf::from("/tmp/work"),
+            branch: "issue-fix-42".to_string(),
+            repo: "owner/repo".to_string(),
+            bare_repo_path: PathBuf::from("/tmp/repo.git"),
+        };
+        assert_eq!(wt.extract_issue_number(), None);
     }
 
     #[test]
     fn test_parse_worktree_list() {
         let output = "worktree /Users/test/.gru/repos/owner_repo.git\nHEAD 1234567890abcdef\nbare\n\nworktree /Users/test/.gru/work/owner/repo/issue-36\nHEAD abcdef1234567890\nbranch refs/heads/issue-36\n\n";
         let bare_path = PathBuf::from("/Users/test/.gru/repos/owner_repo.git");
-        let worktrees = parse_worktree_list(output, "owner/repo", &bare_path).unwrap();
+        let worktrees = parse_worktree_list(output, "owner/repo", &bare_path);
 
         assert_eq!(worktrees.len(), 1);
         assert_eq!(worktrees[0].branch, "issue-36");

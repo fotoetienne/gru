@@ -154,6 +154,62 @@ pub fn parse_github_remote(url: &str) -> Result<(String, String)> {
     anyhow::bail!("Could not parse GitHub URL: {}", url);
 }
 
+/// Represents a single entry from `git worktree list --porcelain` output.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorktreeEntry {
+    /// Filesystem path to the worktree
+    pub path: PathBuf,
+    /// Branch name (without refs/heads/ prefix), None for detached HEAD or bare entries
+    pub branch: Option<String>,
+}
+
+/// Parses `git worktree list --porcelain` output into structured entries.
+///
+/// This is the single source of truth for porcelain parsing, used by both
+/// `GitRepo::find_worktree_for_branch` and the worktree scanner module.
+///
+/// Assumes well-formed porcelain output where each stanza is terminated by a
+/// blank line. If a `worktree` line appears without a preceding blank line,
+/// the in-progress entry is silently discarded (consistent with git's guarantee
+/// for `--porcelain` output).
+pub fn parse_porcelain_worktrees(output: &str) -> Vec<WorktreeEntry> {
+    let mut entries = Vec::new();
+    let mut current_path: Option<PathBuf> = None;
+    let mut current_branch: Option<String> = None;
+
+    for raw_line in output.lines() {
+        // Normalize CRLF: str::lines() splits on \n but doesn't strip \r
+        let line = raw_line.trim_end();
+        if line.starts_with("worktree ") {
+            current_branch = None; // reset stale branch from prior incomplete stanza
+            current_path = Some(PathBuf::from(line.strip_prefix("worktree ").unwrap()));
+        } else if line.starts_with("branch ") {
+            let branch_ref = line.strip_prefix("branch ").unwrap();
+            current_branch = branch_ref
+                .strip_prefix("refs/heads/")
+                .map(|s| s.to_string());
+        } else if line.is_empty() {
+            if let Some(path) = current_path.take() {
+                entries.push(WorktreeEntry {
+                    path,
+                    branch: current_branch.take(),
+                });
+            }
+            current_branch = None;
+        }
+    }
+
+    // Handle last entry if output doesn't end with a blank line
+    if let Some(path) = current_path {
+        entries.push(WorktreeEntry {
+            path,
+            branch: current_branch,
+        });
+    }
+
+    entries
+}
+
 /// Validates a branch name according to Git ref naming rules
 fn validate_branch_name(branch_name: &str) -> Result<()> {
     if branch_name.is_empty() {
@@ -634,42 +690,16 @@ impl GitRepo {
             );
         }
 
-        // Parse the porcelain output
-        // Format:
-        // worktree /path/to/worktree
-        // HEAD <commit-sha>
-        // branch refs/heads/branch-name
-        // <blank line>
         let stdout = String::from_utf8_lossy(&output.stdout);
-        let mut current_worktree: Option<PathBuf> = None;
+        let entries = parse_porcelain_worktrees(&stdout);
 
-        for line in stdout.lines() {
-            let line = line.trim();
-
-            // Empty line indicates end of worktree entry - reset state
-            // Entries without branches (detached HEAD, bare repo) are intentionally skipped
-            if line.is_empty() {
-                current_worktree = None;
-                continue;
+        Ok(entries.into_iter().find_map(|entry| {
+            if entry.branch.as_deref() == Some(branch_name) {
+                Some(entry.path)
+            } else {
+                None
             }
-
-            if line.starts_with("worktree ") {
-                current_worktree = Some(PathBuf::from(line.trim_start_matches("worktree ")));
-            } else if line.starts_with("branch ") {
-                let branch_ref = line.trim_start_matches("branch ");
-                // Git worktree list --porcelain outputs branches in refs/heads/ format
-                if branch_ref == format!("refs/heads/{}", branch_name) {
-                    match current_worktree {
-                        Some(worktree_path) => return Ok(Some(worktree_path)),
-                        None => anyhow::bail!(
-                            "Malformed git worktree list output: found branch entry without preceding worktree path"
-                        ),
-                    }
-                }
-            }
-        }
-
-        Ok(None)
+        }))
     }
 
     /// Removes a worktree
@@ -901,6 +931,54 @@ mod tests {
         assert!(!is_github_url("https://evil.com/github.com/malware.git"));
         assert!(!is_github_url("https://github.com.attacker.com/repo.git"));
         assert!(!is_github_url("user@attacker.com:github.com:malware.git"));
+    }
+
+    #[test]
+    fn test_parse_porcelain_worktrees_basic() {
+        let output = "worktree /repos/owner_repo.git\nHEAD abc123\nbare\n\nworktree /work/issue-36\nHEAD def456\nbranch refs/heads/issue-36\n\n";
+        let entries = parse_porcelain_worktrees(output);
+
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].path, PathBuf::from("/repos/owner_repo.git"));
+        assert_eq!(entries[0].branch, None); // bare entry has no branch
+        assert_eq!(entries[1].path, PathBuf::from("/work/issue-36"));
+        assert_eq!(entries[1].branch.as_deref(), Some("issue-36"));
+    }
+
+    #[test]
+    fn test_parse_porcelain_worktrees_no_trailing_newline() {
+        let output = "worktree /work/feature\nHEAD abc123\nbranch refs/heads/feature-branch";
+        let entries = parse_porcelain_worktrees(output);
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].path, PathBuf::from("/work/feature"));
+        assert_eq!(entries[0].branch.as_deref(), Some("feature-branch"));
+    }
+
+    #[test]
+    fn test_parse_porcelain_worktrees_detached_head() {
+        let output = "worktree /work/detached\nHEAD abc123\ndetached\n\n";
+        let entries = parse_porcelain_worktrees(output);
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].path, PathBuf::from("/work/detached"));
+        assert_eq!(entries[0].branch, None);
+    }
+
+    #[test]
+    fn test_parse_porcelain_worktrees_empty_output() {
+        let entries = parse_porcelain_worktrees("");
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn test_parse_porcelain_worktrees_crlf() {
+        let output = "worktree /work/issue-1\r\nHEAD abc123\r\nbranch refs/heads/issue-1\r\n\r\n";
+        let entries = parse_porcelain_worktrees(output);
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].path, PathBuf::from("/work/issue-1"));
+        assert_eq!(entries[0].branch.as_deref(), Some("issue-1"));
     }
 
     #[test]
