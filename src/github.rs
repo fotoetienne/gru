@@ -193,6 +193,28 @@ impl GitHubClient {
             ))
     }
 
+    /// Fetch pull request details
+    ///
+    /// # Arguments
+    /// * `owner` - Repository owner (user or organization)
+    /// * `repo` - Repository name
+    /// * `number` - PR number
+    pub async fn get_pr(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: u64,
+    ) -> Result<models::pulls::PullRequest> {
+        self.client
+            .pulls(owner, repo)
+            .get(number)
+            .await
+            .context(format!(
+                "Failed to fetch PR #{} from {}/{}",
+                number, owner, repo
+            ))
+    }
+
     /// Post a comment on an issue
     ///
     /// # Arguments
@@ -563,6 +585,54 @@ pub struct IssueInfo {
     pub number: u64,
     pub title: String,
     pub body: Option<String>,
+}
+
+/// Simple struct to hold PR information from gh CLI
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PrInfo {
+    pub title: String,
+    pub body: Option<String>,
+    pub head_ref_name: String,
+}
+
+/// Fetch PR details using gh CLI
+///
+/// # Arguments
+/// * `owner` - Repository owner (user or organization)
+/// * `repo` - Repository name
+/// * `number` - PR number
+pub async fn get_pr_via_cli(owner: &str, repo: &str, number: u64) -> Result<PrInfo> {
+    let output = Command::new("gh")
+        .args([
+            "pr",
+            "view",
+            &number.to_string(),
+            "--repo",
+            &format!("{}/{}", owner, repo),
+            "--json",
+            "title,body,headRefName",
+        ])
+        .output()
+        .await
+        .context("Failed to execute gh pr view command")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow!(
+            "Failed to fetch PR #{} from {}/{}: {}",
+            number,
+            owner,
+            repo,
+            stderr
+        ));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let pr: PrInfo =
+        serde_json::from_str(&stdout).context("Failed to parse gh pr view JSON output")?;
+
+    Ok(pr)
 }
 
 /// Create a draft pull request using gh CLI

@@ -10,7 +10,7 @@ use crate::minion_registry::{
 use crate::progress::{ProgressConfig, ProgressDisplay};
 use crate::prompt_renderer::{render_template, PromptContext};
 use crate::stream;
-use crate::url_utils::parse_issue_info;
+use crate::url_utils::{parse_github_url, parse_issue_info, GitHubResourceType};
 use crate::workspace;
 use anyhow::{Context, Result};
 use chrono::Utc;
@@ -89,6 +89,126 @@ async fn fetch_issue_context(issue_str: &str) -> Result<(PromptContext, String, 
     Ok((context, owner, repo, issue_number))
 }
 
+/// Parses a PR argument (number or URL) into (owner, repo, pr_number)
+///
+/// For plain numbers, auto-detects the repository from the current directory.
+/// For URLs, extracts components directly.
+async fn parse_pr_arg(pr_str: &str) -> Result<(String, String, u64)> {
+    if let Ok(num) = pr_str.parse::<u64>() {
+        // Auto-detect repository from current directory
+        git::detect_git_repo()
+            .await
+            .context("Failed to detect git repository")?;
+
+        let remote_url = git::get_github_remote()
+            .await
+            .context("Failed to get GitHub remote")?;
+
+        let (owner, repo) =
+            git::parse_github_remote(&remote_url).context("Failed to parse GitHub remote URL")?;
+
+        return Ok((owner, repo, num));
+    }
+
+    if let Some(parsed) = parse_github_url(pr_str) {
+        if parsed.resource_type == GitHubResourceType::Pull {
+            return Ok((parsed.owner, parsed.repo, parsed.number as u64));
+        }
+        anyhow::bail!(
+            "Expected a GitHub pull request URL, but got an issue URL.\n\
+             Did you mean to use --issue instead?"
+        );
+    }
+
+    anyhow::bail!(
+        "Invalid PR format. Expected: <number> or <github-url>\n\
+         Examples:\n\
+         - gru prompt \"...\" --pr 42\n\
+         - gru prompt \"...\" --pr https://github.com/owner/repo/pull/42"
+    );
+}
+
+/// Fetches PR data from GitHub and populates a PromptContext.
+/// Returns (context, owner, repo, branch_name).
+async fn fetch_pr_context(pr_str: &str) -> Result<(PromptContext, String, String, String)> {
+    let (owner, repo, pr_number) = parse_pr_arg(pr_str).await?;
+
+    println!("🔗 Fetching PR #{} from {}/{}...", pr_number, owner, repo);
+
+    let mut context = PromptContext::new();
+    context.pr_number = Some(pr_number);
+    context.repo_owner = Some(owner.clone());
+    context.repo_name = Some(repo.clone());
+
+    let branch_name;
+
+    // Try API first, fall back to CLI
+    if let Some(github_client) = GitHubClient::try_from_env(&owner, &repo).await {
+        match github_client.get_pr(&owner, &repo, pr_number).await {
+            Ok(pr) => {
+                context.pr_title = Some(pr.title.clone().unwrap_or_default());
+                context.pr_body = Some(pr.body.unwrap_or_default());
+                branch_name = pr.head.ref_field.clone();
+            }
+            Err(e) => {
+                log::warn!(
+                    "Failed to fetch PR via API: {}. Falling back to gh CLI...",
+                    e
+                );
+                let info = crate::github::get_pr_via_cli(&owner, &repo, pr_number)
+                    .await
+                    .context("Failed to fetch PR via gh CLI")?;
+                context.pr_title = Some(info.title);
+                context.pr_body = Some(info.body.unwrap_or_default());
+                branch_name = info.head_ref_name;
+            }
+        }
+    } else {
+        let info = crate::github::get_pr_via_cli(&owner, &repo, pr_number)
+            .await
+            .context(
+                "Failed to fetch PR. Ensure gh is installed and authenticated, \
+                 or set GRU_GITHUB_TOKEN.",
+            )?;
+        context.pr_title = Some(info.title);
+        context.pr_body = Some(info.body.unwrap_or_default());
+        branch_name = info.head_ref_name;
+    }
+
+    println!(
+        "   PR #{}: {}",
+        pr_number,
+        context.pr_title.as_deref().unwrap_or("(no title)")
+    );
+
+    Ok((context, owner, repo, branch_name))
+}
+
+/// Sets up a worktree for a PR by finding an existing one for the branch, or falling back to CWD
+async fn setup_pr_worktree(owner: &str, repo: &str, branch_name: &str) -> Result<Option<PathBuf>> {
+    let workspace = workspace::Workspace::new().context("Failed to initialize Gru workspace")?;
+
+    let bare_path = workspace.repos().join(owner).join(format!("{}.git", repo));
+
+    // Only look for existing worktrees if the bare repo exists
+    if bare_path.exists() {
+        let git_repo = git::GitRepo::new(owner, repo, bare_path);
+        if let Some(existing_path) = git_repo
+            .find_worktree_for_branch(branch_name)
+            .await
+            .context("Failed to check for existing worktree")?
+        {
+            println!(
+                "♻️  Found existing worktree at: {}",
+                existing_path.display()
+            );
+            return Ok(Some(existing_path));
+        }
+    }
+
+    Ok(None)
+}
+
 /// Sets up a worktree for an issue, returning the worktree path and branch name
 async fn setup_issue_worktree(
     owner: &str,
@@ -131,6 +251,7 @@ async fn setup_issue_worktree(
 pub async fn handle_prompt(
     prompt: &str,
     issue_opt: Option<String>,
+    pr_opt: Option<String>,
     no_worktree: bool,
     params: Vec<String>,
     timeout_opt: Option<String>,
@@ -152,18 +273,42 @@ pub async fn handle_prompt(
     // Parse custom parameters
     let custom_params = parse_params(&params)?;
 
-    // Build prompt context from --issue flag and custom params
+    // Build prompt context from --issue and --pr flags and custom params
     let mut context = PromptContext::new();
-    let mut issue_owner: Option<String> = None;
-    let mut issue_repo: Option<String> = None;
+    let mut context_owner: Option<String> = None;
+    let mut context_repo: Option<String> = None;
     let mut issue_number_val: Option<u64> = None;
+    let mut pr_owner: Option<String> = None;
+    let mut pr_repo: Option<String> = None;
+    let mut pr_branch: Option<String> = None;
 
     if let Some(ref issue_str) = issue_opt {
         let (issue_ctx, owner, repo, issue_num) = fetch_issue_context(issue_str).await?;
         context = issue_ctx;
-        issue_owner = Some(owner);
-        issue_repo = Some(repo);
+        context_owner = Some(owner);
+        context_repo = Some(repo);
         issue_number_val = Some(issue_num);
+    }
+
+    if let Some(ref pr_str) = pr_opt {
+        let (pr_ctx, owner, repo, branch) = fetch_pr_context(pr_str).await?;
+        // Merge PR context into existing context (issue fields are preserved)
+        context.pr_number = pr_ctx.pr_number;
+        context.pr_title = pr_ctx.pr_title;
+        context.pr_body = pr_ctx.pr_body;
+        // Track PR's repo separately for worktree lookup
+        pr_owner = Some(owner.clone());
+        pr_repo = Some(repo.clone());
+        // Set repo info from PR if not already set by --issue
+        if context_owner.is_none() {
+            context_owner = Some(owner);
+            context.repo_owner = pr_ctx.repo_owner;
+        }
+        if context_repo.is_none() {
+            context_repo = Some(repo);
+            context.repo_name = pr_ctx.repo_name;
+        }
+        pr_branch = Some(branch);
     }
 
     // Apply custom params (these override standard variables)
@@ -180,10 +325,15 @@ pub async fn handle_prompt(
     // Initialize workspace
     let workspace = workspace::Workspace::new().context("Failed to initialize Gru workspace")?;
 
-    // Set up worktree or ad-hoc workspace
+    // Set up worktree or ad-hoc workspace.
+    // Priority: --issue creates a new worktree; --pr reuses an existing one or falls
+    // back to CWD. When both are provided, --issue wins for worktree creation since
+    // Claude runs in the issue worktree. PR template variables are still populated
+    // regardless of which worktree is used.
+    let has_context = issue_opt.is_some() || pr_opt.is_some();
     let (workspace_path, branch_name, run_dir) = if issue_opt.is_some() && !no_worktree {
-        let owner = issue_owner.as_deref().unwrap();
-        let repo = issue_repo.as_deref().unwrap();
+        let owner = context_owner.as_deref().unwrap();
+        let repo = context_repo.as_deref().unwrap();
         let issue_num = issue_number_val.unwrap();
 
         let (wt_path, branch) = setup_issue_worktree(owner, repo, issue_num, &minion_id).await?;
@@ -191,13 +341,40 @@ pub async fn handle_prompt(
         context.branch_name = Some(branch.clone());
         let run_dir = wt_path.clone();
         (wt_path, branch, run_dir)
-    } else if no_worktree && issue_opt.is_some() {
-        // --issue with --no-worktree: use the current directory as both the
+    } else if pr_opt.is_some() && !no_worktree {
+        // --pr: try to find an existing worktree for the PR branch, fall back to CWD
+        // Use the PR's own owner/repo for worktree lookup (may differ from --issue repo)
+        let owner = pr_owner.as_deref().unwrap();
+        let repo = pr_repo.as_deref().unwrap();
+        let branch = pr_branch.as_deref().unwrap();
+
+        if let Some(wt_path) = setup_pr_worktree(owner, repo, branch).await? {
+            context.worktree_path = Some(wt_path.clone());
+            context.branch_name = Some(branch.to_string());
+            let run_dir = wt_path.clone();
+            (wt_path, branch.to_string(), run_dir)
+        } else {
+            println!("ℹ️  No existing worktree found for PR branch - using current directory");
+            let run_dir =
+                std::env::current_dir().context("Failed to get current working directory")?;
+            let wt_path = run_dir.clone();
+            context.worktree_path = Some(wt_path.clone());
+            context.branch_name = Some(branch.to_string());
+            (wt_path, branch.to_string(), run_dir)
+        }
+    } else if no_worktree && has_context {
+        // --no-worktree: use the current directory as both the
         // workspace and the run directory so the registry matches reality.
         println!("ℹ️  Running without worktree - Claude will work in the current directory");
         let run_dir = std::env::current_dir().context("Failed to get current working directory")?;
         let wt_path = run_dir.clone();
-        (wt_path, String::new(), run_dir)
+        context.worktree_path = Some(wt_path.clone());
+        // Preserve PR branch name for registry and template context
+        let branch = pr_branch.clone().unwrap_or_default();
+        if !branch.is_empty() {
+            context.branch_name = Some(branch.clone());
+        }
+        (wt_path, branch, run_dir)
     } else {
         // Ad-hoc workspace: ~/.gru/work/ad-hoc/<minion-id>/
         let wt_path = workspace
@@ -226,7 +403,7 @@ pub async fn handle_prompt(
     println!("📂 Workspace: {}", workspace_path.display());
 
     // Register minion in registry
-    let repo_display = if let (Some(ref owner), Some(ref repo)) = (&issue_owner, &issue_repo) {
+    let repo_display = if let (Some(ref owner), Some(ref repo)) = (&context_owner, &context_repo) {
         format!("{}/{}", owner, repo)
     } else {
         "ad-hoc".to_string()
@@ -261,6 +438,12 @@ pub async fn handle_prompt(
             "#{}: {}",
             issue_num,
             context.issue_title.as_deref().unwrap_or("(no title)")
+        )
+    } else if let Some(pr_num) = context.pr_number {
+        format!(
+            "PR #{}: {}",
+            pr_num,
+            context.pr_title.as_deref().unwrap_or("(no title)")
         )
     } else {
         format!("ad-hoc: {}", rendered_prompt)
@@ -357,7 +540,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_prompt_rejects_flag_like_input() {
-        let result = handle_prompt("--help", None, false, vec![], None, false).await;
+        let result = handle_prompt("--help", None, None, false, vec![], None, false).await;
         assert!(result.is_err());
         assert!(result
             .unwrap_err()
@@ -367,11 +550,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_prompt_rejects_empty_input() {
-        let result = handle_prompt("", None, false, vec![], None, false).await;
+        let result = handle_prompt("", None, None, false, vec![], None, false).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("cannot be empty"));
 
-        let result = handle_prompt("   ", None, false, vec![], None, false).await;
+        let result = handle_prompt("   ", None, None, false, vec![], None, false).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("cannot be empty"));
     }
@@ -423,5 +606,47 @@ mod tests {
         let params: Vec<String> = vec![];
         let result = parse_params(&params).unwrap();
         assert!(result.is_empty());
+    }
+
+    // --- parse_pr_arg tests (URL paths only; plain numbers need git context) ---
+
+    #[tokio::test]
+    async fn test_parse_pr_arg_with_url() {
+        let result = parse_pr_arg("https://github.com/fotoetienne/gru/pull/42")
+            .await
+            .unwrap();
+        assert_eq!(result.0, "fotoetienne");
+        assert_eq!(result.1, "gru");
+        assert_eq!(result.2, 42);
+    }
+
+    #[tokio::test]
+    async fn test_parse_pr_arg_with_url_and_query_params() {
+        let result = parse_pr_arg("https://github.com/owner/repo/pull/123?foo=bar")
+            .await
+            .unwrap();
+        assert_eq!(result.0, "owner");
+        assert_eq!(result.1, "repo");
+        assert_eq!(result.2, 123);
+    }
+
+    #[tokio::test]
+    async fn test_parse_pr_arg_rejects_issue_url() {
+        let err = parse_pr_arg("https://github.com/owner/repo/issues/42")
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("issue URL"),
+            "Expected specific error for issue URL given to PR parser, got: {}",
+            msg
+        );
+    }
+
+    #[tokio::test]
+    async fn test_parse_pr_arg_rejects_invalid() {
+        assert!(parse_pr_arg("not-a-number").await.is_err());
+        assert!(parse_pr_arg("").await.is_err());
+        assert!(parse_pr_arg("-42").await.is_err());
     }
 }
