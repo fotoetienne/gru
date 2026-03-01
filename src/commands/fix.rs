@@ -917,7 +917,9 @@ async fn run_claude_session_inner(
     .await;
 
     // Best-effort cleanup: clear PID, set mode to Stopped, and save token usage.
-    // Errors are intentionally discarded so registry issues don't mask the real run result.
+    // Token usage is persisted regardless of exit status (Ok with non-zero exit) because
+    // cost data is valuable even for failed tasks. Only stream-level errors (timeout, stuck)
+    // result in Err, in which case partial usage is not saved.
     let token_usage = run_result.as_ref().ok().map(|r| r.token_usage.clone());
     let exit_minion_id = wt_ctx.minion_id.clone();
     let _ = with_registry(move |registry| {
@@ -938,10 +940,14 @@ async fn run_claude_session_inner(
         progress_tracker.set_phase(MinionPhase::Completed);
 
         let final_message = if claude_run.status.success() {
-            format!(
-                "✅ Task completed successfully! (tokens: {})",
-                claude_run.token_usage.display_compact()
-            )
+            if claude_run.token_usage.total_tokens() > 0 {
+                format!(
+                    "✅ Task completed successfully! (tokens: {})",
+                    claude_run.token_usage.display_compact()
+                )
+            } else {
+                "✅ Task completed successfully!".to_string()
+            }
         } else {
             "❌ Task failed.".to_string()
         };
