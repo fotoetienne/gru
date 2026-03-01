@@ -530,7 +530,7 @@ pub async fn handle_clean(dry_run: bool, force: bool, base_branch: &str) -> Resu
                     failed += 1;
                     continue;
                 }
-                if let Err(e) = std::fs::remove_dir_all(&canonical_path) {
+                if let Err(e) = tokio::fs::remove_dir_all(&canonical_path).await {
                     println!("✗");
                     log::error!("  Error removing directory: {}", e);
                     failed += 1;
