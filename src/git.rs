@@ -16,9 +16,13 @@ const DEFAULT_BRANCHES: &[&str] = &["main", "origin/main", "master", "origin/mas
 /// If a token is provided, the command will include `-c credential.helper=...` to
 /// inject the token via a credential helper. This avoids duplicating the credential
 /// setup logic across clone and fetch operations.
-fn git_command_with_auth(token: &Option<String>) -> Command {
+///
+/// Note: Git spawns a shell to execute credential.helper values prefixed with `!`.
+/// The single-quote escaping applies at the shell level that git invokes,
+/// not at the `Command::arg` level (which does not invoke a shell).
+fn git_command_with_auth(token: Option<&str>) -> Command {
     let mut cmd = Command::new("git");
-    if let Some(ref token) = token {
+    if let Some(token) = token {
         let safe_token = token.replace('\'', "'\\''");
         cmd.arg("-c").arg(format!(
             "credential.helper=!f() {{ echo username=oauth2; echo password='{}'; }}; f",
@@ -224,7 +228,7 @@ impl GitRepo {
                     continue;
                 }
 
-                let output = git_command_with_auth(&token)
+                let output = git_command_with_auth(token.as_deref())
                     .arg("-C")
                     .arg(&self.bare_path)
                     .arg("fetch")
@@ -294,7 +298,7 @@ impl GitRepo {
                     .context("Failed to create parent directory for bare repository")?;
             }
 
-            let mut cmd = git_command_with_auth(&token);
+            let mut cmd = git_command_with_auth(token.as_deref());
 
             cmd.arg("clone")
                 .arg("--bare")
