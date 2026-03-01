@@ -400,6 +400,109 @@ pub(crate) fn list_prompts_by_source_internal(
     })
 }
 
+/// Known context requirements for the `requires` field
+const KNOWN_REQUIREMENTS: &[&str] = &["issue", "pr"];
+
+/// Validates that context requirements declared in frontmatter are satisfied
+///
+/// Checks the `requires` field against the provided CLI flags.
+/// Known requirements: `issue` (needs `--issue`), `pr` (needs `--pr`).
+/// Unknown requirement names produce a warning but do not cause an error.
+///
+/// # Arguments
+/// * `requires` - The list of context requirements from frontmatter
+/// * `issue_provided` - Whether `--issue` was provided
+/// * `pr_provided` - Whether `--pr` was provided
+///
+/// # Returns
+/// A list of (requirement_name, flag_hint) pairs for any missing requirements
+pub fn validate_requires(
+    requires: &[String],
+    issue_provided: bool,
+    pr_provided: bool,
+) -> Vec<(String, String)> {
+    let mut missing = Vec::new();
+    for req in requires {
+        match req.as_str() {
+            "issue" => {
+                if !issue_provided {
+                    missing.push(("issue".to_string(), "--issue <number>".to_string()));
+                }
+            }
+            "pr" => {
+                if !pr_provided {
+                    missing.push(("pr".to_string(), "--pr <number>".to_string()));
+                }
+            }
+            other => {
+                log::warn!(
+                    "Unknown requirement '{}' in prompt frontmatter (known: {:?})",
+                    other,
+                    KNOWN_REQUIREMENTS
+                );
+            }
+        }
+    }
+    missing
+}
+
+/// Validates all prompt requirements (context + params) and returns a combined error
+///
+/// This is the main validation entry point. It checks both `requires` (context like
+/// `--issue`, `--pr`) and `params` (custom `--param` values) and reports ALL missing
+/// requirements in a single error message.
+///
+/// # Arguments
+/// * `prompt_name` - Name of the prompt (for error messages)
+/// * `metadata` - The prompt metadata containing requirements
+/// * `issue_provided` - Whether `--issue` was provided
+/// * `pr_provided` - Whether `--pr` was provided
+/// * `provided_params` - The parameters provided via `--param` flags
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn validate_prompt_requirements(
+    prompt_name: &str,
+    metadata: &PromptMetadata,
+    issue_provided: bool,
+    pr_provided: bool,
+    provided_params: &HashMap<String, String>,
+) -> Result<()> {
+    let missing_requires = validate_requires(&metadata.requires, issue_provided, pr_provided);
+
+    let missing_params: Vec<&PromptParam> = metadata
+        .params
+        .iter()
+        .filter(|p| {
+            p.required
+                && provided_params
+                    .get(&p.name)
+                    .map_or(true, |v| v.trim().is_empty())
+        })
+        .collect();
+
+    if missing_requires.is_empty() && missing_params.is_empty() {
+        return Ok(());
+    }
+
+    let mut msg = format!(
+        "Missing required parameters for prompt '{}':\n",
+        prompt_name
+    );
+
+    for (_req, hint) in &missing_requires {
+        msg.push_str(&format!("  {}\n", hint));
+    }
+
+    for param in &missing_params {
+        msg.push_str(&format!("  --param {}=<value>", param.name));
+        if let Some(ref desc) = param.description {
+            msg.push_str(&format!("  ({})", desc));
+        }
+        msg.push('\n');
+    }
+
+    bail!("{}", msg.trim())
+}
+
 /// Validates a prompt's syntax
 ///
 /// Currently checks:
@@ -915,5 +1018,185 @@ Repo content"#,
         };
 
         assert!(validate_required_params(&metadata, &HashMap::new()).is_ok());
+    }
+
+    // --- validate_requires tests ---
+
+    #[test]
+    fn test_validate_requires_issue_provided() {
+        let requires = vec!["issue".to_string()];
+        let missing = validate_requires(&requires, true, false);
+        assert!(missing.is_empty());
+    }
+
+    #[test]
+    fn test_validate_requires_issue_missing() {
+        let requires = vec!["issue".to_string()];
+        let missing = validate_requires(&requires, false, false);
+        assert_eq!(missing.len(), 1);
+        assert_eq!(missing[0].0, "issue");
+        assert!(missing[0].1.contains("--issue"));
+    }
+
+    #[test]
+    fn test_validate_requires_pr_provided() {
+        let requires = vec!["pr".to_string()];
+        let missing = validate_requires(&requires, false, true);
+        assert!(missing.is_empty());
+    }
+
+    #[test]
+    fn test_validate_requires_pr_missing() {
+        let requires = vec!["pr".to_string()];
+        let missing = validate_requires(&requires, false, false);
+        assert_eq!(missing.len(), 1);
+        assert_eq!(missing[0].0, "pr");
+        assert!(missing[0].1.contains("--pr"));
+    }
+
+    #[test]
+    fn test_validate_requires_both_missing() {
+        let requires = vec!["issue".to_string(), "pr".to_string()];
+        let missing = validate_requires(&requires, false, false);
+        assert_eq!(missing.len(), 2);
+    }
+
+    #[test]
+    fn test_validate_requires_both_provided() {
+        let requires = vec!["issue".to_string(), "pr".to_string()];
+        let missing = validate_requires(&requires, true, true);
+        assert!(missing.is_empty());
+    }
+
+    #[test]
+    fn test_validate_requires_empty() {
+        let requires: Vec<String> = vec![];
+        let missing = validate_requires(&requires, false, false);
+        assert!(missing.is_empty());
+    }
+
+    #[test]
+    fn test_validate_requires_unknown_ignored() {
+        let requires = vec!["unknown_thing".to_string()];
+        let missing = validate_requires(&requires, false, false);
+        // Unknown requirements don't produce missing entries (just a warning)
+        assert!(missing.is_empty());
+    }
+
+    // --- validate_prompt_requirements tests ---
+
+    #[test]
+    fn test_validate_prompt_requirements_all_satisfied() {
+        let metadata = PromptMetadata {
+            description: None,
+            requires: vec!["issue".to_string()],
+            params: vec![PromptParam {
+                name: "component".to_string(),
+                description: None,
+                required: true,
+            }],
+        };
+
+        let mut params = HashMap::new();
+        params.insert("component".to_string(), "auth".to_string());
+
+        let result = validate_prompt_requirements("fix", &metadata, true, false, &params);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_prompt_requirements_missing_requires() {
+        let metadata = PromptMetadata {
+            description: None,
+            requires: vec!["issue".to_string()],
+            params: vec![],
+        };
+
+        let result = validate_prompt_requirements("fix", &metadata, false, false, &HashMap::new());
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("fix"));
+        assert!(err.contains("--issue"));
+    }
+
+    #[test]
+    fn test_validate_prompt_requirements_missing_param() {
+        let metadata = PromptMetadata {
+            description: None,
+            requires: vec![],
+            params: vec![PromptParam {
+                name: "target".to_string(),
+                description: Some("File to target".to_string()),
+                required: true,
+            }],
+        };
+
+        let result =
+            validate_prompt_requirements("analyze", &metadata, false, false, &HashMap::new());
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("analyze"));
+        assert!(err.contains("--param target=<value>"));
+        assert!(err.contains("File to target"));
+    }
+
+    #[test]
+    fn test_validate_prompt_requirements_combined_errors() {
+        let metadata = PromptMetadata {
+            description: None,
+            requires: vec!["issue".to_string()],
+            params: vec![PromptParam {
+                name: "component".to_string(),
+                description: Some("Component name".to_string()),
+                required: true,
+            }],
+        };
+
+        let result =
+            validate_prompt_requirements("analyze", &metadata, false, false, &HashMap::new());
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        // Both missing context and missing param should be in the same error
+        assert!(
+            err.contains("--issue"),
+            "Error should mention --issue: {err}"
+        );
+        assert!(
+            err.contains("--param component=<value>"),
+            "Error should mention --param: {err}"
+        );
+        assert!(
+            err.contains("analyze"),
+            "Error should include prompt name: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_prompt_requirements_no_requirements() {
+        let metadata = PromptMetadata {
+            description: None,
+            requires: vec![],
+            params: vec![],
+        };
+
+        let result =
+            validate_prompt_requirements("simple", &metadata, false, false, &HashMap::new());
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_prompt_requirements_optional_params_ok() {
+        let metadata = PromptMetadata {
+            description: None,
+            requires: vec![],
+            params: vec![PromptParam {
+                name: "optional".to_string(),
+                description: None,
+                required: false,
+            }],
+        };
+
+        let result = validate_prompt_requirements("test", &metadata, false, false, &HashMap::new());
+        assert!(result.is_ok());
     }
 }
