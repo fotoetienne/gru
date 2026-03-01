@@ -305,14 +305,14 @@ pub fn validate_required_params(
     let missing: Vec<&PromptParam> = metadata
         .params
         .iter()
-        .filter(|p| p.required && provided.get(&p.name).map_or(true, |v| v.is_empty()))
+        .filter(|p| p.required && provided.get(&p.name).map_or(true, |v| v.trim().is_empty()))
         .collect();
 
     if missing.is_empty() {
         return Ok(());
     }
 
-    let mut msg = String::from("Missing required parameter(s):\n");
+    let mut msg = String::from("Missing or empty required parameter(s):\n");
     for param in &missing {
         msg.push_str(&format!("  --param {}=<value>", param.name));
         if let Some(ref desc) = param.description {
@@ -794,6 +794,26 @@ Repo content"#,
 
         let mut provided = HashMap::new();
         provided.insert("component".to_string(), String::new());
+
+        let result = validate_required_params(&metadata, &provided);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("component"));
+    }
+
+    #[test]
+    fn test_validate_required_params_whitespace_only_rejected() {
+        let metadata = PromptMetadata {
+            description: None,
+            requires: vec![],
+            params: vec![PromptParam {
+                name: "component".to_string(),
+                description: None,
+                required: true,
+            }],
+        };
+
+        let mut provided = HashMap::new();
+        provided.insert("component".to_string(), "   ".to_string());
 
         let result = validate_required_params(&metadata, &provided);
         assert!(result.is_err());
