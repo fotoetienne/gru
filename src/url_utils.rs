@@ -102,6 +102,11 @@ pub async fn parse_issue_info(issue: &str) -> Result<(String, String, String)> {
         if parsed.resource_type == GitHubResourceType::Issue {
             return Ok((parsed.owner, parsed.repo, parsed.number.to_string()));
         }
+        // Parsed successfully but wrong resource type (e.g., PR URL given for issue command)
+        anyhow::bail!(
+            "Expected a GitHub issue URL, but got a pull request URL.\n\
+             Did you mean to use `gru review` instead?"
+        );
     }
 
     anyhow::bail!(
@@ -123,11 +128,10 @@ pub async fn parse_pr_info(pr: &str) -> Result<(String, String, String, String)>
         pr.to_string()
     } else if let Some(parsed) = parse_github_url(pr) {
         if parsed.resource_type != GitHubResourceType::Pull {
+            // Parsed successfully but wrong resource type (e.g., issue URL given for review command)
             anyhow::bail!(
-                "Invalid PR format. Expected: <number> or <github-url>\n\
-                 Examples:\n\
-                 - gru review 42\n\
-                 - gru review https://github.com/owner/repo/pull/42"
+                "Expected a GitHub pull request URL, but got an issue URL.\n\
+                 Did you mean to use `gru fix` instead?"
             );
         }
         parsed.number.to_string()
@@ -342,10 +346,19 @@ mod tests {
         assert!(parse_issue_info("not-a-number").await.is_err());
         assert!(parse_issue_info("").await.is_err());
         assert!(parse_issue_info("-42").await.is_err());
-        // PR URL should not parse as issue
-        assert!(parse_issue_info("https://github.com/owner/repo/pull/42")
+    }
+
+    #[tokio::test]
+    async fn test_parse_issue_info_rejects_pr_url_with_specific_message() {
+        let err = parse_issue_info("https://github.com/owner/repo/pull/42")
             .await
-            .is_err());
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("pull request URL"),
+            "Expected specific error for PR URL given to issue parser, got: {}",
+            msg
+        );
     }
 
     // --- parse_pr_info validation tests (only format validation; gh calls need network) ---
@@ -355,10 +368,19 @@ mod tests {
         assert!(parse_pr_info("not-a-number").await.is_err());
         assert!(parse_pr_info("").await.is_err());
         assert!(parse_pr_info("-42").await.is_err());
-        // Issue URL should not parse as PR
-        assert!(parse_pr_info("https://github.com/owner/repo/issues/42")
+    }
+
+    #[tokio::test]
+    async fn test_parse_pr_info_rejects_issue_url_with_specific_message() {
+        let err = parse_pr_info("https://github.com/owner/repo/issues/42")
             .await
-            .is_err());
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("issue URL"),
+            "Expected specific error for issue URL given to PR parser, got: {}",
+            msg
+        );
     }
 
     // --- normalize_minion_id tests ---
