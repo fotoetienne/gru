@@ -82,7 +82,6 @@ impl PrState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::env;
 
     #[test]
     fn test_pr_state_new() {
@@ -93,18 +92,16 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::serial]
     fn test_pr_state_save_and_load() {
-        let temp_dir = env::temp_dir().join("gru-test-pr-state");
-        let _ = fs::create_dir_all(&temp_dir);
+        let temp_dir = tempfile::tempdir().unwrap();
 
         // Create and save a PR state
         let state = PrState::new("42".to_string(), "15".to_string());
-        let result = state.save(&temp_dir);
+        let result = state.save(temp_dir.path());
         assert!(result.is_ok(), "Failed to save PR state: {:?}", result);
 
         // Load the state back
-        let loaded = PrState::load(&temp_dir);
+        let loaded = PrState::load(temp_dir.path());
         assert!(loaded.is_ok(), "Failed to load PR state: {:?}", loaded);
 
         let loaded_state = loaded.unwrap();
@@ -114,27 +111,18 @@ mod tests {
         assert_eq!(loaded_state.pr_number, "42");
         assert_eq!(loaded_state.issue_number, "15");
         assert_eq!(loaded_state.status, PrStatus::Draft);
-
-        // Clean up
-        let _ = fs::remove_dir_all(&temp_dir);
     }
 
     #[test]
-    #[serial_test::serial]
     fn test_pr_state_load_nonexistent() {
-        let temp_dir = env::temp_dir().join("gru-test-pr-state-nonexistent");
-        let _ = fs::remove_dir_all(&temp_dir);
-        let _ = fs::create_dir_all(&temp_dir);
+        let temp_dir = tempfile::tempdir().unwrap();
 
-        let result = PrState::load(&temp_dir);
+        let result = PrState::load(temp_dir.path());
         assert!(result.is_ok(), "Load should not error for missing file");
         assert!(
             result.unwrap().is_none(),
             "Should return None for missing file"
         );
-
-        // Clean up
-        let _ = fs::remove_dir_all(&temp_dir);
     }
 
     #[test]

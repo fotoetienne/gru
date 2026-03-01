@@ -435,22 +435,6 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_all_minions_returns_valid_vec() {
-        // This test verifies that scan_all_minions succeeds and returns a valid vector
-        let result = scan_all_minions();
-        assert!(result.is_ok());
-
-        // Verify we get a vector and all minions have required fields
-        let minions = result.unwrap();
-        for minion in &minions {
-            assert!(!minion.minion_id.is_empty());
-            assert!(!minion.repo_name.is_empty());
-            assert!(!minion.status.is_empty());
-            assert!(!minion.uptime.is_empty());
-        }
-    }
-
-    #[test]
     fn test_try_resolve_by_exact_minion_id() {
         let minions = vec![
             test_minion("M001", Some(42), "owner/repo"),

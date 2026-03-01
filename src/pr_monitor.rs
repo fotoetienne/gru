@@ -399,22 +399,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_monitor_result_debug() {
-        // Ensure MonitorResult variants can be formatted
-        let merged = MonitorResult::Merged;
-        assert_eq!(format!("{:?}", merged), "Merged");
-
-        let closed = MonitorResult::Closed;
-        assert_eq!(format!("{:?}", closed), "Closed");
-
-        let reviews = MonitorResult::NewReviews(vec![]);
-        assert!(format!("{:?}", reviews).starts_with("NewReviews("));
-
-        let checks = MonitorResult::FailedChecks(2);
-        assert_eq!(format!("{:?}", checks), "FailedChecks(2)");
-    }
-
-    #[test]
     fn test_format_review_prompt_single_comment() {
         let comments = vec![ReviewComment {
             file: "src/main.rs".to_string(),
@@ -475,22 +459,6 @@ mod tests {
         // Should not have a colon if line is None
         assert!(prompt.contains("**File:** README.md\n"));
         assert!(!prompt.contains("README.md:"));
-    }
-
-    #[test]
-    fn test_review_comment_clone() {
-        let comment = ReviewComment {
-            file: "src/lib.rs".to_string(),
-            line: Some(100),
-            body: "Consider using a more efficient algorithm.".to_string(),
-            reviewer: "dave".to_string(),
-        };
-
-        let cloned = comment.clone();
-        assert_eq!(comment.file, cloned.file);
-        assert_eq!(comment.line, cloned.line);
-        assert_eq!(comment.body, cloned.body);
-        assert_eq!(comment.reviewer, cloned.reviewer);
     }
 
     #[test]

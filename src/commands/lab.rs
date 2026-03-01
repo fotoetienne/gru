@@ -411,13 +411,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_available_slots_calculation() {
-        assert_eq!(5usize.saturating_sub(2), 3);
-        assert_eq!(5usize.saturating_sub(5), 0);
-        assert_eq!(5usize.saturating_sub(10), 0);
-    }
-
-    #[test]
     fn test_reap_children_empty() {
         let mut children: Vec<Child> = Vec::new();
         reap_children(&mut children);

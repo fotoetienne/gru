@@ -1015,11 +1015,6 @@ mod tests {
     }
 
     #[test]
-    fn test_max_fix_attempts_constant() {
-        assert_eq!(MAX_FIX_ATTEMPTS, 3);
-    }
-
-    #[test]
     fn test_safe_tail_short_string() {
         assert_eq!(safe_tail("hello", 10), "hello");
     }

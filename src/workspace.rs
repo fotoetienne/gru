@@ -54,6 +54,12 @@ impl Workspace {
     }
 
     /// Builds and initializes a Workspace from a given root path.
+    #[cfg(test)]
+    pub fn new_with_root(root: PathBuf) -> io::Result<Self> {
+        Self::init(root)
+    }
+
+    /// Builds and initializes a Workspace from a given root path.
     fn init(root: PathBuf) -> io::Result<Self> {
         let repos = root.join("repos");
         let work = root.join("work");
@@ -224,9 +230,15 @@ impl Workspace {
 mod tests {
     use super::*;
 
+    fn test_workspace() -> (tempfile::TempDir, Workspace) {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = Workspace::new_with_root(tmp.path().to_path_buf()).unwrap();
+        (tmp, ws)
+    }
+
     #[test]
     fn test_workspace_creation() {
-        let ws = Workspace::new().unwrap();
+        let (_tmp, ws) = test_workspace();
         assert!(ws.root().exists());
         assert!(ws.repos().exists());
         assert!(ws.work().exists());
@@ -235,7 +247,7 @@ mod tests {
 
     #[test]
     fn test_work_dir_path() {
-        let ws = Workspace::new().unwrap();
+        let (_tmp, ws) = test_workspace();
         // Test with gru-created branch
         let work_path = ws.work_dir("myrepo", "gru/issue-123").unwrap();
         assert_eq!(work_path, ws.work().join("myrepo").join("gru/issue-123"));
@@ -247,21 +259,22 @@ mod tests {
 
     #[test]
     fn test_archive_dir_path() {
-        let ws = Workspace::new().unwrap();
+        let (_tmp, ws) = test_workspace();
         let archive_path = ws.archive_dir("minion-456").unwrap();
         assert_eq!(archive_path, ws.archive().join("minion-456"));
     }
 
     #[test]
     fn test_subsequent_calls_dont_fail() {
-        let ws1 = Workspace::new().unwrap();
-        let ws2 = Workspace::new().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let ws1 = Workspace::new_with_root(tmp.path().to_path_buf()).unwrap();
+        let ws2 = Workspace::new_with_root(tmp.path().to_path_buf()).unwrap();
         assert_eq!(ws1.root(), ws2.root());
     }
 
     #[test]
     fn test_work_dir_rejects_path_traversal() {
-        let ws = Workspace::new().unwrap();
+        let (_tmp, ws) = test_workspace();
         assert!(ws.work_dir("../../etc", "branch").is_err());
         assert!(ws.work_dir("repo", "../branch").is_err());
         assert!(ws.work_dir("repo\\subpath", "branch").is_err()); // Backslashes not allowed
@@ -269,7 +282,7 @@ mod tests {
 
     #[test]
     fn test_work_dir_allows_forward_slashes() {
-        let ws = Workspace::new().unwrap();
+        let (_tmp, ws) = test_workspace();
         // Forward slashes should be allowed in both repo names and branch names
         assert!(ws.work_dir("owner/repo", "gru/issue-123").is_ok());
         assert!(ws
@@ -279,14 +292,14 @@ mod tests {
 
     #[test]
     fn test_archive_dir_rejects_path_traversal() {
-        let ws = Workspace::new().unwrap();
+        let (_tmp, ws) = test_workspace();
         assert!(ws.archive_dir("../minion").is_err());
         assert!(ws.archive_dir("minion/subpath").is_err());
     }
 
     #[test]
     fn test_work_dir_accepts_dots_in_identifiers() {
-        let ws = Workspace::new().unwrap();
+        let (_tmp, ws) = test_workspace();
         // Dots in repo names should be allowed (e.g., "owner.io/repo")
         assert!(ws.work_dir("owner.io", "branch").is_ok());
         assert!(ws.work_dir("my.repo", "branch").is_ok());
@@ -297,7 +310,7 @@ mod tests {
 
     #[test]
     fn test_archive_dir_accepts_dots_in_identifiers() {
-        let ws = Workspace::new().unwrap();
+        let (_tmp, ws) = test_workspace();
         // Dots in minion IDs should be allowed
         assert!(ws.archive_dir("minion-1.2.3").is_ok());
         assert!(ws.archive_dir("v2.0").is_ok());
@@ -305,7 +318,7 @@ mod tests {
 
     #[test]
     fn test_work_dir_strips_remote_prefix() {
-        let ws = Workspace::new().unwrap();
+        let (_tmp, ws) = test_workspace();
         // Remote prefixes should be stripped automatically
         let work_path = ws.work_dir("owner/repo", "origin/main").unwrap();
         assert_eq!(work_path, ws.work().join("owner/repo").join("main"));
@@ -321,7 +334,7 @@ mod tests {
     #[cfg(unix)]
     fn test_directory_permissions() {
         use std::os::unix::fs::PermissionsExt;
-        let ws = Workspace::new().unwrap();
+        let (_tmp, ws) = test_workspace();
         let metadata = fs::metadata(ws.root()).unwrap();
         let permissions = metadata.permissions();
         assert_eq!(permissions.mode() & 0o777, 0o755);
