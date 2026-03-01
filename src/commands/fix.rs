@@ -695,9 +695,13 @@ fn build_fix_prompt(ctx: &IssueContext, wt_ctx: &WorktreeContext) -> String {
 
     // Try to load the prompt through the template system (allows overrides).
     // Use the worktree path as the repo root so `.gru/prompts/fix.md` is found.
-    let prompt_template = prompt_loader::resolve_prompt("fix", Some(&wt_ctx.worktree_path))
-        .ok()
-        .flatten();
+    let prompt_template = match prompt_loader::resolve_prompt("fix", Some(&wt_ctx.worktree_path)) {
+        Ok(p) => p,
+        Err(e) => {
+            log::warn!("Failed to load fix prompt: {e}, using /fix fallback");
+            None
+        }
+    };
 
     let template_content = match prompt_template {
         Some(ref p) => &p.content,
@@ -724,7 +728,10 @@ fn build_fix_prompt(ctx: &IssueContext, wt_ctx: &WorktreeContext) -> String {
     prompt_ctx.branch_name = Some(wt_ctx.branch_name.clone());
 
     let mut variables = prompt_ctx.to_variables();
-    // Add the labels variable (fix-specific context not in the standard PromptContext)
+    // Add the labels variable (fix-specific, not in the standard PromptContext).
+    // Note: the value includes the "\nLabels: " prefix when labels are present,
+    // or is empty when there are none. Override authors should use {{ labels }}
+    // on its own line.
     variables.insert("labels".to_string(), labels_section);
 
     render_template(template_content, &variables)

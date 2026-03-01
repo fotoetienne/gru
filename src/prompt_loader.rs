@@ -415,6 +415,10 @@ fn load_prompts_internal(
 /// This is the main entry point for commands like `gru fix` that need to load
 /// a built-in prompt while allowing user overrides.
 ///
+/// Note: This loads all prompts (scanning filesystem directories) then returns one.
+/// This is acceptable since the number of prompts is small, but could be optimized
+/// with a targeted lookup if prompt count grows significantly.
+///
 /// Returns `None` if no prompt with that name exists (neither built-in nor custom).
 pub fn resolve_prompt(name: &str, repo_root: Option<&Path>) -> Result<Option<Prompt>> {
     let mut prompts = load_prompts(repo_root)?;
