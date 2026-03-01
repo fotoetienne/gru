@@ -1,44 +1,38 @@
 use anyhow::Result;
 
+use crate::git;
 use crate::prompt_loader::{self, BUILT_IN_PROMPTS};
 
 /// Handles the `gru prompts` command by listing all available prompts
 /// grouped by source (built-in, repo, global).
 pub async fn handle_prompts() -> Result<i32> {
-    // Detect repo root from current working directory
-    let repo_root = detect_repo_root();
+    let repo_root = git::detect_git_repo().await.ok();
 
     let prompts_by_source = prompt_loader::list_prompts_by_source(repo_root.as_deref())?;
 
-    // Collect names of repo prompts that override built-in ones
+    // Collect names of custom prompts (repo + global) that override built-in ones
     let built_in_names: Vec<&str> = BUILT_IN_PROMPTS.iter().map(|(name, _)| *name).collect();
-    let repo_override_names: Vec<&str> = prompts_by_source
+    let override_names: Vec<&str> = prompts_by_source
         .repo
         .iter()
+        .chain(prompts_by_source.global.iter())
         .filter(|p| built_in_names.contains(&p.name.as_str()))
         .map(|p| p.name.as_str())
         .collect();
 
-    let mut any_output = false;
-
-    // Built-in prompts
-    if !prompts_by_source.built_in.is_empty() {
-        println!("BUILT-IN PROMPTS:");
-        for (name, description) in &prompts_by_source.built_in {
-            if repo_override_names.contains(&name.as_str()) {
-                println!("  {:<16} {} [OVERRIDDEN]", name, description);
-            } else {
-                println!("  {:<16} {}", name, description);
-            }
+    // Built-in prompts (always present)
+    println!("BUILT-IN PROMPTS:");
+    for (name, description) in &prompts_by_source.built_in {
+        if override_names.contains(&name.as_str()) {
+            println!("  {:<16} {} [OVERRIDDEN]", name, description);
+        } else {
+            println!("  {:<16} {}", name, description);
         }
-        any_output = true;
     }
 
     // Repo prompts
     if !prompts_by_source.repo.is_empty() {
-        if any_output {
-            println!();
-        }
+        println!();
         println!("CUSTOM PROMPTS (.gru/prompts/):");
         for prompt in &prompts_by_source.repo {
             let description = prompt
@@ -53,14 +47,11 @@ pub async fn handle_prompts() -> Result<i32> {
                 println!("  {:<16} {}", prompt.name, description);
             }
         }
-        any_output = true;
     }
 
     // Global prompts
     if !prompts_by_source.global.is_empty() {
-        if any_output {
-            println!();
-        }
+        println!();
         println!("GLOBAL PROMPTS (~/.gru/prompts/):");
         for prompt in &prompts_by_source.global {
             let description = prompt
@@ -75,33 +66,9 @@ pub async fn handle_prompts() -> Result<i32> {
                 println!("  {:<16} {}", prompt.name, description);
             }
         }
-        any_output = true;
-    }
-
-    if !any_output {
-        println!("No prompts found.");
-        println!();
-        println!("To create custom prompts, add .md files to:");
-        println!("  .gru/prompts/     (repo-specific)");
-        println!("  ~/.gru/prompts/   (global)");
     }
 
     Ok(0)
-}
-
-/// Detects the git repository root from the current working directory.
-fn detect_repo_root() -> Option<std::path::PathBuf> {
-    let output = std::process::Command::new("git")
-        .args(["rev-parse", "--show-toplevel"])
-        .output()
-        .ok()?;
-
-    if output.status.success() {
-        let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        Some(std::path::PathBuf::from(path))
-    } else {
-        None
-    }
 }
 
 #[cfg(test)]
@@ -110,11 +77,11 @@ mod tests {
     use std::fs;
     use tempfile::TempDir;
 
-    #[test]
-    fn test_detect_repo_root_returns_some_in_git_repo() {
+    #[tokio::test]
+    async fn test_detect_git_repo_returns_ok_in_git_repo() {
         // This test runs inside a git repo (the gru project itself)
-        let root = detect_repo_root();
-        assert!(root.is_some());
+        let root = git::detect_git_repo().await;
+        assert!(root.is_ok());
     }
 
     #[test]

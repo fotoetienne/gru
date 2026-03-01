@@ -9,10 +9,7 @@
 /// - Support `description`, `requires`, and `params` fields
 /// - Resolution order: repo → built-in → global
 /// - Validate prompt syntax on load
-///
-/// Note: This module is not yet integrated with the CLI (Phase 2 implementation).
-/// The `#[cfg_attr]` allows dead_code during development but will be removed
-/// once the module is actively used.
+/// - List prompts grouped by source for `gru prompts` command
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
