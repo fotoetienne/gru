@@ -74,18 +74,6 @@ impl LabConfig {
         Ok(home.join(".gru").join("config.toml"))
     }
 
-    /// Load from default path if it exists, otherwise return default config
-    #[allow(dead_code)]
-    pub fn load_or_default() -> Result<Self> {
-        let path = Self::default_path()?;
-
-        if path.exists() {
-            Self::load(&path)
-        } else {
-            Ok(Self::default())
-        }
-    }
-
     /// Validate configuration
     pub fn validate(&self) -> Result<()> {
         if self.daemon.repos.is_empty() {
@@ -116,25 +104,6 @@ impl LabConfig {
     /// Get poll interval as Duration
     pub fn poll_interval(&self) -> Duration {
         Duration::from_secs(self.daemon.poll_interval_secs)
-    }
-
-    /// Create example config file
-    #[allow(dead_code)]
-    pub fn example() -> String {
-        r#"[daemon]
-# Repositories to monitor for ready-for-minion issues
-repos = ["owner/repo1", "owner/repo2"]
-
-# Polling interval in seconds (default: 30)
-poll_interval_secs = 30
-
-# Maximum concurrent Minion slots (default: 2)
-max_slots = 2
-
-# Label to watch for issues (default: "ready-for-minion")
-label = "ready-for-minion"
-"#
-        .to_string()
     }
 
     /// Merge with CLI overrides

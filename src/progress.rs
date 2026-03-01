@@ -420,12 +420,6 @@ impl ProgressDisplay {
         self.status_bar.tick();
     }
 
-    /// Finish the progress display
-    #[allow(dead_code)]
-    pub fn finish(&self) {
-        self.status_bar.finish_and_clear();
-    }
-
     /// Finish the progress display and show a final message
     pub fn finish_with_message(&self, message: &str) {
         self.status_bar.finish_with_message(message.to_string());

@@ -312,13 +312,12 @@ impl MinionRegistry {
     }
 
     /// Checks if a Minion exists in the registry
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn exists(&self, minion_id: &str) -> bool {
         self.data.minions.contains_key(minion_id)
     }
 
     /// Gets a Minion's metadata by ID
-    #[allow(dead_code)]
     pub fn get(&self, minion_id: &str) -> Option<&MinionInfo> {
         self.data.minions.get(minion_id)
     }
@@ -342,7 +341,6 @@ impl MinionRegistry {
     /// # Errors
     ///
     /// Returns an error if the registry cannot be saved to disk
-    #[allow(dead_code)]
     pub fn remove(&mut self, minion_id: &str) -> Result<Option<MinionInfo>> {
         let removed = self.data.minions.remove(minion_id);
         if removed.is_some() {

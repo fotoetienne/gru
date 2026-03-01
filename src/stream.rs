@@ -1,7 +1,7 @@
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::process::{ChildStderr, ChildStdout};
+use tokio::process::ChildStdout;
 
 /// Information about a message in a MessageStart event
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
@@ -179,17 +179,8 @@ impl EventStream<ChildStdout> {
     }
 }
 
-impl EventStream<ChildStderr> {
-    /// Create a new EventStream from a child process's stderr
-    #[allow(dead_code)]
-    pub fn from_stderr(stderr: ChildStderr) -> Self {
-        Self::new(stderr)
-    }
-}
-
 impl<R: tokio::io::AsyncRead + Unpin> EventStream<R> {
     /// Creates a new event stream from an async reader
-    #[allow(dead_code)]
     pub fn new(reader: R) -> Self {
         Self {
             reader: BufReader::new(reader),
@@ -245,7 +236,7 @@ impl<R: tokio::io::AsyncRead + Unpin> EventStream<R> {
     }
 
     /// Read all lines from the stream
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub async fn read_all(&mut self) -> anyhow::Result<Vec<StreamOutput>> {
         let mut outputs = Vec::new();
         while let Some(output) = self.next_line().await? {

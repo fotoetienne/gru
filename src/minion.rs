@@ -1,20 +1,10 @@
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Seek, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use fs2::FileExt;
 
 use crate::workspace::Workspace;
-
-/// Represents a Minion workspace for working on a specific GitHub issue
-#[allow(dead_code)]
-#[derive(Debug, Clone)]
-pub struct Minion {
-    pub id: String,
-    pub repo: String,
-    pub issue: String,
-    pub workspace_path: PathBuf,
-}
 
 /// Generates a unique Minion ID using a monotonic counter
 ///
@@ -31,7 +21,6 @@ pub struct Minion {
 ///
 /// * `state_dir` - Optional custom state directory path. If None, uses `~/.gru/state/`.
 ///   This parameter is primarily for testing with isolated temp directories.
-#[allow(dead_code)]
 pub fn generate_minion_id_with_state(state_dir: Option<&Path>) -> io::Result<String> {
     let state_path = if let Some(custom_dir) = state_dir {
         // Test path: use provided directory and ensure it exists
@@ -93,7 +82,6 @@ pub fn generate_minion_id_with_state(state_dir: Option<&Path>) -> io::Result<Str
 /// Generates a unique Minion ID using the default production state directory.
 ///
 /// This is a convenience wrapper around `generate_minion_id_with_state(None)`.
-#[allow(dead_code)]
 pub fn generate_minion_id() -> io::Result<String> {
     generate_minion_id_with_state(None)
 }
@@ -193,19 +181,5 @@ mod tests {
 
         // All IDs should be unique
         assert_eq!(ids.len(), 5);
-    }
-
-    #[test]
-    fn test_minion_struct() {
-        let minion = Minion {
-            id: "M001".to_string(),
-            repo: "fotoetienne/gru".to_string(),
-            issue: "123".to_string(),
-            workspace_path: PathBuf::from("/tmp/test"),
-        };
-
-        assert_eq!(minion.id, "M001");
-        assert_eq!(minion.repo, "fotoetienne/gru");
-        assert_eq!(minion.issue, "123");
     }
 }

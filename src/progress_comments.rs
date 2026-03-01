@@ -1,11 +1,4 @@
 use chrono::{DateTime, Utc};
-use std::time::{Duration, Instant};
-
-/// Minimum time between progress comments (5 minutes)
-/// Note: Currently unused after refactoring to remove GitHub comment posting from stream callback.
-/// Kept for potential future use if async callbacks are implemented.
-#[allow(dead_code)]
-const MIN_COMMENT_INTERVAL: Duration = Duration::from_secs(300);
 
 /// Represents the phase of Minion execution
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,13 +55,9 @@ impl ProgressUpdate {
     }
 }
 
-/// Tracks progress and manages comment posting with rate limiting
+/// Tracks progress and manages comment posting
 pub struct ProgressCommentTracker {
     minion_id: String,
-    /// Note: Currently unused after refactoring to remove GitHub comment posting from stream callback.
-    /// Kept for potential future use if async callbacks are implemented.
-    #[allow(dead_code)]
-    last_comment_time: Option<Instant>,
     current_phase: MinionPhase,
 }
 
@@ -77,7 +66,6 @@ impl ProgressCommentTracker {
     pub fn new(minion_id: String) -> Self {
         Self {
             minion_id,
-            last_comment_time: None,
             current_phase: MinionPhase::Planning,
         }
     }
@@ -85,17 +73,6 @@ impl ProgressCommentTracker {
     /// Update the current phase
     pub fn set_phase(&mut self, phase: MinionPhase) {
         self.current_phase = phase;
-    }
-
-    /// Check if enough time has passed since the last comment
-    /// Note: Currently unused after refactoring to remove GitHub comment posting from stream callback.
-    /// Kept for potential future use if async callbacks are implemented.
-    #[allow(dead_code)]
-    pub fn can_post_comment(&self) -> bool {
-        match self.last_comment_time {
-            None => true,
-            Some(last_time) => last_time.elapsed() >= MIN_COMMENT_INTERVAL,
-        }
     }
 
     /// Create a progress update (without posting it)
@@ -106,14 +83,6 @@ impl ProgressCommentTracker {
             timestamp: Utc::now(),
             message,
         }
-    }
-
-    /// Mark that a comment was posted
-    /// Note: Currently unused after refactoring to remove GitHub comment posting from stream callback.
-    /// Kept for potential future use if async callbacks are implemented.
-    #[allow(dead_code)]
-    pub fn mark_comment_posted(&mut self) {
-        self.last_comment_time = Some(Instant::now());
     }
 
     /// Get the current phase
@@ -165,7 +134,6 @@ mod tests {
         let tracker = ProgressCommentTracker::new("M001".to_string());
         assert_eq!(tracker.minion_id, "M001");
         assert_eq!(tracker.current_phase, MinionPhase::Planning);
-        assert!(tracker.can_post_comment());
     }
 
     #[test]
@@ -178,18 +146,6 @@ mod tests {
 
         tracker.set_phase(MinionPhase::Testing);
         assert_eq!(tracker.current_phase(), MinionPhase::Testing);
-    }
-
-    #[test]
-    fn test_progress_tracker_rate_limiting() {
-        let mut tracker = ProgressCommentTracker::new("M001".to_string());
-
-        // Initially, should be able to post
-        assert!(tracker.can_post_comment());
-
-        // After marking as posted, should not be able to post immediately
-        tracker.mark_comment_posted();
-        assert!(!tracker.can_post_comment());
     }
 
     #[test]

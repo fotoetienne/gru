@@ -53,7 +53,6 @@ pub struct PromptParam {
 }
 
 /// A loaded prompt with metadata and content
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct Prompt {
     /// Name of the prompt (filename without .md extension)
@@ -66,6 +65,7 @@ pub struct Prompt {
     pub content: String,
 
     /// Source location of the prompt file
+    #[cfg_attr(not(test), allow(dead_code))]
     pub source: PromptSource,
 }
 
