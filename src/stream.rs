@@ -201,7 +201,9 @@ pub struct TokenUsage {
 }
 
 impl TokenUsage {
-    /// Update from a message_start event's usage field
+    /// Update from a message_start event's usage field.
+    /// Note: output_tokens in message_start is always 0 per Anthropic's streaming spec;
+    /// actual output token counts come from message_delta events.
     pub fn add_message_start(&mut self, usage: &Usage) {
         self.input_tokens += usage.input_tokens;
         if let Some(cache_creation) = usage.cache_creation_input_tokens {

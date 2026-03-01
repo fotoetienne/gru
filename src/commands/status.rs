@@ -226,8 +226,8 @@ pub async fn handle_status(id: Option<String>) -> Result<i32> {
 
     // Print table header
     println!(
-        "{:<8} {:<20} {:<8} {:<10} {:<8} {:<30} {:<10} {:<8} {:<20}",
-        "MINION", "REPO", "ISSUE", "TASK", "PR", "BRANCH", "STATUS", "UPTIME", "TOKENS"
+        "{:<8} {:<20} {:<8} {:<10} {:<8} {:<30} {:<10} {:<8} TOKENS",
+        "MINION", "REPO", "ISSUE", "TASK", "PR", "BRANCH", "STATUS", "UPTIME"
     );
 
     // Print each minion
@@ -245,7 +245,7 @@ pub async fn handle_status(id: Option<String>) -> Result<i32> {
             .unwrap_or_else(|| "-".to_string());
 
         println!(
-            "{:<8} {:<20} {:<8} {:<10} {:<8} {:<30} {:<10} {:<8} {:<20}",
+            "{:<8} {:<20} {:<8} {:<10} {:<8} {:<30} {:<10} {:<8} {}",
             minion.minion_id,
             minion.repo,
             issue_display,

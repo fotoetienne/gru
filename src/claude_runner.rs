@@ -331,11 +331,6 @@ where
     // Always wait for the process
     let status = child.wait().await.context("Failed to wait for child")?;
 
-    // Log token usage summary
-    if token_usage.total_tokens() > 0 {
-        log::info!("📊 Token usage: {}", token_usage.display_compact());
-    }
-
     // Now check if there was a stream error
     stream_result?;
 

@@ -688,6 +688,8 @@ mod tests {
         assert_eq!(info.mode, MinionMode::Stopped);
         // session_id should get a default UUID
         assert!(!info.session_id.is_empty());
+        // token_usage should default to None for old registry entries
+        assert!(info.token_usage.is_none());
     }
 
     #[test]
