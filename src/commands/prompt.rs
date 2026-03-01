@@ -128,8 +128,9 @@ async fn parse_pr_arg(pr_str: &str) -> Result<(String, String, u64)> {
     );
 }
 
-/// Fetches PR data from GitHub and populates a PromptContext
-async fn fetch_pr_context(pr_str: &str) -> Result<(PromptContext, String, String, u64, String)> {
+/// Fetches PR data from GitHub and populates a PromptContext.
+/// Returns (context, owner, repo, branch_name).
+async fn fetch_pr_context(pr_str: &str) -> Result<(PromptContext, String, String, String)> {
     let (owner, repo, pr_number) = parse_pr_arg(pr_str).await?;
 
     println!("🔗 Fetching PR #{} from {}/{}...", pr_number, owner, repo);
@@ -180,7 +181,7 @@ async fn fetch_pr_context(pr_str: &str) -> Result<(PromptContext, String, String
         context.pr_title.as_deref().unwrap_or("(no title)")
     );
 
-    Ok((context, owner, repo, pr_number, branch_name))
+    Ok((context, owner, repo, branch_name))
 }
 
 /// Sets up a worktree for a PR by finding an existing one for the branch, or falling back to CWD
@@ -290,7 +291,7 @@ pub async fn handle_prompt(
     }
 
     if let Some(ref pr_str) = pr_opt {
-        let (pr_ctx, owner, repo, _pr_num, branch) = fetch_pr_context(pr_str).await?;
+        let (pr_ctx, owner, repo, branch) = fetch_pr_context(pr_str).await?;
         // Merge PR context into existing context (issue fields are preserved)
         context.pr_number = pr_ctx.pr_number;
         context.pr_title = pr_ctx.pr_title;
@@ -324,7 +325,11 @@ pub async fn handle_prompt(
     // Initialize workspace
     let workspace = workspace::Workspace::new().context("Failed to initialize Gru workspace")?;
 
-    // Set up worktree or ad-hoc workspace
+    // Set up worktree or ad-hoc workspace.
+    // Priority: --issue creates a new worktree; --pr reuses an existing one or falls
+    // back to CWD. When both are provided, --issue wins for worktree creation since
+    // Claude runs in the issue worktree. PR template variables are still populated
+    // regardless of which worktree is used.
     let has_context = issue_opt.is_some() || pr_opt.is_some();
     let (workspace_path, branch_name, run_dir) = if issue_opt.is_some() && !no_worktree {
         let owner = context_owner.as_deref().unwrap();
