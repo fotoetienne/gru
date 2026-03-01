@@ -367,7 +367,7 @@ impl ProgressDisplay {
                     }
                 }
             }
-            ClaudeEvent::MessageDelta { delta } => {
+            ClaudeEvent::MessageDelta { delta, .. } => {
                 if let Some(stop_reason) = &delta.stop_reason {
                     match stop_reason.as_str() {
                         "end_turn" => {

@@ -1,4 +1,4 @@
-use crate::stream::{self, EventStream};
+use crate::stream::{self, ClaudeEvent, EventStream, TokenUsage};
 use anyhow::{Context, Result};
 use std::path::Path;
 use std::time::Instant;
@@ -60,6 +60,13 @@ impl std::fmt::Display for ClaudeRunnerError {
 }
 
 impl std::error::Error for ClaudeRunnerError {}
+
+/// Result of running a Claude session, including exit status and token usage
+#[derive(Debug)]
+pub struct ClaudeRunResult {
+    pub status: std::process::ExitStatus,
+    pub token_usage: TokenUsage,
+}
 
 /// Logs an event to events.jsonl in the given directory
 async fn log_event(dir: &Path, event: &stream::StreamOutput) -> Result<()> {
@@ -192,7 +199,7 @@ pub async fn run_claude_with_stream_monitoring<F>(
     timeout_opt: Option<&str>,
     mut output_callback: Option<F>,
     on_spawn: Option<Box<dyn FnOnce(u32) + Send>>,
-) -> Result<std::process::ExitStatus>
+) -> Result<ClaudeRunResult>
 where
     F: FnMut(&stream::StreamOutput),
 {
@@ -227,6 +234,9 @@ where
 
     // Track task start time for overall timeout
     let task_start = Instant::now();
+
+    // Accumulate token usage across the session
+    let mut token_usage = TokenUsage::default();
 
     // Process stream output asynchronously with timeout and error handling
     let stream_result: Result<()> = async {
@@ -284,8 +294,22 @@ where
                     // Update last event time for any output
                     last_event_time = Instant::now();
 
-                    // Reset warning flag only on actual events (not raw output lines)
-                    if matches!(output, stream::StreamOutput::Event(_)) {
+                    // Accumulate token usage from stream events
+                    if let stream::StreamOutput::Event(ref event) = output {
+                        match event {
+                            ClaudeEvent::MessageStart { message } => {
+                                if let Some(ref usage) = message.usage {
+                                    token_usage.add_message_start(usage);
+                                }
+                            }
+                            ClaudeEvent::MessageDelta {
+                                usage: Some(ref usage),
+                                ..
+                            } => {
+                                token_usage.add_message_delta(usage);
+                            }
+                            _ => {}
+                        }
                         inactivity_warning_shown = false;
                     }
 
@@ -311,8 +335,11 @@ where
     // Now check if there was a stream error
     stream_result?;
 
-    // Return the exit status for caller to handle
-    Ok(status)
+    // Return the exit status and token usage for caller to handle
+    Ok(ClaudeRunResult {
+        status,
+        token_usage,
+    })
 }
 
 #[cfg(test)]
