@@ -464,9 +464,9 @@ impl GitHubClient {
 // ============================================================================
 // gh CLI Helper Functions
 // ============================================================================
-// Note: gh CLI functions for issue claiming have been removed in favor of
-// simpler auto-detection from current directory. They may be re-added in
-// future phases when implementing multi-Lab coordination.
+// These free functions use the gh CLI directly for operations where octocrab
+// doesn't provide good support (PR creation, marking ready) or as fallbacks
+// when GitHubClient initialization fails (issue fetching).
 
 /// Mark a draft PR as ready for review using gh CLI
 ///
