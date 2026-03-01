@@ -1,10 +1,11 @@
 use crate::config::LabConfig;
 use crate::github::GitHubClient;
-use crate::minion_registry::MinionRegistry;
+use crate::minion_registry::{is_process_alive, MinionRegistry};
 use anyhow::{Context, Result};
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
+use tokio::process::Child;
 use tokio::time::sleep;
 
 /// Handles the lab daemon command
@@ -58,8 +59,11 @@ pub async fn handle_lab(
     println!("Press Ctrl-C to stop...");
     println!();
 
+    // Track child processes for graceful shutdown
+    let mut children: Vec<Child> = Vec::new();
+
     // Perform initial poll immediately for faster feedback
-    if let Err(e) = poll_and_spawn(&config).await {
+    if let Err(e) = poll_and_spawn(&config, &mut children).await {
         log::warn!("⚠️  Initial polling error: {}", e);
         log::warn!("   Continuing to poll...");
     }
@@ -69,10 +73,14 @@ pub async fn handle_lab(
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {
                 println!("\n🛑 Received shutdown signal, stopping daemon...");
+                shutdown_children(&mut children).await;
                 break;
             }
             _ = sleep(config.poll_interval()) => {
-                if let Err(e) = poll_and_spawn(&config).await {
+                // Clean up finished child processes
+                reap_children(&mut children);
+
+                if let Err(e) = poll_and_spawn(&config, &mut children).await {
                     log::warn!("⚠️  Polling error: {}", e);
                     log::warn!("   Continuing to poll...");
                 }
@@ -83,10 +91,73 @@ pub async fn handle_lab(
     Ok(0)
 }
 
+/// Remove finished child processes from the tracking vec
+fn reap_children(children: &mut Vec<Child>) {
+    let mut i = 0;
+    while i < children.len() {
+        match children[i].try_wait() {
+            Ok(Some(status)) => {
+                log::info!("Minion process exited with status: {}", status);
+                children.swap_remove(i);
+            }
+            Ok(None) => {
+                i += 1; // Still running
+            }
+            Err(e) => {
+                log::warn!("Failed to check child process status: {}", e);
+                i += 1;
+            }
+        }
+    }
+}
+
+/// Signal all child processes to shut down gracefully on Ctrl-C
+async fn shutdown_children(children: &mut [Child]) {
+    if children.is_empty() {
+        return;
+    }
+
+    println!(
+        "🔪 Signaling {} running Minion(s) to shut down...",
+        children.len()
+    );
+
+    // Send SIGTERM to all children
+    for child in children.iter() {
+        if let Some(pid) = child.id() {
+            #[cfg(unix)]
+            {
+                // SAFETY: kill with SIGTERM is safe - it requests graceful termination.
+                // The PID is valid because we just obtained it from the child handle.
+                unsafe {
+                    libc::kill(pid as i32, libc::SIGTERM);
+                }
+            }
+        }
+    }
+
+    // Wait briefly for graceful shutdown
+    println!("⏳ Waiting for Minions to exit...");
+    sleep(Duration::from_secs(5)).await;
+
+    // Force-kill any remaining processes and wait for them to exit
+    for child in children.iter_mut() {
+        match child.try_wait() {
+            Ok(Some(_)) => {} // Already exited
+            _ => {
+                log::warn!("Force-killing Minion process that didn't exit gracefully");
+                let _ = child.kill().await;
+            }
+        }
+    }
+}
+
 /// Poll GitHub for ready issues and spawn Minions if slots are available
-async fn poll_and_spawn(config: &LabConfig) -> Result<()> {
-    // Calculate available slots once at the start to avoid race conditions
-    // Track spawned count within this function to maintain accurate slot availability
+async fn poll_and_spawn(config: &LabConfig, children: &mut Vec<Child>) -> Result<()> {
+    // Prune stale registry entries (worktrees that no longer exist)
+    prune_stale_entries().await?;
+
+    // Calculate available slots using PID liveness (not registry status string)
     let mut available = available_slots(config.daemon.max_slots).await?;
 
     if available == 0 {
@@ -142,7 +213,7 @@ async fn poll_and_spawn(config: &LabConfig) -> Result<()> {
                 break;
             }
 
-            // Check if issue is already being worked on
+            // Check if issue is already being worked on (by a live process)
             if is_issue_claimed(repo_spec, issue.number).await? {
                 continue;
             }
@@ -152,7 +223,8 @@ async fn poll_and_spawn(config: &LabConfig) -> Result<()> {
                 Ok(true) => {
                     // Successfully claimed, spawn Minion
                     match spawn_minion(repo_spec, issue.number).await {
-                        Ok(()) => {
+                        Ok(child) => {
+                            children.push(child);
                             println!(
                                 "✨ Spawned Minion for {}/issues/{}",
                                 repo_spec, issue.number
@@ -201,14 +273,37 @@ async fn poll_and_spawn(config: &LabConfig) -> Result<()> {
     Ok(())
 }
 
-/// Calculate available slots based on active Minions in registry
+/// Prune stale registry entries where worktrees no longer exist
+async fn prune_stale_entries() -> Result<()> {
+    tokio::task::spawn_blocking(move || {
+        let mut registry = MinionRegistry::load(None)?;
+        let minions = registry.list();
+
+        let stale_ids: Vec<String> = minions
+            .iter()
+            .filter(|(_id, info)| !info.worktree.exists())
+            .map(|(id, _)| id.clone())
+            .collect();
+
+        if !stale_ids.is_empty() {
+            let count = registry.remove_batch(&stale_ids)?;
+            log::info!("🗑️  Pruned {} stale Minion(s) from registry", count);
+        }
+
+        Ok::<(), anyhow::Error>(())
+    })
+    .await
+    .context("Failed to join spawn_blocking task")?
+}
+
+/// Calculate available slots based on PID liveness of registered Minions
 async fn available_slots(max_slots: usize) -> Result<usize> {
     let active_count = tokio::task::spawn_blocking(move || {
         let registry = MinionRegistry::load(None)?;
         let active = registry
             .list()
             .iter()
-            .filter(|(_id, info)| info.status == "active")
+            .filter(|(_id, info)| info.pid.is_some_and(is_process_alive))
             .count();
         Ok::<usize, anyhow::Error>(active)
     })
@@ -218,13 +313,15 @@ async fn available_slots(max_slots: usize) -> Result<usize> {
     Ok(max_slots.saturating_sub(active_count))
 }
 
-/// Check if an issue is already being worked on by a Minion
+/// Check if an issue is already being worked on by a live Minion process
 async fn is_issue_claimed(repo: &str, issue_number: u64) -> Result<bool> {
     let repo = repo.to_string();
     tokio::task::spawn_blocking(move || {
         let registry = MinionRegistry::load(None)?;
         let claimed = registry.list().iter().any(|(_id, info)| {
-            info.repo == repo && info.issue == issue_number && info.status == "active"
+            info.repo == repo
+                && info.issue == issue_number
+                && info.pid.is_some_and(is_process_alive)
         });
         Ok::<bool, anyhow::Error>(claimed)
     })
@@ -232,20 +329,38 @@ async fn is_issue_claimed(repo: &str, issue_number: u64) -> Result<bool> {
     .context("Failed to join spawn_blocking task")?
 }
 
-/// Spawn a Minion to work on an issue using the `gru fix` command
-async fn spawn_minion(repo: &str, issue_number: u64) -> Result<()> {
+/// Spawn a Minion to work on an issue using the `gru fix` command.
+/// Returns the child process handle for lifecycle tracking.
+async fn spawn_minion(repo: &str, issue_number: u64) -> Result<Child> {
     let issue_ref = format!("{}/issues/{}", repo, issue_number);
 
     // Get the current executable path
     let exe = std::env::current_exe().context("Failed to get current executable path")?;
 
-    // Spawn `gru fix <issue>` as a background process
+    // Create log directory and open log file for this minion's output
+    let home = dirs::home_dir().context("Failed to determine home directory")?;
+    let log_dir = home.join(".gru").join("state").join("logs");
+    std::fs::create_dir_all(&log_dir)
+        .with_context(|| format!("Failed to create log directory: {}", log_dir.display()))?;
+
+    let safe_repo = repo.replace('/', "-");
+    let log_path = log_dir.join(format!("{}-issue-{}.log", safe_repo, issue_number));
+    let stdout_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .with_context(|| format!("Failed to open log file: {}", log_path.display()))?;
+    let stderr_file = stdout_file
+        .try_clone()
+        .context("Failed to clone log file handle")?;
+
+    // Spawn `gru fix <issue>` as a background process with output captured to log file
     let mut child = tokio::process::Command::new(exe)
         .arg("fix")
         .arg(&issue_ref)
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stdout(Stdio::from(stdout_file))
+        .stderr(Stdio::from(stderr_file))
         .spawn()
         .context("Failed to spawn gru fix command")?;
 
@@ -263,24 +378,33 @@ async fn spawn_minion(repo: &str, issue_number: u64) -> Result<()> {
         );
     }
 
-    // Intentionally drop the Child handle to allow the spawned process to run independently.
-    // This is a deliberate use of the fire-and-forget pattern: we do not wait for the process
-    // to complete, and dropping the handle here ensures it is detached. The spawned `gru fix`
-    // command will register itself in the Minion registry and manage its own lifecycle.
-    // Future maintainers: this is intentional and not an oversight.
-    drop(child);
+    println!("📝 Log: {}", log_path.display());
 
-    Ok(())
+    Ok(child)
 }
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
     fn test_available_slots_calculation() {
-        // This would require mocking the registry, which is complex
-        // For now, we'll test the logic manually
         assert_eq!(5usize.saturating_sub(2), 3);
         assert_eq!(5usize.saturating_sub(5), 0);
         assert_eq!(5usize.saturating_sub(10), 0);
+    }
+
+    #[test]
+    fn test_reap_children_empty() {
+        let mut children: Vec<Child> = Vec::new();
+        reap_children(&mut children);
+        assert!(children.is_empty());
+    }
+
+    #[test]
+    fn test_log_path_construction() {
+        let safe_repo = "owner/repo".replace('/', "-");
+        let log_name = format!("{}-issue-{}.log", safe_repo, 42);
+        assert_eq!(log_name, "owner-repo-issue-42.log");
     }
 }
