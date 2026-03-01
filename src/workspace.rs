@@ -53,7 +53,7 @@ impl Workspace {
         Ok(())
     }
 
-    /// Builds and initializes a Workspace from a given root path.
+    /// Test helper: creates a Workspace rooted at the given path.
     #[cfg(test)]
     pub fn new_with_root(root: PathBuf) -> io::Result<Self> {
         Self::init(root)
