@@ -278,7 +278,10 @@ pub async fn handle_prompt(
     // If it matches a loaded prompt file, use its content and validate requirements.
     // Otherwise, treat it as ad-hoc prompt text.
     let repo_root = std::env::current_dir().ok();
-    let loaded_prompts = prompt_loader::load_prompts(repo_root.as_deref()).unwrap_or_default();
+    let loaded_prompts = prompt_loader::load_prompts(repo_root.as_deref()).unwrap_or_else(|e| {
+        log::warn!("Failed to load prompt files: {}", e);
+        HashMap::new()
+    });
     let resolved_prompt = if let Some(file_prompt) = loaded_prompts.get(trimmed_prompt) {
         // Validate requirements before proceeding
         prompt_loader::validate_prompt_requirements(

@@ -423,7 +423,7 @@ pub fn validate_requires(
 ) -> Vec<(String, String)> {
     let mut missing = Vec::new();
     for req in requires {
-        match req.as_str() {
+        match req.to_lowercase().as_str() {
             "issue" => {
                 if !issue_provided {
                     missing.push(("issue".to_string(), "--issue <number>".to_string()));
@@ -434,10 +434,10 @@ pub fn validate_requires(
                     missing.push(("pr".to_string(), "--pr <number>".to_string()));
                 }
             }
-            other => {
+            _ => {
                 log::warn!(
-                    "Unknown requirement '{}' in prompt frontmatter (known: {:?})",
-                    other,
+                    "Unknown requirement '{}' in prompt frontmatter. Values must be lowercase (known: {:?})",
+                    req,
                     KNOWN_REQUIREMENTS
                 );
             }
@@ -458,7 +458,6 @@ pub fn validate_requires(
 /// * `issue_provided` - Whether `--issue` was provided
 /// * `pr_provided` - Whether `--pr` was provided
 /// * `provided_params` - The parameters provided via `--param` flags
-#[cfg_attr(not(test), allow(dead_code))]
 pub fn validate_prompt_requirements(
     prompt_name: &str,
     metadata: &PromptMetadata,
@@ -1080,6 +1079,18 @@ Repo content"#,
         let requires = vec!["unknown_thing".to_string()];
         let missing = validate_requires(&requires, false, false);
         // Unknown requirements don't produce missing entries (just a warning)
+        assert!(missing.is_empty());
+    }
+
+    #[test]
+    fn test_validate_requires_case_insensitive() {
+        // "Issue" and "PR" should be recognized (case-insensitive matching)
+        let requires = vec!["Issue".to_string(), "PR".to_string()];
+        let missing = validate_requires(&requires, false, false);
+        assert_eq!(missing.len(), 2);
+
+        // Providing them should satisfy the check
+        let missing = validate_requires(&requires, true, true);
         assert!(missing.is_empty());
     }
 
