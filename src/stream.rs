@@ -236,7 +236,7 @@ impl TokenUsage {
 
 /// Format a token count in a human-readable way (e.g., 1234 -> "1.2k", 1234567 -> "1.2M")
 fn format_token_count(count: u64) -> String {
-    if count >= 1_000_000 {
+    if count >= 999_950 {
         format!("{:.1}M", count as f64 / 1_000_000.0)
     } else if count >= 1_000 {
         format!("{:.1}k", count as f64 / 1_000.0)
@@ -702,7 +702,9 @@ mod tests {
         assert_eq!(format_token_count(999), "999");
         assert_eq!(format_token_count(1000), "1.0k");
         assert_eq!(format_token_count(1500), "1.5k");
-        assert_eq!(format_token_count(999_999), "1000.0k");
+        assert_eq!(format_token_count(999_949), "999.9k");
+        assert_eq!(format_token_count(999_950), "1.0M");
+        assert_eq!(format_token_count(999_999), "1.0M");
         assert_eq!(format_token_count(1_000_000), "1.0M");
         assert_eq!(format_token_count(2_500_000), "2.5M");
     }

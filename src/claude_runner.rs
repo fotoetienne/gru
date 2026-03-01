@@ -62,6 +62,7 @@ impl std::fmt::Display for ClaudeRunnerError {
 impl std::error::Error for ClaudeRunnerError {}
 
 /// Result of running a Claude session, including exit status and token usage
+#[derive(Debug)]
 pub struct ClaudeRunResult {
     pub status: std::process::ExitStatus,
     pub token_usage: TokenUsage,
