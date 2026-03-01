@@ -431,7 +431,7 @@ pub fn validate_requires(
 ) -> Vec<(String, String)> {
     let mut missing = Vec::new();
     for req in requires {
-        match req.to_lowercase().as_str() {
+        match req.trim().to_lowercase().as_str() {
             "issue" => {
                 if !issue_provided {
                     missing.push(("issue".to_string(), "--issue <number>".to_string()));
@@ -1088,6 +1088,17 @@ Repo content"#,
         assert_eq!(missing.len(), 2);
 
         // Providing them should satisfy the check
+        let missing = validate_requires(&requires, true, true);
+        assert!(missing.is_empty());
+    }
+
+    #[test]
+    fn test_validate_requires_trims_whitespace() {
+        // Values with leading/trailing whitespace should still match
+        let requires = vec!["issue ".to_string(), " pr".to_string()];
+        let missing = validate_requires(&requires, false, false);
+        assert_eq!(missing.len(), 2);
+
         let missing = validate_requires(&requires, true, true);
         assert!(missing.is_empty());
     }

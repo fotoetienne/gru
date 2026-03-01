@@ -277,12 +277,16 @@ pub async fn handle_prompt(
     // Try to resolve the prompt as a file-based prompt name.
     // If it matches a loaded prompt file, use its content and validate requirements.
     // Otherwise, treat it as ad-hoc prompt text.
-    let repo_root = std::env::current_dir().ok();
+    // Use git toplevel (not cwd) so prompts are found from subdirectories.
+    let repo_root = git::detect_git_repo().await.ok();
     let loaded_prompts = prompt_loader::load_prompts(repo_root.as_deref()).unwrap_or_else(|e| {
         log::warn!("Failed to load prompt files: {}", e);
         HashMap::new()
     });
     let resolved_prompt = if let Some(file_prompt) = loaded_prompts.get(trimmed_prompt) {
+        // Validate prompt syntax (non-empty content, valid param names)
+        prompt_loader::validate_prompt(file_prompt)?;
+
         // Validate requirements before proceeding
         prompt_loader::validate_prompt_requirements(
             &file_prompt.name,
