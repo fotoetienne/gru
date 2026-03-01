@@ -1,55 +1,20 @@
+use crate::claude_runner::{
+    build_claude_command, run_claude_with_stream_monitoring, EXIT_CODE_SIGNAL_TERMINATED,
+};
 use crate::git;
 use crate::minion;
 use crate::minion_registry::{MinionInfo as RegistryMinionInfo, MinionMode, MinionRegistry};
 use crate::minion_resolver;
 use crate::pr_state::PrState;
 use crate::progress::{ProgressConfig, ProgressDisplay};
-use crate::stream::{self, EventStream};
+use crate::stream;
 use crate::url_utils::parse_pr_info;
 use crate::workspace;
 use anyhow::{Context, Result};
 use chrono::Utc;
 use std::env;
-use std::path::Path;
-use std::time::Instant;
-use tokio::fs::OpenOptions;
-use tokio::io::AsyncWriteExt;
 use tokio::process::Command as TokioCommand;
-use tokio::time::{timeout, Duration};
 use uuid::Uuid;
-
-/// Timeout in seconds for each line read from Claude's output stream
-/// Set to 5 minutes to accommodate long-running LLM operations
-const STREAM_TIMEOUT_SECS: u64 = 300;
-
-/// Duration of inactivity before displaying a warning to the user (5 minutes)
-const INACTIVITY_WARNING_SECS: u64 = 300;
-
-/// Duration of inactivity before considering the task stuck
-const INACTIVITY_STUCK_SECS: u64 = 900; // 15 minutes
-
-/// Exit code returned when a process is terminated by a signal (shell convention)
-const EXIT_CODE_SIGNAL_TERMINATED: i32 = 128;
-
-/// Logs an event to events.jsonl in the worktree directory
-async fn log_event(worktree_path: &Path, event: &stream::StreamOutput) -> Result<()> {
-    let events_file = worktree_path.join("events.jsonl");
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&events_file)
-        .await
-        .context("Failed to open events.jsonl")?;
-
-    // Only log actual events, not raw lines
-    if let stream::StreamOutput::Event(claude_event) = event {
-        let json = serde_json::to_string(claude_event)?;
-        file.write_all(json.as_bytes()).await?;
-        file.write_all(b"\n").await?;
-        file.flush().await?;
-    }
-    Ok(())
-}
 
 /// Handles the review command by setting up workspace and spawning autonomous Claude agent with stream parsing
 /// Returns the exit code from the claude process
@@ -169,113 +134,36 @@ pub async fn handle_review(pr_arg: Option<String>) -> Result<i32> {
     let progress = ProgressDisplay::new(config);
 
     // Build the command with flags for autonomous stream-json output
-    let mut cmd = TokioCommand::new("claude");
-    cmd.arg("--print")
-        .arg("--verbose")
-        .arg("--session-id")
-        .arg(session_id.to_string())
-        .arg("--output-format")
-        .arg("stream-json")
-        .arg("--include-partial-messages")
-        .arg("--dangerously-skip-permissions")
-        .arg(format!("/pr_review {}", pr_num))
-        .stdin(std::process::Stdio::inherit())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::inherit())
-        .current_dir(&worktree_path);
+    let cmd = build_claude_command(
+        &worktree_path,
+        &session_id,
+        &format!("/pr_review {}", pr_num),
+    );
 
-    // Spawn the command
-    let mut child = cmd.spawn().context(
-        "claude command not found. Install from: https://github.com/anthropics/claude-code",
-    )?;
-
-    // Record child PID in the registry for status tracking
-    if let Some(pid) = child.id() {
-        let pid_minion_id = minion_id.clone();
-        tokio::task::spawn_blocking(move || {
-            if let Ok(mut registry) = MinionRegistry::load(None) {
-                let _ = registry.update(&pid_minion_id, |info| {
-                    info.pid = Some(pid);
-                    info.last_activity = Utc::now();
-                });
-            }
-        })
-        .await
-        .context("Failed to update registry with PID")?;
-    }
-
-    // Get the stdout handle
-    let stdout = child
-        .stdout
-        .take()
-        .context("Failed to capture stdout from claude process")?;
-
-    // Create event stream reader
-    let mut stream = EventStream::from_stdout(stdout);
-
-    // Process stream output asynchronously with timeout and error handling
-    let stream_result = async {
-        let mut last_event_time = Instant::now();
-        let mut inactivity_warning_shown = false;
-
-        loop {
-            // Check inactivity - time since last event
-            let inactivity = last_event_time.elapsed();
-
-            if inactivity.as_secs() >= INACTIVITY_STUCK_SECS {
-                log::warn!(
-                    "❌ Review appears stuck (no activity for {} minutes)",
-                    INACTIVITY_STUCK_SECS / 60
-                );
-                log::info!("📝 Events saved to events.jsonl");
-                return Err(anyhow::anyhow!(
-                    "No activity for {} minutes - review appears stuck",
-                    INACTIVITY_STUCK_SECS / 60
-                ));
-            } else if inactivity.as_secs() >= INACTIVITY_WARNING_SECS && !inactivity_warning_shown {
-                log::warn!(
-                    "⚠️  No activity for {} minutes",
-                    INACTIVITY_WARNING_SECS / 60
-                );
-                inactivity_warning_shown = true;
-            }
-
-            // Read next line with timeout
-            let line_result = timeout(Duration::from_secs(STREAM_TIMEOUT_SECS), stream.next_line())
-                .await
-                .map_err(|_| {
-                    anyhow::anyhow!(
-                        "Timeout: Claude process hasn't produced output in {} seconds",
-                        STREAM_TIMEOUT_SECS
-                    )
-                })?;
-
-            // Handle the stream result
-            match line_result? {
-                Some(output) => {
-                    // Log the event to events.jsonl
-                    log_event(&worktree_path, &output).await?;
-
-                    // Update last event time for any output
-                    last_event_time = Instant::now();
-
-                    // Reset warning flag only on actual events (not raw output lines)
-                    if matches!(output, stream::StreamOutput::Event(_)) {
-                        inactivity_warning_shown = false;
-                    }
-
-                    // Display progress
-                    progress.handle_output(&output);
-                }
-                None => break, // Stream ended normally
-            }
+    // Build on_spawn callback to record the child PID in the registry
+    let pid_minion_id = minion_id.clone();
+    let on_spawn: Box<dyn FnOnce(u32) + Send> = Box::new(move |pid: u32| {
+        if let Ok(mut registry) = MinionRegistry::load(None) {
+            let _ = registry.update(&pid_minion_id, |info| {
+                info.pid = Some(pid);
+                info.last_activity = Utc::now();
+            });
         }
-        Ok::<_, anyhow::Error>(())
-    }
-    .await;
+    });
 
-    // Always wait for the process, regardless of stream errors
-    let status = child.wait().await?;
+    // Run Claude with stream monitoring (no timeout for reviews)
+    let output_callback = move |output: &stream::StreamOutput| {
+        progress.handle_output(output);
+    };
+
+    let run_result = run_claude_with_stream_monitoring(
+        cmd,
+        &worktree_path,
+        None,
+        Some(output_callback),
+        Some(on_spawn),
+    )
+    .await;
 
     // Remove minion from registry (best effort - don't fail if this errors).
     // No need to update PID/mode first since the entry is being deleted.
@@ -290,13 +178,13 @@ pub async fn handle_review(pr_arg: Option<String>) -> Result<i32> {
     }
 
     // Now check if there was a stream error (after cleanup)
-    stream_result?;
+    let status = run_result?;
 
     // Finish the progress display
     if status.success() {
-        progress.finish_with_message(&format!("✅ Review complete for PR #{}", pr_num));
+        println!("✅ Review complete for PR #{}", pr_num);
     } else {
-        progress.finish_with_message(&format!("❌ Review failed for PR #{}", pr_num));
+        println!("❌ Review failed for PR #{}", pr_num);
     }
 
     // Return the exit code from the claude process
