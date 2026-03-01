@@ -5,6 +5,7 @@ pub mod init;
 pub mod lab;
 pub mod path;
 pub mod prompt;
+pub mod prompts;
 pub mod resume;
 pub mod review;
 pub mod status;

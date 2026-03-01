@@ -21,6 +21,19 @@ use std::path::{Path, PathBuf};
 
 use crate::reserved_commands;
 
+/// Built-in prompt definitions (commands that will become overridable templates in Phase 4)
+pub const BUILT_IN_PROMPTS: &[(&str, &str)] = &[
+    ("fix", "Fix a GitHub issue with tests and PR"),
+    ("review", "Review and respond to PR comments"),
+];
+
+/// Prompts grouped by their source, for display in `gru prompts`
+pub struct PromptsBySource {
+    pub built_in: Vec<(String, String)>,
+    pub repo: Vec<Prompt>,
+    pub global: Vec<Prompt>,
+}
+
 /// Metadata for a prompt file, parsed from YAML frontmatter
 #[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -323,6 +336,72 @@ pub fn validate_required_params(
     msg.push_str("\nProvide the missing parameter(s) with --param KEY=<value>");
 
     bail!("{}", msg.trim())
+}
+
+/// Lists all prompts grouped by source (built-in, repo, global).
+///
+/// Unlike `load_prompts()` which merges by priority, this function returns
+/// prompts in separate collections for display in `gru prompts`.
+pub fn list_prompts_by_source(repo_root: Option<&Path>) -> Result<PromptsBySource> {
+    list_prompts_by_source_internal(repo_root, dirs::home_dir().as_deref())
+}
+
+/// Internal function for listing prompts by source with explicit global directory path.
+fn list_prompts_by_source_internal(
+    repo_root: Option<&Path>,
+    global_root: Option<&Path>,
+) -> Result<PromptsBySource> {
+    // Built-in prompts
+    let built_in: Vec<(String, String)> = BUILT_IN_PROMPTS
+        .iter()
+        .map(|(name, desc)| (name.to_string(), desc.to_string()))
+        .collect();
+
+    // Repo prompts
+    let mut repo_prompts = Vec::new();
+    if let Some(repo_root) = repo_root {
+        let repo_dir = repo_root.join(".gru").join("prompts");
+        let repo_files = scan_prompt_directory(&repo_dir)?;
+
+        let mut sorted_files: Vec<_> = repo_files.into_iter().collect();
+        sorted_files.sort_by(|a, b| a.0.cmp(&b.0));
+
+        for (name, path) in sorted_files {
+            if reserved_commands::is_reserved(&name) {
+                continue;
+            }
+            match load_prompt_file(&path, &name, PromptSource::Repo(path.clone())) {
+                Ok(prompt) => repo_prompts.push(prompt),
+                Err(e) => log::warn!("Warning: Failed to load repo prompt '{}': {}", name, e),
+            }
+        }
+    }
+
+    // Global prompts
+    let mut global_prompts = Vec::new();
+    if let Some(global_root) = global_root {
+        let global_dir = global_root.join(".gru").join("prompts");
+        let global_files = scan_prompt_directory(&global_dir)?;
+
+        let mut sorted_files: Vec<_> = global_files.into_iter().collect();
+        sorted_files.sort_by(|a, b| a.0.cmp(&b.0));
+
+        for (name, path) in sorted_files {
+            if reserved_commands::is_reserved(&name) {
+                continue;
+            }
+            match load_prompt_file(&path, &name, PromptSource::Global(path.clone())) {
+                Ok(prompt) => global_prompts.push(prompt),
+                Err(e) => log::warn!("Warning: Failed to load global prompt '{}': {}", name, e),
+            }
+        }
+    }
+
+    Ok(PromptsBySource {
+        built_in,
+        repo: repo_prompts,
+        global: global_prompts,
+    })
 }
 
 /// Validates a prompt's syntax
