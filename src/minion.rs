@@ -59,38 +59,9 @@ pub fn generate_minion_id_with_state(state_dir: Option<&Path>) -> io::Result<Str
         .truncate(false)
         .open(&counter_path)?;
 
-    // Lock the file (platform-specific)
-    #[cfg(unix)]
-    {
-        use std::os::unix::io::AsRawFd;
-        unsafe {
-            if libc::flock(file.as_raw_fd(), libc::LOCK_EX) != 0 {
-                return Err(io::Error::last_os_error());
-            }
-        }
-    }
-
-    #[cfg(windows)]
-    {
-        use std::os::windows::io::AsRawHandle;
-        use windows_sys::Win32::Storage::FileSystem::{LockFileEx, LOCKFILE_EXCLUSIVE_LOCK};
-        use windows_sys::Win32::System::IO::OVERLAPPED;
-
-        unsafe {
-            let mut overlapped: OVERLAPPED = std::mem::zeroed();
-            if LockFileEx(
-                file.as_raw_handle() as _,
-                LOCKFILE_EXCLUSIVE_LOCK,
-                0,
-                u32::MAX,
-                u32::MAX,
-                &mut overlapped,
-            ) == 0
-            {
-                return Err(io::Error::last_os_error());
-            }
-        }
-    }
+    // Lock the file for exclusive access
+    use fs2::FileExt;
+    file.lock_exclusive()?;
 
     // Read current counter value
     let metadata = file.metadata()?;
