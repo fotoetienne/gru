@@ -43,12 +43,9 @@ use std::path::PathBuf;
 
 use once_cell::sync::Lazy;
 
-use crate::prompt_loader::Prompt;
-
 /// Regex pattern to match template variables: {{ variable_name }}
 /// Supports optional whitespace around variable names
 /// Variable names can contain alphanumeric characters, underscores, and hyphens
-#[cfg_attr(not(test), allow(dead_code))]
 static VARIABLE_PATTERN: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"\{\{\s*([a-zA-Z_][a-zA-Z0-9_-]*)\s*\}\}").unwrap());
 
@@ -57,7 +54,6 @@ static VARIABLE_PATTERN: Lazy<Regex> =
 /// Contains all standard template variables available to prompts.
 /// Variables that are not available are set to None and will be
 /// replaced with empty strings during rendering.
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, Default)]
 pub struct PromptContext {
     // GitHub context (when --issue or --pr provided)
@@ -95,7 +91,6 @@ pub struct PromptContext {
     pub params: HashMap<String, String>,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl PromptContext {
     /// Creates a new empty PromptContext
     pub fn new() -> Self {
@@ -103,6 +98,7 @@ impl PromptContext {
     }
 
     /// Creates a PromptContext with custom parameters
+    #[cfg(test)]
     pub fn with_params(params: HashMap<String, String>) -> Self {
         Self {
             params,
@@ -179,7 +175,6 @@ impl PromptContext {
 ///
 /// # Returns
 /// The rendered string with all variables substituted
-#[cfg_attr(not(test), allow(dead_code))]
 pub fn render_template(template: &str, variables: &HashMap<String, String>) -> String {
     VARIABLE_PATTERN
         .replace_all(template, |caps: &regex::Captures| {
@@ -197,8 +192,8 @@ pub fn render_template(template: &str, variables: &HashMap<String, String>) -> S
 ///
 /// # Returns
 /// The rendered prompt content
-#[cfg_attr(not(test), allow(dead_code))]
-pub fn render_prompt(prompt: &Prompt, context: &PromptContext) -> String {
+#[cfg(test)]
+pub fn render_prompt(prompt: &crate::prompt_loader::Prompt, context: &PromptContext) -> String {
     let variables = context.to_variables();
     render_template(&prompt.content, &variables)
 }
@@ -213,7 +208,7 @@ pub fn render_prompt(prompt: &Prompt, context: &PromptContext) -> String {
 ///
 /// # Returns
 /// A vector of unique variable names found in the template
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 pub fn extract_variables(template: &str) -> Vec<String> {
     use std::collections::HashSet;
 
@@ -229,7 +224,7 @@ pub fn extract_variables(template: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::prompt_loader::{PromptMetadata, PromptSource};
+    use crate::prompt_loader::{Prompt, PromptMetadata, PromptSource};
 
     #[test]
     fn test_render_template_basic() {

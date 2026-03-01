@@ -121,6 +121,27 @@ enum Commands {
         #[arg(
             short,
             long,
+            help = "GitHub issue number or URL for context (populates {{ issue_number }}, {{ issue_title }}, {{ issue_body }})"
+        )]
+        issue: Option<String>,
+
+        #[arg(
+            long,
+            help = "Skip automatic worktree creation when --issue is provided"
+        )]
+        no_worktree: bool,
+
+        #[arg(
+            short = 'P',
+            long = "param",
+            help = "Custom parameter as key=value (can be repeated)",
+            value_name = "KEY=VALUE"
+        )]
+        params: Vec<String>,
+
+        #[arg(
+            short,
+            long,
             help = "Maximum duration for the task (e.g., '10s', '5m', '1h'). Exits with error if exceeded."
         )]
         timeout: Option<String>,
@@ -179,9 +200,13 @@ async fn main() {
         } => clean::handle_clean(dry_run, force, &base_branch).await,
         Commands::Status { id } => status::handle_status(id).await,
         Commands::Stop { id } => stop::handle_stop(id).await,
-        Commands::Prompt { prompt, timeout } => {
-            prompt::handle_prompt(&prompt, timeout, cli.quiet).await
-        }
+        Commands::Prompt {
+            prompt,
+            issue,
+            no_worktree,
+            params,
+            timeout,
+        } => prompt::handle_prompt(&prompt, issue, no_worktree, params, timeout, cli.quiet).await,
         Commands::Lab {
             config,
             repos,
