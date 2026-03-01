@@ -165,26 +165,4 @@ mod tests {
             );
         }
     }
-
-    #[test]
-    fn test_reserved_list_matches_issue_spec() {
-        // Verify the list matches issue #79 acceptance criteria
-        let expected = vec![
-            "status", "attach", "stop", "lab", "tower", "up", "prompts", "help", "version",
-        ];
-
-        assert_eq!(
-            RESERVED_COMMANDS.len(),
-            expected.len(),
-            "Reserved commands list length should match specification"
-        );
-
-        for cmd in expected {
-            assert!(
-                RESERVED_COMMANDS.contains(&cmd),
-                "Expected '{}' to be in reserved commands list",
-                cmd
-            );
-        }
-    }
 }

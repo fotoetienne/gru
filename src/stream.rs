@@ -250,15 +250,15 @@ impl<R: tokio::io::AsyncRead + Unpin> EventStream<R> {
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn test_parse_message_start_event() {
+    #[test]
+    fn test_parse_message_start_event() {
         let json = r#"{"type":"message_start","message":{"id":"msg_123","role":"assistant"}}"#;
         let event: ClaudeEvent = serde_json::from_str(json).unwrap();
         assert!(matches!(event, ClaudeEvent::MessageStart { .. }));
     }
 
-    #[tokio::test]
-    async fn test_parse_content_block_start_event() {
+    #[test]
+    fn test_parse_content_block_start_event() {
         let json = r#"{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","name":"Bash","id":"toolu_1"}}"#;
         let event: ClaudeEvent = serde_json::from_str(json).unwrap();
         match event {
@@ -279,8 +279,8 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn test_parse_content_block_delta_event() {
+    #[test]
+    fn test_parse_content_block_delta_event() {
         let json = r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hello"}}"#;
         let event: ClaudeEvent = serde_json::from_str(json).unwrap();
         match event {
@@ -295,8 +295,8 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn test_parse_message_delta_event() {
+    #[test]
+    fn test_parse_message_delta_event() {
         let json = r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"}}"#;
         let event: ClaudeEvent = serde_json::from_str(json).unwrap();
         match event {
@@ -307,15 +307,15 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn test_parse_message_stop_event() {
+    #[test]
+    fn test_parse_message_stop_event() {
         let json = r#"{"type":"message_stop"}"#;
         let event: ClaudeEvent = serde_json::from_str(json).unwrap();
         assert!(matches!(event, ClaudeEvent::MessageStop));
     }
 
-    #[tokio::test]
-    async fn test_parse_error_event() {
+    #[test]
+    fn test_parse_error_event() {
         let json =
             r#"{"type":"error","error":{"type":"api_error","message":"Something went wrong"}}"#;
         let event: ClaudeEvent = serde_json::from_str(json).unwrap();
@@ -328,8 +328,8 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn test_parse_ping_event() {
+    #[test]
+    fn test_parse_ping_event() {
         let json = r#"{"type":"ping"}"#;
         let event: ClaudeEvent = serde_json::from_str(json).unwrap();
         assert!(matches!(event, ClaudeEvent::Ping));
@@ -463,8 +463,8 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn test_parse_unknown_content_block_type() {
+    #[test]
+    fn test_parse_unknown_content_block_type() {
         let json = r#"{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"some thought"}}"#;
         let event: ClaudeEvent = serde_json::from_str(json).unwrap();
         match event {
@@ -476,8 +476,8 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn test_parse_unknown_content_delta_type() {
+    #[test]
+    fn test_parse_unknown_content_delta_type() {
         let json = r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"more thought"}}"#;
         let event: ClaudeEvent = serde_json::from_str(json).unwrap();
         match event {
@@ -489,8 +489,8 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn test_parse_input_json_delta() {
+    #[test]
+    fn test_parse_input_json_delta() {
         let json = r#"{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"key\":"}}"#;
         let event: ClaudeEvent = serde_json::from_str(json).unwrap();
         match event {
@@ -504,8 +504,8 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn test_parse_text_content_block() {
+    #[test]
+    fn test_parse_text_content_block() {
         let json =
             r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#;
         let event: ClaudeEvent = serde_json::from_str(json).unwrap();

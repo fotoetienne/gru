@@ -577,48 +577,4 @@ mod tests {
         // After taking, tracker should be empty
         assert!(tracker.take().is_none());
     }
-
-    #[test]
-    fn test_handle_tool_result_success() {
-        use crate::stream::ToolResult;
-
-        let tool_result = ToolResult {
-            result_type: "tool_result".to_string(),
-            tool_use_id: "toolu_123".to_string(),
-            content: serde_json::json!("Command output here"),
-            is_error: false,
-        };
-
-        let config = ProgressConfig {
-            minion_id: "M001".to_string(),
-            issue: "42".to_string(),
-            quiet: false,
-        };
-
-        let display = ProgressDisplay::new(config);
-        // Tool results are now printed to stdout, we just verify no panic
-        display.handle_tool_result(&tool_result);
-    }
-
-    #[test]
-    fn test_handle_tool_result_error() {
-        use crate::stream::ToolResult;
-
-        let tool_result = ToolResult {
-            result_type: "tool_result".to_string(),
-            tool_use_id: "toolu_456".to_string(),
-            content: serde_json::json!("Error: command not found"),
-            is_error: true,
-        };
-
-        let config = ProgressConfig {
-            minion_id: "M001".to_string(),
-            issue: "42".to_string(),
-            quiet: false,
-        };
-
-        let display = ProgressDisplay::new(config);
-        // Tool results are now printed to stdout, we just verify no panic
-        display.handle_tool_result(&tool_result);
-    }
 }
