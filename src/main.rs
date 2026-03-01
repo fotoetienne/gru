@@ -21,7 +21,9 @@ mod workspace;
 mod worktree_scanner;
 
 use clap::{Parser, Subcommand};
-use commands::{attach, clean, fix, init, lab, path, prompt, resume, review, status, stop};
+use commands::{
+    attach, clean, fix, init, lab, path, prompt, prompts, resume, review, status, stop,
+};
 
 /// CLI structure for the Gru agent orchestrator
 #[derive(Parser)]
@@ -157,6 +159,8 @@ enum Commands {
         )]
         timeout: Option<String>,
     },
+    #[command(about = "List available prompts")]
+    Prompts,
     #[command(about = "Run Gru Lab in daemon mode to automatically work on issues")]
     Lab {
         #[arg(long, help = "Path to config file (default: ~/.gru/config.toml)")]
@@ -213,6 +217,7 @@ async fn main() {
             params,
             timeout,
         } => prompt::handle_prompt(&prompt, issue, no_worktree, params, timeout, cli.quiet).await,
+        Commands::Prompts => prompts::handle_prompts().await,
         Commands::Lab {
             config,
             repos,
