@@ -132,8 +132,9 @@ pub async fn handle_clean(dry_run: bool, force: bool, base_branch: &str) -> Resu
     println!("Scanning for worktrees in {}...", ws.repos().display());
 
     // Discover all worktrees
-    let worktrees =
-        worktree_scanner::discover_worktrees(ws.repos()).context("Failed to discover worktrees")?;
+    let worktrees = worktree_scanner::discover_worktrees(ws.repos())
+        .await
+        .context("Failed to discover worktrees")?;
 
     if worktrees.is_empty() {
         println!("No worktrees found.");
@@ -281,6 +282,7 @@ pub async fn handle_clean(dry_run: bool, force: bool, base_branch: &str) -> Resu
 
         let status = wt
             .status(base_branch)
+            .await
             .with_context(|| format!("Failed to check status of {}", wt.path.display()))?;
 
         if status != worktree_scanner::WorktreeStatus::Active {

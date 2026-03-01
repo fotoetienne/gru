@@ -76,7 +76,7 @@ pub async fn handle_init(repo_arg: String) -> Result<i32> {
         }
         RepoSource::CurrentDir => {
             println!("🔍 Detecting repository from current directory...");
-            detect_current_repo()?
+            detect_current_repo().await?
         }
         RepoSource::LocalPath(_) => {
             bail!("Local path repositories are not yet supported. Please use GitHub repositories in owner/repo format.");
@@ -124,7 +124,7 @@ pub async fn handle_init(repo_arg: String) -> Result<i32> {
     let bare_repo_path = workspace.repos().join(&owner).join(format!("{}.git", repo));
     let git_repo = GitRepo::new(&owner, &repo, bare_repo_path.clone());
 
-    match git_repo.ensure_bare_clone() {
+    match git_repo.ensure_bare_clone().await {
         Ok(()) => {
             println!("✓ Bare repository ready: {}", bare_repo_path.display());
         }
@@ -205,14 +205,16 @@ pub async fn handle_init(repo_arg: String) -> Result<i32> {
 }
 
 /// Detect repository from current directory's git remote
-fn detect_current_repo() -> Result<(String, String)> {
+async fn detect_current_repo() -> Result<(String, String)> {
     use crate::git::{detect_git_repo, get_github_remote, parse_github_remote};
 
     // Check if we're in a git repo
-    let _git_dir = detect_git_repo().context("Not in a git repository")?;
+    let _git_dir = detect_git_repo().await.context("Not in a git repository")?;
 
     // Get the remote URL (function doesn't need git_dir - it uses current directory)
-    let remote_url = get_github_remote().context("No GitHub remote found in current repository")?;
+    let remote_url = get_github_remote()
+        .await
+        .context("No GitHub remote found in current repository")?;
 
     // Parse owner/repo from remote URL
     let (owner, repo) = parse_github_remote(&remote_url)

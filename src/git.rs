@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use tokio::process::Command;
 
 /// Default branch names to try when creating new worktrees, in priority order.
 ///
@@ -11,13 +11,31 @@ use std::process::Command;
 /// We try both patterns to handle existing repos with different configurations.
 const DEFAULT_BRANCHES: &[&str] = &["main", "origin/main", "master", "origin/master"];
 
+/// Creates a git `Command` pre-configured with credential helper authentication.
+///
+/// If a token is provided, the command will include `-c credential.helper=...` to
+/// inject the token via a credential helper. This avoids duplicating the credential
+/// setup logic across clone and fetch operations.
+fn git_command_with_auth(token: &Option<String>) -> Command {
+    let mut cmd = Command::new("git");
+    if let Some(ref token) = token {
+        let safe_token = token.replace('\'', "'\\''");
+        cmd.arg("-c").arg(format!(
+            "credential.helper=!f() {{ echo username=oauth2; echo password='{}'; }}; f",
+            safe_token
+        ));
+    }
+    cmd
+}
+
 /// Detects if the current directory is within a git repository
 /// Returns the root path of the git repository
-pub fn detect_git_repo() -> Result<PathBuf> {
+pub async fn detect_git_repo() -> Result<PathBuf> {
     let output = Command::new("git")
         .arg("rev-parse")
         .arg("--show-toplevel")
         .output()
+        .await
         .context("Failed to execute git rev-parse")?;
 
     if !output.status.success() {
@@ -38,12 +56,13 @@ pub fn detect_git_repo() -> Result<PathBuf> {
 
 /// Gets the GitHub remote URL from the current git repository
 /// Tries "origin" first, then falls back to the first GitHub remote found
-pub fn get_github_remote() -> Result<String> {
+pub async fn get_github_remote() -> Result<String> {
     // Use `git remote -v` to get all remotes and their URLs in one call
     let output = Command::new("git")
         .arg("remote")
         .arg("-v")
         .output()
+        .await
         .context("Failed to execute git remote -v")?;
 
     if !output.status.success() {
@@ -187,7 +206,7 @@ impl GitRepo {
     /// Returns an error if:
     /// - The git clone or fetch command fails (network issues, authentication, etc.)
     /// - Unable to create parent directories
-    pub fn ensure_bare_clone(&self) -> Result<()> {
+    pub async fn ensure_bare_clone(&self) -> Result<()> {
         let token = std::env::var("GRU_GITHUB_TOKEN")
             .ok()
             .filter(|t| !t.is_empty());
@@ -205,21 +224,14 @@ impl GitRepo {
                     continue;
                 }
 
-                let mut cmd = Command::new("git");
-                if let Some(ref token) = token {
-                    let safe_token = token.replace('\'', "'\\''");
-                    cmd.arg("-c").arg(format!(
-                        "credential.helper=!f() {{ echo username=oauth2; echo password='{}'; }}; f",
-                        safe_token
-                    ));
-                }
-                let output = cmd
+                let output = git_command_with_auth(&token)
                     .arg("-C")
                     .arg(&self.bare_path)
                     .arg("fetch")
                     .arg("origin")
                     .arg(format!("+refs/heads/{}:refs/heads/{}", branch, branch))
                     .output()
+                    .await
                     .context("Failed to execute git fetch")?;
 
                 if output.status.success() {
@@ -277,22 +289,12 @@ impl GitRepo {
 
             // Create parent directory if it doesn't exist
             if let Some(parent) = self.bare_path.parent() {
-                std::fs::create_dir_all(parent)
+                tokio::fs::create_dir_all(parent)
+                    .await
                     .context("Failed to create parent directory for bare repository")?;
             }
 
-            let mut cmd = Command::new("git");
-
-            // If token is provided, use credential helper to provide it securely
-            // Otherwise, rely on system git credentials (SSH keys, credential helpers, etc.)
-            if let Some(token) = token {
-                // Escape single quotes in the token to prevent command injection
-                let safe_token = token.replace('\'', "'\\''");
-                cmd.arg("-c").arg(format!(
-                    "credential.helper=!f() {{ echo username=oauth2; echo password='{}'; }}; f",
-                    safe_token
-                ));
-            }
+            let mut cmd = git_command_with_auth(&token);
 
             cmd.arg("clone")
                 .arg("--bare")
@@ -300,7 +302,7 @@ impl GitRepo {
                 .arg(&self.bare_path)
                 .env("GIT_TERMINAL_PROMPT", "0"); // Disable interactive prompts
 
-            let output = cmd.output().context("Failed to execute git clone")?;
+            let output = cmd.output().await.context("Failed to execute git clone")?;
 
             if !output.status.success() {
                 let stderr = String::from_utf8_lossy(&output.stderr);
@@ -320,6 +322,7 @@ impl GitRepo {
                 .arg("remote.origin.fetch")
                 .arg("+refs/heads/*:refs/heads/*")
                 .output()
+                .await
                 .context("Failed to execute git config for remote.origin.fetch")?;
 
             if !output.status.success() {
@@ -347,7 +350,7 @@ impl GitRepo {
     /// Returns an error if:
     /// - The bare repository doesn't exist
     /// - Remote query fails and fallback branches don't exist
-    fn get_base_branch(&self) -> Result<String> {
+    async fn get_base_branch(&self) -> Result<String> {
         if !self.bare_path.exists() {
             anyhow::bail!(
                 "Bare repository does not exist at {}",
@@ -364,6 +367,7 @@ impl GitRepo {
             .arg("origin")
             .arg("HEAD")
             .output()
+            .await
             .context("Failed to query remote for default branch")?;
 
         if output.status.success() {
@@ -384,7 +388,8 @@ impl GitRepo {
                             .arg("rev-parse")
                             .arg("--verify")
                             .arg(&candidate)
-                            .output();
+                            .output()
+                            .await;
 
                         if let Ok(result) = check {
                             if result.status.success() {
@@ -405,6 +410,7 @@ impl GitRepo {
                 .arg("--verify")
                 .arg(branch)
                 .output()
+                .await
                 .with_context(|| format!("Failed to check if branch '{}' exists", branch))?;
 
             if check.status.success() {
@@ -435,7 +441,7 @@ impl GitRepo {
     /// - The branch name is invalid
     /// - The branch is already checked out in another worktree
     /// - Git worktree creation fails
-    pub fn create_worktree(&self, branch_name: &str, worktree_path: &Path) -> Result<()> {
+    pub async fn create_worktree(&self, branch_name: &str, worktree_path: &Path) -> Result<()> {
         // Validate branch name
         validate_branch_name(branch_name)?;
 
@@ -455,6 +461,7 @@ impl GitRepo {
             .arg("--verify")
             .arg(format!("refs/heads/{}", branch_name))
             .output()
+            .await
             .context("Failed to check if branch exists")?;
 
         let branch_exists = branch_check.status.success();
@@ -473,11 +480,14 @@ impl GitRepo {
             cmd.arg(branch_name);
         } else {
             // Branch doesn't exist, create it based on the default branch
-            let base_branch = self.get_base_branch()?;
+            let base_branch = self.get_base_branch().await?;
             cmd.arg("-b").arg(branch_name).arg(base_branch);
         }
 
-        let output = cmd.output().context("Failed to execute git worktree add")?;
+        let output = cmd
+            .output()
+            .await
+            .context("Failed to execute git worktree add")?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -513,7 +523,7 @@ impl GitRepo {
     /// - The branch name is invalid or doesn't exist
     /// - The worktree path already exists
     /// - Git worktree creation fails
-    pub fn checkout_worktree(&self, branch_name: &str, worktree_path: &Path) -> Result<()> {
+    pub async fn checkout_worktree(&self, branch_name: &str, worktree_path: &Path) -> Result<()> {
         // Validate branch name
         validate_branch_name(branch_name)?;
 
@@ -537,7 +547,8 @@ impl GitRepo {
 
         // Create parent directory if it doesn't exist
         if let Some(parent) = worktree_path.parent() {
-            std::fs::create_dir_all(parent)
+            tokio::fs::create_dir_all(parent)
+                .await
                 .context("Failed to create parent directory for worktree")?;
         }
 
@@ -550,6 +561,7 @@ impl GitRepo {
             .arg(worktree_path)
             .arg(branch_name)
             .output()
+            .await
             .context("Failed to execute git worktree add")?;
 
         if !output.status.success() {
@@ -590,7 +602,7 @@ impl GitRepo {
     /// - The branch name is invalid
     /// - The bare repository doesn't exist
     /// - The git worktree list command fails
-    pub fn find_worktree_for_branch(&self, branch_name: &str) -> Result<Option<PathBuf>> {
+    pub async fn find_worktree_for_branch(&self, branch_name: &str) -> Result<Option<PathBuf>> {
         // Validate branch name
         validate_branch_name(branch_name)?;
 
@@ -608,6 +620,7 @@ impl GitRepo {
             .arg("list")
             .arg("--porcelain")
             .output()
+            .await
             .context("Failed to execute git worktree list")?;
 
         if !output.status.success() {
@@ -664,7 +677,7 @@ impl GitRepo {
     /// Returns an error if:
     /// - The bare repository doesn't exist
     /// - The worktree removal fails (e.g., worktree doesn't exist or has uncommitted changes)
-    pub fn cleanup_worktree(&self, worktree_path: &Path) -> Result<()> {
+    pub async fn cleanup_worktree(&self, worktree_path: &Path) -> Result<()> {
         if !self.bare_path.exists() {
             anyhow::bail!(
                 "Bare repository does not exist at {}",
@@ -679,6 +692,7 @@ impl GitRepo {
             .arg("remove")
             .arg(worktree_path)
             .output()
+            .await
             .context("Failed to execute git worktree remove")?;
 
         if !output.status.success() {
@@ -705,7 +719,7 @@ impl GitRepo {
     /// - The bare repository doesn't exist
     /// - The worktree has uncommitted changes (safety check)
     /// - The worktree removal fails
-    pub fn cleanup_worktree_force(&self, worktree_path: &Path) -> Result<()> {
+    pub async fn cleanup_worktree_force(&self, worktree_path: &Path) -> Result<()> {
         if !self.bare_path.exists() {
             anyhow::bail!(
                 "Bare repository does not exist at {}",
@@ -721,7 +735,8 @@ impl GitRepo {
                 .arg(worktree_path)
                 .arg("rev-parse")
                 .arg("--is-inside-work-tree")
-                .output();
+                .output()
+                .await;
 
             // If it's a valid worktree, check for uncommitted changes
             if let Ok(output) = is_worktree {
@@ -731,7 +746,8 @@ impl GitRepo {
                         .arg(worktree_path)
                         .arg("status")
                         .arg("--porcelain")
-                        .output();
+                        .output()
+                        .await;
 
                     if let Ok(status_output) = status {
                         if !status_output.stdout.is_empty() {
@@ -754,6 +770,7 @@ impl GitRepo {
             .arg("--force")
             .arg(worktree_path)
             .output()
+            .await
             .context("Failed to execute git worktree remove --force")?;
 
         if !output.status.success() {
@@ -777,8 +794,8 @@ impl GitRepo {
     /// - The bare repository doesn't exist
     /// - The branch name is invalid
     /// - The git fetch command fails
-    pub fn fetch_branch(&self, branch_name: &str) -> Result<()> {
-        // Validate branch name using existing comprehensive validation
+    pub async fn fetch_branch(&self, branch_name: &str) -> Result<()> {
+        // Validate branch name using existing validation
         validate_branch_name(branch_name)?;
 
         if !self.bare_path.exists() {
@@ -802,6 +819,7 @@ impl GitRepo {
                 branch_name, branch_name
             ))
             .output()
+            .await
             .context("Failed to execute git fetch")?;
 
         if !output.status.success() {
@@ -836,7 +854,7 @@ impl GitRepo {
     /// Reserved for future use when programmatically pushing branches.
     /// Currently, branches are pushed by the Claude agent via git commands.
     #[allow(dead_code)]
-    pub fn push_branch(&self, worktree_path: &Path, branch_name: &str) -> Result<()> {
+    pub async fn push_branch(&self, worktree_path: &Path, branch_name: &str) -> Result<()> {
         // Validate branch name
         validate_branch_name(branch_name)?;
 
@@ -853,6 +871,7 @@ impl GitRepo {
             .arg("origin")
             .arg(branch_name)
             .output()
+            .await
             .context("Failed to execute git push")?;
 
         if !output.status.success() {
@@ -940,14 +959,16 @@ mod tests {
         assert_eq!(repo.bare_path, PathBuf::from("/tmp/repo.git"));
     }
 
-    #[test]
-    fn test_create_worktree_fails_without_bare_repo() {
+    #[tokio::test]
+    async fn test_create_worktree_fails_without_bare_repo() {
         let repo = GitRepo::new(
             "owner",
             "repo",
             PathBuf::from("/tmp/nonexistent-bare-repo.git"),
         );
-        let result = repo.create_worktree("test-branch", Path::new("/tmp/test-worktree"));
+        let result = repo
+            .create_worktree("test-branch", Path::new("/tmp/test-worktree"))
+            .await;
 
         assert!(result.is_err());
         assert!(result
@@ -956,14 +977,14 @@ mod tests {
             .contains("Bare repository does not exist"));
     }
 
-    #[test]
-    fn test_cleanup_worktree_fails_without_bare_repo() {
+    #[tokio::test]
+    async fn test_cleanup_worktree_fails_without_bare_repo() {
         let repo = GitRepo::new(
             "owner",
             "repo",
             PathBuf::from("/tmp/nonexistent-bare-repo.git"),
         );
-        let result = repo.cleanup_worktree(Path::new("/tmp/test-worktree"));
+        let result = repo.cleanup_worktree(Path::new("/tmp/test-worktree")).await;
 
         assert!(result.is_err());
         assert!(result
@@ -972,10 +993,12 @@ mod tests {
             .contains("Bare repository does not exist"));
     }
 
-    #[test]
-    fn test_create_worktree_rejects_empty_branch_name() {
+    #[tokio::test]
+    async fn test_create_worktree_rejects_empty_branch_name() {
         let repo = GitRepo::new("owner", "repo", PathBuf::from("/tmp/test-repo.git"));
-        let result = repo.create_worktree("", Path::new("/tmp/test-worktree"));
+        let result = repo
+            .create_worktree("", Path::new("/tmp/test-worktree"))
+            .await;
 
         assert!(result.is_err());
         assert!(result
@@ -984,10 +1007,12 @@ mod tests {
             .contains("Branch name cannot be empty"));
     }
 
-    #[test]
-    fn test_create_worktree_rejects_branch_starting_with_dash() {
+    #[tokio::test]
+    async fn test_create_worktree_rejects_branch_starting_with_dash() {
         let repo = GitRepo::new("owner", "repo", PathBuf::from("/tmp/test-repo.git"));
-        let result = repo.create_worktree("-branch", Path::new("/tmp/test-worktree"));
+        let result = repo
+            .create_worktree("-branch", Path::new("/tmp/test-worktree"))
+            .await;
 
         assert!(result.is_err());
         assert!(result
@@ -996,8 +1021,8 @@ mod tests {
             .contains("Branch name cannot start with '-'"));
     }
 
-    #[test]
-    fn test_create_worktree_rejects_invalid_branch_names() {
+    #[tokio::test]
+    async fn test_create_worktree_rejects_invalid_branch_names() {
         let repo = GitRepo::new("owner", "repo", PathBuf::from("/tmp/test-repo.git"));
 
         // Test various invalid branch names
@@ -1010,7 +1035,9 @@ mod tests {
         ];
 
         for name in invalid_names {
-            let result = repo.create_worktree(name, Path::new("/tmp/test-worktree"));
+            let result = repo
+                .create_worktree(name, Path::new("/tmp/test-worktree"))
+                .await;
             assert!(
                 result.is_err(),
                 "Expected '{}' to be rejected as invalid",
@@ -1027,14 +1054,14 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_find_worktree_for_branch_fails_without_bare_repo() {
+    #[tokio::test]
+    async fn test_find_worktree_for_branch_fails_without_bare_repo() {
         let repo = GitRepo::new(
             "owner",
             "repo",
             PathBuf::from("/tmp/nonexistent-bare-repo.git"),
         );
-        let result = repo.find_worktree_for_branch("test-branch");
+        let result = repo.find_worktree_for_branch("test-branch").await;
 
         assert!(result.is_err());
         assert!(result
@@ -1049,9 +1076,9 @@ mod tests {
     //
     // Note: This test will use GRU_GITHUB_TOKEN if set, otherwise it will
     // fall back to system git credentials (SSH keys, credential helpers, etc.)
-    #[test]
+    #[tokio::test]
     #[ignore]
-    fn test_git_operations_integration() {
+    async fn test_git_operations_integration() {
         use std::fs;
 
         let temp_dir = env::temp_dir();
@@ -1066,7 +1093,7 @@ mod tests {
         let repo = GitRepo::new("fotoetienne", "gru", bare_path.clone());
 
         // Test ensure_bare_clone (first time - should clone)
-        let result = repo.ensure_bare_clone();
+        let result = repo.ensure_bare_clone().await;
         assert!(
             result.is_ok(),
             "Failed to clone bare repository: {:?}",
@@ -1075,7 +1102,7 @@ mod tests {
         assert!(bare_path.exists(), "Bare repository was not created");
 
         // Test ensure_bare_clone (second time - should fetch)
-        let result = repo.ensure_bare_clone();
+        let result = repo.ensure_bare_clone().await;
         assert!(
             result.is_ok(),
             "Failed to fetch in existing repository: {:?}",
@@ -1083,7 +1110,7 @@ mod tests {
         );
 
         // Test create_worktree
-        let result = repo.create_worktree("test-branch", &worktree_path);
+        let result = repo.create_worktree("test-branch", &worktree_path).await;
         assert!(result.is_ok(), "Failed to create worktree: {:?}", result);
         assert!(worktree_path.exists(), "Worktree was not created");
 
@@ -1094,13 +1121,14 @@ mod tests {
             .arg("branch")
             .arg("--show-current")
             .output()
+            .await
             .expect("Failed to check branch");
 
         let branch_name = String::from_utf8_lossy(&branch_check.stdout);
         assert_eq!(branch_name.trim(), "test-branch");
 
         // Test find_worktree_for_branch - should find the worktree we just created
-        let result = repo.find_worktree_for_branch("test-branch");
+        let result = repo.find_worktree_for_branch("test-branch").await;
         assert!(
             result.is_ok(),
             "Failed to find worktree for branch: {:?}",
@@ -1113,7 +1141,7 @@ mod tests {
         );
 
         // Test find_worktree_for_branch with non-existent branch
-        let result = repo.find_worktree_for_branch("nonexistent-branch");
+        let result = repo.find_worktree_for_branch("nonexistent-branch").await;
         assert!(
             result.is_ok(),
             "find_worktree_for_branch should not error for non-existent branch"
@@ -1125,11 +1153,11 @@ mod tests {
         );
 
         // Test cleanup_worktree
-        let result = repo.cleanup_worktree(&worktree_path);
+        let result = repo.cleanup_worktree(&worktree_path).await;
         assert!(result.is_ok(), "Failed to cleanup worktree: {:?}", result);
 
         // Test find_worktree_for_branch after cleanup - should return None
-        let result = repo.find_worktree_for_branch("test-branch");
+        let result = repo.find_worktree_for_branch("test-branch").await;
         assert!(
             result.is_ok(),
             "find_worktree_for_branch should not error after cleanup"

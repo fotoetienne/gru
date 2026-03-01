@@ -33,7 +33,7 @@ fn parse_params(params: &[String]) -> Result<HashMap<String, String>> {
 
 /// Fetches issue data from GitHub and populates a PromptContext
 async fn fetch_issue_context(issue_str: &str) -> Result<(PromptContext, String, String, u64)> {
-    let (owner, repo, issue_num_str) = parse_issue_info(issue_str)?;
+    let (owner, repo, issue_num_str) = parse_issue_info(issue_str).await?;
     let issue_number: u64 = issue_num_str
         .parse()
         .context("Failed to parse issue number")?;
@@ -103,6 +103,7 @@ async fn setup_issue_worktree(
     println!("📦 Ensuring repository is cloned...");
     git_repo
         .ensure_bare_clone()
+        .await
         .context("Failed to clone or update repository")?;
 
     let branch_name = format!("minion/issue-{}-{}", issue_number, minion_id);
@@ -115,6 +116,7 @@ async fn setup_issue_worktree(
 
     git_repo
         .create_worktree(&branch_name, &worktree_path)
+        .await
         .context("Failed to create worktree")?;
 
     println!("📂 Worktree created at: {}", worktree_path.display());
