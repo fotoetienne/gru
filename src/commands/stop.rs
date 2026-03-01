@@ -1,4 +1,4 @@
-use crate::minion_registry::{MinionMode, MinionRegistry};
+use crate::minion_registry::{with_registry, MinionMode};
 use crate::minion_resolver;
 use anyhow::{Context, Result};
 use std::path::Path;
@@ -34,12 +34,11 @@ pub async fn handle_stop(id: String) -> Result<i32> {
 
         // Remove from registry since worktree is gone
         let minion_id = minion.minion_id.clone();
-        tokio::task::spawn_blocking(move || {
-            let mut registry = MinionRegistry::load(None)?;
-            registry.remove(&minion_id)
+        with_registry(move |registry| {
+            registry.remove(&minion_id)?;
+            Ok(())
         })
-        .await
-        .context("Failed to spawn blocking task for registry removal")??;
+        .await?;
 
         println!("✅ Minion {} removed from registry", minion.minion_id);
         return Ok(0);
@@ -59,8 +58,7 @@ pub async fn handle_stop(id: String) -> Result<i32> {
 
     // Update registry to mark minion as stopped
     let minion_id = minion.minion_id.clone();
-    let update_result = tokio::task::spawn_blocking(move || {
-        let mut registry = MinionRegistry::load(None)?;
+    match with_registry(move |registry| {
         registry.update(&minion_id, |info| {
             info.status = "stopped".to_string();
             info.pid = None;
@@ -68,9 +66,7 @@ pub async fn handle_stop(id: String) -> Result<i32> {
         })
     })
     .await
-    .context("Failed to spawn blocking task for registry update")?;
-
-    match update_result {
+    {
         Ok(()) => {
             println!("📝 Updated registry: status = stopped");
         }

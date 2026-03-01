@@ -1,4 +1,4 @@
-use crate::minion_registry::{is_process_alive, MinionRegistry};
+use crate::minion_registry::{is_process_alive, with_registry};
 use anyhow::{Context, Result};
 
 /// Combined Minion information from registry and filesystem scanning
@@ -103,9 +103,7 @@ fn determine_status(pid: Option<u32>) -> String {
 /// the registry file, not for I/O operations.
 pub async fn handle_status(id: Option<String>) -> Result<i32> {
     // Phase 1: Load registry and clean up (with lock held)
-    let basic_minions = tokio::task::spawn_blocking(|| {
-        let mut registry = MinionRegistry::load(None)?;
-
+    let basic_minions = with_registry(|registry| {
         // Get all minions from registry
         let registry_minions = registry.list();
 
@@ -147,11 +145,10 @@ pub async fn handle_status(id: Option<String>) -> Result<i32> {
             })
             .collect();
 
-        Ok::<Vec<BasicMinionData>, anyhow::Error>(basic)
+        Ok(basic)
         // Registry is dropped here, releasing the lock
     })
-    .await
-    .context("Failed to spawn blocking task for loading registry")??;
+    .await?;
 
     // Phase 2: Perform status checks and git operations (no lock held)
     let mut minions = tokio::task::spawn_blocking(move || {

@@ -1,6 +1,6 @@
 use crate::config::LabConfig;
 use crate::github::GitHubClient;
-use crate::minion_registry::{is_process_alive, MinionRegistry};
+use crate::minion_registry::{is_process_alive, with_registry};
 use anyhow::{Context, Result};
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -298,8 +298,7 @@ async fn poll_and_spawn(config: &LabConfig, children: &mut Vec<Child>) -> Result
 
 /// Prune stale registry entries where worktrees no longer exist
 async fn prune_stale_entries() -> Result<()> {
-    tokio::task::spawn_blocking(move || {
-        let mut registry = MinionRegistry::load(None)?;
+    with_registry(|registry| {
         let minions = registry.list();
 
         let stale_ids: Vec<String> = minions
@@ -313,25 +312,22 @@ async fn prune_stale_entries() -> Result<()> {
             log::info!("🗑️  Pruned {} stale Minion(s) from registry", count);
         }
 
-        Ok::<(), anyhow::Error>(())
+        Ok(())
     })
     .await
-    .context("Failed to join spawn_blocking task")?
 }
 
 /// Calculate available slots based on PID liveness of registered Minions
 async fn available_slots(max_slots: usize) -> Result<usize> {
-    let active_count = tokio::task::spawn_blocking(move || {
-        let registry = MinionRegistry::load(None)?;
+    let active_count = with_registry(move |registry| {
         let active = registry
             .list()
             .iter()
             .filter(|(_id, info)| info.pid.is_some_and(is_process_alive))
             .count();
-        Ok::<usize, anyhow::Error>(active)
+        Ok(active)
     })
-    .await
-    .context("Failed to join spawn_blocking task")??;
+    .await?;
 
     Ok(max_slots.saturating_sub(active_count))
 }
@@ -339,17 +335,15 @@ async fn available_slots(max_slots: usize) -> Result<usize> {
 /// Check if an issue is already being worked on by a live Minion process
 async fn is_issue_claimed(repo: &str, issue_number: u64) -> Result<bool> {
     let repo = repo.to_string();
-    tokio::task::spawn_blocking(move || {
-        let registry = MinionRegistry::load(None)?;
+    with_registry(move |registry| {
         let claimed = registry.list().iter().any(|(_id, info)| {
             info.repo == repo
                 && info.issue == issue_number
                 && info.pid.is_some_and(is_process_alive)
         });
-        Ok::<bool, anyhow::Error>(claimed)
+        Ok(claimed)
     })
     .await
-    .context("Failed to join spawn_blocking task")?
 }
 
 /// Spawn a Minion to work on an issue using the `gru fix` command.
