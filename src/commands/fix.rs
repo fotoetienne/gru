@@ -151,77 +151,99 @@ async fn create_pr_for_issue(
         "main".to_string()
     };
 
-    // Use cached title or generate a default
-    let issue_title = issue_title_opt.unwrap_or("Fix issue");
+    // Get issue title - use provided title if available, otherwise fetch
+    let issue_title = if let Some(title) = issue_title_opt {
+        title.to_string()
+    } else if let Some(github_client) = GitHubClient::try_from_env(owner, repo).await {
+        match github_client.get_issue(owner, repo, issue_num).await {
+            Ok(issue) => issue.title,
+            Err(_) => "Fix issue".to_string(),
+        }
+    } else {
+        match crate::github::get_issue_via_cli(owner, repo, issue_num).await {
+            Ok(info) => info.title,
+            Err(_) => "Fix issue".to_string(),
+        }
+    };
 
-    let (title, body) = create_wip_template(minion_id, issue_num, issue_title);
-
-    // Check for PR_DESCRIPTION.md to determine if work is complete
-    let desc_path = worktree_path.join("PR_DESCRIPTION.md");
-    let is_ready = match tokio::fs::try_exists(&desc_path).await {
+    // Check if work is complete (description file exists)
+    let description_path = worktree_path.join("PR_DESCRIPTION.md");
+    let should_mark_ready = match tokio::fs::try_exists(&description_path).await {
         Ok(exists) => exists,
         Err(e) => {
-            log::warn!("⚠️  Failed to check PR_DESCRIPTION.md: {}", e);
+            log::warn!(
+                "⚠️  Warning: Failed to check if PR_DESCRIPTION.md exists: {}",
+                e
+            );
             false
         }
     };
-    let (final_title, final_body) = if is_ready {
-        let desc_content = tokio::fs::read_to_string(&desc_path)
-            .await
-            .unwrap_or_default();
-        let ready_title = format!("Fixes #{}: {}", issue_num, issue_title);
-        (ready_title, desc_content)
+
+    let (pr_title, pr_body) = if should_mark_ready {
+        // Read the description file
+        match tokio::fs::read_to_string(&description_path).await {
+            Ok(content) if !content.trim().is_empty() => {
+                // Work is complete - use description and mark ready
+                let pr_title = format!("Fixes #{}: {}", issue_num, issue_title);
+                let pr_body = format!("{}\n\nFixes #{}", content.trim(), issue_num);
+                (pr_title, pr_body)
+            }
+            _ => {
+                // File exists but couldn't be read or is empty - treat as WIP
+                log::warn!(
+                    "⚠️  Warning: PR_DESCRIPTION.md exists but couldn't be read or is empty"
+                );
+                create_wip_template(minion_id, issue_num, &issue_title)
+            }
+        }
     } else {
-        (title, body)
+        // No description file - work in progress
+        create_wip_template(minion_id, issue_num, &issue_title)
     };
 
-    // Create draft PR via gh CLI
-    let mut pr_cmd = TokioCommand::new("gh");
-    pr_cmd
-        .arg("pr")
-        .arg("create")
-        .arg("--draft")
-        .arg("--title")
-        .arg(&final_title)
-        .arg("--body")
-        .arg(&final_body)
-        .arg("--base")
-        .arg(&base_branch)
-        .arg("--head")
-        .arg(branch_name)
-        .arg("--repo")
-        .arg(format!("{}/{}", owner, repo))
-        .current_dir(worktree_path);
+    // Create the draft PR using gh CLI (with URL validation)
+    let pr_number = crate::github::create_draft_pr_via_cli(
+        owner,
+        repo,
+        branch_name,
+        &base_branch,
+        &pr_title,
+        &pr_body,
+    )
+    .await
+    .context("Failed to create draft PR using gh CLI")?;
 
-    let pr_output = pr_cmd.output().await.context("Failed to create draft PR")?;
+    // Mark ready if description was provided
+    if should_mark_ready {
+        if let Some(github_client) = GitHubClient::try_from_env(owner, repo).await {
+            match github_client.mark_pr_ready(owner, repo, &pr_number).await {
+                Ok(_) => {
+                    println!("✅ PR #{} marked ready for review", pr_number);
+                }
+                Err(e) => {
+                    log::warn!("⚠️  Warning: Failed to mark PR ready: {}", e);
+                    log::warn!(
+                        "   PR #{} created as draft - you can mark it ready manually",
+                        pr_number
+                    );
+                }
+            }
+        } else {
+            log::warn!(
+                "⚠️  Warning: No GitHub authentication found - cannot mark PR ready automatically"
+            );
+            log::warn!(
+                "   You can mark PR #{} ready with: gh pr ready {}",
+                pr_number,
+                pr_number
+            );
+        }
 
-    if !pr_output.status.success() {
-        let stderr = String::from_utf8_lossy(&pr_output.stderr);
-        anyhow::bail!("Failed to create PR: {}", stderr.trim());
-    }
-
-    let pr_url = String::from_utf8_lossy(&pr_output.stdout)
-        .trim()
-        .to_string();
-
-    // Extract PR number from URL
-    let pr_number = pr_url.rsplit('/').next().unwrap_or(&pr_url).to_string();
-
-    // Mark ready if description exists
-    if is_ready {
-        // Mark PR as ready using gh CLI directly
-        let _ = TokioCommand::new("gh")
-            .args([
-                "pr",
-                "ready",
-                &pr_number,
-                "--repo",
-                &format!("{}/{}", owner, repo),
-            ])
-            .output()
-            .await;
         // Clean up description file
-        let _ = tokio::fs::remove_file(&desc_path).await;
+        if let Err(e) = tokio::fs::remove_file(&description_path).await {
+            log::warn!("⚠️  Warning: Failed to remove PR_DESCRIPTION.md: {}", e);
+            log::warn!("   File will be cleaned up by 'gru clean'");
+        }
     }
 
     Ok(pr_number)
@@ -271,32 +293,45 @@ async fn invoke_claude_for_reviews(
 async fn trigger_pr_review(
     pr_number: &str,
     worktree_path: &Path,
-    timeout_secs: Option<u64>,
+    review_timeout: Option<Duration>,
 ) -> Result<i32> {
-    // Validate PR number format
-    if pr_number.is_empty() || !pr_number.chars().all(|c| c.is_ascii_digit()) {
-        anyhow::bail!("Invalid PR number format: '{}'", pr_number);
-    }
+    // Validate PR number format (defense in depth)
+    pr_number
+        .parse::<u64>()
+        .with_context(|| format!("Invalid PR number format: '{}'", pr_number))?;
 
-    let timeout_duration = Duration::from_secs(timeout_secs.unwrap_or(DEFAULT_REVIEW_TIMEOUT_SECS));
+    let timeout_duration =
+        review_timeout.unwrap_or_else(|| Duration::from_secs(DEFAULT_REVIEW_TIMEOUT_SECS));
 
     let mut child = TokioCommand::new("gru")
         .arg("review")
         .arg(pr_number)
         .current_dir(worktree_path)
+        .stdin(std::process::Stdio::inherit())
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit())
         .spawn()
-        .context("Failed to spawn gru review process")?;
+        .with_context(|| {
+            format!(
+                "Failed to spawn gru review command for PR #{}. Is gru in your PATH?",
+                pr_number
+            )
+        })?;
 
     match timeout(timeout_duration, child.wait()).await {
-        Ok(Ok(status)) => Ok(status.code().unwrap_or(1)),
-        Ok(Err(e)) => Err(e).context("Failed to wait for review process"),
+        Ok(status) => {
+            let status = status.with_context(|| {
+                format!("Failed to wait for review process for PR #{}", pr_number)
+            })?;
+            Ok(status.code().unwrap_or(EXIT_CODE_SIGNAL_TERMINATED))
+        }
         Err(_) => {
-            // Timeout - kill the process
             let _ = child.kill().await;
-            anyhow::bail!(
-                "PR review timed out after {} seconds",
-                timeout_duration.as_secs()
-            );
+            Err(anyhow::anyhow!(
+                "Review process timed out after {} minutes. PR #{} review may be stuck.",
+                timeout_duration.as_secs() / 60,
+                pr_number
+            ))
         }
     }
 }
@@ -326,6 +361,8 @@ async fn try_post_progress_comment(
 ///
 /// Parses the issue string, checks for existing minions (unless `force_new`),
 /// initializes the GitHub client, and fetches issue details.
+/// Note: Does NOT claim the issue — that happens after worktree setup to avoid
+/// marking issues as in-progress when setup fails.
 async fn resolve_issue(issue: &str, force_new: bool) -> Result<IssueContext> {
     let (owner, repo, issue_num_str) = parse_issue_info(issue)?;
     let issue_num: u64 = issue_num_str
@@ -338,14 +375,9 @@ async fn resolve_issue(issue: &str, force_new: bool) -> Result<IssueContext> {
     }
 
     // Initialize GitHub client (optional - only if token is available)
-    let github_client = GitHubClient::from_env(&owner, &repo).await.ok();
+    let github_client = GitHubClient::try_from_env(&owner, &repo).await;
     if github_client.is_none() {
         println!("⚠️  No GitHub authentication found - progress comments will not be posted");
-    }
-
-    // Claim the issue by adding in-progress label (fire-and-forget)
-    if let Some(ref client) = github_client {
-        claim_issue(client, &owner, &repo, issue_num).await;
     }
 
     // Fetch issue details
@@ -1106,6 +1138,17 @@ pub async fn handle_fix(
 
     // Phase 2: Setup worktree
     let wt_ctx = setup_worktree(&issue_ctx).await?;
+
+    // Claim the issue now that worktree is set up (fire-and-forget)
+    if let Some(ref client) = issue_ctx.github_client {
+        claim_issue(
+            client,
+            &issue_ctx.owner,
+            &issue_ctx.repo,
+            issue_ctx.issue_num,
+        )
+        .await;
+    }
 
     // Phase 3: Run Claude
     let claude_result =
