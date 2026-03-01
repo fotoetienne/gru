@@ -177,7 +177,9 @@ pub fn parse_porcelain_worktrees(output: &str) -> Vec<WorktreeEntry> {
     let mut current_path: Option<PathBuf> = None;
     let mut current_branch: Option<String> = None;
 
-    for line in output.lines() {
+    for raw_line in output.lines() {
+        // Normalize CRLF: str::lines() splits on \n but doesn't strip \r
+        let line = raw_line.trim_end();
         if line.starts_with("worktree ") {
             current_branch = None; // reset stale branch from prior incomplete stanza
             current_path = Some(PathBuf::from(line.strip_prefix("worktree ").unwrap()));
@@ -1019,6 +1021,16 @@ mod tests {
     fn test_parse_porcelain_worktrees_empty_output() {
         let entries = parse_porcelain_worktrees("");
         assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn test_parse_porcelain_worktrees_crlf() {
+        let output = "worktree /work/issue-1\r\nHEAD abc123\r\nbranch refs/heads/issue-1\r\n\r\n";
+        let entries = parse_porcelain_worktrees(output);
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].path, PathBuf::from("/work/issue-1"));
+        assert_eq!(entries[0].branch.as_deref(), Some("issue-1"));
     }
 
     #[test]
