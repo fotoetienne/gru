@@ -1,7 +1,7 @@
 use crate::ci;
 use crate::claude_runner::{
     build_claude_command, build_claude_resume_command, run_claude_with_stream_monitoring,
-    EXIT_CODE_SIGNAL_TERMINATED,
+    ClaudeRunnerError, EXIT_CODE_SIGNAL_TERMINATED,
 };
 use crate::git;
 use crate::github::GitHubClient;
@@ -54,6 +54,12 @@ impl std::fmt::Display for FixError {
             }
         }
     }
+}
+
+/// Returns true if the error indicates the task is stuck or timed out,
+/// meaning it should be labeled `minion:blocked` instead of `minion:failed`.
+fn is_stuck_or_timeout_error(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<ClaudeRunnerError>().is_some()
 }
 
 impl std::error::Error for FixError {}
@@ -346,6 +352,19 @@ async fn trigger_pr_review(
                 timeout_duration.as_secs() / 60,
                 pr_number
             ))
+        }
+    }
+}
+
+/// Attempts to mark an issue as blocked (fire-and-forget).
+/// Logs success/failure but does not propagate errors.
+async fn try_mark_issue_blocked(client: &GitHubClient, owner: &str, repo: &str, issue_num: u64) {
+    match client.mark_issue_blocked(owner, repo, issue_num).await {
+        Ok(()) => {
+            println!("🏷️  Updated issue label to 'minion:blocked'");
+        }
+        Err(e) => {
+            log::warn!("⚠️  Failed to update issue label: {}", e);
         }
     }
 }
@@ -1171,7 +1190,24 @@ pub async fn handle_fix(
 
     // Phase 3: Run Claude
     let claude_result =
-        run_claude_session(&issue_ctx, &wt_ctx, quiet, timeout_opt.as_deref()).await?;
+        match run_claude_session(&issue_ctx, &wt_ctx, quiet, timeout_opt.as_deref()).await {
+            Ok(result) => result,
+            Err(e) if is_stuck_or_timeout_error(&e) => {
+                // Task is stuck or timed out — mark as blocked for human review
+                log::error!("🚨 {:#}", e);
+                if let Some(ref client) = issue_ctx.github_client {
+                    try_mark_issue_blocked(
+                        client,
+                        &issue_ctx.owner,
+                        &issue_ctx.repo,
+                        issue_ctx.issue_num,
+                    )
+                    .await;
+                }
+                return Ok(1);
+            }
+            Err(e) => return Err(e),
+        };
 
     if !claude_result.status.success() {
         // Mark issue as failed (fire-and-forget)
@@ -1213,7 +1249,20 @@ pub async fn handle_fix(
     .await;
     match ci_passed {
         Ok(true) => log::info!("✅ CI checks passed"),
-        Ok(false) => log::warn!("⚠️  CI checks failed or were escalated"),
+        Ok(false) => {
+            // CI fix attempts exhausted — mark issue as blocked for human review
+            log::warn!("⚠️  CI checks failed or were escalated");
+            if let Some(ref client) = issue_ctx.github_client {
+                try_mark_issue_blocked(
+                    client,
+                    &issue_ctx.owner,
+                    &issue_ctx.repo,
+                    issue_ctx.issue_num,
+                )
+                .await;
+            }
+            return Ok(1);
+        }
         Err(e) => log::warn!("⚠️  CI monitoring error (non-fatal): {}", e),
     }
 
@@ -1313,5 +1362,38 @@ mod tests {
             err.downcast_ref::<FixError>(),
             Some(&FixError::ExistingMinionFound)
         );
+    }
+
+    #[test]
+    fn test_is_stuck_or_timeout_error_stuck() {
+        let err: anyhow::Error = ClaudeRunnerError::InactivityStuck { minutes: 15 }.into();
+        assert!(is_stuck_or_timeout_error(&err));
+    }
+
+    #[test]
+    fn test_is_stuck_or_timeout_error_task_timeout() {
+        let err: anyhow::Error =
+            ClaudeRunnerError::MaxTimeout(tokio::time::Duration::from_secs(600)).into();
+        assert!(is_stuck_or_timeout_error(&err));
+    }
+
+    #[test]
+    fn test_is_stuck_or_timeout_error_stream_timeout() {
+        let err: anyhow::Error = ClaudeRunnerError::StreamTimeout { seconds: 300 }.into();
+        assert!(is_stuck_or_timeout_error(&err));
+    }
+
+    #[test]
+    fn test_is_stuck_or_timeout_error_other_error() {
+        let err = anyhow::anyhow!("Failed to spawn claude process");
+        assert!(!is_stuck_or_timeout_error(&err));
+    }
+
+    #[test]
+    fn test_is_stuck_or_timeout_error_wrapped_in_context() {
+        // Typed errors survive context wrapping, unlike string matching
+        let err: anyhow::Error = ClaudeRunnerError::InactivityStuck { minutes: 15 }.into();
+        let wrapped = err.context("Claude session failed");
+        assert!(is_stuck_or_timeout_error(&wrapped));
     }
 }
