@@ -154,7 +154,11 @@ impl Worktree {
     ///
     /// Squash merges create new commit hashes, so `git branch --merged` won't detect them.
     /// This method uses `gh pr list --state merged --head <branch>` to check GitHub directly.
-    /// Returns `Ok(false)` on CLI failure to degrade gracefully (e.g., no network, no auth).
+    ///
+    /// # Error behavior
+    /// - Failure to spawn the `gh`/`ghe` process propagates as `Err` (system-level problem).
+    /// - Non-zero CLI exit (e.g., auth failure, network error) returns `Ok(false)` to degrade
+    ///   gracefully without blocking cleanup of other worktrees.
     pub async fn check_pr_merged_on_github(&self) -> Result<bool> {
         let gh_cmd = github::gh_command_for_repo(&self.repo);
         let output = Command::new(gh_cmd)
