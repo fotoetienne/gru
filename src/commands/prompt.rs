@@ -8,6 +8,7 @@ use crate::minion_registry::{
     with_registry, MinionInfo as RegistryMinionInfo, MinionMode, MinionRegistry, OrchestrationPhase,
 };
 use crate::progress::{ProgressConfig, ProgressDisplay};
+use crate::prompt_loader;
 use crate::prompt_renderer::{render_template, PromptContext};
 use crate::stream;
 use crate::url_utils::{parse_github_url, parse_issue_info, GitHubResourceType};
@@ -273,6 +274,33 @@ pub async fn handle_prompt(
     // Parse custom parameters
     let custom_params = parse_params(&params)?;
 
+    // Try to resolve the prompt as a file-based prompt name.
+    // If it matches a loaded prompt file, use its content and validate requirements.
+    // Otherwise, treat it as ad-hoc prompt text.
+    // Use git toplevel (not cwd) so prompts are found from subdirectories.
+    let repo_root = git::detect_git_repo().await.ok();
+    let loaded_prompts = prompt_loader::load_prompts(repo_root.as_deref()).unwrap_or_else(|e| {
+        log::warn!("Failed to load prompt files: {}", e);
+        HashMap::new()
+    });
+    let resolved_prompt = if let Some(file_prompt) = loaded_prompts.get(trimmed_prompt) {
+        // Validate prompt syntax (non-empty content, valid param names)
+        prompt_loader::validate_prompt(file_prompt)?;
+
+        // Validate requirements before proceeding
+        prompt_loader::validate_prompt_requirements(
+            &file_prompt.name,
+            &file_prompt.metadata,
+            issue_opt.is_some(),
+            pr_opt.is_some(),
+            &custom_params,
+        )?;
+
+        file_prompt.content.clone()
+    } else {
+        trimmed_prompt.to_string()
+    };
+
     // Build prompt context from --issue and --pr flags and custom params
     let mut context = PromptContext::new();
     let mut context_owner: Option<String> = None;
@@ -392,7 +420,7 @@ pub async fn handle_prompt(
 
     // Render the prompt with variable substitution
     let variables = context.to_variables();
-    let rendered_prompt = render_template(prompt, &variables);
+    let rendered_prompt = render_template(&resolved_prompt, &variables);
 
     // Save rendered prompt to file for debugging and audit trail
     let prompt_file = workspace_path.join("prompt.txt");
