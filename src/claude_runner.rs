@@ -21,6 +21,46 @@ pub const INACTIVITY_STUCK_SECS: u64 = 900; // 15 minutes
 /// Exit code returned when a process is terminated by a signal (shell convention)
 pub const EXIT_CODE_SIGNAL_TERMINATED: i32 = 128;
 
+/// Errors from the Claude runner that indicate the task is stuck or timed out.
+///
+/// These are typed errors so callers can reliably detect blocked states via
+/// `downcast_ref::<ClaudeRunnerError>()` rather than fragile string matching.
+#[derive(Debug)]
+pub enum ClaudeRunnerError {
+    /// The task exceeded its configured maximum timeout (--timeout flag).
+    MaxTimeout(Duration),
+    /// No activity (no stream events) for INACTIVITY_STUCK_SECS.
+    InactivityStuck { minutes: u64 },
+    /// No output from the Claude process for STREAM_TIMEOUT_SECS.
+    StreamTimeout { seconds: u64 },
+}
+
+impl std::fmt::Display for ClaudeRunnerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ClaudeRunnerError::MaxTimeout(d) => {
+                write!(f, "Task exceeded maximum timeout of {:?}", d)
+            }
+            ClaudeRunnerError::InactivityStuck { minutes } => {
+                write!(
+                    f,
+                    "No activity for {} minutes - task appears stuck",
+                    minutes
+                )
+            }
+            ClaudeRunnerError::StreamTimeout { seconds } => {
+                write!(
+                    f,
+                    "Timeout: Claude process hasn't produced output in {} seconds",
+                    seconds
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for ClaudeRunnerError {}
+
 /// Logs an event to events.jsonl in the given directory
 async fn log_event(dir: &Path, event: &stream::StreamOutput) -> Result<()> {
     let events_file = dir.join("events.jsonl");
@@ -189,7 +229,7 @@ where
     let task_start = Instant::now();
 
     // Process stream output asynchronously with timeout and error handling
-    let stream_result = async {
+    let stream_result: Result<()> = async {
         let mut last_event_time = Instant::now();
         let mut inactivity_warning_shown = false;
 
@@ -200,10 +240,7 @@ where
                 if elapsed >= max_duration {
                     log::info!("⏱️  Task timeout reached ({:?})", max_duration);
                     log::info!("📝 Events saved to events.jsonl");
-                    return Err(anyhow::anyhow!(
-                        "Task exceeded maximum timeout of {:?}",
-                        max_duration
-                    ));
+                    return Err(ClaudeRunnerError::MaxTimeout(max_duration).into());
                 }
             }
 
@@ -216,10 +253,10 @@ where
                     INACTIVITY_STUCK_SECS / 60
                 );
                 log::info!("📝 Events saved to events.jsonl");
-                return Err(anyhow::anyhow!(
-                    "No activity for {} minutes - task appears stuck",
-                    INACTIVITY_STUCK_SECS / 60
-                ));
+                return Err(ClaudeRunnerError::InactivityStuck {
+                    minutes: INACTIVITY_STUCK_SECS / 60,
+                }
+                .into());
             } else if inactivity.as_secs() >= INACTIVITY_WARNING_SECS && !inactivity_warning_shown {
                 log::warn!(
                     "⚠️  No activity for {} minutes",
@@ -231,11 +268,11 @@ where
             // Try to read next line with timeout
             let line_result = timeout(Duration::from_secs(STREAM_TIMEOUT_SECS), stream.next_line())
                 .await
-                .map_err(|_| {
-                    anyhow::anyhow!(
-                        "Timeout: Claude process hasn't produced output in {} seconds",
-                        STREAM_TIMEOUT_SECS
-                    )
+                .map_err(|_| -> anyhow::Error {
+                    ClaudeRunnerError::StreamTimeout {
+                        seconds: STREAM_TIMEOUT_SECS,
+                    }
+                    .into()
                 })?;
 
             // Handle the stream result

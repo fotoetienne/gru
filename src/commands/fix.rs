@@ -1,7 +1,7 @@
 use crate::ci;
 use crate::claude_runner::{
     build_claude_command, build_claude_resume_command, run_claude_with_stream_monitoring,
-    EXIT_CODE_SIGNAL_TERMINATED,
+    ClaudeRunnerError, EXIT_CODE_SIGNAL_TERMINATED,
 };
 use crate::git;
 use crate::github::GitHubClient;
@@ -59,10 +59,7 @@ impl std::fmt::Display for FixError {
 /// Returns true if the error indicates the task is stuck or timed out,
 /// meaning it should be labeled `minion:blocked` instead of `minion:failed`.
 fn is_stuck_or_timeout_error(err: &anyhow::Error) -> bool {
-    let msg = err.to_string();
-    msg.contains("task appears stuck")
-        || msg.contains("Task exceeded maximum timeout")
-        || msg.contains("hasn't produced output in")
+    err.downcast_ref::<ClaudeRunnerError>().is_some()
 }
 
 impl std::error::Error for FixError {}
@@ -1368,19 +1365,20 @@ mod tests {
 
     #[test]
     fn test_is_stuck_or_timeout_error_stuck() {
-        let err = anyhow::anyhow!("No activity for 15 minutes - task appears stuck");
+        let err: anyhow::Error = ClaudeRunnerError::InactivityStuck { minutes: 15 }.into();
         assert!(is_stuck_or_timeout_error(&err));
     }
 
     #[test]
     fn test_is_stuck_or_timeout_error_task_timeout() {
-        let err = anyhow::anyhow!("Task exceeded maximum timeout of 600s");
+        let err: anyhow::Error =
+            ClaudeRunnerError::MaxTimeout(tokio::time::Duration::from_secs(600)).into();
         assert!(is_stuck_or_timeout_error(&err));
     }
 
     #[test]
     fn test_is_stuck_or_timeout_error_stream_timeout() {
-        let err = anyhow::anyhow!("Timeout: Claude process hasn't produced output in 300 seconds");
+        let err: anyhow::Error = ClaudeRunnerError::StreamTimeout { seconds: 300 }.into();
         assert!(is_stuck_or_timeout_error(&err));
     }
 
@@ -1388,5 +1386,13 @@ mod tests {
     fn test_is_stuck_or_timeout_error_other_error() {
         let err = anyhow::anyhow!("Failed to spawn claude process");
         assert!(!is_stuck_or_timeout_error(&err));
+    }
+
+    #[test]
+    fn test_is_stuck_or_timeout_error_wrapped_in_context() {
+        // Typed errors survive context wrapping, unlike string matching
+        let err: anyhow::Error = ClaudeRunnerError::InactivityStuck { minutes: 15 }.into();
+        let wrapped = err.context("Claude session failed");
+        assert!(is_stuck_or_timeout_error(&wrapped));
     }
 }
