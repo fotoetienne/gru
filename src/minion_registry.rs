@@ -9,6 +9,34 @@ use std::path::{Path, PathBuf};
 
 use crate::workspace::Workspace;
 
+/// Async helper that loads the registry inside `spawn_blocking`, runs the
+/// provided closure, and flattens the `JoinError` / inner `Result`.
+///
+/// This encapsulates the common pattern of:
+/// ```ignore
+/// tokio::task::spawn_blocking(move || {
+///     let mut registry = MinionRegistry::load(None)?;
+///     registry.register/update/remove(...)
+/// })
+/// .await
+/// .context("...")??;
+/// ```
+///
+/// The double `??` (JoinError then inner Result) is a subtle footgun that
+/// this helper eliminates.
+pub async fn with_registry<F, R>(f: F) -> Result<R>
+where
+    F: FnOnce(&mut MinionRegistry) -> Result<R> + Send + 'static,
+    R: Send + 'static,
+{
+    tokio::task::spawn_blocking(move || {
+        let mut registry = MinionRegistry::load(None)?;
+        f(&mut registry)
+    })
+    .await
+    .context("Registry task panicked")?
+}
+
 /// The execution mode of a Minion session
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]

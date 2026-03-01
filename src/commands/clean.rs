@@ -1,4 +1,4 @@
-use crate::minion_registry::MinionRegistry;
+use crate::minion_registry::with_registry;
 use crate::workspace;
 use crate::worktree_scanner;
 use anyhow::{Context, Result};
@@ -146,61 +146,64 @@ pub async fn handle_clean(dry_run: bool, force: bool, base_branch: &str) -> Resu
     // Load registry and get active minion worktrees
     // Note: There's a narrow race condition where a minion could start between registry load
     // and worktree checks. This is acceptable given the trade-offs and typical usage patterns.
-    let registry = MinionRegistry::load(None).context(
-        "Failed to load minion registry from the default location. This may be due to a missing \
-         or corrupt registry file, or insufficient file permissions. The default registry is \
-         typically located at ~/.gru/state/minions.json.",
-    )?;
+    let (active_minion_worktrees, stopped_minion_worktrees, stopped_minion_ids) =
+        with_registry(|registry| {
+            // Partition registry into active (live process) and stopped minion worktree paths.
+            // Active minions are protected from cleanup; stopped minions are cleanable as a fallback
+            // even when git status checks (merged/closed/remote-deleted) find nothing.
+            let mut active = HashSet::new();
+            let mut stopped = HashSet::new();
+            // Track stopped minions by ID for orphan cleanup (registry entries with no git worktree)
+            let mut stopped_ids: Vec<(String, std::path::PathBuf)> = Vec::new();
 
-    // Partition registry into active (live process) and stopped minion worktree paths.
-    // Active minions are protected from cleanup; stopped minions are cleanable as a fallback
-    // even when git status checks (merged/closed/remote-deleted) find nothing.
-    let mut active_minion_worktrees = HashSet::new();
-    let mut stopped_minion_worktrees = HashSet::new();
-    // Track stopped minions by ID for orphan cleanup (registry entries with no git worktree)
-    let mut stopped_minion_ids: Vec<(String, std::path::PathBuf)> = Vec::new();
+            for (minion_id, info) in registry.list() {
+                let is_alive = match info.pid {
+                    // On non-Unix, is_process_alive always returns false, so we conservatively
+                    // assume a recorded PID is alive to avoid cleaning active worktrees.
+                    Some(pid) => {
+                        cfg!(not(unix)) || crate::minion_registry::is_process_alive(pid)
+                    }
+                    // No PID recorded: trust the mode field. Legacy entries (pre-PID) default
+                    // to Stopped, so they won't block cleanup. But if mode says the minion is
+                    // running, be conservative and protect the worktree.
+                    None => matches!(
+                        info.mode,
+                        crate::minion_registry::MinionMode::Autonomous
+                            | crate::minion_registry::MinionMode::Interactive
+                    ),
+                };
+                let canonical = match info.worktree.canonicalize() {
+                    Ok(c) => c,
+                    Err(e) => {
+                        log::warn!(
+                            "Warning: Failed to canonicalize worktree path for minion {}: {} (error: {})",
+                            minion_id,
+                            info.worktree.display(),
+                            e
+                        );
+                        log::warn!(
+                            "         Using original path, but this may cause comparison mismatches."
+                        );
+                        info.worktree
+                    }
+                };
 
-    for (minion_id, info) in registry.list() {
-        let is_alive = match info.pid {
-            // On non-Unix, is_process_alive always returns false, so we conservatively
-            // assume a recorded PID is alive to avoid cleaning active worktrees.
-            Some(pid) => cfg!(not(unix)) || crate::minion_registry::is_process_alive(pid),
-            // No PID recorded: trust the mode field. Legacy entries (pre-PID) default
-            // to Stopped, so they won't block cleanup. But if mode says the minion is
-            // running, be conservative and protect the worktree.
-            None => matches!(
-                info.mode,
-                crate::minion_registry::MinionMode::Autonomous
-                    | crate::minion_registry::MinionMode::Interactive
-            ),
-        };
-        let canonical = match info.worktree.canonicalize() {
-            Ok(c) => c,
-            Err(e) => {
-                log::warn!(
-                    "Warning: Failed to canonicalize worktree path for minion {}: {} (error: {})",
-                    minion_id,
-                    info.worktree.display(),
-                    e
-                );
-                log::warn!(
-                    "         Using original path, but this may cause comparison mismatches."
-                );
-                info.worktree
+                if is_alive {
+                    active.insert(canonical);
+                } else {
+                    stopped.insert(canonical.clone());
+                    stopped_ids.push((minion_id, canonical));
+                }
             }
-        };
 
-        if is_alive {
-            active_minion_worktrees.insert(canonical);
-        } else {
-            stopped_minion_worktrees.insert(canonical.clone());
-            stopped_minion_ids.push((minion_id, canonical));
-        }
-    }
-
-    // Release the registry lock so the cleanup loop can re-acquire it
-    // when removing minions from the registry.
-    drop(registry);
+            Ok((active, stopped, stopped_ids))
+        })
+        .await
+        .context(
+            "Failed to load minion registry from the default location. This may be due to a missing \
+             or corrupt registry file, or insufficient file permissions. The default registry is \
+             typically located at ~/.gru/state/minions.json.",
+        )?;
 
     // Prune stale worktree references (directory no longer exists on disk)
     let (stale, worktrees): (Vec<_>, Vec<_>) =
@@ -552,15 +555,13 @@ pub async fn handle_clean(dry_run: bool, force: bool, base_branch: &str) -> Resu
 
     // Batch-remove all cleaned minions from the registry in a single load/save cycle
     if !registry_ids_to_remove.is_empty() {
-        match MinionRegistry::load(None) {
-            Ok(mut registry) => {
-                if let Err(e) = registry.remove_batch(&registry_ids_to_remove) {
-                    log::warn!("Warning: Failed to update registry after cleanup: {}", e);
-                }
-            }
-            Err(e) => {
-                log::warn!("Warning: Failed to load registry for cleanup: {}", e);
-            }
+        if let Err(e) = with_registry(move |registry| {
+            registry.remove_batch(&registry_ids_to_remove)?;
+            Ok(())
+        })
+        .await
+        {
+            log::warn!("Warning: Failed to update registry after cleanup: {}", e);
         }
     }
 

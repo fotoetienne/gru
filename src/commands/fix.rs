@@ -7,7 +7,7 @@ use crate::git;
 use crate::github::GitHubClient;
 use crate::minion;
 use crate::minion_registry::{
-    is_process_alive, MinionInfo as RegistryMinionInfo, MinionMode, MinionRegistry,
+    is_process_alive, with_registry, MinionInfo as RegistryMinionInfo, MinionMode, MinionRegistry,
     OrchestrationPhase,
 };
 use crate::pr_monitor::{self, MonitorResult};
@@ -355,28 +355,19 @@ async fn try_mark_issue_blocked(client: &GitHubClient, owner: &str, repo: &str, 
 async fn update_orchestration_phase(minion_id: &str, phase: OrchestrationPhase) {
     let minion_id_owned = minion_id.to_string();
     let phase_name = format!("{:?}", phase);
-    let minion_id_for_log = minion_id_owned.clone();
-    let result = tokio::task::spawn_blocking(move || {
-        let mut registry = MinionRegistry::load(None)?;
+    if let Err(e) = with_registry(move |registry| {
         registry.update(&minion_id_owned, |info| {
             info.orchestration_phase = phase;
         })
     })
-    .await;
-    match result {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => log::warn!(
+    .await
+    {
+        log::warn!(
             "⚠️  Failed to update orchestration phase for {} to {}: {}",
-            minion_id_for_log,
+            minion_id,
             phase_name,
             e
-        ),
-        Err(e) => log::warn!(
-            "⚠️  Failed to spawn phase update task for {} to {}: {}",
-            minion_id_for_log,
-            phase_name,
-            e
-        ),
+        );
     }
 }
 
@@ -457,12 +448,9 @@ async fn check_existing_minions(
     issue_num: u64,
 ) -> Result<ExistingMinionCheck> {
     let repo_for_check = format!("{}/{}", owner, repo);
-    let mut existing = tokio::task::spawn_blocking(move || {
-        let registry = MinionRegistry::load(None)?;
-        Ok::<_, anyhow::Error>(registry.find_by_issue(&repo_for_check, issue_num))
-    })
-    .await
-    .context("Failed to spawn blocking task for duplicate check")??;
+    let mut existing =
+        with_registry(move |registry| Ok(registry.find_by_issue(&repo_for_check, issue_num)))
+            .await?;
 
     if existing.is_empty() {
         return Ok(ExistingMinionCheck::None);
@@ -687,12 +675,7 @@ async fn setup_worktree(ctx: &IssueContext) -> Result<WorktreeContext> {
     };
 
     let minion_id_clone = minion_id.clone();
-    tokio::task::spawn_blocking(move || {
-        let mut registry = MinionRegistry::load(None)?;
-        registry.register(minion_id_clone, registry_info)
-    })
-    .await
-    .context("Failed to spawn blocking task for registry registration")??;
+    with_registry(move |registry| registry.register(minion_id_clone, registry_info)).await?;
 
     println!("📝 Registered Minion {} in registry", minion_id);
 
@@ -943,18 +926,16 @@ async fn run_claude_session_inner(
     )
     .await;
 
-    // Always clear PID and set mode to Stopped, regardless of success or error
+    // Best-effort cleanup: clear PID and set mode to Stopped.
+    // Errors are intentionally discarded so registry issues don't mask the real run result.
     let exit_minion_id = wt_ctx.minion_id.clone();
-    tokio::task::spawn_blocking(move || {
-        if let Ok(mut registry) = MinionRegistry::load(None) {
-            let _ = registry.update(&exit_minion_id, |info| {
-                info.pid = None;
-                info.mode = MinionMode::Stopped;
-            });
-        }
+    let _ = with_registry(move |registry| {
+        registry.update(&exit_minion_id, |info| {
+            info.pid = None;
+            info.mode = MinionMode::Stopped;
+        })
     })
-    .await
-    .context("Failed to update registry after process exit")?;
+    .await;
 
     let status = run_result?;
 
@@ -1038,15 +1019,13 @@ async fn handle_pr_creation(
             // Update registry with PR number
             let minion_id_clone = wt_ctx.minion_id.clone();
             let pr_number_clone = pr_number.clone();
-            tokio::task::spawn_blocking(move || {
-                let mut registry = MinionRegistry::load(None)?;
+            with_registry(move |registry| {
                 registry.update(&minion_id_clone, |info| {
                     info.pr = Some(pr_number_clone);
                     info.status = "idle".to_string();
                 })
             })
-            .await
-            .context("Failed to spawn blocking task for registry update")??;
+            .await?;
 
             println!("✅ Draft PR created: #{}", pr_number);
             println!(
@@ -1384,12 +1363,10 @@ pub async fn handle_fix(
         // Already past PR creation — look up the PR from registry
         println!("⏭️  Skipping PR creation (already completed)");
         let minion_id = wt_ctx.minion_id.clone();
-        let existing_pr = tokio::task::spawn_blocking(move || {
-            let registry = MinionRegistry::load(None)?;
-            Ok::<_, anyhow::Error>(registry.get(&minion_id).and_then(|info| info.pr.clone()))
+        let existing_pr = with_registry(move |registry| {
+            Ok(registry.get(&minion_id).and_then(|info| info.pr.clone()))
         })
-        .await
-        .context("Failed to look up PR from registry")??;
+        .await?;
 
         if existing_pr.is_some() {
             existing_pr

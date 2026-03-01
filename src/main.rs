@@ -98,6 +98,12 @@ enum Commands {
     Resume {
         #[arg(help = "Minion ID, issue number, or PR number (e.g., M0tk, 42)")]
         id: String,
+
+        #[arg(
+            long,
+            help = "Skip permission prompts (adds --dangerously-skip-permissions)"
+        )]
+        yolo: bool,
     },
     #[command(about = "Clean up merged/closed worktrees")]
     Clean {
@@ -192,7 +198,7 @@ async fn main() {
         Commands::Review { pr } => review::handle_review(pr).await,
         Commands::Path { id, issue, pr } => path::handle_path(id, issue, pr).await,
         Commands::Attach { id, yolo } => attach::handle_attach(id, yolo).await,
-        Commands::Resume { id } => resume::handle_resume(id).await,
+        Commands::Resume { id, yolo } => resume::handle_resume(id, yolo).await,
         Commands::Clean {
             dry_run,
             force,

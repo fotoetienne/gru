@@ -4,7 +4,7 @@ use crate::claude_runner::{
 use crate::git;
 use crate::minion;
 use crate::minion_registry::{
-    MinionInfo as RegistryMinionInfo, MinionMode, MinionRegistry, OrchestrationPhase,
+    with_registry, MinionInfo as RegistryMinionInfo, MinionMode, MinionRegistry, OrchestrationPhase,
 };
 use crate::minion_resolver;
 use crate::pr_state::PrState;
@@ -116,14 +116,9 @@ pub async fn handle_review(pr_arg: Option<String>) -> Result<i32> {
         orchestration_phase: OrchestrationPhase::RunningClaude,
     };
 
-    // Load registry and register the Minion (spawn_blocking to avoid holding lock during review)
+    // Register the Minion (spawn_blocking to avoid holding lock during review)
     let minion_id_clone = minion_id.clone();
-    tokio::task::spawn_blocking(move || {
-        let mut registry = MinionRegistry::load(None)?;
-        registry.register(minion_id_clone, registry_info)
-    })
-    .await
-    .context("Failed to spawn blocking task for registry registration")??;
+    with_registry(move |registry| registry.register(minion_id_clone, registry_info)).await?;
 
     println!("🤖 Launching autonomous review agent...\n");
 
@@ -175,14 +170,18 @@ pub async fn handle_review(pr_arg: Option<String>) -> Result<i32> {
 
     // Remove minion from registry (best effort - don't fail if this errors).
     // No need to update PID/mode first since the entry is being deleted.
-    if let Ok(mut registry) = MinionRegistry::load(None) {
-        if let Err(e) = registry.remove(&minion_id) {
-            log::warn!(
-                "Warning: Failed to remove minion {} from registry: {}",
-                minion_id,
-                e
-            );
-        }
+    let remove_id = minion_id.clone();
+    if let Err(e) = with_registry(move |registry| {
+        registry.remove(&remove_id)?;
+        Ok(())
+    })
+    .await
+    {
+        log::warn!(
+            "Warning: Failed to remove minion {} from registry: {}",
+            minion_id,
+            e
+        );
     }
 
     // Now check if there was a stream error (after cleanup)

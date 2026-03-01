@@ -5,7 +5,7 @@ use crate::git;
 use crate::github::GitHubClient;
 use crate::minion;
 use crate::minion_registry::{
-    MinionInfo as RegistryMinionInfo, MinionMode, MinionRegistry, OrchestrationPhase,
+    with_registry, MinionInfo as RegistryMinionInfo, MinionMode, MinionRegistry, OrchestrationPhase,
 };
 use crate::progress::{ProgressConfig, ProgressDisplay};
 use crate::prompt_renderer::{render_template, PromptContext};
@@ -249,10 +249,8 @@ pub async fn handle_prompt(
         orchestration_phase: OrchestrationPhase::RunningClaude,
     };
 
-    let mut registry = MinionRegistry::load(None).context("Failed to load Minion registry")?;
-    registry
-        .register(minion_id.clone(), registry_info)
-        .context("Failed to register prompt Minion in registry")?;
+    let minion_id_clone = minion_id.clone();
+    with_registry(move |registry| registry.register(minion_id_clone, registry_info)).await?;
 
     println!("🤖 Launching Claude...\n");
 
@@ -305,14 +303,18 @@ pub async fn handle_prompt(
 
     // Remove minion from registry (best effort - don't fail if this errors).
     // No need to update PID/mode first since the entry is being deleted.
-    if let Ok(mut registry) = MinionRegistry::load(None) {
-        if let Err(e) = registry.remove(&minion_id) {
-            log::info!(
-                "Warning: Failed to remove minion {} from registry: {}",
-                minion_id,
-                e
-            );
-        }
+    let remove_id = minion_id.clone();
+    if let Err(e) = with_registry(move |registry| {
+        registry.remove(&remove_id)?;
+        Ok(())
+    })
+    .await
+    {
+        log::info!(
+            "Warning: Failed to remove minion {} from registry: {}",
+            minion_id,
+            e
+        );
     }
 
     // Now check if there was a stream error (after cleanup)
