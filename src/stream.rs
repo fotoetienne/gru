@@ -598,8 +598,8 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn test_parse_message_start_with_usage() {
+    #[test]
+    fn test_parse_message_start_with_usage() {
         let json = r#"{"type":"message_start","message":{"id":"msg_123","role":"assistant","usage":{"input_tokens":100,"output_tokens":0,"cache_creation_input_tokens":50,"cache_read_input_tokens":25}}}"#;
         let event: ClaudeEvent = serde_json::from_str(json).unwrap();
         match event {
@@ -614,8 +614,8 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn test_parse_message_start_without_usage() {
+    #[test]
+    fn test_parse_message_start_without_usage() {
         let json = r#"{"type":"message_start","message":{"id":"msg_123","role":"assistant"}}"#;
         let event: ClaudeEvent = serde_json::from_str(json).unwrap();
         match event {
@@ -626,8 +626,8 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn test_parse_message_delta_with_usage() {
+    #[test]
+    fn test_parse_message_delta_with_usage() {
         let json = r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":500}}"#;
         let event: ClaudeEvent = serde_json::from_str(json).unwrap();
         match event {
