@@ -300,12 +300,12 @@ fn load_prompts_internal(
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn validate_required_params(
     metadata: &PromptMetadata,
-    provided: &std::collections::HashMap<String, String>,
+    provided: &HashMap<String, String>,
 ) -> Result<()> {
     let missing: Vec<&PromptParam> = metadata
         .params
         .iter()
-        .filter(|p| p.required && !provided.contains_key(&p.name))
+        .filter(|p| p.required && provided.get(&p.name).map_or(true, |v| v.is_empty()))
         .collect();
 
     if missing.is_empty() {
@@ -778,5 +778,47 @@ Repo content"#,
         assert!(err.contains("--param c=<value>"));
         assert!(err.contains("First param"));
         assert!(err.contains("Third param"));
+    }
+
+    #[test]
+    fn test_validate_required_params_empty_value_rejected() {
+        let metadata = PromptMetadata {
+            description: None,
+            requires: vec![],
+            params: vec![PromptParam {
+                name: "component".to_string(),
+                description: None,
+                required: true,
+            }],
+        };
+
+        let mut provided = HashMap::new();
+        provided.insert("component".to_string(), String::new());
+
+        let result = validate_required_params(&metadata, &provided);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("component"));
+    }
+
+    #[test]
+    fn test_validate_required_params_all_optional_none_provided() {
+        let metadata = PromptMetadata {
+            description: None,
+            requires: vec![],
+            params: vec![
+                PromptParam {
+                    name: "opt1".to_string(),
+                    description: None,
+                    required: false,
+                },
+                PromptParam {
+                    name: "opt2".to_string(),
+                    description: None,
+                    required: false,
+                },
+            ],
+        };
+
+        assert!(validate_required_params(&metadata, &HashMap::new()).is_ok());
     }
 }
