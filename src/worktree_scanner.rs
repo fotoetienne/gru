@@ -1,4 +1,5 @@
 use crate::git;
+use crate::github;
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 use tokio::process::Command;
@@ -21,6 +22,8 @@ pub struct Worktree {
 pub enum WorktreeStatus {
     /// Branch has been merged into the base branch
     Merged,
+    /// PR was merged on GitHub (e.g., squash merge where commit hashes differ)
+    PrMerged,
     /// Associated GitHub issue is closed
     IssueClosed,
     /// Branch has been deleted on remote
@@ -73,8 +76,8 @@ impl Worktree {
             None => return Ok(None),
         };
 
-        // Use gh CLI to check issue status
-        let output = Command::new("gh")
+        let gh_cmd = github::gh_command_for_repo(&self.repo);
+        let output = Command::new(gh_cmd)
             .args([
                 "issue",
                 "view",
@@ -139,11 +142,64 @@ impl Worktree {
         Ok(output.stdout.is_empty())
     }
 
+    /// Check if a PR for this branch was merged on GitHub (handles squash merges)
+    ///
+    /// Squash merges create new commit hashes, so `git branch --merged` won't detect them.
+    /// This method uses `gh pr list --state merged --head <branch>` to check GitHub directly.
+    ///
+    /// # Error behavior
+    /// - Failure to spawn the `gh`/`ghe` process propagates as `Err` (system-level problem).
+    /// - Non-zero CLI exit (e.g., auth failure, network error) returns `Ok(false)` to degrade
+    ///   gracefully without blocking cleanup of other worktrees.
+    pub async fn check_pr_merged_on_github(&self) -> Result<bool> {
+        let gh_cmd = github::gh_command_for_repo(&self.repo);
+        let output = Command::new(gh_cmd)
+            .args([
+                "pr",
+                "list",
+                "--state",
+                "merged",
+                "--head",
+                &self.branch,
+                "--repo",
+                &self.repo,
+                "--json",
+                "number",
+                "--jq",
+                "length",
+            ])
+            .output()
+            .await
+            .context("Failed to check PR merge status on GitHub")?;
+
+        if !output.status.success() {
+            return Ok(false);
+        }
+
+        let count_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let count: u64 = if count_str.is_empty() {
+            0
+        } else {
+            match count_str.parse() {
+                Ok(n) => n,
+                Err(_) => {
+                    log::warn!(
+                        "Unexpected output from '{} pr list --jq length': {:?}",
+                        gh_cmd,
+                        count_str
+                    );
+                    0
+                }
+            }
+        };
+        Ok(count > 0)
+    }
+
     /// Determine the overall status of this worktree
     pub async fn status(&self, base_branch: &str) -> Result<WorktreeStatus> {
         // Check in order of priority
 
-        // 1. Check if merged
+        // 1. Check if merged (git-level)
         if self
             .check_merged(base_branch)
             .await
@@ -156,7 +212,20 @@ impl Worktree {
             return Ok(WorktreeStatus::Merged);
         }
 
-        // 2. Check if issue is closed
+        // 2. Check if PR was merged on GitHub (handles squash merges)
+        if self
+            .check_pr_merged_on_github()
+            .await
+            .map_err(|e| {
+                log::warn!("Warning: Failed to check PR merge status on GitHub: {}", e);
+                e
+            })
+            .unwrap_or(false)
+        {
+            return Ok(WorktreeStatus::PrMerged);
+        }
+
+        // 3. Check if issue is closed
         if let Some(true) = self
             .check_issue_closed()
             .await
@@ -169,7 +238,7 @@ impl Worktree {
             return Ok(WorktreeStatus::IssueClosed);
         }
 
-        // 3. Check if remote branch is deleted
+        // 4. Check if remote branch is deleted
         if self
             .check_remote_deleted()
             .await
