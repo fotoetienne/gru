@@ -143,7 +143,7 @@ fn parse_frontmatter(content: &str) -> Result<(PromptMetadata, String)> {
     // Extract and parse YAML
     let yaml_content = lines[1..end_index].join("\n");
     let metadata: PromptMetadata =
-        serde_yaml::from_str(&yaml_content).context("Failed to parse YAML frontmatter")?;
+        serde_yml::from_str(&yaml_content).context("Failed to parse YAML frontmatter")?;
 
     // Extract prompt content (everything after closing delimiter)
     let prompt_content = if end_index + 1 < lines.len() {
