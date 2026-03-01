@@ -268,6 +268,13 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_github_url_rejects_http() {
+        // parse_github_url only accepts https:// web URLs;
+        // use git::parse_github_remote for git remote URLs (which accept http:// and SSH)
+        assert!(parse_github_url("http://github.com/owner/repo/issues/42").is_none());
+    }
+
+    #[test]
     fn test_parse_github_url_rejects_empty_owner() {
         assert!(parse_github_url("https://github.com//repo/issues/42").is_none());
     }
@@ -308,6 +315,15 @@ mod tests {
             .unwrap();
         assert_eq!(result.0, "fotoetienne");
         assert_eq!(result.1, "gru");
+        assert_eq!(result.2, "42");
+    }
+
+    #[tokio::test]
+    async fn test_parse_issue_info_url_normalizes_number() {
+        // Leading zeros are normalized by parsing through u32
+        let result = parse_issue_info("https://github.com/owner/repo/issues/042")
+            .await
+            .unwrap();
         assert_eq!(result.2, "42");
     }
 
