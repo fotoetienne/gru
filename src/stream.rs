@@ -13,7 +13,7 @@ pub struct MessageInfo {
 }
 
 /// A content block within a message (text or tool_use)
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(tag = "type")]
 pub enum ContentBlock {
     #[serde(rename = "tool_use")]
@@ -30,11 +30,12 @@ pub enum ContentBlock {
     },
     /// Catch-all for unknown block types
     #[serde(other)]
+    #[default]
     Unknown,
 }
 
 /// A delta update within a content block
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(tag = "type")]
 pub enum ContentDelta {
     #[serde(rename = "text_delta")]
@@ -43,6 +44,7 @@ pub enum ContentDelta {
     InputJsonDelta { partial_json: String },
     /// Catch-all for unknown delta types
     #[serde(other)]
+    #[default]
     Unknown,
 }
 
@@ -79,6 +81,7 @@ pub enum ClaudeEvent {
     ContentBlockStart {
         #[serde(default)]
         index: usize,
+        #[serde(default)]
         content_block: ContentBlock,
     },
 
@@ -87,6 +90,7 @@ pub enum ClaudeEvent {
     ContentBlockDelta {
         #[serde(default)]
         index: usize,
+        #[serde(default)]
         delta: ContentDelta,
     },
 
@@ -99,7 +103,10 @@ pub enum ClaudeEvent {
 
     /// Delta/update to the message (e.g., stop_reason)
     #[serde(rename = "message_delta")]
-    MessageDelta { delta: MessageDeltaBody },
+    MessageDelta {
+        #[serde(default)]
+        delta: MessageDeltaBody,
+    },
 
     /// End of the message stream
     #[serde(rename = "message_stop")]
@@ -107,7 +114,10 @@ pub enum ClaudeEvent {
 
     /// Error event
     #[serde(rename = "error")]
-    Error { error: ErrorInfo },
+    Error {
+        #[serde(default)]
+        error: ErrorInfo,
+    },
 
     /// Ping event (keepalive)
     #[serde(rename = "ping")]
@@ -453,6 +463,63 @@ mod tests {
                 assert!(tool_result.is_error);
             }
             _ => panic!("Expected ToolResult with error"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_parse_unknown_content_block_type() {
+        let json = r#"{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"some thought"}}"#;
+        let event: ClaudeEvent = serde_json::from_str(json).unwrap();
+        match event {
+            ClaudeEvent::ContentBlockStart {
+                content_block: ContentBlock::Unknown,
+                ..
+            } => {}
+            _ => panic!("Expected Unknown content block"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_parse_unknown_content_delta_type() {
+        let json = r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"more thought"}}"#;
+        let event: ClaudeEvent = serde_json::from_str(json).unwrap();
+        match event {
+            ClaudeEvent::ContentBlockDelta {
+                delta: ContentDelta::Unknown,
+                ..
+            } => {}
+            _ => panic!("Expected Unknown delta"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_parse_input_json_delta() {
+        let json = r#"{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"key\":"}}"#;
+        let event: ClaudeEvent = serde_json::from_str(json).unwrap();
+        match event {
+            ClaudeEvent::ContentBlockDelta { delta, .. } => match delta {
+                ContentDelta::InputJsonDelta { partial_json } => {
+                    assert_eq!(partial_json, r#"{"key":"#);
+                }
+                _ => panic!("Expected InputJsonDelta"),
+            },
+            _ => panic!("Expected ContentBlockDelta event"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_parse_text_content_block() {
+        let json =
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#;
+        let event: ClaudeEvent = serde_json::from_str(json).unwrap();
+        match event {
+            ClaudeEvent::ContentBlockStart {
+                content_block: ContentBlock::Text { text },
+                ..
+            } => {
+                assert_eq!(text, "");
+            }
+            _ => panic!("Expected Text content block"),
         }
     }
 }
