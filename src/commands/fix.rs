@@ -353,11 +353,12 @@ async fn try_mark_issue_blocked(client: &GitHubClient, owner: &str, repo: &str, 
 /// Updates the orchestration phase for a minion in the registry.
 /// Logs a warning if the update fails, since phase tracking is important for resume correctness.
 async fn update_orchestration_phase(minion_id: &str, phase: OrchestrationPhase) {
-    let minion_id = minion_id.to_string();
+    let minion_id_owned = minion_id.to_string();
     let phase_name = format!("{:?}", phase);
+    let minion_id_for_log = minion_id_owned.clone();
     let result = tokio::task::spawn_blocking(move || {
         let mut registry = MinionRegistry::load(None)?;
-        registry.update(&minion_id, |info| {
+        registry.update(&minion_id_owned, |info| {
             info.orchestration_phase = phase;
         })
     })
@@ -365,12 +366,14 @@ async fn update_orchestration_phase(minion_id: &str, phase: OrchestrationPhase) 
     match result {
         Ok(Ok(())) => {}
         Ok(Err(e)) => log::warn!(
-            "⚠️  Failed to update orchestration phase to {}: {}",
+            "⚠️  Failed to update orchestration phase for {} to {}: {}",
+            minion_id_for_log,
             phase_name,
             e
         ),
         Err(e) => log::warn!(
-            "⚠️  Failed to spawn phase update task for {}: {}",
+            "⚠️  Failed to spawn phase update task for {} to {}: {}",
+            minion_id_for_log,
             phase_name,
             e
         ),
@@ -505,8 +508,8 @@ async fn check_existing_minions(
         eprintln!("\nOptions:");
         eprintln!("  - Attach interactively: gru attach {}", best_id);
         eprintln!(
-            "  - Create new session:   gru fix {} --force-new",
-            issue_num
+            "  - Create new session:   gru fix https://github.com/{}/{}/issues/{} --force-new",
+            owner, repo, issue_num
         );
 
         return Ok(ExistingMinionCheck::AlreadyRunning);
@@ -514,7 +517,7 @@ async fn check_existing_minions(
 
     // All minions are stopped - find the best candidate for resume.
     // Look for one that hasn't completed/failed and whose worktree still exists.
-    let resumable = existing.into_iter().find(|(_, info)| {
+    let resumable = existing.iter().find(|(_, info)| {
         !matches!(
             info.orchestration_phase,
             OrchestrationPhase::Completed | OrchestrationPhase::Failed
@@ -522,7 +525,32 @@ async fn check_existing_minions(
     });
 
     if let Some((minion_id, info)) = resumable {
-        return Ok(ExistingMinionCheck::Resumable(minion_id, Box::new(info)));
+        return Ok(ExistingMinionCheck::Resumable(
+            minion_id.clone(),
+            Box::new(info.clone()),
+        ));
+    }
+
+    // Check if any minion failed — require --force-new to prevent silent retry
+    let has_failed = existing
+        .iter()
+        .any(|(_, info)| matches!(info.orchestration_phase, OrchestrationPhase::Failed));
+
+    if has_failed {
+        let (failed_id, _) = existing
+            .iter()
+            .find(|(_, info)| matches!(info.orchestration_phase, OrchestrationPhase::Failed))
+            .unwrap();
+        eprintln!(
+            "Error: Minion {} previously failed for issue {}.",
+            failed_id, issue_num
+        );
+        eprintln!("\nOptions:");
+        eprintln!(
+            "  - Create new session:   gru fix https://github.com/{}/{}/issues/{} --force-new",
+            owner, repo, issue_num
+        );
+        return Ok(ExistingMinionCheck::AlreadyRunning);
     }
 
     Ok(ExistingMinionCheck::None)
