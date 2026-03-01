@@ -359,6 +359,19 @@ async fn trigger_pr_review(
     }
 }
 
+/// Attempts to mark an issue as blocked (fire-and-forget).
+/// Logs success/failure but does not propagate errors.
+async fn try_mark_issue_blocked(client: &GitHubClient, owner: &str, repo: &str, issue_num: u64) {
+    match client.mark_issue_blocked(owner, repo, issue_num).await {
+        Ok(()) => {
+            println!("🏷️  Updated issue label to 'minion:blocked'");
+        }
+        Err(e) => {
+            log::warn!("⚠️  Failed to update issue label: {}", e);
+        }
+    }
+}
+
 /// Posts a progress comment to the issue (fire-and-forget).
 async fn try_post_progress_comment(
     client: &GitHubClient,
@@ -1186,17 +1199,13 @@ pub async fn handle_fix(
                 // Task is stuck or timed out — mark as blocked for human review
                 log::error!("🚨 {}", e);
                 if let Some(ref client) = issue_ctx.github_client {
-                    match client
-                        .mark_issue_blocked(&issue_ctx.owner, &issue_ctx.repo, issue_ctx.issue_num)
-                        .await
-                    {
-                        Ok(()) => {
-                            println!("🏷️  Updated issue label to 'minion:blocked'");
-                        }
-                        Err(label_err) => {
-                            log::warn!("⚠️  Failed to update issue label: {}", label_err);
-                        }
-                    }
+                    try_mark_issue_blocked(
+                        client,
+                        &issue_ctx.owner,
+                        &issue_ctx.repo,
+                        issue_ctx.issue_num,
+                    )
+                    .await;
                 }
                 return Ok(1);
             }
@@ -1247,17 +1256,13 @@ pub async fn handle_fix(
             // CI fix attempts exhausted — mark issue as blocked for human review
             log::warn!("⚠️  CI checks failed or were escalated");
             if let Some(ref client) = issue_ctx.github_client {
-                match client
-                    .mark_issue_blocked(&issue_ctx.owner, &issue_ctx.repo, issue_ctx.issue_num)
-                    .await
-                {
-                    Ok(()) => {
-                        println!("🏷️  Updated issue label to 'minion:blocked'");
-                    }
-                    Err(e) => {
-                        log::warn!("⚠️  Failed to update issue label: {}", e);
-                    }
-                }
+                try_mark_issue_blocked(
+                    client,
+                    &issue_ctx.owner,
+                    &issue_ctx.repo,
+                    issue_ctx.issue_num,
+                )
+                .await;
             }
         }
         Err(e) => log::warn!("⚠️  CI monitoring error (non-fatal): {}", e),
