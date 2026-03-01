@@ -320,7 +320,7 @@ pub fn validate_required_params(
         }
         msg.push('\n');
     }
-    msg.push_str("\nProvide the missing parameter(s) with --param KEY=VALUE");
+    msg.push_str("\nProvide the missing parameter(s) with --param KEY=<value>");
 
     bail!("{}", msg.trim())
 }
