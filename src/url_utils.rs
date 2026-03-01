@@ -94,7 +94,7 @@ pub fn validate_pr_format(pr: &str) -> Result<()> {
 
 /// Extracts owner, repo, and issue number from an issue argument
 /// Supports both plain issue numbers (auto-detects from current directory) and GitHub URLs
-pub fn parse_issue_info(issue: &str) -> Result<(String, String, String)> {
+pub async fn parse_issue_info(issue: &str) -> Result<(String, String, String)> {
     // First validate the format
     validate_issue_format(issue)?;
 
@@ -124,9 +124,13 @@ pub fn parse_issue_info(issue: &str) -> Result<(String, String, String)> {
         Ok((owner, repo, issue_num))
     } else {
         // Plain issue number - auto-detect repository from current directory
-        git::detect_git_repo().context("Failed to detect git repository")?;
+        git::detect_git_repo()
+            .await
+            .context("Failed to detect git repository")?;
 
-        let remote_url = git::get_github_remote().context("Failed to get GitHub remote")?;
+        let remote_url = git::get_github_remote()
+            .await
+            .context("Failed to get GitHub remote")?;
 
         let (owner, repo) =
             git::parse_github_remote(&remote_url).context("Failed to parse GitHub remote URL")?;
@@ -349,17 +353,21 @@ mod tests {
         assert!(validate_pr_format("https://github.com///pull/42").is_err());
     }
 
-    #[test]
-    fn test_parse_issue_info_with_url() {
-        let result = parse_issue_info("https://github.com/fotoetienne/gru/issues/42").unwrap();
+    #[tokio::test]
+    async fn test_parse_issue_info_with_url() {
+        let result = parse_issue_info("https://github.com/fotoetienne/gru/issues/42")
+            .await
+            .unwrap();
         assert_eq!(result.0, "fotoetienne".to_string());
         assert_eq!(result.1, "gru".to_string());
         assert_eq!(result.2, "42".to_string());
     }
 
-    #[test]
-    fn test_parse_issue_info_with_url_and_query_params() {
-        let result = parse_issue_info("https://github.com/owner/repo/issues/123?foo=bar").unwrap();
+    #[tokio::test]
+    async fn test_parse_issue_info_with_url_and_query_params() {
+        let result = parse_issue_info("https://github.com/owner/repo/issues/123?foo=bar")
+            .await
+            .unwrap();
         assert_eq!(result.0, "owner".to_string());
         assert_eq!(result.1, "repo".to_string());
         assert_eq!(result.2, "123".to_string());

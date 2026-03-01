@@ -397,7 +397,7 @@ async fn try_post_progress_comment(
 /// Note: Does NOT claim the issue — that happens after worktree setup to avoid
 /// marking issues as in-progress when setup fails.
 async fn resolve_issue(issue: &str, force_new: bool) -> Result<IssueContext> {
-    let (owner, repo, issue_num_str) = parse_issue_info(issue)?;
+    let (owner, repo, issue_num_str) = parse_issue_info(issue).await?;
     let issue_num: u64 = issue_num_str
         .parse()
         .context("Failed to parse issue number")?;
@@ -583,6 +583,7 @@ async fn setup_worktree(ctx: &IssueContext) -> Result<WorktreeContext> {
     println!("📦 Ensuring repository is cloned...");
     git_repo
         .ensure_bare_clone()
+        .await
         .context("Failed to clone or update repository")?;
 
     let branch_name = format!("minion/issue-{}-{}", ctx.issue_num, minion_id);
@@ -595,6 +596,7 @@ async fn setup_worktree(ctx: &IssueContext) -> Result<WorktreeContext> {
 
     git_repo
         .create_worktree(&branch_name, &worktree_path)
+        .await
         .context("Failed to create worktree")?;
 
     println!("📂 Workspace created at: {}", worktree_path.display());

@@ -6,6 +6,7 @@ use std::collections::HashSet;
 use std::io::Write;
 use std::path::Path;
 use tokio::io::AsyncBufReadExt;
+use tokio::process::Command;
 
 /// Check if a file path represents an ephemeral file that's safe to discard
 /// Ephemeral files include logs, build artifacts, IDE configs, etc.
@@ -55,15 +56,14 @@ fn is_ephemeral_file(path: &Path) -> bool {
 
 /// Check if worktree contains only ephemeral files
 /// Returns (has_modified_files, only_ephemeral)
-fn check_worktree_files(worktree_path: &Path) -> Result<(bool, bool)> {
-    let output = std::process::Command::new("git")
-        .args([
-            "-C",
-            &worktree_path.to_string_lossy(),
-            "status",
-            "--porcelain",
-        ])
+async fn check_worktree_files(worktree_path: &Path) -> Result<(bool, bool)> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(worktree_path)
+        .arg("status")
+        .arg("--porcelain")
         .output()
+        .await
         .context("Failed to check git status")?;
 
     if !output.status.success() {
@@ -132,8 +132,9 @@ pub async fn handle_clean(dry_run: bool, force: bool, base_branch: &str) -> Resu
     println!("Scanning for worktrees in {}...", ws.repos().display());
 
     // Discover all worktrees
-    let worktrees =
-        worktree_scanner::discover_worktrees(ws.repos()).context("Failed to discover worktrees")?;
+    let worktrees = worktree_scanner::discover_worktrees(ws.repos())
+        .await
+        .context("Failed to discover worktrees")?;
 
     if worktrees.is_empty() {
         println!("No worktrees found.");
@@ -217,9 +218,13 @@ pub async fn handle_clean(dry_run: bool, force: bool, base_branch: &str) -> Resu
 
         if !dry_run {
             for bare_repo in &bare_repos_to_prune {
-                let output = std::process::Command::new("git")
-                    .args(["-C", &bare_repo.to_string_lossy(), "worktree", "prune"])
-                    .output();
+                let output = Command::new("git")
+                    .arg("-C")
+                    .arg(bare_repo.as_path())
+                    .arg("worktree")
+                    .arg("prune")
+                    .output()
+                    .await;
 
                 match output {
                     Ok(result) if result.status.success() => {}
@@ -281,6 +286,7 @@ pub async fn handle_clean(dry_run: bool, force: bool, base_branch: &str) -> Resu
 
         let status = wt
             .status(base_branch)
+            .await
             .with_context(|| format!("Failed to check status of {}", wt.path.display()))?;
 
         if status != worktree_scanner::WorktreeStatus::Active {
@@ -342,7 +348,7 @@ pub async fn handle_clean(dry_run: bool, force: bool, base_branch: &str) -> Resu
             println!("    Repo: {}", wt.repo);
 
             // Check worktree dirty status to inform user what will happen
-            match check_worktree_files(&wt.path) {
+            match check_worktree_files(&wt.path).await {
                 Ok((has_modified, only_ephemeral)) => {
                     if !has_modified {
                         println!("    Status: clean");
@@ -406,7 +412,7 @@ pub async fn handle_clean(dry_run: bool, force: bool, base_branch: &str) -> Resu
         std::io::stdout().flush()?;
 
         // Check if worktree has modified/untracked files
-        let (has_modified, only_ephemeral) = match check_worktree_files(&wt.path) {
+        let (has_modified, only_ephemeral) = match check_worktree_files(&wt.path).await {
             Ok(result) => result,
             Err(e) => {
                 println!("✗");
@@ -421,7 +427,7 @@ pub async fn handle_clean(dry_run: bool, force: bool, base_branch: &str) -> Resu
         let force_needed = force || (has_modified && only_ephemeral);
 
         // Build command arguments - need to store string values to avoid lifetime issues
-        let mut cmd = std::process::Command::new("git");
+        let mut cmd = Command::new("git");
         cmd.arg("-C")
             .arg(&wt.bare_repo_path)
             .arg("worktree")
@@ -434,7 +440,14 @@ pub async fn handle_clean(dry_run: bool, force: bool, base_branch: &str) -> Resu
         cmd.arg(&wt.path);
 
         // Remove the worktree
-        let status = cmd.output()?;
+        let status = cmd.output().await.with_context(|| {
+            format!(
+                "failed to run `git worktree remove{}` for path {} (bare repo: {})",
+                if force_needed { " --force" } else { "" },
+                wt.path.display(),
+                wt.bare_repo_path.display(),
+            )
+        })?;
 
         if status.status.success() {
             if force_needed && !force {
@@ -447,15 +460,14 @@ pub async fn handle_clean(dry_run: bool, force: bool, base_branch: &str) -> Resu
             removed += 1;
 
             // Also remove the branch from the bare repository
-            let branch_result = std::process::Command::new("git")
-                .args([
-                    "-C",
-                    &wt.bare_repo_path.to_string_lossy(),
-                    "branch",
-                    "-D",
-                    &wt.branch,
-                ])
-                .output();
+            let branch_result = Command::new("git")
+                .arg("-C")
+                .arg(&wt.bare_repo_path)
+                .arg("branch")
+                .arg("-D")
+                .arg(&wt.branch)
+                .output()
+                .await;
 
             if let Err(e) = branch_result {
                 log::warn!("  Warning: Failed to delete branch: {}", e);
@@ -524,7 +536,7 @@ pub async fn handle_clean(dry_run: bool, force: bool, base_branch: &str) -> Resu
                     failed += 1;
                     continue;
                 }
-                if let Err(e) = std::fs::remove_dir_all(&canonical_path) {
+                if let Err(e) = tokio::fs::remove_dir_all(&canonical_path).await {
                     println!("✗");
                     log::error!("  Error removing directory: {}", e);
                     failed += 1;

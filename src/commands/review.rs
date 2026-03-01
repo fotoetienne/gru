@@ -45,11 +45,13 @@ pub async fn handle_review(pr_arg: Option<String>) -> Result<i32> {
     println!("📦 Ensuring repository is cloned...");
     git_repo
         .ensure_bare_clone()
+        .await
         .with_context(|| format!("Failed to clone or update repository for PR {}", pr_num))?;
 
     // Check if a worktree already exists for this branch
     let worktree_path = if let Some(existing_path) = git_repo
         .find_worktree_for_branch(&branch)
+        .await
         .context("Failed to check for existing worktree")?
     {
         println!(
@@ -62,6 +64,7 @@ pub async fn handle_review(pr_arg: Option<String>) -> Result<i32> {
         println!("🔄 Fetching PR branch: {}", branch);
         git_repo
             .fetch_branch(&branch)
+            .await
             .with_context(|| format!("Failed to fetch PR branch '{}'", branch))?;
 
         let repo_name = format!("{}/{}", owner, repo);
@@ -73,6 +76,7 @@ pub async fn handle_review(pr_arg: Option<String>) -> Result<i32> {
         println!("🌿 Creating worktree for branch: {}", branch);
         git_repo
             .checkout_worktree(&branch, &new_worktree_path)
+            .await
             .with_context(|| format!("Failed to checkout worktree for PR {}", pr_num))?;
 
         new_worktree_path
@@ -200,7 +204,7 @@ async fn resolve_pr_from_current_worktree() -> Result<(String, String, String, S
     let current_dir = env::current_dir().context("Failed to get current directory")?;
 
     // Check if we're in a git repository
-    git::detect_git_repo().context(
+    git::detect_git_repo().await.context(
         "Not in a git repository. Run from a Minion worktree or provide a PR number/URL/Minion ID.",
     )?;
 

@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use tokio::process::Command;
 
 /// Represents a discovered worktree
 #[derive(Debug, Clone)]
@@ -55,7 +55,7 @@ impl Worktree {
     }
 
     /// Check if the worktree's branch has been merged into the base branch
-    pub fn check_merged(&self, base_branch: &str) -> Result<bool> {
+    pub async fn check_merged(&self, base_branch: &str) -> Result<bool> {
         let output = Command::new("git")
             .args([
                 "-C",
@@ -67,13 +67,14 @@ impl Worktree {
                 &self.branch,
             ])
             .output()
+            .await
             .context("Failed to check if branch is merged")?;
 
         Ok(!output.stdout.is_empty())
     }
 
     /// Check if the associated GitHub issue is closed
-    pub fn check_issue_closed(&self) -> Result<Option<bool>> {
+    pub async fn check_issue_closed(&self) -> Result<Option<bool>> {
         let issue_num = match self.extract_issue_number() {
             Some(num) => num,
             None => return Ok(None),
@@ -93,6 +94,7 @@ impl Worktree {
                 &self.repo,
             ])
             .output()
+            .await
             .context("Failed to check issue status")?;
 
         if !output.status.success() {
@@ -104,7 +106,7 @@ impl Worktree {
     }
 
     /// Check if the branch has been deleted on the remote
-    pub fn check_remote_deleted(&self) -> Result<bool> {
+    pub async fn check_remote_deleted(&self) -> Result<bool> {
         // First fetch to ensure we have latest remote info
         let fetch_output = Command::new("git")
             .args([
@@ -114,6 +116,7 @@ impl Worktree {
                 "--prune",
             ])
             .output()
+            .await
             .context("Failed to fetch from remote")?;
 
         if !fetch_output.status.success() {
@@ -136,6 +139,7 @@ impl Worktree {
                 &self.branch,
             ])
             .output()
+            .await
             .context("Failed to check remote branch")?;
 
         // If ls-remote returns empty, the branch doesn't exist on remote
@@ -143,12 +147,13 @@ impl Worktree {
     }
 
     /// Determine the overall status of this worktree
-    pub fn status(&self, base_branch: &str) -> Result<WorktreeStatus> {
+    pub async fn status(&self, base_branch: &str) -> Result<WorktreeStatus> {
         // Check in order of priority
 
         // 1. Check if merged
         if self
             .check_merged(base_branch)
+            .await
             .map_err(|e| {
                 log::warn!("Warning: Failed to check if branch is merged: {}", e);
                 e
@@ -161,6 +166,7 @@ impl Worktree {
         // 2. Check if issue is closed
         if let Some(true) = self
             .check_issue_closed()
+            .await
             .map_err(|e| {
                 log::warn!("Warning: Failed to check issue status: {}", e);
                 e
@@ -173,6 +179,7 @@ impl Worktree {
         // 3. Check if remote branch is deleted
         if self
             .check_remote_deleted()
+            .await
             .map_err(|e| {
                 log::warn!("Warning: Failed to check remote status: {}", e);
                 e
@@ -187,7 +194,7 @@ impl Worktree {
 }
 
 /// Discover all worktrees in the given repos directory
-pub fn discover_worktrees(repos_dir: &Path) -> Result<Vec<Worktree>> {
+pub async fn discover_worktrees(repos_dir: &Path) -> Result<Vec<Worktree>> {
     let mut worktrees = Vec::new();
 
     if !repos_dir.exists() {
@@ -195,11 +202,11 @@ pub fn discover_worktrees(repos_dir: &Path) -> Result<Vec<Worktree>> {
     }
 
     // Find all bare repositories recursively
-    let bare_repos = find_bare_repos(repos_dir)?;
+    let bare_repos = find_bare_repos(repos_dir).await?;
 
     for bare_repo_path in bare_repos {
         // Extract repo name from git config
-        let repo_name = match extract_repo_from_git_config(&bare_repo_path) {
+        let repo_name = match extract_repo_from_git_config(&bare_repo_path).await {
             Ok(name) => name,
             Err(e) => {
                 log::warn!(
@@ -220,7 +227,8 @@ pub fn discover_worktrees(repos_dir: &Path) -> Result<Vec<Worktree>> {
                 "list",
                 "--porcelain",
             ])
-            .output();
+            .output()
+            .await;
 
         let output = match output {
             Ok(out) => out,
@@ -248,7 +256,7 @@ pub fn discover_worktrees(repos_dir: &Path) -> Result<Vec<Worktree>> {
 }
 
 /// Recursively find all bare repositories in the given directory
-fn find_bare_repos(dir: &Path) -> Result<Vec<PathBuf>> {
+async fn find_bare_repos(dir: &Path) -> Result<Vec<PathBuf>> {
     let mut bare_repos = Vec::new();
     let mut dirs_to_scan = vec![dir.to_path_buf()];
 
@@ -286,6 +294,7 @@ fn find_bare_repos(dir: &Path) -> Result<Vec<PathBuf>> {
                     "--is-bare-repository",
                 ])
                 .output()
+                .await
             {
                 Ok(output) => {
                     output.status.success()
@@ -310,11 +319,12 @@ fn find_bare_repos(dir: &Path) -> Result<Vec<PathBuf>> {
 /// Uses `git config remote.origin.url` to get the actual repo URL and parses it
 /// Example: https://github.com/owner/repo.git -> "owner/repo"
 ///          git@github.com:owner/repo.git -> "owner/repo"
-fn extract_repo_from_git_config(path: &Path) -> Result<String> {
+async fn extract_repo_from_git_config(path: &Path) -> Result<String> {
     // Get remote.origin.url from git config
     let output = Command::new("git")
         .args(["-C", &path.to_string_lossy(), "config", "remote.origin.url"])
         .output()
+        .await
         .context("Failed to run git config")?;
 
     if !output.status.success() {
