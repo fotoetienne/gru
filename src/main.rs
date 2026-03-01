@@ -140,9 +140,16 @@ enum Commands {
 
         #[arg(
             long,
-            help = "Skip automatic worktree creation when --issue is provided"
+            help = "Skip automatic worktree setup when --issue or --pr is provided"
         )]
         no_worktree: bool,
+
+        #[arg(
+            short,
+            long,
+            help = "GitHub PR number or URL for context (populates {{ pr_number }}, {{ pr_title }}, {{ pr_body }})"
+        )]
+        pr: Option<String>,
 
         #[arg(
             short = 'P',
@@ -213,10 +220,13 @@ async fn main() {
         Commands::Prompt {
             prompt,
             issue,
+            pr,
             no_worktree,
             params,
             timeout,
-        } => prompt::handle_prompt(&prompt, issue, no_worktree, params, timeout, cli.quiet).await,
+        } => {
+            prompt::handle_prompt(&prompt, issue, pr, no_worktree, params, timeout, cli.quiet).await
+        }
         Commands::Prompts => prompts::handle_prompts().await,
         Commands::Lab {
             config,
