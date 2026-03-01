@@ -10,6 +10,8 @@ use anyhow::{Context, Result};
 /// It is functionally equivalent to:
 /// ```bash
 /// cd $(gru path <id>) && claude -r
+/// # With --yolo:
+/// cd $(gru path <id>) && claude -r --dangerously-skip-permissions
 /// ```
 ///
 /// The ID argument supports smart resolution (same as gru path):
