@@ -28,7 +28,11 @@ pub enum MinionMode {
 
 /// Tracks which phase of the fix orchestration a Minion has reached.
 /// Used to resume interrupted sessions from the correct phase.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+///
+/// Variant order matters: derives `PartialOrd`/`Ord` so earlier phases compare
+/// less than later ones (e.g., `Setup < RunningClaude < CreatingPr`).
+/// `Failed` sorts last since it is a terminal state.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
 pub enum OrchestrationPhase {
     /// Initial state - worktree setup in progress or not started

@@ -1286,13 +1286,14 @@ pub async fn handle_fix(
     }
 
     // Phase 3: Run Claude (skip if already past this phase)
-    let claude_result = if matches!(
-        start_phase,
-        OrchestrationPhase::Setup | OrchestrationPhase::RunningClaude
-    ) {
+    let claude_result = if start_phase <= OrchestrationPhase::RunningClaude {
         update_orchestration_phase(&wt_ctx.minion_id, OrchestrationPhase::RunningClaude).await;
 
-        let result = if is_resume {
+        // Only use --resume if we're resuming a session that actually ran Claude.
+        // If interrupted during Setup (before Claude ever ran), the session ID was
+        // never used, so `claude --resume <uuid>` would fail.
+        let use_resume = is_resume && start_phase > OrchestrationPhase::Setup;
+        let result = if use_resume {
             resume_claude_session(&issue_ctx, &wt_ctx, quiet, timeout_opt.as_deref()).await
         } else {
             run_claude_session(&issue_ctx, &wt_ctx, quiet, timeout_opt.as_deref()).await
@@ -1301,6 +1302,9 @@ pub async fn handle_fix(
         match result {
             Ok(result) => Some(result),
             Err(e) if is_stuck_or_timeout_error(&e) => {
+                // Mark as Failed so the next `gru fix` won't retry indefinitely.
+                // The user can explicitly `--force-new` to start a fresh session.
+                update_orchestration_phase(&wt_ctx.minion_id, OrchestrationPhase::Failed).await;
                 log::error!("🚨 {:#}", e);
                 if let Some(ref client) = issue_ctx.github_client {
                     try_mark_issue_blocked(
@@ -1345,12 +1349,7 @@ pub async fn handle_fix(
     }
 
     // Phase 4: Create PR (skip if already past this phase)
-    let pr_number = if matches!(
-        start_phase,
-        OrchestrationPhase::Setup
-            | OrchestrationPhase::RunningClaude
-            | OrchestrationPhase::CreatingPr
-    ) {
+    let pr_number = if start_phase <= OrchestrationPhase::CreatingPr {
         update_orchestration_phase(&wt_ctx.minion_id, OrchestrationPhase::CreatingPr).await;
         handle_pr_creation(&issue_ctx, &wt_ctx).await?
     } else {
