@@ -3,8 +3,19 @@ use crate::text_buffer::TextBuffer;
 use chrono::Local;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
+
+/// Locks a mutex, recovering from poison if another thread panicked while holding it.
+fn lock_or_recover<'a, T>(mutex: &'a Mutex<T>, name: &str) -> MutexGuard<'a, T> {
+    match mutex.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            log::warn!("{} mutex poisoned, recovering", name);
+            poisoned.into_inner()
+        }
+    }
+}
 
 /// Maximum characters to display for buffered text chunks.
 /// Since text is now buffered for up to 2 seconds, chunks can be larger.
@@ -138,13 +149,7 @@ impl ProgressDisplay {
 
         // Look up the tool name by tool_use_id
         let tool_name = {
-            let names = match self.tool_names.lock() {
-                Ok(guard) => guard,
-                Err(poisoned) => {
-                    log::warn!("Tool names mutex poisoned, recovering");
-                    poisoned.into_inner()
-                }
-            };
+            let names = lock_or_recover(&self.tool_names, "Tool names");
             names.get(&tool_result.tool_use_id).cloned()
         };
 
@@ -313,24 +318,12 @@ impl ProgressDisplay {
 
                         // Store tool name for later reference when tool completes
                         if !id.is_empty() {
-                            let mut names = match self.tool_names.lock() {
-                                Ok(guard) => guard,
-                                Err(poisoned) => {
-                                    log::warn!("Tool names mutex poisoned, recovering");
-                                    poisoned.into_inner()
-                                }
-                            };
+                            let mut names = lock_or_recover(&self.tool_names, "Tool names");
                             names.insert(id.clone(), name.clone());
                         }
 
                         // Start tracking this tool's input
-                        let mut tracker = match self.tool_tracker.lock() {
-                            Ok(guard) => guard,
-                            Err(poisoned) => {
-                                log::warn!("Tool tracker mutex poisoned, recovering");
-                                poisoned.into_inner()
-                            }
-                        };
+                        let mut tracker = lock_or_recover(&self.tool_tracker, "Tool tracker");
                         tracker.start_tool(name.clone());
                     }
                     ContentBlock::Text { .. } => {
@@ -349,13 +342,7 @@ impl ProgressDisplay {
                         }
                     }
                     ContentDelta::InputJsonDelta { partial_json } => {
-                        let mut tracker = match self.tool_tracker.lock() {
-                            Ok(guard) => guard,
-                            Err(poisoned) => {
-                                log::warn!("Tool tracker mutex poisoned, recovering");
-                                poisoned.into_inner()
-                            }
-                        };
+                        let mut tracker = lock_or_recover(&self.tool_tracker, "Tool tracker");
                         tracker.add_input_chunk(partial_json);
                     }
                     ContentDelta::Unknown => {}
@@ -365,13 +352,7 @@ impl ProgressDisplay {
                 // Content block finished - handle both text and tool blocks
 
                 // First, check if we have a tool to format
-                let mut tracker = match self.tool_tracker.lock() {
-                    Ok(guard) => guard,
-                    Err(poisoned) => {
-                        log::warn!("Tool tracker mutex poisoned, recovering");
-                        poisoned.into_inner()
-                    }
-                };
+                let mut tracker = lock_or_recover(&self.tool_tracker, "Tool tracker");
                 let tool_info = tracker.take();
 
                 if let Some((tool_name, input_json)) = tool_info {

@@ -1,17 +1,13 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use fs2::FileExt;
-use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use crate::workspace::Workspace;
-
-/// Cached workspace instance for production state directory access.
-static WORKSPACE: Lazy<io::Result<Workspace>> = Lazy::new(Workspace::new);
 
 /// The execution mode of a Minion session
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -172,10 +168,7 @@ impl MinionRegistry {
             custom_dir.to_path_buf()
         } else {
             // Production path: use cached workspace
-            let workspace = WORKSPACE.as_ref().map_err(|e| {
-                io::Error::new(e.kind(), format!("Failed to initialize workspace: {}", e))
-            })?;
-            workspace.state().to_path_buf()
+            Workspace::global()?.state().to_path_buf()
         };
 
         let registry_path = state_path.join("minions.json");

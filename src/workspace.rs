@@ -1,6 +1,11 @@
+use once_cell::sync::OnceCell;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+
+/// Cached workspace instance initialized once on first successful call.
+/// Uses OnceCell so transient failures don't get permanently cached.
+static GLOBAL_WORKSPACE: OnceCell<Workspace> = OnceCell::new();
 
 /// Manages the Gru workspace directory structure at `~/.gru`.
 ///
@@ -22,6 +27,51 @@ pub struct Workspace {
 
 #[allow(dead_code)]
 impl Workspace {
+    /// Returns a reference to the global cached Workspace instance.
+    ///
+    /// Initialized on first successful call. Subsequent calls return the same instance.
+    /// If initialization fails, the next call will retry (transient errors are not cached).
+    pub fn global() -> io::Result<&'static Workspace> {
+        GLOBAL_WORKSPACE.get_or_try_init(Workspace::new)
+    }
+
+    /// Creates directories with appropriate permissions (0755 on Unix).
+    fn create_dirs(dirs: &[&Path]) -> io::Result<()> {
+        for dir in dirs {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt;
+                let mut builder = fs::DirBuilder::new();
+                builder.mode(0o755);
+                builder.recursive(true);
+                builder.create(dir)?;
+            }
+            #[cfg(not(unix))]
+            {
+                fs::create_dir_all(dir)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Builds and initializes a Workspace from a given root path.
+    fn init(root: PathBuf) -> io::Result<Self> {
+        let repos = root.join("repos");
+        let work = root.join("work");
+        let archive = root.join("archive");
+        let state = root.join("state");
+
+        Self::create_dirs(&[&root, &repos, &work, &archive, &state])?;
+
+        Ok(Workspace {
+            root,
+            repos,
+            work,
+            archive,
+            state,
+        })
+    }
+
     /// Creates a new workspace, initializing all required directories.
     ///
     /// Creates the directory structure at `~/.gru/` if it doesn't exist.
@@ -38,35 +88,7 @@ impl Workspace {
     pub fn new() -> io::Result<Self> {
         let home = dirs::home_dir()
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Home directory not found"))?;
-
-        let root = home.join(".gru");
-        let repos = root.join("repos");
-        let work = root.join("work");
-        let archive = root.join("archive");
-        let state = root.join("state");
-
-        for dir in [&root, &repos, &work, &archive, &state] {
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::DirBuilderExt;
-                let mut builder = fs::DirBuilder::new();
-                builder.mode(0o755);
-                builder.recursive(true);
-                builder.create(dir)?;
-            }
-            #[cfg(not(unix))]
-            {
-                fs::create_dir_all(dir)?;
-            }
-        }
-
-        Ok(Workspace {
-            root,
-            repos,
-            work,
-            archive,
-            state,
-        })
+        Self::init(home.join(".gru"))
     }
 
     /// Creates a workspace with a custom root directory (for testing only).
@@ -85,33 +107,7 @@ impl Workspace {
     /// - Setting directory permissions fails (Unix only)
     #[cfg(test)]
     pub fn new_with_root(root: PathBuf) -> io::Result<Self> {
-        let repos = root.join("repos");
-        let work = root.join("work");
-        let archive = root.join("archive");
-        let state = root.join("state");
-
-        for dir in [&root, &repos, &work, &archive, &state] {
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::DirBuilderExt;
-                let mut builder = fs::DirBuilder::new();
-                builder.mode(0o755);
-                builder.recursive(true);
-                builder.create(dir)?;
-            }
-            #[cfg(not(unix))]
-            {
-                fs::create_dir_all(dir)?;
-            }
-        }
-
-        Ok(Workspace {
-            root,
-            repos,
-            work,
-            archive,
-            state,
-        })
+        Self::init(root)
     }
 
     /// Returns a reference to the workspace root directory path (`~/.gru`).

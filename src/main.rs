@@ -178,15 +178,10 @@ async fn main() {
     let cli = Cli::parse();
 
     // Initialize logger based on quiet flag
-    if cli.quiet {
-        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("error"))
-            .format_timestamp(None)
-            .init();
-    } else {
-        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn"))
-            .format_timestamp(None)
-            .init();
-    }
+    let log_filter = if cli.quiet { "error" } else { "warn" };
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(log_filter))
+        .format_timestamp(None)
+        .init();
 
     let result = match cli.command {
         Commands::Init { repo } => init::handle_init(repo).await,
