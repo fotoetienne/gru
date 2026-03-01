@@ -178,12 +178,14 @@ async fn shutdown_children(children: &mut [Child]) {
 /// Parse a repository spec in "owner/repo" format.
 /// Returns `Some((owner, repo))` if valid, `None` otherwise.
 fn parse_repo_spec(spec: &str) -> Option<(&str, &str)> {
-    let parts: Vec<&str> = spec.split('/').collect();
-    if parts.len() == 2 && !parts[0].is_empty() && !parts[1].is_empty() {
-        Some((parts[0], parts[1]))
-    } else {
-        None
+    let mut parts = spec.splitn(3, '/');
+    let owner = parts.next().filter(|s| !s.is_empty())?;
+    let repo = parts.next().filter(|s| !s.is_empty())?;
+    // Reject specs with more than one slash (e.g., "a/b/c")
+    if parts.next().is_some() {
+        return None;
     }
+    Some((owner, repo))
 }
 
 /// Poll GitHub for ready issues and spawn Minions if slots are available
@@ -466,15 +468,12 @@ mod tests {
         assert_eq!(parse_repo_spec("/"), None);
     }
 
-    // --- slot calculation tests ---
+    // --- slot calculation assumption ---
 
     #[test]
-    fn test_slot_calculation_saturating_sub() {
-        // available_slots uses max_slots.saturating_sub(active_count)
-        assert_eq!(5_usize.saturating_sub(2), 3);
-        assert_eq!(5_usize.saturating_sub(5), 0);
-        assert_eq!(5_usize.saturating_sub(10), 0); // More active than max should be 0, not underflow
-        assert_eq!(0_usize.saturating_sub(0), 0);
-        assert_eq!(1_usize.saturating_sub(0), 1);
+    fn test_slot_calculation_no_underflow() {
+        // Documents that available_slots() relies on saturating_sub to prevent underflow
+        // when more minions are active than max_slots allows (e.g., after config change).
+        assert_eq!(5_usize.saturating_sub(10), 0);
     }
 }
