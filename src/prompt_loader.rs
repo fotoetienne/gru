@@ -278,6 +278,53 @@ fn load_prompts_internal(
     Ok(prompts)
 }
 
+/// Validates that all required parameters declared in a prompt's frontmatter are provided
+///
+/// Returns a helpful error message listing all missing required parameters with their
+/// descriptions (if available).
+///
+/// # Arguments
+/// * `metadata` - The prompt metadata containing parameter declarations
+/// * `provided` - The parameters provided via `--param` flags
+///
+/// # Example
+/// ```ignore
+/// let metadata = PromptMetadata {
+///     params: vec![PromptParam { name: "component".into(), description: Some("Component to analyze".into()), required: true }],
+///     ..
+/// };
+/// let mut provided = HashMap::new();
+/// // Missing "component" param → returns error
+/// validate_required_params(&metadata, &provided)?;
+/// ```
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn validate_required_params(
+    metadata: &PromptMetadata,
+    provided: &HashMap<String, String>,
+) -> Result<()> {
+    let missing: Vec<&PromptParam> = metadata
+        .params
+        .iter()
+        .filter(|p| p.required && provided.get(&p.name).map_or(true, |v| v.trim().is_empty()))
+        .collect();
+
+    if missing.is_empty() {
+        return Ok(());
+    }
+
+    let mut msg = String::from("Missing or empty required parameter(s):\n");
+    for param in &missing {
+        msg.push_str(&format!("  --param {}=<value>", param.name));
+        if let Some(ref desc) = param.description {
+            msg.push_str(&format!("  ({})", desc));
+        }
+        msg.push('\n');
+    }
+    msg.push_str("\nProvide the missing parameter(s) with --param KEY=<value>");
+
+    bail!("{}", msg.trim())
+}
+
 /// Validates a prompt's syntax
 ///
 /// Currently checks:
@@ -559,5 +606,239 @@ Repo content"#,
 
         let global_source = PromptSource::Global(PathBuf::from("~/.gru/prompts/fix.md"));
         assert!(global_source.display().contains("global:"));
+    }
+
+    #[test]
+    fn test_validate_required_params_all_provided() {
+        let metadata = PromptMetadata {
+            description: None,
+            requires: vec![],
+            params: vec![
+                PromptParam {
+                    name: "component".to_string(),
+                    description: Some("Component to analyze".to_string()),
+                    required: true,
+                },
+                PromptParam {
+                    name: "depth".to_string(),
+                    description: None,
+                    required: true,
+                },
+            ],
+        };
+
+        let mut provided = HashMap::new();
+        provided.insert("component".to_string(), "auth".to_string());
+        provided.insert("depth".to_string(), "3".to_string());
+
+        assert!(validate_required_params(&metadata, &provided).is_ok());
+    }
+
+    #[test]
+    fn test_validate_required_params_missing_one() {
+        let metadata = PromptMetadata {
+            description: None,
+            requires: vec![],
+            params: vec![
+                PromptParam {
+                    name: "component".to_string(),
+                    description: Some("Component to analyze".to_string()),
+                    required: true,
+                },
+                PromptParam {
+                    name: "depth".to_string(),
+                    description: None,
+                    required: true,
+                },
+            ],
+        };
+
+        let mut provided = HashMap::new();
+        provided.insert("component".to_string(), "auth".to_string());
+        // Missing "depth"
+
+        let result = validate_required_params(&metadata, &provided);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("depth"));
+        assert!(err.contains("--param"));
+    }
+
+    #[test]
+    fn test_validate_required_params_missing_with_description() {
+        let metadata = PromptMetadata {
+            description: None,
+            requires: vec![],
+            params: vec![PromptParam {
+                name: "target".to_string(),
+                description: Some("File or directory to focus on".to_string()),
+                required: true,
+            }],
+        };
+
+        let provided = HashMap::new();
+
+        let result = validate_required_params(&metadata, &provided);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("target"));
+        assert!(err.contains("File or directory to focus on"));
+        assert!(err.contains("--param target=<value>"));
+    }
+
+    #[test]
+    fn test_validate_required_params_optional_not_required() {
+        let metadata = PromptMetadata {
+            description: None,
+            requires: vec![],
+            params: vec![
+                PromptParam {
+                    name: "required_param".to_string(),
+                    description: None,
+                    required: true,
+                },
+                PromptParam {
+                    name: "optional_param".to_string(),
+                    description: None,
+                    required: false,
+                },
+            ],
+        };
+
+        let mut provided = HashMap::new();
+        provided.insert("required_param".to_string(), "value".to_string());
+        // Not providing optional_param is fine
+
+        assert!(validate_required_params(&metadata, &provided).is_ok());
+    }
+
+    #[test]
+    fn test_validate_required_params_no_params_declared() {
+        let metadata = PromptMetadata {
+            description: None,
+            requires: vec![],
+            params: vec![],
+        };
+
+        let provided = HashMap::new();
+        assert!(validate_required_params(&metadata, &provided).is_ok());
+    }
+
+    #[test]
+    fn test_validate_required_params_extra_params_ok() {
+        let metadata = PromptMetadata {
+            description: None,
+            requires: vec![],
+            params: vec![PromptParam {
+                name: "component".to_string(),
+                description: None,
+                required: true,
+            }],
+        };
+
+        let mut provided = HashMap::new();
+        provided.insert("component".to_string(), "auth".to_string());
+        provided.insert("extra".to_string(), "ignored".to_string());
+
+        assert!(validate_required_params(&metadata, &provided).is_ok());
+    }
+
+    #[test]
+    fn test_validate_required_params_multiple_missing() {
+        let metadata = PromptMetadata {
+            description: None,
+            requires: vec![],
+            params: vec![
+                PromptParam {
+                    name: "a".to_string(),
+                    description: Some("First param".to_string()),
+                    required: true,
+                },
+                PromptParam {
+                    name: "b".to_string(),
+                    description: None,
+                    required: true,
+                },
+                PromptParam {
+                    name: "c".to_string(),
+                    description: Some("Third param".to_string()),
+                    required: true,
+                },
+            ],
+        };
+
+        let provided = HashMap::new();
+
+        let result = validate_required_params(&metadata, &provided);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        // All three should be listed
+        assert!(err.contains("--param a=<value>"));
+        assert!(err.contains("--param b=<value>"));
+        assert!(err.contains("--param c=<value>"));
+        assert!(err.contains("First param"));
+        assert!(err.contains("Third param"));
+    }
+
+    #[test]
+    fn test_validate_required_params_empty_value_rejected() {
+        let metadata = PromptMetadata {
+            description: None,
+            requires: vec![],
+            params: vec![PromptParam {
+                name: "component".to_string(),
+                description: None,
+                required: true,
+            }],
+        };
+
+        let mut provided = HashMap::new();
+        provided.insert("component".to_string(), String::new());
+
+        let result = validate_required_params(&metadata, &provided);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("component"));
+    }
+
+    #[test]
+    fn test_validate_required_params_whitespace_only_rejected() {
+        let metadata = PromptMetadata {
+            description: None,
+            requires: vec![],
+            params: vec![PromptParam {
+                name: "component".to_string(),
+                description: None,
+                required: true,
+            }],
+        };
+
+        let mut provided = HashMap::new();
+        provided.insert("component".to_string(), "   ".to_string());
+
+        let result = validate_required_params(&metadata, &provided);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("component"));
+    }
+
+    #[test]
+    fn test_validate_required_params_all_optional_none_provided() {
+        let metadata = PromptMetadata {
+            description: None,
+            requires: vec![],
+            params: vec![
+                PromptParam {
+                    name: "opt1".to_string(),
+                    description: None,
+                    required: false,
+                },
+                PromptParam {
+                    name: "opt2".to_string(),
+                    description: None,
+                    required: false,
+                },
+            ],
+        };
+
+        assert!(validate_required_params(&metadata, &HashMap::new()).is_ok());
     }
 }
