@@ -117,21 +117,42 @@ async fn shutdown_children(children: &mut [Child]) {
         return;
     }
 
+    // Reap already-exited children first for an accurate running count
+    let mut running_pids = Vec::new();
+    for child in children.iter_mut() {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                log::info!("Minion process already exited with status: {}", status);
+            }
+            Ok(None) => {
+                if let Some(pid) = child.id() {
+                    running_pids.push(pid);
+                }
+            }
+            Err(e) => {
+                log::warn!("Failed to check child process status: {}", e);
+            }
+        }
+    }
+
+    if running_pids.is_empty() {
+        println!("No running Minion processes to shut down.");
+        return;
+    }
+
     println!(
         "🔪 Signaling {} running Minion(s) to shut down...",
-        children.len()
+        running_pids.len()
     );
 
-    // Send SIGTERM to all children
-    for child in children.iter() {
-        if let Some(pid) = child.id() {
-            #[cfg(unix)]
-            {
-                // SAFETY: kill with SIGTERM is safe - it requests graceful termination.
-                // The PID is valid because we just obtained it from the child handle.
-                unsafe {
-                    libc::kill(pid as i32, libc::SIGTERM);
-                }
+    // Send SIGTERM to all still-running children
+    for pid in &running_pids {
+        #[cfg(unix)]
+        {
+            // SAFETY: kill with SIGTERM is safe - it requests graceful termination.
+            // The PID is valid because we just obtained it from the child handle.
+            unsafe {
+                libc::kill(*pid as i32, libc::SIGTERM);
             }
         }
     }
@@ -140,13 +161,15 @@ async fn shutdown_children(children: &mut [Child]) {
     println!("⏳ Waiting for Minions to exit...");
     sleep(Duration::from_secs(5)).await;
 
-    // Force-kill any remaining processes and wait for them to exit
+    // Force-kill any remaining processes and reap to avoid zombies
     for child in children.iter_mut() {
         match child.try_wait() {
             Ok(Some(_)) => {} // Already exited
             _ => {
                 log::warn!("Force-killing Minion process that didn't exit gracefully");
                 let _ = child.kill().await;
+                // Reap the child process to avoid leaving a zombie
+                let _ = child.wait().await;
             }
         }
     }
