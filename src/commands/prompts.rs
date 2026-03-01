@@ -11,7 +11,7 @@ pub async fn handle_prompts() -> Result<i32> {
     let prompts_by_source = prompt_loader::list_prompts_by_source(repo_root.as_deref())?;
 
     // Collect names of custom prompts (repo + global) that override built-in ones
-    let built_in_names: Vec<&str> = BUILT_IN_PROMPTS.iter().map(|(name, _)| *name).collect();
+    let built_in_names: Vec<&str> = BUILT_IN_PROMPTS.iter().map(|b| b.name).collect();
     let override_names: Vec<&str> = prompts_by_source
         .repo
         .iter()
@@ -81,9 +81,9 @@ mod tests {
     fn test_built_in_prompts_defined() {
         // Verify built-in prompts have non-empty names and descriptions
         assert!(BUILT_IN_PROMPTS.len() >= 2);
-        for (name, desc) in BUILT_IN_PROMPTS {
-            assert!(!name.is_empty());
-            assert!(!desc.is_empty());
+        for builtin in BUILT_IN_PROMPTS {
+            assert!(!builtin.name.is_empty());
+            assert!(!builtin.description.is_empty());
         }
     }
 
