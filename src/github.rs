@@ -56,6 +56,22 @@ fn infer_github_host(owner: &str) -> &'static str {
     }
 }
 
+/// Determine the correct `gh` CLI command for a repository.
+///
+/// Returns `"ghe"` for Netflix repos, `"gh"` otherwise.
+///
+/// # Arguments
+/// * `repo` - Repository identifier in "owner/repo" format
+pub fn gh_command_for_repo(repo: &str) -> &'static str {
+    let owner = repo.split('/').next().unwrap_or("");
+    let host = infer_github_host(owner);
+    if host.contains("ghe.") {
+        "ghe"
+    } else {
+        "gh"
+    }
+}
+
 /// Get GitHub token with automatic fallback logic
 ///
 /// Priority order:

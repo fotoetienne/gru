@@ -1,4 +1,5 @@
 use crate::git;
+use crate::github;
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 use tokio::process::Command;
@@ -83,8 +84,8 @@ impl Worktree {
             None => return Ok(None),
         };
 
-        // Use gh CLI to check issue status
-        let output = Command::new("gh")
+        let gh_cmd = github::gh_command_for_repo(&self.repo);
+        let output = Command::new(gh_cmd)
             .args([
                 "issue",
                 "view",
@@ -153,8 +154,10 @@ impl Worktree {
     ///
     /// Squash merges create new commit hashes, so `git branch --merged` won't detect them.
     /// This method uses `gh pr list --state merged --head <branch>` to check GitHub directly.
+    /// Returns `Ok(false)` on CLI failure to degrade gracefully (e.g., no network, no auth).
     pub async fn check_pr_merged_on_github(&self) -> Result<bool> {
-        let output = Command::new("gh")
+        let gh_cmd = github::gh_command_for_repo(&self.repo);
+        let output = Command::new(gh_cmd)
             .args([
                 "pr",
                 "list",
@@ -178,7 +181,21 @@ impl Worktree {
         }
 
         let count_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        let count: u64 = count_str.parse().unwrap_or(0);
+        let count: u64 = if count_str.is_empty() {
+            0
+        } else {
+            match count_str.parse() {
+                Ok(n) => n,
+                Err(_) => {
+                    log::warn!(
+                        "Unexpected output from '{} pr list --jq length': {:?}",
+                        gh_cmd,
+                        count_str
+                    );
+                    0
+                }
+            }
+        };
         Ok(count > 0)
     }
 
