@@ -94,7 +94,7 @@ pub async fn handle_prompt(prompt: &str, timeout_opt: Option<String>, quiet: boo
         issue: format!("ad-hoc: {}", prompt),
         quiet,
     };
-    let progress = ProgressDisplay::new(config);
+    let progress = std::sync::Arc::new(ProgressDisplay::new(config));
 
     // Get current working directory to pass to Claude
     let cwd = std::env::current_dir().context("Failed to get current working directory")?;
@@ -115,8 +115,9 @@ pub async fn handle_prompt(prompt: &str, timeout_opt: Option<String>, quiet: boo
     });
 
     // Run Claude with stream monitoring
+    let progress_cb = std::sync::Arc::clone(&progress);
     let output_callback = move |output: &stream::StreamOutput| {
-        progress.handle_output(output);
+        progress_cb.handle_output(output);
     };
 
     let run_result = run_claude_with_stream_monitoring(
@@ -145,13 +146,13 @@ pub async fn handle_prompt(prompt: &str, timeout_opt: Option<String>, quiet: boo
 
     // Finish the progress display and return appropriate exit code
     if status.success() {
-        println!("\n✅ Task completed");
+        progress.finish_with_message("✅ Task completed");
         println!("\n📁 Session workspace: {}", workspace_path.display());
         println!("💡 To resume this session, use: gru resume {}", minion_id);
         Ok(0)
     } else {
         let exit_code = status.code().unwrap_or(EXIT_CODE_SIGNAL_TERMINATED);
-        println!("\n❌ Task failed (exit code: {})", exit_code);
+        progress.finish_with_message(&format!("❌ Task failed (exit code: {})", exit_code));
         println!(
             "\n📝 Events saved to: {}",
             workspace_path.join("events.jsonl").display()

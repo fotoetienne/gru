@@ -22,7 +22,7 @@ pub const INACTIVITY_STUCK_SECS: u64 = 900; // 15 minutes
 pub const EXIT_CODE_SIGNAL_TERMINATED: i32 = 128;
 
 /// Logs an event to events.jsonl in the given directory
-pub async fn log_event(dir: &Path, event: &stream::StreamOutput) -> Result<()> {
+async fn log_event(dir: &Path, event: &stream::StreamOutput) -> Result<()> {
     let events_file = dir.join("events.jsonl");
     let mut file = OpenOptions::new()
         .create(true)
@@ -142,8 +142,10 @@ pub fn build_claude_resume_command(
 /// Returns the exit status for the caller to inspect. Caller is responsible for
 /// checking if the process succeeded and handling errors appropriately.
 ///
-/// `on_spawn` is called with the child PID immediately after the process is spawned,
-/// allowing callers to record the PID (e.g., in the Minion registry) for status tracking.
+/// `on_spawn` is called synchronously with the child PID immediately after the process
+/// is spawned, before stream processing begins. This ensures the PID is recorded before
+/// the process can exit, avoiding a race condition. The callback should be fast (e.g.,
+/// writing a PID to a registry file); it runs on the async executor thread.
 pub async fn run_claude_with_stream_monitoring<F>(
     mut cmd: TokioCommand,
     worktree_path: &Path,

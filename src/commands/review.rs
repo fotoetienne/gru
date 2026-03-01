@@ -131,7 +131,7 @@ pub async fn handle_review(pr_arg: Option<String>) -> Result<i32> {
         },
         quiet: false,
     };
-    let progress = ProgressDisplay::new(config);
+    let progress = std::sync::Arc::new(ProgressDisplay::new(config));
 
     // Build the command with flags for autonomous stream-json output
     let cmd = build_claude_command(
@@ -152,8 +152,9 @@ pub async fn handle_review(pr_arg: Option<String>) -> Result<i32> {
     });
 
     // Run Claude with stream monitoring (no timeout for reviews)
+    let progress_cb = std::sync::Arc::clone(&progress);
     let output_callback = move |output: &stream::StreamOutput| {
-        progress.handle_output(output);
+        progress_cb.handle_output(output);
     };
 
     let run_result = run_claude_with_stream_monitoring(
@@ -182,9 +183,9 @@ pub async fn handle_review(pr_arg: Option<String>) -> Result<i32> {
 
     // Finish the progress display
     if status.success() {
-        println!("✅ Review complete for PR #{}", pr_num);
+        progress.finish_with_message(&format!("✅ Review complete for PR #{}", pr_num));
     } else {
-        println!("❌ Review failed for PR #{}", pr_num);
+        progress.finish_with_message(&format!("❌ Review failed for PR #{}", pr_num));
     }
 
     // Return the exit code from the claude process
