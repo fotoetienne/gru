@@ -39,9 +39,15 @@ pub enum ContentBlock {
 #[serde(tag = "type")]
 pub enum ContentDelta {
     #[serde(rename = "text_delta")]
-    TextDelta { text: String },
+    TextDelta {
+        #[serde(default)]
+        text: String,
+    },
     #[serde(rename = "input_json_delta")]
-    InputJsonDelta { partial_json: String },
+    InputJsonDelta {
+        #[serde(default)]
+        partial_json: String,
+    },
     /// Catch-all for unknown delta types
     #[serde(other)]
     #[default]

@@ -111,7 +111,12 @@ impl ProgressDisplay {
         if self.config.quiet {
             // In quiet mode, only show errors
             if let StreamOutput::Event(ClaudeEvent::Error { error }) = output {
-                log::error!("{}", error.message);
+                let message = if error.message.is_empty() {
+                    "Unknown error"
+                } else {
+                    &error.message
+                };
+                log::error!("{}", message);
             }
             return;
         }
@@ -303,7 +308,8 @@ impl ProgressDisplay {
             ClaudeEvent::ContentBlockStart { content_block, .. } => {
                 match content_block {
                     ContentBlock::ToolUse { name, id } => {
-                        self.update_status(&format!("🔧 Using tool: {}", name));
+                        let display_name = if name.is_empty() { "unknown" } else { name };
+                        self.update_status(&format!("🔧 Using tool: {}", display_name));
 
                         // Store tool name for later reference when tool completes
                         if !id.is_empty() {
@@ -410,8 +416,19 @@ impl ProgressDisplay {
                 }
 
                 self.update_status("❌ Error");
-                self.print_event(&format!("[{}] Error: {}", timestamp, error.message));
-                log::error!("{}", error.message);
+                let error_text = if error.message.is_empty() {
+                    if error.error_type.is_empty() {
+                        "Unknown error".to_string()
+                    } else {
+                        format!("Unknown error (type: {})", error.error_type)
+                    }
+                } else if error.error_type.is_empty() {
+                    error.message.clone()
+                } else {
+                    format!("{} ({})", error.message, error.error_type)
+                };
+                self.print_event(&format!("[{}] Error: {}", timestamp, error_text));
+                log::error!("{}", error_text);
             }
             ClaudeEvent::Ping => {
                 // Keepalive ping - no action needed, spinner ticks below
