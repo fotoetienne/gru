@@ -21,6 +21,8 @@ pub struct Worktree {
 pub enum WorktreeStatus {
     /// Branch has been merged into the base branch
     Merged,
+    /// PR was merged on GitHub (e.g., squash merge where commit hashes differ)
+    PrMerged,
     /// Associated GitHub issue is closed
     IssueClosed,
     /// Branch has been deleted on remote
@@ -147,11 +149,44 @@ impl Worktree {
         Ok(output.stdout.is_empty())
     }
 
+    /// Check if a PR for this branch was merged on GitHub (handles squash merges)
+    ///
+    /// Squash merges create new commit hashes, so `git branch --merged` won't detect them.
+    /// This method uses `gh pr list --state merged --head <branch>` to check GitHub directly.
+    pub async fn check_pr_merged_on_github(&self) -> Result<bool> {
+        let output = Command::new("gh")
+            .args([
+                "pr",
+                "list",
+                "--state",
+                "merged",
+                "--head",
+                &self.branch,
+                "--repo",
+                &self.repo,
+                "--json",
+                "number",
+                "--jq",
+                "length",
+            ])
+            .output()
+            .await
+            .context("Failed to check PR merge status on GitHub")?;
+
+        if !output.status.success() {
+            return Ok(false);
+        }
+
+        let count_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let count: u64 = count_str.parse().unwrap_or(0);
+        Ok(count > 0)
+    }
+
     /// Determine the overall status of this worktree
     pub async fn status(&self, base_branch: &str) -> Result<WorktreeStatus> {
         // Check in order of priority
 
-        // 1. Check if merged
+        // 1. Check if merged (git-level)
         if self
             .check_merged(base_branch)
             .await
@@ -164,7 +199,20 @@ impl Worktree {
             return Ok(WorktreeStatus::Merged);
         }
 
-        // 2. Check if issue is closed
+        // 2. Check if PR was merged on GitHub (handles squash merges)
+        if self
+            .check_pr_merged_on_github()
+            .await
+            .map_err(|e| {
+                log::warn!("Warning: Failed to check PR merge status on GitHub: {}", e);
+                e
+            })
+            .unwrap_or(false)
+        {
+            return Ok(WorktreeStatus::PrMerged);
+        }
+
+        // 3. Check if issue is closed
         if let Some(true) = self
             .check_issue_closed()
             .await
@@ -177,7 +225,7 @@ impl Worktree {
             return Ok(WorktreeStatus::IssueClosed);
         }
 
-        // 3. Check if remote branch is deleted
+        // 4. Check if remote branch is deleted
         if self
             .check_remote_deleted()
             .await
