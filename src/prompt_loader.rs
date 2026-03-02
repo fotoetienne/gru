@@ -18,11 +18,142 @@ use std::path::{Path, PathBuf};
 
 use crate::reserved_commands;
 
-/// Built-in prompt definitions (commands that will become overridable templates in Phase 4)
-pub const BUILT_IN_PROMPTS: &[(&str, &str)] = &[
-    ("fix", "Fix a GitHub issue with tests and PR"),
-    ("review", "Review and respond to PR comments"),
+/// Built-in prompt definitions: (name, description, content, requires)
+///
+/// These are the default prompts that ship with Gru. Repo-local prompts in
+/// `.gru/prompts/` take precedence over these built-ins when they use the
+/// same name.
+///
+/// Global prompts in `~/.gru/prompts/` are loaded before built-ins. If a
+/// built-in with the same name has non-empty `content`, it is inserted and
+/// will shadow the global prompt. A global prompt therefore only takes effect
+/// when there is no corresponding built-in with content for that name.
+pub const BUILT_IN_PROMPTS: &[BuiltInPrompt] = &[
+    BuiltInPrompt {
+        name: "fix",
+        description: "Fix a GitHub issue with tests and PR",
+        requires: &["issue"],
+        content: r#"# Issue #{{ issue_number }}: {{ issue_title }}
+
+URL: https://github.com/{{ repo_owner }}/{{ repo_name }}/issues/{{ issue_number }}
+{{ labels }}
+
+## Description:
+{{ issue_body }}
+
+# Instructions
+
+## 1. Check if Decomposition is Needed
+- Assess the issue's complexity:
+  - Does it involve multiple distinct components or systems?
+  - Does it have multiple acceptance criteria?
+  - Would it take more than a few hours to complete?
+  - Does it mix different types of work (backend + frontend + docs)?
+
+- **If the issue is complex and should be broken down:**
+  - Recommend to the user: "This issue seems complex. Run `/decompose $ARGUMENTS` to break it into smaller sub-issues first."
+  - Stop the fix workflow here - wait for user to decompose
+
+- **If the issue is focused and ready to fix:**
+  - Proceed to the next step
+
+## 2. Plan the Fix
+- Explore the codebase to understand the relevant code
+- Create a detailed plan using TodoWrite with specific steps to fix the issue
+- Consider tests that need to be added or updated
+
+## 3. Implement the Fix
+- Work through each todo item
+- Write clean, minimal code changes
+- Add or update tests as needed
+- Check CLAUDE.md for project-specific build/test commands
+- Run tests to verify the fix
+
+## 4. Code Review
+- Make a commit with the changes
+- Use the Task tool with `subagent_type='code-reviewer'` to perform an autonomous code review
+- The code-reviewer agent will analyze the changes for:
+  - Code correctness and logic errors
+  - Security vulnerabilities
+  - Error handling gaps
+  - Edge cases
+  - Adherence to project conventions (check CLAUDE.md)
+  - Test coverage
+- Address any issues raised by the code-reviewer before proceeding
+- If the review identifies significant problems, iterate on the implementation
+
+## 5. Finish Your Work
+
+When your implementation is complete and ready for human review:
+
+1. **Commit your implementation changes** with a descriptive commit message
+2. **Push the branch** to the remote repository
+3. Write `PR_DESCRIPTION.md` in the root of the repository with this format:
+   ```markdown
+   ## Summary
+   - Key change 1
+   - Key change 2
+
+   ## Test plan
+   - How you tested this
+   - Commands run: cargo test, just check, etc.
+
+   ## Notes
+   - Context reviewers should know
+   - Follow-up work if any
+   ```
+
+**DO NOT commit PR_DESCRIPTION.md** - Gru will read this file locally from your worktree, use it to create the PR description, mark the PR ready, and then delete it automatically.
+
+**IMPORTANT:** Only write `PR_DESCRIPTION.md` when work is truly complete and ready for human review. If work is still in progress, don't create this file - Gru will create a draft PR instead.
+
+## 6. Iterate on Feedback
+- Look at CI check results
+- Address any issues raised by the CI checks
+- Read review comments
+- Determine which comments require changes. Sometimes reviewers are wrong!
+- Make the necessary changes
+- For any comments that you've determined don't require changes, acknowledge them
+- Make a reply that addresses each comment and includes a summary of the changes made
+- Repeat until the PR is ready to merge
+"#,
+    },
+    BuiltInPrompt {
+        name: "review",
+        description: "Review and respond to PR comments",
+        requires: &["pr"],
+        content: "",
+    },
 ];
+
+/// A built-in prompt definition compiled into the binary
+#[derive(Debug)]
+pub struct BuiltInPrompt {
+    pub name: &'static str,
+    pub description: &'static str,
+    pub requires: &'static [&'static str],
+    pub content: &'static str,
+}
+
+impl BuiltInPrompt {
+    /// Converts this built-in definition into a `Prompt` struct.
+    /// Returns `None` if the built-in has no content (placeholder for future implementation).
+    pub fn to_prompt(&self) -> Option<Prompt> {
+        if self.content.trim().is_empty() {
+            return None;
+        }
+        Some(Prompt {
+            name: self.name.to_string(),
+            metadata: PromptMetadata {
+                description: Some(self.description.to_string()),
+                requires: self.requires.iter().map(|s| s.to_string()).collect(),
+                params: vec![],
+            },
+            content: self.content.to_string(),
+            source: PromptSource::BuiltIn,
+        })
+    }
+}
 
 /// Prompts grouped by their source, for display in `gru prompts`
 pub struct PromptsBySource {
@@ -32,7 +163,6 @@ pub struct PromptsBySource {
 }
 
 /// Metadata for a prompt file, parsed from YAML frontmatter
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PromptMetadata {
     /// Short description of what the prompt does
@@ -48,7 +178,6 @@ pub struct PromptMetadata {
 }
 
 /// Definition of a prompt parameter
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PromptParam {
     /// Parameter name
@@ -80,7 +209,6 @@ pub struct Prompt {
 }
 
 /// Location where a prompt was loaded from
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, PartialEq)]
 pub enum PromptSource {
     /// Repo-specific prompt (.gru/prompts/)
@@ -119,7 +247,6 @@ impl PromptSource {
 /// ---
 /// Prompt content here
 /// ```
-#[cfg_attr(not(test), allow(dead_code))]
 fn parse_frontmatter(content: &str) -> Result<(PromptMetadata, String)> {
     let lines: Vec<&str> = content.lines().collect();
 
@@ -219,14 +346,12 @@ fn scan_prompt_directory(dir: &Path) -> Result<HashMap<String, PathBuf>> {
 /// correct priority while being efficient (no need to check existence before insert).
 ///
 /// Reserved system commands are validated separately and never loaded.
-#[cfg_attr(not(test), allow(dead_code))]
 pub fn load_prompts(repo_root: Option<&Path>) -> Result<HashMap<String, Prompt>> {
     load_prompts_internal(repo_root, dirs::home_dir().as_deref())
 }
 
 /// Internal function for loading prompts with explicit global directory path.
 /// Used by public `load_prompts()` and for testing.
-#[cfg_attr(not(test), allow(dead_code))]
 fn load_prompts_internal(
     repo_root: Option<&Path>,
     global_root: Option<&Path>,
@@ -256,8 +381,12 @@ fn load_prompts_internal(
         }
     }
 
-    // 2. Built-in prompts (currently none, will be added in Phase 4)
-    // For now, this is a placeholder for future built-in prompts
+    // 2. Built-in prompts (override global, overridden by repo)
+    for builtin in BUILT_IN_PROMPTS {
+        if let Some(prompt) = builtin.to_prompt() {
+            prompts.insert(builtin.name.to_string(), prompt);
+        }
+    }
 
     // 3. Load repo-specific prompts (.gru/prompts/) - these override global/built-in
     if let Some(repo_root) = repo_root {
@@ -284,6 +413,23 @@ fn load_prompts_internal(
     }
 
     Ok(prompts)
+}
+
+/// Resolves a prompt by name, checking repo overrides, built-in, and global prompts.
+///
+/// This is the main entry point for commands like `gru fix` that need to load
+/// a built-in prompt while allowing user overrides.
+///
+/// **Performance note:** This loads all prompts from disk (scanning `.gru/prompts/`
+/// directories) and then extracts the requested one. The cost is proportional to
+/// the total number of prompt files, not O(1). This is acceptable since the number
+/// of prompts is small, but could be optimized with a targeted lookup path if
+/// prompt count grows significantly.
+///
+/// Returns `None` if no prompt with that name exists (neither built-in nor custom).
+pub fn resolve_prompt(name: &str, repo_root: Option<&Path>) -> Result<Option<Prompt>> {
+    let mut prompts = load_prompts(repo_root)?;
+    Ok(prompts.remove(name))
 }
 
 /// Collects required parameters that are missing or have empty/whitespace-only values
@@ -358,7 +504,7 @@ pub(crate) fn list_prompts_by_source_internal(
     // Built-in prompts
     let built_in: Vec<(String, String)> = BUILT_IN_PROMPTS
         .iter()
-        .map(|(name, desc)| (name.to_string(), desc.to_string()))
+        .map(|b| (b.name.to_string(), b.description.to_string()))
         .collect();
 
     // Repo prompts
@@ -505,7 +651,6 @@ pub fn validate_prompt_requirements(
 /// Currently checks:
 /// - Prompt content is not empty
 /// - Parameter names are valid identifiers
-#[cfg_attr(not(test), allow(dead_code))]
 pub fn validate_prompt(prompt: &Prompt) -> Result<()> {
     // Check content is not empty
     if prompt.content.trim().is_empty() {
@@ -690,7 +835,7 @@ Test content"#,
 
         let prompts = load_prompts(Some(temp_dir.path())).unwrap();
 
-        assert_eq!(prompts.len(), 1);
+        // Should contain the custom "test" prompt plus any built-in prompts with content
         assert!(prompts.contains_key("test"));
         let prompt = &prompts["test"];
         assert_eq!(prompt.name, "test");
@@ -717,8 +862,8 @@ Content"#,
 
         let prompts = load_prompts(Some(temp_dir.path())).unwrap();
 
-        // Should be empty because 'status' is reserved
-        assert_eq!(prompts.len(), 0);
+        // 'status' is reserved and should be filtered out
+        assert!(!prompts.contains_key("status"));
     }
 
     #[test]
@@ -754,7 +899,6 @@ Repo content"#,
         // Test that repo prompt overrides global prompt
         let prompts = load_prompts_internal(Some(&repo_root), Some(&global_root)).unwrap();
 
-        assert_eq!(prompts.len(), 1);
         let prompt = &prompts["test"];
         assert_eq!(prompt.metadata.description, Some("Repo prompt".to_string()));
         assert_eq!(prompt.content, "Repo content");
@@ -1218,5 +1362,121 @@ Repo content"#,
 
         let result = validate_prompt_requirements("test", &metadata, false, false, &HashMap::new());
         assert!(result.is_ok());
+    }
+
+    // --- Built-in prompt tests ---
+
+    #[test]
+    fn test_builtin_fix_prompt_has_content() {
+        let fix = BUILT_IN_PROMPTS.iter().find(|b| b.name == "fix").unwrap();
+        assert!(!fix.content.trim().is_empty());
+        assert_eq!(fix.description, "Fix a GitHub issue with tests and PR");
+        assert_eq!(fix.requires, &["issue"]);
+    }
+
+    #[test]
+    fn test_builtin_to_prompt_with_content() {
+        let fix = BUILT_IN_PROMPTS.iter().find(|b| b.name == "fix").unwrap();
+        let prompt = fix.to_prompt();
+        assert!(prompt.is_some());
+
+        let prompt = prompt.unwrap();
+        assert_eq!(prompt.name, "fix");
+        assert!(matches!(prompt.source, PromptSource::BuiltIn));
+        assert_eq!(prompt.metadata.requires, vec!["issue"]);
+        assert!(prompt.content.contains("{{ issue_number }}"));
+        assert!(prompt.content.contains("{{ issue_title }}"));
+        assert!(prompt.content.contains("{{ issue_body }}"));
+    }
+
+    #[test]
+    fn test_builtin_to_prompt_without_content() {
+        let review = BUILT_IN_PROMPTS
+            .iter()
+            .find(|b| b.name == "review")
+            .unwrap();
+        // Review has no content yet (placeholder)
+        assert!(review.to_prompt().is_none());
+    }
+
+    #[test]
+    fn test_builtin_fix_included_in_load_prompts() {
+        let temp_dir = TempDir::new().unwrap();
+        let prompts = load_prompts_internal(Some(temp_dir.path()), Some(temp_dir.path())).unwrap();
+
+        assert!(prompts.contains_key("fix"));
+        let fix = &prompts["fix"];
+        assert!(matches!(fix.source, PromptSource::BuiltIn));
+        assert!(fix
+            .content
+            .contains("## 1. Check if Decomposition is Needed"));
+    }
+
+    #[test]
+    fn test_repo_prompt_overrides_builtin() {
+        let temp_dir = TempDir::new().unwrap();
+        let prompts_dir = temp_dir.path().join(".gru").join("prompts");
+        fs::create_dir_all(&prompts_dir).unwrap();
+
+        // Create a repo prompt that overrides the built-in "fix"
+        fs::write(
+            prompts_dir.join("fix.md"),
+            r#"---
+description: Custom fix workflow
+requires: [issue]
+---
+Custom fix for issue #{{ issue_number }}"#,
+        )
+        .unwrap();
+
+        let prompts = load_prompts_internal(Some(temp_dir.path()), Some(temp_dir.path())).unwrap();
+
+        let fix = &prompts["fix"];
+        assert!(matches!(fix.source, PromptSource::Repo(_)));
+        assert_eq!(
+            fix.metadata.description,
+            Some("Custom fix workflow".to_string())
+        );
+        assert_eq!(fix.content, "Custom fix for issue #{{ issue_number }}");
+    }
+
+    #[test]
+    fn test_resolve_prompt_finds_builtin() {
+        let temp_dir = TempDir::new().unwrap();
+        let prompt = resolve_prompt("fix", Some(temp_dir.path())).unwrap();
+        assert!(prompt.is_some());
+
+        let prompt = prompt.unwrap();
+        assert_eq!(prompt.name, "fix");
+        assert!(matches!(prompt.source, PromptSource::BuiltIn));
+    }
+
+    #[test]
+    fn test_resolve_prompt_not_found() {
+        let temp_dir = TempDir::new().unwrap();
+        let prompt = resolve_prompt("nonexistent", Some(temp_dir.path())).unwrap();
+        assert!(prompt.is_none());
+    }
+
+    #[test]
+    fn test_builtin_fix_template_has_expected_variables() {
+        let fix = BUILT_IN_PROMPTS.iter().find(|b| b.name == "fix").unwrap();
+        let prompt = fix.to_prompt().unwrap();
+
+        // Template should reference standard context variables
+        assert!(prompt.content.contains("{{ issue_number }}"));
+        assert!(prompt.content.contains("{{ issue_title }}"));
+        assert!(prompt.content.contains("{{ issue_body }}"));
+        assert!(prompt.content.contains("{{ repo_owner }}"));
+        assert!(prompt.content.contains("{{ repo_name }}"));
+        assert!(prompt.content.contains("{{ labels }}"));
+
+        // Template should contain the key workflow steps
+        assert!(prompt.content.contains("Check if Decomposition is Needed"));
+        assert!(prompt.content.contains("Plan the Fix"));
+        assert!(prompt.content.contains("Implement the Fix"));
+        assert!(prompt.content.contains("Code Review"));
+        assert!(prompt.content.contains("Finish Your Work"));
+        assert!(prompt.content.contains("Iterate on Feedback"));
     }
 }

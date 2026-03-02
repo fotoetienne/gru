@@ -14,6 +14,8 @@ use crate::pr_monitor::{self, MonitorResult};
 use crate::pr_state::PrState;
 use crate::progress::{ProgressConfig, ProgressDisplay};
 use crate::progress_comments::{MinionPhase, ProgressCommentTracker};
+use crate::prompt_loader;
+use crate::prompt_renderer::{render_template, PromptContext};
 use crate::stream;
 use crate::url_utils::parse_issue_info;
 use crate::workspace;
@@ -681,111 +683,57 @@ async fn setup_worktree(ctx: &IssueContext) -> Result<WorktreeContext> {
 // Phase 3: Run Claude
 // ---------------------------------------------------------------------------
 
-/// Builds the prompt string from issue context.
-fn build_fix_prompt(ctx: &IssueContext) -> String {
-    if let Some(ref details) = ctx.details {
-        let labels_section = if details.labels.is_empty() {
-            String::new()
-        } else {
-            format!("\nLabels: {}", details.labels)
-        };
+/// Builds the prompt string from issue context using the prompt template system.
+///
+/// Loads the "fix" prompt template (built-in or overridden via `.gru/prompts/fix.md`),
+/// builds a `PromptContext` from the issue details, and renders the template.
+/// Falls back to `/fix <issue_num>` when issue details are unavailable.
+fn build_fix_prompt(ctx: &IssueContext, wt_ctx: &WorktreeContext) -> String {
+    let Some(ref details) = ctx.details else {
+        return format!("/fix {}", ctx.issue_num);
+    };
 
-        format!(
-            r#"
-# Issue #{}: {}
+    // Try to load the prompt through the template system (allows overrides).
+    // Use the worktree path as the repo root so `.gru/prompts/fix.md` is found.
+    let prompt_template = match prompt_loader::resolve_prompt("fix", Some(&wt_ctx.worktree_path)) {
+        Ok(p) => p,
+        Err(e) => {
+            log::warn!("Failed to load fix prompt: {e}, using /fix fallback");
+            None
+        }
+    };
 
-URL: https://github.com/{}/{}/issues/{}{}
+    let template_content = match prompt_template {
+        Some(ref p) => &p.content,
+        None => {
+            log::warn!("No 'fix' prompt found (built-in or override), using /fix fallback");
+            return format!("/fix {}", ctx.issue_num);
+        }
+    };
 
-## Description:
-{}
-
-# Instructions
-
-## 1. Check if Decomposition is Needed
-- Assess the issue's complexity:
-  - Does it involve multiple distinct components or systems?
-  - Does it have multiple acceptance criteria?
-  - Would it take more than a few hours to complete?
-  - Does it mix different types of work (backend + frontend + docs)?
-
-- **If the issue is complex and should be broken down:**
-  - Recommend to the user: "This issue seems complex. Run `/decompose $ARGUMENTS` to break it into smaller sub-issues first."
-  - Stop the fix workflow here - wait for user to decompose
-
-- **If the issue is focused and ready to fix:**
-  - Proceed to the next step
-
-## 2. Plan the Fix
-- Explore the codebase to understand the relevant code
-- Create a detailed plan using TodoWrite with specific steps to fix the issue
-- Consider tests that need to be added or updated
-
-## 3. Implement the Fix
-- Work through each todo item
-- Write clean, minimal code changes
-- Add or update tests as needed
-- Check CLAUDE.md for project-specific build/test commands
-- Run tests to verify the fix
-
-## 4. Code Review
-- Make a commit with the changes
-- Use the Task tool with `subagent_type='code-reviewer'` to perform an autonomous code review
-- The code-reviewer agent will analyze the changes for:
-  - Code correctness and logic errors
-  - Security vulnerabilities
-  - Error handling gaps
-  - Edge cases
-  - Adherence to project conventions (check CLAUDE.md)
-  - Test coverage
-- Address any issues raised by the code-reviewer before proceeding
-- If the review identifies significant problems, iterate on the implementation
-
-## 5. Finish Your Work
-
-When your implementation is complete and ready for human review:
-
-1. **Commit your implementation changes** with a descriptive commit message
-2. **Push the branch** to the remote repository
-3. Write `PR_DESCRIPTION.md` in the root of the repository with this format:
-   ```markdown
-   ## Summary
-   - Key change 1
-   - Key change 2
-
-   ## Test plan
-   - How you tested this
-   - Commands run: cargo test, just check, etc.
-
-   ## Notes
-   - Context reviewers should know
-   - Follow-up work if any
-   ```
-
-**DO NOT commit PR_DESCRIPTION.md** - Gru will read this file locally from your worktree, use it to create the PR description, mark the PR ready, and then delete it automatically.
-
-**IMPORTANT:** Only write `PR_DESCRIPTION.md` when work is truly complete and ready for human review. If work is still in progress, don't create this file - Gru will create a draft PR instead.
-
-## 6. Iterate on Feedback
-- Look at CI check results
-- Address any issues raised by the CI checks
-- Read review comments
-- Determine which comments require changes. Sometimes reviewers are wrong!
-- Make the necessary changes
-- For any comments that you've determined don't require changes, acknowledge them
-- Make a reply that addresses each comment and includes a summary of the changes made
-- Repeat until the PR is ready to merge
-"#,
-            ctx.issue_num,
-            details.title,
-            ctx.owner,
-            ctx.repo,
-            ctx.issue_num,
-            labels_section,
-            details.body
-        )
+    // Build the context for rendering
+    let labels_value = if details.labels.is_empty() {
+        String::new()
     } else {
-        format!("/fix {}", ctx.issue_num)
-    }
+        format!("Labels: {}", details.labels)
+    };
+
+    let mut prompt_ctx = PromptContext::new();
+    prompt_ctx.issue_number = Some(ctx.issue_num);
+    prompt_ctx.issue_title = Some(details.title.clone());
+    prompt_ctx.issue_body = Some(details.body.clone());
+    prompt_ctx.repo_owner = Some(ctx.owner.clone());
+    prompt_ctx.repo_name = Some(ctx.repo.clone());
+    prompt_ctx.worktree_path = Some(wt_ctx.worktree_path.clone());
+    prompt_ctx.branch_name = Some(wt_ctx.branch_name.clone());
+
+    let mut variables = prompt_ctx.to_variables();
+    // Add the labels variable (fix-specific, not in the standard PromptContext).
+    // Value is "Labels: x, y" when present or empty string when none.
+    // The template places {{ labels }} on its own line to handle both cases.
+    variables.insert("labels".to_string(), labels_value);
+
+    render_template(template_content, &variables)
 }
 
 /// Runs a Claude session with stream monitoring and progress tracking.
@@ -799,7 +747,7 @@ async fn run_claude_session(
     timeout_opt: Option<&str>,
 ) -> Result<ClaudeResult> {
     println!("🤖 Launching Claude...\n");
-    let prompt = build_fix_prompt(issue_ctx);
+    let prompt = build_fix_prompt(issue_ctx, wt_ctx);
     let mut cmd = build_claude_command(&wt_ctx.worktree_path, &wt_ctx.session_id, &prompt);
     cmd.env("GRU_WORKSPACE", &wt_ctx.minion_id);
     run_claude_session_inner(issue_ctx, wt_ctx, cmd, quiet, timeout_opt).await
@@ -1440,8 +1388,21 @@ mod tests {
         assert!(!result.unwrap());
     }
 
+    /// Creates a test `WorktreeContext` pointing at the given path.
+    fn test_wt_ctx(worktree_path: &std::path::Path) -> WorktreeContext {
+        WorktreeContext {
+            minion_id: "M001".to_string(),
+            branch_name: "minion/issue-42-M001".to_string(),
+            worktree_path: worktree_path.to_path_buf(),
+            session_id: Uuid::new_v4(),
+        }
+    }
+
     #[test]
     fn test_build_fix_prompt_with_details() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wt_ctx = test_wt_ctx(tmp.path());
+
         let ctx = IssueContext {
             owner: "octocat".to_string(),
             repo: "hello-world".to_string(),
@@ -1454,8 +1415,8 @@ mod tests {
             github_client: None,
         };
 
-        let prompt = build_fix_prompt(&ctx);
-        assert!(prompt.contains("# Issue #42: Fix the widget"));
+        let prompt = build_fix_prompt(&ctx, &wt_ctx);
+        assert!(prompt.starts_with("# Issue #42: Fix the widget"));
         assert!(prompt.contains("octocat/hello-world/issues/42"));
         assert!(prompt.contains("The widget is broken"));
         assert!(prompt.contains("Labels: bug, priority:high"));
@@ -1464,6 +1425,9 @@ mod tests {
 
     #[test]
     fn test_build_fix_prompt_without_details() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wt_ctx = test_wt_ctx(tmp.path());
+
         let ctx = IssueContext {
             owner: "octocat".to_string(),
             repo: "hello-world".to_string(),
@@ -1472,12 +1436,15 @@ mod tests {
             github_client: None,
         };
 
-        let prompt = build_fix_prompt(&ctx);
+        let prompt = build_fix_prompt(&ctx, &wt_ctx);
         assert_eq!(prompt, "/fix 42");
     }
 
     #[test]
     fn test_build_fix_prompt_empty_labels() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wt_ctx = test_wt_ctx(tmp.path());
+
         let ctx = IssueContext {
             owner: "octocat".to_string(),
             repo: "hello-world".to_string(),
@@ -1490,9 +1457,80 @@ mod tests {
             github_client: None,
         };
 
-        let prompt = build_fix_prompt(&ctx);
+        let prompt = build_fix_prompt(&ctx, &wt_ctx);
         assert!(prompt.contains("# Issue #7: Add feature"));
         assert!(!prompt.contains("Labels:"));
+    }
+
+    #[test]
+    fn test_build_fix_prompt_uses_template_variables() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wt_ctx = test_wt_ctx(tmp.path());
+
+        let ctx = IssueContext {
+            owner: "myorg".to_string(),
+            repo: "myproject".to_string(),
+            issue_num: 99,
+            details: Some(IssueDetails {
+                title: "Template test".to_string(),
+                body: "Body content here".to_string(),
+                labels: "enhancement".to_string(),
+            }),
+            github_client: None,
+        };
+
+        let prompt = build_fix_prompt(&ctx, &wt_ctx);
+
+        // Verify template variables were substituted (no {{ }} patterns remaining
+        // for known variables)
+        assert!(!prompt.contains("{{ issue_number }}"));
+        assert!(!prompt.contains("{{ issue_title }}"));
+        assert!(!prompt.contains("{{ issue_body }}"));
+        assert!(!prompt.contains("{{ repo_owner }}"));
+        assert!(!prompt.contains("{{ repo_name }}"));
+
+        // Verify the substituted values are present
+        assert!(prompt.contains("99"));
+        assert!(prompt.contains("Template test"));
+        assert!(prompt.contains("Body content here"));
+        assert!(prompt.contains("myorg"));
+        assert!(prompt.contains("myproject"));
+        assert!(prompt.contains("Labels: enhancement"));
+    }
+
+    #[test]
+    fn test_build_fix_prompt_repo_override() {
+        let tmp = tempfile::tempdir().unwrap();
+        let prompts_dir = tmp.path().join(".gru").join("prompts");
+        std::fs::create_dir_all(&prompts_dir).unwrap();
+
+        // Create a custom fix prompt that overrides the built-in
+        std::fs::write(
+            prompts_dir.join("fix.md"),
+            r#"---
+description: Custom fix
+requires: [issue]
+---
+CUSTOM: Fix #{{ issue_number }} - {{ issue_title }}"#,
+        )
+        .unwrap();
+
+        let wt_ctx = test_wt_ctx(tmp.path());
+
+        let ctx = IssueContext {
+            owner: "owner".to_string(),
+            repo: "repo".to_string(),
+            issue_num: 55,
+            details: Some(IssueDetails {
+                title: "Custom test".to_string(),
+                body: "Custom body".to_string(),
+                labels: String::new(),
+            }),
+            github_client: None,
+        };
+
+        let prompt = build_fix_prompt(&ctx, &wt_ctx);
+        assert_eq!(prompt, "CUSTOM: Fix #55 - Custom test");
     }
 
     #[test]
