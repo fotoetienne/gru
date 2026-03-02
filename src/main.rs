@@ -22,7 +22,7 @@ mod worktree_scanner;
 
 use clap::{Parser, Subcommand};
 use commands::{
-    attach, clean, fix, init, lab, path, prompt, prompts, resume, review, status, stop,
+    attach, clean, fix, init, lab, path, prompt, prompts, rebase, resume, review, status, stop,
 };
 
 /// CLI structure for the Gru agent orchestrator
@@ -79,6 +79,13 @@ enum Commands {
             help = "PR number, URL, Minion ID, or issue number. Auto-detects from current worktree if omitted."
         )]
         pr: Option<String>,
+    },
+    #[command(about = "Rebase a Minion's branch onto the latest base branch")]
+    Rebase {
+        #[arg(
+            help = "Issue number, PR number, Minion ID, or URL. Auto-detects from current worktree if omitted."
+        )]
+        target: Option<String>,
     },
     #[command(about = "Get the filesystem path to a Minion's worktree")]
     Path {
@@ -231,6 +238,7 @@ async fn main() {
             force_new,
         } => fix::handle_fix(&issue, timeout, review_timeout, cli.quiet, force_new).await,
         Commands::Review { pr } => review::handle_review(pr).await,
+        Commands::Rebase { target } => rebase::handle_rebase(target).await,
         Commands::Path { id, issue, pr } => path::handle_path(id, issue, pr).await,
         Commands::Attach { id, yolo } => attach::handle_attach(id, yolo).await,
         Commands::Resume { id, yolo } => resume::handle_resume(id, yolo).await,
