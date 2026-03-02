@@ -120,7 +120,7 @@ When your implementation is complete and ready for human review:
     },
     BuiltInPrompt {
         name: "review",
-        description: "Review and respond to PR comments",
+        description: "Review a PR and provide code review feedback",
         requires: &["pr"],
         content: r#"# PR #{{ pr_number }}: {{ pr_title }}
 
@@ -131,44 +131,46 @@ URL: https://github.com/{{ repo_owner }}/{{ repo_name }}/pull/{{ pr_number }}
 
 # Instructions
 
-Review and respond to all comments and reviews on this pull request.
+Review this pull request: fetch details, analyze changes, and provide code review feedback.
 
-## 1. Fetch Comments and Reviews
-- Use `gh pr view {{ pr_number }} --repo {{ repo_owner }}/{{ repo_name }}` to get PR details and status
-- Use `gh api repos/{{ repo_owner }}/{{ repo_name }}/pulls/{{ pr_number }}/comments` to fetch all review comments
-- Use `gh api repos/{{ repo_owner }}/{{ repo_name }}/issues/{{ pr_number }}/comments` to fetch all issue comments
-- Use `gh pr checks {{ pr_number }} --repo {{ repo_owner }}/{{ repo_name }}` to check CI status
+## 1. Fetch PR Details
+- Use `gh pr view {{ pr_number }} --repo {{ repo_owner }}/{{ repo_name }} --json headRefName` to get the branch name
+- Use `gh pr view {{ pr_number }} --repo {{ repo_owner }}/{{ repo_name }}` to get the PR title, body, and metadata
+- Use `gh pr view {{ pr_number }} --repo {{ repo_owner }}/{{ repo_name }} --json files` to get a quick overview of changed files
+- Fetch existing review comments: `gh api repos/{{ repo_owner }}/{{ repo_name }}/pulls/{{ pr_number }}/comments`
+- Understand the scope and intent of the PR, and any prior discussion
+- The code should already be checked out in the current directory
+- If this PR is addressing an Issue, read Issue details to understand the problem and context. Does this PR address the issue completely? Are there any missing details or assumptions?
+- You don't need to run tests - CI will handle that.
 
-## 2. Review All Feedback
-- Read through all comments and reviews
-- Identify questions, concerns, or suggestions that need responses
-- Group related comments together
-- Check if any CI checks are failing
+## 2. Analyze the Changes
+- Review each file changed in the diff
+- For complex changes, use Read to examine full file context around the changes
+- Check CLAUDE.md for project-specific conventions and patterns
+- Consider:
+  - Code correctness and logic
+  - Error handling
+  - Edge cases
+  - Security implications
+  - Performance considerations
+  - Test coverage
 
-## 3. Address Feedback
-- For each comment or review:
-  - Determine if it requires a code change
-  - If yes, make the change and note what was done
-  - If no, prepare a thoughtful response explaining why
-- For CI failures:
-  - Investigate the failure
-  - Fix the underlying issue
-  - Verify the fix locally
+## 3. Provide Feedback
+- List any issues found (bugs, security concerns, style problems)
+- Suggest improvements if applicable
+- Give an overall assessment (approve, request changes, or needs discussion)
 
-## 4. Implement Changes
-- Make code changes to address review feedback
-- Run tests to verify changes don't break anything
-- Check CLAUDE.md for project-specific build/test commands
-
-## 5. Commit and Respond
-- Commit changes with a descriptive message summarizing what was addressed
-- Push changes to the branch
-- Use `gh pr comment {{ pr_number }} --repo {{ repo_owner }}/{{ repo_name }} -b "response"` to post a summary of changes made
-- Reply to individual review comments where appropriate
-
-## 6. Verify
-- Run `gh pr checks {{ pr_number }} --repo {{ repo_owner }}/{{ repo_name }}` to verify CI passes
-- Confirm all review comments have been addressed or responded to
+## 4. Submit Review
+- BEFORE submitting: Check if this is your own PR:
+  - Use `gh pr view {{ pr_number }} --repo {{ repo_owner }}/{{ repo_name }} --json author --jq '.author.login'` to get the PR author
+  - Use `gh api user --jq '.login'` to get your GitHub username
+  - If they match, you CANNOT use `--approve` or `--request-changes` (GitHub will reject it)
+- Use `gh pr review {{ pr_number }} --repo {{ repo_owner }}/{{ repo_name }}` with:
+  - `--comment -b "review content"` for general feedback (use this for your own PRs)
+  - `--approve -b "review content"` if explicitly approving AND it's not your own PR
+  - `--request-changes -b "review content"` if changes are required AND it's not your own PR
+- Use a HEREDOC for multi-line review content to preserve formatting
+- **IMPORTANT**: ALWAYS verify the gh command succeeded by checking its output. If it returns empty or fails, inform the user of the issue
 "#,
     },
     BuiltInPrompt {
@@ -1565,7 +1567,7 @@ Repo content"#,
         assert!(prompts.contains_key("review"));
         let review = &prompts["review"];
         assert!(matches!(review.source, PromptSource::BuiltIn));
-        assert!(review.content.contains("## 1. Fetch Comments and Reviews"));
+        assert!(review.content.contains("## 1. Fetch PR Details"));
     }
 
     #[test]
