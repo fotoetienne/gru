@@ -101,14 +101,16 @@ pub async fn handle_review(pr_arg: Option<String>) -> Result<i32> {
     };
 
     // Fetch the issue number linked to this PR (if any)
-    let linked_issue = find_issue_for_pr(&pr_num).await.unwrap_or_else(|e| {
-        log::warn!(
-            "Warning: Failed to fetch linked issue for PR #{}: {}",
-            pr_num,
-            e
-        );
-        0
-    });
+    let linked_issue = find_issue_for_pr(&owner, &repo, &pr_num)
+        .await
+        .unwrap_or_else(|e| {
+            log::warn!(
+                "Warning: Failed to fetch linked issue for PR #{}: {}",
+                pr_num,
+                e
+            );
+            0
+        });
 
     // Generate a unique session ID for conversation continuity
     let session_id = Uuid::new_v4();
@@ -332,9 +334,16 @@ async fn get_pr_info_from_number(pr_num: &str) -> Result<(String, String, String
 /// Finds a PR number associated with an issue number
 /// Uses gh CLI to search for PRs that link to the issue
 async fn find_pr_for_issue(issue_num: u64) -> Result<String> {
+    // Detect repo from current directory to pick gh vs ghe
+    let remote_url = git::get_github_remote()
+        .await
+        .context("Failed to get GitHub remote")?;
+    let (det_owner, det_repo) =
+        git::parse_github_remote(&remote_url).context("Failed to parse GitHub remote URL")?;
+    let gh_cmd = github::gh_command_for_repo(&format!("{}/{}", det_owner, det_repo));
     // Safe: issue_num is validated as u64 by the type system, which can only contain digits.
     // This prevents command injection as the format string will never contain shell metacharacters.
-    let output = TokioCommand::new("gh")
+    let output = TokioCommand::new(gh_cmd)
         .args([
             "pr",
             "list",
@@ -379,13 +388,17 @@ async fn find_pr_for_issue(issue_num: u64) -> Result<String> {
 /// Finds issue numbers linked to a PR
 /// Uses gh CLI to fetch issues that this PR closes/fixes
 /// Returns the first linked issue number, or 0 if no issues are linked
-async fn find_issue_for_pr(pr_num: &str) -> Result<u64> {
+async fn find_issue_for_pr(owner: &str, repo: &str, pr_num: &str) -> Result<u64> {
+    let repo_full = format!("{}/{}", owner, repo);
+    let gh_cmd = github::gh_command_for_repo(&repo_full);
     // Safe: pr_num is already validated as a number earlier in the call chain
-    let output = TokioCommand::new("gh")
+    let output = TokioCommand::new(gh_cmd)
         .args([
             "pr",
             "view",
             pr_num,
+            "--repo",
+            &repo_full,
             "--json",
             "closingIssuesReferences",
             "--jq",
