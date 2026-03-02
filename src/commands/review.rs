@@ -2,6 +2,7 @@ use crate::claude_runner::{
     build_claude_command, run_claude_with_stream_monitoring, EXIT_CODE_SIGNAL_TERMINATED,
 };
 use crate::git;
+use crate::github::{self, GitHubClient};
 use crate::minion;
 use crate::minion_registry::{
     with_registry, MinionInfo as RegistryMinionInfo, MinionMode, MinionRegistry, OrchestrationPhase,
@@ -9,12 +10,15 @@ use crate::minion_registry::{
 use crate::minion_resolver;
 use crate::pr_state::PrState;
 use crate::progress::{ProgressConfig, ProgressDisplay};
+use crate::prompt_loader;
+use crate::prompt_renderer::{render_template, PromptContext};
 use crate::stream;
 use crate::url_utils::parse_pr_info;
 use crate::workspace;
 use anyhow::{Context, Result};
 use chrono::Utc;
 use std::env;
+use std::path::Path;
 use tokio::process::Command as TokioCommand;
 use uuid::Uuid;
 
@@ -84,6 +88,18 @@ pub async fn handle_review(pr_arg: Option<String>) -> Result<i32> {
         new_worktree_path
     };
 
+    // Fetch PR details for prompt rendering
+    let pr_num_u64: u64 = pr_num
+        .parse()
+        .with_context(|| format!("Invalid PR number: '{}'", pr_num))?;
+    let pr_details = match fetch_pr_details(&owner, &repo, pr_num_u64).await {
+        Ok(details) => Some(details),
+        Err(e) => {
+            log::warn!("Failed to fetch PR details: {e}. Using fallback prompt.");
+            None
+        }
+    };
+
     // Fetch the issue number linked to this PR (if any)
     let linked_issue = find_issue_for_pr(&pr_num).await.unwrap_or_else(|e| {
         log::warn!(
@@ -97,13 +113,17 @@ pub async fn handle_review(pr_arg: Option<String>) -> Result<i32> {
     // Generate a unique session ID for conversation continuity
     let session_id = Uuid::new_v4();
 
+    // Build the review prompt using the template system
+    let review_prompt =
+        build_review_prompt(&owner, &repo, &pr_num, pr_details.as_ref(), &worktree_path);
+
     // Register minion in registry
     let now = Utc::now();
     let registry_info = RegistryMinionInfo {
         repo: format!("{}/{}", owner, repo),
         issue: linked_issue,
         command: "review".to_string(),
-        prompt: format!("/pr_review {}", pr_num),
+        prompt: review_prompt.chars().take(200).collect(),
         started_at: now,
         branch: branch.clone(),
         worktree: worktree_path.clone(),
@@ -137,11 +157,7 @@ pub async fn handle_review(pr_arg: Option<String>) -> Result<i32> {
     let progress = std::sync::Arc::new(ProgressDisplay::new(config));
 
     // Build the command with flags for autonomous stream-json output
-    let cmd = build_claude_command(
-        &worktree_path,
-        &session_id,
-        &format!("/pr_review {}", pr_num),
-    );
+    let cmd = build_claude_command(&worktree_path, &session_id, &review_prompt);
 
     // Build on_spawn callback to record the child PID in the registry
     let pid_minion_id = minion_id.clone();
@@ -407,6 +423,84 @@ async fn find_issue_for_pr(pr_num: &str) -> Result<u64> {
         })
 }
 
+/// Details about a PR used for prompt rendering
+struct PrDetails {
+    title: String,
+    body: String,
+}
+
+/// Fetches PR title and body from GitHub for prompt rendering.
+/// Uses the API client if available, falls back to gh CLI.
+async fn fetch_pr_details(owner: &str, repo: &str, pr_num: u64) -> Result<PrDetails> {
+    if let Some(client) = GitHubClient::try_from_env(owner, repo).await {
+        match client.get_pr(owner, repo, pr_num).await {
+            Ok(pr) => {
+                return Ok(PrDetails {
+                    title: pr.title.unwrap_or_default(),
+                    body: pr.body.unwrap_or_default(),
+                });
+            }
+            Err(e) => {
+                log::warn!("Failed to fetch PR via API: {e}. Falling back to gh CLI...");
+            }
+        }
+    }
+
+    let info = github::get_pr_via_cli(owner, repo, pr_num)
+        .await
+        .context("Failed to fetch PR details via gh CLI")?;
+    Ok(PrDetails {
+        title: info.title,
+        body: info.body.unwrap_or_default(),
+    })
+}
+
+/// Builds the review prompt using the prompt template system.
+///
+/// Loads the "review" prompt template (built-in or overridden via `.gru/prompts/review.md`),
+/// builds a `PromptContext` from the PR details, and renders the template.
+/// Falls back to `/pr_review <pr_num>` when PR details are unavailable or no prompt is found.
+fn build_review_prompt(
+    owner: &str,
+    repo: &str,
+    pr_num: &str,
+    details: Option<&PrDetails>,
+    worktree_path: &Path,
+) -> String {
+    let Some(details) = details else {
+        return format!("/pr_review {}", pr_num);
+    };
+
+    let prompt_template = match prompt_loader::resolve_prompt("review", Some(worktree_path)) {
+        Ok(p) => p,
+        Err(e) => {
+            log::warn!("Failed to load review prompt: {e}, using /pr_review fallback");
+            None
+        }
+    };
+
+    let template_content = match prompt_template {
+        Some(ref p) => &p.content,
+        None => {
+            log::warn!(
+                "No 'review' prompt found (built-in or override), using /pr_review fallback"
+            );
+            return format!("/pr_review {}", pr_num);
+        }
+    };
+
+    let mut prompt_ctx = PromptContext::new();
+    prompt_ctx.pr_number = pr_num.parse().ok();
+    prompt_ctx.pr_title = Some(details.title.clone());
+    prompt_ctx.pr_body = Some(details.body.clone());
+    prompt_ctx.repo_owner = Some(owner.to_string());
+    prompt_ctx.repo_name = Some(repo.to_string());
+    prompt_ctx.worktree_path = Some(worktree_path.to_path_buf());
+
+    let variables = prompt_ctx.to_variables();
+    render_template(template_content, &variables)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -427,5 +521,79 @@ mod tests {
         assert!(!looks_like_minion_id("M-42")); // Contains non-alphanumeric
         assert!(!looks_like_minion_id("M 42")); // Contains space
         assert!(!looks_like_minion_id("")); // Empty string
+    }
+
+    #[test]
+    fn test_build_review_prompt_with_details() {
+        let tmp = tempfile::tempdir().unwrap();
+        let details = PrDetails {
+            title: "Fix the widget".to_string(),
+            body: "This PR fixes the broken widget".to_string(),
+        };
+
+        let prompt =
+            build_review_prompt("octocat", "hello-world", "456", Some(&details), tmp.path());
+        assert!(prompt.starts_with("# PR #456: Fix the widget"));
+        assert!(prompt.contains("octocat/hello-world/pull/456"));
+        assert!(prompt.contains("This PR fixes the broken widget"));
+        assert!(prompt.contains("## 1. Fetch Comments and Reviews"));
+    }
+
+    #[test]
+    fn test_build_review_prompt_without_details() {
+        let tmp = tempfile::tempdir().unwrap();
+        let prompt = build_review_prompt("octocat", "hello-world", "456", None, tmp.path());
+        assert_eq!(prompt, "/pr_review 456");
+    }
+
+    #[test]
+    fn test_build_review_prompt_uses_template_variables() {
+        let tmp = tempfile::tempdir().unwrap();
+        let details = PrDetails {
+            title: "Template test".to_string(),
+            body: "Body content here".to_string(),
+        };
+
+        let prompt = build_review_prompt("myorg", "myproject", "99", Some(&details), tmp.path());
+
+        // Verify template variables were substituted
+        assert!(!prompt.contains("{{ pr_number }}"));
+        assert!(!prompt.contains("{{ pr_title }}"));
+        assert!(!prompt.contains("{{ pr_body }}"));
+        assert!(!prompt.contains("{{ repo_owner }}"));
+        assert!(!prompt.contains("{{ repo_name }}"));
+
+        // Verify the substituted values are present
+        assert!(prompt.contains("99"));
+        assert!(prompt.contains("Template test"));
+        assert!(prompt.contains("Body content here"));
+        assert!(prompt.contains("myorg"));
+        assert!(prompt.contains("myproject"));
+    }
+
+    #[test]
+    fn test_build_review_prompt_repo_override() {
+        let tmp = tempfile::tempdir().unwrap();
+        let prompts_dir = tmp.path().join(".gru").join("prompts");
+        std::fs::create_dir_all(&prompts_dir).unwrap();
+
+        // Create a custom review prompt that overrides the built-in
+        std::fs::write(
+            prompts_dir.join("review.md"),
+            r#"---
+description: Custom review
+requires: [pr]
+---
+CUSTOM: Review PR #{{ pr_number }} - {{ pr_title }}"#,
+        )
+        .unwrap();
+
+        let details = PrDetails {
+            title: "Custom test".to_string(),
+            body: "Custom body".to_string(),
+        };
+
+        let prompt = build_review_prompt("owner", "repo", "55", Some(&details), tmp.path());
+        assert_eq!(prompt, "CUSTOM: Review PR #55 - Custom test");
     }
 }

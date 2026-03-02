@@ -122,7 +122,54 @@ When your implementation is complete and ready for human review:
         name: "review",
         description: "Review and respond to PR comments",
         requires: &["pr"],
-        content: "",
+        content: r#"# PR #{{ pr_number }}: {{ pr_title }}
+
+URL: https://github.com/{{ repo_owner }}/{{ repo_name }}/pull/{{ pr_number }}
+
+## Description:
+{{ pr_body }}
+
+# Instructions
+
+Review and respond to all comments and reviews on this pull request.
+
+## 1. Fetch Comments and Reviews
+- Use `gh pr view {{ pr_number }} --repo {{ repo_owner }}/{{ repo_name }}` to get PR details and status
+- Use `gh api repos/{{ repo_owner }}/{{ repo_name }}/pulls/{{ pr_number }}/comments` to fetch all review comments
+- Use `gh api repos/{{ repo_owner }}/{{ repo_name }}/issues/{{ pr_number }}/comments` to fetch all issue comments
+- Use `gh pr checks {{ pr_number }} --repo {{ repo_owner }}/{{ repo_name }}` to check CI status
+
+## 2. Review All Feedback
+- Read through all comments and reviews
+- Identify questions, concerns, or suggestions that need responses
+- Group related comments together
+- Check if any CI checks are failing
+
+## 3. Address Feedback
+- For each comment or review:
+  - Determine if it requires a code change
+  - If yes, make the change and note what was done
+  - If no, prepare a thoughtful response explaining why
+- For CI failures:
+  - Investigate the failure
+  - Fix the underlying issue
+  - Verify the fix locally
+
+## 4. Implement Changes
+- Make code changes to address review feedback
+- Run tests to verify changes don't break anything
+- Check CLAUDE.md for project-specific build/test commands
+
+## 5. Commit and Respond
+- Commit changes with a descriptive message summarizing what was addressed
+- Push changes to the branch
+- Use `gh pr comment {{ pr_number }} --repo {{ repo_owner }}/{{ repo_name }} -b "response"` to post a summary of changes made
+- Reply to individual review comments where appropriate
+
+## 6. Verify
+- Run `gh pr checks {{ pr_number }} --repo {{ repo_owner }}/{{ repo_name }}` to verify CI passes
+- Confirm all review comments have been addressed or responded to
+"#,
     },
 ];
 
@@ -1390,13 +1437,21 @@ Repo content"#,
     }
 
     #[test]
-    fn test_builtin_to_prompt_without_content() {
+    fn test_builtin_review_prompt_has_content() {
         let review = BUILT_IN_PROMPTS
             .iter()
             .find(|b| b.name == "review")
             .unwrap();
-        // Review has no content yet (placeholder)
-        assert!(review.to_prompt().is_none());
+        let prompt = review.to_prompt();
+        assert!(prompt.is_some());
+
+        let prompt = prompt.unwrap();
+        assert_eq!(prompt.name, "review");
+        assert!(matches!(prompt.source, PromptSource::BuiltIn));
+        assert_eq!(prompt.metadata.requires, vec!["pr"]);
+        assert!(prompt.content.contains("{{ pr_number }}"));
+        assert!(prompt.content.contains("{{ pr_title }}"));
+        assert!(prompt.content.contains("{{ pr_body }}"));
     }
 
     #[test]
@@ -1410,6 +1465,17 @@ Repo content"#,
         assert!(fix
             .content
             .contains("## 1. Check if Decomposition is Needed"));
+    }
+
+    #[test]
+    fn test_builtin_review_included_in_load_prompts() {
+        let temp_dir = TempDir::new().unwrap();
+        let prompts = load_prompts_internal(Some(temp_dir.path()), Some(temp_dir.path())).unwrap();
+
+        assert!(prompts.contains_key("review"));
+        let review = &prompts["review"];
+        assert!(matches!(review.source, PromptSource::BuiltIn));
+        assert!(review.content.contains("## 1. Fetch Comments and Reviews"));
     }
 
     #[test]
