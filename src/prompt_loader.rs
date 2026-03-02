@@ -178,13 +178,18 @@ Review and respond to all comments and reviews on this pull request.
         content: r#"Rebase the current working branch onto the default branch with intelligent conflict resolution.
 
 Branch: {{ branch_name }}
-Base branch: {{ base_branch }}
+Base branch hint: {{ base_branch }}
 Worktree: {{ worktree_path }}
 
-## 1. Verify Git State
+## 1. Verify Git State and Determine Base Branch
 - Confirm you are on a feature branch (not the default branch)
 - Ensure the working directory is clean (no uncommitted changes)
 - If dirty, ask the user to commit or stash first
+- Determine the default branch to rebase onto:
+  - If "{{ base_branch }}" is provided above, use it (strip any `origin/` prefix if present)
+  - Otherwise, detect it: `git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's|refs/remotes/origin/||'`
+  - If detection fails, fall back to `main`
+- Store the resolved branch name (without `origin/` prefix) for use in subsequent steps
 
 ## 2. Gather Context
 - Run `gh pr view --json number,title,body,url` to get PR context (if on a PR branch)
@@ -192,8 +197,8 @@ Worktree: {{ worktree_path }}
 - This context helps make informed conflict resolution decisions
 
 ## 3. Fetch and Rebase
-- Run `git fetch origin {{ base_branch }}` to get the latest upstream changes
-- Run `git rebase origin/{{ base_branch }}` to start the rebase
+- Run `git fetch origin <base_branch>` to get the latest upstream changes
+- Run `git rebase origin/<base_branch>` to start the rebase
 
 ## 4. Resolve Conflicts
 If conflicts occur during the rebase:
@@ -222,9 +227,9 @@ After resolving each conflict:
 - Continue with `git rebase --continue`
 
 ## 5. After Rebase Completes
-- Review the changes: `git log --oneline origin/{{ base_branch }}..HEAD`
+- Review the changes: `git log --oneline origin/<base_branch>..HEAD`
 - Run the project's test suite to ensure nothing broke (check CLAUDE.md for test commands, if present)
-- Force push the rebased branch: `git push --force-with-lease origin {{ branch_name }}`
+- Force push the rebased branch: `git push --force-with-lease`
 - Report the result to the user
 
 ## 6. If Something Goes Wrong
@@ -1571,7 +1576,9 @@ Repo content"#,
         assert!(prompts.contains_key("rebase"));
         let rebase = &prompts["rebase"];
         assert!(matches!(rebase.source, PromptSource::BuiltIn));
-        assert!(rebase.content.contains("## 1. Verify Git State"));
+        assert!(rebase
+            .content
+            .contains("## 1. Verify Git State and Determine Base Branch"));
     }
 
     #[test]
@@ -1590,11 +1597,24 @@ Repo content"#,
         assert!(prompt.content.contains("{{ worktree_path }}"));
 
         // Template should contain the key workflow steps
-        assert!(prompt.content.contains("Verify Git State"));
+        assert!(prompt
+            .content
+            .contains("Verify Git State and Determine Base Branch"));
         assert!(prompt.content.contains("Gather Context"));
         assert!(prompt.content.contains("Fetch and Rebase"));
         assert!(prompt.content.contains("Resolve Conflicts"));
         assert!(prompt.content.contains("force-with-lease"));
+
+        // Template should NOT hardcode origin/ before {{ base_branch }}
+        // to avoid double-prefixing when base_branch is "origin/main"
+        assert!(
+            !prompt.content.contains("origin/{{ base_branch }}"),
+            "Template should not hardcode origin/ before base_branch variable"
+        );
+
+        // Template should include fallback detection for when base_branch is empty
+        assert!(prompt.content.contains("symbolic-ref"));
+        assert!(prompt.content.contains("fall back to `main`"));
 
         // Render with actual values and verify substitution
         let context = PromptContext {
@@ -1608,12 +1628,38 @@ Repo content"#,
 
         let rendered = render_template(&prompt.content, &context.to_variables());
         assert!(rendered.contains("minion/issue-42-M001"));
-        assert!(rendered.contains("git fetch origin main"));
-        assert!(rendered.contains("git rebase origin/main"));
-        assert!(rendered.contains("git push --force-with-lease origin minion/issue-42-M001"));
+        assert!(rendered.contains("git push --force-with-lease"));
         assert!(!rendered.contains("{{ branch_name }}"));
         assert!(!rendered.contains("{{ base_branch }}"));
         assert!(!rendered.contains("{{ worktree_path }}"));
+    }
+
+    #[test]
+    fn test_builtin_rebase_renders_with_empty_base_branch() {
+        use crate::prompt_renderer::{render_template, PromptContext};
+
+        let rebase = BUILT_IN_PROMPTS
+            .iter()
+            .find(|b| b.name == "rebase")
+            .unwrap();
+        let prompt = rebase.to_prompt().unwrap();
+
+        // When base_branch is not set (e.g., via `gru prompt rebase`),
+        // the template should still be usable - detection instructions remain
+        let context = PromptContext {
+            branch_name: Some("feature/my-branch".to_string()),
+            ..PromptContext::default()
+        };
+
+        let rendered = render_template(&prompt.content, &context.to_variables());
+
+        // base_branch renders as empty but detection instructions remain
+        assert!(rendered.contains("Base branch hint:"));
+        assert!(rendered.contains("detect it:"));
+        assert!(rendered.contains("fall back to `main`"));
+        // branch_name should still be substituted
+        assert!(rendered.contains("feature/my-branch"));
+        assert!(!rendered.contains("{{ branch_name }}"));
     }
 
     #[test]
