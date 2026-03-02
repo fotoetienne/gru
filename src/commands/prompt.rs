@@ -248,6 +248,7 @@ async fn setup_issue_worktree(
 }
 
 /// Options for the prompt command, grouped to avoid too many function arguments
+#[derive(Debug, Default)]
 pub struct PromptOptions {
     pub issue: Option<String>,
     pub pr: Option<String>,
@@ -279,6 +280,21 @@ pub async fn handle_prompt(prompt: &str, opts: PromptOptions) -> Result<i32> {
 
     if trimmed_prompt.is_empty() {
         anyhow::bail!("Prompt cannot be empty");
+    }
+
+    // Validate --worktree path early, before any network calls or state changes
+    if let Some(ref wt) = worktree_opt {
+        let p = PathBuf::from(wt);
+        if !p.exists() {
+            anyhow::bail!(
+                "Worktree path does not exist: {}\n\
+                 Ensure the path exists before using --worktree.",
+                p.display()
+            );
+        }
+        if !p.is_dir() {
+            anyhow::bail!("Worktree path is not a directory: {}", p.display());
+        }
     }
 
     // Parse custom parameters
@@ -377,16 +393,9 @@ pub async fn handle_prompt(prompt: &str, opts: PromptOptions) -> Result<i32> {
     let has_context = issue_opt.is_some() || pr_opt.is_some();
     let use_auto_worktree = !no_worktree && worktree_opt.is_none();
     let (workspace_path, branch_name, run_dir) = if let Some(ref explicit_path) = worktree_opt {
-        // --worktree <path>: use the explicit path as both workspace and run directory
-        let wt_path = PathBuf::from(explicit_path);
-        if !wt_path.exists() {
-            anyhow::bail!(
-                "Worktree path does not exist: {}\n\
-                 Ensure the path exists before using --worktree.",
-                wt_path.display()
-            );
-        }
-        let wt_path = wt_path
+        // --worktree <path>: use the explicit path as both workspace and run directory.
+        // Path existence and is_dir checks were already done at the top of the function.
+        let wt_path = PathBuf::from(explicit_path)
             .canonicalize()
             .with_context(|| format!("Failed to resolve worktree path: {}", explicit_path))?;
         println!("📂 Using explicit worktree: {}", wt_path.display());
@@ -605,22 +614,9 @@ pub async fn handle_prompt(prompt: &str, opts: PromptOptions) -> Result<i32> {
 mod tests {
     use super::*;
 
-    /// Helper to create default PromptOptions for tests
-    fn default_opts() -> PromptOptions {
-        PromptOptions {
-            issue: None,
-            pr: None,
-            no_worktree: false,
-            worktree: None,
-            params: vec![],
-            timeout: None,
-            quiet: false,
-        }
-    }
-
     #[tokio::test]
     async fn test_handle_prompt_rejects_flag_like_input() {
-        let result = handle_prompt("--help", default_opts()).await;
+        let result = handle_prompt("--help", PromptOptions::default()).await;
         assert!(result.is_err());
         assert!(result
             .unwrap_err()
@@ -630,11 +626,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_prompt_rejects_empty_input() {
-        let result = handle_prompt("", default_opts()).await;
+        let result = handle_prompt("", PromptOptions::default()).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("cannot be empty"));
 
-        let result = handle_prompt("   ", default_opts()).await;
+        let result = handle_prompt("   ", PromptOptions::default()).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("cannot be empty"));
     }
@@ -643,7 +639,7 @@ mod tests {
     async fn test_handle_prompt_rejects_nonexistent_worktree_path() {
         let opts = PromptOptions {
             worktree: Some("/nonexistent/path/that/does/not/exist".to_string()),
-            ..default_opts()
+            ..PromptOptions::default()
         };
         let result = handle_prompt("test prompt", opts).await;
         assert!(result.is_err());
@@ -656,6 +652,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_handle_prompt_rejects_file_as_worktree_path() {
+        let temp = std::env::temp_dir().join("gru-test-worktree-file");
+        let _ = std::fs::write(&temp, "not a directory");
+        let opts = PromptOptions {
+            worktree: Some(temp.to_string_lossy().to_string()),
+            ..PromptOptions::default()
+        };
+        let result = handle_prompt("test prompt", opts).await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("not a directory"),
+            "Expected 'not a directory' error, got: {}",
+            err_msg
+        );
+        let _ = std::fs::remove_file(&temp);
+    }
+
+    #[tokio::test]
     async fn test_handle_prompt_worktree_flag_accepts_existing_path() {
         // Use a temp directory as the explicit worktree path.
         // The prompt will proceed past validation but fail later (no Claude binary),
@@ -664,16 +679,17 @@ mod tests {
         let _ = std::fs::create_dir_all(&temp);
         let opts = PromptOptions {
             worktree: Some(temp.to_string_lossy().to_string()),
-            ..default_opts()
+            ..PromptOptions::default()
         };
         let result = handle_prompt("test prompt", opts).await;
         // We expect an error further down (workspace init, claude binary, etc.)
-        // but NOT the "does not exist" error
+        // but NOT the "does not exist" or "not a directory" error
         if let Err(e) = &result {
+            let msg = e.to_string();
             assert!(
-                !e.to_string().contains("does not exist"),
+                !msg.contains("does not exist") && !msg.contains("not a directory"),
                 "Path validation should pass for existing directory, got: {}",
-                e
+                msg
             );
         }
         let _ = std::fs::remove_dir_all(&temp);
