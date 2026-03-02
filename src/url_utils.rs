@@ -127,6 +127,9 @@ pub async fn parse_pr_info(pr: &str) -> Result<(String, String, String, String)>
     // Extract PR number and determine the correct gh CLI command
     let (pr_num, gh_cmd) = if pr.parse::<u32>().is_ok() {
         // Plain number: detect repo from current directory to pick gh vs ghe
+        git::detect_git_repo()
+            .await
+            .context("Failed to detect git repository")?;
         let remote_url = git::get_github_remote()
             .await
             .context("Failed to get GitHub remote")?;

@@ -370,6 +370,9 @@ fn calculate_uptime(worktree_path: &std::path::Path) -> Result<String> {
 /// Returns the issue number if the PR contains "Fixes #<num>", "Closes #<num>", or "Resolves #<num>"
 async fn resolve_issue_from_pr(pr_num: u64) -> Result<u64> {
     // Detect repo from current directory to pick gh vs ghe
+    git::detect_git_repo()
+        .await
+        .context("Failed to detect git repository")?;
     let remote_url = git::get_github_remote()
         .await
         .context("Failed to get GitHub remote")?;

@@ -335,6 +335,9 @@ async fn get_pr_info_from_number(pr_num: &str) -> Result<(String, String, String
 /// Uses gh CLI to search for PRs that link to the issue
 async fn find_pr_for_issue(issue_num: u64) -> Result<String> {
     // Detect repo from current directory to pick gh vs ghe
+    git::detect_git_repo()
+        .await
+        .context("Failed to detect git repository")?;
     let remote_url = git::get_github_remote()
         .await
         .context("Failed to get GitHub remote")?;
