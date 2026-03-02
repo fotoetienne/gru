@@ -1,5 +1,5 @@
 use crate::claude_runner::{
-    build_claude_resume_command, run_claude_with_stream_monitoring, ClaudeRunnerError,
+    build_claude_resume_command, is_stuck_or_timeout_error, run_claude_with_stream_monitoring,
     EXIT_CODE_SIGNAL_TERMINATED,
 };
 use crate::commands::fix::{
@@ -12,7 +12,7 @@ use crate::minion_registry::{
 use crate::minion_resolver;
 use crate::progress::{ProgressConfig, ProgressDisplay};
 use crate::stream;
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Result};
 use chrono::Utc;
 use uuid::Uuid;
 
@@ -21,6 +21,8 @@ use uuid::Uuid;
 enum ResumeError {
     /// The minion has a live process — user must stop it first.
     AlreadyRunning { minion_id: String, mode: MinionMode },
+    /// Registry shows a non-Stopped mode but no PID is recorded.
+    InconsistentState { minion_id: String, mode: MinionMode },
 }
 
 impl std::fmt::Display for ResumeError {
@@ -33,16 +35,19 @@ impl std::fmt::Display for ResumeError {
                     minion_id, mode, minion_id
                 )
             }
+            ResumeError::InconsistentState { minion_id, mode } => {
+                write!(
+                    f,
+                    "Minion {} is currently in {} mode without an associated process. \
+                     Please wait or run 'gru status' / 'gru stop {}' to recover.",
+                    minion_id, mode, minion_id
+                )
+            }
         }
     }
 }
 
 impl std::error::Error for ResumeError {}
-
-/// Returns true if the error indicates the task is stuck or timed out.
-fn is_stuck_or_timeout_error(err: &anyhow::Error) -> bool {
-    err.downcast_ref::<ClaudeRunnerError>().is_some()
-}
 
 /// Handles the resume command: resumes a stopped Minion in autonomous mode.
 ///
@@ -90,8 +95,14 @@ pub async fn handle_resume(
         }
     };
 
-    let session_uuid =
-        Uuid::parse_str(&session_id).context("Failed to parse session ID from registry")?;
+    let session_uuid = match Uuid::parse_str(&session_id) {
+        Ok(uuid) => uuid,
+        Err(e) => {
+            // Revert registry to Stopped since we claimed Autonomous but can't proceed
+            revert_to_stopped(&minion.minion_id).await;
+            return Err(anyhow::anyhow!(e).context("Failed to parse session ID from registry"));
+        }
+    };
 
     // Build the continuation prompt
     let prompt = if let Some(ref extra) = additional_prompt {
@@ -187,6 +198,20 @@ pub async fn handle_resume(
     Ok(0)
 }
 
+/// Reverts the registry to Stopped mode (best-effort).
+/// Used when claim succeeded but we can't proceed with the spawn.
+async fn revert_to_stopped(minion_id: &str) {
+    let mid = minion_id.to_string();
+    let _ = with_registry(move |reg| {
+        reg.update(&mid, |info| {
+            info.mode = MinionMode::Stopped;
+            info.pid = None;
+            info.last_activity = Utc::now();
+        })
+    })
+    .await;
+}
+
 /// Runs Claude in autonomous mode with stream monitoring.
 ///
 /// Spawns Claude with `--resume` and stream-json output, tracks progress,
@@ -212,7 +237,9 @@ async fn run_autonomous_claude(
         progress.handle_output(output);
     };
 
-    // Register PID on spawn
+    // Register PID on spawn. Uses MinionRegistry::load directly instead of
+    // with_registry because the on_spawn callback is synchronous (FnOnce, not async).
+    // This is consistent with the same pattern in fix.rs::run_claude_session_inner.
     let pid_minion_id = wt_ctx.minion_id.clone();
     let on_spawn: Box<dyn FnOnce(u32) + Send> = Box::new(move |pid: u32| {
         if let Ok(mut registry) = MinionRegistry::load(None) {
@@ -295,12 +322,13 @@ async fn check_and_claim_session(
                             })?;
                         }
                         None => {
-                            // No PID but not stopped — reset to consistent state
-                            reg.update(&id, |info| {
-                                info.mode = MinionMode::Stopped;
-                                info.pid = None;
-                                info.last_activity = Utc::now();
-                            })?;
+                            // Inconsistent state: mode != Stopped but no PID recorded.
+                            // Treat this as locked/in use to avoid double-claiming.
+                            return Err(ResumeError::InconsistentState {
+                                minion_id: id,
+                                mode,
+                            }
+                            .into());
                         }
                     }
                 }
@@ -376,6 +404,18 @@ mod tests {
         assert!(msg.contains("already running"));
         assert!(msg.contains("autonomous"));
         assert!(msg.contains("gru stop M001"));
+    }
+
+    #[test]
+    fn test_resume_error_display_inconsistent_state() {
+        let err = ResumeError::InconsistentState {
+            minion_id: "M002".to_string(),
+            mode: MinionMode::Interactive,
+        };
+        let msg = format!("{}", err);
+        assert!(msg.contains("interactive mode"));
+        assert!(msg.contains("without an associated process"));
+        assert!(msg.contains("gru stop M002"));
     }
 
     #[test]
