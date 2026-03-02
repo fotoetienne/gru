@@ -171,6 +171,72 @@ Review and respond to all comments and reviews on this pull request.
 - Confirm all review comments have been addressed or responded to
 "#,
     },
+    BuiltInPrompt {
+        name: "rebase",
+        description: "Rebase branch with intelligent conflict resolution",
+        requires: &[],
+        content: r#"Rebase the current working branch onto the default branch with intelligent conflict resolution.
+
+Branch: {{ branch_name }}
+Base branch hint: {{ base_branch }}
+Worktree: {{ worktree_path }}
+
+## 1. Verify Git State and Determine Base Branch
+- Confirm you are on a feature branch (not the default branch)
+- Ensure the working directory is clean (no uncommitted changes)
+- If dirty, ask the user to commit or stash first
+- Determine the default branch to rebase onto:
+  - If "{{ base_branch }}" is provided above, use it (strip any `origin/` prefix if present)
+  - Otherwise, detect it: `git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's|refs/remotes/origin/||'`
+  - If detection fails, fall back to `main`
+- Store the resolved branch name (without `origin/` prefix) for use in subsequent steps
+
+## 2. Gather Context
+- Run `gh pr view --json number,title,body,url` to get PR context (if on a PR branch)
+- If a linked issue exists, run `gh issue view <number> --json number,title,body,url`
+- This context helps make informed conflict resolution decisions
+
+## 3. Fetch and Rebase
+- Run `git fetch origin <base_branch>` to get the latest upstream changes
+- Run `git rebase origin/<base_branch>` to start the rebase
+
+## 4. Resolve Conflicts
+If conflicts occur during the rebase:
+
+**Automatically resolve these confidently:**
+- Independent changes in different code sections
+- Import additions (merge and sort them)
+- Refactoring on the default branch (adapt your code)
+- Both branches adding tests or config (merge both)
+
+**Pause and report these to the user:**
+- Logic conflicts with different approaches
+- Security or permission changes
+- Architectural decisions
+- Configuration value conflicts
+- Anything ambiguous or uncertain
+
+For each conflict requiring input, provide:
+- Clear explanation of the conflict
+- Context from the PR/issue gathered in step 2
+- Why you are uncertain
+- Resolution options
+
+After resolving each conflict:
+- Stage the resolved files with `git add <file>`
+- Continue with `git rebase --continue`
+
+## 5. After Rebase Completes
+- Review the changes: `git log --oneline origin/<base_branch>..HEAD`
+- Run the project's test suite to ensure nothing broke (check CLAUDE.md for test commands, if present)
+- Force push the rebased branch: `git push --force-with-lease`
+- Report the result to the user
+
+## 6. If Something Goes Wrong
+- If the rebase cannot be completed, abort with `git rebase --abort`
+- Report what went wrong and suggest next steps
+"#,
+    },
 ];
 
 /// A built-in prompt definition compiled into the binary
@@ -1455,6 +1521,30 @@ Repo content"#,
     }
 
     #[test]
+    fn test_builtin_rebase_prompt_has_content() {
+        let rebase = BUILT_IN_PROMPTS
+            .iter()
+            .find(|b| b.name == "rebase")
+            .unwrap();
+        assert_eq!(
+            rebase.description,
+            "Rebase branch with intelligent conflict resolution"
+        );
+        assert!(
+            rebase.requires.is_empty(),
+            "rebase should have no requires (works on current branch)"
+        );
+
+        let prompt = rebase.to_prompt();
+        assert!(prompt.is_some());
+
+        let prompt = prompt.unwrap();
+        assert_eq!(prompt.name, "rebase");
+        assert!(matches!(prompt.source, PromptSource::BuiltIn));
+        assert!(prompt.metadata.requires.is_empty());
+    }
+
+    #[test]
     fn test_builtin_fix_included_in_load_prompts() {
         let temp_dir = TempDir::new().unwrap();
         let prompts = load_prompts_internal(Some(temp_dir.path()), Some(temp_dir.path())).unwrap();
@@ -1476,6 +1566,100 @@ Repo content"#,
         let review = &prompts["review"];
         assert!(matches!(review.source, PromptSource::BuiltIn));
         assert!(review.content.contains("## 1. Fetch Comments and Reviews"));
+    }
+
+    #[test]
+    fn test_builtin_rebase_included_in_load_prompts() {
+        let temp_dir = TempDir::new().unwrap();
+        let prompts = load_prompts_internal(Some(temp_dir.path()), Some(temp_dir.path())).unwrap();
+
+        assert!(prompts.contains_key("rebase"));
+        let rebase = &prompts["rebase"];
+        assert!(matches!(rebase.source, PromptSource::BuiltIn));
+        assert!(rebase
+            .content
+            .contains("## 1. Verify Git State and Determine Base Branch"));
+    }
+
+    #[test]
+    fn test_builtin_rebase_renders_correctly() {
+        use crate::prompt_renderer::{render_template, PromptContext};
+
+        let rebase = BUILT_IN_PROMPTS
+            .iter()
+            .find(|b| b.name == "rebase")
+            .unwrap();
+        let prompt = rebase.to_prompt().unwrap();
+
+        // Template should reference git context variables
+        assert!(prompt.content.contains("{{ branch_name }}"));
+        assert!(prompt.content.contains("{{ base_branch }}"));
+        assert!(prompt.content.contains("{{ worktree_path }}"));
+
+        // Template should contain the key workflow steps
+        assert!(prompt
+            .content
+            .contains("Verify Git State and Determine Base Branch"));
+        assert!(prompt.content.contains("Gather Context"));
+        assert!(prompt.content.contains("Fetch and Rebase"));
+        assert!(prompt.content.contains("Resolve Conflicts"));
+        assert!(prompt.content.contains("force-with-lease"));
+
+        // Template should NOT hardcode origin/ before {{ base_branch }}
+        // to avoid double-prefixing when base_branch is "origin/main"
+        assert!(
+            !prompt.content.contains("origin/{{ base_branch }}"),
+            "Template should not hardcode origin/ before base_branch variable"
+        );
+
+        // Template should include fallback detection for when base_branch is empty
+        assert!(prompt.content.contains("symbolic-ref"));
+        assert!(prompt.content.contains("fall back to `main`"));
+
+        // Render with actual values and verify substitution
+        let context = PromptContext {
+            branch_name: Some("minion/issue-42-M001".to_string()),
+            base_branch: Some("main".to_string()),
+            worktree_path: Some(std::path::PathBuf::from(
+                "/home/user/.gru/work/owner/repo/M001",
+            )),
+            ..PromptContext::default()
+        };
+
+        let rendered = render_template(&prompt.content, &context.to_variables());
+        assert!(rendered.contains("minion/issue-42-M001"));
+        assert!(rendered.contains("git push --force-with-lease"));
+        assert!(!rendered.contains("{{ branch_name }}"));
+        assert!(!rendered.contains("{{ base_branch }}"));
+        assert!(!rendered.contains("{{ worktree_path }}"));
+    }
+
+    #[test]
+    fn test_builtin_rebase_renders_with_empty_base_branch() {
+        use crate::prompt_renderer::{render_template, PromptContext};
+
+        let rebase = BUILT_IN_PROMPTS
+            .iter()
+            .find(|b| b.name == "rebase")
+            .unwrap();
+        let prompt = rebase.to_prompt().unwrap();
+
+        // When base_branch is not set (e.g., via `gru prompt rebase`),
+        // the template should still be usable - detection instructions remain
+        let context = PromptContext {
+            branch_name: Some("feature/my-branch".to_string()),
+            ..PromptContext::default()
+        };
+
+        let rendered = render_template(&prompt.content, &context.to_variables());
+
+        // base_branch renders as empty but detection instructions remain
+        assert!(rendered.contains("Base branch hint:"));
+        assert!(rendered.contains("detect it:"));
+        assert!(rendered.contains("fall back to `main`"));
+        // branch_name should still be substituted
+        assert!(rendered.contains("feature/my-branch"));
+        assert!(!rendered.contains("{{ branch_name }}"));
     }
 
     #[test]
