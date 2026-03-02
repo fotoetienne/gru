@@ -171,6 +171,63 @@ Review and respond to all comments and reviews on this pull request.
 - Confirm all review comments have been addressed or responded to
 "#,
     },
+    BuiltInPrompt {
+        name: "rebase",
+        description: "Rebase branch with intelligent conflict resolution",
+        requires: &[],
+        content: r#"Rebase the current working branch onto the default branch with intelligent conflict resolution.
+
+Branch: {{ branch_name }}
+Base branch: {{ base_branch }}
+Worktree: {{ worktree_path }}
+
+## Steps
+
+### 1. Verify Git State
+- Confirm you are on a feature branch (not the default branch)
+- Ensure the working directory is clean (no uncommitted changes)
+- If dirty, ask the user to commit or stash first
+
+### 2. Fetch and Rebase
+- Run `git fetch origin {{ base_branch }}` to get the latest upstream changes
+- Run `git rebase origin/{{ base_branch }}` to start the rebase
+
+### 3. Resolve Conflicts
+If conflicts occur during the rebase:
+
+**Automatically resolve these confidently:**
+- Independent changes in different code sections
+- Import additions (merge and sort them)
+- Refactoring on the default branch (adapt your code)
+- Both branches adding tests or config (merge both)
+
+**Pause and report these to the user:**
+- Logic conflicts with different approaches
+- Security or permission changes
+- Architectural decisions
+- Configuration value conflicts
+- Anything ambiguous or uncertain
+
+For each conflict requiring input, provide:
+- Clear explanation of the conflict
+- Context from the PR/issue
+- Why you are uncertain
+- Resolution options
+
+After resolving each conflict:
+- Stage the resolved files with `git add <file>`
+- Continue with `git rebase --continue`
+
+### 4. After Rebase Completes
+- Review the changes: `git log --oneline origin/{{ base_branch }}..HEAD`
+- Run the project's test suite to ensure nothing broke (check CLAUDE.md for test commands)
+- Report the result to the user
+
+### 5. If Something Goes Wrong
+- If the rebase cannot be completed, abort with `git rebase --abort`
+- Report what went wrong and suggest next steps
+"#,
+    },
 ];
 
 /// A built-in prompt definition compiled into the binary
@@ -1455,6 +1512,24 @@ Repo content"#,
     }
 
     #[test]
+    fn test_builtin_rebase_prompt_has_content() {
+        let rebase = BUILT_IN_PROMPTS
+            .iter()
+            .find(|b| b.name == "rebase")
+            .unwrap();
+        let prompt = rebase.to_prompt();
+        assert!(prompt.is_some());
+
+        let prompt = prompt.unwrap();
+        assert_eq!(prompt.name, "rebase");
+        assert!(matches!(prompt.source, PromptSource::BuiltIn));
+        assert!(prompt.metadata.requires.is_empty());
+        assert!(prompt.content.contains("{{ branch_name }}"));
+        assert!(prompt.content.contains("{{ base_branch }}"));
+        assert!(prompt.content.contains("{{ worktree_path }}"));
+    }
+
+    #[test]
     fn test_builtin_fix_included_in_load_prompts() {
         let temp_dir = TempDir::new().unwrap();
         let prompts = load_prompts_internal(Some(temp_dir.path()), Some(temp_dir.path())).unwrap();
@@ -1476,6 +1551,52 @@ Repo content"#,
         let review = &prompts["review"];
         assert!(matches!(review.source, PromptSource::BuiltIn));
         assert!(review.content.contains("## 1. Fetch Comments and Reviews"));
+    }
+
+    #[test]
+    fn test_builtin_rebase_included_in_load_prompts() {
+        let temp_dir = TempDir::new().unwrap();
+        let prompts = load_prompts_internal(Some(temp_dir.path()), Some(temp_dir.path())).unwrap();
+
+        assert!(prompts.contains_key("rebase"));
+        let rebase = &prompts["rebase"];
+        assert!(matches!(rebase.source, PromptSource::BuiltIn));
+        assert!(rebase.content.contains("## 1. Verify Git State"));
+    }
+
+    #[test]
+    fn test_builtin_rebase_template_has_expected_variables() {
+        let rebase = BUILT_IN_PROMPTS
+            .iter()
+            .find(|b| b.name == "rebase")
+            .unwrap();
+        let prompt = rebase.to_prompt().unwrap();
+
+        // Template should reference git context variables
+        assert!(prompt.content.contains("{{ branch_name }}"));
+        assert!(prompt.content.contains("{{ base_branch }}"));
+        assert!(prompt.content.contains("{{ worktree_path }}"));
+
+        // Template should contain the key workflow steps
+        assert!(prompt.content.contains("Verify Git State"));
+        assert!(prompt.content.contains("Fetch and Rebase"));
+        assert!(prompt.content.contains("Resolve Conflicts"));
+    }
+
+    #[test]
+    fn test_builtin_rebase_no_requires() {
+        let rebase = BUILT_IN_PROMPTS
+            .iter()
+            .find(|b| b.name == "rebase")
+            .unwrap();
+        assert!(
+            rebase.requires.is_empty(),
+            "rebase should have no requires (works on current branch)"
+        );
+        assert_eq!(
+            rebase.description,
+            "Rebase branch with intelligent conflict resolution"
+        );
     }
 
     #[test]
