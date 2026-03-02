@@ -1,17 +1,61 @@
+use crate::minion_registry::{is_process_alive, with_registry, MinionMode};
 use crate::minion_resolver;
 use anyhow::{Context, Result};
+use chrono::Utc;
+use std::process::Stdio;
+use tokio::process::Command;
+use tokio::time::Duration;
+
+/// Typed errors from the attach command that callers can match on via
+/// `downcast_ref::<AttachError>()` instead of brittle string matching.
+#[derive(Debug)]
+enum AttachError {
+    /// The minion has a live process — user must stop it first.
+    AlreadyRunning { minion_id: String, mode: MinionMode },
+    /// Registry shows a non-Stopped mode but no PID is recorded.
+    InconsistentState { minion_id: String, mode: MinionMode },
+}
+
+impl std::fmt::Display for AttachError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AttachError::AlreadyRunning { minion_id, mode } => {
+                write!(
+                    f,
+                    "Minion {} is already running (mode: {}). Stop it first with: gru stop {}",
+                    minion_id, mode, minion_id
+                )
+            }
+            AttachError::InconsistentState { minion_id, mode } => {
+                write!(
+                    f,
+                    "Minion {} is currently in {} mode without an associated process. \
+                     Please wait or run 'gru status' / 'gru stop {}' to recover.",
+                    minion_id, mode, minion_id
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for AttachError {}
+
+/// Grace period for the child process to exit after receiving a signal
+/// before we force-kill it.
+const CTRL_C_GRACE_SECS: u64 = 5;
 
 /// Handles the attach command to attach to a Minion's Claude session
 /// Returns 0 on success, 1 on error
 ///
-/// This command attaches to a running or paused Minion's session,
-/// allowing you to see live output and send keyboard input.
+/// This command attaches to a stopped Minion's session interactively,
+/// allowing you to unstick it without losing conversation context.
 ///
 /// It is functionally equivalent to:
 /// ```bash
+/// # With session_id from registry:
+/// cd $(gru path <id>) && claude --resume <session-id>
+/// # Without registry (fallback):
 /// cd $(gru path <id>) && claude -r
-/// # With --yolo:
-/// cd $(gru path <id>) && claude -r --dangerously-skip-permissions
 /// ```
 ///
 /// The ID argument supports smart resolution (same as gru path):
@@ -20,8 +64,11 @@ use anyhow::{Context, Result};
 /// 3. Parse as number, search local minions by issue number
 /// 4. Fallback to GitHub API for PRs (if online)
 ///
-/// On Unix systems, this command replaces the current process with claude.
-/// On Windows, it spawns claude and waits for completion.
+/// Registry integration:
+/// - Before attaching: atomically checks mode and claims the session as Interactive
+/// - During attach: updates registry with PID after spawn
+/// - After exit: updates registry with mode=Stopped and clears PID
+/// - Signal handling: Ctrl-C is caught to ensure registry cleanup runs
 ///
 /// Note: This command is identical to `gru resume` - both attach to the
 /// same Claude session interactively. The `attach` name is used for
@@ -39,44 +86,224 @@ pub async fn handle_attach(id: String, yolo: bool) -> Result<i32> {
         );
     }
 
+    // Atomically check registry state, get session_id, and claim as Interactive.
+    // This prevents TOCTOU races where two `gru attach` calls could both see
+    // mode=Stopped and proceed simultaneously.
+    let session_id = check_and_claim_session(&minion.minion_id).await?;
+
     println!("🔌 Attaching to Minion {}...", minion.minion_id);
     if yolo {
         println!("⚡ YOLO mode: skipping permission prompts");
     }
     println!("📂 Workspace: {}", minion.worktree_path.display());
 
-    // Unix: exec() replaces the current process
-    // Windows: spawn() creates a new process and waits for it
+    // Build claude command for interactive mode (no --print, no --output-format)
+    let mut cmd = Command::new("claude");
+    match &session_id {
+        Some(sid) => {
+            cmd.arg("--resume").arg(sid);
+        }
+        None => {
+            cmd.arg("-r");
+        }
+    }
+    if yolo {
+        cmd.arg("--dangerously-skip-permissions");
+    }
+    cmd.current_dir(&minion.worktree_path)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+
+    // Spawn claude process (not exec - we need to update registry after exit)
+    let mut child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(e) => {
+            // Spawn failed - revert registry to Stopped
+            let mid = minion.minion_id.clone();
+            let _ = with_registry(move |reg| {
+                reg.update(&mid, |info| {
+                    info.mode = MinionMode::Stopped;
+                    info.pid = None;
+                    info.last_activity = Utc::now();
+                })
+            })
+            .await;
+            return Err(e).context(
+                "Failed to start claude. Is Claude CLI installed and in your PATH?\n\
+                 See: https://claude.com/claude-code",
+            );
+        }
+    };
+
+    // Update registry with PID and ensure mode=Interactive.
+    // Setting mode here is idempotent when check_and_claim_session already claimed,
+    // but covers the edge case where the claim fell back to Ok(None) due to a
+    // transient registry failure while the registry is now available again.
+    let pid_at_spawn = child.id();
+    let mid = minion.minion_id.clone();
+    let _ = with_registry(move |reg| {
+        reg.update(&mid, |info| {
+            info.mode = MinionMode::Interactive;
+            info.pid = pid_at_spawn;
+            info.last_activity = Utc::now();
+        })
+    })
+    .await;
+
+    // Wait for claude to exit, handling Ctrl-C gracefully.
+    // Without this select!, SIGINT would kill gru immediately (default OS behavior),
+    // skipping registry cleanup. By catching ctrl_c(), we ensure the "mode=Stopped"
+    // update always runs.
+    let status = tokio::select! {
+        result = child.wait() => result.context("Failed to wait for claude process")?,
+        _ = tokio::signal::ctrl_c() => {
+            // Explicitly signal the child to terminate in case it didn't receive
+            // the SIGINT (different process group, platform differences, etc.)
+            signal_child(&mut child);
+
+            // Wait with a grace period, then force-kill if still running
+            match tokio::time::timeout(
+                Duration::from_secs(CTRL_C_GRACE_SECS),
+                child.wait(),
+            )
+            .await
+            {
+                Ok(result) => result.context("Failed to wait for claude after interrupt")?,
+                Err(_) => {
+                    log::warn!("Claude process did not exit within {}s, force-killing", CTRL_C_GRACE_SECS);
+                    let _ = child.kill().await;
+                    child.wait().await.context("Failed to reap claude after force-kill")?
+                }
+            }
+        }
+    };
+
+    // Update registry: mode=Stopped, pid=None
+    let mid = minion.minion_id;
+    let _ = with_registry(move |reg| {
+        reg.update(&mid, |info| {
+            info.mode = MinionMode::Stopped;
+            info.pid = None;
+            info.last_activity = Utc::now();
+        })
+    })
+    .await;
+
+    Ok(if status.success() { 0 } else { 1 })
+}
+
+/// Send a termination signal to the child process.
+/// On Unix, sends SIGTERM for graceful shutdown.
+/// On other platforms, attempts kill (there is no graceful signal equivalent).
+fn signal_child(child: &mut tokio::process::Child) {
     #[cfg(unix)]
     {
-        use std::os::unix::process::CommandExt;
-        let mut cmd = std::process::Command::new("claude");
-        cmd.arg("-r");
-        if yolo {
-            cmd.arg("--dangerously-skip-permissions");
+        if let Some(pid) = child.id() {
+            // SAFETY: kill with SIGTERM is safe — it requests graceful termination.
+            // The PID was just obtained from the child handle.
+            unsafe {
+                libc::kill(pid as i32, libc::SIGTERM);
+            }
         }
-        let err = cmd.current_dir(&minion.worktree_path).exec(); // Replaces current process
-
-        // If we reach here, exec failed
-        Err(err).context(
-            "Failed to exec claude. Is Claude CLI installed and in your PATH?\n\
-             See: https://claude.com/claude-code",
-        )
     }
-
     #[cfg(not(unix))]
     {
-        let mut cmd = std::process::Command::new("claude");
-        cmd.arg("-r");
-        if yolo {
-            cmd.arg("--dangerously-skip-permissions");
-        }
-        let status = cmd.current_dir(&minion.worktree_path).status().context(
-            "Failed to run claude. Is Claude CLI installed and in your PATH?\n\
-                 See: https://claude.com/claude-code",
-        )?;
+        // No graceful signal on non-Unix; start_kill is best-effort
+        let _ = child.start_kill();
+    }
+}
 
-        Ok(if status.success() { 0 } else { 1 })
+/// Atomically checks if the minion is available and claims it as Interactive.
+///
+/// This combines the mode check and the mode update in a single `with_registry`
+/// call, which holds an exclusive file lock for the duration. This prevents
+/// TOCTOU races between concurrent `gru attach` calls.
+///
+/// Returns the session_id if the minion is found in the registry.
+/// Errors with [`AttachError::AlreadyRunning`] if the minion has a live process.
+/// Errors with [`AttachError::InconsistentState`] if the mode is non-Stopped but
+/// no PID is recorded (ambiguous state that needs manual recovery).
+/// Returns None if the minion is not in the registry (allows attach without registry).
+async fn check_and_claim_session(minion_id: &str) -> Result<Option<String>> {
+    let id = minion_id.to_string();
+    let result = with_registry(move |reg| {
+        // Clone data from the immutable borrow before mutating
+        let info_data = reg
+            .get(&id)
+            .map(|info| (info.session_id.clone(), info.mode.clone(), info.pid));
+
+        match info_data {
+            Some((session_id, mode, pid)) => {
+                // Treat any non-Stopped mode as an exclusive lock by default.
+                // Only allow recovery when there is a PID and it is confirmed dead,
+                // and bring the entry back to a consistent Stopped state before
+                // claiming Interactive within this same registry lock.
+                if mode != MinionMode::Stopped {
+                    match pid {
+                        Some(pid_val) => {
+                            // On Unix, verify the process is actually alive.
+                            // On non-Unix, is_process_alive always returns false, so be
+                            // conservative and treat any recorded PID as alive (matching
+                            // the pattern in commands/clean.rs).
+                            let is_running = cfg!(not(unix)) || is_process_alive(pid_val);
+                            if is_running {
+                                return Err(AttachError::AlreadyRunning {
+                                    minion_id: id,
+                                    mode,
+                                }
+                                .into());
+                            }
+                            // Stale entry: process is dead but registry still thinks
+                            // it's running. Reset to a consistent Stopped state before
+                            // proceeding to claim.
+                            reg.update(&id, |info| {
+                                info.mode = MinionMode::Stopped;
+                                info.pid = None;
+                                info.last_activity = Utc::now();
+                            })?;
+                        }
+                        None => {
+                            // Inconsistent state: mode != Stopped but no PID recorded.
+                            // Treat this as locked/in use to avoid double-attach.
+                            return Err(AttachError::InconsistentState {
+                                minion_id: id,
+                                mode,
+                            }
+                            .into());
+                        }
+                    }
+                }
+
+                // At this point, the entry is either:
+                // - cleanly Stopped, or
+                // - was a stale running entry that we just reset to Stopped.
+                // Atomically claim the session as Interactive.
+                reg.update(&id, |info| {
+                    info.mode = MinionMode::Interactive;
+                    info.last_activity = Utc::now();
+                })?;
+                Ok(Some(session_id))
+            }
+            None => Ok(None), // Not in registry
+        }
+    })
+    .await;
+
+    match result {
+        Ok(session_id) => Ok(session_id),
+        Err(e) => {
+            // Use typed error matching instead of brittle string comparison.
+            // AttachError variants are user-facing errors that must propagate.
+            if e.downcast_ref::<AttachError>().is_some() {
+                Err(e)
+            } else {
+                // Registry unavailable (lock contention, IO error, etc.) —
+                // proceed without it as a graceful degradation.
+                log::debug!("Could not check registry: {}", e);
+                Ok(None)
+            }
+        }
     }
 }
 
@@ -105,5 +332,70 @@ mod tests {
 
         let err_msg = format!("{:#}", result.unwrap_err());
         assert!(err_msg.contains("Could not resolve ID"));
+    }
+
+    #[test]
+    fn test_running_check_with_dead_process() {
+        // Dead PID should not block attach
+        let dead_pid = Some(4_194_304u32); // PID that doesn't exist
+        assert!(!dead_pid.is_some_and(is_process_alive));
+    }
+
+    #[test]
+    fn test_running_check_with_no_pid() {
+        // Missing PID should not block attach
+        let no_pid: Option<u32> = None;
+        assert!(!no_pid.is_some_and(is_process_alive));
+    }
+
+    // is_process_alive always returns false on non-Unix, so only assert
+    // that a live PID is detected on Unix targets.
+    #[cfg(unix)]
+    #[test]
+    fn test_running_check_with_live_process() {
+        // Live PID should block attach on Unix
+        let live_pid = Some(std::process::id());
+        assert!(live_pid.is_some_and(is_process_alive));
+    }
+
+    #[test]
+    fn test_minion_mode_display() {
+        assert_eq!(format!("{}", MinionMode::Autonomous), "autonomous");
+        assert_eq!(format!("{}", MinionMode::Interactive), "interactive");
+        assert_eq!(format!("{}", MinionMode::Stopped), "stopped");
+    }
+
+    #[test]
+    fn test_attach_error_display_already_running() {
+        let err = AttachError::AlreadyRunning {
+            minion_id: "M001".to_string(),
+            mode: MinionMode::Autonomous,
+        };
+        let msg = format!("{}", err);
+        assert!(msg.contains("already running"));
+        assert!(msg.contains("autonomous"));
+        assert!(msg.contains("gru stop M001"));
+    }
+
+    #[test]
+    fn test_attach_error_display_inconsistent_state() {
+        let err = AttachError::InconsistentState {
+            minion_id: "M002".to_string(),
+            mode: MinionMode::Interactive,
+        };
+        let msg = format!("{}", err);
+        assert!(msg.contains("interactive mode"));
+        assert!(msg.contains("without an associated process"));
+        assert!(msg.contains("gru stop M002"));
+    }
+
+    #[test]
+    fn test_attach_error_is_downcastable() {
+        let err: anyhow::Error = AttachError::AlreadyRunning {
+            minion_id: "M001".to_string(),
+            mode: MinionMode::Autonomous,
+        }
+        .into();
+        assert!(err.downcast_ref::<AttachError>().is_some());
     }
 }
