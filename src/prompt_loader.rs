@@ -181,18 +181,21 @@ Branch: {{ branch_name }}
 Base branch: {{ base_branch }}
 Worktree: {{ worktree_path }}
 
-## Steps
-
-### 1. Verify Git State
+## 1. Verify Git State
 - Confirm you are on a feature branch (not the default branch)
 - Ensure the working directory is clean (no uncommitted changes)
 - If dirty, ask the user to commit or stash first
 
-### 2. Fetch and Rebase
+## 2. Gather Context
+- Run `gh pr view --json number,title,body,url` to get PR context (if on a PR branch)
+- If a linked issue exists, run `gh issue view <number> --json number,title,body,url`
+- This context helps make informed conflict resolution decisions
+
+## 3. Fetch and Rebase
 - Run `git fetch origin {{ base_branch }}` to get the latest upstream changes
 - Run `git rebase origin/{{ base_branch }}` to start the rebase
 
-### 3. Resolve Conflicts
+## 4. Resolve Conflicts
 If conflicts occur during the rebase:
 
 **Automatically resolve these confidently:**
@@ -210,7 +213,7 @@ If conflicts occur during the rebase:
 
 For each conflict requiring input, provide:
 - Clear explanation of the conflict
-- Context from the PR/issue
+- Context from the PR/issue gathered in step 2
 - Why you are uncertain
 - Resolution options
 
@@ -218,12 +221,13 @@ After resolving each conflict:
 - Stage the resolved files with `git add <file>`
 - Continue with `git rebase --continue`
 
-### 4. After Rebase Completes
+## 5. After Rebase Completes
 - Review the changes: `git log --oneline origin/{{ base_branch }}..HEAD`
-- Run the project's test suite to ensure nothing broke (check CLAUDE.md for test commands)
+- Run the project's test suite to ensure nothing broke (check CLAUDE.md for test commands, if present)
+- Force push the rebased branch: `git push --force-with-lease origin {{ branch_name }}`
 - Report the result to the user
 
-### 5. If Something Goes Wrong
+## 6. If Something Goes Wrong
 - If the rebase cannot be completed, abort with `git rebase --abort`
 - Report what went wrong and suggest next steps
 "#,
@@ -1517,6 +1521,15 @@ Repo content"#,
             .iter()
             .find(|b| b.name == "rebase")
             .unwrap();
+        assert_eq!(
+            rebase.description,
+            "Rebase branch with intelligent conflict resolution"
+        );
+        assert!(
+            rebase.requires.is_empty(),
+            "rebase should have no requires (works on current branch)"
+        );
+
         let prompt = rebase.to_prompt();
         assert!(prompt.is_some());
 
@@ -1524,9 +1537,6 @@ Repo content"#,
         assert_eq!(prompt.name, "rebase");
         assert!(matches!(prompt.source, PromptSource::BuiltIn));
         assert!(prompt.metadata.requires.is_empty());
-        assert!(prompt.content.contains("{{ branch_name }}"));
-        assert!(prompt.content.contains("{{ base_branch }}"));
-        assert!(prompt.content.contains("{{ worktree_path }}"));
     }
 
     #[test]
@@ -1565,7 +1575,9 @@ Repo content"#,
     }
 
     #[test]
-    fn test_builtin_rebase_template_has_expected_variables() {
+    fn test_builtin_rebase_renders_correctly() {
+        use crate::prompt_renderer::{render_template, PromptContext};
+
         let rebase = BUILT_IN_PROMPTS
             .iter()
             .find(|b| b.name == "rebase")
@@ -1579,24 +1591,29 @@ Repo content"#,
 
         // Template should contain the key workflow steps
         assert!(prompt.content.contains("Verify Git State"));
+        assert!(prompt.content.contains("Gather Context"));
         assert!(prompt.content.contains("Fetch and Rebase"));
         assert!(prompt.content.contains("Resolve Conflicts"));
-    }
+        assert!(prompt.content.contains("force-with-lease"));
 
-    #[test]
-    fn test_builtin_rebase_no_requires() {
-        let rebase = BUILT_IN_PROMPTS
-            .iter()
-            .find(|b| b.name == "rebase")
-            .unwrap();
-        assert!(
-            rebase.requires.is_empty(),
-            "rebase should have no requires (works on current branch)"
-        );
-        assert_eq!(
-            rebase.description,
-            "Rebase branch with intelligent conflict resolution"
-        );
+        // Render with actual values and verify substitution
+        let context = PromptContext {
+            branch_name: Some("minion/issue-42-M001".to_string()),
+            base_branch: Some("main".to_string()),
+            worktree_path: Some(std::path::PathBuf::from(
+                "/home/user/.gru/work/owner/repo/M001",
+            )),
+            ..PromptContext::default()
+        };
+
+        let rendered = render_template(&prompt.content, &context.to_variables());
+        assert!(rendered.contains("minion/issue-42-M001"));
+        assert!(rendered.contains("git fetch origin main"));
+        assert!(rendered.contains("git rebase origin/main"));
+        assert!(rendered.contains("git push --force-with-lease origin minion/issue-42-M001"));
+        assert!(!rendered.contains("{{ branch_name }}"));
+        assert!(!rendered.contains("{{ base_branch }}"));
+        assert!(!rendered.contains("{{ worktree_path }}"));
     }
 
     #[test]
