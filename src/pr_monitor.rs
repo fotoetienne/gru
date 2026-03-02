@@ -1,3 +1,4 @@
+use crate::github;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
@@ -67,27 +68,30 @@ fn calculate_retry_delay(attempt: u32) -> u64 {
 /// Execute a gh API command with retry logic and exponential backoff.
 ///
 /// # Arguments
-/// * `args` - The arguments to pass to `gh` command
+/// * `repo` - Repository identifier in "owner/repo" format (used to select `gh` or `ghe`)
+/// * `args` - The arguments to pass to the gh command
 /// * `max_retries` - Maximum number of retry attempts (default: 5)
 ///
 /// # Returns
 /// The command output on success, or an error after all retries are exhausted.
-async fn gh_api_with_retry(args: &[&str], max_retries: u32) -> Result<Output> {
+async fn gh_api_with_retry(repo: &str, args: &[&str], max_retries: u32) -> Result<Output> {
+    let gh_cmd = github::gh_command_for_repo(repo);
     let mut attempts = 0;
     let args_str = args.join(" ");
 
     loop {
-        let output = tokio::process::Command::new("gh")
+        let output = tokio::process::Command::new(gh_cmd)
             .args(args)
             .output()
             .await
-            .with_context(|| format!("Failed to execute: gh {}", args_str))?;
+            .with_context(|| format!("Failed to execute: {} {}", gh_cmd, args_str))?;
 
         if output.status.success() {
             if attempts > 0 {
                 log::info!(
-                    "GitHub API call succeeded after {} retries: gh {}",
+                    "GitHub API call succeeded after {} retries: {} {}",
                     attempts,
+                    gh_cmd,
                     args_str
                 );
             }
@@ -257,8 +261,9 @@ pub enum MonitorResult {
 
 /// Fetch PR details using gh CLI with retry logic for transient failures
 async fn get_pr(owner: &str, repo: &str, pr_number: &str) -> Result<PullRequest> {
-    let endpoint = format!("repos/{owner}/{repo}/pulls/{pr_number}");
-    let output = gh_api_with_retry(&["api", &endpoint], DEFAULT_MAX_RETRIES).await?;
+    let repo_full = format!("{owner}/{repo}");
+    let endpoint = format!("repos/{repo_full}/pulls/{pr_number}");
+    let output = gh_api_with_retry(&repo_full, &["api", &endpoint], DEFAULT_MAX_RETRIES).await?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -273,8 +278,9 @@ async fn get_pr(owner: &str, repo: &str, pr_number: &str) -> Result<PullRequest>
 
 /// Fetch all reviews for a PR with retry logic for transient failures
 async fn get_all_reviews(owner: &str, repo: &str, pr_number: &str) -> Result<Vec<Review>> {
-    let endpoint = format!("repos/{owner}/{repo}/pulls/{pr_number}/reviews");
-    let output = gh_api_with_retry(&["api", &endpoint], DEFAULT_MAX_RETRIES).await?;
+    let repo_full = format!("{owner}/{repo}");
+    let endpoint = format!("repos/{repo_full}/pulls/{pr_number}/reviews");
+    let output = gh_api_with_retry(&repo_full, &["api", &endpoint], DEFAULT_MAX_RETRIES).await?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -312,16 +318,18 @@ async fn get_review_comments(
     pr_number: &str,
     reviews: &[Review],
 ) -> Result<Vec<ReviewComment>> {
+    let repo_full = format!("{owner}/{repo}");
     let mut all_comments = Vec::new();
     let mut failed_reviews = 0;
 
     for review in reviews {
         // Fetch comments for this specific review with retry
         let endpoint = format!(
-            "repos/{owner}/{repo}/pulls/{pr_number}/reviews/{}/comments",
+            "repos/{repo_full}/pulls/{pr_number}/reviews/{}/comments",
             review.id
         );
-        let output = gh_api_with_retry(&["api", &endpoint], DEFAULT_MAX_RETRIES).await?;
+        let output =
+            gh_api_with_retry(&repo_full, &["api", &endpoint], DEFAULT_MAX_RETRIES).await?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -387,8 +395,9 @@ pub fn format_review_prompt(issue_num: u64, pr_number: &str, comments: &[ReviewC
 
 /// Fetch check runs for a given commit SHA with retry logic for transient failures
 async fn get_check_runs(owner: &str, repo: &str, sha: &str) -> Result<Vec<CheckRun>> {
-    let endpoint = format!("repos/{owner}/{repo}/commits/{sha}/check-runs");
-    let output = gh_api_with_retry(&["api", &endpoint], DEFAULT_MAX_RETRIES).await?;
+    let repo_full = format!("{owner}/{repo}");
+    let endpoint = format!("repos/{repo_full}/commits/{sha}/check-runs");
+    let output = gh_api_with_retry(&repo_full, &["api", &endpoint], DEFAULT_MAX_RETRIES).await?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);

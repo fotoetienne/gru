@@ -1,3 +1,4 @@
+use crate::github;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -231,8 +232,9 @@ pub fn build_ci_fix_prompt(failed_checks: &[CheckRun], attempt: u32) -> String {
 /// Returns a list of CheckRun structs parsed from the gh CLI output.
 pub async fn fetch_check_runs(owner: &str, repo: &str, git_ref: &str) -> Result<Vec<CheckRun>> {
     let repo_full = format!("{}/{}", owner, repo);
+    let gh_cmd = github::gh_command_for_repo(&repo_full);
 
-    let output = Command::new("gh")
+    let output = Command::new(gh_cmd)
         .args([
             "api",
             &format!("repos/{}/commits/{}/check-runs", repo_full, git_ref),
@@ -330,8 +332,9 @@ pub async fn fetch_check_logs(
 ) -> Result<Option<String>> {
     // Use gh to get the workflow run associated with this PR
     let repo_full = format!("{}/{}", owner, repo);
+    let gh_cmd = github::gh_command_for_repo(&repo_full);
 
-    let output = Command::new("gh")
+    let output = Command::new(gh_cmd)
         .args([
             "run",
             "list",
@@ -365,7 +368,7 @@ pub async fn fetch_check_logs(
         if name.to_lowercase().contains(&check_name.to_lowercase()) && conclusion == "failure" {
             if let Some(run_id) = run["databaseId"].as_u64() {
                 // Try to get the logs for this run
-                let log_output = Command::new("gh")
+                let log_output = Command::new(gh_cmd)
                     .args([
                         "run",
                         "view",
@@ -392,7 +395,7 @@ pub async fn fetch_check_logs(
     }
 
     // Also try using gh pr checks to get status info
-    let pr_output = Command::new("gh")
+    let pr_output = Command::new(gh_cmd)
         .args(["pr", "checks", &pr_number.to_string(), "--repo", &repo_full])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -506,8 +509,9 @@ pub async fn get_head_sha(worktree_path: &Path) -> Result<String> {
 /// Gets the PR number associated with the current branch
 pub async fn get_pr_number(owner: &str, repo: &str, branch: &str) -> Result<Option<u64>> {
     let repo_full = format!("{}/{}", owner, repo);
+    let gh_cmd = github::gh_command_for_repo(&repo_full);
 
-    let output = Command::new("gh")
+    let output = Command::new(gh_cmd)
         .args([
             "pr", "list", "--repo", &repo_full, "--head", branch, "--json", "number", "--limit",
             "1",
@@ -604,7 +608,8 @@ pub async fn post_escalation_comment(
 
     body.push_str("\n**Labels:** `minion:blocked`\n");
 
-    let output = Command::new("gh")
+    let gh_cmd = github::gh_command_for_repo(&repo_full);
+    let output = Command::new(gh_cmd)
         .args([
             "pr",
             "comment",
@@ -626,7 +631,7 @@ pub async fn post_escalation_comment(
     }
 
     // Add the blocked label
-    let _ = Command::new("gh")
+    let _ = Command::new(gh_cmd)
         .args([
             "pr",
             "edit",

@@ -513,7 +513,9 @@ impl GitHubClient {
 /// * `repo` - Repository name
 /// * `pr_number` - PR number
 pub async fn mark_pr_ready_via_cli(owner: &str, repo: &str, pr_number: &str) -> Result<()> {
-    let output = Command::new("gh")
+    let repo_full = format!("{}/{}", owner, repo);
+    let gh_cmd = gh_command_for_repo(&repo_full);
+    let output = Command::new(gh_cmd)
         .args([
             "pr",
             "ready",
@@ -546,7 +548,9 @@ pub async fn mark_pr_ready_via_cli(owner: &str, repo: &str, pr_number: &str) -> 
 /// * `repo` - Repository name
 /// * `number` - Issue number
 pub async fn get_issue_via_cli(owner: &str, repo: &str, number: u64) -> Result<IssueInfo> {
-    let output = Command::new("gh")
+    let repo_full = format!("{}/{}", owner, repo);
+    let gh_cmd = gh_command_for_repo(&repo_full);
+    let output = Command::new(gh_cmd)
         .args([
             "issue",
             "view",
@@ -603,7 +607,9 @@ pub struct PrInfo {
 /// * `repo` - Repository name
 /// * `number` - PR number
 pub async fn get_pr_via_cli(owner: &str, repo: &str, number: u64) -> Result<PrInfo> {
-    let output = Command::new("gh")
+    let repo_full = format!("{}/{}", owner, repo);
+    let gh_cmd = gh_command_for_repo(&repo_full);
+    let output = Command::new(gh_cmd)
         .args([
             "pr",
             "view",
@@ -654,21 +660,12 @@ pub async fn create_draft_pr_via_cli(
     title: &str,
     body: &str,
 ) -> Result<String> {
-    let output = Command::new("gh")
+    let repo_full = format!("{}/{}", owner, repo);
+    let gh_cmd = gh_command_for_repo(&repo_full);
+    let output = Command::new(gh_cmd)
         .args([
-            "pr",
-            "create",
-            "--repo",
-            &format!("{}/{}", owner, repo),
-            "--head",
-            branch,
-            "--base",
-            base,
-            "--title",
-            title,
-            "--body",
-            body,
-            "--draft",
+            "pr", "create", "--repo", &repo_full, "--head", branch, "--base", base, "--title",
+            title, "--body", body, "--draft",
         ])
         .output()
         .await

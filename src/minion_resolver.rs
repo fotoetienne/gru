@@ -1,3 +1,5 @@
+use crate::git;
+use crate::github;
 use crate::minion_registry::MinionRegistry;
 use crate::workspace;
 use anyhow::{Context, Result};
@@ -367,9 +369,28 @@ fn calculate_uptime(worktree_path: &std::path::Path) -> Result<String> {
 /// Extracts the linked issue number from a GitHub PR
 /// Returns the issue number if the PR contains "Fixes #<num>", "Closes #<num>", or "Resolves #<num>"
 async fn resolve_issue_from_pr(pr_num: u64) -> Result<u64> {
+    // Detect repo from current directory to pick gh vs ghe
+    git::detect_git_repo()
+        .await
+        .context("Failed to detect git repository")?;
+    let remote_url = git::get_github_remote()
+        .await
+        .context("Failed to get GitHub remote")?;
+    let (det_owner, det_repo) =
+        git::parse_github_remote(&remote_url).context("Failed to parse GitHub remote URL")?;
+    let repo_full = format!("{}/{}", det_owner, det_repo);
+    let gh_cmd = github::gh_command_for_repo(&repo_full);
     // Use gh CLI to get linked issue from PR body
-    let output = Command::new("gh")
-        .args(["pr", "view", &pr_num.to_string(), "--json", "body"])
+    let output = Command::new(gh_cmd)
+        .args([
+            "pr",
+            "view",
+            &pr_num.to_string(),
+            "--repo",
+            &repo_full,
+            "--json",
+            "body",
+        ])
         .output()
         .await
         .context("Failed to execute gh command. Is GitHub CLI installed?")?;
