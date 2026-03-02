@@ -436,7 +436,7 @@ async fn fetch_pr_details(owner: &str, repo: &str, pr_num: u64) -> Result<PrDeta
         match client.get_pr(owner, repo, pr_num).await {
             Ok(pr) => {
                 return Ok(PrDetails {
-                    title: pr.title.clone().unwrap_or_default(),
+                    title: pr.title.unwrap_or_default(),
                     body: pr.body.unwrap_or_default(),
                 });
             }
