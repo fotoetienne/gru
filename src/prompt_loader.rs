@@ -134,10 +134,9 @@ URL: https://github.com/{{ repo_owner }}/{{ repo_name }}/pull/{{ pr_number }}
 Review this pull request: fetch details, analyze changes, and provide code review feedback.
 
 ## 1. Fetch PR Details
-- Use `gh pr view {{ pr_number }} --repo {{ repo_owner }}/{{ repo_name }} --json headRefName` to get the branch name
 - Use `gh pr view {{ pr_number }} --repo {{ repo_owner }}/{{ repo_name }}` to get the PR title, body, and metadata
-- Use `gh pr view {{ pr_number }} --repo {{ repo_owner }}/{{ repo_name }} --json files` to get a quick overview of changed files
-- Fetch existing review comments: `gh api repos/{{ repo_owner }}/{{ repo_name }}/pulls/{{ pr_number }}/comments`
+- Use `gh pr view {{ pr_number }} --repo {{ repo_owner }}/{{ repo_name }} --json files --jq '.files[].path'` to get a quick overview of changed files
+- Fetch existing review comments: `gh api --paginate repos/{{ repo_owner }}/{{ repo_name }}/pulls/{{ pr_number }}/comments`
 - Understand the scope and intent of the PR, and any prior discussion
 - The code should already be checked out in the current directory
 - If this PR is addressing an Issue, read Issue details to understand the problem and context. Does this PR address the issue completely? Are there any missing details or assumptions?
@@ -170,7 +169,7 @@ Review this pull request: fetch details, analyze changes, and provide code revie
   - `--approve -b "review content"` if explicitly approving AND it's not your own PR
   - `--request-changes -b "review content"` if changes are required AND it's not your own PR
 - Use a HEREDOC for multi-line review content to preserve formatting
-- **IMPORTANT**: ALWAYS verify the gh command succeeded by checking its output. If it returns empty or fails, inform the user of the issue
+- **IMPORTANT**: ALWAYS verify the gh command succeeded by checking its exit status and any error output. If the command fails, inform the user of the issue
 "#,
     },
     BuiltInPrompt {
