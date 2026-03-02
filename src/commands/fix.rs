@@ -315,9 +315,14 @@ async fn trigger_pr_review(
                 let _ = child.kill().await;
                 let elapsed_secs = timeout_duration.as_secs();
                 let time_display = if elapsed_secs >= 60 {
-                    format!("{} minutes", elapsed_secs / 60)
+                    let minutes = elapsed_secs / 60;
+                    format!("{} minute{}", minutes, if minutes == 1 { "" } else { "s" })
                 } else {
-                    format!("{} seconds", elapsed_secs)
+                    format!(
+                        "{} second{}",
+                        elapsed_secs,
+                        if elapsed_secs == 1 { "" } else { "s" }
+                    )
                 };
                 Err(anyhow::anyhow!(
                     "Review process timed out after {}. PR #{} review may be stuck.",
