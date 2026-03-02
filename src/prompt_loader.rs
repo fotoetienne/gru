@@ -134,10 +134,10 @@ URL: https://github.com/{{ repo_owner }}/{{ repo_name }}/pull/{{ pr_number }}
 Review and respond to all comments and reviews on this pull request.
 
 ## 1. Fetch Comments and Reviews
-- Use `gh pr view {{ pr_number }}` to get PR details and status
+- Use `gh pr view {{ pr_number }} --repo {{ repo_owner }}/{{ repo_name }}` to get PR details and status
 - Use `gh api repos/{{ repo_owner }}/{{ repo_name }}/pulls/{{ pr_number }}/comments` to fetch all review comments
 - Use `gh api repos/{{ repo_owner }}/{{ repo_name }}/issues/{{ pr_number }}/comments` to fetch all issue comments
-- Use `gh pr checks {{ pr_number }}` to check CI status
+- Use `gh pr checks {{ pr_number }} --repo {{ repo_owner }}/{{ repo_name }}` to check CI status
 
 ## 2. Review All Feedback
 - Read through all comments and reviews
@@ -163,11 +163,11 @@ Review and respond to all comments and reviews on this pull request.
 ## 5. Commit and Respond
 - Commit changes with a descriptive message summarizing what was addressed
 - Push changes to the branch
-- Use `gh pr comment {{ pr_number }} -b "response"` to post a summary of changes made
+- Use `gh pr comment {{ pr_number }} --repo {{ repo_owner }}/{{ repo_name }} -b "response"` to post a summary of changes made
 - Reply to individual review comments where appropriate
 
 ## 6. Verify
-- Run `gh pr checks {{ pr_number }}` to verify CI passes
+- Run `gh pr checks {{ pr_number }} --repo {{ repo_owner }}/{{ repo_name }}` to verify CI passes
 - Confirm all review comments have been addressed or responded to
 "#,
     },
