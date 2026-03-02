@@ -140,9 +140,19 @@ enum Commands {
 
         #[arg(
             long,
-            help = "Skip automatic worktree setup when --issue or --pr is provided"
+            conflicts_with = "worktree",
+            help = "Skip automatic worktree setup when --issue or --pr is provided; run in CWD instead"
         )]
         no_worktree: bool,
+
+        #[arg(
+            short = 'w',
+            long,
+            conflicts_with = "no_worktree",
+            value_name = "PATH",
+            help = "Use an explicit worktree path instead of auto-creating one"
+        )]
+        worktree: Option<String>,
 
         #[arg(
             short,
@@ -222,10 +232,23 @@ async fn main() {
             issue,
             pr,
             no_worktree,
+            worktree,
             params,
             timeout,
         } => {
-            prompt::handle_prompt(&prompt, issue, pr, no_worktree, params, timeout, cli.quiet).await
+            prompt::handle_prompt(
+                &prompt,
+                prompt::PromptOptions {
+                    issue,
+                    pr,
+                    no_worktree,
+                    worktree,
+                    params,
+                    timeout,
+                    quiet: cli.quiet,
+                },
+            )
+            .await
         }
         Commands::Prompts => prompts::handle_prompts().await,
         Commands::Lab {

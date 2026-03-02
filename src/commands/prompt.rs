@@ -247,17 +247,27 @@ async fn setup_issue_worktree(
     Ok((worktree_path, branch_name))
 }
 
+/// Options for the prompt command, grouped to avoid too many function arguments
+pub struct PromptOptions {
+    pub issue: Option<String>,
+    pub pr: Option<String>,
+    pub no_worktree: bool,
+    pub worktree: Option<String>,
+    pub params: Vec<String>,
+    pub timeout: Option<String>,
+    pub quiet: bool,
+}
+
 /// Handles the prompt command by launching Claude with an ad-hoc prompt
 /// Returns the exit code from the claude process
-pub async fn handle_prompt(
-    prompt: &str,
-    issue_opt: Option<String>,
-    pr_opt: Option<String>,
-    no_worktree: bool,
-    params: Vec<String>,
-    timeout_opt: Option<String>,
-    quiet: bool,
-) -> Result<i32> {
+pub async fn handle_prompt(prompt: &str, opts: PromptOptions) -> Result<i32> {
+    let issue_opt = opts.issue;
+    let pr_opt = opts.pr;
+    let no_worktree = opts.no_worktree;
+    let worktree_opt = opts.worktree;
+    let params = opts.params;
+    let timeout_opt = opts.timeout;
+    let quiet = opts.quiet;
     // Validate prompt doesn't start with flags (security check)
     let trimmed_prompt = prompt.trim();
     if trimmed_prompt.starts_with('-') {
@@ -354,12 +364,41 @@ pub async fn handle_prompt(
     let workspace = workspace::Workspace::new().context("Failed to initialize Gru workspace")?;
 
     // Set up worktree or ad-hoc workspace.
-    // Priority: --issue creates a new worktree; --pr reuses an existing one or falls
-    // back to CWD. When both are provided, --issue wins for worktree creation since
-    // Claude runs in the issue worktree. PR template variables are still populated
-    // regardless of which worktree is used.
+    // Priority order:
+    //   1. --worktree <path>: use explicit path (validated to exist)
+    //   2. --no-worktree: force CWD even when --issue/--pr provided
+    //   3. --issue: auto-create worktree for issue
+    //   4. --pr: reuse existing worktree or fall back to CWD
+    //   5. Default: ad-hoc workspace with CWD as run directory
+    //
+    // When both --issue and --pr are provided, --issue wins for worktree creation
+    // since Claude runs in the issue worktree. PR template variables are still
+    // populated regardless of which worktree is used.
     let has_context = issue_opt.is_some() || pr_opt.is_some();
-    let (workspace_path, branch_name, run_dir) = if issue_opt.is_some() && !no_worktree {
+    let use_auto_worktree = !no_worktree && worktree_opt.is_none();
+    let (workspace_path, branch_name, run_dir) = if let Some(ref explicit_path) = worktree_opt {
+        // --worktree <path>: use the explicit path as both workspace and run directory
+        let wt_path = PathBuf::from(explicit_path);
+        if !wt_path.exists() {
+            anyhow::bail!(
+                "Worktree path does not exist: {}\n\
+                 Ensure the path exists before using --worktree.",
+                wt_path.display()
+            );
+        }
+        let wt_path = wt_path
+            .canonicalize()
+            .with_context(|| format!("Failed to resolve worktree path: {}", explicit_path))?;
+        println!("📂 Using explicit worktree: {}", wt_path.display());
+        context.worktree_path = Some(wt_path.clone());
+        // Preserve PR branch name for registry and template context
+        let branch = pr_branch.clone().unwrap_or_default();
+        if !branch.is_empty() {
+            context.branch_name = Some(branch.clone());
+        }
+        let run_dir = wt_path.clone();
+        (wt_path, branch, run_dir)
+    } else if issue_opt.is_some() && use_auto_worktree {
         let owner = context_owner.as_deref().unwrap();
         let repo = context_repo.as_deref().unwrap();
         let issue_num = issue_number_val.unwrap();
@@ -369,7 +408,7 @@ pub async fn handle_prompt(
         context.branch_name = Some(branch.clone());
         let run_dir = wt_path.clone();
         (wt_path, branch, run_dir)
-    } else if pr_opt.is_some() && !no_worktree {
+    } else if pr_opt.is_some() && use_auto_worktree {
         // --pr: try to find an existing worktree for the PR branch, fall back to CWD
         // Use the PR's own owner/repo for worktree lookup (may differ from --issue repo)
         let owner = pr_owner.as_deref().unwrap();
@@ -566,9 +605,22 @@ pub async fn handle_prompt(
 mod tests {
     use super::*;
 
+    /// Helper to create default PromptOptions for tests
+    fn default_opts() -> PromptOptions {
+        PromptOptions {
+            issue: None,
+            pr: None,
+            no_worktree: false,
+            worktree: None,
+            params: vec![],
+            timeout: None,
+            quiet: false,
+        }
+    }
+
     #[tokio::test]
     async fn test_handle_prompt_rejects_flag_like_input() {
-        let result = handle_prompt("--help", None, None, false, vec![], None, false).await;
+        let result = handle_prompt("--help", default_opts()).await;
         assert!(result.is_err());
         assert!(result
             .unwrap_err()
@@ -578,13 +630,53 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_prompt_rejects_empty_input() {
-        let result = handle_prompt("", None, None, false, vec![], None, false).await;
+        let result = handle_prompt("", default_opts()).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("cannot be empty"));
 
-        let result = handle_prompt("   ", None, None, false, vec![], None, false).await;
+        let result = handle_prompt("   ", default_opts()).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("cannot be empty"));
+    }
+
+    #[tokio::test]
+    async fn test_handle_prompt_rejects_nonexistent_worktree_path() {
+        let opts = PromptOptions {
+            worktree: Some("/nonexistent/path/that/does/not/exist".to_string()),
+            ..default_opts()
+        };
+        let result = handle_prompt("test prompt", opts).await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("does not exist"),
+            "Expected 'does not exist' error, got: {}",
+            err_msg
+        );
+    }
+
+    #[tokio::test]
+    async fn test_handle_prompt_worktree_flag_accepts_existing_path() {
+        // Use a temp directory as the explicit worktree path.
+        // The prompt will proceed past validation but fail later (no Claude binary),
+        // which proves the path validation itself passed.
+        let temp = std::env::temp_dir().join("gru-test-worktree-flag");
+        let _ = std::fs::create_dir_all(&temp);
+        let opts = PromptOptions {
+            worktree: Some(temp.to_string_lossy().to_string()),
+            ..default_opts()
+        };
+        let result = handle_prompt("test prompt", opts).await;
+        // We expect an error further down (workspace init, claude binary, etc.)
+        // but NOT the "does not exist" error
+        if let Err(e) = &result {
+            assert!(
+                !e.to_string().contains("does not exist"),
+                "Path validation should pass for existing directory, got: {}",
+                e
+            );
+        }
+        let _ = std::fs::remove_dir_all(&temp);
     }
 
     #[test]
