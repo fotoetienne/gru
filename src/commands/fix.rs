@@ -313,10 +313,22 @@ async fn trigger_pr_review(
             }
             Err(_) => {
                 let _ = child.kill().await;
+                let _ = child.wait().await;
                 let elapsed_secs = timeout_duration.as_secs();
                 let time_display = if elapsed_secs >= 60 {
                     let minutes = elapsed_secs / 60;
-                    format!("{} minute{}", minutes, if minutes == 1 { "" } else { "s" })
+                    let seconds = elapsed_secs % 60;
+                    if seconds == 0 {
+                        format!("{} minute{}", minutes, if minutes == 1 { "" } else { "s" })
+                    } else {
+                        format!(
+                            "{} minute{} {} second{}",
+                            minutes,
+                            if minutes == 1 { "" } else { "s" },
+                            seconds,
+                            if seconds == 1 { "" } else { "s" }
+                        )
+                    }
                 } else {
                     format!(
                         "{} second{}",
