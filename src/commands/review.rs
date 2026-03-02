@@ -340,13 +340,16 @@ async fn find_pr_for_issue(issue_num: u64) -> Result<String> {
         .context("Failed to get GitHub remote")?;
     let (det_owner, det_repo) =
         git::parse_github_remote(&remote_url).context("Failed to parse GitHub remote URL")?;
-    let gh_cmd = github::gh_command_for_repo(&format!("{}/{}", det_owner, det_repo));
+    let repo_full = format!("{}/{}", det_owner, det_repo);
+    let gh_cmd = github::gh_command_for_repo(&repo_full);
     // Safe: issue_num is validated as u64 by the type system, which can only contain digits.
     // This prevents command injection as the format string will never contain shell metacharacters.
     let output = TokioCommand::new(gh_cmd)
         .args([
             "pr",
             "list",
+            "--repo",
+            &repo_full,
             "--search",
             &format!("linked:issue#{}", issue_num),
             "--json",
