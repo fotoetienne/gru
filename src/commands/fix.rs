@@ -712,10 +712,10 @@ fn build_fix_prompt(ctx: &IssueContext, wt_ctx: &WorktreeContext) -> String {
     };
 
     // Build the context for rendering
-    let labels_section = if details.labels.is_empty() {
+    let labels_value = if details.labels.is_empty() {
         String::new()
     } else {
-        format!("\nLabels: {}", details.labels)
+        format!("Labels: {}", details.labels)
     };
 
     let mut prompt_ctx = PromptContext::new();
@@ -729,10 +729,9 @@ fn build_fix_prompt(ctx: &IssueContext, wt_ctx: &WorktreeContext) -> String {
 
     let mut variables = prompt_ctx.to_variables();
     // Add the labels variable (fix-specific, not in the standard PromptContext).
-    // Note: the value includes the "\nLabels: " prefix when labels are present,
-    // or is empty when there are none. Override authors should use {{ labels }}
-    // on its own line.
-    variables.insert("labels".to_string(), labels_section);
+    // Value is "Labels: x, y" when present or empty string when none.
+    // The template places {{ labels }} on its own line to handle both cases.
+    variables.insert("labels".to_string(), labels_value);
 
     render_template(template_content, &variables)
 }

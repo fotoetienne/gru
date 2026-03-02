@@ -20,9 +20,14 @@ use crate::reserved_commands;
 
 /// Built-in prompt definitions: (name, description, content, requires)
 ///
-/// These are the default prompts that ship with Gru. Each can be overridden
-/// by placing a file with the same name in `.gru/prompts/` (repo) or
-/// `~/.gru/prompts/` (global).
+/// These are the default prompts that ship with Gru. Repo-local prompts in
+/// `.gru/prompts/` take precedence over these built-ins when they use the
+/// same name.
+///
+/// Global prompts in `~/.gru/prompts/` are loaded before built-ins. If a
+/// built-in with the same name has non-empty `content`, it is inserted and
+/// will shadow the global prompt. A global prompt therefore only takes effect
+/// when there is no corresponding built-in with content for that name.
 pub const BUILT_IN_PROMPTS: &[BuiltInPrompt] = &[
     BuiltInPrompt {
         name: "fix",
@@ -415,9 +420,11 @@ fn load_prompts_internal(
 /// This is the main entry point for commands like `gru fix` that need to load
 /// a built-in prompt while allowing user overrides.
 ///
-/// Note: This loads all prompts (scanning filesystem directories) then returns one.
-/// This is acceptable since the number of prompts is small, but could be optimized
-/// with a targeted lookup if prompt count grows significantly.
+/// **Performance note:** This loads all prompts from disk (scanning `.gru/prompts/`
+/// directories) and then extracts the requested one. The cost is proportional to
+/// the total number of prompt files, not O(1). This is acceptable since the number
+/// of prompts is small, but could be optimized with a targeted lookup path if
+/// prompt count grows significantly.
 ///
 /// Returns `None` if no prompt with that name exists (neither built-in nor custom).
 pub fn resolve_prompt(name: &str, repo_root: Option<&Path>) -> Result<Option<Prompt>> {
