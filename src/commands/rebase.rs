@@ -85,19 +85,10 @@ enum RebaseOutcome {
 
 /// Resolves the worktree path from the current working directory.
 async fn resolve_worktree_from_cwd() -> Result<PathBuf> {
-    let cwd = std::env::current_dir().context("Failed to get current directory")?;
-
-    // Check we're in a git repository
+    // Check we're in a git repository and return the repo root
     let repo_root = git::detect_git_repo().await.context(
         "Not in a git repository. Run from a Minion worktree or provide an issue/PR number.",
     )?;
-
-    // Verify it looks like a Gru worktree (under ~/.gru/work/)
-    let repo_root_str = repo_root.to_string_lossy();
-    if !repo_root_str.contains(".gru/work/") {
-        // Not a Gru worktree, but still a valid git repo - use CWD
-        return Ok(cwd);
-    }
 
     Ok(repo_root)
 }
@@ -139,6 +130,28 @@ async fn fetch_origin(worktree_path: &Path) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Gets the remote origin URL for a worktree (uses -C to target the right repo).
+async fn get_remote_url(worktree_path: &Path) -> Result<String> {
+    let output = Command::new("git")
+        .args([
+            "-C",
+            &worktree_path.to_string_lossy(),
+            "remote",
+            "get-url",
+            "origin",
+        ])
+        .output()
+        .await
+        .context("Failed to get remote URL")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("Failed to get remote URL: {}", stderr.trim());
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
 /// Detects the base branch for the current worktree.
@@ -205,8 +218,8 @@ async fn get_current_branch(worktree_path: &Path) -> Result<String> {
 
 /// Tries to get the base branch from an associated PR via GitHub CLI.
 async fn get_pr_base_branch(worktree_path: &Path, branch: &str) -> Result<Option<String>> {
-    // Detect repo to pick gh vs ghe
-    let remote_url = git::get_github_remote().await?;
+    // Detect repo from the worktree (not CWD) to pick gh vs ghe
+    let remote_url = get_remote_url(worktree_path).await?;
     let (owner, repo) = git::parse_github_remote(&remote_url)?;
     let repo_full = format!("{}/{}", owner, repo);
     let gh_cmd = github::gh_command_for_repo(&repo_full);
@@ -301,8 +314,13 @@ async fn attempt_rebase(worktree_path: &Path, base_branch: &str) -> Result<Rebas
     if output.status.success() {
         Ok(RebaseOutcome::Clean { commit_count })
     } else {
+        // Git writes "CONFLICT ..." to stdout and "error: could not apply ..." to stderr
         let stderr = String::from_utf8_lossy(&output.stderr);
-        if stderr.contains("CONFLICT") || stderr.contains("could not apply") {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        if stdout.contains("CONFLICT")
+            || stderr.contains("CONFLICT")
+            || stderr.contains("could not apply")
+        {
             Ok(RebaseOutcome::Conflicts)
         } else {
             // Some other rebase failure - abort and report
@@ -329,7 +347,6 @@ async fn abort_rebase(worktree_path: &Path) -> Result<()> {
 }
 
 /// Force-pushes the current branch using --force-with-lease.
-/// Falls back to --force if --force-with-lease is rejected.
 async fn force_push(worktree_path: &Path) -> Result<()> {
     let output = Command::new("git")
         .args([
@@ -347,24 +364,12 @@ async fn force_push(worktree_path: &Path) -> Result<()> {
     }
 
     let stderr = String::from_utf8_lossy(&output.stderr);
-    log::warn!(
-        "git push --force-with-lease failed: {}. Retrying with --force...",
+    anyhow::bail!(
+        "git push --force-with-lease failed: {}\n\
+         The remote branch may have been updated since your last fetch.\n\
+         Run `git fetch origin` and try again.",
         stderr.trim()
     );
-
-    // Retry with --force
-    let output = Command::new("git")
-        .args(["-C", &worktree_path.to_string_lossy(), "push", "--force"])
-        .output()
-        .await
-        .context("Failed to execute git push --force")?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("git push --force failed: {}", stderr.trim());
-    }
-
-    Ok(())
 }
 
 /// Spawns Claude Code with the `/rebase` command to resolve conflicts.
