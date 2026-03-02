@@ -83,7 +83,7 @@ pub(crate) struct ClaudeResult {
 // ---------------------------------------------------------------------------
 
 /// Checks if a branch has been pushed to the remote
-async fn is_branch_pushed(worktree_path: &Path, branch_name: &str) -> Result<bool> {
+pub(crate) async fn is_branch_pushed(worktree_path: &Path, branch_name: &str) -> Result<bool> {
     let output = TokioCommand::new("git")
         .arg("-C")
         .arg(worktree_path)
@@ -369,7 +369,7 @@ async fn try_mark_issue_blocked(client: &GitHubClient, owner: &str, repo: &str, 
 
 /// Updates the orchestration phase for a minion in the registry.
 /// Logs a warning if the update fails, since phase tracking is important for resume correctness.
-async fn update_orchestration_phase(minion_id: &str, phase: OrchestrationPhase) {
+pub(crate) async fn update_orchestration_phase(minion_id: &str, phase: OrchestrationPhase) {
     let minion_id_owned = minion_id.to_string();
     let phase_name = format!("{:?}", phase);
     if let Err(e) = with_registry(move |registry| {
@@ -957,7 +957,7 @@ async fn run_claude_session_inner(
 
 /// Creates a PR for the branch and updates labels/registry.
 /// Returns the PR number if successful.
-async fn handle_pr_creation(
+pub(crate) async fn handle_pr_creation(
     issue_ctx: &IssueContext,
     wt_ctx: &WorktreeContext,
 ) -> Result<Option<String>> {
