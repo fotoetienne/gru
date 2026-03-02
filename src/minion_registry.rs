@@ -51,6 +51,16 @@ pub enum MinionMode {
     Stopped,
 }
 
+impl std::fmt::Display for MinionMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MinionMode::Autonomous => write!(f, "autonomous"),
+            MinionMode::Interactive => write!(f, "interactive"),
+            MinionMode::Stopped => write!(f, "stopped"),
+        }
+    }
+}
+
 /// Tracks which phase of the fix orchestration a Minion has reached.
 /// Used to resume interrupted sessions from the correct phase.
 ///
