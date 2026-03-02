@@ -134,8 +134,15 @@ enum Commands {
     },
     #[command(about = "Run an ad-hoc prompt with Claude")]
     Prompt {
-        #[arg(help = "Prompt text to send to Claude")]
+        #[arg(help = "Prompt text or prompt name to send to Claude")]
         prompt: String,
+
+        #[arg(
+            long,
+            help = "Show detailed information about this prompt (description, parameters, source)",
+            conflicts_with_all = ["issue", "pr", "no_worktree", "worktree", "param", "timeout"]
+        )]
+        info: bool,
 
         #[arg(
             short,
@@ -236,6 +243,7 @@ async fn main() {
         Commands::Stop { id } => stop::handle_stop(id).await,
         Commands::Prompt {
             prompt,
+            info,
             issue,
             pr,
             no_worktree,
@@ -243,19 +251,23 @@ async fn main() {
             params,
             timeout,
         } => {
-            prompt::handle_prompt(
-                &prompt,
-                prompt::PromptOptions {
-                    issue,
-                    pr,
-                    no_worktree,
-                    worktree,
-                    params,
-                    timeout,
-                    quiet: cli.quiet,
-                },
-            )
-            .await
+            if info {
+                prompt::handle_prompt_info(&prompt).await
+            } else {
+                prompt::handle_prompt(
+                    &prompt,
+                    prompt::PromptOptions {
+                        issue,
+                        pr,
+                        no_worktree,
+                        worktree,
+                        params,
+                        timeout,
+                        quiet: cli.quiet,
+                    },
+                )
+                .await
+            }
         }
         Commands::Prompts => prompts::handle_prompts().await,
         Commands::Lab {

@@ -247,6 +247,148 @@ async fn setup_issue_worktree(
     Ok((worktree_path, branch_name))
 }
 
+/// Formats prompt info into a displayable string.
+/// Separated from handle_prompt_info for testability.
+fn format_prompt_info(prompt: &prompt_loader::Prompt) -> String {
+    use std::fmt::Write;
+    let mut output = String::new();
+
+    writeln!(output, "Prompt: {}", prompt.name).unwrap();
+
+    // Description
+    if let Some(ref desc) = prompt.metadata.description {
+        writeln!(output, "{}", desc).unwrap();
+    }
+
+    // Required parameters (from requires field + required params)
+    let requires = &prompt.metadata.requires;
+    let required_params: Vec<&prompt_loader::PromptParam> = prompt
+        .metadata
+        .params
+        .iter()
+        .filter(|p| p.required)
+        .collect();
+
+    if !requires.is_empty() || !required_params.is_empty() {
+        writeln!(output, "\nRequired parameters:").unwrap();
+        for req in requires {
+            match req.trim().to_lowercase().as_str() {
+                "issue" => {
+                    writeln!(output, "  --issue <number>    GitHub issue number or URL").unwrap()
+                }
+                "pr" => writeln!(output, "  --pr <number>       GitHub PR number or URL").unwrap(),
+                _ => writeln!(output, "  {} (unknown requirement)", req).unwrap(),
+            }
+        }
+        for param in &required_params {
+            let desc = param.description.as_deref().unwrap_or("No description");
+            writeln!(output, "  --param {}=<value>    {}", param.name, desc).unwrap();
+        }
+    }
+
+    // Optional parameters
+    let optional_params: Vec<&prompt_loader::PromptParam> = prompt
+        .metadata
+        .params
+        .iter()
+        .filter(|p| !p.required)
+        .collect();
+
+    if !optional_params.is_empty() {
+        writeln!(output, "\nOptional parameters:").unwrap();
+        for param in &optional_params {
+            let desc = param.description.as_deref().unwrap_or("No description");
+            writeln!(output, "  --param {}=<value>    {}", param.name, desc).unwrap();
+        }
+    }
+
+    // Source location
+    let source_display = prompt.source.display();
+    let overrides_builtin = !matches!(prompt.source, prompt_loader::PromptSource::BuiltIn)
+        && prompt_loader::BUILT_IN_PROMPTS
+            .iter()
+            .any(|b| b.name == prompt.name);
+    if overrides_builtin {
+        writeln!(
+            output,
+            "\nTemplate location: {} (overrides built-in)",
+            source_display
+        )
+        .unwrap();
+    } else {
+        writeln!(output, "\nTemplate location: {}", source_display).unwrap();
+    }
+
+    output
+}
+
+/// Formats built-in prompt info into a displayable string.
+fn format_builtin_prompt_info(builtin: &prompt_loader::BuiltInPrompt) -> String {
+    use std::fmt::Write;
+    let mut output = String::new();
+    writeln!(output, "Prompt: {}", builtin.name).unwrap();
+    writeln!(output, "{}", builtin.description).unwrap();
+    if !builtin.requires.is_empty() {
+        writeln!(output, "\nRequired parameters:").unwrap();
+        for req in builtin.requires {
+            match *req {
+                "issue" => {
+                    writeln!(output, "  --issue <number>    GitHub issue number or URL").unwrap()
+                }
+                "pr" => writeln!(output, "  --pr <number>       GitHub PR number or URL").unwrap(),
+                _ => writeln!(output, "  {} (unknown requirement)", req).unwrap(),
+            }
+        }
+    }
+    writeln!(output, "\nTemplate location: built-in").unwrap();
+    output
+}
+
+/// Handles the `gru prompt <name> --info` command by displaying prompt details
+pub async fn handle_prompt_info(prompt_name: &str) -> Result<i32> {
+    let trimmed = prompt_name.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("Prompt name cannot be empty");
+    }
+
+    // Check if it matches a built-in prompt (available even if file loading fails)
+    let built_in = prompt_loader::BUILT_IN_PROMPTS
+        .iter()
+        .find(|b| b.name == trimmed);
+
+    // Load file-based prompts; treat errors as non-fatal if we have a built-in fallback
+    let repo_root = git::detect_git_repo().await.ok();
+    let loaded_prompts = match prompt_loader::load_prompts(repo_root.as_deref()) {
+        Ok(prompts) => prompts,
+        Err(err) => {
+            if let Some(builtin) = built_in {
+                log::warn!("Failed to load prompts from files: {}", err);
+                print!("{}", format_builtin_prompt_info(builtin));
+                return Ok(0);
+            }
+            return Err(err);
+        }
+    };
+
+    // File-based prompts take priority (they may override built-ins)
+    if let Some(prompt) = loaded_prompts.get(trimmed) {
+        print!("{}", format_prompt_info(prompt));
+        return Ok(0);
+    }
+
+    // Fall back to built-in prompt
+    if let Some(builtin) = built_in {
+        print!("{}", format_builtin_prompt_info(builtin));
+        return Ok(0);
+    }
+
+    // Prompt not found
+    anyhow::bail!(
+        "Unknown prompt '{}'. Run `gru prompts` to see available prompts.",
+        trimmed
+    );
+}
+
 /// Options for the prompt command, grouped to avoid too many function arguments
 #[derive(Debug, Default)]
 pub struct PromptOptions {
@@ -784,5 +926,164 @@ mod tests {
         assert!(parse_pr_arg("not-a-number").await.is_err());
         assert!(parse_pr_arg("").await.is_err());
         assert!(parse_pr_arg("-42").await.is_err());
+    }
+
+    // --- format_prompt_info tests ---
+
+    #[test]
+    fn test_format_prompt_info_full() {
+        let prompt = prompt_loader::Prompt {
+            name: "fix".to_string(),
+            metadata: prompt_loader::PromptMetadata {
+                description: Some("Fix a GitHub issue with tests and PR".to_string()),
+                requires: vec!["issue".to_string()],
+                params: vec![prompt_loader::PromptParam {
+                    name: "target".to_string(),
+                    description: Some("Specific file/module to focus on".to_string()),
+                    required: false,
+                }],
+            },
+            content: "template content".to_string(),
+            source: prompt_loader::PromptSource::Repo(PathBuf::from(".gru/prompts/fix.md")),
+        };
+
+        let output = format_prompt_info(&prompt);
+        assert!(output.contains("Prompt: fix"));
+        assert!(output.contains("Fix a GitHub issue with tests and PR"));
+        assert!(output.contains("Required parameters:"));
+        assert!(output.contains("--issue <number>"));
+        assert!(output.contains("Optional parameters:"));
+        assert!(output.contains("--param target=<value>"));
+        assert!(output.contains("Specific file/module to focus on"));
+        assert!(output.contains("(overrides built-in)"));
+    }
+
+    #[test]
+    fn test_format_prompt_info_no_description() {
+        let prompt = prompt_loader::Prompt {
+            name: "simple".to_string(),
+            metadata: prompt_loader::PromptMetadata {
+                description: None,
+                requires: vec![],
+                params: vec![],
+            },
+            content: "template content".to_string(),
+            source: prompt_loader::PromptSource::Global(PathBuf::from(
+                "/home/user/.gru/prompts/simple.md",
+            )),
+        };
+
+        let output = format_prompt_info(&prompt);
+        assert!(output.contains("Prompt: simple"));
+        assert!(!output.contains("Required parameters:"));
+        assert!(!output.contains("Optional parameters:"));
+        assert!(output.contains("/home/user/.gru/prompts/simple.md"));
+        assert!(!output.contains("overrides built-in"));
+    }
+
+    #[test]
+    fn test_format_prompt_info_required_params_only() {
+        let prompt = prompt_loader::Prompt {
+            name: "analyze".to_string(),
+            metadata: prompt_loader::PromptMetadata {
+                description: Some("Analyze a component".to_string()),
+                requires: vec![],
+                params: vec![prompt_loader::PromptParam {
+                    name: "component".to_string(),
+                    description: Some("Component to analyze".to_string()),
+                    required: true,
+                }],
+            },
+            content: "template content".to_string(),
+            source: prompt_loader::PromptSource::Repo(PathBuf::from(".gru/prompts/analyze.md")),
+        };
+
+        let output = format_prompt_info(&prompt);
+        assert!(output.contains("Required parameters:"));
+        assert!(output.contains("--param component=<value>    Component to analyze"));
+        assert!(!output.contains("Optional parameters:"));
+    }
+
+    #[test]
+    fn test_format_prompt_info_pr_requirement() {
+        let prompt = prompt_loader::Prompt {
+            name: "review-custom".to_string(),
+            metadata: prompt_loader::PromptMetadata {
+                description: Some("Custom review prompt".to_string()),
+                requires: vec!["pr".to_string()],
+                params: vec![],
+            },
+            content: "template content".to_string(),
+            source: prompt_loader::PromptSource::Repo(PathBuf::from(
+                ".gru/prompts/review-custom.md",
+            )),
+        };
+
+        let output = format_prompt_info(&prompt);
+        assert!(output.contains("--pr <number>"));
+    }
+
+    #[test]
+    fn test_format_builtin_prompt_info() {
+        let builtin = prompt_loader::BuiltInPrompt {
+            name: "fix",
+            description: "Fix a GitHub issue with tests and PR",
+            requires: &["issue"],
+            content: "",
+        };
+        let output = format_builtin_prompt_info(&builtin);
+        assert!(output.contains("Prompt: fix"));
+        assert!(output.contains("Fix a GitHub issue with tests and PR"));
+        assert!(output.contains("--issue <number>"));
+        assert!(output.contains("Template location: built-in"));
+    }
+
+    #[test]
+    fn test_format_prompt_info_builtin_source_not_marked_as_override() {
+        // Even if the name matches a built-in, a BuiltIn-sourced prompt
+        // should not be marked as "overrides built-in"
+        let prompt = prompt_loader::Prompt {
+            name: "fix".to_string(),
+            metadata: prompt_loader::PromptMetadata {
+                description: Some("Built-in fix".to_string()),
+                requires: vec![],
+                params: vec![],
+            },
+            content: "content".to_string(),
+            source: prompt_loader::PromptSource::BuiltIn,
+        };
+
+        let output = format_prompt_info(&prompt);
+        assert!(!output.contains("overrides built-in"));
+        assert!(output.contains("Template location: built-in"));
+    }
+
+    #[tokio::test]
+    async fn test_handle_prompt_info_builtin_success() {
+        // "fix" is always in BUILT_IN_PROMPTS
+        let result = handle_prompt_info("fix").await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_handle_prompt_info_rejects_empty_name() {
+        let result = handle_prompt_info("").await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("cannot be empty"));
+
+        let result = handle_prompt_info("  ").await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("cannot be empty"));
+    }
+
+    #[tokio::test]
+    async fn test_handle_prompt_info_unknown_prompt() {
+        let result = handle_prompt_info("nonexistent-prompt-xyz").await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("Unknown prompt"));
+        assert!(err.contains("nonexistent-prompt-xyz"));
+        assert!(err.contains("gru prompts"));
     }
 }
