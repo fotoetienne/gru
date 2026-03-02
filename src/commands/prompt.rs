@@ -398,7 +398,9 @@ pub async fn handle_prompt(prompt: &str, opts: PromptOptions) -> Result<i32> {
         let wt_path = PathBuf::from(explicit_path)
             .canonicalize()
             .with_context(|| format!("Failed to resolve worktree path: {}", explicit_path))?;
-        println!("📂 Using explicit worktree: {}", wt_path.display());
+        if !quiet {
+            println!("📂 Using explicit worktree: {}", wt_path.display());
+        }
         context.worktree_path = Some(wt_path.clone());
         // Preserve PR branch name for registry and template context
         let branch = pr_branch.clone().unwrap_or_default();
@@ -653,10 +655,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_prompt_rejects_file_as_worktree_path() {
-        let temp = std::env::temp_dir().join("gru-test-worktree-file");
-        let _ = std::fs::write(&temp, "not a directory");
+        // Use tempfile::NamedTempFile for unique paths and automatic cleanup
+        let temp_file =
+            tempfile::NamedTempFile::new().expect("Failed to create temp file for test");
         let opts = PromptOptions {
-            worktree: Some(temp.to_string_lossy().to_string()),
+            worktree: Some(temp_file.path().to_string_lossy().to_string()),
             ..PromptOptions::default()
         };
         let result = handle_prompt("test prompt", opts).await;
@@ -667,18 +670,16 @@ mod tests {
             "Expected 'not a directory' error, got: {}",
             err_msg
         );
-        let _ = std::fs::remove_file(&temp);
     }
 
     #[tokio::test]
     async fn test_handle_prompt_worktree_flag_accepts_existing_path() {
-        // Use a temp directory as the explicit worktree path.
+        // Use tempfile::TempDir for unique paths and automatic cleanup.
         // The prompt will proceed past validation but fail later (no Claude binary),
         // which proves the path validation itself passed.
-        let temp = std::env::temp_dir().join("gru-test-worktree-flag");
-        let _ = std::fs::create_dir_all(&temp);
+        let temp_dir = tempfile::TempDir::new().expect("Failed to create temp dir for test");
         let opts = PromptOptions {
-            worktree: Some(temp.to_string_lossy().to_string()),
+            worktree: Some(temp_dir.path().to_string_lossy().to_string()),
             ..PromptOptions::default()
         };
         let result = handle_prompt("test prompt", opts).await;
@@ -692,7 +693,6 @@ mod tests {
                 msg
             );
         }
-        let _ = std::fs::remove_dir_all(&temp);
     }
 
     #[test]
