@@ -1,7 +1,7 @@
 use crate::ci;
 use crate::claude_runner::{
-    build_claude_command, build_claude_resume_command, run_claude_with_stream_monitoring,
-    ClaudeRunnerError, EXIT_CODE_SIGNAL_TERMINATED,
+    build_claude_command, build_claude_resume_command, parse_timeout,
+    run_claude_with_stream_monitoring, ClaudeRunnerError, EXIT_CODE_SIGNAL_TERMINATED,
 };
 use crate::git;
 use crate::github::GitHubClient;
@@ -32,10 +32,6 @@ const MAX_OUTPUT_BUFFER_SIZE: usize = 10000;
 
 /// Size to trim the output buffer to when it exceeds the maximum (in bytes)
 const TRIM_OUTPUT_BUFFER_SIZE: usize = 5000;
-
-/// Default timeout for review process in seconds (30 minutes)
-/// Reviews can take longer than fixes due to analysis depth
-const DEFAULT_REVIEW_TIMEOUT_SECS: u64 = 1800;
 
 /// Maximum number of review rounds to handle automatically
 /// After this limit, the user must handle additional reviews manually
@@ -281,7 +277,9 @@ async fn invoke_claude_for_reviews(
     Ok(())
 }
 
-/// Trigger a PR review as a separate process, with a timeout
+/// Trigger a PR review as a separate process.
+/// If `review_timeout` is `Some`, the review is killed after that duration.
+/// If `None`, the review runs without a timeout (Claude's built-in stuck detection applies).
 async fn trigger_pr_review(
     pr_number: &str,
     worktree_path: &Path,
@@ -291,9 +289,6 @@ async fn trigger_pr_review(
     pr_number
         .parse::<u64>()
         .with_context(|| format!("Invalid PR number format: '{}'", pr_number))?;
-
-    let timeout_duration =
-        review_timeout.unwrap_or_else(|| Duration::from_secs(DEFAULT_REVIEW_TIMEOUT_SECS));
 
     let mut child = TokioCommand::new("gru")
         .arg("review")
@@ -310,20 +305,51 @@ async fn trigger_pr_review(
             )
         })?;
 
-    match timeout(timeout_duration, child.wait()).await {
-        Ok(status) => {
-            let status = status.with_context(|| {
+    match review_timeout {
+        Some(timeout_duration) => match timeout(timeout_duration, child.wait()).await {
+            Ok(status) => {
+                let status = status.with_context(|| {
+                    format!("Failed to wait for review process for PR #{}", pr_number)
+                })?;
+                Ok(status.code().unwrap_or(EXIT_CODE_SIGNAL_TERMINATED))
+            }
+            Err(_) => {
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+                let elapsed_secs = timeout_duration.as_secs();
+                let time_display = if elapsed_secs >= 60 {
+                    let minutes = elapsed_secs / 60;
+                    let seconds = elapsed_secs % 60;
+                    if seconds == 0 {
+                        format!("{} minute{}", minutes, if minutes == 1 { "" } else { "s" })
+                    } else {
+                        format!(
+                            "{} minute{} {} second{}",
+                            minutes,
+                            if minutes == 1 { "" } else { "s" },
+                            seconds,
+                            if seconds == 1 { "" } else { "s" }
+                        )
+                    }
+                } else {
+                    format!(
+                        "{} second{}",
+                        elapsed_secs,
+                        if elapsed_secs == 1 { "" } else { "s" }
+                    )
+                };
+                Err(anyhow::anyhow!(
+                    "Review process timed out after {}. PR #{} review may be stuck.",
+                    time_display,
+                    pr_number
+                ))
+            }
+        },
+        None => {
+            let status = child.wait().await.with_context(|| {
                 format!("Failed to wait for review process for PR #{}", pr_number)
             })?;
             Ok(status.code().unwrap_or(EXIT_CODE_SIGNAL_TERMINATED))
-        }
-        Err(_) => {
-            let _ = child.kill().await;
-            Err(anyhow::anyhow!(
-                "Review process timed out after {} minutes. PR #{} review may be stuck.",
-                timeout_duration.as_secs() / 60,
-                pr_number
-            ))
         }
     }
 }
@@ -1038,10 +1064,11 @@ async fn monitor_pr_lifecycle(
     wt_ctx: &WorktreeContext,
     pr_number: &str,
     timeout_opt: Option<&str>,
+    review_timeout: Option<Duration>,
 ) {
     // Auto-trigger review for Minion-created PRs
     println!("\n🔍 Starting automated PR review...");
-    match trigger_pr_review(pr_number, &wt_ctx.worktree_path, None).await {
+    match trigger_pr_review(pr_number, &wt_ctx.worktree_path, review_timeout).await {
         Ok(review_exit_code) => {
             if review_exit_code == 0 {
                 println!("✅ PR review completed successfully");
@@ -1195,9 +1222,16 @@ async fn monitor_ci_after_fix(
 pub async fn handle_fix(
     issue: &str,
     timeout_opt: Option<String>,
+    review_timeout_opt: Option<String>,
     quiet: bool,
     force_new: bool,
 ) -> Result<i32> {
+    // Parse review timeout if provided
+    let review_timeout = review_timeout_opt
+        .map(|s| parse_timeout(&s))
+        .transpose()
+        .context("Invalid --review-timeout value")?;
+
     // Phase 1: Resolve issue (always runs - need fresh issue details)
     let issue_ctx = resolve_issue(issue).await?;
 
@@ -1333,7 +1367,14 @@ pub async fn handle_fix(
     // Phase 5: Monitor PR lifecycle (review + polling)
     if let Some(ref pr_num) = pr_number {
         update_orchestration_phase(&wt_ctx.minion_id, OrchestrationPhase::MonitoringPr).await;
-        monitor_pr_lifecycle(&issue_ctx, &wt_ctx, pr_num, timeout_opt.as_deref()).await;
+        monitor_pr_lifecycle(
+            &issue_ctx,
+            &wt_ctx,
+            pr_num,
+            timeout_opt.as_deref(),
+            review_timeout,
+        )
+        .await;
     }
 
     // CI monitoring

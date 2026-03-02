@@ -63,6 +63,12 @@ enum Commands {
 
         #[arg(
             long,
+            help = "Timeout for the automated PR review subprocess (e.g., '30m', '1h'). No timeout by default."
+        )]
+        review_timeout: Option<String>,
+
+        #[arg(
+            long,
             help = "Create a new Minion even if one already exists for this issue"
         )]
         force_new: bool,
@@ -204,8 +210,9 @@ async fn main() {
         Commands::Fix {
             issue,
             timeout,
+            review_timeout,
             force_new,
-        } => fix::handle_fix(&issue, timeout, cli.quiet, force_new).await,
+        } => fix::handle_fix(&issue, timeout, review_timeout, cli.quiet, force_new).await,
         Commands::Review { pr } => review::handle_review(pr).await,
         Commands::Path { id, issue, pr } => path::handle_path(id, issue, pr).await,
         Commands::Attach { id, yolo } => attach::handle_attach(id, yolo).await,
