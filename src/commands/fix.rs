@@ -63,7 +63,10 @@ pub(crate) struct IssueDetails {
 pub(crate) struct WorktreeContext {
     pub minion_id: String,
     pub branch_name: String,
-    pub worktree_path: PathBuf,
+    /// Top-level minion directory where metadata lives (events.jsonl, PR_DESCRIPTION.md, etc.)
+    pub minion_dir: PathBuf,
+    /// Git worktree checkout path (minion_dir/checkout for new layout, minion_dir for legacy)
+    pub checkout_path: PathBuf,
     pub session_id: Uuid,
 }
 
@@ -103,19 +106,21 @@ fn create_wip_template(minion_id: &str, issue_num: u64, issue_title: &str) -> (S
 }
 
 /// Creates a PR for the given issue, returning the PR number
+#[allow(clippy::too_many_arguments)]
 async fn create_pr_for_issue(
     owner: &str,
     repo: &str,
     branch_name: &str,
     issue_num: u64,
     minion_id: &str,
-    worktree_path: &Path,
+    checkout_path: &Path,
+    minion_dir: &Path,
     issue_title_opt: Option<&str>,
 ) -> Result<String> {
     // Detect base branch
     let base_output = TokioCommand::new("git")
         .arg("-C")
-        .arg(worktree_path)
+        .arg(checkout_path)
         .arg("symbolic-ref")
         .arg("refs/remotes/origin/HEAD")
         .output()
@@ -147,8 +152,8 @@ async fn create_pr_for_issue(
         }
     };
 
-    // Check if work is complete (description file exists)
-    let description_path = worktree_path.join("PR_DESCRIPTION.md");
+    // Check if work is complete (description file exists in minion_dir)
+    let description_path = minion_dir.join("PR_DESCRIPTION.md");
     let should_mark_ready = match tokio::fs::try_exists(&description_path).await {
         Ok(exists) => exists,
         Err(e) => {
@@ -248,16 +253,17 @@ async fn handle_cli_fetch_result(result: Result<crate::github::IssueInfo>) -> Op
 
 /// Invokes Claude to address review comments using the same session
 async fn invoke_claude_for_reviews(
-    worktree_path: &Path,
+    checkout_path: &Path,
+    minion_dir: &Path,
     session_id: &Uuid,
     prompt: &str,
     timeout_opt: Option<&str>,
 ) -> Result<()> {
-    let cmd = build_claude_resume_command(worktree_path, session_id, prompt);
+    let cmd = build_claude_resume_command(checkout_path, session_id, prompt);
 
     let result = run_claude_with_stream_monitoring(
         cmd,
-        worktree_path,
+        minion_dir,
         timeout_opt,
         None::<fn(&stream::StreamOutput)>,
         None::<Box<dyn FnOnce(u32) + Send>>,
@@ -653,20 +659,28 @@ async fn setup_worktree(ctx: &IssueContext) -> Result<WorktreeContext> {
     println!("🌿 Creating worktree with branch: {}", branch_name);
 
     let repo_name = format!("{}/{}", ctx.owner, ctx.repo);
-    let worktree_path = workspace
+    let minion_dir = workspace
         .work_dir(&repo_name, &branch_name)
-        .context("Failed to compute worktree path")?;
+        .context("Failed to compute minion directory path")?;
+
+    // Create checkout subdirectory for the git worktree
+    let checkout_path = minion_dir.join("checkout");
+
+    // Ensure the minion directory exists
+    tokio::fs::create_dir_all(&minion_dir)
+        .await
+        .context("Failed to create minion directory")?;
 
     git_repo
-        .create_worktree(&branch_name, &worktree_path)
+        .create_worktree(&branch_name, &checkout_path)
         .await
         .context("Failed to create worktree")?;
 
-    println!("📂 Workspace created at: {}", worktree_path.display());
+    println!("📂 Workspace created at: {}", checkout_path.display());
 
     let session_id = Uuid::new_v4();
 
-    // Register the Minion in the registry
+    // Register the Minion in the registry (worktree field stores the minion_dir)
     let now = Utc::now();
     let registry_info = RegistryMinionInfo {
         repo: repo_name.clone(),
@@ -675,7 +689,7 @@ async fn setup_worktree(ctx: &IssueContext) -> Result<WorktreeContext> {
         prompt: format!("/fix {}", ctx.issue_num),
         started_at: now,
         branch: branch_name.clone(),
-        worktree: worktree_path.clone(),
+        worktree: minion_dir.clone(),
         status: "active".to_string(),
         pr: None,
         session_id: session_id.to_string(),
@@ -694,7 +708,8 @@ async fn setup_worktree(ctx: &IssueContext) -> Result<WorktreeContext> {
     Ok(WorktreeContext {
         minion_id,
         branch_name,
-        worktree_path,
+        minion_dir,
+        checkout_path,
         session_id,
     })
 }
@@ -715,7 +730,7 @@ fn build_fix_prompt(ctx: &IssueContext, wt_ctx: &WorktreeContext) -> String {
 
     // Try to load the prompt through the template system (allows overrides).
     // Use the worktree path as the repo root so `.gru/prompts/fix.md` is found.
-    let prompt_template = match prompt_loader::resolve_prompt("fix", Some(&wt_ctx.worktree_path)) {
+    let prompt_template = match prompt_loader::resolve_prompt("fix", Some(&wt_ctx.checkout_path)) {
         Ok(p) => p,
         Err(e) => {
             log::warn!("Failed to load fix prompt: {e}, using /fix fallback");
@@ -744,7 +759,8 @@ fn build_fix_prompt(ctx: &IssueContext, wt_ctx: &WorktreeContext) -> String {
     prompt_ctx.issue_body = Some(details.body.clone());
     prompt_ctx.repo_owner = Some(ctx.owner.clone());
     prompt_ctx.repo_name = Some(ctx.repo.clone());
-    prompt_ctx.worktree_path = Some(wt_ctx.worktree_path.clone());
+    prompt_ctx.worktree_path = Some(wt_ctx.checkout_path.clone());
+    prompt_ctx.minion_dir = Some(wt_ctx.minion_dir.clone());
     prompt_ctx.branch_name = Some(wt_ctx.branch_name.clone());
 
     let mut variables = prompt_ctx.to_variables();
@@ -768,7 +784,7 @@ async fn run_claude_session(
 ) -> Result<ClaudeResult> {
     println!("🤖 Launching Claude...\n");
     let prompt = build_fix_prompt(issue_ctx, wt_ctx);
-    let mut cmd = build_claude_command(&wt_ctx.worktree_path, &wt_ctx.session_id, &prompt);
+    let mut cmd = build_claude_command(&wt_ctx.checkout_path, &wt_ctx.session_id, &prompt);
     cmd.env("GRU_WORKSPACE", &wt_ctx.minion_id);
     run_claude_session_inner(issue_ctx, wt_ctx, cmd, quiet, timeout_opt).await
 }
@@ -788,7 +804,7 @@ async fn resume_claude_session(
          If you've already completed the implementation, proceed to push and write PR_DESCRIPTION.md.",
         issue_ctx.issue_num
     );
-    let mut cmd = build_claude_resume_command(&wt_ctx.worktree_path, &wt_ctx.session_id, &prompt);
+    let mut cmd = build_claude_resume_command(&wt_ctx.checkout_path, &wt_ctx.session_id, &prompt);
     cmd.env("GRU_WORKSPACE", &wt_ctx.minion_id);
     run_claude_session_inner(issue_ctx, wt_ctx, cmd, quiet, timeout_opt).await
 }
@@ -877,7 +893,7 @@ async fn run_claude_session_inner(
 
     let run_result = run_claude_with_stream_monitoring(
         cmd,
-        &wt_ctx.worktree_path,
+        &wt_ctx.minion_dir,
         timeout_opt,
         Some(callback),
         Some(on_spawn),
@@ -956,7 +972,7 @@ pub(crate) async fn handle_pr_creation(
     wt_ctx: &WorktreeContext,
 ) -> Result<Option<String>> {
     println!("\n🔍 Checking if branch was pushed...");
-    let branch_pushed = is_branch_pushed(&wt_ctx.worktree_path, &wt_ctx.branch_name).await?;
+    let branch_pushed = is_branch_pushed(&wt_ctx.checkout_path, &wt_ctx.branch_name).await?;
 
     if !branch_pushed {
         println!("ℹ️  Branch was not pushed. No PR will be created.");
@@ -977,16 +993,17 @@ pub(crate) async fn handle_pr_creation(
         &wt_ctx.branch_name,
         issue_ctx.issue_num,
         &wt_ctx.minion_id,
-        &wt_ctx.worktree_path,
+        &wt_ctx.checkout_path,
+        &wt_ctx.minion_dir,
         issue_title_cached,
     )
     .await
     {
         Ok(pr_number) => {
-            // Save PR state
+            // Save PR state to minion_dir (metadata)
             let pr_state = PrState::new(pr_number.clone(), issue_ctx.issue_num.to_string());
             pr_state
-                .save(&wt_ctx.worktree_path)
+                .save(&wt_ctx.minion_dir)
                 .context("Failed to save PR state")?;
 
             // Update registry with PR number
@@ -1063,7 +1080,7 @@ async fn monitor_pr_lifecycle(
 ) {
     // Auto-trigger review for Minion-created PRs
     println!("\n🔍 Starting automated PR review...");
-    match trigger_pr_review(pr_number, &wt_ctx.worktree_path, review_timeout).await {
+    match trigger_pr_review(pr_number, &wt_ctx.checkout_path, review_timeout).await {
         Ok(review_exit_code) => {
             if review_exit_code == 0 {
                 println!("✅ PR review completed successfully");
@@ -1115,7 +1132,7 @@ async fn monitor_pr_lifecycle(
             &issue_ctx.owner,
             &issue_ctx.repo,
             pr_number,
-            &wt_ctx.worktree_path,
+            &wt_ctx.checkout_path,
             remaining,
         )
         .await
@@ -1157,7 +1174,8 @@ async fn monitor_pr_lifecycle(
                 println!("🔄 Re-invoking to address review feedback...\n");
 
                 match invoke_claude_for_reviews(
-                    &wt_ctx.worktree_path,
+                    &wt_ctx.checkout_path,
+                    &wt_ctx.minion_dir,
                     &wt_ctx.session_id,
                     &review_prompt,
                     timeout_opt,
@@ -1312,10 +1330,12 @@ pub async fn handle_fix(
                 );
                 let session_id = Uuid::parse_str(&info.session_id)
                     .context("Failed to parse session ID from registry")?;
+                let checkout_path = info.checkout_path();
                 let wt_ctx = WorktreeContext {
                     minion_id,
                     branch_name: info.branch,
-                    worktree_path: info.worktree,
+                    minion_dir: info.worktree,
+                    checkout_path,
                     session_id,
                 };
                 (wt_ctx, Some(phase))
@@ -1445,7 +1465,7 @@ pub async fn handle_fix(
         &issue_ctx.owner,
         &issue_ctx.repo,
         &wt_ctx.branch_name,
-        &wt_ctx.worktree_path,
+        &wt_ctx.checkout_path,
     )
     .await;
     match ci_passed {
@@ -1494,11 +1514,12 @@ mod tests {
     }
 
     /// Creates a test `WorktreeContext` pointing at the given path.
-    fn test_wt_ctx(worktree_path: &std::path::Path) -> WorktreeContext {
+    fn test_wt_ctx(path: &std::path::Path) -> WorktreeContext {
         WorktreeContext {
             minion_id: "M001".to_string(),
             branch_name: "minion/issue-42-M001".to_string(),
-            worktree_path: worktree_path.to_path_buf(),
+            minion_dir: path.to_path_buf(),
+            checkout_path: path.to_path_buf(),
             session_id: Uuid::new_v4(),
         }
     }

@@ -25,6 +25,8 @@ pub struct MinionInfo {
     #[allow(dead_code)]
     // Populated by resolver; callers currently only use minion_id/worktree_path
     pub branch: String,
+    /// The top-level minion directory (metadata lives here).
+    /// Use `checkout_path()` to get the git worktree location.
     pub worktree_path: PathBuf,
     #[allow(dead_code)]
     // Populated by resolver; callers currently only use minion_id/worktree_path
@@ -32,6 +34,16 @@ pub struct MinionInfo {
     #[allow(dead_code)]
     // Populated by resolver; callers currently only use minion_id/worktree_path
     pub uptime: String,
+}
+
+impl MinionInfo {
+    /// Returns the checkout path where the git worktree lives.
+    ///
+    /// New-style minions store the git worktree in `worktree_path/checkout/`.
+    /// Legacy minions have the git worktree directly in `worktree_path/`.
+    pub fn checkout_path(&self) -> PathBuf {
+        crate::workspace::resolve_checkout_path(&self.worktree_path)
+    }
 }
 
 /// Smart ID resolution that tries multiple strategies
@@ -241,16 +253,22 @@ pub fn scan_all_minions() -> Result<Vec<MinionInfo>> {
                     continue; // Skip paths that escape the work directory
                 }
 
-                // Check if this is a valid git worktree
-                let git_dir = minion_path.join(".git");
-                if !git_dir.exists() {
-                    continue;
-                }
+                // Check if this is a valid git worktree (new or legacy layout)
+                let checkout_path = {
+                    let checkout_subdir = minion_path.join("checkout");
+                    if checkout_subdir.join(".git").exists() {
+                        checkout_subdir
+                    } else if minion_path.join(".git").exists() {
+                        minion_path.clone()
+                    } else {
+                        continue; // Neither layout found
+                    }
+                };
 
                 // Get the branch name from git
                 let branch_output = std::process::Command::new("git")
                     .arg("-C")
-                    .arg(&minion_path)
+                    .arg(&checkout_path)
                     .arg("branch")
                     .arg("--show-current")
                     .output()?;
@@ -263,7 +281,7 @@ pub fn scan_all_minions() -> Result<Vec<MinionInfo>> {
                 let issue_number = parse_issue_from_branch(&branch);
 
                 // Determine status (Active or Idle) based on git index modification time
-                let status = determine_status(&minion_path)?;
+                let status = determine_status(&checkout_path)?;
 
                 // Calculate uptime from worktree creation time
                 let uptime = calculate_uptime(&minion_path)?;

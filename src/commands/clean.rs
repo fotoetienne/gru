@@ -15,10 +15,9 @@ fn is_ephemeral_file(path: &Path) -> bool {
 
     // Check for specific ephemeral files
     // Note: Cargo.lock is ephemeral for binary projects (auto-regenerated)
-    if matches!(
-        file_name,
-        "events.jsonl" | "PR_DESCRIPTION.md" | "Cargo.lock" | ".DS_Store" | "Thumbs.db"
-    ) {
+    // Note: events.jsonl and PR_DESCRIPTION.md now live in the minion_dir
+    // (parent of checkout/), not in the git checkout, so they're not listed here.
+    if matches!(file_name, "Cargo.lock" | ".DS_Store" | "Thumbs.db") {
         return true;
     }
 
@@ -504,9 +503,41 @@ pub async fn handle_clean(dry_run: bool, force: bool, base_branch: &str) -> Resu
                 log::warn!("  Warning: Failed to delete branch: {}", e);
             }
 
+            // For new-style layouts (checkout/ subdir), clean up the parent minion_dir
+            // which contains metadata files (events.jsonl, .gru_pr_state.json, etc.)
+            if wt
+                .path
+                .file_name()
+                .map(|n| n == "checkout")
+                .unwrap_or(false)
+            {
+                if let Some(parent_dir) = wt.path.parent() {
+                    if parent_dir.exists() {
+                        if let Err(e) = tokio::fs::remove_dir_all(parent_dir).await {
+                            log::warn!(
+                                "  Warning: Failed to remove minion directory {}: {}",
+                                parent_dir.display(),
+                                e
+                            );
+                        }
+                    }
+                }
+            }
+
             // Queue minion ID for batch registry removal
-            // ASSUMPTION: Worktree directory name equals minion ID (e.g., M001)
-            if let Some(dir_name) = wt.path.file_name() {
+            // For new-style layouts, the minion ID is the parent dir name
+            // For legacy layouts, the minion ID is the worktree dir name
+            let dir_for_id = if wt
+                .path
+                .file_name()
+                .map(|n| n == "checkout")
+                .unwrap_or(false)
+            {
+                wt.path.parent().and_then(|p| p.file_name())
+            } else {
+                wt.path.file_name()
+            };
+            if let Some(dir_name) = dir_for_id {
                 if let Some(dir_str) = dir_name.to_str() {
                     registry_ids_to_remove.push(dir_str.to_string());
                 }
@@ -603,8 +634,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_is_ephemeral_file_events_log() {
-        assert!(is_ephemeral_file(Path::new("events.jsonl")));
+    fn test_is_not_ephemeral_file_events_log() {
+        // events.jsonl now lives in minion_dir, not in git checkout
+        assert!(!is_ephemeral_file(Path::new("events.jsonl")));
     }
 
     #[test]
@@ -623,8 +655,9 @@ mod tests {
     }
 
     #[test]
-    fn test_is_ephemeral_file_pr_description() {
-        assert!(is_ephemeral_file(Path::new("PR_DESCRIPTION.md")));
+    fn test_is_not_ephemeral_file_pr_description() {
+        // PR_DESCRIPTION.md now lives in minion_dir, not in git checkout
+        assert!(!is_ephemeral_file(Path::new("PR_DESCRIPTION.md")));
     }
 
     #[test]

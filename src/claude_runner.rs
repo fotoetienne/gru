@@ -195,13 +195,17 @@ pub fn build_claude_resume_command(
 /// Returns the exit status for the caller to inspect. Caller is responsible for
 /// checking if the process succeeded and handling errors appropriately.
 ///
+/// `events_dir` is the directory where `events.jsonl` will be written.
+/// This is typically the minion directory, separate from the git checkout
+/// where Claude runs (which is set via `cmd.current_dir()` by the caller).
+///
 /// `on_spawn` is called synchronously with the child PID immediately after the process
 /// is spawned, before stream processing begins. This ensures the PID is recorded before
 /// the process can exit, avoiding a race condition. The callback should be fast (e.g.,
 /// writing a PID to a registry file); it runs on the async executor thread.
 pub async fn run_claude_with_stream_monitoring<F>(
     mut cmd: TokioCommand,
-    worktree_path: &Path,
+    events_dir: &Path,
     timeout_opt: Option<&str>,
     mut output_callback: Option<F>,
     on_spawn: Option<Box<dyn FnOnce(u32) + Send>>,
@@ -295,7 +299,7 @@ where
             match line_result? {
                 Some(output) => {
                     // Log the event to events.jsonl
-                    log_event(worktree_path, &output).await?;
+                    log_event(events_dir, &output).await?;
 
                     // Update last event time for any output
                     last_event_time = Instant::now();

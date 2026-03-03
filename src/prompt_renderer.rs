@@ -71,8 +71,10 @@ pub struct PromptContext {
     pub pr_body: Option<String>,
 
     // Git context
-    /// Path to the worktree directory
+    /// Path to the worktree directory (checkout path where git lives)
     pub worktree_path: Option<PathBuf>,
+    /// Path to the minion directory (where metadata files like PR_DESCRIPTION.md live)
+    pub minion_dir: Option<PathBuf>,
     /// Current git branch name
     pub branch_name: Option<String>,
     /// Base branch (e.g., main, master)
@@ -136,6 +138,9 @@ impl PromptContext {
         // Git context
         if let Some(ref p) = self.worktree_path {
             vars.insert("worktree_path".to_string(), p.display().to_string());
+        }
+        if let Some(ref p) = self.minion_dir {
+            vars.insert("minion_dir".to_string(), p.display().to_string());
         }
         if let Some(ref s) = self.branch_name {
             vars.insert("branch_name".to_string(), s.clone());
@@ -394,6 +399,7 @@ feature/add-thing"#;
             pr_title: Some("Test PR".to_string()),
             pr_body: Some("PR description".to_string()),
             worktree_path: Some(PathBuf::from("/path/to/worktree")),
+            minion_dir: Some(PathBuf::from("/path/to/minion")),
             branch_name: Some("feature/test".to_string()),
             base_branch: Some("main".to_string()),
             repo_owner: Some("owner".to_string()),
@@ -417,6 +423,7 @@ feature/add-thing"#;
             vars.get("worktree_path"),
             Some(&"/path/to/worktree".to_string())
         );
+        assert_eq!(vars.get("minion_dir"), Some(&"/path/to/minion".to_string()));
         assert_eq!(vars.get("branch_name"), Some(&"feature/test".to_string()));
         assert_eq!(vars.get("base_branch"), Some(&"main".to_string()));
         assert_eq!(vars.get("repo_owner"), Some(&"owner".to_string()));

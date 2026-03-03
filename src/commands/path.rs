@@ -26,7 +26,7 @@ pub async fn handle_path(id: String, issue: Option<u64>, pr: Option<u64>) -> Res
     // Deprecated flags are ignored to ensure the non-deprecated argument wins
     let minion = minion_resolver::resolve_minion(&id).await?;
 
-    // Output just the path to stdout
-    println!("{}", minion.worktree_path.display());
+    // Output the checkout path (where users cd to for git work)
+    println!("{}", minion.checkout_path().display());
     Ok(0)
 }

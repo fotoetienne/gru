@@ -138,6 +138,17 @@ pub struct MinionInfo {
     pub token_usage: Option<TokenUsage>,
 }
 
+impl MinionInfo {
+    /// Returns the checkout path where the git worktree lives.
+    ///
+    /// New-style minions store the git worktree in `worktree/checkout/`.
+    /// Legacy minions have the git worktree directly in `worktree/`.
+    /// This method detects the layout at runtime and returns the correct path.
+    pub fn checkout_path(&self) -> PathBuf {
+        crate::workspace::resolve_checkout_path(&self.worktree)
+    }
+}
+
 /// Checks whether a process with the given PID is still alive.
 ///
 /// Uses `kill(pid, 0)` on Unix (signal 0 checks process existence without delivering a signal).
