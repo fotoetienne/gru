@@ -191,6 +191,7 @@ struct CheckRunsResponse {
 /// - Detects when the PR is closed without merging (exits with message)
 /// - Detects new review comments (returns for handling)
 /// - Detects CI failures (returns for handling)
+/// - Detects Ctrl+C (returns `MonitorResult::Interrupted` for graceful shutdown)
 ///
 /// # Arguments
 /// * `worktree_path` - Reserved for future use (e.g., reading local git state, logging)
@@ -214,6 +215,10 @@ pub async fn monitor_pr(
         .map(|r| r.submitted_at)
         .unwrap_or_else(Utc::now);
 
+    // Register the Ctrl+C listener once to avoid signal loss between iterations
+    let ctrl_c = tokio::signal::ctrl_c();
+    tokio::pin!(ctrl_c);
+
     loop {
         // Check if we've exceeded the maximum duration
         if let Some(max) = max_duration {
@@ -223,16 +228,22 @@ pub async fn monitor_pr(
             }
         }
 
-        // Use select! to race the polling iteration against Ctrl+C
+        // Race the polling iteration against Ctrl+C
         tokio::select! {
             result = poll_once(owner, repo, pr_number, &mut last_check_time) => {
                 if let Some(monitor_result) = result? {
                     return Ok(monitor_result);
                 }
-                // No actionable event; sleep then loop
-                sleep(Duration::from_secs(POLL_INTERVAL_SECS)).await;
             }
-            _ = tokio::signal::ctrl_c() => {
+            _ = &mut ctrl_c => {
+                return Ok(MonitorResult::Interrupted);
+            }
+        }
+
+        // Sleep between polls, still responding to Ctrl+C
+        tokio::select! {
+            _ = sleep(Duration::from_secs(POLL_INTERVAL_SECS)) => {}
+            _ = &mut ctrl_c => {
                 return Ok(MonitorResult::Interrupted);
             }
         }
