@@ -213,23 +213,13 @@ The **Lab** is the main process that orchestrates Minions.
 - Expose GraphQL API for introspection (future)
 
 **Configuration:**
-```yaml
-# ~/.gru/config.yaml
-github:
-  token: ghp_xxxxxxxxxxxx
-  repos:
-    - owner/repo1
-    - owner/repo2
-    
-lab:
-  slots: 2                    # Max concurrent Minions
-  poll_interval: 30s          # How often to check for new issues
-  minion_timeout: 2h          # Max time before declaring stuck
-  
-llm:
-  provider: anthropic
-  model: claude-sonnet-4-5
-  max_tokens_per_issue: 100000
+```toml
+# ~/.gru/config.toml
+[daemon]
+repos = ["owner/repo1", "owner/repo2"]
+poll_interval_secs = 30       # How often to check for new issues
+max_slots = 2                 # Max concurrent Minions
+label = "ready-for-minion"    # Label to watch for
 ```
 
 ### Minion
@@ -239,8 +229,8 @@ A **Minion** is a Claude Code session working on a single issue.
 **Key Insight:** Each Minion **IS** a Claude Code session. One-to-one mapping.
 
 ```
-Minion M42  =  Claude Code session in worktree ~/.gru/work/owner/repo/M42
-Minion M43  =  Claude Code session in worktree ~/.gru/work/owner/repo/M43
+Minion M042  =  Claude Code session in worktree ~/.gru/work/owner/repo/minion/issue-42-M042/checkout/
+Minion M043  =  Claude Code session in worktree ~/.gru/work/owner/repo/minion/issue-43-M043/checkout/
 ```
 
 **How Lab manages Minions:**
@@ -1454,9 +1444,8 @@ async fn recover(&self) -> Result<(), LabError> {
 
 **1. GitHub Token Security**
 ```rust
-// ~/.gru/config.yaml (mode 0600)
-// github:
-//   token: ghp_xxxxxxxxxxxx
+// GitHub auth: gh/ghe CLI token (primary) or GRU_GITHUB_TOKEN env var (fallback)
+// Tokens are never stored in config files
 
 // Never log tokens
 impl std::fmt::Display for Config {
@@ -1614,93 +1603,63 @@ POST /api/minions/:id/abandon # Abandon Minion
 
 ```
 ~/.gru/
-├── config.yaml                      # Lab configuration
+├── config.toml                      # Lab configuration
 ├── repos/                           # Bare repository mirrors
 │   └── owner/
 │       └── repo.git/                # Bare clone
 ├── work/                            # Active worktrees
 │   └── owner/
 │       └── repo/
-│           ├── M42/                 # Minion M42's worktree
-│           │   ├── .git             # Worktree metadata
-│           │   └── <repo files>
-│           └── M43/                 # Minion M43's worktree
-├── archive/                         # Completed Minion artifacts
-│   ├── M42/
-│   │   ├── events.jsonl             # Structured event log
-│   │   ├── plan.md                  # Execution plan
-│   │   ├── commits.log              # Git commit history
-│   │   ├── ci-results.json          # CI check run results
-│   │   └── metrics.json             # Cost and performance metrics
-│   └── M43/
+│           └── minion/
+│               └── issue-42-M042/   # Minion directory (branch name)
+│                   ├── events.jsonl
+│                   ├── .gru_pr_state.json
+│                   └── checkout/    # Git worktree (repo files)
+│                       ├── .git
+│                       └── <repo files>
 ├── state/
 │   ├── next_id.txt                  # Monotonic counter for Minion IDs (base36)
-│   └── cursors.json                 # GitHub timeline cursors per issue
-└── logs/
-    └── gru.log                      # Lab process logs
-
-# Note: No SQLite database - active Minions tracked in-memory only
-# Recovery on restart: enumerate tmux sessions, fetch state from GitHub
+│   ├── minions.json                 # Persistent Minion registry
+│   └── minions.json.lock            # Registry file lock
+└── archive/                         # Completed work (future)
 ```
 
 ---
 
 ## Configuration
 
-### Environment Variables (Required)
+### Environment Variables
 
-**Tokens via environment variables only (no plaintext in config):**
+**GitHub authentication priority:**
+1. `gh`/`ghe` CLI token (`gh auth token --hostname <host>`)
+2. `GRU_GITHUB_TOKEN` environment variable (fallback)
 
 ```bash
-# Required
+# Optional fallback if gh CLI auth is not configured
 export GRU_GITHUB_TOKEN="ghp_xxxxxxxxxxxx"
-export ANTHROPIC_API_KEY="sk-ant-xxxxxxxxxxxx"
 
-# Lab will fail on startup if these are missing
+# Claude CLI handles its own authentication
 ```
 
-### config.yaml
+### config.toml
 
 **Non-sensitive settings only:**
 
-```yaml
-# ~/.gru/config.yaml
+```toml
+# ~/.gru/config.toml
 
+[daemon]
 # Repositories to monitor (multi-repo support)
-repos:
-  - owner/repo1
-  - owner/repo2
-  - anotherowner/repo3
+repos = ["owner/repo1", "owner/repo2", "anotherowner/repo3"]
 
-lab:
-  # Concurrency - slots shared across all repos
-  slots: 2
-  
-  # Polling interval (seconds)
-  poll_interval: 30
-  
-  # Retry limits
-  max_ci_retries: 10  # High limit before pausing for human review
-  
-  # Archive retention (0 = keep forever)
-  archive_retention_days: 0
+# Max concurrent Minions
+max_slots = 2
 
-git:
-  # User identity for commits
-  user_name: "Gru Minion"
-  user_email: "minion@gru.local"
-  
-  # Branch naming
-  branch_prefix: "minion/issue-"
+# Polling interval (seconds)
+poll_interval_secs = 30
 
-observability:
-  # Logging
-  log_level: info
-  log_file: ~/.gru/logs/gru.log
-  
-  # Metrics (Prometheus format)
-  metrics_enabled: true
-  metrics_port: 9090
+# Label to watch for issues (default: "ready-for-minion")
+label = "ready-for-minion"
 ```
 
 ---

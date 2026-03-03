@@ -1,12 +1,12 @@
 # Gru: Local-First LLM Agent Orchestrator
 
-Gru is a command-line tool that helps you work with GitHub issues using LLM-based agents. Currently in Phase 1, it provides a convenient way to delegate issue fixing to the Claude CLI.
+Gru is a local-first LLM agent orchestrator that autonomously works on GitHub issues using Claude Code. It manages "Minions" (agent sessions) that claim issues, implement fixes, create PRs, monitor CI, and respond to reviews.
 
 ## Installation
 
 ### Prerequisites
 
-- [Rust](https://rustup.rs/) (1.70 or later)
+- [Rust](https://rustup.rs/) (1.73 or later)
 - [Claude CLI](https://github.com/anthropics/claude-code) installed and configured
 - Git and GitHub CLI (`gh`) recommended
 
@@ -22,11 +22,11 @@ This will install the `gru` binary to `~/.cargo/bin/gru`.
 
 ## Usage
 
-### Current Features (Phase 1)
+### Core Commands
 
-**`gru do <issue>`** - Work on a GitHub issue using Claude CLI
+**`gru do <issue>`** - Work on a GitHub issue autonomously
 
-Delegates to Claude CLI with improved error handling and validation.
+Creates a worktree, spawns Claude CLI, monitors progress via stream parsing, creates a PR, monitors CI and reviews, and iterates until done.
 
 ```bash
 # Work on an issue by number (must be run from within the repo)
@@ -34,31 +34,55 @@ gru do 42
 
 # Work on an issue by URL (works from anywhere)
 gru do https://github.com/owner/repo/issues/42
+
+# With timeout
+gru do 42 --timeout 30m
 ```
 
 **`gru review <pr>`** - Review a GitHub pull request using Claude CLI
 
-Delegates to Claude CLI's `/pr_review` command.
+```bash
+gru review 42
+gru review https://github.com/owner/repo/pull/42
+```
+
+**`gru prompt <name>`** - Run a custom or built-in prompt
 
 ```bash
-# Review a PR by number
-gru review 42
+# Run a named prompt
+gru prompt my-prompt --issue 42
 
-# Review a PR by URL
-gru review https://github.com/owner/repo/pull/42
+# List available prompts
+gru prompts
+```
+
+### Minion Management
+
+```bash
+gru status              # List all active Minions
+gru status M001         # Show details for a specific Minion
+gru attach M001         # Attach terminal to a running Minion
+gru stop M001           # Stop a running Minion
+gru resume M001         # Resume a stopped Minion
+gru rebase M001         # Rebase a Minion's branch
+gru path M001           # Print worktree path for a Minion
+gru clean               # Remove worktrees for merged/closed PRs
+```
+
+### Workspace Setup
+
+```bash
+gru init owner/repo                 # Initialize workspace for a repo
+gru lab --repos owner/repo          # Start daemon mode with explicit repos
+# or configure repos in ~/.gru/config.toml and run: gru lab
 ```
 
 ### Other Commands
 
 ```bash
-# Show version
-gru --version
-
-# Show help
-gru --help
-
-# Show help for do command
-gru do --help
+gru --version           # Show version
+gru --help              # Show help
+gru do --help           # Show help for do command
 ```
 
 ## Error Handling
@@ -134,33 +158,23 @@ git commit --no-verify
 
 ## Roadmap
 
-Gru is being developed in phases, with Phase 1 now complete. Future phases will add:
+Gru is being developed in phases. V1 is feature-complete with worktree management, lab mode, CI monitoring, and PR lifecycle management.
 
-### Phase 2: Local Minion Management
-- Direct integration with Claude Agent Protocol
-- Local worktree management (`~/.gru/work/`)
-- Bare repository mirroring (`~/.gru/repos/`)
-- Issue claiming and branch creation
+### Completed (V1)
+- Autonomous issue fixing with full PR lifecycle
+- Git worktree isolation (`~/.gru/work/`, `~/.gru/repos/`)
+- Lab mode — continuous polling with configurable slots
+- CI monitoring and auto-fix (up to 3 attempts)
+- PR review monitoring and automated responses
+- Minion management (attach, stop, resume, rebase)
+- Custom prompt system with template variables
+- Persistent Minion registry
 
-### Phase 3: Lab Mode
-- Continuous polling for `ready-for-minion` labeled issues
-- Parallel Minion execution with configurable slots
-- GraphQL API for querying Minion status
-- WebSocket support for real-time updates
-- Post-PR monitoring (reviews, CI failures, comments)
-
-### Phase 4: Tower Mode
-- Web UI for monitoring Labs and Minions
-- Multi-Lab coordination
-- Proxy layer for remote access
-- Handoff and live attach sessions
-
-### Phase 5: Advanced Features
-- Learned prioritization
-- Multi-repo orchestration
-- Local embedding index
-- Cost and token accounting
-- Slack/mobile notifications
+### Future Phases
+- **V2:** Multi-Lab coordination, distributed locking via GitHub Projects
+- **V3:** Tower web UI, WebSocket live updates, OAuth auth
+- **V4:** Issue dependency DAG, RAG embeddings, learned prioritization
+- **V5:** Multi-repo orchestration, cost accounting, notifications
 
 ## Architecture
 
