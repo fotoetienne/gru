@@ -302,16 +302,28 @@ fn format_prompt_info(prompt: &prompt_loader::Prompt) -> String {
         }
     }
 
-    // Source location
+    // Source location with override/shadowing indicator.
+    // Only repo prompts can override built-ins (resolution: repo > built-in > global).
+    // Global prompts are shadowed BY built-ins, not the other way around.
     let source_display = prompt.source.display();
-    let overrides_builtin = !matches!(prompt.source, prompt_loader::PromptSource::BuiltIn)
-        && prompt_loader::BUILT_IN_PROMPTS
-            .iter()
-            .any(|b| b.name == prompt.name);
-    if overrides_builtin {
+    let matches_builtin = prompt_loader::BUILT_IN_PROMPTS
+        .iter()
+        .any(|b| b.name == prompt.name);
+    if matches!(prompt.source, prompt_loader::PromptSource::Repo(_)) && matches_builtin {
         writeln!(
             output,
             "\nTemplate location: {} (overrides built-in)",
+            source_display
+        )
+        .unwrap();
+    } else if matches!(prompt.source, prompt_loader::PromptSource::Global(_)) && matches_builtin {
+        // Note: currently unreachable through handle_prompt_info() because
+        // load_prompts() resolves by priority and overwrites global entries with
+        // built-ins of the same name. Kept for correctness if this formatter is
+        // ever called from a different code path.
+        writeln!(
+            output,
+            "\nTemplate location: {} (shadowed by built-in)",
             source_display
         )
         .unwrap();
@@ -977,7 +989,7 @@ mod tests {
         assert!(output.contains("Prompt: simple"));
         assert!(!output.contains("Required parameters:"));
         assert!(!output.contains("Optional parameters:"));
-        assert!(output.contains("/home/user/.gru/prompts/simple.md"));
+        assert!(output.contains("~/.gru/prompts/simple.md"));
         assert!(!output.contains("overrides built-in"));
     }
 
@@ -1056,6 +1068,56 @@ mod tests {
         let output = format_prompt_info(&prompt);
         assert!(!output.contains("overrides built-in"));
         assert!(output.contains("Template location: built-in"));
+    }
+
+    #[test]
+    fn test_format_prompt_info_global_source_shadowed_by_builtin() {
+        // A global prompt named "fix" should show "shadowed by built-in"
+        // because built-ins have higher priority than global prompts
+        let prompt = prompt_loader::Prompt {
+            name: "fix".to_string(),
+            metadata: prompt_loader::PromptMetadata {
+                description: Some("Global fix attempt".to_string()),
+                requires: vec![],
+                params: vec![],
+            },
+            content: "content".to_string(),
+            source: prompt_loader::PromptSource::Global(PathBuf::from(
+                "/home/user/.gru/prompts/fix.md",
+            )),
+        };
+
+        let output = format_prompt_info(&prompt);
+        assert!(
+            output.contains("shadowed by built-in"),
+            "Global prompt matching built-in name should show shadowed indicator, got: {}",
+            output
+        );
+        assert!(!output.contains("overrides built-in"));
+        assert!(output.contains("~/.gru/prompts/fix.md"));
+    }
+
+    #[test]
+    fn test_format_prompt_info_repo_source_overrides_builtin() {
+        // A repo prompt named "fix" should show "overrides built-in"
+        let prompt = prompt_loader::Prompt {
+            name: "fix".to_string(),
+            metadata: prompt_loader::PromptMetadata {
+                description: Some("Team fix workflow".to_string()),
+                requires: vec!["issue".to_string()],
+                params: vec![],
+            },
+            content: "content".to_string(),
+            source: prompt_loader::PromptSource::Repo(PathBuf::from("/repo/.gru/prompts/fix.md")),
+        };
+
+        let output = format_prompt_info(&prompt);
+        assert!(
+            output.contains("overrides built-in"),
+            "Repo prompt matching built-in name should show overrides indicator, got: {}",
+            output
+        );
+        assert!(output.contains(".gru/prompts/fix.md"));
     }
 
     #[tokio::test]

@@ -318,7 +318,6 @@ pub struct Prompt {
     pub content: String,
 
     /// Source location of the prompt file
-    #[cfg_attr(not(test), allow(dead_code))]
     pub source: PromptSource,
 }
 
@@ -336,13 +335,29 @@ pub enum PromptSource {
 }
 
 impl PromptSource {
-    /// Returns a display string for the source
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// Returns a user-friendly display string for the source.
+    ///
+    /// Shows clean relative paths that match the section headers in `gru prompts`:
+    /// - Repo: `.gru/prompts/<filename>`
+    /// - Built-in: `built-in`
+    /// - Global: `~/.gru/prompts/<filename>`
     pub fn display(&self) -> String {
         match self {
-            PromptSource::Repo(path) => format!("repo: {}", path.display()),
+            PromptSource::Repo(path) => {
+                let filename = path
+                    .file_name()
+                    .map(|f| f.to_string_lossy().to_string())
+                    .unwrap_or_else(|| path.display().to_string());
+                format!(".gru/prompts/{}", filename)
+            }
             PromptSource::BuiltIn => "built-in".to_string(),
-            PromptSource::Global(path) => format!("global: {}", path.display()),
+            PromptSource::Global(path) => {
+                let filename = path
+                    .file_name()
+                    .map(|f| f.to_string_lossy().to_string())
+                    .unwrap_or_else(|| path.display().to_string());
+                format!("~/.gru/prompts/{}", filename)
+            }
         }
     }
 }
@@ -1032,13 +1047,14 @@ Repo content"#,
     #[test]
     fn test_prompt_source_display() {
         let repo_source = PromptSource::Repo(PathBuf::from("/repo/.gru/prompts/fix.md"));
-        assert!(repo_source.display().contains("repo:"));
+        assert_eq!(repo_source.display(), ".gru/prompts/fix.md");
 
         let builtin_source = PromptSource::BuiltIn;
         assert_eq!(builtin_source.display(), "built-in");
 
-        let global_source = PromptSource::Global(PathBuf::from("~/.gru/prompts/fix.md"));
-        assert!(global_source.display().contains("global:"));
+        let global_source =
+            PromptSource::Global(PathBuf::from("/home/user/.gru/prompts/explain.md"));
+        assert_eq!(global_source.display(), "~/.gru/prompts/explain.md");
     }
 
     #[test]
