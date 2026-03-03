@@ -72,8 +72,9 @@ gru clean               # Remove worktrees for merged/closed PRs
 ### Workspace Setup
 
 ```bash
-gru init owner/repo     # Initialize workspace for a repo
-gru lab                 # Start daemon mode (polls for issues)
+gru init owner/repo                 # Initialize workspace for a repo
+gru lab --repos owner/repo          # Start daemon mode with explicit repos
+# or configure repos in ~/.gru/config.toml and run: gru lab
 ```
 
 ### Other Commands

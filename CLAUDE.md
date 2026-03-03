@@ -153,7 +153,7 @@ claude --print \
 
 **State Management:**
 - **GitHub as source of truth** - Labels, comments, PRs provide complete state
-- **Local state:** Persistent Minion registry at `~/.gru/state/minions.json` (atomic writes with file locking), file-based cursors for timeline polling
+- **Local state:** Persistent Minion registry at `~/.gru/state/minions.json` (atomic writes with file locking)
 - **No SQLite** - Rebuild state from GitHub on restart
 - **Minion IDs:** Stored in `~/.gru/state/next_id.txt` with file locking for atomicity
 
@@ -220,9 +220,8 @@ Located in `.claude/skills/`:
 - See `experiments/DMX_ANALYSIS.md` for approach comparison (CLI + Stream Parsing scored 0.735)
 
 ### GitHub Integration
-- Use `ghe` instead of `gh` for Netflix GitHub repos (auto-detected by owner name)
 - Never stage files with `git add -A` - always be explicit
-- Authentication priority: `gh`/`ghe` CLI token (`gh auth token`), then `GRU_GITHUB_TOKEN` env var as fallback
+- Authentication priority: `gh` CLI token (`gh auth token`), then `GRU_GITHUB_TOKEN` env var as fallback
 - Labels drive state machine: `ready-for-minion` → `in-progress` → `minion:done`/`minion:failed`
 - Comments use YAML frontmatter for structured events
 - Issue/PR parsing supports both numbers (when in repo) and full GitHub URLs
