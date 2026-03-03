@@ -195,6 +195,58 @@ impl Worktree {
         Ok(count > 0)
     }
 
+    /// Check if there is an open PR for this branch on GitHub
+    ///
+    /// Used to prevent cleaning worktrees that have PRs under review.
+    ///
+    /// # Error behavior
+    /// - Failure to spawn the `gh`/`ghe` process propagates as `Err` (system-level problem).
+    /// - Non-zero CLI exit (e.g., auth failure, network error) returns `Ok(false)` to degrade
+    ///   gracefully without blocking cleanup of other worktrees.
+    pub async fn check_has_open_pr(&self) -> Result<bool> {
+        let gh_cmd = github::gh_command_for_repo(&self.repo);
+        let output = Command::new(gh_cmd)
+            .args([
+                "pr",
+                "list",
+                "--state",
+                "open",
+                "--head",
+                &self.branch,
+                "--repo",
+                &self.repo,
+                "--json",
+                "number",
+                "--jq",
+                "length",
+            ])
+            .output()
+            .await
+            .context("Failed to check for open PRs on GitHub")?;
+
+        if !output.status.success() {
+            return Ok(false);
+        }
+
+        let count_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let count: u64 = if count_str.is_empty() {
+            0
+        } else {
+            match count_str.parse() {
+                Ok(n) => n,
+                Err(_) => {
+                    log::warn!(
+                        "Unexpected output from '{} pr list --jq length': {:?}",
+                        gh_cmd,
+                        count_str
+                    );
+                    0
+                }
+            }
+        };
+        Ok(count > 0)
+    }
+
     /// Determine the overall status of this worktree
     pub async fn status(&self, base_branch: &str) -> Result<WorktreeStatus> {
         // Check in order of priority
