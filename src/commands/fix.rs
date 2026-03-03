@@ -1513,13 +1513,16 @@ mod tests {
         assert!(!result.unwrap());
     }
 
-    /// Creates a test `WorktreeContext` pointing at the given path.
+    /// Creates a test `WorktreeContext` with separate minion_dir and checkout_path.
     fn test_wt_ctx(path: &std::path::Path) -> WorktreeContext {
+        let checkout = path.join("checkout");
+        // Create checkout dir so resolve_checkout_path detects new layout
+        let _ = std::fs::create_dir_all(&checkout);
         WorktreeContext {
             minion_id: "M001".to_string(),
             branch_name: "minion/issue-42-M001".to_string(),
             minion_dir: path.to_path_buf(),
-            checkout_path: path.to_path_buf(),
+            checkout_path: checkout,
             session_id: Uuid::new_v4(),
         }
     }
@@ -1627,10 +1630,12 @@ mod tests {
     #[test]
     fn test_build_fix_prompt_repo_override() {
         let tmp = tempfile::tempdir().unwrap();
-        let prompts_dir = tmp.path().join(".gru").join("prompts");
+        let wt_ctx = test_wt_ctx(tmp.path());
+
+        // Create a custom fix prompt in the checkout dir (where the repo lives)
+        let prompts_dir = wt_ctx.checkout_path.join(".gru").join("prompts");
         std::fs::create_dir_all(&prompts_dir).unwrap();
 
-        // Create a custom fix prompt that overrides the built-in
         std::fs::write(
             prompts_dir.join("fix.md"),
             r#"---
@@ -1640,8 +1645,6 @@ requires: [issue]
 CUSTOM: Fix #{{ issue_number }} - {{ issue_title }}"#,
         )
         .unwrap();
-
-        let wt_ctx = test_wt_ctx(tmp.path());
 
         let ctx = IssueContext {
             owner: "owner".to_string(),
