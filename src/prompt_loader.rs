@@ -134,7 +134,7 @@ URL: https://github.com/{{ repo_owner }}/{{ repo_name }}/pull/{{ pr_number }}
 Review this pull request: fetch details, analyze changes, and provide code review feedback.
 
 ## 1. Fetch PR Details
-- The PR title, description, and URL are provided above. Use `gh pr view {{ pr_number }} --repo {{ repo_owner }}/{{ repo_name }} --json files,author,closingIssuesReferences` to get changed files, author, and issues this PR closes in a single call.
+- The PR title, description, and URL are provided above. Use `gh pr view {{ pr_number }} --repo {{ repo_owner }}/{{ repo_name }} --json files,author,closingIssuesReferences --jq '{author: .author.login, files: [.files[].path], closingIssues: [.closingIssuesReferences[].number]}'` to get changed files, author, and issues this PR closes in a single call.
 - Fetch existing review comments: `gh api --paginate repos/{{ repo_owner }}/{{ repo_name }}/pulls/{{ pr_number }}/comments`
 - Understand the scope and intent of the PR, and any prior discussion
 - The code should already be checked out in the current directory
