@@ -207,13 +207,10 @@ pub async fn monitor_pr(
 ) -> Result<MonitorResult> {
     let start_time = Instant::now();
 
-    // Initialize last_check_time to avoid missing reviews submitted during monitor startup
-    // Get existing reviews to set the baseline
-    let existing_reviews = get_all_reviews(owner, repo, pr_number).await?;
-    let mut last_check_time = existing_reviews
-        .last()
-        .map(|r| r.submitted_at)
-        .unwrap_or_else(Utc::now);
+    // Seed baseline to "now" so that pre-existing reviews aren't re-detected
+    // on the first poll.  The get_reviews_since filter uses >= which would
+    // otherwise match the last existing review's submitted_at timestamp.
+    let mut last_check_time = Utc::now();
 
     // Register the Ctrl+C listener once to avoid signal loss between iterations
     let ctrl_c = tokio::signal::ctrl_c();
