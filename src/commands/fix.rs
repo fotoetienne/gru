@@ -1059,6 +1059,7 @@ async fn monitor_pr_lifecycle(
     pr_number: &str,
     timeout_opt: Option<&str>,
     review_timeout: Option<Duration>,
+    monitor_timeout: Duration,
 ) {
     // Auto-trigger review for Minion-created PRs
     println!("\n🔍 Starting automated PR review...");
@@ -1083,13 +1084,39 @@ async fn monitor_pr_lifecycle(
     println!("\n👀 Monitoring PR for updates (polling every 30s)...");
     println!("   Press Ctrl+C to stop monitoring\n");
 
+    let monitor_start = tokio::time::Instant::now();
     let mut review_round = 0;
     loop {
+        // Compute remaining time so the timeout spans the entire lifecycle,
+        // not just a single monitor_pr invocation.
+        let remaining = monitor_timeout.checked_sub(monitor_start.elapsed());
+        if remaining.is_none() || remaining == Some(Duration::ZERO) {
+            let elapsed = monitor_start.elapsed();
+            let total_secs = elapsed.as_secs();
+            let hours = total_secs / 3600;
+            let minutes = (total_secs % 3600) / 60;
+            let secs = total_secs % 60;
+            let display = if hours > 0 {
+                format!("{}h{}m", hours, minutes)
+            } else if minutes > 0 {
+                format!("{}m", minutes)
+            } else {
+                format!("{}s", secs)
+            };
+            println!("⏰ PR monitoring timed out after {}", display);
+            println!(
+                "   PR is still open: https://github.com/{}/{}/pull/{}",
+                issue_ctx.owner, issue_ctx.repo, pr_number
+            );
+            break;
+        }
+
         match pr_monitor::monitor_pr(
             &issue_ctx.owner,
             &issue_ctx.repo,
             pr_number,
             &wt_ctx.worktree_path,
+            remaining,
         )
         .await
         {
@@ -1160,6 +1187,26 @@ async fn monitor_pr_lifecycle(
                 println!("   Fix issues and push updates to the branch");
                 break;
             }
+            Ok(MonitorResult::Timeout) => {
+                // Use the lifecycle-level start time for an accurate total elapsed display
+                let total_secs = monitor_start.elapsed().as_secs();
+                let hours = total_secs / 3600;
+                let minutes = (total_secs % 3600) / 60;
+                let secs = total_secs % 60;
+                let display = if hours > 0 {
+                    format!("{}h{}m", hours, minutes)
+                } else if minutes > 0 {
+                    format!("{}m", minutes)
+                } else {
+                    format!("{}s", secs)
+                };
+                println!("⏰ PR monitoring timed out after {}", display);
+                println!(
+                    "   PR is still open: https://github.com/{}/{}/pull/{}",
+                    issue_ctx.owner, issue_ctx.repo, pr_number
+                );
+                break;
+            }
             Err(e) => {
                 log::warn!("⚠️  PR monitoring failed: {}", e);
                 log::warn!(
@@ -1217,6 +1264,7 @@ pub async fn handle_fix(
     issue: &str,
     timeout_opt: Option<String>,
     review_timeout_opt: Option<String>,
+    monitor_timeout_opt: Option<String>,
     quiet: bool,
     force_new: bool,
 ) -> Result<i32> {
@@ -1225,6 +1273,18 @@ pub async fn handle_fix(
         .map(|s| parse_timeout(&s))
         .transpose()
         .context("Invalid --review-timeout value")?;
+
+    // Parse monitor timeout if provided; default to 24 hours
+    let monitor_timeout = match monitor_timeout_opt {
+        Some(s) => {
+            let d = parse_timeout(&s).context("Invalid --monitor-timeout value")?;
+            if d.is_zero() {
+                anyhow::bail!("--monitor-timeout must be greater than zero");
+            }
+            d
+        }
+        None => Duration::from_secs(24 * 3600),
+    };
 
     // Phase 1: Resolve issue (always runs - need fresh issue details)
     let issue_ctx = resolve_issue(issue).await?;
@@ -1367,6 +1427,7 @@ pub async fn handle_fix(
             pr_num,
             timeout_opt.as_deref(),
             review_timeout,
+            monitor_timeout,
         )
         .await;
     }
