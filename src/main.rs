@@ -137,6 +137,9 @@ enum Commands {
     Status {
         #[arg(help = "Optional ID to filter by (minion ID, issue number, or PR number)")]
         id: Option<String>,
+
+        #[arg(short, long, help = "Show session ID and PID details")]
+        verbose: bool,
     },
     #[command(about = "Stop a running Minion")]
     Stop {
@@ -255,7 +258,7 @@ async fn main() {
             force,
             base_branch,
         } => clean::handle_clean(dry_run, force, &base_branch).await,
-        Commands::Status { id } => status::handle_status(id).await,
+        Commands::Status { id, verbose } => status::handle_status(id, verbose).await,
         Commands::Stop { id } => stop::handle_stop(id).await,
         Commands::Prompt {
             prompt,

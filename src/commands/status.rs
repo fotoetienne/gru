@@ -1,4 +1,4 @@
-use crate::minion_registry::{is_process_alive, with_registry};
+use crate::minion_registry::{is_process_alive, with_registry, MinionMode};
 use crate::stream::TokenUsage;
 use anyhow::{Context, Result};
 
@@ -11,9 +11,12 @@ struct EnhancedMinionInfo {
     task: String,
     pr: Option<String>,
     branch: String,
-    status: String,
+    mode_display: String,
     uptime: String,
     token_usage: Option<TokenUsage>,
+    session_id: String,
+    pid: Option<u32>,
+    worktree_path: String,
 }
 
 /// Intermediate Minion data extracted from registry (without expensive status checks)
@@ -28,6 +31,8 @@ struct BasicMinionData {
     started_at: chrono::DateTime<chrono::Utc>,
     worktree: std::path::PathBuf,
     pid: Option<u32>,
+    mode: MinionMode,
+    session_id: String,
     token_usage: Option<TokenUsage>,
 }
 
@@ -81,11 +86,15 @@ fn get_current_branch(worktree_path: &std::path::Path, registry_branch: &str) ->
     }
 }
 
-/// Determines if a Minion is Active or Stopped based on its registered PID
-fn determine_status(pid: Option<u32>) -> String {
+/// Determines the display mode string based on PID liveness and registered mode
+fn format_mode_display(pid: Option<u32>, mode: &MinionMode) -> String {
     match pid {
-        Some(pid) if is_process_alive(pid) => "Active".to_string(),
-        _ => "Stopped".to_string(),
+        Some(pid) if is_process_alive(pid) => match mode {
+            MinionMode::Autonomous => "running (autonomous)".to_string(),
+            MinionMode::Interactive => "running (interactive)".to_string(),
+            MinionMode::Stopped => "running".to_string(),
+        },
+        _ => "stopped".to_string(),
     }
 }
 
@@ -104,7 +113,7 @@ fn determine_status(pid: Option<u32>) -> String {
 ///
 /// This ensures the lock is only held for the minimum time needed to read/write
 /// the registry file, not for I/O operations.
-pub async fn handle_status(id: Option<String>) -> Result<i32> {
+pub async fn handle_status(id: Option<String>, verbose: bool) -> Result<i32> {
     // Phase 1: Load registry and clean up (with lock held)
     let basic_minions = with_registry(|registry| {
         // Get all minions from registry
@@ -129,6 +138,19 @@ pub async fn handle_status(id: Option<String>) -> Result<i32> {
             );
         }
 
+        // Detect dead processes and update registry
+        let registry_minions = registry.list();
+        for (minion_id, info) in &registry_minions {
+            if let Some(pid) = info.pid {
+                if !is_process_alive(pid) {
+                    registry.update(minion_id, |info| {
+                        info.mode = MinionMode::Stopped;
+                        info.pid = None;
+                    })?;
+                }
+            }
+        }
+
         // Get updated registry after cleanup
         let registry_minions = registry.list();
 
@@ -145,6 +167,8 @@ pub async fn handle_status(id: Option<String>) -> Result<i32> {
                 started_at: info.started_at,
                 worktree: info.worktree,
                 pid: info.pid,
+                mode: info.mode,
+                session_id: info.session_id,
                 token_usage: info.token_usage,
             })
             .collect();
@@ -161,11 +185,11 @@ pub async fn handle_status(id: Option<String>) -> Result<i32> {
             // Filter out worktrees that were removed between Phase 1 and Phase 2
             .filter(|basic| basic.worktree.exists())
             .map(|basic| {
-                // Determine status from PID (accurate, no 5min lag)
-                let status = determine_status(basic.pid);
+                let mode_display = format_mode_display(basic.pid, &basic.mode);
                 let uptime = calculate_uptime(basic.started_at);
                 // Get current branch from worktree (checks for detached HEAD, branch changes, etc.)
                 let branch = get_current_branch(&basic.worktree, &basic.branch);
+                let worktree_path = basic.worktree.display().to_string();
 
                 EnhancedMinionInfo {
                     minion_id: basic.minion_id,
@@ -174,9 +198,12 @@ pub async fn handle_status(id: Option<String>) -> Result<i32> {
                     task: basic.task,
                     pr: basic.pr,
                     branch,
-                    status,
+                    mode_display,
                     uptime,
                     token_usage: basic.token_usage,
+                    session_id: basic.session_id,
+                    pid: basic.pid,
+                    worktree_path,
                 }
             })
             .collect::<Vec<EnhancedMinionInfo>>()
@@ -217,45 +244,74 @@ pub async fn handle_status(id: Option<String>) -> Result<i32> {
         return Ok(0);
     }
 
-    // Sort by: status (active first), then minion_id
-    minions.sort_by(|a, b| match (a.status.as_str(), b.status.as_str()) {
-        ("Active", "Stopped") => std::cmp::Ordering::Less,
-        ("Stopped", "Active") => std::cmp::Ordering::Greater,
-        _ => a.minion_id.cmp(&b.minion_id),
+    // Sort by: running first (anything not "stopped"), then minion_id
+    minions.sort_by(|a, b| {
+        let a_running = !a.mode_display.starts_with("stopped");
+        let b_running = !b.mode_display.starts_with("stopped");
+        match (a_running, b_running) {
+            (true, false) => std::cmp::Ordering::Less,
+            (false, true) => std::cmp::Ordering::Greater,
+            _ => a.minion_id.cmp(&b.minion_id),
+        }
     });
 
     // Print table header
-    println!(
-        "{:<8} {:<20} {:<8} {:<10} {:<8} {:<30} {:<10} {:<8} TOKENS",
-        "MINION", "REPO", "ISSUE", "TASK", "PR", "BRANCH", "STATUS", "UPTIME"
-    );
+    if verbose {
+        println!(
+            "{:<8} {:<8} {:<22} {:<38} {:<8} PATH",
+            "ID", "ISSUE", "MODE", "SESSION ID", "PID"
+        );
+    } else {
+        println!(
+            "{:<8} {:<20} {:<8} {:<10} {:<8} {:<30} {:<22} {:<8} TOKENS",
+            "MINION", "REPO", "ISSUE", "TASK", "PR", "BRANCH", "MODE", "UPTIME"
+        );
+    }
 
     // Print each minion
     for minion in &minions {
-        let issue_display = format!("#{}", minion.issue);
-        let pr_display = minion
-            .pr
-            .as_ref()
-            .map(|pr| format!("#{}", pr))
-            .unwrap_or_else(|| "-".to_string());
-        let tokens_display = minion
-            .token_usage
-            .as_ref()
-            .map(|u| u.display_compact())
-            .unwrap_or_else(|| "-".to_string());
+        if verbose {
+            let issue_display = format!("#{}", minion.issue);
+            let pid_display = minion
+                .pid
+                .map(|p| p.to_string())
+                .unwrap_or_else(|| "-".to_string());
 
-        println!(
-            "{:<8} {:<20} {:<8} {:<10} {:<8} {:<30} {:<10} {:<8} {}",
-            minion.minion_id,
-            minion.repo,
-            issue_display,
-            minion.task,
-            pr_display,
-            minion.branch,
-            minion.status,
-            minion.uptime,
-            tokens_display
-        );
+            println!(
+                "{:<8} {:<8} {:<22} {:<38} {:<8} {}",
+                minion.minion_id,
+                issue_display,
+                minion.mode_display,
+                minion.session_id,
+                pid_display,
+                minion.worktree_path
+            );
+        } else {
+            let issue_display = format!("#{}", minion.issue);
+            let pr_display = minion
+                .pr
+                .as_ref()
+                .map(|pr| format!("#{}", pr))
+                .unwrap_or_else(|| "-".to_string());
+            let tokens_display = minion
+                .token_usage
+                .as_ref()
+                .map(|u| u.display_compact())
+                .unwrap_or_else(|| "-".to_string());
+
+            println!(
+                "{:<8} {:<20} {:<8} {:<10} {:<8} {:<30} {:<22} {:<8} {}",
+                minion.minion_id,
+                minion.repo,
+                issue_display,
+                minion.task,
+                pr_display,
+                minion.branch,
+                minion.mode_display,
+                minion.uptime,
+                tokens_display
+            );
+        }
     }
 
     println!();
@@ -272,7 +328,7 @@ mod tests {
     #[ignore] // Integration test - performs real I/O and git operations
     async fn test_handle_status_no_filter() {
         // This test verifies that handle_status succeeds without filtering
-        let result = handle_status(None).await;
+        let result = handle_status(None, false).await;
         assert!(result.is_ok());
     }
 
@@ -340,25 +396,53 @@ mod tests {
         assert_eq!(calculate_uptime(started), "< 1m");
     }
 
-    // --- determine_status tests ---
+    // --- format_mode_display tests ---
 
     #[test]
-    fn test_determine_status_no_pid() {
-        assert_eq!(determine_status(None), "Stopped");
+    fn test_format_mode_display_no_pid() {
+        assert_eq!(
+            format_mode_display(None, &MinionMode::Autonomous),
+            "stopped"
+        );
     }
 
     #[test]
-    fn test_determine_status_current_process() {
+    fn test_format_mode_display_autonomous_alive() {
         // Our own PID should be alive
         let pid = std::process::id();
-        assert_eq!(determine_status(Some(pid)), "Active");
+        assert_eq!(
+            format_mode_display(Some(pid), &MinionMode::Autonomous),
+            "running (autonomous)"
+        );
     }
 
     #[test]
-    fn test_determine_status_dead_pid() {
+    fn test_format_mode_display_interactive_alive() {
+        let pid = std::process::id();
+        assert_eq!(
+            format_mode_display(Some(pid), &MinionMode::Interactive),
+            "running (interactive)"
+        );
+    }
+
+    #[test]
+    fn test_format_mode_display_dead_pid() {
         // Use a very high PID that's still valid as i32 (positive) but almost certainly
         // doesn't exist. Avoid u32::MAX which wraps to -1 as i32, causing kill(-1,0)
         // to signal all processes.
-        assert_eq!(determine_status(Some(i32::MAX as u32)), "Stopped");
+        assert_eq!(
+            format_mode_display(Some(i32::MAX as u32), &MinionMode::Autonomous),
+            "stopped"
+        );
+    }
+
+    #[test]
+    fn test_format_mode_display_stopped_mode_alive_pid() {
+        // Edge case: PID alive but mode is Stopped (shouldn't normally happen)
+        let pid = std::process::id();
+        assert_eq!(
+            format_mode_display(Some(pid), &MinionMode::Stopped),
+            "running"
+        );
     }
 }
