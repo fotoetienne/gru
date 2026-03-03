@@ -147,9 +147,9 @@ impl Worktree {
     /// Runs `gh pr list --state <state> --head <branch> --json number --jq length`.
     ///
     /// # Error behavior
-    /// - Failure to spawn the `gh`/`ghe` process propagates as `Err` (system-level problem).
-    /// - Non-zero CLI exit (e.g., auth failure, network error) returns `Ok(0)` to degrade
-    ///   gracefully without blocking cleanup of other worktrees.
+    /// - Failure to spawn the `gh`/`ghe` process propagates as `Err`.
+    /// - Non-zero CLI exit (e.g., auth failure, network error) propagates as `Err`.
+    ///   Callers decide the conservative default for their use case.
     async fn count_prs_in_state(&self, state: &str) -> Result<u64> {
         let gh_cmd = github::gh_command_for_repo(&self.repo);
         let output = Command::new(gh_cmd)
@@ -172,7 +172,14 @@ impl Worktree {
             .with_context(|| format!("Failed to run `{} pr list --state {}`", gh_cmd, state))?;
 
         if !output.status.success() {
-            return Ok(0);
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            anyhow::bail!(
+                "`{} pr list --state {}` exited with {}: {}",
+                gh_cmd,
+                state,
+                output.status,
+                stderr
+            );
         }
 
         let count_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
