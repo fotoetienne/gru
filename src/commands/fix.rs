@@ -1207,6 +1207,14 @@ async fn monitor_pr_lifecycle(
                 );
                 break;
             }
+            Ok(MonitorResult::Interrupted) => {
+                println!("\n⚠️  Monitoring interrupted by user");
+                println!(
+                    "   PR is still open: https://github.com/{}/{}/pull/{}",
+                    issue_ctx.owner, issue_ctx.repo, pr_number
+                );
+                break;
+            }
             Err(e) => {
                 log::warn!("⚠️  PR monitoring failed: {}", e);
                 log::warn!(
