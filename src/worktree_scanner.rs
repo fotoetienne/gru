@@ -201,6 +201,8 @@ impl Worktree {
     ///
     /// Squash merges create new commit hashes, so `git branch --merged` won't detect them.
     /// This method uses `gh pr list --state merged --head <branch>` to check GitHub directly.
+    /// Callers should treat errors conservatively (i.e., assume the PR may not have been
+    /// confirmed as merged).
     pub async fn check_pr_merged_on_github(&self) -> Result<bool> {
         Ok(self.count_prs_in_state("merged").await? > 0)
     }

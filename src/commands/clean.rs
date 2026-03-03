@@ -266,6 +266,7 @@ pub async fn handle_clean(dry_run: bool, force: bool, base_branch: &str) -> Resu
     // Check status of each worktree
     let mut cleanable = Vec::new();
     let mut skipped_active_minions = Vec::new();
+    let mut skipped_open_prs = Vec::new();
     for wt in worktrees {
         // Skip if this worktree has an active minion
         // Canonicalize the worktree path for reliable comparison
@@ -305,10 +306,7 @@ pub async fn handle_clean(dry_run: bool, force: bool, base_branch: &str) -> Resu
             });
 
             if has_open_pr {
-                println!(
-                    "  Skipping {} (minion stopped but has open PR)",
-                    wt.path.display()
-                );
+                skipped_open_prs.push(wt);
             } else {
                 cleanable.push((wt, worktree_scanner::WorktreeStatus::MinionStopped));
             }
@@ -336,12 +334,27 @@ pub async fn handle_clean(dry_run: bool, force: bool, base_branch: &str) -> Resu
         }
     }
 
+    // Display skipped worktrees with open PRs
+    if !skipped_open_prs.is_empty() {
+        println!(
+            "Skipped {} worktree(s) with open PRs:\n",
+            skipped_open_prs.len()
+        );
+        for wt in &skipped_open_prs {
+            println!("  {} (open PR)", wt.path.display());
+            println!("    Branch: {}", wt.branch);
+            println!("    Repo: {}", wt.repo);
+            println!();
+        }
+    }
+
     if cleanable.is_empty() && orphaned_minions.is_empty() {
-        if skipped_active_minions.is_empty() {
+        let has_skips = !skipped_active_minions.is_empty() || !skipped_open_prs.is_empty();
+        if !has_skips {
             println!("No worktrees to clean.");
         } else {
             println!(
-                "No cleanable worktrees found (all worktrees were skipped due to active minions)."
+                "No cleanable worktrees found (skipped worktrees have active minions or open PRs)."
             );
         }
         return Ok(0);
