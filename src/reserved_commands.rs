@@ -17,10 +17,10 @@ use anyhow::{bail, Result};
 /// 2. Quoted strings → ad-hoc prompts
 /// 3. Unquoted strings → prompt file lookup (can override built-ins)
 ///
-/// **Important**: Commands like `do`, `review`, `init`, etc. are NOT in this list
+/// **Important**: Commands like `do`, `review`, etc. are NOT in this list
 /// because they are built-in prompts (Phase 4) that teams can override with
-/// custom versions in `.gru/prompts/`. Reserved commands are truly protected
-/// system commands that must always resolve to their hardcoded CLI behavior.
+/// custom versions in `.gru/prompts/`. By contrast, commands like `init` are
+/// hardcoded CLI subcommands, not prompts, and are not overrideable via prompt files.
 ///
 /// This will be used by the prompt file loader (Phase 2) to validate that
 /// `.gru/prompts/*.md` files don't use these reserved names.

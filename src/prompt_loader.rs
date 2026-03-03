@@ -548,6 +548,11 @@ fn load_prompts_internal(
 /// This is the main entry point for commands like `gru do` that need to load
 /// a built-in prompt while allowing user overrides.
 ///
+/// **Backward compatibility:** When resolving the `"do"` prompt, if the result is
+/// the built-in (no user override via `do.md`), this also checks for a legacy
+/// `fix.md` override and uses it with a deprecation warning. This ensures existing
+/// `.gru/prompts/fix.md` files continue to work after the `fix` → `do` rename.
+///
 /// **Performance note:** This loads all prompts from disk (scanning `.gru/prompts/`
 /// directories) and then extracts the requested one. The cost is proportional to
 /// the total number of prompt files, not O(1). This is acceptable since the number
@@ -557,7 +562,30 @@ fn load_prompts_internal(
 /// Returns `None` if no prompt with that name exists (neither built-in nor custom).
 pub fn resolve_prompt(name: &str, repo_root: Option<&Path>) -> Result<Option<Prompt>> {
     let mut prompts = load_prompts(repo_root)?;
-    Ok(prompts.remove(name))
+
+    let prompt = prompts.remove(name);
+
+    // Backward compatibility: "do" was previously named "fix".
+    // If we resolved the built-in "do" (no user override via do.md),
+    // check if the user has a "fix.md" override and use that instead.
+    if name == "do" {
+        if let Some(ref p) = prompt {
+            if matches!(p.source, PromptSource::BuiltIn) {
+                if let Some(mut fix_prompt) = prompts.remove("fix") {
+                    if !matches!(fix_prompt.source, PromptSource::BuiltIn) {
+                        log::warn!(
+                            "Deprecation: prompt override 'fix.md' found. \
+                             Please rename to 'do.md' — 'fix.md' support will be removed in a future version."
+                        );
+                        fix_prompt.name = "do".to_string();
+                        return Ok(Some(fix_prompt));
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(prompt)
 }
 
 /// Collects required parameters that are missing or have empty/whitespace-only values
@@ -1725,6 +1753,56 @@ Custom do for issue #{{ issue_number }}"#,
         let temp_dir = TempDir::new().unwrap();
         let prompt = resolve_prompt("nonexistent", Some(temp_dir.path())).unwrap();
         assert!(prompt.is_none());
+    }
+
+    #[test]
+    fn test_resolve_do_falls_back_to_fix_md_override() {
+        let temp_dir = TempDir::new().unwrap();
+        let prompts_dir = temp_dir.path().join(".gru").join("prompts");
+        fs::create_dir_all(&prompts_dir).unwrap();
+
+        // Create a legacy fix.md repo override (no do.md present)
+        fs::write(
+            prompts_dir.join("fix.md"),
+            "---\ndescription: Legacy fix override\nrequires: [issue]\n---\nLegacy fix content",
+        )
+        .unwrap();
+
+        let prompt = resolve_prompt("do", Some(temp_dir.path())).unwrap();
+        assert!(prompt.is_some());
+
+        let prompt = prompt.unwrap();
+        // Should use the fix.md content but rename to "do"
+        assert_eq!(prompt.name, "do");
+        assert!(matches!(prompt.source, PromptSource::Repo(_)));
+        assert_eq!(prompt.content, "Legacy fix content");
+    }
+
+    #[test]
+    fn test_resolve_do_prefers_do_md_over_fix_md() {
+        let temp_dir = TempDir::new().unwrap();
+        let prompts_dir = temp_dir.path().join(".gru").join("prompts");
+        fs::create_dir_all(&prompts_dir).unwrap();
+
+        // Create both do.md and fix.md — do.md should win
+        fs::write(
+            prompts_dir.join("do.md"),
+            "---\ndescription: New do override\nrequires: [issue]\n---\nNew do content",
+        )
+        .unwrap();
+        fs::write(
+            prompts_dir.join("fix.md"),
+            "---\ndescription: Legacy fix override\nrequires: [issue]\n---\nLegacy fix content",
+        )
+        .unwrap();
+
+        let prompt = resolve_prompt("do", Some(temp_dir.path())).unwrap();
+        assert!(prompt.is_some());
+
+        let prompt = prompt.unwrap();
+        assert_eq!(prompt.name, "do");
+        assert!(matches!(prompt.source, PromptSource::Repo(_)));
+        assert_eq!(prompt.content, "New do content");
     }
 
     #[test]

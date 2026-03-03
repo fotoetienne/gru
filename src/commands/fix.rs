@@ -720,8 +720,9 @@ async fn setup_worktree(ctx: &IssueContext) -> Result<WorktreeContext> {
 
 /// Builds the prompt string from issue context using the prompt template system.
 ///
-/// Loads the "do" prompt template (built-in or overridden via `.gru/prompts/do.md`),
-/// builds a `PromptContext` from the issue details, and renders the template.
+/// Loads the "do" prompt template (built-in or overridden via `.gru/prompts/do.md`
+/// or legacy `.gru/prompts/fix.md`), builds a `PromptContext` from the issue
+/// details, and renders the template.
 /// Falls back to `/do <issue_num>` when issue details are unavailable.
 fn build_fix_prompt(ctx: &IssueContext, wt_ctx: &WorktreeContext) -> String {
     let Some(ref details) = ctx.details else {
