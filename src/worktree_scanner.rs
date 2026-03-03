@@ -142,109 +142,68 @@ impl Worktree {
         Ok(output.stdout.is_empty())
     }
 
+    /// Count PRs in a given state for this branch on GitHub.
+    ///
+    /// Runs `gh pr list --state <state> --head <branch> --json number --jq length`.
+    ///
+    /// # Error behavior
+    /// - Failure to spawn the `gh`/`ghe` process propagates as `Err` (system-level problem).
+    /// - Non-zero CLI exit (e.g., auth failure, network error) returns `Ok(0)` to degrade
+    ///   gracefully without blocking cleanup of other worktrees.
+    async fn count_prs_in_state(&self, state: &str) -> Result<u64> {
+        let gh_cmd = github::gh_command_for_repo(&self.repo);
+        let output = Command::new(gh_cmd)
+            .args([
+                "pr",
+                "list",
+                "--state",
+                state,
+                "--head",
+                &self.branch,
+                "--repo",
+                &self.repo,
+                "--json",
+                "number",
+                "--jq",
+                "length",
+            ])
+            .output()
+            .await
+            .with_context(|| format!("Failed to run `{} pr list --state {}`", gh_cmd, state))?;
+
+        if !output.status.success() {
+            return Ok(0);
+        }
+
+        let count_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if count_str.is_empty() {
+            return Ok(0);
+        }
+
+        Ok(count_str.parse().unwrap_or_else(|_| {
+            log::warn!(
+                "Unexpected output from '{} pr list --jq length': {:?}",
+                gh_cmd,
+                count_str
+            );
+            0
+        }))
+    }
+
     /// Check if a PR for this branch was merged on GitHub (handles squash merges)
     ///
     /// Squash merges create new commit hashes, so `git branch --merged` won't detect them.
     /// This method uses `gh pr list --state merged --head <branch>` to check GitHub directly.
-    ///
-    /// # Error behavior
-    /// - Failure to spawn the `gh`/`ghe` process propagates as `Err` (system-level problem).
-    /// - Non-zero CLI exit (e.g., auth failure, network error) returns `Ok(false)` to degrade
-    ///   gracefully without blocking cleanup of other worktrees.
     pub async fn check_pr_merged_on_github(&self) -> Result<bool> {
-        let gh_cmd = github::gh_command_for_repo(&self.repo);
-        let output = Command::new(gh_cmd)
-            .args([
-                "pr",
-                "list",
-                "--state",
-                "merged",
-                "--head",
-                &self.branch,
-                "--repo",
-                &self.repo,
-                "--json",
-                "number",
-                "--jq",
-                "length",
-            ])
-            .output()
-            .await
-            .context("Failed to check PR merge status on GitHub")?;
-
-        if !output.status.success() {
-            return Ok(false);
-        }
-
-        let count_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        let count: u64 = if count_str.is_empty() {
-            0
-        } else {
-            match count_str.parse() {
-                Ok(n) => n,
-                Err(_) => {
-                    log::warn!(
-                        "Unexpected output from '{} pr list --jq length': {:?}",
-                        gh_cmd,
-                        count_str
-                    );
-                    0
-                }
-            }
-        };
-        Ok(count > 0)
+        Ok(self.count_prs_in_state("merged").await? > 0)
     }
 
-    /// Check if there is an open PR for this branch on GitHub
+    /// Check if there is an open PR for this branch on GitHub.
     ///
     /// Used to prevent cleaning worktrees that have PRs under review.
-    ///
-    /// # Error behavior
-    /// - Failure to spawn the `gh`/`ghe` process propagates as `Err` (system-level problem).
-    /// - Non-zero CLI exit (e.g., auth failure, network error) returns `Ok(false)` to degrade
-    ///   gracefully without blocking cleanup of other worktrees.
+    /// Callers should treat errors conservatively (i.e., assume an open PR may exist).
     pub async fn check_has_open_pr(&self) -> Result<bool> {
-        let gh_cmd = github::gh_command_for_repo(&self.repo);
-        let output = Command::new(gh_cmd)
-            .args([
-                "pr",
-                "list",
-                "--state",
-                "open",
-                "--head",
-                &self.branch,
-                "--repo",
-                &self.repo,
-                "--json",
-                "number",
-                "--jq",
-                "length",
-            ])
-            .output()
-            .await
-            .context("Failed to check for open PRs on GitHub")?;
-
-        if !output.status.success() {
-            return Ok(false);
-        }
-
-        let count_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        let count: u64 = if count_str.is_empty() {
-            0
-        } else {
-            match count_str.parse() {
-                Ok(n) => n,
-                Err(_) => {
-                    log::warn!(
-                        "Unexpected output from '{} pr list --jq length': {:?}",
-                        gh_cmd,
-                        count_str
-                    );
-                    0
-                }
-            }
-        };
-        Ok(count > 0)
+        Ok(self.count_prs_in_state("open").await? > 0)
     }
 
     /// Determine the overall status of this worktree

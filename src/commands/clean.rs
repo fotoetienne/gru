@@ -297,18 +297,16 @@ pub async fn handle_clean(dry_run: bool, force: bool, base_branch: &str) -> Resu
         } else if stopped_minion_worktrees.contains(&canonical_wt_path) {
             // Git status says "active" but the minion process is stopped.
             // Before marking as cleanable, check if there's an open PR under review.
-            let has_open_pr = wt
-                .check_has_open_pr()
-                .await
-                .map_err(|e| {
-                    log::warn!("Warning: Failed to check for open PRs: {}", e);
-                    e
-                })
-                .unwrap_or(false);
+            let has_open_pr = wt.check_has_open_pr().await.unwrap_or_else(|e| {
+                log::warn!("Warning: Failed to check for open PRs: {}", e);
+                // Conservative default: assume an open PR exists so we don't
+                // accidentally clean a worktree under review.
+                true
+            });
 
             if has_open_pr {
-                log::info!(
-                    "Skipping {} — minion stopped but has open PR",
+                println!(
+                    "  Skipping {} (minion stopped but has open PR)",
                     wt.path.display()
                 );
             } else {
