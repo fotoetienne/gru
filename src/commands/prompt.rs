@@ -317,6 +317,10 @@ fn format_prompt_info(prompt: &prompt_loader::Prompt) -> String {
         )
         .unwrap();
     } else if matches!(prompt.source, prompt_loader::PromptSource::Global(_)) && matches_builtin {
+        // Note: currently unreachable through handle_prompt_info() because
+        // load_prompts() resolves by priority and overwrites global entries with
+        // built-ins of the same name. Kept for correctness if this formatter is
+        // ever called from a different code path.
         writeln!(
             output,
             "\nTemplate location: {} (shadowed by built-in)",
