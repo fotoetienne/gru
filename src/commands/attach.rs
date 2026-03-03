@@ -207,7 +207,7 @@ pub async fn handle_attach(
 /// Prompts the user whether to auto-resume autonomous monitoring.
 ///
 /// Returns `true` if the user confirmed (Enter, "y", or "yes"), `false` otherwise
-/// (including "n", Ctrl+C, or any read error).
+/// (including "n", Ctrl+C, Ctrl+D, or any read error).
 async fn prompt_auto_resume() -> bool {
     use std::io::Write;
     use tokio::io::AsyncBufReadExt;
@@ -220,9 +220,17 @@ async fn prompt_auto_resume() -> bool {
     let mut input = String::new();
     let stdin = tokio::io::stdin();
     let mut reader = tokio::io::BufReader::new(stdin);
-    match reader.read_line(&mut input).await {
-        Ok(0) | Err(_) => false, // EOF (Ctrl+D) or error
-        Ok(_) => is_affirmative(&input),
+
+    // Race stdin against Ctrl+C so the user isn't stuck at the prompt
+    // if SIGINT is caught by Tokio instead of killing the process.
+    tokio::select! {
+        result = reader.read_line(&mut input) => {
+            match result {
+                Ok(0) | Err(_) => false, // EOF (Ctrl+D) or error
+                Ok(_) => is_affirmative(&input),
+            }
+        }
+        _ = tokio::signal::ctrl_c() => false,
     }
 }
 
