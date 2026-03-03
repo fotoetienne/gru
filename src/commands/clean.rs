@@ -15,9 +15,13 @@ fn is_ephemeral_file(path: &Path) -> bool {
 
     // Check for specific ephemeral files
     // Note: Cargo.lock is ephemeral for binary projects (auto-regenerated)
-    // Note: events.jsonl and PR_DESCRIPTION.md now live in the minion_dir
-    // (parent of checkout/), not in the git checkout, so they're not listed here.
-    if matches!(file_name, "Cargo.lock" | ".DS_Store" | "Thumbs.db") {
+    // Note: events.jsonl and PR_DESCRIPTION.md live in the minion_dir in new
+    // layouts (parent of checkout/), but we keep them here for legacy worktrees
+    // where these files still live at the git worktree root.
+    if matches!(
+        file_name,
+        "Cargo.lock" | ".DS_Store" | "Thumbs.db" | "events.jsonl" | "PR_DESCRIPTION.md"
+    ) {
         return true;
     }
 
@@ -512,7 +516,18 @@ pub async fn handle_clean(dry_run: bool, force: bool, base_branch: &str) -> Resu
                 .unwrap_or(false)
             {
                 if let Some(parent_dir) = wt.path.parent() {
-                    if parent_dir.exists() {
+                    // Safety: only remove directories inside the Gru workspace work dir
+                    // to avoid accidentally deleting user-created worktrees outside ~/.gru/
+                    let work_dir = ws
+                        .work()
+                        .canonicalize()
+                        .unwrap_or_else(|_| ws.work().to_path_buf());
+                    let safe_to_remove = parent_dir
+                        .canonicalize()
+                        .map(|p| p.starts_with(&work_dir))
+                        .unwrap_or(false);
+
+                    if safe_to_remove && parent_dir.exists() {
                         if let Err(e) = tokio::fs::remove_dir_all(parent_dir).await {
                             log::warn!(
                                 "  Warning: Failed to remove minion directory {}: {}",
@@ -520,6 +535,11 @@ pub async fn handle_clean(dry_run: bool, force: bool, base_branch: &str) -> Resu
                                 e
                             );
                         }
+                    } else if parent_dir.exists() && !safe_to_remove {
+                        log::warn!(
+                            "  Skipping minion dir cleanup: {} is outside workspace",
+                            parent_dir.display()
+                        );
                     }
                 }
             }
@@ -634,9 +654,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_is_not_ephemeral_file_events_log() {
-        // events.jsonl now lives in minion_dir, not in git checkout
-        assert!(!is_ephemeral_file(Path::new("events.jsonl")));
+    fn test_is_ephemeral_file_events_log() {
+        // Kept as ephemeral for legacy worktrees where it lives at git root
+        assert!(is_ephemeral_file(Path::new("events.jsonl")));
     }
 
     #[test]
@@ -655,9 +675,9 @@ mod tests {
     }
 
     #[test]
-    fn test_is_not_ephemeral_file_pr_description() {
-        // PR_DESCRIPTION.md now lives in minion_dir, not in git checkout
-        assert!(!is_ephemeral_file(Path::new("PR_DESCRIPTION.md")));
+    fn test_is_ephemeral_file_pr_description() {
+        // Kept as ephemeral for legacy worktrees where it lives at git root
+        assert!(is_ephemeral_file(Path::new("PR_DESCRIPTION.md")));
     }
 
     #[test]

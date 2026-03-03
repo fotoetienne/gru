@@ -139,7 +139,9 @@ impl PromptContext {
         if let Some(ref p) = self.worktree_path {
             vars.insert("worktree_path".to_string(), p.display().to_string());
         }
-        if let Some(ref p) = self.minion_dir {
+        // Default minion_dir to worktree_path when not explicitly set,
+        // so {{ minion_dir }} in prompts always resolves to a valid path.
+        if let Some(p) = self.minion_dir.as_ref().or(self.worktree_path.as_ref()) {
             vars.insert("minion_dir".to_string(), p.display().to_string());
         }
         if let Some(ref s) = self.branch_name {

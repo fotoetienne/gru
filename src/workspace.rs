@@ -229,18 +229,17 @@ impl Workspace {
 
 /// Resolves the checkout path from a minion directory.
 ///
-/// New-style minion directories have a `checkout/` subdirectory containing the
-/// git worktree. Legacy minion directories have the git worktree directly in
-/// the minion directory (no `checkout/` subdirectory).
-///
-/// Returns `minion_dir/checkout` if it exists, otherwise `minion_dir` itself.
+/// Prefers `minion_dir/checkout` only if it looks like a Git worktree
+/// (i.e., contains a `.git` marker). Otherwise falls back to `minion_dir`
+/// itself (supporting legacy layouts and avoiding stale/empty `checkout/`).
 pub fn resolve_checkout_path(minion_dir: &Path) -> PathBuf {
     let checkout = minion_dir.join("checkout");
-    if checkout.exists() {
-        checkout
-    } else {
-        minion_dir.to_path_buf()
+    if checkout.join(".git").exists() {
+        return checkout;
     }
+
+    // Legacy layout or no checkout/ subdir — use minion_dir itself.
+    minion_dir.to_path_buf()
 }
 
 #[cfg(test)]
@@ -338,7 +337,13 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let minion_dir = tmp.path().join("minion");
         let checkout_dir = minion_dir.join("checkout");
+        // Create checkout/ with a .git marker (simulates a real worktree)
         fs::create_dir_all(&checkout_dir).unwrap();
+        fs::write(
+            checkout_dir.join(".git"),
+            "gitdir: ../../../repo.git/worktrees/checkout",
+        )
+        .unwrap();
 
         let resolved = super::resolve_checkout_path(&minion_dir);
         assert_eq!(resolved, checkout_dir);
@@ -350,6 +355,18 @@ mod tests {
         let minion_dir = tmp.path().join("minion");
         fs::create_dir_all(&minion_dir).unwrap();
         // No checkout/ subdir — legacy layout
+
+        let resolved = super::resolve_checkout_path(&minion_dir);
+        assert_eq!(resolved, minion_dir);
+    }
+
+    #[test]
+    fn test_resolve_checkout_path_stale_checkout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let minion_dir = tmp.path().join("minion");
+        let checkout_dir = minion_dir.join("checkout");
+        // Create checkout/ without .git — stale/empty dir should be ignored
+        fs::create_dir_all(&checkout_dir).unwrap();
 
         let resolved = super::resolve_checkout_path(&minion_dir);
         assert_eq!(resolved, minion_dir);

@@ -1516,8 +1516,9 @@ mod tests {
     /// Creates a test `WorktreeContext` with separate minion_dir and checkout_path.
     fn test_wt_ctx(path: &std::path::Path) -> WorktreeContext {
         let checkout = path.join("checkout");
-        // Create checkout dir so resolve_checkout_path detects new layout
+        // Create checkout dir with .git marker so resolve_checkout_path detects new layout
         let _ = std::fs::create_dir_all(&checkout);
+        let _ = std::fs::write(checkout.join(".git"), "gitdir: test");
         WorktreeContext {
             minion_id: "M001".to_string(),
             branch_name: "minion/issue-42-M001".to_string(),
