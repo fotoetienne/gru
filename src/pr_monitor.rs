@@ -194,6 +194,7 @@ struct CheckRunsResponse {
 ///
 /// # Arguments
 /// * `worktree_path` - Reserved for future use (e.g., reading local git state, logging)
+/// * `max_duration` - Optional maximum duration before returning `MonitorResult::Timeout`
 ///
 /// Returns `Ok(MonitorResult)` when an event requires action or the PR reaches a terminal state.
 pub async fn monitor_pr(
@@ -218,7 +219,7 @@ pub async fn monitor_pr(
         if let Some(max) = max_duration {
             let elapsed = start_time.elapsed();
             if elapsed >= max {
-                return Ok(MonitorResult::Timeout(elapsed));
+                return Ok(MonitorResult::Timeout);
             }
         }
 
@@ -269,7 +270,7 @@ pub enum MonitorResult {
     /// CI checks failed (count)
     FailedChecks(usize),
     /// Monitoring timed out after the configured duration
-    Timeout(Duration),
+    Timeout,
 }
 
 /// Fetch PR details using gh CLI with retry logic for transient failures
@@ -1154,15 +1155,14 @@ mod tests {
     // ========================================================================
 
     #[test]
-    fn test_timeout_variant_stores_duration() {
-        let duration = Duration::from_secs(3600);
-        let result = MonitorResult::Timeout(duration);
-        assert!(matches!(result, MonitorResult::Timeout(d) if d.as_secs() == 3600));
+    fn test_timeout_variant() {
+        let result = MonitorResult::Timeout;
+        assert!(matches!(result, MonitorResult::Timeout));
     }
 
     #[test]
     fn test_timeout_variant_debug_format() {
-        let result = MonitorResult::Timeout(Duration::from_secs(7200));
+        let result = MonitorResult::Timeout;
         let debug = format!("{:?}", result);
         assert!(debug.contains("Timeout"));
     }

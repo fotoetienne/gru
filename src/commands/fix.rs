@@ -1084,14 +1084,39 @@ async fn monitor_pr_lifecycle(
     println!("\n👀 Monitoring PR for updates (polling every 30s)...");
     println!("   Press Ctrl+C to stop monitoring\n");
 
+    let monitor_start = tokio::time::Instant::now();
     let mut review_round = 0;
     loop {
+        // Compute remaining time so the timeout spans the entire lifecycle,
+        // not just a single monitor_pr invocation.
+        let remaining = monitor_timeout.checked_sub(monitor_start.elapsed());
+        if remaining.is_none() || remaining == Some(Duration::ZERO) {
+            let elapsed = monitor_start.elapsed();
+            let total_secs = elapsed.as_secs();
+            let hours = total_secs / 3600;
+            let minutes = (total_secs % 3600) / 60;
+            let secs = total_secs % 60;
+            let display = if hours > 0 {
+                format!("{}h{}m", hours, minutes)
+            } else if minutes > 0 {
+                format!("{}m", minutes)
+            } else {
+                format!("{}s", secs)
+            };
+            println!("⏰ PR monitoring timed out after {}", display);
+            println!(
+                "   PR is still open: https://github.com/{}/{}/pull/{}",
+                issue_ctx.owner, issue_ctx.repo, pr_number
+            );
+            break;
+        }
+
         match pr_monitor::monitor_pr(
             &issue_ctx.owner,
             &issue_ctx.repo,
             pr_number,
             &wt_ctx.worktree_path,
-            Some(monitor_timeout),
+            remaining,
         )
         .await
         {
@@ -1162,19 +1187,20 @@ async fn monitor_pr_lifecycle(
                 println!("   Fix issues and push updates to the branch");
                 break;
             }
-            Ok(MonitorResult::Timeout(duration)) => {
-                let total_secs = duration.as_secs();
+            Ok(MonitorResult::Timeout) => {
+                // Use the lifecycle-level start time for an accurate total elapsed display
+                let total_secs = monitor_start.elapsed().as_secs();
                 let hours = total_secs / 3600;
                 let minutes = (total_secs % 3600) / 60;
                 let secs = total_secs % 60;
-                let elapsed = if hours > 0 {
+                let display = if hours > 0 {
                     format!("{}h{}m", hours, minutes)
                 } else if minutes > 0 {
                     format!("{}m", minutes)
                 } else {
                     format!("{}s", secs)
                 };
-                println!("⏰ PR monitoring timed out after {}", elapsed);
+                println!("⏰ PR monitoring timed out after {}", display);
                 println!(
                     "   PR is still open: https://github.com/{}/{}/pull/{}",
                     issue_ctx.owner, issue_ctx.repo, pr_number
