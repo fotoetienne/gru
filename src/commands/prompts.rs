@@ -196,6 +196,17 @@ mod tests {
         // No repo prompts exist, so no built-in can be marked [OVERRIDDEN].
         // Only repo prompts override built-ins; global prompts are shadowed BY built-ins.
         assert!(prompts.repo.is_empty());
+
+        // Derive the override set as handle_prompts does and verify that
+        // the global "fix" prompt is NOT considered an override.
+        let built_in_names: Vec<&str> = BUILT_IN_PROMPTS.iter().map(|b| b.name).collect();
+        let repo_override_names: Vec<&str> = prompts
+            .repo
+            .iter()
+            .filter(|p| built_in_names.contains(&p.name.as_str()))
+            .map(|p| p.name.as_str())
+            .collect();
+        assert!(!repo_override_names.contains(&"fix"));
     }
 
     #[test]
