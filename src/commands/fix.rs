@@ -1059,6 +1059,7 @@ async fn monitor_pr_lifecycle(
     pr_number: &str,
     timeout_opt: Option<&str>,
     review_timeout: Option<Duration>,
+    monitor_timeout: Duration,
 ) {
     // Auto-trigger review for Minion-created PRs
     println!("\n🔍 Starting automated PR review...");
@@ -1090,6 +1091,7 @@ async fn monitor_pr_lifecycle(
             &issue_ctx.repo,
             pr_number,
             &wt_ctx.worktree_path,
+            Some(monitor_timeout),
         )
         .await
         {
@@ -1160,6 +1162,20 @@ async fn monitor_pr_lifecycle(
                 println!("   Fix issues and push updates to the branch");
                 break;
             }
+            Ok(MonitorResult::Timeout(duration)) => {
+                let hours = duration.as_secs() / 3600;
+                let minutes = (duration.as_secs() % 3600) / 60;
+                if hours > 0 {
+                    println!("⏰ PR monitoring timed out after {}h{}m", hours, minutes);
+                } else {
+                    println!("⏰ PR monitoring timed out after {}m", minutes);
+                }
+                println!(
+                    "   PR is still open: https://github.com/{}/{}/pull/{}",
+                    issue_ctx.owner, issue_ctx.repo, pr_number
+                );
+                break;
+            }
             Err(e) => {
                 log::warn!("⚠️  PR monitoring failed: {}", e);
                 log::warn!(
@@ -1217,6 +1233,7 @@ pub async fn handle_fix(
     issue: &str,
     timeout_opt: Option<String>,
     review_timeout_opt: Option<String>,
+    monitor_timeout_opt: Option<String>,
     quiet: bool,
     force_new: bool,
 ) -> Result<i32> {
@@ -1225,6 +1242,12 @@ pub async fn handle_fix(
         .map(|s| parse_timeout(&s))
         .transpose()
         .context("Invalid --review-timeout value")?;
+
+    // Parse monitor timeout if provided; default to 24 hours
+    let monitor_timeout = match monitor_timeout_opt {
+        Some(s) => parse_timeout(&s).context("Invalid --monitor-timeout value")?,
+        None => Duration::from_secs(24 * 3600),
+    };
 
     // Phase 1: Resolve issue (always runs - need fresh issue details)
     let issue_ctx = resolve_issue(issue).await?;
@@ -1367,6 +1390,7 @@ pub async fn handle_fix(
             pr_num,
             timeout_opt.as_deref(),
             review_timeout,
+            monitor_timeout,
         )
         .await;
     }

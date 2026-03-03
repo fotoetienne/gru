@@ -4,7 +4,7 @@ use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use std::path::Path;
 use std::process::Output;
-use tokio::time::{sleep, Duration};
+use tokio::time::{sleep, Duration, Instant};
 
 const POLL_INTERVAL_SECS: u64 = 30;
 // Use 5 retries for PR monitoring (lower than CLAUDE.md's 10-15 guideline)
@@ -201,7 +201,10 @@ pub async fn monitor_pr(
     repo: &str,
     pr_number: &str,
     _worktree_path: &Path,
+    max_duration: Option<Duration>,
 ) -> Result<MonitorResult> {
+    let start_time = Instant::now();
+
     // Initialize last_check_time to avoid missing reviews submitted during monitor startup
     // Get existing reviews to set the baseline
     let existing_reviews = get_all_reviews(owner, repo, pr_number).await?;
@@ -211,6 +214,13 @@ pub async fn monitor_pr(
         .unwrap_or_else(Utc::now);
 
     loop {
+        // Check if we've exceeded the maximum duration
+        if let Some(max) = max_duration {
+            if start_time.elapsed() >= max {
+                return Ok(MonitorResult::Timeout(max));
+            }
+        }
+
         // Fetch PR state
         let pr = get_pr(owner, repo, pr_number).await?;
 
@@ -257,6 +267,8 @@ pub enum MonitorResult {
     NewReviews(Vec<ReviewComment>),
     /// CI checks failed (count)
     FailedChecks(usize),
+    /// Monitoring timed out after the configured duration
+    Timeout(Duration),
 }
 
 /// Fetch PR details using gh CLI with retry logic for transient failures
@@ -1134,5 +1146,23 @@ mod tests {
         assert_eq!(calculate_retry_delay(6), MAX_DELAY_SECS);
         assert_eq!(calculate_retry_delay(7), MAX_DELAY_SECS);
         assert_eq!(calculate_retry_delay(10), MAX_DELAY_SECS);
+    }
+
+    // ========================================================================
+    // MonitorResult::Timeout Tests
+    // ========================================================================
+
+    #[test]
+    fn test_timeout_variant_stores_duration() {
+        let duration = Duration::from_secs(3600);
+        let result = MonitorResult::Timeout(duration);
+        assert!(matches!(result, MonitorResult::Timeout(d) if d.as_secs() == 3600));
+    }
+
+    #[test]
+    fn test_timeout_variant_debug_format() {
+        let result = MonitorResult::Timeout(Duration::from_secs(7200));
+        let debug = format!("{:?}", result);
+        assert!(debug.contains("Timeout"));
     }
 }

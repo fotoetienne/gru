@@ -69,6 +69,12 @@ enum Commands {
 
         #[arg(
             long,
+            help = "Maximum duration for PR monitoring (e.g., '2h', '24h'). Defaults to 24 hours."
+        )]
+        monitor_timeout: Option<String>,
+
+        #[arg(
+            long,
             help = "Create a new Minion even if one already exists for this issue"
         )]
         force_new: bool,
@@ -239,8 +245,19 @@ async fn main() {
             issue,
             timeout,
             review_timeout,
+            monitor_timeout,
             force_new,
-        } => fix::handle_fix(&issue, timeout, review_timeout, cli.quiet, force_new).await,
+        } => {
+            fix::handle_fix(
+                &issue,
+                timeout,
+                review_timeout,
+                monitor_timeout,
+                cli.quiet,
+                force_new,
+            )
+            .await
+        }
         Commands::Review { pr } => review::handle_review(pr).await,
         Commands::Rebase { target } => rebase::handle_rebase(target).await,
         Commands::Path { id, issue, pr } => path::handle_path(id, issue, pr).await,
