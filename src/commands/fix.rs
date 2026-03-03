@@ -1,7 +1,7 @@
 use crate::ci;
 use crate::claude_runner::{
-    build_claude_command, build_claude_resume_command, parse_timeout,
-    run_claude_with_stream_monitoring, ClaudeRunnerError, EXIT_CODE_SIGNAL_TERMINATED,
+    build_claude_command, build_claude_resume_command, is_stuck_or_timeout_error, parse_timeout,
+    run_claude_with_stream_monitoring, EXIT_CODE_SIGNAL_TERMINATED,
 };
 use crate::git;
 use crate::github::GitHubClient;
@@ -36,12 +36,6 @@ const TRIM_OUTPUT_BUFFER_SIZE: usize = 5000;
 /// Maximum number of review rounds to handle automatically
 /// After this limit, the user must handle additional reviews manually
 const MAX_REVIEW_ROUNDS: usize = 5;
-
-/// Returns true if the error indicates the task is stuck or timed out,
-/// meaning it should be labeled `minion:blocked` instead of `minion:failed`.
-fn is_stuck_or_timeout_error(err: &anyhow::Error) -> bool {
-    err.downcast_ref::<ClaudeRunnerError>().is_some()
-}
 
 // ---------------------------------------------------------------------------
 // Phase context structs
@@ -83,7 +77,7 @@ pub(crate) struct ClaudeResult {
 // ---------------------------------------------------------------------------
 
 /// Checks if a branch has been pushed to the remote
-async fn is_branch_pushed(worktree_path: &Path, branch_name: &str) -> Result<bool> {
+pub(crate) async fn is_branch_pushed(worktree_path: &Path, branch_name: &str) -> Result<bool> {
     let output = TokioCommand::new("git")
         .arg("-C")
         .arg(worktree_path)
@@ -369,7 +363,7 @@ async fn try_mark_issue_blocked(client: &GitHubClient, owner: &str, repo: &str, 
 
 /// Updates the orchestration phase for a minion in the registry.
 /// Logs a warning if the update fails, since phase tracking is important for resume correctness.
-async fn update_orchestration_phase(minion_id: &str, phase: OrchestrationPhase) {
+pub(crate) async fn update_orchestration_phase(minion_id: &str, phase: OrchestrationPhase) {
     let minion_id_owned = minion_id.to_string();
     let phase_name = format!("{:?}", phase);
     if let Err(e) = with_registry(move |registry| {
@@ -957,7 +951,7 @@ async fn run_claude_session_inner(
 
 /// Creates a PR for the branch and updates labels/registry.
 /// Returns the PR number if successful.
-async fn handle_pr_creation(
+pub(crate) async fn handle_pr_creation(
     issue_ctx: &IssueContext,
     wt_ctx: &WorktreeContext,
 ) -> Result<Option<String>> {
@@ -1415,6 +1409,7 @@ pub async fn handle_fix(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::claude_runner::ClaudeRunnerError;
 
     #[tokio::test]
     async fn test_is_branch_pushed_nonexistent() {

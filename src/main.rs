@@ -109,16 +109,20 @@ enum Commands {
         )]
         yolo: bool,
     },
-    #[command(about = "Resume a Minion's Claude session")]
+    #[command(about = "Resume a Minion in autonomous mode (stream monitoring + auto-PR)")]
     Resume {
         #[arg(help = "Minion ID, issue number, or PR number (e.g., M0tk, 42)")]
         id: String,
 
+        #[arg(long, help = "Additional instructions to pass to Claude when resuming")]
+        prompt: Option<String>,
+
         #[arg(
+            short,
             long,
-            help = "Skip permission prompts (adds --dangerously-skip-permissions)"
+            help = "Maximum duration for the task (e.g., '10s', '5m', '1h'). Exits with error if exceeded."
         )]
-        yolo: bool,
+        timeout: Option<String>,
     },
     #[command(about = "Clean up merged/closed worktrees")]
     Clean {
@@ -241,7 +245,11 @@ async fn main() {
         Commands::Rebase { target } => rebase::handle_rebase(target).await,
         Commands::Path { id, issue, pr } => path::handle_path(id, issue, pr).await,
         Commands::Attach { id, yolo } => attach::handle_attach(id, yolo).await,
-        Commands::Resume { id, yolo } => resume::handle_resume(id, yolo).await,
+        Commands::Resume {
+            id,
+            prompt,
+            timeout,
+        } => resume::handle_resume(id, prompt, timeout, cli.quiet).await,
         Commands::Clean {
             dry_run,
             force,

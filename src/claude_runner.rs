@@ -61,6 +61,12 @@ impl std::fmt::Display for ClaudeRunnerError {
 
 impl std::error::Error for ClaudeRunnerError {}
 
+/// Returns true if the error indicates the task is stuck or timed out,
+/// meaning it should be labeled `minion:blocked` instead of `minion:failed`.
+pub fn is_stuck_or_timeout_error(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<ClaudeRunnerError>().is_some()
+}
+
 /// Result of running a Claude session, including exit status and token usage
 #[derive(Debug)]
 pub struct ClaudeRunResult {
