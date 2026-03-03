@@ -1,4 +1,6 @@
-use crate::claude_runner::{build_claude_command, run_claude_with_stream_monitoring};
+use crate::claude_runner::{
+    build_claude_command, run_claude_with_stream_monitoring, EXIT_CODE_SIGNAL_TERMINATED,
+};
 use crate::git;
 use crate::github;
 use crate::minion_resolver;
@@ -29,6 +31,9 @@ pub async fn handle_rebase(target: Option<String>) -> Result<i32> {
     // Detect the base branch
     let base_branch = detect_base_branch(&worktree_path).await?;
     println!("🎯 Base branch: {}", base_branch);
+
+    // Pre-flight: check for uncommitted changes
+    check_clean_worktree(&worktree_path).await?;
 
     // Check if already up-to-date
     if is_up_to_date(&worktree_path, &base_branch).await? {
@@ -63,12 +68,17 @@ pub async fn handle_rebase(target: Option<String>) -> Result<i32> {
             let exit_code = run_claude_rebase(&worktree_path).await?;
 
             if exit_code == 0 {
-                // Claude succeeded - force push the result
+                // Claude succeeded - defensively force push in case the /rebase
+                // skill didn't push (harmless no-op if already pushed)
                 force_push(&worktree_path).await?;
                 println!("🚀 Force-pushed rebased branch");
                 Ok(0)
             } else {
-                println!("❌ Claude Code exited with code {}. You may need to resolve conflicts manually.", exit_code);
+                println!(
+                    "❌ Claude Code exited with code {}. The previous rebase was aborted, so no rebase is currently in progress.\n\
+                     You can retry with `gru rebase`, or perform the rebase manually with `git rebase origin/{}`.",
+                    exit_code, base_branch
+                );
                 Ok(exit_code)
             }
         }
@@ -116,10 +126,31 @@ async fn resolve_worktree_from_arg(arg: &str) -> Result<PathBuf> {
     Ok(info.worktree_path)
 }
 
+/// Checks that the worktree has no uncommitted changes.
+async fn check_clean_worktree(worktree_path: &Path) -> Result<()> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(worktree_path)
+        .args(["status", "--porcelain"])
+        .output()
+        .await
+        .context("Failed to check working tree status")?;
+
+    if !output.stdout.is_empty() {
+        anyhow::bail!(
+            "Working directory has uncommitted changes. Commit or stash them before rebasing."
+        );
+    }
+
+    Ok(())
+}
+
 /// Fetches the latest changes from origin in a worktree.
 async fn fetch_origin(worktree_path: &Path) -> Result<()> {
     let output = Command::new("git")
-        .args(["-C", &worktree_path.to_string_lossy(), "fetch", "origin"])
+        .arg("-C")
+        .arg(worktree_path)
+        .args(["fetch", "origin"])
         .output()
         .await
         .context("Failed to execute git fetch origin")?;
@@ -135,13 +166,9 @@ async fn fetch_origin(worktree_path: &Path) -> Result<()> {
 /// Gets the remote origin URL for a worktree (uses -C to target the right repo).
 async fn get_remote_url(worktree_path: &Path) -> Result<String> {
     let output = Command::new("git")
-        .args([
-            "-C",
-            &worktree_path.to_string_lossy(),
-            "remote",
-            "get-url",
-            "origin",
-        ])
+        .arg("-C")
+        .arg(worktree_path)
+        .args(["remote", "get-url", "origin"])
         .output()
         .await
         .context("Failed to get remote URL")?;
@@ -163,18 +190,21 @@ async fn detect_base_branch(worktree_path: &Path) -> Result<String> {
     let branch = get_current_branch(worktree_path).await?;
 
     // Try to get base branch from an associated PR
-    if let Ok(Some(base)) = get_pr_base_branch(worktree_path, &branch).await {
-        return Ok(base);
+    match get_pr_base_branch(worktree_path, &branch).await {
+        Ok(Some(base)) => return Ok(base),
+        Ok(None) => {} // No associated PR; fall through to default branch detection
+        Err(e) => log::warn!(
+            "Could not detect PR base branch for '{}': {}. Falling back to default branch detection.",
+            branch,
+            e
+        ),
     }
 
     // Fall back to detecting the default branch from remote
     let output = Command::new("git")
-        .args([
-            "-C",
-            &worktree_path.to_string_lossy(),
-            "symbolic-ref",
-            "refs/remotes/origin/HEAD",
-        ])
+        .arg("-C")
+        .arg(worktree_path)
+        .args(["symbolic-ref", "refs/remotes/origin/HEAD"])
         .output()
         .await;
 
@@ -194,12 +224,9 @@ async fn detect_base_branch(worktree_path: &Path) -> Result<String> {
 /// Gets the current branch name in a worktree.
 async fn get_current_branch(worktree_path: &Path) -> Result<String> {
     let output = Command::new("git")
-        .args([
-            "-C",
-            &worktree_path.to_string_lossy(),
-            "branch",
-            "--show-current",
-        ])
+        .arg("-C")
+        .arg(worktree_path)
+        .args(["branch", "--show-current"])
         .output()
         .await
         .context("Failed to get current branch")?;
@@ -257,14 +284,9 @@ async fn get_pr_base_branch(worktree_path: &Path, branch: &str) -> Result<Option
 async fn is_up_to_date(worktree_path: &Path, base_branch: &str) -> Result<bool> {
     let remote_ref = format!("origin/{}", base_branch);
     let output = Command::new("git")
-        .args([
-            "-C",
-            &worktree_path.to_string_lossy(),
-            "merge-base",
-            "--is-ancestor",
-            &remote_ref,
-            "HEAD",
-        ])
+        .arg("-C")
+        .arg(worktree_path)
+        .args(["merge-base", "--is-ancestor", &remote_ref, "HEAD"])
         .output()
         .await
         .context("Failed to check if branch is up-to-date")?;
@@ -279,13 +301,9 @@ async fn attempt_rebase(worktree_path: &Path, base_branch: &str) -> Result<Rebas
 
     // Count commits that will be replayed (for reporting)
     let count_output = Command::new("git")
-        .args([
-            "-C",
-            &worktree_path.to_string_lossy(),
-            "rev-list",
-            "--count",
-            &format!("{}..HEAD", remote_ref),
-        ])
+        .arg("-C")
+        .arg(worktree_path)
+        .args(["rev-list", "--count", &format!("{}..HEAD", remote_ref)])
         .output()
         .await
         .context("Failed to count commits")?;
@@ -301,12 +319,9 @@ async fn attempt_rebase(worktree_path: &Path, base_branch: &str) -> Result<Rebas
 
     // Attempt the rebase
     let output = Command::new("git")
-        .args([
-            "-C",
-            &worktree_path.to_string_lossy(),
-            "rebase",
-            &remote_ref,
-        ])
+        .arg("-C")
+        .arg(worktree_path)
+        .args(["rebase", &remote_ref])
         .output()
         .await
         .context("Failed to execute git rebase")?;
@@ -333,7 +348,9 @@ async fn attempt_rebase(worktree_path: &Path, base_branch: &str) -> Result<Rebas
 /// Aborts an in-progress rebase.
 async fn abort_rebase(worktree_path: &Path) -> Result<()> {
     let output = Command::new("git")
-        .args(["-C", &worktree_path.to_string_lossy(), "rebase", "--abort"])
+        .arg("-C")
+        .arg(worktree_path)
+        .args(["rebase", "--abort"])
         .output()
         .await
         .context("Failed to abort rebase")?;
@@ -347,14 +364,14 @@ async fn abort_rebase(worktree_path: &Path) -> Result<()> {
 }
 
 /// Force-pushes the current branch using --force-with-lease.
+///
+/// Explicitly specifies `origin HEAD` to avoid relying on upstream tracking
+/// configuration, which may not be set in worktrees created from bare repos.
 async fn force_push(worktree_path: &Path) -> Result<()> {
     let output = Command::new("git")
-        .args([
-            "-C",
-            &worktree_path.to_string_lossy(),
-            "push",
-            "--force-with-lease",
-        ])
+        .arg("-C")
+        .arg(worktree_path)
+        .args(["push", "--force-with-lease", "origin", "HEAD"])
         .output()
         .await
         .context("Failed to execute git push --force-with-lease")?;
@@ -389,20 +406,5 @@ async fn run_claude_rebase(worktree_path: &Path) -> Result<i32> {
     .await
     .context("Failed to run Claude Code for rebase")?;
 
-    Ok(result.status.code().unwrap_or(1))
-}
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn test_strip_hash_prefix() {
-        assert_eq!("#123".strip_prefix('#').unwrap_or("#123"), "123");
-        assert_eq!("123".strip_prefix('#').unwrap_or("123"), "123");
-        assert_eq!(
-            "https://github.com/o/r/issues/1"
-                .strip_prefix('#')
-                .unwrap_or("https://github.com/o/r/issues/1"),
-            "https://github.com/o/r/issues/1"
-        );
-    }
+    Ok(result.status.code().unwrap_or(EXIT_CODE_SIGNAL_TERMINATED))
 }
