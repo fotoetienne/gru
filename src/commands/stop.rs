@@ -22,7 +22,8 @@ pub async fn handle_stop(id: String) -> Result<i32> {
     let minion = minion_resolver::resolve_minion(&id).await?;
 
     println!("🛑 Stopping Minion {}...", minion.minion_id);
-    println!("📂 Workspace: {}", minion.worktree_path.display());
+    let checkout_path = minion.checkout_path();
+    println!("📂 Workspace: {}", checkout_path.display());
 
     // Check if worktree exists
     if !minion.worktree_path.exists() {
@@ -45,7 +46,7 @@ pub async fn handle_stop(id: String) -> Result<i32> {
     }
 
     // Try to terminate Claude processes running in this worktree
-    let terminated = terminate_claude_in_worktree(&minion.worktree_path).await?;
+    let terminated = terminate_claude_in_worktree(&checkout_path).await?;
 
     if terminated > 0 {
         println!(
@@ -77,10 +78,7 @@ pub async fn handle_stop(id: String) -> Result<i32> {
     }
 
     println!("\n✅ Minion {} stopped", minion.minion_id);
-    println!(
-        "💡 Worktree preserved at: {}",
-        minion.worktree_path.display()
-    );
+    println!("💡 Worktree preserved at: {}", checkout_path.display());
     println!("   To clean up, run: gru clean");
 
     Ok(0)

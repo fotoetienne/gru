@@ -55,7 +55,7 @@ pub async fn handle_review(pr_arg: Option<String>) -> Result<i32> {
         .with_context(|| format!("Failed to clone or update repository for PR {}", pr_num))?;
 
     // Check if a worktree already exists for this branch
-    let worktree_path = if let Some(existing_path) = git_repo
+    let (minion_dir, checkout_path) = if let Some(existing_path) = git_repo
         .find_worktree_for_branch(&branch)
         .await
         .context("Failed to check for existing worktree")?
@@ -64,7 +64,22 @@ pub async fn handle_review(pr_arg: Option<String>) -> Result<i32> {
             "♻️  Reusing existing worktree at: {}",
             existing_path.display()
         );
-        existing_path
+        // For existing worktrees, detect the layout (new vs legacy)
+        // If checkout_path == existing_path, it's legacy (minion_dir is the same)
+        // If existing_path ends in "checkout", the parent is minion_dir
+        let minion_dir = if existing_path
+            .file_name()
+            .map(|n| n == "checkout")
+            .unwrap_or(false)
+        {
+            existing_path
+                .parent()
+                .unwrap_or(&existing_path)
+                .to_path_buf()
+        } else {
+            existing_path.clone()
+        };
+        (minion_dir, existing_path)
     } else {
         // No existing worktree, fetch the branch and create one
         println!("🔄 Fetching PR branch: {}", branch);
@@ -74,18 +89,24 @@ pub async fn handle_review(pr_arg: Option<String>) -> Result<i32> {
             .with_context(|| format!("Failed to fetch PR branch '{}'", branch))?;
 
         let repo_name = format!("{}/{}", owner, repo);
-        // Use minion ID for worktree path instead of branch name
-        let new_worktree_path = workspace
+        let minion_dir = workspace
             .work_dir(&repo_name, &minion_id)
-            .context("Failed to compute worktree path")?;
+            .context("Failed to compute minion directory path")?;
+
+        let checkout_path = minion_dir.join("checkout");
+
+        // Ensure the minion directory exists
+        tokio::fs::create_dir_all(&minion_dir)
+            .await
+            .context("Failed to create minion directory")?;
 
         println!("🌿 Creating worktree for branch: {}", branch);
         git_repo
-            .checkout_worktree(&branch, &new_worktree_path)
+            .checkout_worktree(&branch, &checkout_path)
             .await
             .with_context(|| format!("Failed to checkout worktree for PR {}", pr_num))?;
 
-        new_worktree_path
+        (minion_dir, checkout_path)
     };
 
     // Fetch PR details for prompt rendering
@@ -117,9 +138,9 @@ pub async fn handle_review(pr_arg: Option<String>) -> Result<i32> {
 
     // Build the review prompt using the template system
     let review_prompt =
-        build_review_prompt(&owner, &repo, &pr_num, pr_details.as_ref(), &worktree_path);
+        build_review_prompt(&owner, &repo, &pr_num, pr_details.as_ref(), &checkout_path);
 
-    // Register minion in registry
+    // Register minion in registry (worktree field stores the minion_dir)
     let now = Utc::now();
     let registry_info = RegistryMinionInfo {
         repo: format!("{}/{}", owner, repo),
@@ -128,7 +149,7 @@ pub async fn handle_review(pr_arg: Option<String>) -> Result<i32> {
         prompt: review_prompt.chars().take(200).collect(),
         started_at: now,
         branch: branch.clone(),
-        worktree: worktree_path.clone(),
+        worktree: minion_dir.clone(),
         status: "active".to_string(),
         pr: Some(pr_num.clone()),
         session_id: session_id.to_string(),
@@ -159,7 +180,7 @@ pub async fn handle_review(pr_arg: Option<String>) -> Result<i32> {
     let progress = std::sync::Arc::new(ProgressDisplay::new(config));
 
     // Build the command with flags for autonomous stream-json output
-    let cmd = build_claude_command(&worktree_path, &session_id, &review_prompt);
+    let cmd = build_claude_command(&checkout_path, &session_id, &review_prompt);
 
     // Build on_spawn callback to record the child PID in the registry
     let pid_minion_id = minion_id.clone();
@@ -180,7 +201,7 @@ pub async fn handle_review(pr_arg: Option<String>) -> Result<i32> {
 
     let run_result = run_claude_with_stream_monitoring(
         cmd,
-        &worktree_path,
+        &minion_dir,
         None,
         Some(output_callback),
         Some(on_spawn),

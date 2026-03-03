@@ -202,9 +202,10 @@ pub async fn handle_status(id: Option<String>, verbose: bool) -> Result<i32> {
             .map(|basic| {
                 let (is_running, mode_display) = format_mode_display(basic.pid, &basic.mode);
                 let uptime = calculate_uptime(basic.started_at);
-                // Get current branch from worktree (checks for detached HEAD, branch changes, etc.)
-                let branch = get_current_branch(&basic.worktree, &basic.branch);
-                let worktree_path = basic.worktree.display().to_string();
+                // Get current branch from checkout path (checks for detached HEAD, branch changes, etc.)
+                let checkout_path = crate::workspace::resolve_checkout_path(&basic.worktree);
+                let branch = get_current_branch(&checkout_path, &basic.branch);
+                let worktree_path = checkout_path.display().to_string();
 
                 EnhancedMinionInfo {
                     minion_id: basic.minion_id,

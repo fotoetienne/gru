@@ -244,17 +244,27 @@ Located in `.claude/skills/`:
 ├── repos/              # Bare git repositories
 │   └── owner/
 │       └── repo.git/
-├── work/               # Active Minion worktrees
+├── work/               # Active Minion workspaces
 │   └── owner/
 │       └── repo/
-│           └── M001/   # Minion ID as directory name
-│               ├── .git
-│               ├── events.jsonl  # Stream events log
-│               └── <repo files>
+│           └── minion/
+│               └── issue-42-M001/      # Minion directory (metadata)
+│                   ├── events.jsonl     # Stream events log
+│                   ├── .gru_pr_state.json  # PR state
+│                   ├── PR_DESCRIPTION.md   # PR description (when ready)
+│                   └── checkout/        # Git worktree (repo files)
+│                       ├── .git
+│                       ├── src/
+│                       └── Cargo.toml
 ├── state/              # Local state
 │   └── next_id.txt     # Minion ID counter
 └── archive/            # Completed work (future)
 ```
+
+**Path concepts:**
+- **`minion_dir`** — top-level minion directory for metadata. What `workspace.work_dir()` returns.
+- **`checkout_path`** — `minion_dir/checkout/`. The actual git worktree where Claude runs.
+- Legacy worktrees (no `checkout/` subdir) are auto-detected at runtime.
 
 ## Future Phases
 

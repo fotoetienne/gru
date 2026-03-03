@@ -82,14 +82,16 @@ pub async fn handle_attach(
     // Reuse exact same resolution as gru path
     let minion = minion_resolver::resolve_minion(&id).await?;
 
-    // Verify worktree still exists
+    // Verify minion directory still exists
     if !minion.worktree_path.exists() {
         anyhow::bail!(
-            "Worktree directory no longer exists: {}\n\
+            "Minion directory no longer exists: {}\n\
              The worktree may have been removed. Try 'gru status' to see active minions.",
             minion.worktree_path.display()
         );
     }
+
+    let checkout_path = minion.checkout_path();
 
     // Atomically check registry state, get session_id, and claim as Interactive.
     // This prevents TOCTOU races where two `gru attach` calls could both see
@@ -100,7 +102,7 @@ pub async fn handle_attach(
     if yolo {
         println!("⚡ YOLO mode: skipping permission prompts");
     }
-    println!("📂 Workspace: {}", minion.worktree_path.display());
+    println!("📂 Workspace: {}", checkout_path.display());
 
     // Build claude command for interactive mode (no --print, no --output-format)
     let mut cmd = Command::new("claude");
@@ -115,7 +117,7 @@ pub async fn handle_attach(
     if yolo {
         cmd.arg("--dangerously-skip-permissions");
     }
-    cmd.current_dir(&minion.worktree_path)
+    cmd.current_dir(&checkout_path)
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());

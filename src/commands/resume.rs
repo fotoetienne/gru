@@ -71,10 +71,10 @@ pub async fn handle_resume(
     // Resolve the minion ID (same smart resolution as gru path/attach)
     let minion = minion_resolver::resolve_minion(&id).await?;
 
-    // Verify worktree still exists
+    // Verify minion directory still exists
     if !minion.worktree_path.exists() {
         bail!(
-            "Worktree directory no longer exists: {}\n\
+            "Minion directory no longer exists: {}\n\
              The worktree may have been removed. Try 'gru status' to see active minions.",
             minion.worktree_path.display()
         );
@@ -122,13 +122,15 @@ pub async fn handle_resume(
         "🔄 Resuming Minion {} in autonomous mode...",
         minion.minion_id
     );
-    println!("📂 Workspace: {}", minion.worktree_path.display());
+    let checkout_path = minion.checkout_path();
+    println!("📂 Workspace: {}", checkout_path.display());
 
     // Build WorktreeContext for PR creation
     let wt_ctx = WorktreeContext {
         minion_id: minion.minion_id.clone(),
         branch_name: branch_name.clone(),
-        worktree_path: minion.worktree_path.clone(),
+        minion_dir: minion.worktree_path.clone(),
+        checkout_path,
         session_id: session_uuid,
     };
 
@@ -212,7 +214,7 @@ async fn run_autonomous_claude(
     timeout_opt: Option<&str>,
     issue_num: u64,
 ) -> Result<std::process::ExitStatus> {
-    let mut cmd = build_claude_resume_command(&wt_ctx.worktree_path, &wt_ctx.session_id, prompt);
+    let mut cmd = build_claude_resume_command(&wt_ctx.checkout_path, &wt_ctx.session_id, prompt);
     cmd.env("GRU_WORKSPACE", &wt_ctx.minion_id);
 
     let config = ProgressConfig {
@@ -242,7 +244,7 @@ async fn run_autonomous_claude(
 
     let run_result = run_claude_with_stream_monitoring(
         cmd,
-        &wt_ctx.worktree_path,
+        &wt_ctx.minion_dir,
         timeout_opt,
         Some(callback),
         Some(on_spawn),

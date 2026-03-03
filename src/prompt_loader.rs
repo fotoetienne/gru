@@ -88,7 +88,7 @@ When your implementation is complete and ready for human review:
 
 1. **Commit your implementation changes** with a descriptive commit message
 2. **Push the branch** to the remote repository
-3. Write `PR_DESCRIPTION.md` in the root of the repository with this format:
+3. Write `PR_DESCRIPTION.md` to `{{ minion_dir }}/PR_DESCRIPTION.md` with this format:
    ```markdown
    ## Summary
    - Key change 1
@@ -103,7 +103,7 @@ When your implementation is complete and ready for human review:
    - Follow-up work if any
    ```
 
-**DO NOT commit PR_DESCRIPTION.md** - Gru will read this file locally from your worktree, use it to create the PR description, mark the PR ready, and then delete it automatically.
+**DO NOT commit PR_DESCRIPTION.md** - It lives outside the git checkout in the minion metadata directory. Gru will read this file, use it to create the PR description, mark the PR ready, and then delete it automatically.
 
 **IMPORTANT:** Only write `PR_DESCRIPTION.md` when work is truly complete and ready for human review. If work is still in progress, don't create this file - Gru will create a draft PR instead.
 

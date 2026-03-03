@@ -37,25 +37,42 @@ impl PrState {
     /// Load PR state from a file
     ///
     /// # Arguments
-    /// * `worktree_path` - Path to the worktree directory
+    /// * `dir` - Path to search for the PR state file. Searches the given directory
+    ///   first, then falls back to the parent directory. This handles both:
+    ///   - New layout: state in `minion_dir/`, caller passes `minion_dir`
+    ///   - Legacy layout: state in the same directory as the git checkout
+    ///   - Checkout subdir: caller passes `checkout/`, state is in parent `minion_dir/`
     ///
-    /// Returns None if the file doesn't exist
-    pub fn load(worktree_path: &Path) -> Result<Option<Self>> {
-        let pr_state_path = worktree_path.join(".gru_pr_state.json");
+    /// Returns None if the file doesn't exist in either location
+    pub fn load(dir: &Path) -> Result<Option<Self>> {
+        let pr_state_path = dir.join(".gru_pr_state.json");
 
-        if !pr_state_path.exists() {
-            return Ok(None);
+        if pr_state_path.exists() {
+            let contents = fs::read_to_string(&pr_state_path).context(format!(
+                "Failed to read PR state from {}",
+                pr_state_path.display()
+            ))?;
+            let state: PrState =
+                serde_json::from_str(&contents).context("Failed to parse PR state JSON")?;
+            return Ok(Some(state));
         }
 
-        let contents = fs::read_to_string(&pr_state_path).context(format!(
-            "Failed to read PR state from {}",
-            pr_state_path.display()
-        ))?;
+        // Fallback: check parent directory (handles case where caller passes checkout_path
+        // but state lives in the parent minion_dir)
+        if let Some(parent) = dir.parent() {
+            let parent_path = parent.join(".gru_pr_state.json");
+            if parent_path.exists() {
+                let contents = fs::read_to_string(&parent_path).context(format!(
+                    "Failed to read PR state from {}",
+                    parent_path.display()
+                ))?;
+                let state: PrState =
+                    serde_json::from_str(&contents).context("Failed to parse PR state JSON")?;
+                return Ok(Some(state));
+            }
+        }
 
-        let state: PrState =
-            serde_json::from_str(&contents).context("Failed to parse PR state JSON")?;
-
-        Ok(Some(state))
+        Ok(None)
     }
 
     /// Save PR state to a file
@@ -123,6 +140,21 @@ mod tests {
             result.unwrap().is_none(),
             "Should return None for missing file"
         );
+    }
+
+    #[test]
+    fn test_pr_state_load_parent_fallback() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let checkout_dir = temp_dir.path().join("checkout");
+        std::fs::create_dir_all(&checkout_dir).unwrap();
+
+        // Save state in parent (minion_dir), load from child (checkout/)
+        let state = PrState::new("42".to_string(), "15".to_string());
+        state.save(temp_dir.path()).unwrap();
+
+        let loaded = PrState::load(&checkout_dir).unwrap();
+        assert!(loaded.is_some(), "Should find PR state in parent directory");
+        assert_eq!(loaded.unwrap().pr_number, "42");
     }
 
     #[test]
