@@ -142,23 +142,22 @@ impl Worktree {
         Ok(output.stdout.is_empty())
     }
 
-    /// Check if a PR for this branch was merged on GitHub (handles squash merges)
+    /// Count PRs in a given state for this branch on GitHub.
     ///
-    /// Squash merges create new commit hashes, so `git branch --merged` won't detect them.
-    /// This method uses `gh pr list --state merged --head <branch>` to check GitHub directly.
+    /// Runs `gh pr list --state <state> --head <branch> --json number --jq length`.
     ///
     /// # Error behavior
-    /// - Failure to spawn the `gh`/`ghe` process propagates as `Err` (system-level problem).
-    /// - Non-zero CLI exit (e.g., auth failure, network error) returns `Ok(false)` to degrade
-    ///   gracefully without blocking cleanup of other worktrees.
-    pub async fn check_pr_merged_on_github(&self) -> Result<bool> {
+    /// - Failure to spawn the `gh`/`ghe` process propagates as `Err`.
+    /// - Non-zero CLI exit (e.g., auth failure, network error) propagates as `Err`.
+    ///   Callers decide the conservative default for their use case.
+    async fn count_prs_in_state(&self, state: &str) -> Result<u64> {
         let gh_cmd = github::gh_command_for_repo(&self.repo);
         let output = Command::new(gh_cmd)
             .args([
                 "pr",
                 "list",
                 "--state",
-                "merged",
+                state,
                 "--head",
                 &self.branch,
                 "--repo",
@@ -170,29 +169,50 @@ impl Worktree {
             ])
             .output()
             .await
-            .context("Failed to check PR merge status on GitHub")?;
+            .with_context(|| format!("Failed to run `{} pr list --state {}`", gh_cmd, state))?;
 
         if !output.status.success() {
-            return Ok(false);
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            anyhow::bail!(
+                "`{} pr list --state {}` exited with {}: {}",
+                gh_cmd,
+                state,
+                output.status,
+                stderr
+            );
         }
 
         let count_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        let count: u64 = if count_str.is_empty() {
+        if count_str.is_empty() {
+            return Ok(0);
+        }
+
+        Ok(count_str.parse().unwrap_or_else(|_| {
+            log::warn!(
+                "Unexpected output from '{} pr list --jq length': {:?}",
+                gh_cmd,
+                count_str
+            );
             0
-        } else {
-            match count_str.parse() {
-                Ok(n) => n,
-                Err(_) => {
-                    log::warn!(
-                        "Unexpected output from '{} pr list --jq length': {:?}",
-                        gh_cmd,
-                        count_str
-                    );
-                    0
-                }
-            }
-        };
-        Ok(count > 0)
+        }))
+    }
+
+    /// Check if a PR for this branch was merged on GitHub (handles squash merges)
+    ///
+    /// Squash merges create new commit hashes, so `git branch --merged` won't detect them.
+    /// This method uses `gh pr list --state merged --head <branch>` to check GitHub directly.
+    /// Callers should treat errors conservatively (i.e., assume the PR may not have been
+    /// confirmed as merged).
+    pub async fn check_pr_merged_on_github(&self) -> Result<bool> {
+        Ok(self.count_prs_in_state("merged").await? > 0)
+    }
+
+    /// Check if there is an open PR for this branch on GitHub.
+    ///
+    /// Used to prevent cleaning worktrees that have PRs under review.
+    /// Callers should treat errors conservatively (i.e., assume an open PR may exist).
+    pub async fn check_has_open_pr(&self) -> Result<bool> {
+        Ok(self.count_prs_in_state("open").await? > 0)
     }
 
     /// Determine the overall status of this worktree
