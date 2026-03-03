@@ -134,7 +134,7 @@ URL: https://github.com/{{ repo_owner }}/{{ repo_name }}/pull/{{ pr_number }}
 Review this pull request: fetch details, analyze changes, and provide code review feedback.
 
 ## 1. Fetch PR Details
-- The PR title, description, and URL are provided above. Use `gh pr view {{ pr_number }} --repo {{ repo_owner }}/{{ repo_name }} --json files,author,closingIssuesReferences` to get changed files, author, and linked issues in a single call.
+- The PR title, description, and URL are provided above. Use `gh pr view {{ pr_number }} --repo {{ repo_owner }}/{{ repo_name }} --json files,author,closingIssuesReferences` to get changed files, author, and issues this PR closes in a single call.
 - Fetch existing review comments: `gh api --paginate repos/{{ repo_owner }}/{{ repo_name }}/pulls/{{ pr_number }}/comments`
 - Understand the scope and intent of the PR, and any prior discussion
 - The code should already be checked out in the current directory
@@ -160,7 +160,7 @@ Review this pull request: fetch details, analyze changes, and provide code revie
 
 ## 4. Submit Review
 - BEFORE submitting: Check if this is your own PR:
-  - Use the PR author from the Step 1 JSON response
+  - Use the PR author login from the Step 1 JSON response (`.author.login` field)
   - Use `gh api user --jq '.login'` to get your GitHub username
   - If they match, you CANNOT use `--approve` or `--request-changes` (GitHub will reject it)
 - Use `gh pr review {{ pr_number }} --repo {{ repo_owner }}/{{ repo_name }}` with:
