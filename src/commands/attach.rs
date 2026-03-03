@@ -196,7 +196,7 @@ pub async fn handle_attach(
     .await;
 
     // On successful exit, offer to resume autonomous monitoring
-    if status.success() && !no_auto_resume && prompt_auto_resume() {
+    if status.success() && !no_auto_resume && !quiet && prompt_auto_resume().await {
         println!("Resuming autonomous monitoring...");
         return crate::commands::resume::handle_resume(minion.minion_id, None, None, quiet).await;
     }
@@ -208,16 +208,19 @@ pub async fn handle_attach(
 ///
 /// Returns `true` if the user confirmed (Enter, "y", or "yes"), `false` otherwise
 /// (including "n", Ctrl+C, or any read error).
-fn prompt_auto_resume() -> bool {
-    use std::io::{stdin, stdout, Write};
+async fn prompt_auto_resume() -> bool {
+    use std::io::Write;
+    use tokio::io::AsyncBufReadExt;
 
     print!("Auto-resume autonomous monitoring? [Y/n] ");
-    if stdout().flush().is_err() {
+    if std::io::stdout().flush().is_err() {
         return false;
     }
 
     let mut input = String::new();
-    match stdin().read_line(&mut input) {
+    let stdin = tokio::io::stdin();
+    let mut reader = tokio::io::BufReader::new(stdin);
+    match reader.read_line(&mut input).await {
         Ok(0) | Err(_) => false, // EOF (Ctrl+D) or error
         Ok(_) => is_affirmative(&input),
     }
