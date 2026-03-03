@@ -1163,13 +1163,18 @@ async fn monitor_pr_lifecycle(
                 break;
             }
             Ok(MonitorResult::Timeout(duration)) => {
-                let hours = duration.as_secs() / 3600;
-                let minutes = (duration.as_secs() % 3600) / 60;
-                if hours > 0 {
-                    println!("⏰ PR monitoring timed out after {}h{}m", hours, minutes);
+                let total_secs = duration.as_secs();
+                let hours = total_secs / 3600;
+                let minutes = (total_secs % 3600) / 60;
+                let secs = total_secs % 60;
+                let elapsed = if hours > 0 {
+                    format!("{}h{}m", hours, minutes)
+                } else if minutes > 0 {
+                    format!("{}m", minutes)
                 } else {
-                    println!("⏰ PR monitoring timed out after {}m", minutes);
-                }
+                    format!("{}s", secs)
+                };
+                println!("⏰ PR monitoring timed out after {}", elapsed);
                 println!(
                     "   PR is still open: https://github.com/{}/{}/pull/{}",
                     issue_ctx.owner, issue_ctx.repo, pr_number
@@ -1245,7 +1250,13 @@ pub async fn handle_fix(
 
     // Parse monitor timeout if provided; default to 24 hours
     let monitor_timeout = match monitor_timeout_opt {
-        Some(s) => parse_timeout(&s).context("Invalid --monitor-timeout value")?,
+        Some(s) => {
+            let d = parse_timeout(&s).context("Invalid --monitor-timeout value")?;
+            if d.is_zero() {
+                anyhow::bail!("--monitor-timeout must be greater than zero");
+            }
+            d
+        }
         None => Duration::from_secs(24 * 3600),
     };
 

@@ -216,8 +216,9 @@ pub async fn monitor_pr(
     loop {
         // Check if we've exceeded the maximum duration
         if let Some(max) = max_duration {
-            if start_time.elapsed() >= max {
-                return Ok(MonitorResult::Timeout(max));
+            let elapsed = start_time.elapsed();
+            if elapsed >= max {
+                return Ok(MonitorResult::Timeout(elapsed));
             }
         }
 

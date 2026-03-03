@@ -69,7 +69,7 @@ enum Commands {
 
         #[arg(
             long,
-            help = "Maximum duration for PR monitoring (e.g., '2h', '24h'). Defaults to 24 hours."
+            help = "Maximum duration for PR monitoring (e.g., '30m', '2h', '24h'). Defaults to 24 hours."
         )]
         monitor_timeout: Option<String>,
 
