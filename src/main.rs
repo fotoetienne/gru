@@ -138,7 +138,7 @@ enum Commands {
         #[arg(help = "Optional ID to filter by (minion ID, issue number, or PR number)")]
         id: Option<String>,
 
-        #[arg(short, long, help = "Show session ID and PID details")]
+        #[arg(short, long, help = "Show session ID, PID, and worktree path details")]
         verbose: bool,
     },
     #[command(about = "Stop a running Minion")]
