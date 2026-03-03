@@ -141,10 +141,10 @@ mod tests {
         let prompts_dir = temp_dir.path().join(".gru").join("prompts");
         fs::create_dir_all(&prompts_dir).unwrap();
 
-        // Create a prompt named "fix" which matches a built-in
+        // Create a prompt named "do" which matches a built-in
         fs::write(
-            prompts_dir.join("fix.md"),
-            "---\ndescription: Team fix workflow\n---\nCustom fix",
+            prompts_dir.join("do.md"),
+            "---\ndescription: Team do workflow\n---\nCustom do",
         )
         .unwrap();
 
@@ -156,13 +156,13 @@ mod tests {
 
         let prompts = result.unwrap();
 
-        // The repo prompt named "fix" should be present
+        // The repo prompt named "do" should be present
         assert_eq!(prompts.repo.len(), 1);
-        assert_eq!(prompts.repo[0].name, "fix");
+        assert_eq!(prompts.repo[0].name, "do");
 
-        // Built-in "fix" should still be listed
+        // Built-in "do" should still be listed
         let built_in_names: Vec<&str> = prompts.built_in.iter().map(|(n, _)| n.as_str()).collect();
-        assert!(built_in_names.contains(&"fix"));
+        assert!(built_in_names.contains(&"do"));
     }
 
     #[test]
@@ -172,12 +172,12 @@ mod tests {
         let global_dir = temp_dir.path().join("global");
         fs::create_dir_all(repo_dir.join(".gru").join("prompts")).unwrap();
 
-        // Create a global prompt named "fix" which matches a built-in
+        // Create a global prompt named "do" which matches a built-in
         let global_prompts = global_dir.join(".gru").join("prompts");
         fs::create_dir_all(&global_prompts).unwrap();
         fs::write(
-            global_prompts.join("fix.md"),
-            "---\ndescription: Global fix override attempt\n---\nGlobal fix",
+            global_prompts.join("do.md"),
+            "---\ndescription: Global do override attempt\n---\nGlobal do",
         )
         .unwrap();
 
@@ -189,16 +189,16 @@ mod tests {
 
         let prompts = result.unwrap();
 
-        // Global prompt named "fix" should appear in the global collection
+        // Global prompt named "do" should appear in the global collection
         assert_eq!(prompts.global.len(), 1);
-        assert_eq!(prompts.global[0].name, "fix");
+        assert_eq!(prompts.global[0].name, "do");
 
         // No repo prompts exist, so no built-in can be marked [OVERRIDDEN].
         // Only repo prompts override built-ins; global prompts are shadowed BY built-ins.
         assert!(prompts.repo.is_empty());
 
         // Derive the override set as handle_prompts does and verify that
-        // the global "fix" prompt is NOT considered an override.
+        // the global "do" prompt is NOT considered an override.
         let built_in_names: Vec<&str> = BUILT_IN_PROMPTS.iter().map(|b| b.name).collect();
         let repo_override_names: Vec<&str> = prompts
             .repo
@@ -206,7 +206,7 @@ mod tests {
             .filter(|p| built_in_names.contains(&p.name.as_str()))
             .map(|p| p.name.as_str())
             .collect();
-        assert!(!repo_override_names.contains(&"fix"));
+        assert!(!repo_override_names.contains(&"do"));
     }
 
     #[test]

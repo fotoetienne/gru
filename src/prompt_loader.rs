@@ -30,8 +30,8 @@ use crate::reserved_commands;
 /// when there is no corresponding built-in with content for that name.
 pub const BUILT_IN_PROMPTS: &[BuiltInPrompt] = &[
     BuiltInPrompt {
-        name: "fix",
-        description: "Fix a GitHub issue with tests and PR",
+        name: "do",
+        description: "Work on a GitHub issue with tests and PR",
         requires: &["issue"],
         content: r#"# Issue #{{ issue_number }}: {{ issue_title }}
 
@@ -545,7 +545,7 @@ fn load_prompts_internal(
 
 /// Resolves a prompt by name, checking repo overrides, built-in, and global prompts.
 ///
-/// This is the main entry point for commands like `gru fix` that need to load
+/// This is the main entry point for commands like `gru do` that need to load
 /// a built-in prompt while allowing user overrides.
 ///
 /// **Performance note:** This loads all prompts from disk (scanning `.gru/prompts/`
@@ -1496,21 +1496,24 @@ Repo content"#,
     // --- Built-in prompt tests ---
 
     #[test]
-    fn test_builtin_fix_prompt_has_content() {
-        let fix = BUILT_IN_PROMPTS.iter().find(|b| b.name == "fix").unwrap();
-        assert!(!fix.content.trim().is_empty());
-        assert_eq!(fix.description, "Fix a GitHub issue with tests and PR");
-        assert_eq!(fix.requires, &["issue"]);
+    fn test_builtin_do_prompt_has_content() {
+        let do_prompt = BUILT_IN_PROMPTS.iter().find(|b| b.name == "do").unwrap();
+        assert!(!do_prompt.content.trim().is_empty());
+        assert_eq!(
+            do_prompt.description,
+            "Work on a GitHub issue with tests and PR"
+        );
+        assert_eq!(do_prompt.requires, &["issue"]);
     }
 
     #[test]
     fn test_builtin_to_prompt_with_content() {
-        let fix = BUILT_IN_PROMPTS.iter().find(|b| b.name == "fix").unwrap();
-        let prompt = fix.to_prompt();
+        let do_prompt = BUILT_IN_PROMPTS.iter().find(|b| b.name == "do").unwrap();
+        let prompt = do_prompt.to_prompt();
         assert!(prompt.is_some());
 
         let prompt = prompt.unwrap();
-        assert_eq!(prompt.name, "fix");
+        assert_eq!(prompt.name, "do");
         assert!(matches!(prompt.source, PromptSource::BuiltIn));
         assert_eq!(prompt.metadata.requires, vec!["issue"]);
         assert!(prompt.content.contains("{{ issue_number }}"));
@@ -1561,14 +1564,14 @@ Repo content"#,
     }
 
     #[test]
-    fn test_builtin_fix_included_in_load_prompts() {
+    fn test_builtin_do_included_in_load_prompts() {
         let temp_dir = TempDir::new().unwrap();
         let prompts = load_prompts_internal(Some(temp_dir.path()), Some(temp_dir.path())).unwrap();
 
-        assert!(prompts.contains_key("fix"));
-        let fix = &prompts["fix"];
-        assert!(matches!(fix.source, PromptSource::BuiltIn));
-        assert!(fix
+        assert!(prompts.contains_key("do"));
+        let do_prompt = &prompts["do"];
+        assert!(matches!(do_prompt.source, PromptSource::BuiltIn));
+        assert!(do_prompt
             .content
             .contains("## 1. Check if Decomposition is Needed"));
     }
@@ -1684,36 +1687,36 @@ Repo content"#,
         let prompts_dir = temp_dir.path().join(".gru").join("prompts");
         fs::create_dir_all(&prompts_dir).unwrap();
 
-        // Create a repo prompt that overrides the built-in "fix"
+        // Create a repo prompt that overrides the built-in "do"
         fs::write(
-            prompts_dir.join("fix.md"),
+            prompts_dir.join("do.md"),
             r#"---
-description: Custom fix workflow
+description: Custom do workflow
 requires: [issue]
 ---
-Custom fix for issue #{{ issue_number }}"#,
+Custom do for issue #{{ issue_number }}"#,
         )
         .unwrap();
 
         let prompts = load_prompts_internal(Some(temp_dir.path()), Some(temp_dir.path())).unwrap();
 
-        let fix = &prompts["fix"];
-        assert!(matches!(fix.source, PromptSource::Repo(_)));
+        let do_prompt = &prompts["do"];
+        assert!(matches!(do_prompt.source, PromptSource::Repo(_)));
         assert_eq!(
-            fix.metadata.description,
-            Some("Custom fix workflow".to_string())
+            do_prompt.metadata.description,
+            Some("Custom do workflow".to_string())
         );
-        assert_eq!(fix.content, "Custom fix for issue #{{ issue_number }}");
+        assert_eq!(do_prompt.content, "Custom do for issue #{{ issue_number }}");
     }
 
     #[test]
     fn test_resolve_prompt_finds_builtin() {
         let temp_dir = TempDir::new().unwrap();
-        let prompt = resolve_prompt("fix", Some(temp_dir.path())).unwrap();
+        let prompt = resolve_prompt("do", Some(temp_dir.path())).unwrap();
         assert!(prompt.is_some());
 
         let prompt = prompt.unwrap();
-        assert_eq!(prompt.name, "fix");
+        assert_eq!(prompt.name, "do");
         assert!(matches!(prompt.source, PromptSource::BuiltIn));
     }
 
@@ -1725,9 +1728,9 @@ Custom fix for issue #{{ issue_number }}"#,
     }
 
     #[test]
-    fn test_builtin_fix_template_has_expected_variables() {
-        let fix = BUILT_IN_PROMPTS.iter().find(|b| b.name == "fix").unwrap();
-        let prompt = fix.to_prompt().unwrap();
+    fn test_builtin_do_template_has_expected_variables() {
+        let do_prompt = BUILT_IN_PROMPTS.iter().find(|b| b.name == "do").unwrap();
+        let prompt = do_prompt.to_prompt().unwrap();
 
         // Template should reference standard context variables
         assert!(prompt.content.contains("{{ issue_number }}"));

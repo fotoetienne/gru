@@ -513,7 +513,7 @@ async fn check_existing_minions(
         eprintln!("\nOptions:");
         eprintln!("  - Attach interactively: gru attach {}", best_id);
         eprintln!(
-            "  - Create new session:   gru fix https://github.com/{}/{}/issues/{} --force-new",
+            "  - Create new session:   gru do https://github.com/{}/{}/issues/{} --force-new",
             owner, repo, issue_num
         );
 
@@ -552,7 +552,7 @@ async fn check_existing_minions(
         );
         eprintln!("\nOptions:");
         eprintln!(
-            "  - Create new session:   gru fix https://github.com/{}/{}/issues/{} --force-new",
+            "  - Create new session:   gru do https://github.com/{}/{}/issues/{} --force-new",
             owner, repo, issue_num
         );
         return Ok(ExistingMinionCheck::AlreadyRunning);
@@ -685,8 +685,8 @@ async fn setup_worktree(ctx: &IssueContext) -> Result<WorktreeContext> {
     let registry_info = RegistryMinionInfo {
         repo: repo_name.clone(),
         issue: ctx.issue_num,
-        command: "fix".to_string(),
-        prompt: format!("/fix {}", ctx.issue_num),
+        command: "do".to_string(),
+        prompt: format!("/do {}", ctx.issue_num),
         started_at: now,
         branch: branch_name.clone(),
         worktree: minion_dir.clone(),
@@ -720,20 +720,20 @@ async fn setup_worktree(ctx: &IssueContext) -> Result<WorktreeContext> {
 
 /// Builds the prompt string from issue context using the prompt template system.
 ///
-/// Loads the "fix" prompt template (built-in or overridden via `.gru/prompts/fix.md`),
+/// Loads the "do" prompt template (built-in or overridden via `.gru/prompts/do.md`),
 /// builds a `PromptContext` from the issue details, and renders the template.
-/// Falls back to `/fix <issue_num>` when issue details are unavailable.
+/// Falls back to `/do <issue_num>` when issue details are unavailable.
 fn build_fix_prompt(ctx: &IssueContext, wt_ctx: &WorktreeContext) -> String {
     let Some(ref details) = ctx.details else {
-        return format!("/fix {}", ctx.issue_num);
+        return format!("/do {}", ctx.issue_num);
     };
 
     // Try to load the prompt through the template system (allows overrides).
-    // Use the worktree path as the repo root so `.gru/prompts/fix.md` is found.
-    let prompt_template = match prompt_loader::resolve_prompt("fix", Some(&wt_ctx.checkout_path)) {
+    // Use the worktree path as the repo root so `.gru/prompts/do.md` is found.
+    let prompt_template = match prompt_loader::resolve_prompt("do", Some(&wt_ctx.checkout_path)) {
         Ok(p) => p,
         Err(e) => {
-            log::warn!("Failed to load fix prompt: {e}, using /fix fallback");
+            log::warn!("Failed to load do prompt: {e}, using /do fallback");
             None
         }
     };
@@ -1378,7 +1378,7 @@ pub async fn handle_fix(
         match result {
             Ok(result) => Some(result),
             Err(e) if is_stuck_or_timeout_error(&e) => {
-                // Mark as Failed so the next `gru fix` won't retry indefinitely.
+                // Mark as Failed so the next `gru do` won't retry indefinitely.
                 // The user can explicitly `--force-new` to start a fresh session.
                 update_orchestration_phase(&wt_ctx.minion_id, OrchestrationPhase::Failed).await;
                 log::error!("🚨 {:#}", e);
@@ -1567,7 +1567,7 @@ mod tests {
         };
 
         let prompt = build_fix_prompt(&ctx, &wt_ctx);
-        assert_eq!(prompt, "/fix 42");
+        assert_eq!(prompt, "/do 42");
     }
 
     #[test]
@@ -1633,14 +1633,14 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let wt_ctx = test_wt_ctx(tmp.path());
 
-        // Create a custom fix prompt in the checkout dir (where the repo lives)
+        // Create a custom do prompt in the checkout dir (where the repo lives)
         let prompts_dir = wt_ctx.checkout_path.join(".gru").join("prompts");
         std::fs::create_dir_all(&prompts_dir).unwrap();
 
         std::fs::write(
-            prompts_dir.join("fix.md"),
+            prompts_dir.join("do.md"),
             r#"---
-description: Custom fix
+description: Custom do
 requires: [issue]
 ---
 CUSTOM: Fix #{{ issue_number }} - {{ issue_title }}"#,

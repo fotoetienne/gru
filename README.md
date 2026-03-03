@@ -24,16 +24,16 @@ This will install the `gru` binary to `~/.cargo/bin/gru`.
 
 ### Current Features (Phase 1)
 
-**`gru fix <issue>`** - Fix a GitHub issue using Claude CLI
+**`gru do <issue>`** - Work on a GitHub issue using Claude CLI
 
-Delegates to Claude CLI's `/fix` command with improved error handling and validation.
+Delegates to Claude CLI with improved error handling and validation.
 
 ```bash
-# Fix an issue by number (must be run from within the repo)
-gru fix 42
+# Work on an issue by number (must be run from within the repo)
+gru do 42
 
-# Fix an issue by URL (works from anywhere)
-gru fix https://github.com/owner/repo/issues/42
+# Work on an issue by URL (works from anywhere)
+gru do https://github.com/owner/repo/issues/42
 ```
 
 **`gru review <pr>`** - Review a GitHub pull request using Claude CLI
@@ -57,8 +57,8 @@ gru --version
 # Show help
 gru --help
 
-# Show help for fix command
-gru fix --help
+# Show help for do command
+gru do --help
 ```
 
 ## Error Handling

@@ -196,7 +196,7 @@ pub async fn handle_init(repo_arg: String) -> Result<i32> {
     println!("  1. Mark an issue as ready:");
     println!("     gh issue edit 42 --add-label ready-for-minion");
     println!("  2. Start a Minion:");
-    println!("     gru fix {}/{}#42", owner, repo);
+    println!("     gru do {}/{}#42", owner, repo);
     println!("  3. Check status:");
     println!("     gru status");
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
