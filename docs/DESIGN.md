@@ -213,8 +213,8 @@ The **Lab** is the main process that orchestrates Minions.
 - Expose GraphQL API for introspection (future)
 
 **Configuration:**
-```yaml
-# ~/.gru/config.yaml
+```toml
+# ~/.gru/config.toml
 github:
   token: ghp_xxxxxxxxxxxx
   repos:
@@ -1454,7 +1454,7 @@ async fn recover(&self) -> Result<(), LabError> {
 
 **1. GitHub Token Security**
 ```rust
-// ~/.gru/config.yaml (mode 0600)
+// ~/.gru/config.toml (mode 0600)
 // github:
 //   token: ghp_xxxxxxxxxxxx
 
@@ -1614,17 +1614,20 @@ POST /api/minions/:id/abandon # Abandon Minion
 
 ```
 ~/.gru/
-├── config.yaml                      # Lab configuration
+├── config.toml                      # Lab configuration
 ├── repos/                           # Bare repository mirrors
 │   └── owner/
 │       └── repo.git/                # Bare clone
 ├── work/                            # Active worktrees
 │   └── owner/
 │       └── repo/
-│           ├── M42/                 # Minion M42's worktree
-│           │   ├── .git             # Worktree metadata
-│           │   └── <repo files>
-│           └── M43/                 # Minion M43's worktree
+│           └── minion/
+│               └── issue-42-M042/   # Minion directory (branch name)
+│                   ├── events.jsonl
+│                   ├── .gru_pr_state.json
+│                   └── checkout/    # Git worktree (repo files)
+│                       ├── .git
+│                       └── <repo files>
 ├── archive/                         # Completed Minion artifacts
 │   ├── M42/
 │   │   ├── events.jsonl             # Structured event log
@@ -1635,36 +1638,34 @@ POST /api/minions/:id/abandon # Abandon Minion
 │   └── M43/
 ├── state/
 │   ├── next_id.txt                  # Monotonic counter for Minion IDs (base36)
-│   └── cursors.json                 # GitHub timeline cursors per issue
-└── logs/
-    └── gru.log                      # Lab process logs
-
-# Note: No SQLite database - active Minions tracked in-memory only
-# Recovery on restart: enumerate tmux sessions, fetch state from GitHub
+│   ├── minions.json                 # Persistent Minion registry
+│   └── minions.json.lock            # Registry file lock
+└── archive/                         # Completed work (future)
 ```
 
 ---
 
 ## Configuration
 
-### Environment Variables (Required)
+### Environment Variables
 
-**Tokens via environment variables only (no plaintext in config):**
+**GitHub authentication priority:**
+1. `gh`/`ghe` CLI token (`gh auth token --hostname <host>`)
+2. `GRU_GITHUB_TOKEN` environment variable (fallback)
 
 ```bash
-# Required
+# Optional fallback if gh CLI auth is not configured
 export GRU_GITHUB_TOKEN="ghp_xxxxxxxxxxxx"
-export ANTHROPIC_API_KEY="sk-ant-xxxxxxxxxxxx"
 
-# Lab will fail on startup if these are missing
+# Claude CLI handles its own authentication
 ```
 
-### config.yaml
+### config.toml
 
 **Non-sensitive settings only:**
 
-```yaml
-# ~/.gru/config.yaml
+```toml
+# ~/.gru/config.toml
 
 # Repositories to monitor (multi-repo support)
 repos:
