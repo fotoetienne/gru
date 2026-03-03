@@ -73,7 +73,12 @@ const CTRL_C_GRACE_SECS: u64 = 5;
 /// Note: This command is identical to `gru resume` - both attach to the
 /// same Claude session interactively. The `attach` name is used for
 /// consistency with documentation and expected UX.
-pub async fn handle_attach(id: String, yolo: bool) -> Result<i32> {
+pub async fn handle_attach(
+    id: String,
+    yolo: bool,
+    no_auto_resume: bool,
+    quiet: bool,
+) -> Result<i32> {
     // Reuse exact same resolution as gru path
     let minion = minion_resolver::resolve_minion(&id).await?;
 
@@ -180,7 +185,7 @@ pub async fn handle_attach(id: String, yolo: bool) -> Result<i32> {
     };
 
     // Update registry: mode=Stopped, pid=None
-    let mid = minion.minion_id;
+    let mid = minion.minion_id.clone();
     let _ = with_registry(move |reg| {
         reg.update(&mid, |info| {
             info.mode = MinionMode::Stopped;
@@ -190,7 +195,38 @@ pub async fn handle_attach(id: String, yolo: bool) -> Result<i32> {
     })
     .await;
 
+    // On successful exit, offer to resume autonomous monitoring
+    if status.success() && !no_auto_resume && prompt_auto_resume() {
+        println!("Resuming autonomous monitoring...");
+        return crate::commands::resume::handle_resume(minion.minion_id, None, None, quiet).await;
+    }
+
     Ok(if status.success() { 0 } else { 1 })
+}
+
+/// Prompts the user whether to auto-resume autonomous monitoring.
+///
+/// Returns `true` if the user confirmed (Enter, "y", or "yes"), `false` otherwise
+/// (including "n", Ctrl+C, or any read error).
+fn prompt_auto_resume() -> bool {
+    use std::io::{stdin, stdout, Write};
+
+    print!("Auto-resume autonomous monitoring? [Y/n] ");
+    if stdout().flush().is_err() {
+        return false;
+    }
+
+    let mut input = String::new();
+    match stdin().read_line(&mut input) {
+        Ok(0) | Err(_) => false, // EOF (Ctrl+D) or error
+        Ok(_) => is_affirmative(&input),
+    }
+}
+
+/// Returns `true` if the input is an affirmative answer (empty, "y", or "yes").
+fn is_affirmative(input: &str) -> bool {
+    let answer = input.trim().to_lowercase();
+    answer.is_empty() || answer == "y" || answer == "yes"
 }
 
 /// Send a termination signal to the child process.
@@ -315,7 +351,7 @@ mod tests {
     async fn test_handle_attach_with_invalid_id() {
         // Test that handle_attach returns an error for an invalid ID
         // This verifies the minion_resolver integration works correctly
-        let result = handle_attach("nonexistent-minion-xyz".to_string(), false).await;
+        let result = handle_attach("nonexistent-minion-xyz".to_string(), false, false, false).await;
         assert!(result.is_err());
 
         // Verify the error message suggests using gru status
@@ -327,7 +363,17 @@ mod tests {
     #[tokio::test]
     async fn test_handle_attach_yolo_with_invalid_id() {
         // Test that handle_attach with yolo=true still validates the ID
-        let result = handle_attach("nonexistent-minion-xyz".to_string(), true).await;
+        let result = handle_attach("nonexistent-minion-xyz".to_string(), true, false, false).await;
+        assert!(result.is_err());
+
+        let err_msg = format!("{:#}", result.unwrap_err());
+        assert!(err_msg.contains("Could not resolve ID"));
+    }
+
+    #[tokio::test]
+    async fn test_handle_attach_no_auto_resume_with_invalid_id() {
+        // Test that handle_attach with no_auto_resume=true still validates the ID
+        let result = handle_attach("nonexistent-minion-xyz".to_string(), false, true, false).await;
         assert!(result.is_err());
 
         let err_msg = format!("{:#}", result.unwrap_err());
@@ -397,5 +443,33 @@ mod tests {
         }
         .into();
         assert!(err.downcast_ref::<AttachError>().is_some());
+    }
+
+    #[test]
+    fn test_is_affirmative_empty_input() {
+        // Enter key (empty input) defaults to yes
+        assert!(is_affirmative(""));
+        assert!(is_affirmative("\n"));
+        assert!(is_affirmative("  \n"));
+    }
+
+    #[test]
+    fn test_is_affirmative_yes_variants() {
+        assert!(is_affirmative("y\n"));
+        assert!(is_affirmative("Y\n"));
+        assert!(is_affirmative("yes\n"));
+        assert!(is_affirmative("YES\n"));
+        assert!(is_affirmative("Yes\n"));
+        assert!(is_affirmative("  y  \n"));
+    }
+
+    #[test]
+    fn test_is_affirmative_no_variants() {
+        assert!(!is_affirmative("n\n"));
+        assert!(!is_affirmative("N\n"));
+        assert!(!is_affirmative("no\n"));
+        assert!(!is_affirmative("NO\n"));
+        assert!(!is_affirmative("nope\n"));
+        assert!(!is_affirmative("anything else\n"));
     }
 }

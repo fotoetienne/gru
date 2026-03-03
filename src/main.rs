@@ -108,6 +108,12 @@ enum Commands {
             help = "Skip permission prompts (adds --dangerously-skip-permissions)"
         )]
         yolo: bool,
+
+        #[arg(
+            long,
+            help = "Skip auto-resume prompt after exiting interactive session"
+        )]
+        no_auto_resume: bool,
     },
     #[command(about = "Resume a Minion in autonomous mode (stream monitoring + auto-PR)")]
     Resume {
@@ -244,7 +250,11 @@ async fn main() {
         Commands::Review { pr } => review::handle_review(pr).await,
         Commands::Rebase { target } => rebase::handle_rebase(target).await,
         Commands::Path { id, issue, pr } => path::handle_path(id, issue, pr).await,
-        Commands::Attach { id, yolo } => attach::handle_attach(id, yolo).await,
+        Commands::Attach {
+            id,
+            yolo,
+            no_auto_resume,
+        } => attach::handle_attach(id, yolo, no_auto_resume, cli.quiet).await,
         Commands::Resume {
             id,
             prompt,
