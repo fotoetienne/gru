@@ -741,8 +741,8 @@ fn build_fix_prompt(ctx: &IssueContext, wt_ctx: &WorktreeContext) -> String {
     let template_content = match prompt_template {
         Some(ref p) => &p.content,
         None => {
-            log::warn!("No 'fix' prompt found (built-in or override), using /fix fallback");
-            return format!("/fix {}", ctx.issue_num);
+            log::warn!("No 'do' prompt found (built-in or override), using /do fallback");
+            return format!("/do {}", ctx.issue_num);
         }
     };
 
