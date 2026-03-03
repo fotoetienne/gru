@@ -223,39 +223,64 @@ pub async fn monitor_pr(
             }
         }
 
-        // Fetch PR state
-        let pr = get_pr(owner, repo, pr_number).await?;
-
-        // Check terminal states - merged PRs are also in "closed" state
-        // Must check merged flag first to distinguish merged from just closed
-        if pr.state == "closed" {
-            if pr.merged {
-                return Ok(MonitorResult::Merged);
-            } else {
-                return Ok(MonitorResult::Closed);
+        // Use select! to race the polling iteration against Ctrl+C
+        tokio::select! {
+            result = poll_once(owner, repo, pr_number, &mut last_check_time) => {
+                if let Some(monitor_result) = result? {
+                    return Ok(monitor_result);
+                }
+                // No actionable event; sleep then loop
+                sleep(Duration::from_secs(POLL_INTERVAL_SECS)).await;
+            }
+            _ = tokio::signal::ctrl_c() => {
+                return Ok(MonitorResult::Interrupted);
             }
         }
-
-        // Check for new reviews (use >= to avoid missing reviews at exact timestamp)
-        let reviews = get_reviews_since(owner, repo, pr_number, last_check_time).await?;
-        if !reviews.is_empty() {
-            // Fetch detailed comments for the new reviews
-            let comments = get_review_comments(owner, repo, pr_number, &reviews).await?;
-            return Ok(MonitorResult::NewReviews(comments));
-        }
-
-        // Check for failed CI runs - include all error states
-        let check_runs = get_check_runs(owner, repo, &pr.head.sha).await?;
-        let failed_checks = check_runs.iter().filter(|c| is_failed_check(c)).count();
-
-        if failed_checks > 0 {
-            return Ok(MonitorResult::FailedChecks(failed_checks));
-        }
-
-        // Update last check time and sleep
-        last_check_time = Utc::now();
-        sleep(Duration::from_secs(POLL_INTERVAL_SECS)).await;
     }
+}
+
+/// Perform a single polling iteration: check PR state, reviews, and CI.
+///
+/// Returns `Ok(Some(result))` if an actionable event was detected,
+/// or `Ok(None)` if nothing happened and the caller should sleep and retry.
+async fn poll_once(
+    owner: &str,
+    repo: &str,
+    pr_number: &str,
+    last_check_time: &mut DateTime<Utc>,
+) -> Result<Option<MonitorResult>> {
+    // Fetch PR state
+    let pr = get_pr(owner, repo, pr_number).await?;
+
+    // Check terminal states - merged PRs are also in "closed" state
+    // Must check merged flag first to distinguish merged from just closed
+    if pr.state == "closed" {
+        if pr.merged {
+            return Ok(Some(MonitorResult::Merged));
+        } else {
+            return Ok(Some(MonitorResult::Closed));
+        }
+    }
+
+    // Check for new reviews (use >= to avoid missing reviews at exact timestamp)
+    let reviews = get_reviews_since(owner, repo, pr_number, *last_check_time).await?;
+    if !reviews.is_empty() {
+        // Fetch detailed comments for the new reviews
+        let comments = get_review_comments(owner, repo, pr_number, &reviews).await?;
+        return Ok(Some(MonitorResult::NewReviews(comments)));
+    }
+
+    // Check for failed CI runs - include all error states
+    let check_runs = get_check_runs(owner, repo, &pr.head.sha).await?;
+    let failed_checks = check_runs.iter().filter(|c| is_failed_check(c)).count();
+
+    if failed_checks > 0 {
+        return Ok(Some(MonitorResult::FailedChecks(failed_checks)));
+    }
+
+    // Update last check time
+    *last_check_time = Utc::now();
+    Ok(None)
 }
 
 /// Result of monitoring a PR
@@ -271,6 +296,8 @@ pub enum MonitorResult {
     FailedChecks(usize),
     /// Monitoring timed out after the configured duration
     Timeout,
+    /// Monitoring was interrupted by the user (e.g., Ctrl+C)
+    Interrupted,
 }
 
 /// Fetch PR details using gh CLI with retry logic for transient failures
@@ -1165,5 +1192,22 @@ mod tests {
         let result = MonitorResult::Timeout;
         let debug = format!("{:?}", result);
         assert!(debug.contains("Timeout"));
+    }
+
+    // ========================================================================
+    // MonitorResult::Interrupted Tests
+    // ========================================================================
+
+    #[test]
+    fn test_interrupted_variant() {
+        let result = MonitorResult::Interrupted;
+        assert!(matches!(result, MonitorResult::Interrupted));
+    }
+
+    #[test]
+    fn test_interrupted_variant_debug_format() {
+        let result = MonitorResult::Interrupted;
+        let debug = format!("{:?}", result);
+        assert!(debug.contains("Interrupted"));
     }
 }
