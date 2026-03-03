@@ -555,7 +555,7 @@ mod tests {
         assert!(prompt.starts_with("# PR #456: Fix the widget"));
         assert!(prompt.contains("octocat/hello-world/pull/456"));
         assert!(prompt.contains("This PR fixes the broken widget"));
-        assert!(prompt.contains("## 1. Fetch Comments and Reviews"));
+        assert!(prompt.contains("## 1. Fetch PR Details"));
     }
 
     #[test]
