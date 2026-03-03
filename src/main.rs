@@ -49,9 +49,9 @@ enum Commands {
         )]
         repo: String,
     },
-    #[command(about = "Fix a GitHub issue")]
-    Fix {
-        #[arg(help = "Issue number or URL to fix")]
+    #[command(about = "Work on a GitHub issue", alias = "fix")]
+    Do {
+        #[arg(help = "Issue number or URL")]
         issue: String,
 
         #[arg(
@@ -250,7 +250,7 @@ async fn main() {
 
     let result = match cli.command {
         Commands::Init { repo } => init::handle_init(repo).await,
-        Commands::Fix {
+        Commands::Do {
             issue,
             timeout,
             review_timeout,

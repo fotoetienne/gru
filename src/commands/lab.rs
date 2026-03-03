@@ -359,7 +359,7 @@ async fn is_issue_claimed(repo: &str, issue_number: u64) -> Result<bool> {
     .await
 }
 
-/// Spawn a Minion to work on an issue using the `gru fix` command.
+/// Spawn a Minion to work on an issue using the `gru do` command.
 /// Returns the child process handle for lifecycle tracking.
 async fn spawn_minion(repo: &str, issue_number: u64) -> Result<Child> {
     let issue_ref = format!("{}/issues/{}", repo, issue_number);
@@ -384,15 +384,15 @@ async fn spawn_minion(repo: &str, issue_number: u64) -> Result<Child> {
         .try_clone()
         .context("Failed to clone log file handle")?;
 
-    // Spawn `gru fix <issue>` as a background process with output captured to log file
+    // Spawn `gru do <issue>` as a background process with output captured to log file
     let mut child = tokio::process::Command::new(exe)
-        .arg("fix")
+        .arg("do")
         .arg(&issue_ref)
         .stdin(Stdio::null())
         .stdout(Stdio::from(stdout_file))
         .stderr(Stdio::from(stderr_file))
         .spawn()
-        .context("Failed to spawn gru fix command")?;
+        .context("Failed to spawn gru do command")?;
 
     // Give the process a moment to fail if there are startup issues
     // This prevents phantom slot occupancy from processes that immediately fail

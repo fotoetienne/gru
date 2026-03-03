@@ -39,5 +39,5 @@ Inform the user:
 ✓ Branch: issue-<issue#>
 
 Next steps:
-  cd ~/.gru/work/owner/repo/issue-<issue#> && gru fix <issue#>
+  cd ~/.gru/work/owner/repo/issue-<issue#> && gru do <issue#>
 ```

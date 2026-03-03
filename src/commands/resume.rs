@@ -53,7 +53,7 @@ impl std::error::Error for ResumeError {}
 ///
 /// Unlike `gru attach` (which runs interactively), `gru resume` runs in
 /// autonomous mode with stream-json monitoring and auto-PR creation — the
-/// same execution model as `gru fix`.
+/// same execution model as `gru do`.
 ///
 /// Flow:
 /// 1. Resolve the minion ID and load registry info

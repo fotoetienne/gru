@@ -88,7 +88,7 @@ git commit --no-verify
 
 ### Module Structure
 
-- `src/main.rs` - CLI entry point using Clap, defines commands: fix, review, path, clean, status
+- `src/main.rs` - CLI entry point using Clap, defines commands: do, review, path, clean, status
 - `src/commands/` - Command handlers
   - `fix.rs` - Creates worktrees, spawns Claude CLI with stream-json output, monitors progress
   - `review.rs` - Delegates PR review to Claude CLI
@@ -151,7 +151,7 @@ claude --print \
 - Stream timeout: 5 minutes per line (handles long LLM operations)
 - Inactivity warning: 5 minutes (warns user of potential stuck state)
 - Stuck threshold: 15 minutes (considers task stuck, exits with error)
-- Optional timeout flag: `gru fix 42 --timeout 10m` (exits if task exceeds duration)
+- Optional timeout flag: `gru do 42 --timeout 10m` (exits if task exceeds duration)
 
 ### Design Philosophy
 
@@ -165,7 +165,7 @@ claude --print \
 
 Located in `.claude/commands/`:
 
-- `/fix <issue# or URL>` - Implement a fix for an issue (run from worktree)
+- `/do <issue# or URL>` - Work on an issue (run from worktree)
 - `/setup-worktree <issue# or URL>` - Create git worktree for working on an issue
 - `/decompose <issue# or URL>` - Break large issue into smaller sub-issues
 - `/issue [description]` - Create a GitHub issue from description or context

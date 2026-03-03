@@ -61,7 +61,7 @@ Claude: I recommend #7 (Integrate workspace management) ⚡
         - Will unblock #8 and #13 when complete
         - Medium complexity (~3 hours)
 
-        Want to start? Use `/fix 7`
+        Want to start? Use `/do 7`
 ```
 
 ## Key Features
@@ -127,7 +127,7 @@ To modify the skill:
 ## Tips
 
 - Ask project management questions naturally
-- Use `/fix <number>` to implement issues
+- Use `/do <number>` to implement issues
 - Ask "what's ready?" frequently as you complete work
 - The skill celebrates milestone completions! 🎉
 

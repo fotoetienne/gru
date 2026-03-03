@@ -945,9 +945,9 @@ mod tests {
     #[test]
     fn test_format_prompt_info_full() {
         let prompt = prompt_loader::Prompt {
-            name: "fix".to_string(),
+            name: "do".to_string(),
             metadata: prompt_loader::PromptMetadata {
-                description: Some("Fix a GitHub issue with tests and PR".to_string()),
+                description: Some("Work on a GitHub issue with tests and PR".to_string()),
                 requires: vec!["issue".to_string()],
                 params: vec![prompt_loader::PromptParam {
                     name: "target".to_string(),
@@ -956,12 +956,12 @@ mod tests {
                 }],
             },
             content: "template content".to_string(),
-            source: prompt_loader::PromptSource::Repo(PathBuf::from(".gru/prompts/fix.md")),
+            source: prompt_loader::PromptSource::Repo(PathBuf::from(".gru/prompts/do.md")),
         };
 
         let output = format_prompt_info(&prompt);
-        assert!(output.contains("Prompt: fix"));
-        assert!(output.contains("Fix a GitHub issue with tests and PR"));
+        assert!(output.contains("Prompt: do"));
+        assert!(output.contains("Work on a GitHub issue with tests and PR"));
         assert!(output.contains("Required parameters:"));
         assert!(output.contains("--issue <number>"));
         assert!(output.contains("Optional parameters:"));
@@ -1038,14 +1038,14 @@ mod tests {
     #[test]
     fn test_format_builtin_prompt_info() {
         let builtin = prompt_loader::BuiltInPrompt {
-            name: "fix",
-            description: "Fix a GitHub issue with tests and PR",
+            name: "do",
+            description: "Work on a GitHub issue with tests and PR",
             requires: &["issue"],
             content: "",
         };
         let output = format_builtin_prompt_info(&builtin);
-        assert!(output.contains("Prompt: fix"));
-        assert!(output.contains("Fix a GitHub issue with tests and PR"));
+        assert!(output.contains("Prompt: do"));
+        assert!(output.contains("Work on a GitHub issue with tests and PR"));
         assert!(output.contains("--issue <number>"));
         assert!(output.contains("Template location: built-in"));
     }
@@ -1055,9 +1055,9 @@ mod tests {
         // Even if the name matches a built-in, a BuiltIn-sourced prompt
         // should not be marked as "overrides built-in"
         let prompt = prompt_loader::Prompt {
-            name: "fix".to_string(),
+            name: "do".to_string(),
             metadata: prompt_loader::PromptMetadata {
-                description: Some("Built-in fix".to_string()),
+                description: Some("Built-in do".to_string()),
                 requires: vec![],
                 params: vec![],
             },
@@ -1072,18 +1072,18 @@ mod tests {
 
     #[test]
     fn test_format_prompt_info_global_source_shadowed_by_builtin() {
-        // A global prompt named "fix" should show "shadowed by built-in"
+        // A global prompt named "do" should show "shadowed by built-in"
         // because built-ins have higher priority than global prompts
         let prompt = prompt_loader::Prompt {
-            name: "fix".to_string(),
+            name: "do".to_string(),
             metadata: prompt_loader::PromptMetadata {
-                description: Some("Global fix attempt".to_string()),
+                description: Some("Global do attempt".to_string()),
                 requires: vec![],
                 params: vec![],
             },
             content: "content".to_string(),
             source: prompt_loader::PromptSource::Global(PathBuf::from(
-                "/home/user/.gru/prompts/fix.md",
+                "/home/user/.gru/prompts/do.md",
             )),
         };
 
@@ -1094,21 +1094,21 @@ mod tests {
             output
         );
         assert!(!output.contains("overrides built-in"));
-        assert!(output.contains("~/.gru/prompts/fix.md"));
+        assert!(output.contains("~/.gru/prompts/do.md"));
     }
 
     #[test]
     fn test_format_prompt_info_repo_source_overrides_builtin() {
-        // A repo prompt named "fix" should show "overrides built-in"
+        // A repo prompt named "do" should show "overrides built-in"
         let prompt = prompt_loader::Prompt {
-            name: "fix".to_string(),
+            name: "do".to_string(),
             metadata: prompt_loader::PromptMetadata {
-                description: Some("Team fix workflow".to_string()),
+                description: Some("Team do workflow".to_string()),
                 requires: vec!["issue".to_string()],
                 params: vec![],
             },
             content: "content".to_string(),
-            source: prompt_loader::PromptSource::Repo(PathBuf::from("/repo/.gru/prompts/fix.md")),
+            source: prompt_loader::PromptSource::Repo(PathBuf::from("/repo/.gru/prompts/do.md")),
         };
 
         let output = format_prompt_info(&prompt);
@@ -1117,13 +1117,13 @@ mod tests {
             "Repo prompt matching built-in name should show overrides indicator, got: {}",
             output
         );
-        assert!(output.contains(".gru/prompts/fix.md"));
+        assert!(output.contains(".gru/prompts/do.md"));
     }
 
     #[tokio::test]
     async fn test_handle_prompt_info_builtin_success() {
-        // "fix" is always in BUILT_IN_PROMPTS
-        let result = handle_prompt_info("fix").await;
+        // "do" is always in BUILT_IN_PROMPTS
+        let result = handle_prompt_info("do").await;
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), 0);
     }

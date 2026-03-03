@@ -113,8 +113,8 @@ pub async fn parse_issue_info(issue: &str) -> Result<(String, String, String)> {
     anyhow::bail!(
         "Invalid issue format. Expected: <number> or <github-url>\n\
          Examples:\n\
-         - gru fix 42\n\
-         - gru fix https://github.com/owner/repo/issues/42"
+         - gru do 42\n\
+         - gru do https://github.com/owner/repo/issues/42"
     );
 }
 
@@ -142,7 +142,7 @@ pub async fn parse_pr_info(pr: &str) -> Result<(String, String, String, String)>
             // Parsed successfully but wrong resource type (e.g., issue URL given for review command)
             anyhow::bail!(
                 "Expected a GitHub pull request URL, but got an issue URL.\n\
-                 Did you mean to use `gru fix` instead?"
+                 Did you mean to use `gru do` instead?"
             );
         }
         let cmd = github::gh_command_for_repo(&format!("{}/{}", parsed.owner, parsed.repo));

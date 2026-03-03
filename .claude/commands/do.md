@@ -1,10 +1,10 @@
 ---
-description: Implement a fix for a GitHub issue (run from worktree)
+description: Work on a GitHub issue (run from worktree)
 allowed-tools: Bash(gh:*), Bash(gh pr checks:*), Bash(git:*), Bash(cargo:*), Bash(just:*), Read, Glob, Grep, Edit, Write, Task, TodoWrite, WebFetch
 argument-hint: "<issue# or URL>"
 ---
 
-Implement a fix for a GitHub issue.
+Work on a GitHub issue.
 
 **Issue:**
 $ARGUMENTS

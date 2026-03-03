@@ -205,7 +205,7 @@ Claude: Let me check the worktrees:
 
 ## Related Commands
 
-- `/fix <issue>` - Creates Minion with worktree automatically
+- `/do <issue>` - Creates Minion with worktree automatically
 - `gh issue view <number>` - View issue before creating Minion
 
 ## Learn More

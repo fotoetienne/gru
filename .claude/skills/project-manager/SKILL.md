@@ -186,7 +186,7 @@ python3 .claude/skills/project-manager/pm.py graph
 - "Should I show the critical path?"
 
 ### After showing what's next
-- "Ready to start on #7? Use `/fix 7` to begin"
+- "Ready to start on #7? Use `/do 7` to begin"
 - "Want to know what this will unblock?"
 
 ### After showing blockers
@@ -218,12 +218,12 @@ Your role is **planning and prioritization**, not implementation.
 - ✅ Celebrate milestones
 
 ### DON'T:
-- ❌ Implement issues (that's `/fix` command)
+- ❌ Implement issues (that's `/do` command)
 - ❌ Debug code (that's outside your scope)
 - ❌ Modify project structure
 - ❌ Make technical implementation decisions
 
-If user wants to implement, suggest: "Ready to start? Use `/fix <issue-number>` to begin implementation!"
+If user wants to implement, suggest: "Ready to start? Use `/do <issue-number>` to begin implementation!"
 
 ## Error Handling
 

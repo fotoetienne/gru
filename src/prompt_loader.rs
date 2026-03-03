@@ -30,8 +30,8 @@ use crate::reserved_commands;
 /// when there is no corresponding built-in with content for that name.
 pub const BUILT_IN_PROMPTS: &[BuiltInPrompt] = &[
     BuiltInPrompt {
-        name: "fix",
-        description: "Fix a GitHub issue with tests and PR",
+        name: "do",
+        description: "Work on a GitHub issue with tests and PR",
         requires: &["issue"],
         content: r#"# Issue #{{ issue_number }}: {{ issue_title }}
 
@@ -545,8 +545,13 @@ fn load_prompts_internal(
 
 /// Resolves a prompt by name, checking repo overrides, built-in, and global prompts.
 ///
-/// This is the main entry point for commands like `gru fix` that need to load
+/// This is the main entry point for commands like `gru do` that need to load
 /// a built-in prompt while allowing user overrides.
+///
+/// **Backward compatibility:** When resolving the `"do"` prompt, if the result is
+/// the built-in (no user override via `do.md`), this also checks for a legacy
+/// `fix.md` override and uses it with a deprecation warning. This ensures existing
+/// `.gru/prompts/fix.md` files continue to work after the `fix` → `do` rename.
 ///
 /// **Performance note:** This loads all prompts from disk (scanning `.gru/prompts/`
 /// directories) and then extracts the requested one. The cost is proportional to
@@ -557,7 +562,30 @@ fn load_prompts_internal(
 /// Returns `None` if no prompt with that name exists (neither built-in nor custom).
 pub fn resolve_prompt(name: &str, repo_root: Option<&Path>) -> Result<Option<Prompt>> {
     let mut prompts = load_prompts(repo_root)?;
-    Ok(prompts.remove(name))
+
+    let prompt = prompts.remove(name);
+
+    // Backward compatibility: "do" was previously named "fix".
+    // If we resolved the built-in "do" (no user override via do.md),
+    // check if the user has a "fix.md" override and use that instead.
+    if name == "do" {
+        if let Some(ref p) = prompt {
+            if matches!(p.source, PromptSource::BuiltIn) {
+                if let Some(mut fix_prompt) = prompts.remove("fix") {
+                    if !matches!(fix_prompt.source, PromptSource::BuiltIn) {
+                        log::warn!(
+                            "Deprecation: prompt override 'fix.md' found. \
+                             Please rename to 'do.md' — 'fix.md' support will be removed in a future version."
+                        );
+                        fix_prompt.name = "do".to_string();
+                        return Ok(Some(fix_prompt));
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(prompt)
 }
 
 /// Collects required parameters that are missing or have empty/whitespace-only values
@@ -1496,21 +1524,24 @@ Repo content"#,
     // --- Built-in prompt tests ---
 
     #[test]
-    fn test_builtin_fix_prompt_has_content() {
-        let fix = BUILT_IN_PROMPTS.iter().find(|b| b.name == "fix").unwrap();
-        assert!(!fix.content.trim().is_empty());
-        assert_eq!(fix.description, "Fix a GitHub issue with tests and PR");
-        assert_eq!(fix.requires, &["issue"]);
+    fn test_builtin_do_prompt_has_content() {
+        let do_prompt = BUILT_IN_PROMPTS.iter().find(|b| b.name == "do").unwrap();
+        assert!(!do_prompt.content.trim().is_empty());
+        assert_eq!(
+            do_prompt.description,
+            "Work on a GitHub issue with tests and PR"
+        );
+        assert_eq!(do_prompt.requires, &["issue"]);
     }
 
     #[test]
     fn test_builtin_to_prompt_with_content() {
-        let fix = BUILT_IN_PROMPTS.iter().find(|b| b.name == "fix").unwrap();
-        let prompt = fix.to_prompt();
+        let do_prompt = BUILT_IN_PROMPTS.iter().find(|b| b.name == "do").unwrap();
+        let prompt = do_prompt.to_prompt();
         assert!(prompt.is_some());
 
         let prompt = prompt.unwrap();
-        assert_eq!(prompt.name, "fix");
+        assert_eq!(prompt.name, "do");
         assert!(matches!(prompt.source, PromptSource::BuiltIn));
         assert_eq!(prompt.metadata.requires, vec!["issue"]);
         assert!(prompt.content.contains("{{ issue_number }}"));
@@ -1561,14 +1592,14 @@ Repo content"#,
     }
 
     #[test]
-    fn test_builtin_fix_included_in_load_prompts() {
+    fn test_builtin_do_included_in_load_prompts() {
         let temp_dir = TempDir::new().unwrap();
         let prompts = load_prompts_internal(Some(temp_dir.path()), Some(temp_dir.path())).unwrap();
 
-        assert!(prompts.contains_key("fix"));
-        let fix = &prompts["fix"];
-        assert!(matches!(fix.source, PromptSource::BuiltIn));
-        assert!(fix
+        assert!(prompts.contains_key("do"));
+        let do_prompt = &prompts["do"];
+        assert!(matches!(do_prompt.source, PromptSource::BuiltIn));
+        assert!(do_prompt
             .content
             .contains("## 1. Check if Decomposition is Needed"));
     }
@@ -1684,36 +1715,36 @@ Repo content"#,
         let prompts_dir = temp_dir.path().join(".gru").join("prompts");
         fs::create_dir_all(&prompts_dir).unwrap();
 
-        // Create a repo prompt that overrides the built-in "fix"
+        // Create a repo prompt that overrides the built-in "do"
         fs::write(
-            prompts_dir.join("fix.md"),
+            prompts_dir.join("do.md"),
             r#"---
-description: Custom fix workflow
+description: Custom do workflow
 requires: [issue]
 ---
-Custom fix for issue #{{ issue_number }}"#,
+Custom do for issue #{{ issue_number }}"#,
         )
         .unwrap();
 
         let prompts = load_prompts_internal(Some(temp_dir.path()), Some(temp_dir.path())).unwrap();
 
-        let fix = &prompts["fix"];
-        assert!(matches!(fix.source, PromptSource::Repo(_)));
+        let do_prompt = &prompts["do"];
+        assert!(matches!(do_prompt.source, PromptSource::Repo(_)));
         assert_eq!(
-            fix.metadata.description,
-            Some("Custom fix workflow".to_string())
+            do_prompt.metadata.description,
+            Some("Custom do workflow".to_string())
         );
-        assert_eq!(fix.content, "Custom fix for issue #{{ issue_number }}");
+        assert_eq!(do_prompt.content, "Custom do for issue #{{ issue_number }}");
     }
 
     #[test]
     fn test_resolve_prompt_finds_builtin() {
         let temp_dir = TempDir::new().unwrap();
-        let prompt = resolve_prompt("fix", Some(temp_dir.path())).unwrap();
+        let prompt = resolve_prompt("do", Some(temp_dir.path())).unwrap();
         assert!(prompt.is_some());
 
         let prompt = prompt.unwrap();
-        assert_eq!(prompt.name, "fix");
+        assert_eq!(prompt.name, "do");
         assert!(matches!(prompt.source, PromptSource::BuiltIn));
     }
 
@@ -1725,9 +1756,59 @@ Custom fix for issue #{{ issue_number }}"#,
     }
 
     #[test]
-    fn test_builtin_fix_template_has_expected_variables() {
-        let fix = BUILT_IN_PROMPTS.iter().find(|b| b.name == "fix").unwrap();
-        let prompt = fix.to_prompt().unwrap();
+    fn test_resolve_do_falls_back_to_fix_md_override() {
+        let temp_dir = TempDir::new().unwrap();
+        let prompts_dir = temp_dir.path().join(".gru").join("prompts");
+        fs::create_dir_all(&prompts_dir).unwrap();
+
+        // Create a legacy fix.md repo override (no do.md present)
+        fs::write(
+            prompts_dir.join("fix.md"),
+            "---\ndescription: Legacy fix override\nrequires: [issue]\n---\nLegacy fix content",
+        )
+        .unwrap();
+
+        let prompt = resolve_prompt("do", Some(temp_dir.path())).unwrap();
+        assert!(prompt.is_some());
+
+        let prompt = prompt.unwrap();
+        // Should use the fix.md content but rename to "do"
+        assert_eq!(prompt.name, "do");
+        assert!(matches!(prompt.source, PromptSource::Repo(_)));
+        assert_eq!(prompt.content, "Legacy fix content");
+    }
+
+    #[test]
+    fn test_resolve_do_prefers_do_md_over_fix_md() {
+        let temp_dir = TempDir::new().unwrap();
+        let prompts_dir = temp_dir.path().join(".gru").join("prompts");
+        fs::create_dir_all(&prompts_dir).unwrap();
+
+        // Create both do.md and fix.md — do.md should win
+        fs::write(
+            prompts_dir.join("do.md"),
+            "---\ndescription: New do override\nrequires: [issue]\n---\nNew do content",
+        )
+        .unwrap();
+        fs::write(
+            prompts_dir.join("fix.md"),
+            "---\ndescription: Legacy fix override\nrequires: [issue]\n---\nLegacy fix content",
+        )
+        .unwrap();
+
+        let prompt = resolve_prompt("do", Some(temp_dir.path())).unwrap();
+        assert!(prompt.is_some());
+
+        let prompt = prompt.unwrap();
+        assert_eq!(prompt.name, "do");
+        assert!(matches!(prompt.source, PromptSource::Repo(_)));
+        assert_eq!(prompt.content, "New do content");
+    }
+
+    #[test]
+    fn test_builtin_do_template_has_expected_variables() {
+        let do_prompt = BUILT_IN_PROMPTS.iter().find(|b| b.name == "do").unwrap();
+        let prompt = do_prompt.to_prompt().unwrap();
 
         // Template should reference standard context variables
         assert!(prompt.content.contains("{{ issue_number }}"));

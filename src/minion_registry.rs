@@ -42,7 +42,7 @@ where
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum MinionMode {
-    /// Autonomous operation via `gru fix` or `gru resume` - stream monitoring
+    /// Autonomous operation via `gru do` or `gru resume` - stream monitoring
     Autonomous,
     /// Interactive operation via `gru attach` - user in terminal
     Interactive,
@@ -102,7 +102,7 @@ pub struct MinionInfo {
     pub repo: String,
     /// Issue number the Minion is addressing
     pub issue: u64,
-    /// Command that started the Minion (e.g., "fix", "review", "respond", "rebase")
+    /// Command that started the Minion (e.g., "do", "review", "respond", "rebase")
     pub command: String,
     /// The prompt that was given to the Minion
     pub prompt: String,
@@ -436,8 +436,8 @@ mod tests {
         MinionInfo {
             repo: "fotoetienne/gru".to_string(),
             issue: 42,
-            command: "fix".to_string(),
-            prompt: "Fix issue #42".to_string(),
+            command: "do".to_string(),
+            prompt: "Do issue #42".to_string(),
             started_at: now,
             branch: "minion/issue-42-M001".to_string(),
             worktree: PathBuf::from("/tmp/test"),

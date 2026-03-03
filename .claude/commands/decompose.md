@@ -78,7 +78,7 @@ For each approved sub-issue:
 
 ## 8. Summarize
 - Report the sub-issues created with their numbers
-- Suggest: "Run `/fix <first-sub-issue>` to start implementation"
+- Suggest: "Run `/do <first-sub-issue>` to start implementation"
 - Note: Don't close the parent issue - it will close automatically when all sub-issues are done
 
 ## Notes
