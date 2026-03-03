@@ -107,10 +107,7 @@ enum Commands {
         #[arg(help = "Minion ID, issue number, or PR number (e.g., M0tk, 42)")]
         id: String,
 
-        #[arg(
-            long,
-            help = "Additional prompt to pass to Claude as continuation message"
-        )]
+        #[arg(long, help = "Additional instructions to pass to Claude when resuming")]
         prompt: Option<String>,
 
         #[arg(

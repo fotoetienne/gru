@@ -3,7 +3,7 @@ use crate::claude_runner::{
     EXIT_CODE_SIGNAL_TERMINATED,
 };
 use crate::commands::fix::{
-    handle_pr_creation, is_branch_pushed, update_orchestration_phase, IssueContext, WorktreeContext,
+    handle_pr_creation, update_orchestration_phase, IssueContext, WorktreeContext,
 };
 use crate::github::GitHubClient;
 use crate::minion_registry::{
@@ -12,7 +12,7 @@ use crate::minion_registry::{
 use crate::minion_resolver;
 use crate::progress::{ProgressConfig, ProgressDisplay};
 use crate::stream;
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use chrono::Utc;
 use uuid::Uuid;
 
@@ -155,42 +155,31 @@ pub async fn handle_resume(
         Err(e) => return Err(e),
     }
 
-    // Phase: Create PR if branch was pushed
-    let branch_pushed = is_branch_pushed(&minion.worktree_path, &branch_name).await?;
+    // Phase: Create PR (handle_pr_creation checks if branch was pushed internally)
+    update_orchestration_phase(&minion.minion_id, OrchestrationPhase::CreatingPr).await;
 
-    if branch_pushed {
-        update_orchestration_phase(&minion.minion_id, OrchestrationPhase::CreatingPr).await;
-
-        // Build IssueContext for PR creation (fetch issue details for PR title)
-        let github_client = match GitHubClient::from_env(&owner, &repo).await {
-            Ok(client) => Some(client),
-            Err(e) => {
-                log::warn!("⚠️  GitHub client unavailable: {}", e);
-                None
-            }
-        };
-
-        let issue_ctx = IssueContext {
-            owner,
-            repo,
-            issue_num,
-            details: None,
-            github_client,
-        };
-
-        match handle_pr_creation(&issue_ctx, &wt_ctx).await {
-            Ok(Some(pr_number)) => {
-                println!("✅ PR #{} created successfully", pr_number);
-            }
-            Ok(None) => {
-                println!("ℹ️  No PR created (branch may already have a PR)");
-            }
-            Err(e) => {
-                log::warn!("⚠️  PR creation failed: {}", e);
-            }
+    let github_client = match GitHubClient::from_env(&owner, &repo).await {
+        Ok(client) => Some(client),
+        Err(e) => {
+            log::warn!("⚠️  GitHub client unavailable: {}", e);
+            None
         }
-    } else {
-        println!("ℹ️  Branch was not pushed. No PR will be created.");
+    };
+
+    let issue_ctx = IssueContext {
+        owner,
+        repo,
+        issue_num,
+        details: None,
+        github_client,
+    };
+
+    match handle_pr_creation(&issue_ctx, &wt_ctx).await {
+        Ok(Some(_)) => {}
+        Ok(None) => {}
+        Err(e) => {
+            log::warn!("⚠️  PR creation failed: {}", e);
+        }
     }
 
     update_orchestration_phase(&minion.minion_id, OrchestrationPhase::Completed).await;
@@ -306,8 +295,7 @@ async fn check_and_claim_session(
                 if mode != MinionMode::Stopped {
                     match pid {
                         Some(pid_val) => {
-                            let is_running = cfg!(not(unix)) || is_process_alive(pid_val);
-                            if is_running {
+                            if is_process_alive(pid_val) {
                                 return Err(ResumeError::AlreadyRunning {
                                     minion_id: id,
                                     mode,
@@ -343,7 +331,12 @@ async fn check_and_claim_session(
                 let (owner, repo_name) = repo
                     .split_once('/')
                     .map(|(o, r)| (o.to_string(), r.to_string()))
-                    .unwrap_or_else(|| (String::new(), repo));
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "Invalid repo format in registry: '{}' (expected 'owner/repo')",
+                            repo
+                        )
+                    })?;
 
                 Ok(Some((session_id, owner, repo_name, issue, branch)))
             }
@@ -352,17 +345,7 @@ async fn check_and_claim_session(
     })
     .await;
 
-    match result {
-        Ok(info) => Ok(info),
-        Err(e) => {
-            if e.downcast_ref::<ResumeError>().is_some() {
-                Err(e)
-            } else {
-                log::debug!("Could not check registry: {}", e);
-                Ok(None)
-            }
-        }
-    }
+    result.context("Failed to access minion registry")
 }
 
 #[cfg(test)]
