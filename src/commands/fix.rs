@@ -4,7 +4,7 @@ use crate::claude_runner::{
     run_claude_with_stream_monitoring, EXIT_CODE_SIGNAL_TERMINATED,
 };
 use crate::git;
-use crate::github::GitHubClient;
+use crate::github::{infer_github_host, GitHubClient};
 use crate::minion;
 use crate::minion_registry::{
     is_process_alive, with_registry, MinionInfo as RegistryMinionInfo, MinionMode, MinionRegistry,
@@ -85,8 +85,10 @@ pub(crate) struct ClaudeResult {
 /// refs, because gru worktrees are backed by bare repos whose `origin` remote
 /// points to the local bare repo — not to GitHub.
 pub(crate) async fn is_branch_pushed(owner: &str, repo: &str, branch_name: &str) -> Result<bool> {
-    let remote_url = format!("https://github.com/{}/{}.git", owner, repo);
+    let host = infer_github_host(owner);
+    let remote_url = format!("https://{}/{}/{}.git", host, owner, repo);
     let output = TokioCommand::new("git")
+        .env("GIT_TERMINAL_PROMPT", "0")
         .arg("ls-remote")
         .arg("--heads")
         .arg(&remote_url)

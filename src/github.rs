@@ -46,7 +46,7 @@ async fn try_get_token_from_cli(owner: &str, _repo: &str) -> Option<String> {
 /// * `owner` - Repository owner (user or organization)
 ///
 /// Returns the appropriate GitHub hostname (github.com or ghe.netflix.net)
-fn infer_github_host(owner: &str) -> &'static str {
+pub(crate) fn infer_github_host(owner: &str) -> &'static str {
     // Future enhancement: Parse from git remote URL
     // For now, use simple heuristic
     if owner == "netflix" || owner.contains("netflix") {
