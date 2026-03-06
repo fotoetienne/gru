@@ -362,7 +362,8 @@ async fn is_issue_claimed(repo: &str, issue_number: u64) -> Result<bool> {
 /// Spawn a Minion to work on an issue using the `gru do` command.
 /// Returns the child process handle for lifecycle tracking.
 async fn spawn_minion(repo: &str, issue_number: u64) -> Result<Child> {
-    let issue_ref = format!("{}/issues/{}", repo, issue_number);
+    let issue_ref = crate::github::build_issue_url(repo, issue_number)
+        .with_context(|| format!("Invalid repo format: '{}'", repo))?;
 
     // Get the current executable path
     let exe = std::env::current_exe().context("Failed to get current executable path")?;
@@ -401,9 +402,8 @@ async fn spawn_minion(repo: &str, issue_number: u64) -> Result<Child> {
     // Check if the process is still running
     if let Ok(Some(status)) = child.try_wait() {
         anyhow::bail!(
-            "Spawned process for {}/issues/{} exited immediately with status: {:?}",
-            repo,
-            issue_number,
+            "Spawned process for {} exited immediately with status: {:?}",
+            issue_ref,
             status
         );
     }
@@ -466,5 +466,31 @@ mod tests {
         assert_eq!(parse_repo_spec("/repo"), None);
         assert_eq!(parse_repo_spec("owner/"), None);
         assert_eq!(parse_repo_spec("/"), None);
+    }
+
+    // --- issue URL construction tests ---
+
+    #[test]
+    fn test_issue_ref_builds_full_github_url() {
+        let url = crate::github::build_issue_url("fotoetienne/gru", 42).unwrap();
+        assert_eq!(url, "https://github.com/fotoetienne/gru/issues/42");
+    }
+
+    #[test]
+    fn test_issue_ref_builds_ghe_url_for_netflix() {
+        let url = crate::github::build_issue_url("netflix/some-service", 99).unwrap();
+        assert_eq!(
+            url,
+            "https://ghe.netflix.net/netflix/some-service/issues/99"
+        );
+    }
+
+    #[test]
+    fn test_build_issue_url_rejects_invalid_repo() {
+        assert!(crate::github::build_issue_url("", 1).is_none());
+        assert!(crate::github::build_issue_url("justrepo", 1).is_none());
+        assert!(crate::github::build_issue_url("/repo", 1).is_none());
+        assert!(crate::github::build_issue_url("owner/", 1).is_none());
+        assert!(crate::github::build_issue_url("a/b/c", 1).is_none());
     }
 }
