@@ -4,7 +4,7 @@ use crate::claude_runner::{
     run_claude_with_stream_monitoring, EXIT_CODE_SIGNAL_TERMINATED,
 };
 use crate::git;
-use crate::github::GitHubClient;
+use crate::github::{gh_command_for_repo, GitHubClient};
 use crate::minion;
 use crate::minion_registry::{
     is_process_alive, with_registry, MinionInfo as RegistryMinionInfo, MinionMode, MinionRegistry,
@@ -79,18 +79,37 @@ pub(crate) struct ClaudeResult {
 // Helper functions (unchanged from original)
 // ---------------------------------------------------------------------------
 
-/// Checks if a branch has been pushed to the remote
-pub(crate) async fn is_branch_pushed(worktree_path: &Path, branch_name: &str) -> Result<bool> {
-    let output = TokioCommand::new("git")
-        .arg("-C")
-        .arg(worktree_path)
-        .arg("rev-parse")
-        .arg(format!("origin/{}", branch_name))
+/// Checks if a branch has been pushed to the remote by querying GitHub's API.
+///
+/// Uses the `gh`/`ghe` CLI instead of local git tracking refs, because gru
+/// worktrees are backed by bare repos whose `origin` remote points to the
+/// local bare repo — not to GitHub.
+pub(crate) async fn is_branch_pushed(owner: &str, repo: &str, branch_name: &str) -> Result<bool> {
+    let repo_full = format!("{}/{}", owner, repo);
+    let gh_cmd = gh_command_for_repo(&repo_full);
+    let endpoint = format!("repos/{}/git/ref/heads/{}", repo_full, branch_name);
+    let output = TokioCommand::new(gh_cmd)
+        .args(["api", &endpoint, "--silent"])
         .output()
         .await
-        .context("Failed to check if branch is pushed")?;
+        .context("Failed to run gh api to check if branch is pushed")?;
 
-    Ok(output.status.success())
+    if output.status.success() {
+        return Ok(true);
+    }
+
+    // 404 means the branch doesn't exist on the remote
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if stderr.contains("404") || stderr.contains("Not Found") {
+        return Ok(false);
+    }
+
+    // Any other failure (auth, network, rate limit) is a real error
+    Err(anyhow::anyhow!(
+        "gh api failed while checking if branch '{}' is pushed: {}",
+        branch_name,
+        stderr.trim()
+    ))
 }
 
 /// Creates a WIP PR title and body template
@@ -973,7 +992,8 @@ pub(crate) async fn handle_pr_creation(
     wt_ctx: &WorktreeContext,
 ) -> Result<Option<String>> {
     println!("\n🔍 Checking if branch was pushed...");
-    let branch_pushed = is_branch_pushed(&wt_ctx.checkout_path, &wt_ctx.branch_name).await?;
+    let branch_pushed =
+        is_branch_pushed(&issue_ctx.owner, &issue_ctx.repo, &wt_ctx.branch_name).await?;
 
     if !branch_pushed {
         println!("ℹ️  Branch was not pushed. No PR will be created.");
@@ -1503,15 +1523,23 @@ mod tests {
 
     #[tokio::test]
     async fn test_is_branch_pushed_nonexistent() {
-        use std::env;
+        // Test with a nonexistent branch — gh api should return 404 → Ok(false)
+        let result = is_branch_pushed("fotoetienne", "gru", "nonexistent-branch-xyz-12345").await;
 
-        // Test with a non-existent directory
-        let temp_dir = env::temp_dir().join("gru-test-nonexistent");
-        let result = is_branch_pushed(&temp_dir, "test-branch").await;
-
-        // Git command will fail, but we return Ok(false) to indicate branch is not pushed
-        assert!(result.is_ok());
-        assert!(!result.unwrap());
+        // gh api returns 404 for nonexistent branches, which we map to Ok(false)
+        // Skip assertion if gh CLI is not available (e.g., CI without auth)
+        match result {
+            Ok(pushed) => assert!(!pushed),
+            Err(e) => {
+                let msg = e.to_string();
+                // Acceptable failures: gh not installed, not authenticated
+                assert!(
+                    msg.contains("gh api failed") || msg.contains("Failed to run gh api"),
+                    "Unexpected error: {}",
+                    msg
+                );
+            }
+        }
     }
 
     /// Creates a test `WorktreeContext` with separate minion_dir and checkout_path.
