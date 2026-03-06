@@ -79,18 +79,24 @@ pub(crate) struct ClaudeResult {
 // Helper functions (unchanged from original)
 // ---------------------------------------------------------------------------
 
-/// Checks if a branch has been pushed to the remote
-pub(crate) async fn is_branch_pushed(worktree_path: &Path, branch_name: &str) -> Result<bool> {
+/// Checks if a branch has been pushed to the remote by querying GitHub directly.
+///
+/// Uses `git ls-remote` with the GitHub URL rather than checking local tracking
+/// refs, because gru worktrees are backed by bare repos whose `origin` remote
+/// points to the local bare repo — not to GitHub.
+pub(crate) async fn is_branch_pushed(owner: &str, repo: &str, branch_name: &str) -> Result<bool> {
+    let remote_url = format!("https://github.com/{}/{}.git", owner, repo);
     let output = TokioCommand::new("git")
-        .arg("-C")
-        .arg(worktree_path)
-        .arg("rev-parse")
-        .arg(format!("origin/{}", branch_name))
+        .arg("ls-remote")
+        .arg("--heads")
+        .arg(&remote_url)
+        .arg(branch_name)
         .output()
         .await
         .context("Failed to check if branch is pushed")?;
 
-    Ok(output.status.success())
+    // ls-remote prints matching refs; non-empty stdout means the branch exists
+    Ok(output.status.success() && !output.stdout.is_empty())
 }
 
 /// Creates a WIP PR title and body template
@@ -973,7 +979,8 @@ pub(crate) async fn handle_pr_creation(
     wt_ctx: &WorktreeContext,
 ) -> Result<Option<String>> {
     println!("\n🔍 Checking if branch was pushed...");
-    let branch_pushed = is_branch_pushed(&wt_ctx.checkout_path, &wt_ctx.branch_name).await?;
+    let branch_pushed =
+        is_branch_pushed(&issue_ctx.owner, &issue_ctx.repo, &wt_ctx.branch_name).await?;
 
     if !branch_pushed {
         println!("ℹ️  Branch was not pushed. No PR will be created.");
@@ -1503,13 +1510,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_is_branch_pushed_nonexistent() {
-        use std::env;
+        // Test with a nonexistent branch on a real repo
+        let result = is_branch_pushed("fotoetienne", "gru", "nonexistent-branch-xyz-12345").await;
 
-        // Test with a non-existent directory
-        let temp_dir = env::temp_dir().join("gru-test-nonexistent");
-        let result = is_branch_pushed(&temp_dir, "test-branch").await;
-
-        // Git command will fail, but we return Ok(false) to indicate branch is not pushed
+        // ls-remote succeeds but returns no matching refs
         assert!(result.is_ok());
         assert!(!result.unwrap());
     }
