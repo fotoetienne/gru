@@ -46,7 +46,7 @@ async fn try_get_token_from_cli(owner: &str, _repo: &str) -> Option<String> {
 /// * `owner` - Repository owner (user or organization)
 ///
 /// Returns the appropriate GitHub hostname (github.com or ghe.netflix.net)
-pub fn infer_github_host(owner: &str) -> &'static str {
+fn infer_github_host(owner: &str) -> &'static str {
     // Future enhancement: Parse from git remote URL
     // For now, use simple heuristic
     if owner == "netflix" || owner.contains("netflix") {
@@ -54,6 +54,13 @@ pub fn infer_github_host(owner: &str) -> &'static str {
     } else {
         "github.com"
     }
+}
+
+/// Build a full GitHub issue URL for a repo in "owner/repo" format.
+pub fn build_issue_url(repo: &str, issue_number: u64) -> String {
+    let owner = repo.split('/').next().unwrap_or("");
+    let host = infer_github_host(owner);
+    format!("https://{}/{}/issues/{}", host, repo, issue_number)
 }
 
 /// Determine the correct `gh` CLI command for a repository.

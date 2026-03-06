@@ -30,21 +30,24 @@ fn clean_url(url: &str) -> &str {
         .trim_end_matches('/')
 }
 
+/// Known GitHub hosts (public and enterprise).
+const KNOWN_GITHUB_HOSTS: &[&str] = &["https://github.com/", "https://ghe.netflix.net/"];
+
 /// Parses a GitHub issue or PR URL into its components.
 ///
 /// Handles URLs like:
 /// - `https://github.com/owner/repo/issues/42`
 /// - `https://github.com/owner/repo/pull/42`
+/// - `https://ghe.netflix.net/owner/repo/issues/42`
 /// - URLs with query params, fragments, and trailing slashes
 ///
 /// Returns `None` if the URL is not a valid GitHub issue/PR URL.
 pub fn parse_github_url(url: &str) -> Option<GitHubUrl> {
-    if !url.starts_with("https://github.com/") {
-        return None;
-    }
-
     let cleaned = clean_url(url);
-    let path = cleaned.strip_prefix("https://github.com/")?;
+    let host_prefix = KNOWN_GITHUB_HOSTS
+        .iter()
+        .find(|&&h| cleaned.starts_with(h))?;
+    let path = cleaned.strip_prefix(host_prefix)?;
     let parts: Vec<&str> = path.split('/').collect();
 
     if parts.len() != 4 {
@@ -206,6 +209,26 @@ mod tests {
         assert_eq!(result.repo, "gru");
         assert_eq!(result.resource_type, GitHubResourceType::Issue);
         assert_eq!(result.number, 42);
+    }
+
+    #[test]
+    fn test_parse_github_url_ghe_issue() {
+        let result =
+            parse_github_url("https://ghe.netflix.net/netflix/some-service/issues/99").unwrap();
+        assert_eq!(result.owner, "netflix");
+        assert_eq!(result.repo, "some-service");
+        assert_eq!(result.resource_type, GitHubResourceType::Issue);
+        assert_eq!(result.number, 99);
+    }
+
+    #[test]
+    fn test_parse_github_url_ghe_pull() {
+        let result =
+            parse_github_url("https://ghe.netflix.net/netflix/some-service/pull/10").unwrap();
+        assert_eq!(result.owner, "netflix");
+        assert_eq!(result.repo, "some-service");
+        assert_eq!(result.resource_type, GitHubResourceType::Pull);
+        assert_eq!(result.number, 10);
     }
 
     #[test]

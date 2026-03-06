@@ -362,9 +362,7 @@ async fn is_issue_claimed(repo: &str, issue_number: u64) -> Result<bool> {
 /// Spawn a Minion to work on an issue using the `gru do` command.
 /// Returns the child process handle for lifecycle tracking.
 async fn spawn_minion(repo: &str, issue_number: u64) -> Result<Child> {
-    let owner = repo.split('/').next().unwrap_or("");
-    let host = crate::github::infer_github_host(owner);
-    let issue_ref = format!("https://{}/{}/issues/{}", host, repo, issue_number);
+    let issue_ref = crate::github::build_issue_url(repo, issue_number);
 
     // Get the current executable path
     let exe = std::env::current_exe().context("Failed to get current executable path")?;
@@ -470,15 +468,20 @@ mod tests {
         assert_eq!(parse_repo_spec("/"), None);
     }
 
-    // --- issue_ref URL construction tests ---
+    // --- issue URL construction tests ---
 
     #[test]
     fn test_issue_ref_builds_full_github_url() {
-        let repo = "fotoetienne/gru";
-        let issue_number: u64 = 42;
-        let owner = repo.split('/').next().unwrap_or("");
-        let host = crate::github::infer_github_host(owner);
-        let issue_ref = format!("https://{}/{}/issues/{}", host, repo, issue_number);
-        assert_eq!(issue_ref, "https://github.com/fotoetienne/gru/issues/42");
+        let url = crate::github::build_issue_url("fotoetienne/gru", 42);
+        assert_eq!(url, "https://github.com/fotoetienne/gru/issues/42");
+    }
+
+    #[test]
+    fn test_issue_ref_builds_ghe_url_for_netflix() {
+        let url = crate::github::build_issue_url("netflix/some-service", 99);
+        assert_eq!(
+            url,
+            "https://ghe.netflix.net/netflix/some-service/issues/99"
+        );
     }
 }
