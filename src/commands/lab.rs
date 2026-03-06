@@ -362,7 +362,9 @@ async fn is_issue_claimed(repo: &str, issue_number: u64) -> Result<bool> {
 /// Spawn a Minion to work on an issue using the `gru do` command.
 /// Returns the child process handle for lifecycle tracking.
 async fn spawn_minion(repo: &str, issue_number: u64) -> Result<Child> {
-    let issue_ref = format!("{}/issues/{}", repo, issue_number);
+    let owner = repo.split('/').next().unwrap_or("");
+    let host = crate::github::infer_github_host(owner);
+    let issue_ref = format!("https://{}/{}/issues/{}", host, repo, issue_number);
 
     // Get the current executable path
     let exe = std::env::current_exe().context("Failed to get current executable path")?;
@@ -466,5 +468,17 @@ mod tests {
         assert_eq!(parse_repo_spec("/repo"), None);
         assert_eq!(parse_repo_spec("owner/"), None);
         assert_eq!(parse_repo_spec("/"), None);
+    }
+
+    // --- issue_ref URL construction tests ---
+
+    #[test]
+    fn test_issue_ref_builds_full_github_url() {
+        let repo = "fotoetienne/gru";
+        let issue_number: u64 = 42;
+        let owner = repo.split('/').next().unwrap_or("");
+        let host = crate::github::infer_github_host(owner);
+        let issue_ref = format!("https://{}/{}/issues/{}", host, repo, issue_number);
+        assert_eq!(issue_ref, "https://github.com/fotoetienne/gru/issues/42");
     }
 }
