@@ -45,9 +45,9 @@ enum Commands {
     #[command(about = "Initialize a repository for use with Gru")]
     Init {
         #[arg(
-            help = "Repository to initialize: 'owner/repo' for GitHub, '.' for current directory, or a path"
+            help = "Repository to initialize: 'owner/repo' for GitHub, '.' for current directory, or a path. Defaults to current directory."
         )]
-        repo: String,
+        repo: Option<String>,
     },
     #[command(about = "Work on a GitHub issue", alias = "fix")]
     Do {
@@ -249,7 +249,7 @@ async fn main() {
         .init();
 
     let result = match cli.command {
-        Commands::Init { repo } => init::handle_init(repo).await,
+        Commands::Init { repo } => init::handle_init(repo.unwrap_or_else(|| ".".to_string())).await,
         Commands::Do {
             issue,
             timeout,
