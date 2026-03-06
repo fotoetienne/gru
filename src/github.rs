@@ -57,10 +57,18 @@ fn infer_github_host(owner: &str) -> &'static str {
 }
 
 /// Build a full GitHub issue URL for a repo in "owner/repo" format.
-pub fn build_issue_url(repo: &str, issue_number: u64) -> String {
-    let owner = repo.split('/').next().unwrap_or("");
+///
+/// Returns `Some(url)` when `repo` is a valid `owner/repo` string, otherwise `None`.
+pub fn build_issue_url(repo: &str, issue_number: u64) -> Option<String> {
+    let (owner, repo_name) = repo.split_once('/')?;
+    if owner.is_empty() || repo_name.is_empty() || repo_name.contains('/') {
+        return None;
+    }
     let host = infer_github_host(owner);
-    format!("https://{}/{}/issues/{}", host, repo, issue_number)
+    Some(format!(
+        "https://{}/{}/{}/issues/{}",
+        host, owner, repo_name, issue_number
+    ))
 }
 
 /// Determine the correct `gh` CLI command for a repository.
