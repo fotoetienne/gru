@@ -15,8 +15,8 @@ use uuid::Uuid;
 
 /// Normalized event emitted by any agent backend.
 ///
-/// This is the common event type that `progress.rs` and `fix.rs` consume,
-/// regardless of the underlying agent implementation.
+/// This is the common event type that the `progress` and `fix` commands
+/// consume, regardless of the underlying agent implementation.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentEvent {
@@ -24,9 +24,9 @@ pub enum AgentEvent {
     Started,
     /// Agent is thinking / processing.
     Thinking {
-        /// Thinking text, if exposed by the backend. Empty if not available.
-        #[serde(default)]
-        text: String,
+        /// Optional thinking text, if exposed by the backend.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        text: Option<String>,
     },
     /// Agent is invoking a tool.
     ToolUse {
@@ -75,15 +75,17 @@ pub enum AgentEvent {
 /// Agent-agnostic accumulated token usage.
 ///
 /// Tracks input and output token counts across an entire agent session.
-/// Cache token fields are optional since not all backends support prompt caching.
+/// Cache token fields are `Option<u64>` since not all backends support prompt
+/// caching — `None` means the backend does not report cache metrics, while
+/// `Some(0)` means caching is supported but no tokens were cached.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct TokenUsage {
     pub input_tokens: u64,
     pub output_tokens: u64,
-    #[serde(default)]
-    pub cache_creation_input_tokens: u64,
-    #[serde(default)]
-    pub cache_read_input_tokens: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_creation_input_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_read_input_tokens: Option<u64>,
 }
 
 impl TokenUsage {
@@ -161,7 +163,7 @@ mod tests {
     #[test]
     fn test_agent_event_thinking_roundtrip() {
         let event = AgentEvent::Thinking {
-            text: "Let me analyze this...".to_string(),
+            text: Some("Let me analyze this...".to_string()),
         };
         let json = serde_json::to_string(&event).unwrap();
         let deserialized: AgentEvent = serde_json::from_str(&json).unwrap();
@@ -169,16 +171,20 @@ mod tests {
     }
 
     #[test]
-    fn test_agent_event_thinking_empty_text() {
-        // Thinking with empty text (backend doesn't expose thinking content)
+    fn test_agent_event_thinking_no_text() {
+        // Thinking without text (backend doesn't expose thinking content)
         let json = r#"{"type": "thinking"}"#;
         let event: AgentEvent = serde_json::from_str(json).unwrap();
-        assert_eq!(
-            event,
-            AgentEvent::Thinking {
-                text: String::new()
-            }
-        );
+        assert_eq!(event, AgentEvent::Thinking { text: None });
+    }
+
+    #[test]
+    fn test_agent_event_thinking_none_omits_text() {
+        // Thinking with None text should not serialize the text field
+        let event = AgentEvent::Thinking { text: None };
+        let json = serde_json::to_string(&event).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(value.get("text").is_none());
     }
 
     #[test]
@@ -233,8 +239,8 @@ mod tests {
             usage: Some(TokenUsage {
                 input_tokens: 1000,
                 output_tokens: 500,
-                cache_creation_input_tokens: 100,
-                cache_read_input_tokens: 200,
+                cache_creation_input_tokens: Some(100),
+                cache_read_input_tokens: Some(200),
             }),
         };
         let json = serde_json::to_string(&event).unwrap();
@@ -259,8 +265,8 @@ mod tests {
             usage: Some(TokenUsage {
                 input_tokens: 5000,
                 output_tokens: 2000,
-                cache_creation_input_tokens: 0,
-                cache_read_input_tokens: 0,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
             }),
         };
         let json = serde_json::to_string(&event).unwrap();
@@ -317,8 +323,8 @@ mod tests {
         let usage = TokenUsage::default();
         assert_eq!(usage.input_tokens, 0);
         assert_eq!(usage.output_tokens, 0);
-        assert_eq!(usage.cache_creation_input_tokens, 0);
-        assert_eq!(usage.cache_read_input_tokens, 0);
+        assert_eq!(usage.cache_creation_input_tokens, None);
+        assert_eq!(usage.cache_read_input_tokens, None);
         assert_eq!(usage.total_tokens(), 0);
     }
 
@@ -327,8 +333,7 @@ mod tests {
         let usage = TokenUsage {
             input_tokens: 1000,
             output_tokens: 500,
-            cache_creation_input_tokens: 0,
-            cache_read_input_tokens: 0,
+            ..Default::default()
         };
         assert_eq!(usage.total_tokens(), 1500);
     }
@@ -368,8 +373,8 @@ mod tests {
         let usage = TokenUsage {
             input_tokens: 1000,
             output_tokens: 500,
-            cache_creation_input_tokens: 100,
-            cache_read_input_tokens: 200,
+            cache_creation_input_tokens: Some(100),
+            cache_read_input_tokens: Some(200),
         };
         let json = serde_json::to_string(&usage).unwrap();
         let deserialized: TokenUsage = serde_json::from_str(&json).unwrap();
@@ -378,12 +383,26 @@ mod tests {
 
     #[test]
     fn test_token_usage_deserialize_missing_cache_fields() {
-        // Cache fields should default to 0 when missing
+        // Cache fields should default to None when missing
         let json = r#"{"input_tokens": 100, "output_tokens": 50}"#;
         let usage: TokenUsage = serde_json::from_str(json).unwrap();
         assert_eq!(usage.input_tokens, 100);
         assert_eq!(usage.output_tokens, 50);
-        assert_eq!(usage.cache_creation_input_tokens, 0);
-        assert_eq!(usage.cache_read_input_tokens, 0);
+        assert_eq!(usage.cache_creation_input_tokens, None);
+        assert_eq!(usage.cache_read_input_tokens, None);
+    }
+
+    #[test]
+    fn test_token_usage_none_cache_fields_omitted() {
+        // When cache fields are None, they should not appear in serialized JSON
+        let usage = TokenUsage {
+            input_tokens: 100,
+            output_tokens: 50,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&usage).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(value.get("cache_creation_input_tokens").is_none());
+        assert!(value.get("cache_read_input_tokens").is_none());
     }
 }
