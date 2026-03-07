@@ -22,16 +22,31 @@ use uuid::Uuid;
 pub enum AgentEvent {
     /// Agent session has started
     Started,
-    /// Agent is thinking / processing
-    Thinking,
-    /// Agent is invoking a tool
+    /// Agent is thinking / processing.
+    Thinking {
+        /// Thinking text, if exposed by the backend. Empty if not available.
+        #[serde(default)]
+        text: String,
+    },
+    /// Agent is invoking a tool.
     ToolUse {
         /// Name of the tool being invoked
         tool_name: String,
         /// Unique identifier for this tool invocation
         tool_use_id: String,
     },
-    /// Incremental text output from the agent
+    /// Result of a tool invocation.
+    ToolResult {
+        /// Identifier of the tool invocation this result belongs to.
+        tool_use_id: String,
+        /// Tool output content, if available.
+        #[serde(default)]
+        content: String,
+        /// Whether the tool invocation was an error.
+        #[serde(default)]
+        is_error: bool,
+    },
+    /// Incremental text output from the agent.
     TextDelta {
         /// The text fragment
         text: String,
@@ -119,12 +134,10 @@ pub trait AgentBackend: Send + Sync {
     /// commonly includes non-event lines.
     fn parse_event(&self, line: &str) -> Option<AgentEvent>;
 
-    /// Whether this backend supports resuming a previous session.
-    fn supports_resume(&self) -> bool;
-
     /// Build the command to resume an existing agent session.
     ///
     /// Returns `None` if the backend does not support resume.
+    /// Callers can check `is_some()` to test for resume support.
     fn build_resume_command(
         &self,
         worktree_path: &Path,
@@ -147,7 +160,46 @@ mod tests {
 
     #[test]
     fn test_agent_event_thinking_roundtrip() {
-        let event = AgentEvent::Thinking;
+        let event = AgentEvent::Thinking {
+            text: "Let me analyze this...".to_string(),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let deserialized: AgentEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(event, deserialized);
+    }
+
+    #[test]
+    fn test_agent_event_thinking_empty_text() {
+        // Thinking with empty text (backend doesn't expose thinking content)
+        let json = r#"{"type": "thinking"}"#;
+        let event: AgentEvent = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            event,
+            AgentEvent::Thinking {
+                text: String::new()
+            }
+        );
+    }
+
+    #[test]
+    fn test_agent_event_tool_result_roundtrip() {
+        let event = AgentEvent::ToolResult {
+            tool_use_id: "tool_123".to_string(),
+            content: "file contents here".to_string(),
+            is_error: false,
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let deserialized: AgentEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(event, deserialized);
+    }
+
+    #[test]
+    fn test_agent_event_tool_result_error() {
+        let event = AgentEvent::ToolResult {
+            tool_use_id: "tool_456".to_string(),
+            content: "command not found".to_string(),
+            is_error: true,
+        };
         let json = serde_json::to_string(&event).unwrap();
         let deserialized: AgentEvent = serde_json::from_str(&json).unwrap();
         assert_eq!(event, deserialized);
