@@ -11,7 +11,7 @@
 #![allow(dead_code)]
 
 use crate::agent::{AgentBackend, AgentEvent, TokenUsage as AgentTokenUsage};
-use crate::stream::{ClaudeEvent, ContentBlock, ContentDelta, ConversationMessage, StreamOutput};
+use crate::stream::{self, ClaudeEvent, ContentBlock, ContentDelta, StreamOutput};
 use std::path::Path;
 use tokio::process::Command as TokioCommand;
 use uuid::Uuid;
@@ -27,43 +27,13 @@ impl ClaudeBackend {
         Self
     }
 
-    /// Parse a raw line into a `StreamOutput` (internal helper).
-    ///
-    /// This mirrors the logic in `EventStream::next_line()` but operates on
-    /// an already-read `&str` instead of an async reader, so that `parse_event`
-    /// can satisfy the synchronous `AgentBackend` trait method.
-    fn parse_stream_output(line: &str) -> Option<StreamOutput> {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            return None;
-        }
-
-        // Try stream_event wrapper from Claude Code
-        if let Ok(wrapper) = serde_json::from_str::<serde_json::Value>(trimmed) {
-            if wrapper.get("type").and_then(|t| t.as_str()) == Some("stream_event") {
-                if let Some(event_value) = wrapper.get("event") {
-                    if let Ok(event) = serde_json::from_value::<ClaudeEvent>(event_value.clone()) {
-                        return Some(StreamOutput::Event(event));
-                    }
-                }
-            }
-        }
-
-        // Try conversation message (verbose output with tool results)
-        if let Ok(conv_msg) = serde_json::from_str::<ConversationMessage>(trimmed) {
-            if conv_msg.message_type == "user" && !conv_msg.message.content.is_empty() {
-                return Some(StreamOutput::ToolResult(
-                    conv_msg.message.content[0].clone(),
-                ));
-            }
-        }
-
-        None
-    }
-
     /// Map a `ClaudeEvent` to an `AgentEvent`.
     fn map_claude_event(event: &ClaudeEvent) -> Option<AgentEvent> {
         match event {
+            // TODO(token-accounting): MessageStart carries input token usage
+            // (message.usage) not captured in AgentEvent::Started. When fix.rs
+            // migrates to AgentBackend, token accounting must consume the raw
+            // stream or AgentEvent::Started needs an optional usage field.
             ClaudeEvent::MessageStart { .. } => Some(AgentEvent::Started),
 
             ClaudeEvent::ContentBlockStart { content_block, .. } => match content_block {
@@ -131,7 +101,7 @@ impl AgentBackend for ClaudeBackend {
     }
 
     fn parse_event(&self, line: &str) -> Option<AgentEvent> {
-        let stream_output = Self::parse_stream_output(line)?;
+        let stream_output = stream::parse_line(line.trim())?;
         match stream_output {
             StreamOutput::Event(ref claude_event) => Self::map_claude_event(claude_event),
             StreamOutput::ToolResult(ref tool_result) => {
@@ -204,6 +174,8 @@ mod tests {
         assert!(args.contains(&"--include-partial-messages".as_ref()));
         assert!(args.contains(&"--dangerously-skip-permissions".as_ref()));
         assert!(args.contains(&"fix the bug".as_ref()));
+        // Prompt must be the last argument (positional)
+        assert_eq!(*args.last().unwrap(), std::ffi::OsStr::new("fix the bug"));
         // Should NOT contain --resume
         assert!(!args.contains(&"--resume".as_ref()));
     }
@@ -281,6 +253,20 @@ mod tests {
             }
             other => panic!("Expected MessageComplete, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_parse_event_message_delta_no_usage() {
+        let b = backend();
+        let line = r#"{"type":"stream_event","event":{"type":"message_delta","delta":{"stop_reason":"end_turn"}}}"#;
+        let event = b.parse_event(line).unwrap();
+        assert_eq!(
+            event,
+            AgentEvent::MessageComplete {
+                stop_reason: Some("end_turn".to_string()),
+                usage: None,
+            }
+        );
     }
 
     #[test]

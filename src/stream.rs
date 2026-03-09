@@ -191,6 +191,39 @@ pub enum StreamOutput {
     RawLine(String),
 }
 
+/// Parse a trimmed line of Claude Code output into a structured `StreamOutput`.
+///
+/// Returns `None` if the line is empty or doesn't match any recognized format.
+/// This is the shared parsing logic used by both `EventStream::next_line()` and
+/// `ClaudeBackend::parse_event()`.
+pub fn parse_line(trimmed: &str) -> Option<StreamOutput> {
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    // Try stream_event wrapper from Claude Code
+    if let Ok(wrapper) = serde_json::from_str::<serde_json::Value>(trimmed) {
+        if wrapper.get("type").and_then(|t| t.as_str()) == Some("stream_event") {
+            if let Some(event_value) = wrapper.get("event") {
+                if let Ok(event) = serde_json::from_value::<ClaudeEvent>(event_value.clone()) {
+                    return Some(StreamOutput::Event(event));
+                }
+            }
+        }
+    }
+
+    // Try conversation message (verbose output with tool results)
+    if let Ok(conv_msg) = serde_json::from_str::<ConversationMessage>(trimmed) {
+        if conv_msg.message_type == "user" && !conv_msg.message.content.is_empty() {
+            return Some(StreamOutput::ToolResult(
+                conv_msg.message.content[0].clone(),
+            ));
+        }
+    }
+
+    None
+}
+
 /// Accumulated token usage across a session
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct TokenUsage {
@@ -285,28 +318,9 @@ impl<R: tokio::io::AsyncRead + Unpin> EventStream<R> {
             return Ok(Some(StreamOutput::RawLine(String::new())));
         }
 
-        // Try to parse as JSON event
-        // First check if it's a stream_event wrapper from Claude Code
-        if let Ok(wrapper) = serde_json::from_str::<serde_json::Value>(trimmed) {
-            if wrapper.get("type").and_then(|t| t.as_str()) == Some("stream_event") {
-                // Extract the inner event and try to parse it
-                if let Some(event_value) = wrapper.get("event") {
-                    if let Ok(event) = serde_json::from_value::<ClaudeEvent>(event_value.clone()) {
-                        return Ok(Some(StreamOutput::Event(event)));
-                    }
-                }
-            }
-        }
-
-        // Try to parse as a conversation message (verbose output)
-        if let Ok(conv_msg) = serde_json::from_str::<ConversationMessage>(trimmed) {
-            if conv_msg.message_type == "user" && !conv_msg.message.content.is_empty() {
-                // Return the first tool result (typically there's only one per message)
-                // The is_empty() guard above ensures that direct indexing is safe here.
-                return Ok(Some(StreamOutput::ToolResult(
-                    conv_msg.message.content[0].clone(),
-                )));
-            }
+        // Delegate to shared parsing logic
+        if let Some(output) = parse_line(trimmed) {
+            return Ok(Some(output));
         }
 
         // Not a recognized format, treat as raw line
