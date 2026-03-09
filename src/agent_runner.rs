@@ -264,14 +264,16 @@ where
                 continue;
             }
 
+            // Any non-empty line counts as activity for inactivity detection.
+            // This ensures we don't treat the task as stuck when the backend
+            // chooses to skip certain lines (e.g., logs, banners, non-JSON).
+            last_event_time = Instant::now();
+            inactivity_warning_shown = false;
+
             // Parse the line through the backend
             if let Some(event) = backend.parse_event(trimmed) {
                 // Log the event to events.jsonl
                 log_event(events_dir, &event).await?;
-
-                // Update last event time
-                last_event_time = Instant::now();
-                inactivity_warning_shown = false;
 
                 // Accumulate token usage from events
                 accumulate_token_usage(&mut token_usage, &event);
@@ -316,6 +318,20 @@ fn accumulate_token_usage(total: &mut TokenUsage, event: &AgentEvent) {
             usage: Some(usage), ..
         } => {
             total.output_tokens += usage.output_tokens;
+        }
+        AgentEvent::Finished {
+            usage: Some(usage), ..
+        } => {
+            // Some backends report aggregate usage only at session end.
+            // Accumulate all fields so we don't silently drop final totals.
+            total.input_tokens += usage.input_tokens;
+            total.output_tokens += usage.output_tokens;
+            if let Some(cache_creation) = usage.cache_creation_input_tokens {
+                *total.cache_creation_input_tokens.get_or_insert(0) += cache_creation;
+            }
+            if let Some(cache_read) = usage.cache_read_input_tokens {
+                *total.cache_read_input_tokens.get_or_insert(0) += cache_read;
+            }
         }
         _ => {}
     }
@@ -466,6 +482,26 @@ mod tests {
         assert_eq!(total.cache_creation_input_tokens, Some(200));
         assert_eq!(total.cache_read_input_tokens, Some(600));
         assert_eq!(total.total_tokens(), 3800);
+    }
+
+    #[test]
+    fn test_accumulate_token_usage_finished() {
+        let mut total = TokenUsage::default();
+        accumulate_token_usage(
+            &mut total,
+            &AgentEvent::Finished {
+                usage: Some(TokenUsage {
+                    input_tokens: 5000,
+                    output_tokens: 2000,
+                    cache_creation_input_tokens: Some(300),
+                    cache_read_input_tokens: Some(100),
+                }),
+            },
+        );
+        assert_eq!(total.input_tokens, 5000);
+        assert_eq!(total.output_tokens, 2000);
+        assert_eq!(total.cache_creation_input_tokens, Some(300));
+        assert_eq!(total.cache_read_input_tokens, Some(100));
     }
 
     #[test]

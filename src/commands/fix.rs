@@ -884,21 +884,31 @@ async fn run_agent_session_inner(
                     callback_state.text_output_buffer.split_off(trim_pos);
             }
 
-            // Detect phase transitions from text content
+            // Detect phase transitions from a rolling window of the accumulated
+            // buffer (last 200 chars). Using the buffer instead of just the current
+            // chunk ensures we catch markers split across multiple TextDelta events.
+            let buf = &callback_state.text_output_buffer;
+            let window_start = buf.len().saturating_sub(200);
+            // Align to a char boundary
+            let window_start = (window_start..buf.len())
+                .find(|&i| buf.is_char_boundary(i))
+                .unwrap_or(buf.len());
+            let window = &buf[window_start..];
+
             let previous_phase = callback_state.progress_tracker.current_phase();
-            if text.contains("Plan") || text.contains("plan") {
+            if window.contains("Plan") || window.contains("plan") {
                 if previous_phase != MinionPhase::Planning {
                     callback_state
                         .progress_tracker
                         .set_phase(MinionPhase::Planning);
                 }
-            } else if (text.contains("Implement") || text.contains("Writing"))
+            } else if (window.contains("Implement") || window.contains("Writing"))
                 && previous_phase != MinionPhase::Implementing
             {
                 callback_state
                     .progress_tracker
                     .set_phase(MinionPhase::Implementing);
-            } else if (text.contains("test") || text.contains("Test"))
+            } else if (window.contains("test") || window.contains("Test"))
                 && previous_phase != MinionPhase::Testing
             {
                 callback_state
