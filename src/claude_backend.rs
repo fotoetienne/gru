@@ -11,6 +11,7 @@
 #![allow(dead_code)]
 
 use crate::agent::{AgentBackend, AgentEvent, TokenUsage as AgentTokenUsage};
+use crate::claude_runner;
 use crate::stream::{self, ClaudeEvent, ContentBlock, ContentDelta, StreamOutput};
 use std::path::Path;
 use tokio::process::Command as TokioCommand;
@@ -66,7 +67,13 @@ impl ClaudeBackend {
                 })
             }
 
-            ClaudeEvent::MessageStop => None,
+            // Treat MessageStop as a completion boundary to ensure streams
+            // that emit `message_stop` but no `message_delta` still produce
+            // a normalized completion signal.
+            ClaudeEvent::MessageStop => Some(AgentEvent::MessageComplete {
+                stop_reason: None,
+                usage: None,
+            }),
 
             ClaudeEvent::Error { error } => Some(AgentEvent::Error {
                 message: error.message.clone(),
@@ -83,21 +90,7 @@ impl AgentBackend for ClaudeBackend {
     }
 
     fn build_command(&self, worktree_path: &Path, session_id: &Uuid, prompt: &str) -> TokioCommand {
-        let mut cmd = TokioCommand::new("claude");
-        cmd.arg("--print")
-            .arg("--verbose")
-            .arg("--session-id")
-            .arg(session_id.to_string())
-            .arg("--output-format")
-            .arg("stream-json")
-            .arg("--include-partial-messages")
-            .arg("--dangerously-skip-permissions")
-            .arg(prompt)
-            .stdin(std::process::Stdio::inherit())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::inherit())
-            .current_dir(worktree_path);
-        cmd
+        claude_runner::build_claude_command(worktree_path, session_id, prompt)
     }
 
     fn parse_event(&self, line: &str) -> Option<AgentEvent> {
@@ -125,21 +118,11 @@ impl AgentBackend for ClaudeBackend {
         session_id: &Uuid,
         prompt: &str,
     ) -> Option<TokioCommand> {
-        let mut cmd = TokioCommand::new("claude");
-        cmd.arg("--print")
-            .arg("--verbose")
-            .arg("--resume")
-            .arg(session_id.to_string())
-            .arg("--output-format")
-            .arg("stream-json")
-            .arg("--include-partial-messages")
-            .arg("--dangerously-skip-permissions")
-            .arg(prompt)
-            .stdin(std::process::Stdio::inherit())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::inherit())
-            .current_dir(worktree_path);
-        Some(cmd)
+        Some(claude_runner::build_claude_resume_command(
+            worktree_path,
+            session_id,
+            prompt,
+        ))
     }
 }
 
@@ -341,10 +324,17 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_event_message_stop_returns_none() {
+    fn test_parse_event_message_stop_produces_completion() {
         let b = backend();
         let line = r#"{"type":"stream_event","event":{"type":"message_stop"}}"#;
-        assert!(b.parse_event(line).is_none());
+        let event = b.parse_event(line).unwrap();
+        assert_eq!(
+            event,
+            AgentEvent::MessageComplete {
+                stop_reason: None,
+                usage: None,
+            }
+        );
     }
 
     #[test]

@@ -196,7 +196,7 @@ pub enum StreamOutput {
 /// Returns `None` if the line is empty or doesn't match any recognized format.
 /// This is the shared parsing logic used by both `EventStream::next_line()` and
 /// `ClaudeBackend::parse_event()`.
-pub fn parse_line(trimmed: &str) -> Option<StreamOutput> {
+pub(crate) fn parse_line(trimmed: &str) -> Option<StreamOutput> {
     if trimmed.is_empty() {
         return None;
     }
