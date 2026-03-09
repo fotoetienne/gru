@@ -5,10 +5,7 @@
 //! interface. This is the first concrete backend and should produce identical
 //! behavior to the pre-refactor code paths.
 //!
-//! These types are not yet consumed by the rest of the codebase — they will be
-//! integrated when `fix.rs` and `resume.rs` are migrated to use `AgentBackend`.
-//! The `allow(dead_code)` will be removed once consumers exist.
-#![allow(dead_code)]
+//! Now consumed by `agent_runner.rs` and the command modules.
 
 use crate::agent::{AgentBackend, AgentEvent, TokenUsage as AgentTokenUsage};
 use crate::claude_runner;
@@ -31,11 +28,15 @@ impl ClaudeBackend {
     /// Map a `ClaudeEvent` to an `AgentEvent`.
     fn map_claude_event(event: &ClaudeEvent) -> Option<AgentEvent> {
         match event {
-            // TODO(token-accounting): MessageStart carries input token usage
-            // (message.usage) not captured in AgentEvent::Started. When fix.rs
-            // migrates to AgentBackend, token accounting must consume the raw
-            // stream or AgentEvent::Started needs an optional usage field.
-            ClaudeEvent::MessageStart { .. } => Some(AgentEvent::Started),
+            ClaudeEvent::MessageStart { message } => {
+                let agent_usage = message.usage.as_ref().map(|u| AgentTokenUsage {
+                    input_tokens: u.input_tokens,
+                    cache_creation_input_tokens: u.cache_creation_input_tokens,
+                    cache_read_input_tokens: u.cache_read_input_tokens,
+                    ..Default::default()
+                });
+                Some(AgentEvent::Started { usage: agent_usage })
+            }
 
             ClaudeEvent::ContentBlockStart { content_block, .. } => match content_block {
                 ContentBlock::ToolUse { name, id } => Some(AgentEvent::ToolUse {
@@ -194,7 +195,7 @@ mod tests {
         let b = backend();
         let line = r#"{"type":"stream_event","event":{"type":"message_start","message":{"id":"msg_1","role":"assistant"}}}"#;
         let event = b.parse_event(line).unwrap();
-        assert_eq!(event, AgentEvent::Started);
+        assert!(matches!(event, AgentEvent::Started { usage: None }));
     }
 
     #[test]

@@ -3,10 +3,8 @@
 //! Defines the `AgentBackend` trait and `AgentEvent` normalized event model
 //! that decouple core orchestration from any specific agent CLI implementation.
 //!
-//! These types are not yet consumed by the rest of the codebase — they will be
-//! integrated in subsequent Phase 1 issues. The `allow(dead_code)` will be
-//! removed once consumers exist.
-#![allow(dead_code)]
+//! These types are consumed by `agent_runner.rs`, `progress.rs`, and the
+//! command modules (`fix.rs`, `review.rs`, `prompt.rs`, `resume.rs`).
 
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -20,8 +18,13 @@ use uuid::Uuid;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentEvent {
-    /// Agent session has started
-    Started,
+    /// Agent session has started (or a new message turn began).
+    Started {
+        /// Token usage from the initial message (e.g., input tokens, cache tokens).
+        /// Backends that report per-message input usage populate this field.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        usage: Option<TokenUsage>,
+    },
     /// Agent is thinking / processing.
     Thinking {
         /// Optional thinking text, if exposed by the backend.
@@ -154,7 +157,7 @@ mod tests {
 
     #[test]
     fn test_agent_event_started_roundtrip() {
-        let event = AgentEvent::Started;
+        let event = AgentEvent::Started { usage: None };
         let json = serde_json::to_string(&event).unwrap();
         let deserialized: AgentEvent = serde_json::from_str(&json).unwrap();
         assert_eq!(event, deserialized);

@@ -1,6 +1,6 @@
-use crate::claude_runner::{
-    build_claude_command, run_claude_with_stream_monitoring, EXIT_CODE_SIGNAL_TERMINATED,
-};
+use crate::agent::{AgentBackend, AgentEvent};
+use crate::agent_runner::{run_agent_with_stream_monitoring, EXIT_CODE_SIGNAL_TERMINATED};
+use crate::claude_backend::ClaudeBackend;
 use crate::git;
 use crate::github::GitHubClient;
 use crate::minion;
@@ -10,7 +10,6 @@ use crate::minion_registry::{
 use crate::progress::{ProgressConfig, ProgressDisplay};
 use crate::prompt_loader;
 use crate::prompt_renderer::{render_template, PromptContext};
-use crate::stream;
 use crate::url_utils::{parse_github_url, parse_issue_info, GitHubResourceType};
 use crate::workspace;
 use anyhow::{Context, Result};
@@ -688,7 +687,8 @@ pub async fn handle_prompt(prompt: &str, opts: PromptOptions) -> Result<i32> {
     let progress = std::sync::Arc::new(ProgressDisplay::new(config));
 
     // Build the command with flags for non-interactive stream-json output
-    let mut cmd = build_claude_command(&run_dir, &session_id, &rendered_prompt);
+    let backend = ClaudeBackend::new();
+    let mut cmd = backend.build_command(&run_dir, &session_id, &rendered_prompt);
     cmd.env("GRU_WORKSPACE", &minion_id);
 
     // Build on_spawn callback to record the child PID in the registry
@@ -702,14 +702,15 @@ pub async fn handle_prompt(prompt: &str, opts: PromptOptions) -> Result<i32> {
         }
     });
 
-    // Run Claude with stream monitoring
+    // Run agent with stream monitoring
     let progress_cb = std::sync::Arc::clone(&progress);
-    let output_callback = move |output: &stream::StreamOutput| {
-        progress_cb.handle_output(output);
+    let output_callback = move |event: &AgentEvent| {
+        progress_cb.handle_event(event);
     };
 
-    let run_result = run_claude_with_stream_monitoring(
+    let run_result = run_agent_with_stream_monitoring(
         cmd,
+        &backend,
         &workspace_path,
         timeout_opt.as_deref(),
         Some(output_callback),
@@ -734,14 +735,14 @@ pub async fn handle_prompt(prompt: &str, opts: PromptOptions) -> Result<i32> {
     }
 
     // Now check if there was a stream error (after cleanup)
-    let claude_run = run_result?;
-    let status = claude_run.status;
+    let agent_run = run_result?;
+    let status = agent_run.status;
 
     // Log token usage
-    if claude_run.token_usage.total_tokens() > 0 {
+    if agent_run.token_usage.total_tokens() > 0 {
         log::info!(
             "📊 Token usage: {}",
-            claude_run.token_usage.display_compact()
+            agent_run.token_usage.display_compact()
         );
     }
 

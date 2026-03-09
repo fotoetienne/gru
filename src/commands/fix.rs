@@ -1,8 +1,10 @@
-use crate::ci;
-use crate::claude_runner::{
-    build_claude_command, build_claude_resume_command, is_stuck_or_timeout_error, parse_timeout,
-    run_claude_with_stream_monitoring, EXIT_CODE_SIGNAL_TERMINATED,
+use crate::agent::{AgentBackend, AgentEvent};
+use crate::agent_runner::{
+    is_stuck_or_timeout_error, parse_timeout, run_agent_with_stream_monitoring,
+    EXIT_CODE_SIGNAL_TERMINATED,
 };
+use crate::ci;
+use crate::claude_backend::ClaudeBackend;
 use crate::git;
 use crate::github::{gh_command_for_repo, GitHubClient};
 use crate::minion;
@@ -16,7 +18,6 @@ use crate::progress::{ProgressConfig, ProgressDisplay};
 use crate::progress_comments::{MinionPhase, ProgressCommentTracker};
 use crate::prompt_loader;
 use crate::prompt_renderer::{render_template, PromptContext};
-use crate::stream;
 use crate::url_utils::parse_issue_info;
 use crate::workspace;
 use anyhow::{Context, Result};
@@ -71,7 +72,7 @@ pub(crate) struct WorktreeContext {
 }
 
 /// Result of running a Claude session.
-pub(crate) struct ClaudeResult {
+pub(crate) struct AgentResult {
     pub status: ExitStatus,
 }
 
@@ -270,21 +271,25 @@ async fn handle_cli_fetch_result(result: Result<crate::github::IssueInfo>) -> Op
     }
 }
 
-/// Invokes Claude to address review comments using the same session
-async fn invoke_claude_for_reviews(
+/// Invokes the agent to address review comments using the same session
+async fn invoke_agent_for_reviews(
+    backend: &dyn AgentBackend,
     checkout_path: &Path,
     minion_dir: &Path,
     session_id: &Uuid,
     prompt: &str,
     timeout_opt: Option<&str>,
 ) -> Result<()> {
-    let cmd = build_claude_resume_command(checkout_path, session_id, prompt);
+    let cmd = backend
+        .build_resume_command(checkout_path, session_id, prompt)
+        .context("Agent backend does not support resume")?;
 
-    let result = run_claude_with_stream_monitoring(
+    let result = run_agent_with_stream_monitoring(
         cmd,
+        backend,
         minion_dir,
         timeout_opt,
-        None::<fn(&stream::StreamOutput)>,
+        None::<fn(&AgentEvent)>,
         None::<Box<dyn FnOnce(u32) + Send>>,
     )
     .await?;
@@ -792,53 +797,58 @@ fn build_fix_prompt(ctx: &IssueContext, wt_ctx: &WorktreeContext) -> String {
     render_template(template_content, &variables)
 }
 
-/// Runs a Claude session with stream monitoring and progress tracking.
+/// Runs an agent session with stream monitoring and progress tracking.
 ///
-/// Spawns the Claude CLI, tracks progress, records PID in registry,
+/// Spawns the agent CLI, tracks progress, records PID in registry,
 /// and cleans up on exit (success or failure).
-async fn run_claude_session(
+async fn run_agent_session(
+    backend: &dyn AgentBackend,
     issue_ctx: &IssueContext,
     wt_ctx: &WorktreeContext,
     quiet: bool,
     timeout_opt: Option<&str>,
-) -> Result<ClaudeResult> {
-    println!("🤖 Launching Claude...\n");
+) -> Result<AgentResult> {
+    println!("🤖 Launching {}...\n", backend.name());
     let prompt = build_fix_prompt(issue_ctx, wt_ctx);
-    let mut cmd = build_claude_command(&wt_ctx.checkout_path, &wt_ctx.session_id, &prompt);
+    let mut cmd = backend.build_command(&wt_ctx.checkout_path, &wt_ctx.session_id, &prompt);
     cmd.env("GRU_WORKSPACE", &wt_ctx.minion_id);
-    run_claude_session_inner(issue_ctx, wt_ctx, cmd, quiet, timeout_opt).await
+    run_agent_session_inner(backend, issue_ctx, wt_ctx, cmd, quiet, timeout_opt).await
 }
 
-/// Runs a resumed Claude session, continuing from a previous interrupted session.
+/// Runs a resumed agent session, continuing from a previous interrupted session.
 ///
-/// Uses `--resume` instead of `--session-id` to continue the existing conversation.
-async fn resume_claude_session(
+/// Uses the backend's resume command to continue the existing conversation.
+async fn resume_agent_session(
+    backend: &dyn AgentBackend,
     issue_ctx: &IssueContext,
     wt_ctx: &WorktreeContext,
     quiet: bool,
     timeout_opt: Option<&str>,
-) -> Result<ClaudeResult> {
-    println!("🔄 Resuming Claude session...\n");
+) -> Result<AgentResult> {
+    println!("🔄 Resuming {} session...\n", backend.name());
     let prompt = format!(
         "Continue working on issue #{}. Pick up where you left off. \
          If you've already completed the implementation, proceed to push and write PR_DESCRIPTION.md.",
         issue_ctx.issue_num
     );
-    let mut cmd = build_claude_resume_command(&wt_ctx.checkout_path, &wt_ctx.session_id, &prompt);
+    let mut cmd = backend
+        .build_resume_command(&wt_ctx.checkout_path, &wt_ctx.session_id, &prompt)
+        .context("Agent backend does not support resume")?;
     cmd.env("GRU_WORKSPACE", &wt_ctx.minion_id);
-    run_claude_session_inner(issue_ctx, wt_ctx, cmd, quiet, timeout_opt).await
+    run_agent_session_inner(backend, issue_ctx, wt_ctx, cmd, quiet, timeout_opt).await
 }
 
-/// Shared implementation for running a Claude session (new or resumed).
+/// Shared implementation for running an agent session (new or resumed).
 ///
 /// Handles stream monitoring, progress tracking, PID registration, and cleanup.
-async fn run_claude_session_inner(
+async fn run_agent_session_inner(
+    backend: &dyn AgentBackend,
     issue_ctx: &IssueContext,
     wt_ctx: &WorktreeContext,
     cmd: TokioCommand,
     quiet: bool,
     timeout_opt: Option<&str>,
-) -> Result<ClaudeResult> {
+) -> Result<AgentResult> {
     let config = ProgressConfig {
         minion_id: wt_ctx.minion_id.clone(),
         issue: issue_ctx.issue_num.to_string(),
@@ -849,48 +859,46 @@ async fn run_claude_session_inner(
     let mut progress_tracker = ProgressCommentTracker::new(wt_ctx.minion_id.clone());
 
     struct CallbackState<'a> {
-        raw_output_buffer: String,
+        text_output_buffer: String,
         progress: &'a ProgressDisplay,
         progress_tracker: &'a mut ProgressCommentTracker,
     }
 
     let mut callback_state = CallbackState {
-        raw_output_buffer: String::new(),
+        text_output_buffer: String::new(),
         progress: &progress,
         progress_tracker: &mut progress_tracker,
     };
 
-    let callback = |output: &stream::StreamOutput| {
-        if let stream::StreamOutput::RawLine(ref line) = output {
-            callback_state.raw_output_buffer.push_str(line);
-            if callback_state.raw_output_buffer.len() > MAX_OUTPUT_BUFFER_SIZE {
+    let callback = |event: &AgentEvent| {
+        // Accumulate text output for phase detection
+        if let AgentEvent::TextDelta { ref text } = event {
+            callback_state.text_output_buffer.push_str(text);
+            if callback_state.text_output_buffer.len() > MAX_OUTPUT_BUFFER_SIZE {
                 let mut trim_pos = TRIM_OUTPUT_BUFFER_SIZE;
-                while trim_pos > 0 && !callback_state.raw_output_buffer.is_char_boundary(trim_pos) {
+                while trim_pos > 0 && !callback_state.text_output_buffer.is_char_boundary(trim_pos)
+                {
                     trim_pos -= 1;
                 }
-                callback_state.raw_output_buffer =
-                    callback_state.raw_output_buffer.split_off(trim_pos);
+                callback_state.text_output_buffer =
+                    callback_state.text_output_buffer.split_off(trim_pos);
             }
-        }
 
-        callback_state.progress.handle_output(output);
-
-        if let stream::StreamOutput::RawLine(ref line) = output {
+            // Detect phase transitions from text content
             let previous_phase = callback_state.progress_tracker.current_phase();
-
-            if line.contains("Plan") || line.contains("plan") {
+            if text.contains("Plan") || text.contains("plan") {
                 if previous_phase != MinionPhase::Planning {
                     callback_state
                         .progress_tracker
                         .set_phase(MinionPhase::Planning);
                 }
-            } else if (line.contains("Implement") || line.contains("Writing"))
+            } else if (text.contains("Implement") || text.contains("Writing"))
                 && previous_phase != MinionPhase::Implementing
             {
                 callback_state
                     .progress_tracker
                     .set_phase(MinionPhase::Implementing);
-            } else if (line.contains("test") || line.contains("Test"))
+            } else if (text.contains("test") || text.contains("Test"))
                 && previous_phase != MinionPhase::Testing
             {
                 callback_state
@@ -898,6 +906,8 @@ async fn run_claude_session_inner(
                     .set_phase(MinionPhase::Testing);
             }
         }
+
+        callback_state.progress.handle_event(event);
     };
 
     let pid_minion_id = wt_ctx.minion_id.clone();
@@ -911,8 +921,9 @@ async fn run_claude_session_inner(
         }
     });
 
-    let run_result = run_claude_with_stream_monitoring(
+    let run_result = run_agent_with_stream_monitoring(
         cmd,
+        backend,
         &wt_ctx.minion_dir,
         timeout_opt,
         Some(callback),
@@ -937,17 +948,17 @@ async fn run_claude_session_inner(
     })
     .await;
 
-    let claude_run = run_result?;
+    let agent_run = run_result?;
 
     // Post final completion comment
     if let Some(ref client) = issue_ctx.github_client {
         progress_tracker.set_phase(MinionPhase::Completed);
 
-        let final_message = if claude_run.status.success() {
-            if claude_run.token_usage.total_tokens() > 0 {
+        let final_message = if agent_run.status.success() {
+            if agent_run.token_usage.total_tokens() > 0 {
                 format!(
                     "✅ Task completed successfully! (tokens: {})",
-                    claude_run.token_usage.display_compact()
+                    agent_run.token_usage.display_compact()
                 )
             } else {
                 "✅ Task completed successfully!".to_string()
@@ -970,14 +981,14 @@ async fn run_claude_session_inner(
     }
 
     // Finish the progress display
-    if claude_run.status.success() {
+    if agent_run.status.success() {
         progress.finish_with_message(&format!("✅ Completed issue {}", issue_ctx.issue_num));
     } else {
         progress.finish_with_message(&format!("❌ Failed to fix issue {}", issue_ctx.issue_num));
     }
 
-    Ok(ClaudeResult {
-        status: claude_run.status,
+    Ok(AgentResult {
+        status: agent_run.status,
     })
 }
 
@@ -1194,7 +1205,9 @@ async fn monitor_pr_lifecycle(
 
                 println!("🔄 Re-invoking to address review feedback...\n");
 
-                match invoke_claude_for_reviews(
+                let backend = ClaudeBackend::new();
+                match invoke_agent_for_reviews(
+                    &backend,
                     &wt_ctx.checkout_path,
                     &wt_ctx.minion_dir,
                     &wt_ctx.session_id,
@@ -1295,13 +1308,13 @@ async fn monitor_ci_after_fix(
 // Orchestrator
 // ---------------------------------------------------------------------------
 
-/// Handles the fix command by delegating to the Claude CLI.
-/// Returns the exit code from the claude process.
+/// Handles the fix command by delegating to the agent backend.
+/// Returns the exit code from the agent process.
 ///
 /// Orchestrates 5 phases:
 /// 1. `resolve_issue` - Parse issue, check duplicates, fetch details
 /// 2. `setup_worktree` - Clone repo, create worktree, register minion
-/// 3. `run_claude_session` - Build prompt, run Claude, track progress
+/// 3. `run_agent_session` - Build prompt, run agent, track progress
 /// 4. `handle_pr_creation` - Push check, create PR, update labels
 /// 5. `monitor_pr_lifecycle` - Review, poll for updates, handle feedback
 ///
@@ -1382,18 +1395,19 @@ pub async fn handle_fix(
         }
     }
 
-    // Phase 3: Run Claude (skip if already past this phase)
-    let claude_result = if start_phase <= OrchestrationPhase::RunningClaude {
+    // Phase 3: Run agent (skip if already past this phase)
+    let backend = ClaudeBackend::new();
+    let agent_result = if start_phase <= OrchestrationPhase::RunningClaude {
         update_orchestration_phase(&wt_ctx.minion_id, OrchestrationPhase::RunningClaude).await;
 
-        // Only use --resume if we're resuming a session that actually ran Claude.
-        // If interrupted during Setup (before Claude ever ran), the session ID was
-        // never used, so `claude --resume <uuid>` would fail.
+        // Only use --resume if we're resuming a session that actually ran the agent.
+        // If interrupted during Setup (before the agent ever ran), the session ID was
+        // never used, so resume would fail.
         let use_resume = is_resume && start_phase > OrchestrationPhase::Setup;
         let result = if use_resume {
-            resume_claude_session(&issue_ctx, &wt_ctx, quiet, timeout_opt.as_deref()).await
+            resume_agent_session(&backend, &issue_ctx, &wt_ctx, quiet, timeout_opt.as_deref()).await
         } else {
-            run_claude_session(&issue_ctx, &wt_ctx, quiet, timeout_opt.as_deref()).await
+            run_agent_session(&backend, &issue_ctx, &wt_ctx, quiet, timeout_opt.as_deref()).await
         };
 
         match result {
@@ -1423,7 +1437,7 @@ pub async fn handle_fix(
     };
 
     // Check Claude result if we ran it
-    if let Some(ref result) = claude_result {
+    if let Some(ref result) = agent_result {
         if !result.status.success() {
             update_orchestration_phase(&wt_ctx.minion_id, OrchestrationPhase::Failed).await;
 
@@ -1509,7 +1523,7 @@ pub async fn handle_fix(
 
     update_orchestration_phase(&wt_ctx.minion_id, OrchestrationPhase::Completed).await;
 
-    let exit_code = claude_result
+    let exit_code = agent_result
         .map(|r| r.status.code().unwrap_or(EXIT_CODE_SIGNAL_TERMINATED))
         .unwrap_or(0);
 
@@ -1519,7 +1533,7 @@ pub async fn handle_fix(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::claude_runner::ClaudeRunnerError;
+    use crate::agent_runner::AgentRunnerError;
 
     #[tokio::test]
     async fn test_is_branch_pushed_nonexistent() {
@@ -1703,20 +1717,20 @@ CUSTOM: Fix #{{ issue_number }} - {{ issue_title }}"#,
 
     #[test]
     fn test_is_stuck_or_timeout_error_stuck() {
-        let err: anyhow::Error = ClaudeRunnerError::InactivityStuck { minutes: 15 }.into();
+        let err: anyhow::Error = AgentRunnerError::InactivityStuck { minutes: 15 }.into();
         assert!(is_stuck_or_timeout_error(&err));
     }
 
     #[test]
     fn test_is_stuck_or_timeout_error_task_timeout() {
         let err: anyhow::Error =
-            ClaudeRunnerError::MaxTimeout(tokio::time::Duration::from_secs(600)).into();
+            AgentRunnerError::MaxTimeout(tokio::time::Duration::from_secs(600)).into();
         assert!(is_stuck_or_timeout_error(&err));
     }
 
     #[test]
     fn test_is_stuck_or_timeout_error_stream_timeout() {
-        let err: anyhow::Error = ClaudeRunnerError::StreamTimeout { seconds: 300 }.into();
+        let err: anyhow::Error = AgentRunnerError::StreamTimeout { seconds: 300 }.into();
         assert!(is_stuck_or_timeout_error(&err));
     }
 
@@ -1729,7 +1743,7 @@ CUSTOM: Fix #{{ issue_number }} - {{ issue_title }}"#,
     #[test]
     fn test_is_stuck_or_timeout_error_wrapped_in_context() {
         // Typed errors survive context wrapping, unlike string matching
-        let err: anyhow::Error = ClaudeRunnerError::InactivityStuck { minutes: 15 }.into();
+        let err: anyhow::Error = AgentRunnerError::InactivityStuck { minutes: 15 }.into();
         let wrapped = err.context("Claude session failed");
         assert!(is_stuck_or_timeout_error(&wrapped));
     }

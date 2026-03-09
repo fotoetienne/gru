@@ -7,7 +7,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use crate::stream::TokenUsage;
+use crate::agent::TokenUsage;
 use crate::workspace::Workspace;
 
 /// Async helper that loads the registry inside `spawn_blocking`, runs the

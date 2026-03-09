@@ -1,7 +1,8 @@
-use crate::claude_runner::{
-    build_claude_resume_command, is_stuck_or_timeout_error, run_claude_with_stream_monitoring,
-    EXIT_CODE_SIGNAL_TERMINATED,
+use crate::agent::{AgentBackend, AgentEvent};
+use crate::agent_runner::{
+    is_stuck_or_timeout_error, run_agent_with_stream_monitoring, EXIT_CODE_SIGNAL_TERMINATED,
 };
+use crate::claude_backend::ClaudeBackend;
 use crate::commands::fix::{
     handle_pr_creation, update_orchestration_phase, IssueContext, WorktreeContext,
 };
@@ -11,7 +12,6 @@ use crate::minion_registry::{
 };
 use crate::minion_resolver;
 use crate::progress::{ProgressConfig, ProgressDisplay};
-use crate::stream;
 use anyhow::{bail, Context, Result};
 use chrono::Utc;
 use uuid::Uuid;
@@ -139,7 +139,7 @@ pub async fn handle_resume(
 
     // Run Claude in autonomous mode with stream monitoring
     let claude_result =
-        run_autonomous_claude(&wt_ctx, &prompt, quiet, timeout_opt.as_deref(), issue_num).await;
+        run_autonomous_agent(&wt_ctx, &prompt, quiet, timeout_opt.as_deref(), issue_num).await;
 
     match claude_result {
         Ok(status) => {
@@ -203,18 +203,21 @@ async fn revert_to_stopped(minion_id: &str) {
     .await;
 }
 
-/// Runs Claude in autonomous mode with stream monitoring.
+/// Runs the agent in autonomous mode with stream monitoring.
 ///
-/// Spawns Claude with `--resume` and stream-json output, tracks progress,
+/// Spawns the agent with resume and stream-json output, tracks progress,
 /// and updates the registry with PID/mode during execution.
-async fn run_autonomous_claude(
+async fn run_autonomous_agent(
     wt_ctx: &WorktreeContext,
     prompt: &str,
     quiet: bool,
     timeout_opt: Option<&str>,
     issue_num: u64,
 ) -> Result<std::process::ExitStatus> {
-    let mut cmd = build_claude_resume_command(&wt_ctx.checkout_path, &wt_ctx.session_id, prompt);
+    let backend = ClaudeBackend::new();
+    let mut cmd = backend
+        .build_resume_command(&wt_ctx.checkout_path, &wt_ctx.session_id, prompt)
+        .context("Agent backend does not support resume")?;
     cmd.env("GRU_WORKSPACE", &wt_ctx.minion_id);
 
     let config = ProgressConfig {
@@ -224,13 +227,13 @@ async fn run_autonomous_claude(
     };
     let progress = ProgressDisplay::new(config);
 
-    let callback = move |output: &stream::StreamOutput| {
-        progress.handle_output(output);
+    let callback = move |event: &AgentEvent| {
+        progress.handle_event(event);
     };
 
     // Register PID on spawn. Uses MinionRegistry::load directly instead of
     // with_registry because the on_spawn callback is synchronous (FnOnce, not async).
-    // This is consistent with the same pattern in fix.rs::run_claude_session_inner.
+    // This is consistent with the same pattern in fix.rs::run_agent_session_inner.
     let pid_minion_id = wt_ctx.minion_id.clone();
     let on_spawn: Box<dyn FnOnce(u32) + Send> = Box::new(move |pid: u32| {
         if let Ok(mut registry) = MinionRegistry::load(None) {
@@ -242,8 +245,9 @@ async fn run_autonomous_claude(
         }
     });
 
-    let run_result = run_claude_with_stream_monitoring(
+    let run_result = run_agent_with_stream_monitoring(
         cmd,
+        &backend,
         &wt_ctx.minion_dir,
         timeout_opt,
         Some(callback),
@@ -265,8 +269,8 @@ async fn run_autonomous_claude(
     })
     .await;
 
-    let claude_run = run_result?;
-    Ok(claude_run.status)
+    let agent_run = run_result?;
+    Ok(agent_run.status)
 }
 
 /// Atomically checks if the minion is available and claims it as Autonomous.
