@@ -175,19 +175,24 @@ pub async fn handle_clean(dry_run: bool, force: bool, base_branch: &str) -> Resu
                             | crate::minion_registry::MinionMode::Interactive
                     ),
                 };
-                let canonical = match info.worktree.canonicalize() {
+                // Use checkout_path() (not worktree) because the scanner discovers
+                // checkout paths from `git worktree list`. The registry stores the
+                // minion_dir (parent of checkout/), so comparing raw worktree paths
+                // would never match and active minions would not be protected.
+                let checkout = info.checkout_path();
+                let canonical = match checkout.canonicalize() {
                     Ok(c) => c,
                     Err(e) => {
                         log::warn!(
-                            "Warning: Failed to canonicalize worktree path for minion {}: {} (error: {})",
+                            "Warning: Failed to canonicalize checkout path for minion {}: {} (error: {})",
                             minion_id,
-                            info.worktree.display(),
+                            checkout.display(),
                             e
                         );
                         log::warn!(
                             "         Using original path, but this may cause comparison mismatches."
                         );
-                        info.worktree
+                        checkout
                     }
                 };
 
