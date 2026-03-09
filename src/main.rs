@@ -1,5 +1,6 @@
 mod agent;
 mod ci;
+mod claude_backend;
 mod claude_runner;
 mod commands;
 mod config;
