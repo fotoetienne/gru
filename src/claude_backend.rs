@@ -11,22 +11,40 @@ use crate::agent::{AgentBackend, AgentEvent, TokenUsage as AgentTokenUsage};
 use crate::claude_runner;
 use crate::stream::{self, ClaudeEvent, ContentBlock, ContentDelta, StreamOutput};
 use std::path::Path;
+use std::sync::Mutex;
 use tokio::process::Command as TokioCommand;
 use uuid::Uuid;
+
+/// Buffered state for a tool invocation whose input JSON is still arriving.
+struct ToolBuffer {
+    tool_name: String,
+    tool_use_id: String,
+    input_json: String,
+}
 
 /// Claude Code CLI backend.
 ///
 /// Implements `AgentBackend` by delegating to the existing Claude CLI invocation
 /// flags and Anthropic Messages API stream parsing.
-pub struct ClaudeBackend;
+///
+/// The backend buffers `ContentBlockStart(ToolUse)` and `InputJsonDelta` events
+/// internally, emitting a single `AgentEvent::ToolUse` with a populated
+/// `input_summary` when `ContentBlockStop` arrives. This eliminates the UX
+/// regression of showing "Tool: Bash" instead of "Run: git status".
+pub struct ClaudeBackend {
+    tool_buffer: Mutex<Option<ToolBuffer>>,
+}
 
 impl ClaudeBackend {
     pub fn new() -> Self {
-        Self
+        Self {
+            tool_buffer: Mutex::new(None),
+        }
     }
 
-    /// Map a `ClaudeEvent` to an `AgentEvent`.
-    fn map_claude_event(event: &ClaudeEvent) -> Option<AgentEvent> {
+    /// Map a `ClaudeEvent` to an `AgentEvent`, using internal state to buffer
+    /// tool invocations until their input JSON is complete.
+    fn map_event(&self, event: &ClaudeEvent) -> Option<AgentEvent> {
         match event {
             ClaudeEvent::MessageStart { message } => {
                 let agent_usage = message.usage.as_ref().map(|u| AgentTokenUsage {
@@ -39,10 +57,17 @@ impl ClaudeBackend {
             }
 
             ClaudeEvent::ContentBlockStart { content_block, .. } => match content_block {
-                ContentBlock::ToolUse { name, id } => Some(AgentEvent::ToolUse {
-                    tool_name: name.clone(),
-                    tool_use_id: id.clone(),
-                }),
+                ContentBlock::ToolUse { name, id } => {
+                    // Buffer the tool — don't emit yet. We'll emit on ContentBlockStop
+                    // once we have the full input JSON for a meaningful summary.
+                    let mut buf = self.tool_buffer.lock().unwrap_or_else(|e| e.into_inner());
+                    *buf = Some(ToolBuffer {
+                        tool_name: name.clone(),
+                        tool_use_id: id.clone(),
+                        input_json: String::new(),
+                    });
+                    None
+                }
                 ContentBlock::Text { .. } => None,
                 ContentBlock::Unknown => None,
             },
@@ -51,11 +76,32 @@ impl ClaudeBackend {
                 ContentDelta::TextDelta { text } => {
                     Some(AgentEvent::TextDelta { text: text.clone() })
                 }
-                ContentDelta::InputJsonDelta { .. } => None,
+                ContentDelta::InputJsonDelta { partial_json } => {
+                    // Accumulate into the tool buffer
+                    let mut buf = self.tool_buffer.lock().unwrap_or_else(|e| e.into_inner());
+                    if let Some(ref mut tb) = *buf {
+                        tb.input_json.push_str(partial_json);
+                    }
+                    None
+                }
                 ContentDelta::Unknown => None,
             },
 
-            ClaudeEvent::ContentBlockStop { .. } => None,
+            ClaudeEvent::ContentBlockStop { .. } => {
+                // If we have a buffered tool, emit it now with a formatted summary
+                let mut buf = self.tool_buffer.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(tb) = buf.take() {
+                    let summary = format_tool_summary(&tb.tool_name, &tb.input_json);
+                    Some(AgentEvent::ToolUse {
+                        tool_name: tb.tool_name,
+                        tool_use_id: tb.tool_use_id,
+                        input_summary: Some(summary),
+                    })
+                } else {
+                    // Text block ended — no event needed (text was already emitted via TextDelta)
+                    None
+                }
+            }
 
             ClaudeEvent::MessageDelta { delta, usage } => {
                 let agent_usage = usage.as_ref().map(|u| AgentTokenUsage {
@@ -68,9 +114,6 @@ impl ClaudeBackend {
                 })
             }
 
-            // Treat MessageStop as a completion boundary to ensure streams
-            // that emit `message_stop` but no `message_delta` still produce
-            // a normalized completion signal.
             ClaudeEvent::MessageStop => Some(AgentEvent::MessageComplete {
                 stop_reason: None,
                 usage: None,
@@ -97,7 +140,7 @@ impl AgentBackend for ClaudeBackend {
     fn parse_event(&self, line: &str) -> Option<AgentEvent> {
         let stream_output = stream::parse_line(line.trim())?;
         match stream_output {
-            StreamOutput::Event(ref claude_event) => Self::map_claude_event(claude_event),
+            StreamOutput::Event(ref claude_event) => self.map_event(claude_event),
             StreamOutput::ToolResult(ref tool_result) => {
                 let content = match &tool_result.content {
                     serde_json::Value::String(s) => s.clone(),
@@ -124,6 +167,106 @@ impl AgentBackend for ClaudeBackend {
             session_id,
             prompt,
         ))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tool input formatting (Claude-specific tool schemas)
+// ---------------------------------------------------------------------------
+
+/// Formats a human-readable summary of a tool call from its name and input JSON.
+fn format_tool_summary(tool_name: &str, input_json: &str) -> String {
+    let input: serde_json::Value = match serde_json::from_str(input_json) {
+        Ok(v) => v,
+        Err(_) => return format!("Tool: {}", tool_name),
+    };
+
+    match tool_name {
+        "Bash" => {
+            if let Some(command) = input.get("command").and_then(|c| c.as_str()) {
+                let truncated = truncate_string(command, 60);
+                format!("Run: {}", truncated)
+            } else {
+                "Run: bash command".to_string()
+            }
+        }
+        "Read" => {
+            if let Some(file_path) = input.get("file_path").and_then(|f| f.as_str()) {
+                format!("Read: {}", shorten_path(file_path))
+            } else {
+                "Read: file".to_string()
+            }
+        }
+        "Write" => {
+            if let Some(file_path) = input.get("file_path").and_then(|f| f.as_str()) {
+                format!("Write: {}", shorten_path(file_path))
+            } else {
+                "Write: file".to_string()
+            }
+        }
+        "Edit" => {
+            if let Some(file_path) = input.get("file_path").and_then(|f| f.as_str()) {
+                format!("Edit: {}", shorten_path(file_path))
+            } else {
+                "Edit: file".to_string()
+            }
+        }
+        "Grep" => {
+            if let Some(pattern) = input.get("pattern").and_then(|p| p.as_str()) {
+                let truncated = truncate_string(pattern, 40);
+                format!("Search: {}", truncated)
+            } else {
+                "Search: pattern".to_string()
+            }
+        }
+        "Glob" => {
+            if let Some(pattern) = input.get("pattern").and_then(|p| p.as_str()) {
+                let truncated = truncate_string(pattern, 40);
+                format!("Find: {}", truncated)
+            } else {
+                "Find: files".to_string()
+            }
+        }
+        "Task" | "Agent" => {
+            if let Some(description) = input.get("description").and_then(|d| d.as_str()) {
+                let truncated = truncate_string(description, 50);
+                format!("Task: {}", truncated)
+            } else {
+                "Task: running agent".to_string()
+            }
+        }
+        "TodoWrite" => "Update todos".to_string(),
+        "AskUserQuestion" => "Asking question...".to_string(),
+        _ => format!("Tool: {}", tool_name),
+    }
+}
+
+/// Truncate a string to a maximum number of characters (not bytes).
+fn truncate_string(s: &str, max_chars: usize) -> String {
+    let chars: Vec<char> = s.chars().take(max_chars + 1).collect();
+    if chars.len() > max_chars {
+        format!("{}...", chars[..max_chars].iter().collect::<String>())
+    } else {
+        s.to_string()
+    }
+}
+
+/// Shorten a file path for display, showing the last 3 components.
+fn shorten_path(path: &str) -> String {
+    let path_obj = std::path::Path::new(path);
+    let components: Vec<_> = path_obj.components().collect();
+
+    if components.len() <= 3 {
+        path.to_string()
+    } else {
+        let last_parts: Vec<_> = components
+            .iter()
+            .rev()
+            .take(3)
+            .rev()
+            .map(|c| c.as_os_str().to_string_lossy())
+            .collect();
+        format!(".../{}", last_parts.join("/"))
     }
 }
 
@@ -158,9 +301,7 @@ mod tests {
         assert!(args.contains(&"--include-partial-messages".as_ref()));
         assert!(args.contains(&"--dangerously-skip-permissions".as_ref()));
         assert!(args.contains(&"fix the bug".as_ref()));
-        // Prompt must be the last argument (positional)
         assert_eq!(*args.last().unwrap(), std::ffi::OsStr::new("fix the bug"));
-        // Should NOT contain --resume
         assert!(!args.contains(&"--resume".as_ref()));
     }
 
@@ -176,7 +317,6 @@ mod tests {
 
         let args: Vec<&std::ffi::OsStr> = inner.get_args().collect();
         assert!(args.contains(&"--resume".as_ref()));
-        // Should NOT contain --session-id
         assert!(!args.contains(&"--session-id".as_ref()));
     }
 
@@ -199,17 +339,57 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_event_tool_use() {
+    fn test_parse_event_tool_use_buffered_until_stop() {
         let b = backend();
-        let line = r#"{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","name":"Bash","id":"toolu_1"}}}"#;
-        let event = b.parse_event(line).unwrap();
-        assert_eq!(
-            event,
+
+        // ContentBlockStart(ToolUse) should NOT emit — it buffers
+        let start_line = r#"{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","name":"Bash","id":"toolu_1"}}}"#;
+        assert!(b.parse_event(start_line).is_none());
+
+        // InputJsonDelta should accumulate
+        let delta_line = r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"command\":\"git status\"}"}}}"#;
+        assert!(b.parse_event(delta_line).is_none());
+
+        // ContentBlockStop should emit ToolUse with summary
+        let stop_line =
+            r#"{"type":"stream_event","event":{"type":"content_block_stop","index":0}}"#;
+        let event = b.parse_event(stop_line).unwrap();
+        match event {
             AgentEvent::ToolUse {
-                tool_name: "Bash".to_string(),
-                tool_use_id: "toolu_1".to_string(),
+                tool_name,
+                tool_use_id,
+                input_summary,
+            } => {
+                assert_eq!(tool_name, "Bash");
+                assert_eq!(tool_use_id, "toolu_1");
+                assert_eq!(input_summary, Some("Run: git status".to_string()));
             }
-        );
+            other => panic!("Expected ToolUse, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_event_tool_use_multi_delta() {
+        let b = backend();
+
+        let start = r#"{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","name":"Read","id":"toolu_2"}}}"#;
+        assert!(b.parse_event(start).is_none());
+
+        // Two partial JSON deltas
+        let delta1 = r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"file_path\":\""}}}"#;
+        assert!(b.parse_event(delta1).is_none());
+
+        let delta2 = r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"src/main.rs\"}"}}}"#;
+        assert!(b.parse_event(delta2).is_none());
+
+        let stop = r#"{"type":"stream_event","event":{"type":"content_block_stop","index":0}}"#;
+        let event = b.parse_event(stop).unwrap();
+        match event {
+            AgentEvent::ToolUse { input_summary, .. } => {
+                assert_eq!(input_summary, Some("Read: src/main.rs".to_string()));
+            }
+            other => panic!("Expected ToolUse, got {:?}", other),
+        }
     }
 
     #[test]
@@ -223,6 +403,14 @@ mod tests {
                 text: "Hello world".to_string(),
             }
         );
+    }
+
+    #[test]
+    fn test_parse_event_text_block_stop_returns_none() {
+        let b = backend();
+        // ContentBlockStop with no buffered tool = text block end = None
+        let line = r#"{"type":"stream_event","event":{"type":"content_block_stop","index":0}}"#;
+        assert!(b.parse_event(line).is_none());
     }
 
     #[test]
@@ -318,13 +506,6 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_event_content_block_stop_returns_none() {
-        let b = backend();
-        let line = r#"{"type":"stream_event","event":{"type":"content_block_stop","index":0}}"#;
-        assert!(b.parse_event(line).is_none());
-    }
-
-    #[test]
     fn test_parse_event_message_stop_produces_completion() {
         let b = backend();
         let line = r#"{"type":"stream_event","event":{"type":"message_stop"}}"#;
@@ -339,13 +520,6 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_event_input_json_delta_returns_none() {
-        let b = backend();
-        let line = r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"key\":"}}}"#;
-        assert!(b.parse_event(line).is_none());
-    }
-
-    #[test]
     fn test_parse_event_text_content_block_start_returns_none() {
         let b = backend();
         let line = r#"{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}}"#;
@@ -355,13 +529,17 @@ mod tests {
     #[test]
     fn test_parse_event_tool_names_preserved() {
         let b = backend();
-        // Verify various Claude tool names pass through correctly
         for tool in &["Bash", "Read", "Write", "Edit", "Glob", "Grep", "Agent"] {
-            let line = format!(
+            // Start tool block
+            let start = format!(
                 r#"{{"type":"stream_event","event":{{"type":"content_block_start","index":0,"content_block":{{"type":"tool_use","name":"{}","id":"t1"}}}}}}"#,
                 tool
             );
-            let event = b.parse_event(&line).unwrap();
+            assert!(b.parse_event(&start).is_none()); // buffered
+
+            // Stop block — emits ToolUse
+            let stop = r#"{"type":"stream_event","event":{"type":"content_block_stop","index":0}}"#;
+            let event = b.parse_event(stop).unwrap();
             match event {
                 AgentEvent::ToolUse { tool_name, .. } => {
                     assert_eq!(tool_name, *tool);
@@ -369,5 +547,69 @@ mod tests {
                 other => panic!("Expected ToolUse for {}, got {:?}", tool, other),
             }
         }
+    }
+
+    // ---- format_tool_summary tests ----
+
+    #[test]
+    fn test_format_tool_summary_bash() {
+        let result = format_tool_summary("Bash", r#"{"command":"git status"}"#);
+        assert_eq!(result, "Run: git status");
+    }
+
+    #[test]
+    fn test_format_tool_summary_bash_long() {
+        let result = format_tool_summary(
+            "Bash",
+            r#"{"command":"git commit -m 'This is a very long commit message that should be truncated'"}"#,
+        );
+        assert!(result.starts_with("Run: git commit"));
+        assert!(result.ends_with("..."));
+    }
+
+    #[test]
+    fn test_format_tool_summary_read() {
+        let result = format_tool_summary("Read", r#"{"file_path":"src/main.rs"}"#);
+        assert_eq!(result, "Read: src/main.rs");
+    }
+
+    #[test]
+    fn test_format_tool_summary_edit_long_path() {
+        let result = format_tool_summary(
+            "Edit",
+            r#"{"file_path":"/Users/test/projects/gru/src/commands/fix.rs"}"#,
+        );
+        assert_eq!(result, "Edit: .../src/commands/fix.rs");
+    }
+
+    #[test]
+    fn test_format_tool_summary_grep() {
+        let result = format_tool_summary("Grep", r#"{"pattern":"TODO"}"#);
+        assert_eq!(result, "Search: TODO");
+    }
+
+    #[test]
+    fn test_format_tool_summary_unknown_tool() {
+        let result = format_tool_summary("CustomTool", r#"{"foo":"bar"}"#);
+        assert_eq!(result, "Tool: CustomTool");
+    }
+
+    #[test]
+    fn test_format_tool_summary_invalid_json() {
+        let result = format_tool_summary("Bash", "not valid json");
+        assert_eq!(result, "Tool: Bash");
+    }
+
+    #[test]
+    fn test_shorten_path_short() {
+        assert_eq!(shorten_path("src/main.rs"), "src/main.rs");
+    }
+
+    #[test]
+    fn test_shorten_path_long() {
+        assert_eq!(
+            shorten_path("/Users/test/projects/gru/src/commands/fix.rs"),
+            ".../src/commands/fix.rs"
+        );
     }
 }

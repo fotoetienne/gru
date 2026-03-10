@@ -124,6 +124,7 @@ impl ProgressDisplay {
             AgentEvent::ToolUse {
                 tool_name,
                 tool_use_id,
+                input_summary,
             } => {
                 // Flush any buffered text before showing tool
                 if let Some(flushed_text) = self.text_buffer.flush() {
@@ -137,7 +138,11 @@ impl ProgressDisplay {
                     tool_name
                 };
                 self.update_status(&format!("🔧 Using tool: {}", display_name));
-                self.print_event(&format!("[{}] Tool: {}", timestamp, display_name));
+
+                // Use the backend-provided summary when available (e.g., "Run: git status"),
+                // otherwise fall back to just the tool name.
+                let display_text = input_summary.as_deref().unwrap_or(display_name);
+                self.print_event(&format!("[{}] {}", timestamp, display_text));
 
                 // Store tool name for later reference when tool completes
                 if !tool_use_id.is_empty() {

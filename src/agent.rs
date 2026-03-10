@@ -37,6 +37,11 @@ pub enum AgentEvent {
         tool_name: String,
         /// Unique identifier for this tool invocation
         tool_use_id: String,
+        /// Human-readable summary of the tool call (e.g., "Run: git status").
+        /// Populated by backends that can determine tool input before emitting
+        /// the event. `None` when input is unknown or not applicable.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        input_summary: Option<String>,
     },
     /// Result of a tool invocation.
     ToolResult {
@@ -219,6 +224,7 @@ mod tests {
         let event = AgentEvent::ToolUse {
             tool_name: "Bash".to_string(),
             tool_use_id: "tool_123".to_string(),
+            input_summary: None,
         };
         let json = serde_json::to_string(&event).unwrap();
         let deserialized: AgentEvent = serde_json::from_str(&json).unwrap();
@@ -301,6 +307,7 @@ mod tests {
         let event = AgentEvent::ToolUse {
             tool_name: "Read".to_string(),
             tool_use_id: "abc".to_string(),
+            input_summary: None,
         };
         let json = serde_json::to_string(&event).unwrap();
         let value: serde_json::Value = serde_json::from_str(&json).unwrap();
