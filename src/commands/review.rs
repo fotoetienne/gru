@@ -1,6 +1,6 @@
-use crate::claude_runner::{
-    build_claude_command, run_claude_with_stream_monitoring, EXIT_CODE_SIGNAL_TERMINATED,
-};
+use crate::agent::{AgentBackend, AgentEvent};
+use crate::agent_runner::{run_agent_with_stream_monitoring, EXIT_CODE_SIGNAL_TERMINATED};
+use crate::claude_backend::ClaudeBackend;
 use crate::git;
 use crate::github::{self, GitHubClient};
 use crate::minion;
@@ -12,7 +12,6 @@ use crate::pr_state::PrState;
 use crate::progress::{ProgressConfig, ProgressDisplay};
 use crate::prompt_loader;
 use crate::prompt_renderer::{render_template, PromptContext};
-use crate::stream;
 use crate::url_utils::parse_pr_info;
 use crate::workspace;
 use anyhow::{Context, Result};
@@ -180,7 +179,8 @@ pub async fn handle_review(pr_arg: Option<String>) -> Result<i32> {
     let progress = std::sync::Arc::new(ProgressDisplay::new(config));
 
     // Build the command with flags for autonomous stream-json output
-    let cmd = build_claude_command(&checkout_path, &session_id, &review_prompt);
+    let backend = ClaudeBackend::new();
+    let cmd = backend.build_command(&checkout_path, &session_id, &review_prompt);
 
     // Build on_spawn callback to record the child PID in the registry
     let pid_minion_id = minion_id.clone();
@@ -193,14 +193,15 @@ pub async fn handle_review(pr_arg: Option<String>) -> Result<i32> {
         }
     });
 
-    // Run Claude with stream monitoring (no timeout for reviews)
+    // Run agent with stream monitoring (no timeout for reviews)
     let progress_cb = std::sync::Arc::clone(&progress);
-    let output_callback = move |output: &stream::StreamOutput| {
-        progress_cb.handle_output(output);
+    let output_callback = move |event: &AgentEvent| {
+        progress_cb.handle_event(event);
     };
 
-    let run_result = run_claude_with_stream_monitoring(
+    let run_result = run_agent_with_stream_monitoring(
         cmd,
+        &backend,
         &minion_dir,
         None,
         Some(output_callback),
@@ -225,14 +226,14 @@ pub async fn handle_review(pr_arg: Option<String>) -> Result<i32> {
     }
 
     // Now check if there was a stream error (after cleanup)
-    let claude_run = run_result?;
-    let status = claude_run.status;
+    let agent_run = run_result?;
+    let status = agent_run.status;
 
     // Log token usage
-    if claude_run.token_usage.total_tokens() > 0 {
+    if agent_run.token_usage.total_tokens() > 0 {
         log::info!(
             "📊 Token usage: {}",
-            claude_run.token_usage.display_compact()
+            agent_run.token_usage.display_compact()
         );
     }
 
@@ -243,7 +244,7 @@ pub async fn handle_review(pr_arg: Option<String>) -> Result<i32> {
         progress.finish_with_message(&format!("❌ Review failed for PR #{}", pr_num));
     }
 
-    // Return the exit code from the claude process
+    // Return the exit code from the agent process
     // Use 128 for signal terminations to follow shell conventions
     Ok(status.code().unwrap_or(EXIT_CODE_SIGNAL_TERMINATED))
 }

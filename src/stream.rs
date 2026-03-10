@@ -1,3 +1,11 @@
+//! Claude Code stream parsing module.
+//!
+//! Contains Claude-specific event types and stream parsing logic.
+//! The public API is consumed exclusively by `ClaudeBackend::parse_event()`.
+//! Types like `EventStream`, `TokenUsage`, and `StreamOutput::RawLine` are
+//! retained for test coverage but are not called from production code paths
+//! (the generic `agent_runner` reads lines directly and delegates to the backend).
+
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -180,8 +188,11 @@ pub struct MessageContent {
     pub content: Vec<ToolResult>,
 }
 
-/// Represents the output from parsing a stream line
+/// Represents the output from parsing a stream line.
+/// The `RawLine` variant is unused in production (the generic runner skips unparseable
+/// lines) but is tested in `stream::tests`.
 #[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)]
 pub enum StreamOutput {
     /// A parsed Claude event
     Event(ClaudeEvent),
@@ -224,7 +235,10 @@ pub(crate) fn parse_line(trimmed: &str) -> Option<StreamOutput> {
     None
 }
 
-/// Accumulated token usage across a session
+/// Accumulated token usage across a session.
+/// Retained for backward compatibility with existing events.jsonl files and tests.
+/// Production code now uses `agent::TokenUsage` instead.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct TokenUsage {
     pub input_tokens: u64,
@@ -233,6 +247,7 @@ pub struct TokenUsage {
     pub cache_read_input_tokens: u64,
 }
 
+#[allow(dead_code)]
 impl TokenUsage {
     /// Update from a message_start event's usage field.
     /// Note: output_tokens in message_start is always 0 per Anthropic's streaming spec;
@@ -268,6 +283,7 @@ impl TokenUsage {
 }
 
 /// Format a token count in a human-readable way (e.g., 1234 -> "1.2k", 1234567 -> "1.2M")
+#[allow(dead_code)]
 fn format_token_count(count: u64) -> String {
     if count >= 999_950 {
         format!("{:.1}M", count as f64 / 1_000_000.0)
@@ -278,11 +294,14 @@ fn format_token_count(count: u64) -> String {
     }
 }
 
-/// Async event stream reader for Claude Code output
+/// Async event stream reader for Claude Code output.
+/// Retained for tests; production code uses `agent_runner` line reading instead.
+#[allow(dead_code)]
 pub struct EventStream<R> {
     reader: BufReader<R>,
 }
 
+#[allow(dead_code)]
 impl EventStream<ChildStdout> {
     /// Create a new EventStream from a child process's stdout
     pub fn from_stdout(stdout: ChildStdout) -> Self {
@@ -290,6 +309,7 @@ impl EventStream<ChildStdout> {
     }
 }
 
+#[allow(dead_code)]
 impl<R: tokio::io::AsyncRead + Unpin> EventStream<R> {
     /// Creates a new event stream from an async reader
     pub fn new(reader: R) -> Self {

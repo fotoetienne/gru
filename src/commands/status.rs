@@ -1,5 +1,5 @@
+use crate::agent::TokenUsage;
 use crate::minion_registry::{is_process_alive, with_registry, MinionMode};
-use crate::stream::TokenUsage;
 use anyhow::{Context, Result};
 
 /// Combined Minion information from registry and filesystem scanning

@@ -1,4 +1,4 @@
-use crate::stream::{ClaudeEvent, ContentBlock, ContentDelta, StreamOutput};
+use crate::agent::AgentEvent;
 use crate::text_buffer::TextBuffer;
 use chrono::Local;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
@@ -29,41 +29,16 @@ pub struct ProgressConfig {
     pub quiet: bool,
 }
 
-/// Tracks the current tool being used and its accumulated input JSON
-#[derive(Default)]
-struct ToolInputTracker {
-    tool_name: Option<String>,
-    input_json: String,
-}
-
-impl ToolInputTracker {
-    fn start_tool(&mut self, name: String) {
-        self.tool_name = Some(name);
-        self.input_json.clear();
-    }
-
-    fn add_input_chunk(&mut self, chunk: &str) {
-        self.input_json.push_str(chunk);
-    }
-
-    fn take(&mut self) -> Option<(String, String)> {
-        if let Some(name) = self.tool_name.take() {
-            let input = std::mem::take(&mut self.input_json);
-            Some((name, input))
-        } else {
-            None
-        }
-    }
-}
-
-/// Progress display manager for Minion work
+/// Progress display manager for Minion work.
+///
+/// Consumes normalized `AgentEvent` values to drive the spinner, status bar,
+/// and scrolling event log — regardless of which agent backend produced them.
 pub struct ProgressDisplay {
     multi: MultiProgress,
     status_bar: ProgressBar,
     start_time: Instant,
     config: ProgressConfig,
     text_buffer: TextBuffer,
-    tool_tracker: Arc<Mutex<ToolInputTracker>>,
     /// Maps tool_use_id to tool_name for displaying tool completion messages
     tool_names: Arc<Mutex<HashMap<String, String>>>,
 }
@@ -88,7 +63,6 @@ impl ProgressDisplay {
             start_time: Instant::now(),
             config,
             text_buffer: TextBuffer::new(Duration::from_secs(2)),
-            tool_tracker: Arc::new(Mutex::new(ToolInputTracker::default())),
             tool_names: Arc::new(Mutex::new(HashMap::new())),
         };
 
@@ -117,77 +91,160 @@ impl ProgressDisplay {
         let _ = self.multi.println(event_text);
     }
 
-    /// Process a stream output and update the display
-    pub fn handle_output(&self, output: &StreamOutput) {
+    /// Process a normalized agent event and update the display.
+    pub fn handle_event(&self, event: &AgentEvent) {
         if self.config.quiet {
             // In quiet mode, only show errors
-            if let StreamOutput::Event(ClaudeEvent::Error { error }) = output {
-                let message = if error.message.is_empty() {
+            if let AgentEvent::Error { message } = event {
+                let msg = if message.is_empty() {
                     "Unknown error"
                 } else {
-                    &error.message
+                    message
                 };
-                log::error!("{}", message);
+                log::error!("{}", msg);
             }
             return;
         }
 
-        match output {
-            StreamOutput::Event(event) => self.handle_event(event),
-            StreamOutput::ToolResult(tool_result) => self.handle_tool_result(tool_result),
-            StreamOutput::RawLine(_line) => {
-                // Raw lines are no longer printed to avoid clutter
-                // Formatted events from handle_event() provide sufficient output
-                // Raw lines are still logged to events.jsonl for debugging
-            }
-        }
-    }
-
-    /// Handle a tool result message
-    fn handle_tool_result(&self, tool_result: &crate::stream::ToolResult) {
         let timestamp = Local::now().format("%H:%M:%S");
 
-        // Look up the tool name by tool_use_id
-        let tool_name = {
-            let names = lock_or_recover(&self.tool_names, "Tool names");
-            names.get(&tool_result.tool_use_id).cloned()
-        };
-
-        let formatted = if tool_result.is_error {
-            // Format error tool results
-            let error_msg = match tool_result.content.as_str() {
-                Some(s) => s.to_string(),
-                None => format!(
-                    "Tool failed with non-string error content: {}",
-                    tool_result.content
-                ),
-            };
-            // Show first line of error
-            let first_line = error_msg.lines().next().unwrap_or(&error_msg);
-            let truncated = Self::truncate_string(first_line, 60);
-            if let Some(name) = tool_name {
-                format!("[{}] ✗ {} failed: {}", timestamp, name, truncated)
-            } else {
-                format!("[{}] ✗ Tool failed: {}", timestamp, truncated)
+        match event {
+            AgentEvent::Started { .. } => {
+                // Flush any buffered text from a previous turn
+                if let Some(flushed_text) = self.text_buffer.flush() {
+                    let truncated = Self::truncate_string(&flushed_text, MAX_DISPLAY_CHARS);
+                    self.print_event(&truncated);
+                }
+                self.update_status("💭 Thinking...");
+                self.print_event(&format!("[{}] ▶︎", timestamp));
             }
-        } else {
-            // Format successful tool results
-            let size = tool_result
-                .content
-                .as_str()
-                .map(|s| s.len())
-                .unwrap_or_else(|| {
-                    // For non-string content, estimate size from JSON
-                    tool_result.content.to_string().len()
-                });
-            if let Some(name) = tool_name {
-                format!("[{}] ✓ {} completed ({} bytes)", timestamp, name, size)
-            } else {
-                format!("[{}] ✓ Tool completed ({} bytes)", timestamp, size)
+            AgentEvent::Thinking { .. } => {
+                self.update_status("💭 Thinking...");
             }
-        };
+            AgentEvent::ToolUse {
+                tool_name,
+                tool_use_id,
+                input_summary,
+            } => {
+                // Flush any buffered text before showing tool
+                if let Some(flushed_text) = self.text_buffer.flush() {
+                    let truncated = Self::truncate_string(&flushed_text, MAX_DISPLAY_CHARS);
+                    self.print_event(&truncated);
+                }
 
-        self.print_event(&formatted);
+                let display_name = if tool_name.is_empty() {
+                    "unknown"
+                } else {
+                    tool_name
+                };
+                self.update_status(&format!("🔧 Using tool: {}", display_name));
+
+                // Use the backend-provided summary when available (e.g., "Run: git status"),
+                // otherwise fall back to just the tool name.
+                let display_text = input_summary.as_deref().unwrap_or(display_name);
+                self.print_event(&format!("[{}] {}", timestamp, display_text));
+
+                // Store display name for later reference when tool completes.
+                // Use display_name (not tool_name) so empty names show as "unknown"
+                // in ToolResult formatting instead of blank.
+                if !tool_use_id.is_empty() {
+                    let mut names = lock_or_recover(&self.tool_names, "Tool names");
+                    names.insert(tool_use_id.clone(), display_name.to_string());
+                }
+            }
+            AgentEvent::ToolResult {
+                tool_use_id,
+                content,
+                is_error,
+            } => {
+                // Look up the tool name by tool_use_id
+                let tool_name = {
+                    let names = lock_or_recover(&self.tool_names, "Tool names");
+                    names.get(tool_use_id).cloned()
+                };
+
+                let formatted = if *is_error {
+                    let first_line = content.lines().next().unwrap_or(content);
+                    let truncated = Self::truncate_string(first_line, 60);
+                    if let Some(name) = tool_name {
+                        format!("[{}] ✗ {} failed: {}", timestamp, name, truncated)
+                    } else {
+                        format!("[{}] ✗ Tool failed: {}", timestamp, truncated)
+                    }
+                } else {
+                    let size = content.len();
+                    if let Some(name) = tool_name {
+                        format!("[{}] ✓ {} completed ({} bytes)", timestamp, name, size)
+                    } else {
+                        format!("[{}] ✓ Tool completed ({} bytes)", timestamp, size)
+                    }
+                };
+
+                self.print_event(&formatted);
+            }
+            AgentEvent::TextDelta { text } => {
+                self.update_status("📝 Responding...");
+                // Add text to buffer; flush if ready
+                if let Some(flushed_text) = self.text_buffer.add(text) {
+                    let truncated = Self::truncate_string(&flushed_text, MAX_DISPLAY_CHARS);
+                    self.print_event(&truncated);
+                }
+            }
+            AgentEvent::MessageComplete { stop_reason, .. } => {
+                // Flush any remaining buffered text
+                if let Some(flushed_text) = self.text_buffer.flush() {
+                    let truncated = Self::truncate_string(&flushed_text, MAX_DISPLAY_CHARS);
+                    self.print_event(&truncated);
+                }
+
+                if let Some(reason) = stop_reason {
+                    match reason.as_str() {
+                        "end_turn" => {
+                            self.update_status("✅ Complete");
+                            self.print_event(&format!("[{}] Complete", timestamp));
+                        }
+                        "tool_use" => {
+                            self.update_status("⏸️  Waiting for tool results...");
+                        }
+                        _ => {
+                            self.update_status("✅ Message complete");
+                        }
+                    }
+                } else {
+                    self.update_status("✅ Message complete");
+                }
+            }
+            AgentEvent::Finished { .. } => {
+                // Flush any remaining buffered text
+                if let Some(flushed_text) = self.text_buffer.flush() {
+                    let truncated = Self::truncate_string(&flushed_text, MAX_DISPLAY_CHARS);
+                    self.print_event(&truncated);
+                }
+                self.update_status("✅ Finished");
+            }
+            AgentEvent::Error { message } => {
+                // Flush any buffered text before showing error
+                if let Some(flushed_text) = self.text_buffer.flush() {
+                    let truncated = Self::truncate_string(&flushed_text, MAX_DISPLAY_CHARS);
+                    self.print_event(&truncated);
+                }
+
+                self.update_status("❌ Error");
+                let error_text = if message.is_empty() {
+                    "Unknown error".to_string()
+                } else {
+                    message.clone()
+                };
+                self.print_event(&format!("[{}] Error: {}", timestamp, error_text));
+                log::error!("{}", error_text);
+            }
+            AgentEvent::Ping => {
+                // Keepalive ping - no action needed, spinner ticks below
+            }
+        }
+
+        // Tick the spinner to show activity
+        self.status_bar.tick();
     }
 
     /// Truncate a string to a maximum number of characters (not bytes)
@@ -201,223 +258,6 @@ impl ProgressDisplay {
             // String is max_chars or shorter, return as-is
             s.to_string()
         }
-    }
-
-    /// Format tool information for display
-    /// Returns a concise, human-readable description of the tool call
-    fn format_tool_info(tool_name: &str, input_json: &str) -> String {
-        // Try to parse the input JSON
-        let input: serde_json::Value = match serde_json::from_str(input_json) {
-            Ok(v) => v,
-            Err(_) => {
-                // If parsing fails, just show the tool name
-                return format!("Tool: {}", tool_name);
-            }
-        };
-
-        match tool_name {
-            "Bash" => {
-                if let Some(command) = input.get("command").and_then(|c| c.as_str()) {
-                    let truncated = Self::truncate_string(command, 60);
-                    format!("Run: {}", truncated)
-                } else {
-                    "Run: bash command".to_string()
-                }
-            }
-            "Read" => {
-                if let Some(file_path) = input.get("file_path").and_then(|f| f.as_str()) {
-                    // Show just the filename or last few path components
-                    let shortened = Self::shorten_path(file_path);
-                    format!("Read: {}", shortened)
-                } else {
-                    "Read: file".to_string()
-                }
-            }
-            "Write" => {
-                if let Some(file_path) = input.get("file_path").and_then(|f| f.as_str()) {
-                    let shortened = Self::shorten_path(file_path);
-                    format!("Write: {}", shortened)
-                } else {
-                    "Write: file".to_string()
-                }
-            }
-            "Edit" => {
-                if let Some(file_path) = input.get("file_path").and_then(|f| f.as_str()) {
-                    let shortened = Self::shorten_path(file_path);
-                    format!("Edit: {}", shortened)
-                } else {
-                    "Edit: file".to_string()
-                }
-            }
-            "Grep" => {
-                if let Some(pattern) = input.get("pattern").and_then(|p| p.as_str()) {
-                    let truncated = Self::truncate_string(pattern, 40);
-                    format!("Search: {}", truncated)
-                } else {
-                    "Search: pattern".to_string()
-                }
-            }
-            "Glob" => {
-                if let Some(pattern) = input.get("pattern").and_then(|p| p.as_str()) {
-                    let truncated = Self::truncate_string(pattern, 40);
-                    format!("Find: {}", truncated)
-                } else {
-                    "Find: files".to_string()
-                }
-            }
-            "Task" => {
-                if let Some(description) = input.get("description").and_then(|d| d.as_str()) {
-                    let truncated = Self::truncate_string(description, 50);
-                    format!("Task: {}", truncated)
-                } else {
-                    "Task: running agent".to_string()
-                }
-            }
-            "TodoWrite" => "Update todos".to_string(),
-            "AskUserQuestion" => "Asking question...".to_string(),
-            _ => format!("Tool: {}", tool_name),
-        }
-    }
-
-    /// Shorten a file path for display
-    /// Shows ".../" prefix if path is long, keeping the most relevant parts
-    fn shorten_path(path: &str) -> String {
-        let path_obj = std::path::Path::new(path);
-        let components: Vec<_> = path_obj.components().collect();
-
-        if components.len() <= 3 {
-            // Short path, show as-is
-            path.to_string()
-        } else {
-            // Long path, show last 3 components
-            let last_parts: Vec<_> = components
-                .iter()
-                .rev()
-                .take(3)
-                .rev()
-                .map(|c| c.as_os_str().to_string_lossy())
-                .collect();
-            format!(".../{}", last_parts.join("/"))
-        }
-    }
-
-    /// Handle a parsed Claude event
-    fn handle_event(&self, event: &ClaudeEvent) {
-        let timestamp = Local::now().format("%H:%M:%S");
-
-        match event {
-            ClaudeEvent::MessageStart { .. } => {
-                self.update_status("💭 Thinking...");
-                self.print_event(&format!("[{}] ▶︎", timestamp));
-            }
-            ClaudeEvent::ContentBlockStart { content_block, .. } => {
-                match content_block {
-                    ContentBlock::ToolUse { name, id } => {
-                        let display_name = if name.is_empty() { "unknown" } else { name };
-                        self.update_status(&format!("🔧 Using tool: {}", display_name));
-
-                        // Store tool name for later reference when tool completes
-                        if !id.is_empty() {
-                            let mut names = lock_or_recover(&self.tool_names, "Tool names");
-                            names.insert(id.clone(), name.clone());
-                        }
-
-                        // Start tracking this tool's input
-                        let mut tracker = lock_or_recover(&self.tool_tracker, "Tool tracker");
-                        tracker.start_tool(name.clone());
-                    }
-                    ContentBlock::Text { .. } => {
-                        self.update_status("📝 Responding...");
-                    }
-                    ContentBlock::Unknown => {}
-                }
-            }
-            ClaudeEvent::ContentBlockDelta { delta, .. } => {
-                match delta {
-                    ContentDelta::TextDelta { text } => {
-                        // Add text to buffer; flush if ready
-                        if let Some(flushed_text) = self.text_buffer.add(text) {
-                            let truncated = Self::truncate_string(&flushed_text, MAX_DISPLAY_CHARS);
-                            self.print_event(&truncated);
-                        }
-                    }
-                    ContentDelta::InputJsonDelta { partial_json } => {
-                        let mut tracker = lock_or_recover(&self.tool_tracker, "Tool tracker");
-                        tracker.add_input_chunk(partial_json);
-                    }
-                    ContentDelta::Unknown => {}
-                }
-            }
-            ClaudeEvent::ContentBlockStop { .. } => {
-                // Content block finished - handle both text and tool blocks
-
-                // First, check if we have a tool to format
-                let mut tracker = lock_or_recover(&self.tool_tracker, "Tool tracker");
-                let tool_info = tracker.take();
-
-                if let Some((tool_name, input_json)) = tool_info {
-                    // Format and display tool information
-                    let formatted = Self::format_tool_info(&tool_name, &input_json);
-                    self.print_event(&format!("[{}] {}", timestamp, formatted));
-                } else {
-                    // No tool, check for buffered text
-                    if let Some(flushed_text) = self.text_buffer.flush() {
-                        let truncated = Self::truncate_string(&flushed_text, MAX_DISPLAY_CHARS);
-                        self.print_event(&truncated);
-                    }
-                }
-            }
-            ClaudeEvent::MessageDelta { delta, .. } => {
-                if let Some(stop_reason) = &delta.stop_reason {
-                    match stop_reason.as_str() {
-                        "end_turn" => {
-                            self.update_status("✅ Complete");
-                            self.print_event(&format!("[{}] Complete", timestamp));
-                        }
-                        "tool_use" => {
-                            self.update_status("⏸️  Waiting for tool results...");
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            ClaudeEvent::MessageStop => {
-                // Flush any remaining buffered text before completing
-                if let Some(flushed_text) = self.text_buffer.flush() {
-                    let truncated = Self::truncate_string(&flushed_text, MAX_DISPLAY_CHARS);
-                    self.print_event(&truncated);
-                }
-                self.update_status("✅ Message complete");
-            }
-            ClaudeEvent::Error { error } => {
-                // Flush any buffered text before showing error
-                if let Some(flushed_text) = self.text_buffer.flush() {
-                    let truncated = Self::truncate_string(&flushed_text, MAX_DISPLAY_CHARS);
-                    self.print_event(&truncated);
-                }
-
-                self.update_status("❌ Error");
-                let error_text = if error.message.is_empty() {
-                    if error.error_type.is_empty() {
-                        "Unknown error".to_string()
-                    } else {
-                        format!("Unknown error (type: {})", error.error_type)
-                    }
-                } else if error.error_type.is_empty() {
-                    error.message.clone()
-                } else {
-                    format!("{} ({})", error.message, error.error_type)
-                };
-                self.print_event(&format!("[{}] Error: {}", timestamp, error_text));
-                log::error!("{}", error_text);
-            }
-            ClaudeEvent::Ping => {
-                // Keepalive ping - no action needed, spinner ticks below
-            }
-        }
-
-        // Tick the spinner to show activity
-        self.status_bar.tick();
     }
 
     /// Finish the progress display and show a final message
@@ -455,126 +295,9 @@ mod tests {
         let display = ProgressDisplay::new(config);
 
         // In quiet mode, non-error events shouldn't be printed
-        let message_start = StreamOutput::Event(ClaudeEvent::MessageStart {
-            message: Default::default(),
-        });
+        display.handle_event(&AgentEvent::Started { usage: None });
 
-        display.handle_output(&message_start);
-
-        // Verify quiet mode is enabled (output is suppressed in handle_output)
+        // Verify quiet mode is enabled (output is suppressed in handle_event)
         assert!(display.config.quiet);
-    }
-
-    #[test]
-    fn test_format_tool_info_bash() {
-        let input = r#"{"command":"git status"}"#;
-        let result = ProgressDisplay::format_tool_info("Bash", input);
-        assert_eq!(result, "Run: git status");
-    }
-
-    #[test]
-    fn test_format_tool_info_bash_long() {
-        let input = r#"{"command":"git commit -m 'This is a very long commit message that should be truncated'"}"#;
-        let result = ProgressDisplay::format_tool_info("Bash", input);
-        assert!(result.starts_with("Run: git commit"));
-        assert!(result.ends_with("..."));
-    }
-
-    #[test]
-    fn test_format_tool_info_read() {
-        let input = r#"{"file_path":"src/main.rs"}"#;
-        let result = ProgressDisplay::format_tool_info("Read", input);
-        assert_eq!(result, "Read: src/main.rs");
-    }
-
-    #[test]
-    fn test_format_tool_info_write() {
-        let input = r#"{"file_path":"/Users/test/project/src/lib.rs"}"#;
-        let result = ProgressDisplay::format_tool_info("Write", input);
-        assert!(result.contains("Write:"));
-        assert!(result.contains("lib.rs"));
-    }
-
-    #[test]
-    fn test_format_tool_info_edit() {
-        let input = r#"{"file_path":"src/commands/fix.rs"}"#;
-        let result = ProgressDisplay::format_tool_info("Edit", input);
-        assert_eq!(result, "Edit: src/commands/fix.rs");
-    }
-
-    #[test]
-    fn test_format_tool_info_grep() {
-        let input = r#"{"pattern":"TODO"}"#;
-        let result = ProgressDisplay::format_tool_info("Grep", input);
-        assert_eq!(result, "Search: TODO");
-    }
-
-    #[test]
-    fn test_format_tool_info_glob() {
-        let input = r#"{"pattern":"**/*.rs"}"#;
-        let result = ProgressDisplay::format_tool_info("Glob", input);
-        assert_eq!(result, "Find: **/*.rs");
-    }
-
-    #[test]
-    fn test_format_tool_info_task() {
-        let input = r#"{"description":"Explore codebase"}"#;
-        let result = ProgressDisplay::format_tool_info("Task", input);
-        assert_eq!(result, "Task: Explore codebase");
-    }
-
-    #[test]
-    fn test_format_tool_info_todowrite() {
-        let input = r#"{"todos":[]}"#;
-        let result = ProgressDisplay::format_tool_info("TodoWrite", input);
-        assert_eq!(result, "Update todos");
-    }
-
-    #[test]
-    fn test_format_tool_info_unknown_tool() {
-        let input = r#"{"foo":"bar"}"#;
-        let result = ProgressDisplay::format_tool_info("UnknownTool", input);
-        assert_eq!(result, "Tool: UnknownTool");
-    }
-
-    #[test]
-    fn test_format_tool_info_invalid_json() {
-        let input = "not valid json";
-        let result = ProgressDisplay::format_tool_info("Bash", input);
-        assert_eq!(result, "Tool: Bash");
-    }
-
-    #[test]
-    fn test_shorten_path_short() {
-        let path = "src/main.rs";
-        let result = ProgressDisplay::shorten_path(path);
-        assert_eq!(result, "src/main.rs");
-    }
-
-    #[test]
-    fn test_shorten_path_long() {
-        let path = "/Users/test/projects/gru/src/commands/fix.rs";
-        let result = ProgressDisplay::shorten_path(path);
-        assert_eq!(result, ".../src/commands/fix.rs");
-    }
-
-    #[test]
-    fn test_tool_input_tracker() {
-        let mut tracker = ToolInputTracker::default();
-
-        // Start tracking a tool
-        tracker.start_tool("Bash".to_string());
-        tracker.add_input_chunk(r#"{"comm"#);
-        tracker.add_input_chunk(r#"and":"ls"}"#);
-
-        // Take the accumulated input
-        let result = tracker.take();
-        assert!(result.is_some());
-        let (name, input) = result.unwrap();
-        assert_eq!(name, "Bash");
-        assert_eq!(input, r#"{"command":"ls"}"#);
-
-        // After taking, tracker should be empty
-        assert!(tracker.take().is_none());
     }
 }

@@ -1,6 +1,6 @@
-use crate::claude_runner::{
-    build_claude_command, run_claude_with_stream_monitoring, EXIT_CODE_SIGNAL_TERMINATED,
-};
+use crate::agent::{AgentBackend, AgentEvent};
+use crate::agent_runner::{run_agent_with_stream_monitoring, EXIT_CODE_SIGNAL_TERMINATED};
+use crate::claude_backend::ClaudeBackend;
 use crate::git;
 use crate::github;
 use crate::minion_resolver;
@@ -65,7 +65,7 @@ pub async fn handle_rebase(target: Option<String>) -> Result<i32> {
             abort_rebase(&worktree_path).await?;
 
             // Spawn Claude Code with /rebase command
-            let exit_code = run_claude_rebase(&worktree_path).await?;
+            let exit_code = run_agent_rebase(&worktree_path).await?;
 
             if exit_code == 0 {
                 // Claude succeeded - defensively force push in case the /rebase
@@ -389,22 +389,24 @@ async fn force_push(worktree_path: &Path) -> Result<()> {
     );
 }
 
-/// Spawns Claude Code with the `/rebase` command to resolve conflicts.
+/// Spawns the agent with the `/rebase` command to resolve conflicts.
 ///
-/// Returns Claude's exit code.
-async fn run_claude_rebase(worktree_path: &Path) -> Result<i32> {
+/// Returns the agent's exit code.
+async fn run_agent_rebase(worktree_path: &Path) -> Result<i32> {
+    let backend = ClaudeBackend::new();
     let session_id = Uuid::new_v4();
-    let cmd = build_claude_command(worktree_path, &session_id, "/rebase");
+    let cmd = backend.build_command(worktree_path, &session_id, "/rebase");
 
-    let result = run_claude_with_stream_monitoring(
+    let result = run_agent_with_stream_monitoring(
         cmd,
+        &backend,
         worktree_path,
-        None,           // no timeout
-        None::<fn(&_)>, // no output callback
-        None,           // no on_spawn callback
+        None,                    // no timeout
+        None::<fn(&AgentEvent)>, // no output callback
+        None,                    // no on_spawn callback
     )
     .await
-    .context("Failed to run Claude Code for rebase")?;
+    .context("Failed to run agent for rebase")?;
 
     Ok(result.status.code().unwrap_or(EXIT_CODE_SIGNAL_TERMINATED))
 }
