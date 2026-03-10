@@ -144,10 +144,12 @@ impl ProgressDisplay {
                 let display_text = input_summary.as_deref().unwrap_or(display_name);
                 self.print_event(&format!("[{}] {}", timestamp, display_text));
 
-                // Store tool name for later reference when tool completes
+                // Store display name for later reference when tool completes.
+                // Use display_name (not tool_name) so empty names show as "unknown"
+                // in ToolResult formatting instead of blank.
                 if !tool_use_id.is_empty() {
                     let mut names = lock_or_recover(&self.tool_names, "Tool names");
-                    names.insert(tool_use_id.clone(), tool_name.clone());
+                    names.insert(tool_use_id.clone(), display_name.to_string());
                 }
             }
             AgentEvent::ToolResult {

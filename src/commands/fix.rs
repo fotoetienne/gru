@@ -71,7 +71,7 @@ pub(crate) struct WorktreeContext {
     pub session_id: Uuid,
 }
 
-/// Result of running a Claude session.
+/// Result of running an agent session.
 pub(crate) struct AgentResult {
     pub status: ExitStatus,
 }

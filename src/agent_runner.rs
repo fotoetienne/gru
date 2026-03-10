@@ -168,6 +168,11 @@ pub async fn run_agent_with_stream_monitoring<F>(
 where
     F: FnMut(&AgentEvent),
 {
+    // Ensure stdout is piped so we can read the agent's event stream.
+    // This is defensive — backends should already set this in build_command(),
+    // but forcing it here prevents silent failures from misconfigured commands.
+    cmd.stdout(std::process::Stdio::piped());
+
     // Spawn the command
     let mut child = cmd
         .spawn()
