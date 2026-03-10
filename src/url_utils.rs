@@ -121,6 +121,25 @@ pub async fn parse_issue_info(issue: &str) -> Result<(String, String, String)> {
     );
 }
 
+/// Builds the argument list for `gh pr view` to fetch PR metadata.
+///
+/// When `repo` is `Some`, includes `--repo owner/repo` so the command targets the
+/// correct repository regardless of the current working directory.
+fn build_pr_view_args(pr_num: &str, repo: Option<&str>) -> Vec<String> {
+    let mut args = vec![
+        "pr".to_string(),
+        "view".to_string(),
+        pr_num.to_string(),
+        "--json".to_string(),
+        "headRefName,headRepository,headRepositoryOwner".to_string(),
+    ];
+    if let Some(repo) = repo {
+        args.push("--repo".to_string());
+        args.push(repo.to_string());
+    }
+    args
+}
+
 /// Extracts owner, repo, PR number, and branch name from a PR argument.
 ///
 /// Supports both plain PR numbers and GitHub URLs.
@@ -161,17 +180,7 @@ pub async fn parse_pr_info(pr: &str) -> Result<(String, String, String, String)>
     };
 
     // Fetch PR metadata from GitHub to get branch and repo info
-    let mut args = vec![
-        "pr".to_string(),
-        "view".to_string(),
-        pr_num.clone(),
-        "--json".to_string(),
-        "headRefName,headRepository,headRepositoryOwner".to_string(),
-    ];
-    if let Some(ref repo) = repo_flag {
-        args.push("--repo".to_string());
-        args.push(repo.clone());
-    }
+    let args = build_pr_view_args(&pr_num, repo_flag.as_deref());
     let output = Command::new(gh_cmd)
         .args(&args)
         .output()
@@ -367,6 +376,34 @@ mod tests {
             "Expected specific error for PR URL given to issue parser, got: {}",
             msg
         );
+    }
+
+    // --- build_pr_view_args tests ---
+
+    #[test]
+    fn test_build_pr_view_args_without_repo() {
+        let args = build_pr_view_args("42", None);
+        assert_eq!(
+            args,
+            [
+                "pr",
+                "view",
+                "42",
+                "--json",
+                "headRefName,headRepository,headRepositoryOwner"
+            ]
+        );
+        assert!(!args.contains(&"--repo".to_string()));
+    }
+
+    #[test]
+    fn test_build_pr_view_args_with_repo() {
+        let args = build_pr_view_args("99", Some("fotoetienne/gru"));
+        assert!(args.contains(&"--repo".to_string()));
+        assert!(args.contains(&"fotoetienne/gru".to_string()));
+        // --repo should come after the base args
+        let repo_idx = args.iter().position(|a| a == "--repo").unwrap();
+        assert_eq!(args[repo_idx + 1], "fotoetienne/gru");
     }
 
     // --- parse_pr_info validation tests (only format validation; gh calls need network) ---
