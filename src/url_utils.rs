@@ -127,8 +127,8 @@ pub async fn parse_issue_info(issue: &str) -> Result<(String, String, String)> {
 /// For plain numbers, fetches metadata from GitHub to get branch info.
 /// Validates the input format as part of parsing (no separate validation step needed).
 pub async fn parse_pr_info(pr: &str) -> Result<(String, String, String, String)> {
-    // Extract PR number and determine the correct gh CLI command
-    let (pr_num, gh_cmd) = if pr.parse::<u32>().is_ok() {
+    // Extract PR number, gh command, and optional repo qualifier
+    let (pr_num, gh_cmd, repo_flag) = if pr.parse::<u32>().is_ok() {
         // Plain number: detect repo from current directory to pick gh vs ghe
         git::detect_git_repo()
             .await
@@ -139,7 +139,7 @@ pub async fn parse_pr_info(pr: &str) -> Result<(String, String, String, String)>
         let (det_owner, det_repo) =
             git::parse_github_remote(&remote_url).context("Failed to parse GitHub remote URL")?;
         let cmd = github::gh_command_for_repo(&format!("{}/{}", det_owner, det_repo));
-        (pr.to_string(), cmd)
+        (pr.to_string(), cmd, None)
     } else if let Some(parsed) = parse_github_url(pr) {
         if parsed.resource_type != GitHubResourceType::Pull {
             // Parsed successfully but wrong resource type (e.g., issue URL given for review command)
@@ -148,8 +148,9 @@ pub async fn parse_pr_info(pr: &str) -> Result<(String, String, String, String)>
                  Did you mean to use `gru do` instead?"
             );
         }
-        let cmd = github::gh_command_for_repo(&format!("{}/{}", parsed.owner, parsed.repo));
-        (parsed.number.to_string(), cmd)
+        let repo_full = format!("{}/{}", parsed.owner, parsed.repo);
+        let cmd = github::gh_command_for_repo(&repo_full);
+        (parsed.number.to_string(), cmd, Some(repo_full))
     } else {
         anyhow::bail!(
             "Invalid PR format. Expected: <number> or <github-url>\n\
@@ -160,14 +161,19 @@ pub async fn parse_pr_info(pr: &str) -> Result<(String, String, String, String)>
     };
 
     // Fetch PR metadata from GitHub to get branch and repo info
+    let mut args = vec![
+        "pr".to_string(),
+        "view".to_string(),
+        pr_num.clone(),
+        "--json".to_string(),
+        "headRefName,headRepository,headRepositoryOwner".to_string(),
+    ];
+    if let Some(ref repo) = repo_flag {
+        args.push("--repo".to_string());
+        args.push(repo.clone());
+    }
     let output = Command::new(gh_cmd)
-        .args([
-            "pr",
-            "view",
-            &pr_num,
-            "--json",
-            "headRefName,headRepository,headRepositoryOwner",
-        ])
+        .args(&args)
         .output()
         .await
         .context("Failed to execute gh pr view")?;
