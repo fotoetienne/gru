@@ -1,6 +1,7 @@
-use crate::agent::{AgentBackend, AgentEvent};
+use crate::agent::AgentEvent;
+use crate::agent_registry::AgentRegistry;
 use crate::agent_runner::{run_agent_with_stream_monitoring, EXIT_CODE_SIGNAL_TERMINATED};
-use crate::claude_backend::ClaudeBackend;
+use crate::config::AgentConfig;
 use crate::git;
 use crate::github::GitHubClient;
 use crate::minion;
@@ -656,6 +657,7 @@ pub async fn handle_prompt(prompt: &str, opts: PromptOptions) -> Result<i32> {
         last_activity: now,
         orchestration_phase: OrchestrationPhase::RunningClaude,
         token_usage: None,
+        agent_backend: "claude".to_string(),
     };
 
     let minion_id_clone = minion_id.clone();
@@ -687,7 +689,8 @@ pub async fn handle_prompt(prompt: &str, opts: PromptOptions) -> Result<i32> {
     let progress = std::sync::Arc::new(ProgressDisplay::new(config));
 
     // Build the command with flags for non-interactive stream-json output
-    let backend = ClaudeBackend::new();
+    let registry = AgentRegistry::from_config(&AgentConfig::default())?;
+    let backend = registry.default_backend();
     let mut cmd = backend.build_command(&run_dir, &session_id, &rendered_prompt);
     cmd.env("GRU_WORKSPACE", &minion_id);
 
@@ -710,7 +713,7 @@ pub async fn handle_prompt(prompt: &str, opts: PromptOptions) -> Result<i32> {
 
     let run_result = run_agent_with_stream_monitoring(
         cmd,
-        &backend,
+        backend,
         &workspace_path,
         timeout_opt.as_deref(),
         Some(output_callback),

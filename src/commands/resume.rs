@@ -1,11 +1,12 @@
-use crate::agent::{AgentBackend, AgentEvent};
+use crate::agent::AgentEvent;
+use crate::agent_registry::AgentRegistry;
 use crate::agent_runner::{
     is_stuck_or_timeout_error, run_agent_with_stream_monitoring, EXIT_CODE_SIGNAL_TERMINATED,
 };
-use crate::claude_backend::ClaudeBackend;
 use crate::commands::fix::{
     handle_pr_creation, update_orchestration_phase, IssueContext, WorktreeContext,
 };
+use crate::config::AgentConfig;
 use crate::github::GitHubClient;
 use crate::minion_registry::{
     is_process_alive, with_registry, MinionMode, MinionRegistry, OrchestrationPhase,
@@ -214,7 +215,8 @@ async fn run_autonomous_agent(
     timeout_opt: Option<&str>,
     issue_num: u64,
 ) -> Result<std::process::ExitStatus> {
-    let backend = ClaudeBackend::new();
+    let registry = AgentRegistry::from_config(&AgentConfig::default())?;
+    let backend = registry.default_backend();
     let mut cmd = backend
         .build_resume_command(&wt_ctx.checkout_path, &wt_ctx.session_id, prompt)
         .context("Agent backend does not support resume")?;
@@ -247,7 +249,7 @@ async fn run_autonomous_agent(
 
     let run_result = run_agent_with_stream_monitoring(
         cmd,
-        &backend,
+        backend,
         &wt_ctx.minion_dir,
         timeout_opt,
         Some(callback),
