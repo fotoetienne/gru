@@ -556,11 +556,12 @@ pub async fn mark_pr_ready_via_cli(owner: &str, repo: &str, pr_number: &str) -> 
     Ok(())
 }
 
-/// List issues with a label, excluding blocked issues, using gh CLI search.
+/// List issues with a label, excluding blocked and already-claimed issues, using gh CLI search.
 ///
 /// Uses GitHub's search qualifiers to exclude:
 /// - Issues in GitHub's native blocked state (`-is:blocked`)
 /// - Issues labeled `minion:blocked` (`-label:minion:blocked`)
+/// - Issues already claimed (`-label:in-progress`)
 ///
 /// # Arguments
 /// * `owner` - Repository owner
@@ -568,11 +569,14 @@ pub async fn mark_pr_ready_via_cli(owner: &str, repo: &str, pr_number: &str) -> 
 /// * `label` - Label to search for (e.g., "ready-for-minion")
 ///
 /// # Returns
-/// List of issue numbers matching the search criteria
+/// List of issue numbers matching the search criteria (capped at 100)
 pub async fn list_ready_issues_via_cli(owner: &str, repo: &str, label: &str) -> Result<Vec<u64>> {
     let repo_full = format!("{}/{}", owner, repo);
     let gh_cmd = gh_command_for_repo(&repo_full);
-    let search_query = format!("label:{} -is:blocked -label:minion:blocked", label);
+    let search_query = format!(
+        "label:\"{}\" -is:blocked -label:\"minion:blocked\" -label:in-progress",
+        label
+    );
     let output = Command::new(gh_cmd)
         .args([
             "issue",
