@@ -1239,15 +1239,50 @@ async fn monitor_pr_lifecycle(
             }
             Ok(MonitorResult::FailedChecks(count)) => {
                 println!(
-                    "❌ Detected {} failed CI check(s) on PR #{}",
+                    "❌ Detected {} failed CI check(s) on PR #{}, attempting auto-fix...",
                     count, pr_number
                 );
-                println!(
-                    "   Review the checks at: https://github.com/{}/{}/pull/{}/checks",
-                    issue_ctx.owner, issue_ctx.repo, pr_number
-                );
-                println!("   Fix issues and push updates to the branch");
-                break;
+
+                // Parse pr_number for the CI fix API
+                let pr_num_u64 = pr_number.parse::<u64>().unwrap_or(0);
+                if pr_num_u64 == 0 {
+                    println!("⚠️  Could not parse PR number, skipping CI auto-fix");
+                    break;
+                }
+
+                match ci::monitor_and_fix_ci(
+                    &issue_ctx.owner,
+                    &issue_ctx.repo,
+                    pr_num_u64,
+                    &wt_ctx.branch_name,
+                    &wt_ctx.checkout_path,
+                )
+                .await
+                {
+                    Ok(true) => {
+                        println!("✅ CI checks now pass after auto-fix");
+                        println!("🔄 Continuing to monitor PR...\n");
+                        // Continue monitoring - CI is green, wait for merge/reviews
+                    }
+                    Ok(false) => {
+                        // Escalated to human - continue monitoring instead of breaking
+                        println!("⚠️  CI auto-fix escalated to human after max attempts");
+                        println!(
+                            "   Review the checks at: https://github.com/{}/{}/pull/{}/checks",
+                            issue_ctx.owner, issue_ctx.repo, pr_number
+                        );
+                        println!("🔄 Continuing to monitor PR for other events...\n");
+                        // Don't break - keep monitoring for reviews/merge/close
+                    }
+                    Err(e) => {
+                        log::warn!("⚠️  CI auto-fix error: {}", e);
+                        println!(
+                            "   Review the checks at: https://github.com/{}/{}/pull/{}/checks",
+                            issue_ctx.owner, issue_ctx.repo, pr_number
+                        );
+                        // Continue monitoring despite the error
+                    }
+                }
             }
             Ok(MonitorResult::Timeout) => {
                 // Use the lifecycle-level start time for an accurate total elapsed display

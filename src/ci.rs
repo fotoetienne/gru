@@ -8,7 +8,7 @@ use tokio::process::Command;
 use tokio::time::{sleep, Duration};
 
 /// Maximum number of auto-fix attempts before escalating to human
-const MAX_FIX_ATTEMPTS: u32 = 3;
+pub const MAX_CI_FIX_ATTEMPTS: u32 = 2;
 
 /// Polling interval for checking CI status (30 seconds)
 const CI_POLL_INTERVAL_SECS: u64 = 30;
@@ -180,7 +180,7 @@ pub fn classify_failure(check: &CheckRun) -> FailureType {
 pub fn build_ci_fix_prompt(failed_checks: &[CheckRun], attempt: u32) -> String {
     let mut prompt = format!(
         "Your PR's CI checks failed (attempt {}/{}). Please analyze the failure and fix it.\n\n",
-        attempt, MAX_FIX_ATTEMPTS
+        attempt, MAX_CI_FIX_ATTEMPTS
     );
 
     for check in failed_checks {
@@ -584,7 +584,7 @@ pub async fn post_escalation_comment(
         "## 🚨 CI Fix Escalation\n\n\
          Automated CI fix failed after **{}/{}** attempts. Human intervention required.\n\n\
          ### Failed Checks\n\n",
-        attempts, MAX_FIX_ATTEMPTS
+        attempts, MAX_CI_FIX_ATTEMPTS
     );
 
     for check in failed_checks {
@@ -654,7 +654,7 @@ pub async fn post_escalation_comment(
 /// After a PR is created/updated:
 /// 1. Wait for CI checks to complete
 /// 2. If checks fail, invoke Claude to fix
-/// 3. Retry up to MAX_FIX_ATTEMPTS times
+/// 3. Retry up to MAX_CI_FIX_ATTEMPTS times
 /// 4. Escalate if all attempts fail
 ///
 /// Returns Ok(true) if CI passed (possibly after fixes), Ok(false) if escalated.
@@ -665,14 +665,14 @@ pub async fn monitor_and_fix_ci(
     branch: &str,
     worktree_path: &Path,
 ) -> Result<bool> {
-    for attempt in 1..=MAX_FIX_ATTEMPTS {
+    for attempt in 1..=MAX_CI_FIX_ATTEMPTS {
         // Get the current HEAD SHA
         let head_sha = get_head_sha(worktree_path).await?;
 
         eprintln!(
             "\n🔍 CI monitoring (attempt {}/{}) for commit {}...",
             attempt,
-            MAX_FIX_ATTEMPTS,
+            MAX_CI_FIX_ATTEMPTS,
             &head_sha[..8.min(head_sha.len())]
         );
 
@@ -690,7 +690,7 @@ pub async fn monitor_and_fix_ci(
             }
             CiResult::Timeout => {
                 eprintln!("⏱️  CI checks timed out");
-                if attempt == MAX_FIX_ATTEMPTS {
+                if attempt == MAX_CI_FIX_ATTEMPTS {
                     break;
                 }
                 continue;
@@ -711,11 +711,11 @@ pub async fn monitor_and_fix_ci(
                     }
                 }
 
-                if attempt == MAX_FIX_ATTEMPTS {
+                if attempt == MAX_CI_FIX_ATTEMPTS {
                     // Last attempt failed, escalate
                     eprintln!(
                         "🚨 Max fix attempts ({}) reached, escalating to human",
-                        MAX_FIX_ATTEMPTS
+                        MAX_CI_FIX_ATTEMPTS
                     );
                     post_escalation_comment(owner, repo, pr_number, &failed_checks, attempt)
                         .await
@@ -726,7 +726,7 @@ pub async fn monitor_and_fix_ci(
                 // Invoke Claude to fix
                 eprintln!(
                     "🔧 Invoking Claude to fix CI failures (attempt {}/{})...",
-                    attempt, MAX_FIX_ATTEMPTS
+                    attempt, MAX_CI_FIX_ATTEMPTS
                 );
                 let exit_code = invoke_ci_fix(worktree_path, &failed_checks, attempt).await?;
 
@@ -741,7 +741,7 @@ pub async fn monitor_and_fix_ci(
                 let new_sha = get_head_sha(worktree_path).await?;
                 if new_sha == head_sha {
                     eprintln!("⚠️  Claude made no new commits, cannot retry");
-                    if attempt < MAX_FIX_ATTEMPTS {
+                    if attempt < MAX_CI_FIX_ATTEMPTS {
                         continue;
                     }
                     break;
@@ -931,7 +931,7 @@ mod tests {
         }];
 
         let prompt = build_ci_fix_prompt(&checks, 1);
-        assert!(prompt.contains("attempt 1/3"));
+        assert!(prompt.contains("attempt 1/2"));
         assert!(prompt.contains("Test Suite"));
         assert!(prompt.contains("test failure"));
         assert!(prompt.contains("FAILED tests/test_auth.rs"));
@@ -958,7 +958,7 @@ mod tests {
         ];
 
         let prompt = build_ci_fix_prompt(&checks, 2);
-        assert!(prompt.contains("attempt 2/3"));
+        assert!(prompt.contains("attempt 2/2"));
         assert!(prompt.contains("Build"));
         assert!(prompt.contains("Lint"));
     }
