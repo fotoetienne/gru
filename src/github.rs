@@ -556,6 +556,75 @@ pub async fn mark_pr_ready_via_cli(owner: &str, repo: &str, pr_number: &str) -> 
     Ok(())
 }
 
+/// List issues with a label, excluding blocked and already-claimed issues, using gh CLI search.
+///
+/// Uses GitHub's search qualifiers to exclude:
+/// - Issues in GitHub's native blocked state (`-is:blocked`)
+/// - Issues labeled `minion:blocked` (`-label:minion:blocked`)
+/// - Issues already claimed (`-label:in-progress`)
+///
+/// # Arguments
+/// * `owner` - Repository owner
+/// * `repo` - Repository name
+/// * `label` - Label to search for (e.g., "ready-for-minion")
+///
+/// # Returns
+/// List of issue numbers matching the search criteria (capped at 100)
+/// Build a GitHub search query that finds issues with the given label while excluding
+/// blocked and in-progress issues. Escapes special characters in the label.
+fn build_ready_issues_search_query(label: &str) -> String {
+    let escaped_label = label.replace('\\', "\\\\").replace('"', "\\\"");
+    format!(
+        "label:\"{}\" -is:blocked -label:\"minion:blocked\" -label:in-progress",
+        escaped_label
+    )
+}
+
+pub async fn list_ready_issues_via_cli(owner: &str, repo: &str, label: &str) -> Result<Vec<u64>> {
+    let repo_full = format!("{}/{}", owner, repo);
+    let gh_cmd = gh_command_for_repo(&repo_full);
+    let search_query = build_ready_issues_search_query(label);
+    let output = Command::new(gh_cmd)
+        .args([
+            "issue",
+            "list",
+            "--repo",
+            &repo_full,
+            "--search",
+            &search_query,
+            "--state",
+            "open",
+            "--json",
+            "number",
+            "--limit",
+            "100",
+        ])
+        .output()
+        .await
+        .context("Failed to execute gh issue list command")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow!(
+            "Failed to list ready issues in {}: {}",
+            repo_full,
+            stderr
+        ));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let items: Vec<IssueNumber> =
+        serde_json::from_str(&stdout).context("Failed to parse gh issue list JSON output")?;
+
+    Ok(items.into_iter().map(|i| i.number).collect())
+}
+
+/// Helper struct for deserializing issue number from gh CLI JSON
+#[derive(Debug, serde::Deserialize)]
+struct IssueNumber {
+    number: u64,
+}
+
 /// Fetch issue details using gh CLI
 ///
 /// # Arguments
@@ -942,5 +1011,70 @@ mod tests {
             .remove_label(owner, repo, issue, label)
             .await
             .expect("Failed to remove label");
+    }
+
+    // --- IssueNumber deserialization tests ---
+
+    #[test]
+    fn test_issue_number_deserialize() {
+        let json = r#"[{"number": 1}, {"number": 42}, {"number": 100}]"#;
+        let items: Vec<IssueNumber> = serde_json::from_str(json).unwrap();
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[0].number, 1);
+        assert_eq!(items[1].number, 42);
+        assert_eq!(items[2].number, 100);
+    }
+
+    #[test]
+    fn test_issue_number_deserialize_empty() {
+        let json = "[]";
+        let items: Vec<IssueNumber> = serde_json::from_str(json).unwrap();
+        assert!(items.is_empty());
+    }
+
+    #[test]
+    fn test_issue_number_deserialize_extra_fields() {
+        let json = r#"[{"number": 5, "title": "ignored", "url": "https://example.com"}]"#;
+        let items: Vec<IssueNumber> = serde_json::from_str(json).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].number, 5);
+    }
+
+    #[test]
+    fn test_issue_number_deserialize_missing_number() {
+        let json = r#"[{"title": "no number"}]"#;
+        let result: Result<Vec<IssueNumber>, _> = serde_json::from_str(json);
+        assert!(result.is_err());
+    }
+
+    // --- Search query construction tests ---
+
+    #[test]
+    fn test_build_ready_issues_search_query_simple() {
+        let query = build_ready_issues_search_query("ready-for-minion");
+        assert_eq!(
+            query,
+            "label:\"ready-for-minion\" -is:blocked -label:\"minion:blocked\" -label:in-progress"
+        );
+    }
+
+    #[test]
+    fn test_build_ready_issues_search_query_with_spaces() {
+        let query = build_ready_issues_search_query("ready for minion");
+        assert!(query.starts_with("label:\"ready for minion\""));
+    }
+
+    #[test]
+    fn test_build_ready_issues_search_query_escapes_quotes() {
+        let query = build_ready_issues_search_query(r#"label"with"quotes"#);
+        // Input quotes are escaped: label"with"quotes → label\"with\"quotes
+        assert!(query.starts_with(r#"label:"label\"with\"quotes""#));
+    }
+
+    #[test]
+    fn test_build_ready_issues_search_query_escapes_backslashes() {
+        let query = build_ready_issues_search_query(r"back\slash");
+        // Input backslash is escaped: back\slash → back\\slash
+        assert!(query.starts_with(r#"label:"back\\slash""#));
     }
 }
