@@ -1,5 +1,5 @@
 use crate::config::LabConfig;
-use crate::github::GitHubClient;
+use crate::github::{list_ready_issues_via_cli, GitHubClient};
 use crate::minion_registry::{is_process_alive, with_registry};
 use anyhow::{Context, Result};
 use std::path::PathBuf;
@@ -218,7 +218,17 @@ async fn poll_and_spawn(config: &LabConfig, children: &mut Vec<Child>) -> Result
             }
         };
 
-        // Create GitHub client for this repo
+        // Fetch ready issues, excluding blocked ones (both GitHub-blocked and minion:blocked)
+        let issue_numbers = match list_ready_issues_via_cli(owner, repo, &config.daemon.label).await
+        {
+            Ok(numbers) => numbers,
+            Err(e) => {
+                log::warn!("⚠️  Failed to fetch issues for {}: {}", repo_spec, e);
+                continue;
+            }
+        };
+
+        // Create GitHub client for claiming issues
         let client = match GitHubClient::from_env(owner, repo).await {
             Ok(client) => client,
             Err(e) => {
@@ -231,39 +241,27 @@ async fn poll_and_spawn(config: &LabConfig, children: &mut Vec<Child>) -> Result
             }
         };
 
-        // Fetch issues with the configured label
-        let issues = match client
-            .list_issues_with_label(owner, repo, &config.daemon.label)
-            .await
-        {
-            Ok(issues) => issues,
-            Err(e) => {
-                log::warn!("⚠️  Failed to fetch issues for {}: {}", repo_spec, e);
-                continue;
-            }
-        };
-
         // Try to spawn a Minion for each ready issue
-        for issue in issues {
+        for issue_number in issue_numbers {
             if available == 0 {
                 break;
             }
 
             // Check if issue is already being worked on (by a live process)
-            if is_issue_claimed(repo_spec, issue.number).await? {
+            if is_issue_claimed(repo_spec, issue_number).await? {
                 continue;
             }
 
             // Try to claim the issue
-            match client.claim_issue(owner, repo, issue.number).await {
+            match client.claim_issue(owner, repo, issue_number).await {
                 Ok(true) => {
                     // Successfully claimed, spawn Minion
-                    match spawn_minion(repo_spec, issue.number).await {
+                    match spawn_minion(repo_spec, issue_number).await {
                         Ok(child) => {
                             children.push(child);
                             println!(
                                 "✨ Spawned Minion for {}/issues/{}",
-                                repo_spec, issue.number
+                                repo_spec, issue_number
                             );
                             spawned += 1;
                             available -= 1; // Decrement available slots after successful spawn
@@ -272,12 +270,12 @@ async fn poll_and_spawn(config: &LabConfig, children: &mut Vec<Child>) -> Result
                             log::warn!(
                                 "⚠️  Failed to spawn Minion for {}/issues/{}: {}",
                                 repo_spec,
-                                issue.number,
+                                issue_number,
                                 e
                             );
                             // Unclaim the issue since we failed to spawn
                             if let Err(e) = client
-                                .remove_label(owner, repo, issue.number, "in-progress")
+                                .remove_label(owner, repo, issue_number, "in-progress")
                                 .await
                             {
                                 log::warn!("⚠️  Failed to remove in-progress label: {}", e);
@@ -293,7 +291,7 @@ async fn poll_and_spawn(config: &LabConfig, children: &mut Vec<Child>) -> Result
                     log::warn!(
                         "⚠️  Failed to claim issue {}/issues/{}: {}",
                         repo_spec,
-                        issue.number,
+                        issue_number,
                         e
                     );
                     continue;

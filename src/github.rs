@@ -556,6 +556,64 @@ pub async fn mark_pr_ready_via_cli(owner: &str, repo: &str, pr_number: &str) -> 
     Ok(())
 }
 
+/// List issues with a label, excluding blocked issues, using gh CLI search.
+///
+/// Uses GitHub's search qualifiers to exclude:
+/// - Issues in GitHub's native blocked state (`-is:blocked`)
+/// - Issues labeled `minion:blocked` (`-label:minion:blocked`)
+///
+/// # Arguments
+/// * `owner` - Repository owner
+/// * `repo` - Repository name
+/// * `label` - Label to search for (e.g., "ready-for-minion")
+///
+/// # Returns
+/// List of issue numbers matching the search criteria
+pub async fn list_ready_issues_via_cli(owner: &str, repo: &str, label: &str) -> Result<Vec<u64>> {
+    let repo_full = format!("{}/{}", owner, repo);
+    let gh_cmd = gh_command_for_repo(&repo_full);
+    let search_query = format!("label:{} -is:blocked -label:minion:blocked", label);
+    let output = Command::new(gh_cmd)
+        .args([
+            "issue",
+            "list",
+            "--repo",
+            &repo_full,
+            "--search",
+            &search_query,
+            "--state",
+            "open",
+            "--json",
+            "number",
+            "--limit",
+            "100",
+        ])
+        .output()
+        .await
+        .context("Failed to execute gh issue list command")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow!(
+            "Failed to list ready issues in {}: {}",
+            repo_full,
+            stderr
+        ));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let items: Vec<IssueNumber> =
+        serde_json::from_str(&stdout).context("Failed to parse gh issue list JSON output")?;
+
+    Ok(items.into_iter().map(|i| i.number).collect())
+}
+
+/// Helper struct for deserializing issue number from gh CLI JSON
+#[derive(Debug, serde::Deserialize)]
+struct IssueNumber {
+    number: u64,
+}
+
 /// Fetch issue details using gh CLI
 ///
 /// # Arguments
