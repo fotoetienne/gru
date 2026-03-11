@@ -218,13 +218,25 @@ async fn poll_and_spawn(config: &LabConfig, children: &mut Vec<Child>) -> Result
             }
         };
 
-        // Fetch ready issues, excluding blocked ones (both GitHub-blocked and minion:blocked)
+        // Fetch ready issues, excluding blocked ones (both GitHub-blocked and minion:blocked).
+        // Try CLI first (supports -is:blocked qualifier), fall back to octocrab with
+        // client-side filtering if CLI is unavailable.
         let issue_numbers = match list_ready_issues_via_cli(owner, repo, &config.daemon.label).await
         {
             Ok(numbers) => numbers,
-            Err(e) => {
-                log::warn!("⚠️  Failed to fetch issues for {}: {}", repo_spec, e);
-                continue;
+            Err(cli_err) => {
+                log::warn!(
+                    "⚠️  CLI issue fetch failed for {}: {}, trying API fallback",
+                    repo_spec,
+                    cli_err
+                );
+                match fallback_list_issues(owner, repo, &config.daemon.label).await {
+                    Ok(numbers) => numbers,
+                    Err(e) => {
+                        log::warn!("⚠️  API fallback also failed for {}: {}", repo_spec, e);
+                        continue;
+                    }
+                }
             }
         };
 
@@ -409,6 +421,29 @@ async fn spawn_minion(repo: &str, issue_number: u64) -> Result<Child> {
     println!("📝 Log: {}", log_path.display());
 
     Ok(child)
+}
+
+/// Fallback issue listing using octocrab API with client-side filtering.
+/// Used when the gh CLI is unavailable. Cannot filter GitHub-native blocked state
+/// (no API equivalent of `-is:blocked`), but does filter out `minion:blocked` and
+/// `in-progress` labels.
+async fn fallback_list_issues(owner: &str, repo: &str, label: &str) -> Result<Vec<u64>> {
+    let client = GitHubClient::from_env(owner, repo).await?;
+    let issues = client.list_issues_with_label(owner, repo, label).await?;
+
+    let blocked_labels = ["minion:blocked", "in-progress"];
+    let filtered: Vec<u64> = issues
+        .into_iter()
+        .filter(|issue| {
+            !issue
+                .labels
+                .iter()
+                .any(|l| blocked_labels.contains(&l.name.as_str()))
+        })
+        .map(|issue| issue.number)
+        .collect();
+
+    Ok(filtered)
 }
 
 #[cfg(test)]

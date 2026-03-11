@@ -570,13 +570,20 @@ pub async fn mark_pr_ready_via_cli(owner: &str, repo: &str, pr_number: &str) -> 
 ///
 /// # Returns
 /// List of issue numbers matching the search criteria (capped at 100)
+/// Build a GitHub search query that finds issues with the given label while excluding
+/// blocked and in-progress issues. Escapes special characters in the label.
+fn build_ready_issues_search_query(label: &str) -> String {
+    let escaped_label = label.replace('\\', "\\\\").replace('"', "\\\"");
+    format!(
+        "label:\"{}\" -is:blocked -label:\"minion:blocked\" -label:in-progress",
+        escaped_label
+    )
+}
+
 pub async fn list_ready_issues_via_cli(owner: &str, repo: &str, label: &str) -> Result<Vec<u64>> {
     let repo_full = format!("{}/{}", owner, repo);
     let gh_cmd = gh_command_for_repo(&repo_full);
-    let search_query = format!(
-        "label:\"{}\" -is:blocked -label:\"minion:blocked\" -label:in-progress",
-        label
-    );
+    let search_query = build_ready_issues_search_query(label);
     let output = Command::new(gh_cmd)
         .args([
             "issue",
@@ -1004,5 +1011,70 @@ mod tests {
             .remove_label(owner, repo, issue, label)
             .await
             .expect("Failed to remove label");
+    }
+
+    // --- IssueNumber deserialization tests ---
+
+    #[test]
+    fn test_issue_number_deserialize() {
+        let json = r#"[{"number": 1}, {"number": 42}, {"number": 100}]"#;
+        let items: Vec<IssueNumber> = serde_json::from_str(json).unwrap();
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[0].number, 1);
+        assert_eq!(items[1].number, 42);
+        assert_eq!(items[2].number, 100);
+    }
+
+    #[test]
+    fn test_issue_number_deserialize_empty() {
+        let json = "[]";
+        let items: Vec<IssueNumber> = serde_json::from_str(json).unwrap();
+        assert!(items.is_empty());
+    }
+
+    #[test]
+    fn test_issue_number_deserialize_extra_fields() {
+        let json = r#"[{"number": 5, "title": "ignored", "url": "https://example.com"}]"#;
+        let items: Vec<IssueNumber> = serde_json::from_str(json).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].number, 5);
+    }
+
+    #[test]
+    fn test_issue_number_deserialize_missing_number() {
+        let json = r#"[{"title": "no number"}]"#;
+        let result: Result<Vec<IssueNumber>, _> = serde_json::from_str(json);
+        assert!(result.is_err());
+    }
+
+    // --- Search query construction tests ---
+
+    #[test]
+    fn test_build_ready_issues_search_query_simple() {
+        let query = build_ready_issues_search_query("ready-for-minion");
+        assert_eq!(
+            query,
+            "label:\"ready-for-minion\" -is:blocked -label:\"minion:blocked\" -label:in-progress"
+        );
+    }
+
+    #[test]
+    fn test_build_ready_issues_search_query_with_spaces() {
+        let query = build_ready_issues_search_query("ready for minion");
+        assert!(query.starts_with("label:\"ready for minion\""));
+    }
+
+    #[test]
+    fn test_build_ready_issues_search_query_escapes_quotes() {
+        let query = build_ready_issues_search_query(r#"label"with"quotes"#);
+        // Input quotes are escaped: label"with"quotes → label\"with\"quotes
+        assert!(query.starts_with(r#"label:"label\"with\"quotes""#));
+    }
+
+    #[test]
+    fn test_build_ready_issues_search_query_escapes_backslashes() {
+        let query = build_ready_issues_search_query(r"back\slash");
+        // Input backslash is escaped: back\slash → back\\slash
+        assert!(query.starts_with(r#"label:"back\\slash""#));
     }
 }
