@@ -147,6 +147,7 @@ mod tests {
     fn test_available_backends() {
         let registry = AgentRegistry::default_registry();
         let backends = registry.available_backends();
-        assert_eq!(backends, vec!["claude"]);
+        assert_eq!(backends.len(), 1);
+        assert!(backends.contains(&"claude"));
     }
 }
