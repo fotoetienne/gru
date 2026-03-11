@@ -6,7 +6,6 @@ use crate::agent_runner::{
 use crate::commands::fix::{
     handle_pr_creation, update_orchestration_phase, IssueContext, WorktreeContext,
 };
-use crate::config::AgentConfig;
 use crate::github::GitHubClient;
 use crate::minion_registry::{
     is_process_alive, with_registry, MinionMode, MinionRegistry, OrchestrationPhase,
@@ -215,7 +214,7 @@ async fn run_autonomous_agent(
     timeout_opt: Option<&str>,
     issue_num: u64,
 ) -> Result<std::process::ExitStatus> {
-    let registry = AgentRegistry::from_config(&AgentConfig::default())?;
+    let registry = AgentRegistry::default_registry();
     let backend = registry.default_backend();
     let mut cmd = backend
         .build_resume_command(&wt_ctx.checkout_path, &wt_ctx.session_id, prompt)

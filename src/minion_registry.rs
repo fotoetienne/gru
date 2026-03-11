@@ -8,6 +8,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use crate::agent::TokenUsage;
+use crate::agent_registry::DEFAULT_AGENT_NAME;
 use crate::workspace::Workspace;
 
 /// Async helper that loads the registry inside `spawn_blocking`, runs the
@@ -142,7 +143,7 @@ pub struct MinionInfo {
 }
 
 fn default_agent_backend() -> String {
-    "claude".to_string()
+    DEFAULT_AGENT_NAME.to_string()
 }
 
 impl MinionInfo {

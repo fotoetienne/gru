@@ -10,6 +10,9 @@ use crate::config::AgentConfig;
 use anyhow::{bail, Result};
 use std::collections::HashMap;
 
+/// The default agent backend name used when no config is loaded.
+pub const DEFAULT_AGENT_NAME: &str = "claude";
+
 /// Registry that maps agent names to their `AgentBackend` implementations.
 pub struct AgentRegistry {
     backends: HashMap<String, Box<dyn AgentBackend>>,
@@ -21,17 +24,22 @@ impl AgentRegistry {
     ///
     /// Registers `ClaudeBackend` under the name "claude". If the configured
     /// default agent name doesn't match any registered backend, returns an error.
+    #[allow(dead_code)] // Phase 2: used when config is threaded into command handlers
     pub fn from_config(config: &AgentConfig) -> Result<Self> {
         let mut backends: HashMap<String, Box<dyn AgentBackend>> = HashMap::new();
 
         // Register the Claude backend (the only one in Phase 1)
-        backends.insert("claude".to_string(), Box::new(ClaudeBackend::new()));
+        backends.insert(
+            DEFAULT_AGENT_NAME.to_string(),
+            Box::new(ClaudeBackend::new()),
+        );
 
         let default_name = config.default.clone();
 
         // Validate that the default agent exists
         if !backends.contains_key(&default_name) {
-            let available: Vec<&str> = backends.keys().map(|k| k.as_str()).collect();
+            let mut available: Vec<&str> = backends.keys().map(|k| k.as_str()).collect();
+            available.sort();
             bail!(
                 "Unknown agent '{}'. Available: {}",
                 default_name,
@@ -46,13 +54,18 @@ impl AgentRegistry {
     }
 
     /// Create a registry with default configuration (claude as default).
-    #[allow(dead_code)] // Phase 2: used when --agent CLI flag is added
+    ///
+    /// Used by commands that don't yet load user config from `config.toml`.
+    /// Phase 2 will thread loaded `AgentConfig` into command handlers.
     pub fn default_registry() -> Self {
         let mut backends: HashMap<String, Box<dyn AgentBackend>> = HashMap::new();
-        backends.insert("claude".to_string(), Box::new(ClaudeBackend::new()));
+        backends.insert(
+            DEFAULT_AGENT_NAME.to_string(),
+            Box::new(ClaudeBackend::new()),
+        );
         Self {
             backends,
-            default_name: "claude".to_string(),
+            default_name: DEFAULT_AGENT_NAME.to_string(),
         }
     }
 
@@ -70,7 +83,8 @@ impl AgentRegistry {
         match self.backends.get(name) {
             Some(backend) => Ok(backend.as_ref()),
             None => {
-                let available: Vec<&str> = self.backends.keys().map(|k| k.as_str()).collect();
+                let mut available: Vec<&str> = self.backends.keys().map(|k| k.as_str()).collect();
+                available.sort();
                 bail!(
                     "Unknown agent '{}'. Available: {}",
                     name,

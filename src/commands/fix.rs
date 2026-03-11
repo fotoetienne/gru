@@ -1,11 +1,10 @@
 use crate::agent::{AgentBackend, AgentEvent};
-use crate::agent_registry::AgentRegistry;
+use crate::agent_registry::{AgentRegistry, DEFAULT_AGENT_NAME};
 use crate::agent_runner::{
     is_stuck_or_timeout_error, parse_timeout, run_agent_with_stream_monitoring,
     EXIT_CODE_SIGNAL_TERMINATED,
 };
 use crate::ci;
-use crate::config::AgentConfig;
 use crate::git;
 use crate::github::{gh_command_for_repo, GitHubClient};
 use crate::minion;
@@ -723,7 +722,7 @@ async fn setup_worktree(ctx: &IssueContext) -> Result<WorktreeContext> {
         last_activity: now,
         orchestration_phase: OrchestrationPhase::Setup,
         token_usage: None,
-        agent_backend: "claude".to_string(),
+        agent_backend: DEFAULT_AGENT_NAME.to_string(),
     };
 
     let minion_id_clone = minion_id.clone();
@@ -1217,8 +1216,7 @@ async fn monitor_pr_lifecycle(
 
                 println!("🔄 Re-invoking to address review feedback...\n");
 
-                let review_registry = AgentRegistry::from_config(&AgentConfig::default())
-                    .expect("default agent config must be valid");
+                let review_registry = AgentRegistry::default_registry();
                 let backend = review_registry.default_backend();
                 match invoke_agent_for_reviews(
                     backend,
@@ -1410,7 +1408,7 @@ pub async fn handle_fix(
     }
 
     // Phase 3: Run agent (skip if already past this phase)
-    let registry = AgentRegistry::from_config(&AgentConfig::default())?;
+    let registry = AgentRegistry::default_registry();
     let backend = registry.default_backend();
     let agent_result = if start_phase <= OrchestrationPhase::RunningClaude {
         update_orchestration_phase(&wt_ctx.minion_id, OrchestrationPhase::RunningClaude).await;

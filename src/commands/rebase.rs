@@ -1,7 +1,6 @@
 use crate::agent::AgentEvent;
 use crate::agent_registry::AgentRegistry;
 use crate::agent_runner::{run_agent_with_stream_monitoring, EXIT_CODE_SIGNAL_TERMINATED};
-use crate::config::AgentConfig;
 use crate::git;
 use crate::github;
 use crate::minion_resolver;
@@ -394,7 +393,7 @@ async fn force_push(worktree_path: &Path) -> Result<()> {
 ///
 /// Returns the agent's exit code.
 async fn run_agent_rebase(worktree_path: &Path) -> Result<i32> {
-    let registry = AgentRegistry::from_config(&AgentConfig::default())?;
+    let registry = AgentRegistry::default_registry();
     let backend = registry.default_backend();
     let session_id = Uuid::new_v4();
     let cmd = backend.build_command(worktree_path, &session_id, "/rebase");
