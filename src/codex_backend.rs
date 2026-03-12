@@ -114,10 +114,8 @@ struct CodexEvent {
     /// Present on `error` events.
     #[serde(default)]
     error: Option<CodexError>,
-    /// Thread ID from `thread.started`.
-    #[serde(default)]
-    #[allow(dead_code)]
-    thread_id: Option<String>,
+    // Note: thread_id and other unrecognized fields are silently ignored
+    // by serde since we don't deny_unknown_fields.
 }
 
 /// A Codex item (command execution, message, file change, etc.)
@@ -160,9 +158,7 @@ struct CodexUsage {
 struct CodexError {
     #[serde(default)]
     message: Option<String>,
-    #[serde(default, rename = "type")]
-    #[allow(dead_code)]
-    error_type: Option<String>,
+    // Note: error_type and other unrecognized fields are silently ignored by serde.
 }
 
 /// Parse a single line of Codex JSONL output into an `AgentEvent`.
