@@ -6,9 +6,13 @@
 
 use crate::agent::AgentBackend;
 use crate::claude_backend::ClaudeBackend;
+use crate::codex_backend::CodexBackend;
 use crate::config::AgentConfig;
 use anyhow::{bail, Result};
 use std::collections::HashMap;
+
+/// The Codex agent backend name.
+pub const CODEX_AGENT_NAME: &str = "codex";
 
 /// The default agent backend name used when no config is loaded.
 pub const DEFAULT_AGENT_NAME: &str = "claude";
@@ -28,11 +32,11 @@ impl AgentRegistry {
     pub fn from_config(config: &AgentConfig) -> Result<Self> {
         let mut backends: HashMap<String, Box<dyn AgentBackend>> = HashMap::new();
 
-        // Register the Claude backend (the only one in Phase 1)
         backends.insert(
             DEFAULT_AGENT_NAME.to_string(),
             Box::new(ClaudeBackend::new()),
         );
+        backends.insert(CODEX_AGENT_NAME.to_string(), Box::new(CodexBackend::new()));
 
         let default_name = config.default.clone();
 
@@ -63,6 +67,7 @@ impl AgentRegistry {
             DEFAULT_AGENT_NAME.to_string(),
             Box::new(ClaudeBackend::new()),
         );
+        backends.insert(CODEX_AGENT_NAME.to_string(), Box::new(CodexBackend::new()));
         Self {
             backends,
             default_name: DEFAULT_AGENT_NAME.to_string(),
@@ -78,7 +83,6 @@ impl AgentRegistry {
     }
 
     /// Get an agent backend by name.
-    #[allow(dead_code)] // Phase 2: used when --agent CLI flag is added
     pub fn get(&self, name: &str) -> Result<&dyn AgentBackend> {
         match self.backends.get(name) {
             Some(backend) => Ok(backend.as_ref()),
@@ -95,7 +99,7 @@ impl AgentRegistry {
     }
 
     /// Returns the name of the default agent.
-    #[allow(dead_code)] // Phase 2: used when --agent CLI flag is added
+    #[allow(dead_code)]
     pub fn default_name(&self) -> &str {
         &self.default_name
     }
@@ -161,7 +165,15 @@ mod tests {
     fn test_available_backends() {
         let registry = AgentRegistry::default_registry();
         let backends = registry.available_backends();
-        assert_eq!(backends.len(), 1);
+        assert_eq!(backends.len(), 2);
         assert!(backends.contains(&"claude"));
+        assert!(backends.contains(&"codex"));
+    }
+
+    #[test]
+    fn test_get_codex_backend() {
+        let registry = AgentRegistry::default_registry();
+        let backend = registry.get("codex").unwrap();
+        assert_eq!(backend.name(), "codex");
     }
 }

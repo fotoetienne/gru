@@ -1120,6 +1120,7 @@ async fn monitor_pr_lifecycle(
     timeout_opt: Option<&str>,
     review_timeout: Option<Duration>,
     monitor_timeout: Duration,
+    backend: &dyn AgentBackend,
 ) {
     // Auto-trigger review for Minion-created PRs
     println!("\n🔍 Starting automated PR review...");
@@ -1217,8 +1218,6 @@ async fn monitor_pr_lifecycle(
 
                 println!("🔄 Re-invoking to address review feedback...\n");
 
-                let review_registry = AgentRegistry::default_registry();
-                let backend = review_registry.default_backend();
                 match invoke_agent_for_reviews(
                     backend,
                     &wt_ctx.checkout_path,
@@ -1386,6 +1385,7 @@ pub async fn handle_fix(
     monitor_timeout_opt: Option<String>,
     quiet: bool,
     force_new: bool,
+    agent: Option<String>,
 ) -> Result<i32> {
     // Parse review timeout if provided
     let review_timeout = review_timeout_opt
@@ -1456,7 +1456,12 @@ pub async fn handle_fix(
 
     // Phase 3: Run agent (skip if already past this phase)
     let registry = AgentRegistry::default_registry();
-    let backend = registry.default_backend();
+    let backend = match agent.as_deref() {
+        Some(name) => registry
+            .get(name)
+            .context("Failed to select agent backend")?,
+        None => registry.default_backend(),
+    };
     let agent_result = if start_phase <= OrchestrationPhase::RunningAgent {
         update_orchestration_phase(&wt_ctx.minion_id, OrchestrationPhase::RunningAgent).await;
 
@@ -1492,7 +1497,7 @@ pub async fn handle_fix(
         }
     } else {
         // Skipping Claude phase — already completed in a previous run
-        println!("⏭️  Skipping Claude session (already completed)");
+        println!("⏭️  Skipping agent session (already completed)");
         None
     };
 
@@ -1551,6 +1556,7 @@ pub async fn handle_fix(
             timeout_opt.as_deref(),
             review_timeout,
             monitor_timeout,
+            backend,
         )
         .await;
     }
