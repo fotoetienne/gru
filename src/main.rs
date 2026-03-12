@@ -4,6 +4,7 @@ mod agent_runner;
 mod ci;
 mod claude_backend;
 mod claude_runner;
+mod codex_backend;
 mod commands;
 mod config;
 mod git;
@@ -83,6 +84,12 @@ enum Commands {
             help = "Create a new Minion even if one already exists for this issue"
         )]
         force_new: bool,
+
+        #[arg(
+            long,
+            help = "Agent backend to use (claude, codex). Defaults to claude."
+        )]
+        agent: Option<String>,
     },
     #[command(about = "Review a GitHub pull request")]
     Review {
@@ -261,6 +268,7 @@ async fn main() {
             review_timeout,
             monitor_timeout,
             force_new,
+            agent,
         } => {
             fix::handle_fix(
                 &issue,
@@ -269,6 +277,7 @@ async fn main() {
                 monitor_timeout,
                 cli.quiet,
                 force_new,
+                agent,
             )
             .await
         }
