@@ -186,20 +186,6 @@ struct CheckRunsResponse {
     check_runs: Vec<CheckRun>,
 }
 
-/// Monitor a PR for review comments, CI failures, and merge/close events.
-///
-/// This function polls the PR every 30 seconds and:
-/// - Detects when the PR is merged (exits successfully)
-/// - Detects when the PR is closed without merging (exits with message)
-/// - Detects new review comments (returns for handling)
-/// - Detects CI failures (returns for handling)
-/// - Detects Ctrl+C (returns `MonitorResult::Interrupted` for graceful shutdown)
-///
-/// # Arguments
-/// * `worktree_path` - Reserved for future use (e.g., reading local git state, logging)
-/// * `max_duration` - Optional maximum duration before returning `MonitorResult::Timeout`
-///
-/// Returns `Ok(MonitorResult)` when an event requires action or the PR reaches a terminal state.
 /// Monitor a PR for actionable events (reviews, CI failures, merge conflicts, etc.).
 ///
 /// `baseline` optionally provides a timestamp to seed the review tracker.
@@ -207,6 +193,12 @@ struct CheckRunsResponse {
 /// which lets the caller preserve review tracking across re-entries (e.g. after a
 /// rebase). When `None`, `last_check_time` is seeded to `Utc::now()` so that
 /// pre-existing reviews aren't re-detected.
+///
+/// Returns `(MonitorResult, DateTime<Utc>)` where the second element is the
+/// internal `last_check_time` at the time the event was detected. Callers
+/// should pass this value as `baseline` on the next invocation so that:
+/// - Already-handled reviews are not re-fetched.
+/// - Reviews posted during event handling (rebase, review response) are caught.
 pub async fn monitor_pr(
     owner: &str,
     repo: &str,
@@ -214,7 +206,7 @@ pub async fn monitor_pr(
     _worktree_path: &Path,
     max_duration: Option<Duration>,
     baseline: Option<DateTime<Utc>>,
-) -> Result<MonitorResult> {
+) -> Result<(MonitorResult, DateTime<Utc>)> {
     let start_time = Instant::now();
 
     let mut last_check_time = baseline.unwrap_or_else(Utc::now);
@@ -228,7 +220,7 @@ pub async fn monitor_pr(
         if let Some(max) = max_duration {
             let elapsed = start_time.elapsed();
             if elapsed >= max {
-                return Ok(MonitorResult::Timeout);
+                return Ok((MonitorResult::Timeout, last_check_time));
             }
         }
 
@@ -236,11 +228,11 @@ pub async fn monitor_pr(
         tokio::select! {
             result = poll_once(owner, repo, pr_number, &mut last_check_time) => {
                 if let Some(monitor_result) = result? {
-                    return Ok(monitor_result);
+                    return Ok((monitor_result, last_check_time));
                 }
             }
             _ = &mut ctrl_c => {
-                return Ok(MonitorResult::Interrupted);
+                return Ok((MonitorResult::Interrupted, last_check_time));
             }
         }
 
@@ -248,7 +240,7 @@ pub async fn monitor_pr(
         tokio::select! {
             _ = sleep(Duration::from_secs(POLL_INTERVAL_SECS)) => {}
             _ = &mut ctrl_c => {
-                return Ok(MonitorResult::Interrupted);
+                return Ok((MonitorResult::Interrupted, last_check_time));
             }
         }
     }
@@ -283,6 +275,9 @@ async fn poll_once(
     if !reviews.is_empty() {
         // Fetch detailed comments for the new reviews
         let comments = get_review_comments(owner, repo, pr_number, &reviews).await?;
+        // Advance past these reviews so they are not re-fetched if the caller
+        // passes the returned last_check_time back as the next baseline.
+        *last_check_time = Utc::now();
         return Ok(Some(MonitorResult::NewReviews(comments)));
     }
 

@@ -1264,11 +1264,6 @@ async fn monitor_pr_lifecycle(
             break;
         }
 
-        // Snapshot the current time before entering the poll loop so that
-        // if we re-enter after handling an event (rebase, reviews), the next
-        // monitor_pr_from call picks up any reviews posted during event handling.
-        let pre_monitor = chrono::Utc::now();
-
         match pr_monitor::monitor_pr(
             &issue_ctx.owner,
             &issue_ctx.repo,
@@ -1279,17 +1274,17 @@ async fn monitor_pr_lifecycle(
         )
         .await
         {
-            Ok(MonitorResult::Merged) => {
+            Ok((MonitorResult::Merged, _)) => {
                 println!("✅ PR #{} was merged successfully!", pr_number);
                 println!("🎉 Issue {} is complete!", issue_ctx.issue_num);
                 break;
             }
-            Ok(MonitorResult::Closed) => {
+            Ok((MonitorResult::Closed, _)) => {
                 println!("⚠️  PR #{} was closed without merging", pr_number);
                 println!("   The issue may need to be reopened or addressed differently");
                 break;
             }
-            Ok(MonitorResult::NewReviews(comments)) => {
+            Ok((MonitorResult::NewReviews(comments), check_time)) => {
                 review_round += 1;
                 let count = comments.len();
                 println!(
@@ -1330,9 +1325,11 @@ async fn monitor_pr_lifecycle(
                     Ok(()) => {
                         println!("\n✅ Finished addressing review comments");
                         println!("🔄 Continuing to monitor PR...\n");
-                        // Preserve review baseline so the next monitor_pr_from
-                        // call picks up any reviews posted during handling.
-                        review_baseline = Some(pre_monitor);
+                        // Use the check_time returned by monitor_pr, which was
+                        // advanced past the reviews we just handled. This ensures
+                        // those reviews aren't re-fetched while still catching
+                        // any new reviews posted during handling.
+                        review_baseline = Some(check_time);
                     }
                     Err(e) => {
                         log::warn!("⚠️  Failed to address review comments: {}", e);
@@ -1341,7 +1338,7 @@ async fn monitor_pr_lifecycle(
                     }
                 }
             }
-            Ok(MonitorResult::FailedChecks(count)) => {
+            Ok((MonitorResult::FailedChecks(count), _)) => {
                 if ci_escalated {
                     // Already escalated — wait for human intervention
                     println!(
@@ -1399,7 +1396,7 @@ async fn monitor_pr_lifecycle(
                     }
                 }
             }
-            Ok(MonitorResult::MergeConflict) => {
+            Ok((MonitorResult::MergeConflict, check_time)) => {
                 if rebase_attempts >= MAX_REBASE_ATTEMPTS {
                     println!(
                         "❌ Reached maximum rebase attempts ({}), escalating",
@@ -1428,9 +1425,10 @@ async fn monitor_pr_lifecycle(
                         // while it recomputes. We don't want stale signals to
                         // exhaust the attempt budget.
                         rebase_attempts = 0;
-                        // Preserve review baseline so reviews posted before/during
-                        // the rebase are not missed on the next monitor_pr_from call.
-                        review_baseline = Some(pre_monitor);
+                        // Use the check_time from just before the conflict was
+                        // detected. Reviews posted during the rebase will have
+                        // submitted_at > check_time and be caught on the next poll.
+                        review_baseline = Some(check_time);
                         println!("✅ Rebase succeeded, continuing to monitor PR...\n");
                     }
                     Ok(false) => {
@@ -1458,7 +1456,7 @@ async fn monitor_pr_lifecycle(
                     }
                 }
             }
-            Ok(MonitorResult::Timeout) => {
+            Ok((MonitorResult::Timeout, _)) => {
                 // Use the lifecycle-level start time for an accurate total elapsed display
                 let total_secs = monitor_start.elapsed().as_secs();
                 let hours = total_secs / 3600;
@@ -1478,7 +1476,7 @@ async fn monitor_pr_lifecycle(
                 );
                 break;
             }
-            Ok(MonitorResult::Interrupted) => {
+            Ok((MonitorResult::Interrupted, _)) => {
                 println!("\n⚠️  Monitoring interrupted by user");
                 println!(
                     "   PR is still open: https://github.com/{}/{}/pull/{}",
