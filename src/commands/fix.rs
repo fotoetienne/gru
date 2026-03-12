@@ -1236,6 +1236,9 @@ async fn monitor_pr_lifecycle(
     let mut review_round = 0;
     let mut ci_escalated = false;
     let mut rebase_attempts = 0;
+    // Track review baseline across monitor_pr re-entries so reviews posted
+    // before/during event handling (e.g. rebase) are not silently dropped.
+    let mut review_baseline: Option<chrono::DateTime<chrono::Utc>> = None;
     loop {
         // Compute remaining time so the timeout spans the entire lifecycle,
         // not just a single monitor_pr invocation.
@@ -1261,12 +1264,18 @@ async fn monitor_pr_lifecycle(
             break;
         }
 
+        // Snapshot the current time before entering the poll loop so that
+        // if we re-enter after handling an event (rebase, reviews), the next
+        // monitor_pr_from call picks up any reviews posted during event handling.
+        let pre_monitor = chrono::Utc::now();
+
         match pr_monitor::monitor_pr(
             &issue_ctx.owner,
             &issue_ctx.repo,
             pr_number,
             &wt_ctx.checkout_path,
             remaining,
+            review_baseline,
         )
         .await
         {
@@ -1321,6 +1330,9 @@ async fn monitor_pr_lifecycle(
                     Ok(()) => {
                         println!("\n✅ Finished addressing review comments");
                         println!("🔄 Continuing to monitor PR...\n");
+                        // Preserve review baseline so the next monitor_pr_from
+                        // call picks up any reviews posted during handling.
+                        review_baseline = Some(pre_monitor);
                     }
                     Err(e) => {
                         log::warn!("⚠️  Failed to address review comments: {}", e);
@@ -1416,6 +1428,9 @@ async fn monitor_pr_lifecycle(
                         // while it recomputes. We don't want stale signals to
                         // exhaust the attempt budget.
                         rebase_attempts = 0;
+                        // Preserve review baseline so reviews posted before/during
+                        // the rebase are not missed on the next monitor_pr_from call.
+                        review_baseline = Some(pre_monitor);
                         println!("✅ Rebase succeeded, continuing to monitor PR...\n");
                     }
                     Ok(false) => {

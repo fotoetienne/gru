@@ -200,19 +200,24 @@ struct CheckRunsResponse {
 /// * `max_duration` - Optional maximum duration before returning `MonitorResult::Timeout`
 ///
 /// Returns `Ok(MonitorResult)` when an event requires action or the PR reaches a terminal state.
+/// Monitor a PR for actionable events (reviews, CI failures, merge conflicts, etc.).
+///
+/// `baseline` optionally provides a timestamp to seed the review tracker.
+/// When `Some`, reviews posted after that time will be detected on the first poll,
+/// which lets the caller preserve review tracking across re-entries (e.g. after a
+/// rebase). When `None`, `last_check_time` is seeded to `Utc::now()` so that
+/// pre-existing reviews aren't re-detected.
 pub async fn monitor_pr(
     owner: &str,
     repo: &str,
     pr_number: &str,
     _worktree_path: &Path,
     max_duration: Option<Duration>,
+    baseline: Option<DateTime<Utc>>,
 ) -> Result<MonitorResult> {
     let start_time = Instant::now();
 
-    // Seed baseline to "now" so that pre-existing reviews aren't re-detected
-    // on the first poll.  The get_reviews_since filter uses >= which would
-    // otherwise match the last existing review's submitted_at timestamp.
-    let mut last_check_time = Utc::now();
+    let mut last_check_time = baseline.unwrap_or_else(Utc::now);
 
     // Register the Ctrl+C listener once to avoid signal loss between iterations
     let ctrl_c = tokio::signal::ctrl_c();
@@ -272,19 +277,20 @@ async fn poll_once(
         }
     }
 
-    // Check merge conflict status.
-    // mergeable == Some(false) means GitHub detected conflicts.
-    // mergeable == None means GitHub is still computing — skip and re-check next cycle.
-    if pr.mergeable == Some(false) {
-        return Ok(Some(MonitorResult::MergeConflict));
-    }
-
-    // Check for new reviews (use >= to avoid missing reviews at exact timestamp)
+    // Check for new reviews BEFORE merge conflicts so that reviewer feedback
+    // is never silently dropped when conflicts and reviews overlap.
     let reviews = get_reviews_since(owner, repo, pr_number, *last_check_time).await?;
     if !reviews.is_empty() {
         // Fetch detailed comments for the new reviews
         let comments = get_review_comments(owner, repo, pr_number, &reviews).await?;
         return Ok(Some(MonitorResult::NewReviews(comments)));
+    }
+
+    // Check merge conflict status.
+    // mergeable == Some(false) means GitHub detected conflicts.
+    // mergeable == None means GitHub is still computing — skip and re-check next cycle.
+    if pr.mergeable == Some(false) {
+        return Ok(Some(MonitorResult::MergeConflict));
     }
 
     // Check for failed CI runs - include all error states
