@@ -28,6 +28,7 @@ use tokio::process::Command as TokioCommand;
 use tokio::time::{timeout, Duration};
 use uuid::Uuid;
 
+/// Options for the `gru do` (fix) command.
 pub struct FixOptions {
     pub timeout: Option<String>,
     pub review_timeout: Option<String>,
@@ -1553,15 +1554,24 @@ async fn monitor_ci_after_fix(
 /// If a previous session for the same issue was interrupted, it will
 /// automatically resume from the last completed phase.
 pub async fn handle_fix(issue: &str, opts: FixOptions) -> Result<i32> {
+    let FixOptions {
+        timeout: timeout_opt,
+        review_timeout: review_timeout_opt,
+        monitor_timeout: monitor_timeout_opt,
+        quiet,
+        force_new,
+        agent_name,
+        no_watch,
+    } = opts;
+
     // Parse review timeout if provided
-    let review_timeout = opts
-        .review_timeout
+    let review_timeout = review_timeout_opt
         .map(|s| parse_timeout(&s))
         .transpose()
         .context("Invalid --review-timeout value")?;
 
     // Parse monitor timeout if provided; default to 24 hours
-    let monitor_timeout = match opts.monitor_timeout {
+    let monitor_timeout = match monitor_timeout_opt {
         Some(s) => {
             let d = parse_timeout(&s).context("Invalid --monitor-timeout value")?;
             if d.is_zero() {
@@ -1571,12 +1581,6 @@ pub async fn handle_fix(issue: &str, opts: FixOptions) -> Result<i32> {
         }
         None => Duration::from_secs(24 * 3600),
     };
-
-    let timeout_opt = opts.timeout;
-    let quiet = opts.quiet;
-    let force_new = opts.force_new;
-    let agent_name = opts.agent_name;
-    let no_watch = opts.no_watch;
 
     // Phase 1: Resolve issue (always runs - need fresh issue details)
     let issue_ctx = resolve_issue(issue).await?;
@@ -1736,6 +1740,11 @@ pub async fn handle_fix(issue: &str, opts: FixOptions) -> Result<i32> {
                 "PR #{} created. Skipping lifecycle monitoring (--no-watch).",
                 pr_num
             );
+            update_orchestration_phase(&wt_ctx.minion_id, OrchestrationPhase::Completed).await;
+            let exit_code = agent_result
+                .map(|r| r.status.code().unwrap_or(EXIT_CODE_SIGNAL_TERMINATED))
+                .unwrap_or(0);
+            return Ok(exit_code);
         } else {
             update_orchestration_phase(&wt_ctx.minion_id, OrchestrationPhase::MonitoringPr).await;
             monitor_pr_lifecycle(
