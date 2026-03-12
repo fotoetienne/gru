@@ -281,9 +281,14 @@ async fn handle_cli_fetch_result(result: Result<crate::github::IssueInfo>) -> Op
 /// `Ok(false)` if Claude couldn't resolve conflicts, or `Err` on unexpected failures.
 async fn auto_rebase_pr(worktree_path: &Path) -> Result<bool> {
     use super::rebase::{
-        abort_rebase, attempt_rebase, detect_base_branch, fetch_origin, force_push,
-        run_agent_rebase, RebaseOutcome,
+        abort_rebase, attempt_rebase, check_clean_worktree, detect_base_branch, fetch_origin,
+        force_push, run_agent_rebase, RebaseOutcome,
     };
+
+    // Bail early if worktree has uncommitted changes (e.g., agent crashed mid-edit)
+    check_clean_worktree(worktree_path)
+        .await
+        .context("Cannot auto-rebase: worktree has uncommitted changes")?;
 
     // Fetch latest from origin
     println!("📡 Fetching latest changes from origin...");
@@ -1383,13 +1388,7 @@ async fn monitor_pr_lifecycle(
                 }
             }
             Ok(MonitorResult::MergeConflict) => {
-                rebase_attempts += 1;
-                println!(
-                    "⚠️  Merge conflict detected on PR #{} (rebase attempt {}/{})",
-                    pr_number, rebase_attempts, MAX_REBASE_ATTEMPTS
-                );
-
-                if rebase_attempts > MAX_REBASE_ATTEMPTS {
+                if rebase_attempts >= MAX_REBASE_ATTEMPTS {
                     println!(
                         "❌ Reached maximum rebase attempts ({}), escalating",
                         MAX_REBASE_ATTEMPTS
@@ -1404,12 +1403,23 @@ async fn monitor_pr_lifecycle(
                     break;
                 }
 
+                rebase_attempts += 1;
+                println!(
+                    "⚠️  Merge conflict detected on PR #{} (rebase attempt {}/{})",
+                    pr_number, rebase_attempts, MAX_REBASE_ATTEMPTS
+                );
+
                 match auto_rebase_pr(&wt_ctx.checkout_path).await {
                     Ok(true) => {
+                        // Reset counter on success — GitHub may still report
+                        // mergeable: false for a few poll cycles after force-push
+                        // while it recomputes. We don't want stale signals to
+                        // exhaust the attempt budget.
+                        rebase_attempts = 0;
                         println!("✅ Rebase succeeded, continuing to monitor PR...\n");
                     }
                     Ok(false) => {
-                        // Claude couldn't resolve conflicts
+                        // Agent couldn't resolve conflicts
                         println!("❌ Could not resolve merge conflicts automatically");
                         post_escalation_comment(
                             &issue_ctx.owner,
@@ -1421,12 +1431,12 @@ async fn monitor_pr_lifecycle(
                         break;
                     }
                     Err(e) => {
-                        log::warn!("⚠️  Auto-rebase error: {}", e);
+                        log::warn!("⚠️  Auto-rebase error: {:#}", e);
                         post_escalation_comment(
                             &issue_ctx.owner,
                             &issue_ctx.repo,
                             pr_number,
-                            &format!("Auto-rebase encountered an error: {}. Manual intervention required.", e),
+                            "Auto-rebase encountered an unexpected error. Check Minion logs for details.",
                         )
                         .await;
                         break;

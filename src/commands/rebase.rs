@@ -127,7 +127,7 @@ async fn resolve_worktree_from_arg(arg: &str) -> Result<PathBuf> {
 }
 
 /// Checks that the worktree has no uncommitted changes.
-async fn check_clean_worktree(worktree_path: &Path) -> Result<()> {
+pub(crate) async fn check_clean_worktree(worktree_path: &Path) -> Result<()> {
     let output = Command::new("git")
         .arg("-C")
         .arg(worktree_path)
