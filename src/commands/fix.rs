@@ -28,6 +28,17 @@ use tokio::process::Command as TokioCommand;
 use tokio::time::{timeout, Duration};
 use uuid::Uuid;
 
+/// Options for the `gru do` (fix) command.
+pub struct FixOptions {
+    pub timeout: Option<String>,
+    pub review_timeout: Option<String>,
+    pub monitor_timeout: Option<String>,
+    pub quiet: bool,
+    pub force_new: bool,
+    pub agent_name: String,
+    pub no_watch: bool,
+}
+
 /// Maximum size of the output buffer for test detection (in bytes)
 const MAX_OUTPUT_BUFFER_SIZE: usize = 10000;
 
@@ -1542,15 +1553,17 @@ async fn monitor_ci_after_fix(
 ///
 /// If a previous session for the same issue was interrupted, it will
 /// automatically resume from the last completed phase.
-pub async fn handle_fix(
-    issue: &str,
-    timeout_opt: Option<String>,
-    review_timeout_opt: Option<String>,
-    monitor_timeout_opt: Option<String>,
-    quiet: bool,
-    force_new: bool,
-    agent_name: &str,
-) -> Result<i32> {
+pub async fn handle_fix(issue: &str, opts: FixOptions) -> Result<i32> {
+    let FixOptions {
+        timeout: timeout_opt,
+        review_timeout: review_timeout_opt,
+        monitor_timeout: monitor_timeout_opt,
+        quiet,
+        force_new,
+        agent_name,
+        no_watch,
+    } = opts;
+
     // Parse review timeout if provided
     let review_timeout = review_timeout_opt
         .map(|s| parse_timeout(&s))
@@ -1573,15 +1586,15 @@ pub async fn handle_fix(
     let issue_ctx = resolve_issue(issue).await?;
 
     // Validate agent name and create backend early (fail fast on unknown agents)
-    let backend = agent_registry::resolve_backend(agent_name)?;
+    let backend = agent_registry::resolve_backend(&agent_name)?;
 
     // Determine whether to resume an existing session or start fresh
     let (wt_ctx, resume_phase) = if force_new {
-        (setup_worktree(&issue_ctx, agent_name).await?, None)
+        (setup_worktree(&issue_ctx, &agent_name).await?, None)
     } else {
         match check_existing_minions(&issue_ctx.owner, &issue_ctx.repo, issue_ctx.issue_num).await?
         {
-            ExistingMinionCheck::None => (setup_worktree(&issue_ctx, agent_name).await?, None),
+            ExistingMinionCheck::None => (setup_worktree(&issue_ctx, &agent_name).await?, None),
             ExistingMinionCheck::Resumable(minion_id, info) => {
                 let phase = info.orchestration_phase.clone();
                 println!(
@@ -1720,6 +1733,25 @@ pub async fn handle_fix(
         }
     };
 
+    let agent_exit_code = || {
+        agent_result
+            .as_ref()
+            .map(|r| r.status.code().unwrap_or(EXIT_CODE_SIGNAL_TERMINATED))
+            .unwrap_or(0)
+    };
+
+    // --no-watch: skip all monitoring (PR lifecycle + CI) for fire-and-forget mode
+    if no_watch {
+        if let Some(ref pr_num) = pr_number {
+            println!(
+                "PR #{} created. Skipping lifecycle monitoring (--no-watch).",
+                pr_num
+            );
+        }
+        update_orchestration_phase(&wt_ctx.minion_id, OrchestrationPhase::Completed).await;
+        return Ok(agent_exit_code());
+    }
+
     // Phase 5: Monitor PR lifecycle (review + polling)
     if let Some(ref pr_num) = pr_number {
         update_orchestration_phase(&wt_ctx.minion_id, OrchestrationPhase::MonitoringPr).await;
@@ -1763,11 +1795,7 @@ pub async fn handle_fix(
 
     update_orchestration_phase(&wt_ctx.minion_id, OrchestrationPhase::Completed).await;
 
-    let exit_code = agent_result
-        .map(|r| r.status.code().unwrap_or(EXIT_CODE_SIGNAL_TERMINATED))
-        .unwrap_or(0);
-
-    Ok(exit_code)
+    Ok(agent_exit_code())
 }
 
 #[cfg(test)]
@@ -1986,5 +2014,63 @@ CUSTOM: Fix #{{ issue_number }} - {{ issue_title }}"#,
         let err: anyhow::Error = AgentRunnerError::InactivityStuck { minutes: 15 }.into();
         let wrapped = err.context("Claude session failed");
         assert!(is_stuck_or_timeout_error(&wrapped));
+    }
+
+    #[test]
+    fn test_fix_options_no_watch_default_false() {
+        let opts = FixOptions {
+            timeout: None,
+            review_timeout: None,
+            monitor_timeout: None,
+            quiet: false,
+            force_new: false,
+            agent_name: "claude".to_string(),
+            no_watch: false,
+        };
+        assert!(!opts.no_watch);
+    }
+
+    #[test]
+    fn test_fix_options_no_watch_set() {
+        let opts = FixOptions {
+            timeout: None,
+            review_timeout: None,
+            monitor_timeout: None,
+            quiet: false,
+            force_new: false,
+            agent_name: "claude".to_string(),
+            no_watch: true,
+        };
+        assert!(opts.no_watch);
+    }
+
+    #[test]
+    fn test_fix_options_destructuring() {
+        // Verify all fields can be destructured as handle_fix does
+        let opts = FixOptions {
+            timeout: Some("10m".to_string()),
+            review_timeout: Some("5m".to_string()),
+            monitor_timeout: Some("1h".to_string()),
+            quiet: true,
+            force_new: true,
+            agent_name: "codex".to_string(),
+            no_watch: true,
+        };
+        let FixOptions {
+            timeout,
+            review_timeout,
+            monitor_timeout,
+            quiet,
+            force_new,
+            agent_name,
+            no_watch,
+        } = opts;
+        assert_eq!(timeout.as_deref(), Some("10m"));
+        assert_eq!(review_timeout.as_deref(), Some("5m"));
+        assert_eq!(monitor_timeout.as_deref(), Some("1h"));
+        assert!(quiet);
+        assert!(force_new);
+        assert_eq!(agent_name, "codex");
+        assert!(no_watch);
     }
 }
