@@ -1255,11 +1255,14 @@ async fn monitor_pr_lifecycle(
                 );
 
                 // Parse pr_number for the CI fix API
-                let pr_num_u64 = pr_number.parse::<u64>().unwrap_or(0);
-                if pr_num_u64 == 0 {
-                    println!("⚠️  Could not parse PR number, skipping CI auto-fix");
-                    break;
-                }
+                let pr_num_u64 = match pr_number.parse::<u64>() {
+                    Ok(n) => n,
+                    Err(_) => {
+                        println!("⚠️  Could not parse PR number, skipping CI auto-fix");
+                        println!("🔄 Continuing to monitor PR for other events...\n");
+                        continue;
+                    }
+                };
 
                 match ci::monitor_and_fix_ci(
                     &issue_ctx.owner,
@@ -1284,12 +1287,12 @@ async fn monitor_pr_lifecycle(
                         println!("🔄 Continuing to monitor PR for other events...\n");
                     }
                     Err(e) => {
-                        ci_escalated = true;
                         println!("⚠️  CI auto-fix error: {}", e);
                         println!(
                             "   Review the checks at: https://github.com/{}/{}/pull/{}/checks",
                             issue_ctx.owner, issue_ctx.repo, pr_number
                         );
+                        println!("🔄 Will retry CI auto-fix on subsequent monitoring cycles...\n");
                     }
                 }
             }
