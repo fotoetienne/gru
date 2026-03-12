@@ -654,7 +654,7 @@ pub async fn handle_prompt(prompt: &str, opts: PromptOptions) -> Result<i32> {
         pid: None,
         mode: MinionMode::Autonomous,
         last_activity: now,
-        orchestration_phase: OrchestrationPhase::RunningClaude,
+        orchestration_phase: OrchestrationPhase::RunningAgent,
         token_usage: None,
         agent_backend: DEFAULT_AGENT_NAME.to_string(),
     };

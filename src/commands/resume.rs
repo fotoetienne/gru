@@ -135,7 +135,7 @@ pub async fn handle_resume(
     };
 
     // Update orchestration phase
-    update_orchestration_phase(&minion.minion_id, OrchestrationPhase::RunningClaude).await;
+    update_orchestration_phase(&minion.minion_id, OrchestrationPhase::RunningAgent).await;
 
     // Run Claude in autonomous mode with stream monitoring
     let claude_result =

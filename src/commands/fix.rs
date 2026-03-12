@@ -1457,8 +1457,8 @@ pub async fn handle_fix(
     // Phase 3: Run agent (skip if already past this phase)
     let registry = AgentRegistry::default_registry();
     let backend = registry.default_backend();
-    let agent_result = if start_phase <= OrchestrationPhase::RunningClaude {
-        update_orchestration_phase(&wt_ctx.minion_id, OrchestrationPhase::RunningClaude).await;
+    let agent_result = if start_phase <= OrchestrationPhase::RunningAgent {
+        update_orchestration_phase(&wt_ctx.minion_id, OrchestrationPhase::RunningAgent).await;
 
         // Only use --resume if we're resuming a session that actually ran the agent.
         // If interrupted during Setup (before the agent ever ran), the session ID was
