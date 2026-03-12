@@ -69,6 +69,7 @@ pub async fn check_merge_readiness(
         get_unresolved_thread_count(owner, repo, pr_number),
     )?;
 
+    // Sequential: needs head SHA from get_pr_details above
     let check_runs = get_check_runs(owner, repo, &pr.head_sha).await?;
 
     let ci_passing = evaluate_ci(&check_runs);
@@ -130,6 +131,12 @@ struct CheckRunsApiResponse {
 #[derive(Debug, Deserialize)]
 struct GraphQlResponse {
     data: Option<GraphQlData>,
+    errors: Option<Vec<GraphQlError>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GraphQlError {
+    message: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -151,8 +158,16 @@ struct GraphQlPullRequest {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct GraphQlThreadConnection {
     nodes: Vec<GraphQlThread>,
+    page_info: GraphQlPageInfo,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GraphQlPageInfo {
+    has_next_page: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -249,7 +264,12 @@ async fn get_pr_details(owner: &str, repo: &str, pr_number: &str) -> Result<PrDe
 async fn get_reviews(owner: &str, repo: &str, pr_number: &str) -> Result<Vec<ReviewApiResponse>> {
     let repo_full = format!("{owner}/{repo}");
     let endpoint = format!("repos/{repo_full}/pulls/{pr_number}/reviews");
-    let output = gh_api_with_retry(&repo_full, &["api", &endpoint], DEFAULT_MAX_RETRIES).await?;
+    let output = gh_api_with_retry(
+        &repo_full,
+        &["api", "--paginate", &endpoint],
+        DEFAULT_MAX_RETRIES,
+    )
+    .await?;
 
     let reviews: Vec<ReviewApiResponse> =
         serde_json::from_slice(&output.stdout).context("Failed to parse reviews JSON")?;
@@ -260,7 +280,13 @@ async fn get_reviews(owner: &str, repo: &str, pr_number: &str) -> Result<Vec<Rev
 async fn get_check_runs(owner: &str, repo: &str, sha: &str) -> Result<Vec<CheckRun>> {
     let repo_full = format!("{owner}/{repo}");
     let endpoint = format!("repos/{repo_full}/commits/{sha}/check-runs");
-    let output = gh_api_with_retry(&repo_full, &["api", &endpoint], DEFAULT_MAX_RETRIES).await?;
+    // --paginate ensures we get all check runs (default page size is 30)
+    let output = gh_api_with_retry(
+        &repo_full,
+        &["api", "--paginate", &endpoint],
+        DEFAULT_MAX_RETRIES,
+    )
+    .await?;
 
     let response: CheckRunsApiResponse =
         serde_json::from_slice(&output.stdout).context("Failed to parse check runs JSON")?;
@@ -270,12 +296,34 @@ async fn get_check_runs(owner: &str, repo: &str, sha: &str) -> Result<Vec<CheckR
 
 async fn get_unresolved_thread_count(owner: &str, repo: &str, pr_number: u64) -> Result<usize> {
     let repo_full = format!("{owner}/{repo}");
-    let query = format!(
-        r#"query {{ repository(owner: "{owner}", name: "{repo}") {{ pullRequest(number: {pr_number}) {{ reviewThreads(first: 100) {{ nodes {{ isResolved }} }} }} }} }}"#,
-    );
+    // Use GraphQL variables to avoid injection via owner/repo strings
+    let query = "query($owner:String!,$repo:String!,$pr:Int!) { \
+        repository(owner:$owner, name:$repo) { \
+            pullRequest(number:$pr) { \
+                reviewThreads(first:100) { \
+                    nodes { isResolved } \
+                    pageInfo { hasNextPage } \
+                } \
+            } \
+        } \
+    }";
+    let owner_var = format!("owner={owner}");
+    let repo_var = format!("repo={repo}");
+    let pr_var = format!("pr={pr_number}");
     let output = gh_api_with_retry(
         &repo_full,
-        &["api", "graphql", "-f", &format!("query={query}")],
+        &[
+            "api",
+            "graphql",
+            "-f",
+            &format!("query={query}"),
+            "-F",
+            &owner_var,
+            "-F",
+            &repo_var,
+            "-F",
+            &pr_var,
+        ],
         DEFAULT_MAX_RETRIES,
     )
     .await?;
@@ -283,18 +331,35 @@ async fn get_unresolved_thread_count(owner: &str, repo: &str, pr_number: u64) ->
     let response: GraphQlResponse =
         serde_json::from_slice(&output.stdout).context("Failed to parse GraphQL response")?;
 
-    let count = response
+    // Surface GraphQL-level errors
+    if let Some(errors) = &response.errors {
+        if !errors.is_empty() {
+            let messages: Vec<&str> = errors.iter().map(|e| e.message.as_str()).collect();
+            anyhow::bail!("GraphQL errors: {}", messages.join("; "));
+        }
+    }
+
+    let pr_data = response
         .data
         .and_then(|d| d.repository)
-        .and_then(|r| r.pull_request)
-        .map(|pr| {
-            pr.review_threads
-                .nodes
-                .iter()
-                .filter(|t| !t.is_resolved)
-                .count()
-        })
-        .unwrap_or(0);
+        .and_then(|r| r.pull_request);
+
+    let Some(pr_data) = pr_data else {
+        return Ok(0);
+    };
+
+    if pr_data.review_threads.page_info.has_next_page {
+        anyhow::bail!(
+            "PR #{pr_number} has more than 100 review threads; pagination not yet supported"
+        );
+    }
+
+    let count = pr_data
+        .review_threads
+        .nodes
+        .iter()
+        .filter(|t| !t.is_resolved)
+        .count();
 
     Ok(count)
 }
@@ -450,6 +515,16 @@ mod tests {
         let runs = vec![CheckRun {
             conclusion: None,
             status: Some("queued".into()),
+        }];
+        assert!(!evaluate_ci(&runs));
+    }
+
+    #[test]
+    fn test_ci_no_status_no_conclusion() {
+        // A check run with neither status nor conclusion set
+        let runs = vec![CheckRun {
+            conclusion: None,
+            status: None,
         }];
         assert!(!evaluate_ci(&runs));
     }
