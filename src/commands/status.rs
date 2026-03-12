@@ -18,6 +18,7 @@ struct EnhancedMinionInfo {
     session_id: String,
     pid: Option<u32>,
     worktree_path: String,
+    agent_name: String,
 }
 
 /// Intermediate Minion data extracted from registry (without expensive status checks)
@@ -35,6 +36,7 @@ struct BasicMinionData {
     mode: MinionMode,
     session_id: String,
     token_usage: Option<TokenUsage>,
+    agent_name: String,
 }
 
 /// Calculates uptime from a timestamp
@@ -185,6 +187,7 @@ pub async fn handle_status(id: Option<String>, verbose: bool) -> Result<i32> {
                 mode: info.mode,
                 session_id: info.session_id,
                 token_usage: info.token_usage,
+                agent_name: info.agent_name,
             })
             .collect();
 
@@ -221,6 +224,7 @@ pub async fn handle_status(id: Option<String>, verbose: bool) -> Result<i32> {
                     session_id: basic.session_id,
                     pid: basic.pid,
                     worktree_path,
+                    agent_name: basic.agent_name,
                 }
             })
             .collect::<Vec<EnhancedMinionInfo>>()
@@ -271,13 +275,13 @@ pub async fn handle_status(id: Option<String>, verbose: bool) -> Result<i32> {
     // Print table header
     if verbose {
         println!(
-            "{:<8} {:<8} {:<22} {:<38} {:<8} PATH",
-            "ID", "ISSUE", "MODE", "SESSION ID", "PID"
+            "{:<8} {:<8} {:<8} {:<22} {:<38} {:<8} PATH",
+            "ID", "ISSUE", "AGENT", "MODE", "SESSION ID", "PID"
         );
     } else {
         println!(
-            "{:<8} {:<20} {:<8} {:<10} {:<8} {:<30} {:<22} {:<8} TOKENS",
-            "MINION", "REPO", "ISSUE", "TASK", "PR", "BRANCH", "MODE", "UPTIME"
+            "{:<8} {:<8} {:<20} {:<8} {:<10} {:<8} {:<30} {:<22} {:<8} TOKENS",
+            "MINION", "AGENT", "REPO", "ISSUE", "TASK", "PR", "BRANCH", "MODE", "UPTIME"
         );
     }
 
@@ -291,9 +295,10 @@ pub async fn handle_status(id: Option<String>, verbose: bool) -> Result<i32> {
                 .unwrap_or_else(|| "-".to_string());
 
             println!(
-                "{:<8} {:<8} {:<22} {:<38} {:<8} {}",
+                "{:<8} {:<8} {:<8} {:<22} {:<38} {:<8} {}",
                 minion.minion_id,
                 issue_display,
+                minion.agent_name,
                 minion.mode_display,
                 minion.session_id,
                 pid_display,
@@ -313,8 +318,9 @@ pub async fn handle_status(id: Option<String>, verbose: bool) -> Result<i32> {
                 .unwrap_or_else(|| "-".to_string());
 
             println!(
-                "{:<8} {:<20} {:<8} {:<10} {:<8} {:<30} {:<22} {:<8} {}",
+                "{:<8} {:<8} {:<20} {:<8} {:<10} {:<8} {:<30} {:<22} {:<8} {}",
                 minion.minion_id,
+                minion.agent_name,
                 minion.repo,
                 issue_display,
                 minion.task,

@@ -97,6 +97,12 @@ enum Commands {
             help = "PR number, URL, Minion ID, or issue number. Auto-detects from current worktree if omitted."
         )]
         pr: Option<String>,
+
+        #[arg(
+            long,
+            help = "Agent backend to use (e.g., 'claude'). Overrides config.toml default."
+        )]
+        agent: Option<String>,
     },
     #[command(about = "Rebase a Minion's branch onto the latest base branch")]
     Rebase {
@@ -170,15 +176,15 @@ enum Commands {
         #[arg(help = "Minion ID, issue number, or PR number (e.g., M0tk, 42)")]
         id: String,
     },
-    #[command(about = "Run an ad-hoc prompt with Claude")]
+    #[command(about = "Run an ad-hoc prompt with an agent")]
     Prompt {
-        #[arg(help = "Prompt text or prompt name to send to Claude")]
+        #[arg(help = "Prompt text or prompt name to send to the agent")]
         prompt: String,
 
         #[arg(
             long,
             help = "Show detailed information about this prompt (description, parameters, source)",
-            conflicts_with_all = ["issue", "pr", "no_worktree", "worktree", "param", "timeout"]
+            conflicts_with_all = ["issue", "pr", "no_worktree", "worktree", "param", "timeout", "agent"]
         )]
         info: bool,
 
@@ -226,6 +232,12 @@ enum Commands {
             help = "Maximum duration for the task (e.g., '10s', '5m', '1h'). Exits with error if exceeded."
         )]
         timeout: Option<String>,
+
+        #[arg(
+            long,
+            help = "Agent backend to use (e.g., 'claude'). Overrides config.toml default."
+        )]
+        agent: Option<String>,
     },
     #[command(about = "List available prompts")]
     Prompts,
@@ -270,6 +282,7 @@ async fn main() {
             force_new,
             agent,
         } => {
+            let agent_name = agent.unwrap_or_else(|| agent_registry::DEFAULT_AGENT.to_string());
             fix::handle_fix(
                 &issue,
                 timeout,
@@ -277,11 +290,14 @@ async fn main() {
                 monitor_timeout,
                 cli.quiet,
                 force_new,
-                agent,
+                &agent_name,
             )
             .await
         }
-        Commands::Review { pr } => review::handle_review(pr).await,
+        Commands::Review { pr, agent } => {
+            let agent_name = agent.unwrap_or_else(|| agent_registry::DEFAULT_AGENT.to_string());
+            review::handle_review(pr, &agent_name).await
+        }
         Commands::Rebase { target } => rebase::handle_rebase(target).await,
         Commands::Path { id, issue, pr } => path::handle_path(id, issue, pr).await,
         Commands::Attach {
@@ -310,10 +326,12 @@ async fn main() {
             worktree,
             params,
             timeout,
+            agent,
         } => {
             if info {
                 prompt::handle_prompt_info(&prompt).await
             } else {
+                let agent_name = agent.unwrap_or_else(|| agent_registry::DEFAULT_AGENT.to_string());
                 prompt::handle_prompt(
                     &prompt,
                     prompt::PromptOptions {
@@ -324,6 +342,7 @@ async fn main() {
                         params,
                         timeout,
                         quiet: cli.quiet,
+                        agent_name,
                     },
                 )
                 .await

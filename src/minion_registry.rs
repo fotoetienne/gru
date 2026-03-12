@@ -8,7 +8,6 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use crate::agent::TokenUsage;
-use crate::agent_registry::DEFAULT_AGENT_NAME;
 use crate::workspace::Workspace;
 
 /// Async helper that loads the registry inside `spawn_blocking`, runs the
@@ -139,13 +138,14 @@ pub struct MinionInfo {
     /// Accumulated token usage for this minion's session
     #[serde(default)]
     pub token_usage: Option<TokenUsage>,
-    /// Which agent backend was used for this minion (e.g., "claude")
-    #[serde(default = "default_agent_backend")]
-    pub agent_backend: String,
+    /// Name of the agent backend used by this minion (e.g., "claude", "codex")
+    #[serde(default = "default_agent_name")]
+    pub agent_name: String,
 }
 
-fn default_agent_backend() -> String {
-    DEFAULT_AGENT_NAME.to_string()
+/// Default agent name for backwards compatibility with existing registry entries
+fn default_agent_name() -> String {
+    "claude".to_string()
 }
 
 impl MinionInfo {
@@ -459,7 +459,7 @@ mod tests {
             last_activity: now,
             orchestration_phase: OrchestrationPhase::Setup,
             token_usage: None,
-            agent_backend: "claude".to_string(),
+            agent_name: "claude".to_string(),
         }
     }
 

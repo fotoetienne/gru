@@ -1,5 +1,5 @@
 use crate::agent::AgentEvent;
-use crate::agent_registry::{AgentRegistry, DEFAULT_AGENT_NAME};
+use crate::agent_registry;
 use crate::agent_runner::{run_agent_with_stream_monitoring, EXIT_CODE_SIGNAL_TERMINATED};
 use crate::git;
 use crate::github::{self, GitHubClient};
@@ -23,7 +23,7 @@ use uuid::Uuid;
 
 /// Handles the review command by setting up workspace and spawning autonomous Claude agent with stream parsing
 /// Returns the exit code from the claude process
-pub async fn handle_review(pr_arg: Option<String>) -> Result<i32> {
+pub async fn handle_review(pr_arg: Option<String>, agent_name: &str) -> Result<i32> {
     // Resolve PR information from various input formats
     let (owner, repo, pr_num, branch) = match pr_arg {
         None => resolve_pr_from_current_worktree().await?,
@@ -157,7 +157,7 @@ pub async fn handle_review(pr_arg: Option<String>) -> Result<i32> {
         last_activity: now,
         orchestration_phase: OrchestrationPhase::RunningAgent,
         token_usage: None,
-        agent_backend: DEFAULT_AGENT_NAME.to_string(),
+        agent_name: agent_name.to_string(),
     };
 
     // Register the Minion (spawn_blocking to avoid holding lock during review)
@@ -180,8 +180,7 @@ pub async fn handle_review(pr_arg: Option<String>) -> Result<i32> {
     let progress = std::sync::Arc::new(ProgressDisplay::new(config));
 
     // Build the command with flags for autonomous stream-json output
-    let registry = AgentRegistry::default_registry();
-    let backend = registry.default_backend();
+    let backend = agent_registry::resolve_backend(agent_name)?;
     let cmd = backend.build_command(&checkout_path, &session_id, &review_prompt);
 
     // Build on_spawn callback to record the child PID in the registry
@@ -203,7 +202,7 @@ pub async fn handle_review(pr_arg: Option<String>) -> Result<i32> {
 
     let run_result = run_agent_with_stream_monitoring(
         cmd,
-        backend,
+        &*backend,
         &minion_dir,
         None,
         Some(output_callback),

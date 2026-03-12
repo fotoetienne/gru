@@ -1,5 +1,5 @@
 use crate::agent::AgentEvent;
-use crate::agent_registry::{AgentRegistry, DEFAULT_AGENT_NAME};
+use crate::agent_registry;
 use crate::agent_runner::{run_agent_with_stream_monitoring, EXIT_CODE_SIGNAL_TERMINATED};
 use crate::git;
 use crate::github::GitHubClient;
@@ -410,6 +410,7 @@ pub struct PromptOptions {
     pub params: Vec<String>,
     pub timeout: Option<String>,
     pub quiet: bool,
+    pub agent_name: String,
 }
 
 /// Handles the prompt command by launching Claude with an ad-hoc prompt
@@ -422,6 +423,7 @@ pub async fn handle_prompt(prompt: &str, opts: PromptOptions) -> Result<i32> {
     let params = opts.params;
     let timeout_opt = opts.timeout;
     let quiet = opts.quiet;
+    let agent_name = opts.agent_name;
     // Validate prompt doesn't start with flags (security check)
     let trimmed_prompt = prompt.trim();
     if trimmed_prompt.starts_with('-') {
@@ -656,13 +658,16 @@ pub async fn handle_prompt(prompt: &str, opts: PromptOptions) -> Result<i32> {
         last_activity: now,
         orchestration_phase: OrchestrationPhase::RunningAgent,
         token_usage: None,
-        agent_backend: DEFAULT_AGENT_NAME.to_string(),
+        agent_name: agent_name.clone(),
     };
 
     let minion_id_clone = minion_id.clone();
     with_registry(move |registry| registry.register(minion_id_clone, registry_info)).await?;
 
-    println!("🤖 Launching Claude...\n");
+    // Resolve the agent backend
+    let backend = agent_registry::resolve_backend(&agent_name)?;
+
+    println!("🤖 Launching {}...\n", backend.name());
 
     // Create progress display
     let issue_display = if let Some(issue_num) = issue_number_val {
@@ -688,8 +693,6 @@ pub async fn handle_prompt(prompt: &str, opts: PromptOptions) -> Result<i32> {
     let progress = std::sync::Arc::new(ProgressDisplay::new(config));
 
     // Build the command with flags for non-interactive stream-json output
-    let registry = AgentRegistry::default_registry();
-    let backend = registry.default_backend();
     let mut cmd = backend.build_command(&run_dir, &session_id, &rendered_prompt);
     cmd.env("GRU_WORKSPACE", &minion_id);
 
@@ -712,7 +715,7 @@ pub async fn handle_prompt(prompt: &str, opts: PromptOptions) -> Result<i32> {
 
     let run_result = run_agent_with_stream_monitoring(
         cmd,
-        backend,
+        &*backend,
         &workspace_path,
         timeout_opt.as_deref(),
         Some(output_callback),
