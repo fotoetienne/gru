@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+
 use std::path::{Path, PathBuf};
 use tokio::process::Command;
 
@@ -231,6 +232,75 @@ fn validate_branch_name(branch_name: &str) -> Result<()> {
         anyhow::bail!("Invalid branch name: {}", branch_name);
     }
 
+    Ok(())
+}
+
+/// Configures git hooks in a worktree if a `.githooks/` directory exists.
+///
+/// Projects that use the `.githooks/` convention get `core.hooksPath` set
+/// automatically so that pre-commit hooks (formatting, linting, tests) run
+/// inside minion worktrees — preventing trivial CI failures.
+async fn configure_hooks(worktree_path: &Path) -> Result<()> {
+    let githooks_dir = worktree_path.join(".githooks");
+    if !githooks_dir.is_dir() {
+        return Ok(());
+    }
+
+    // Check if core.hooksPath is already set — don't overwrite existing config
+    let existing = Command::new("git")
+        .arg("-C")
+        .arg(worktree_path)
+        .arg("config")
+        .arg("core.hooksPath")
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .output()
+        .await
+        .ok();
+
+    if let Some(ref out) = existing {
+        if out.status.success() {
+            let current = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if !current.is_empty() && current != ".githooks" {
+                log::debug!(
+                    "core.hooksPath already set to '{}' in {}, skipping",
+                    current,
+                    worktree_path.display()
+                );
+                return Ok(());
+            }
+            if current == ".githooks" {
+                return Ok(());
+            }
+        }
+    }
+
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(worktree_path)
+        .arg("config")
+        .arg("core.hooksPath")
+        .arg(".githooks")
+        // Clear git env vars that may be inherited from a parent git process
+        // (e.g., pre-commit hook), which would cause git to operate on the
+        // parent repo instead of the target worktree.
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .output()
+        .await
+        .context("Failed to execute git config core.hooksPath")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("Failed to configure git hooks: {}", stderr);
+    }
+
+    log::info!(
+        "Configured core.hooksPath=.githooks in {}",
+        worktree_path.display()
+    );
     Ok(())
 }
 
@@ -568,6 +638,14 @@ impl GitRepo {
             );
         }
 
+        if let Err(e) = configure_hooks(worktree_path).await {
+            log::warn!(
+                "Failed to configure git hooks in {}: {}",
+                worktree_path.display(),
+                e
+            );
+        }
+
         Ok(())
     }
 
@@ -628,6 +706,14 @@ impl GitRepo {
                 "git worktree add failed with exit code {:?}: {}",
                 output.status.code(),
                 stderr
+            );
+        }
+
+        if let Err(e) = configure_hooks(worktree_path).await {
+            log::warn!(
+                "Failed to configure git hooks in {}: {}",
+                worktree_path.display(),
+                e
             );
         }
 
@@ -1098,6 +1184,104 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("Bare repository does not exist"));
+    }
+
+    /// Creates a git Command with GIT_DIR/GIT_WORK_TREE/GIT_INDEX_FILE cleared
+    /// so tests work correctly even when run from a pre-commit hook.
+    fn clean_git_cmd() -> Command {
+        let mut cmd = Command::new("git");
+        cmd.env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE");
+        cmd
+    }
+
+    #[tokio::test]
+    async fn test_configure_hooks_sets_hooks_path_when_githooks_exists() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let dir = temp_dir.path();
+
+        // Initialize a git repo
+        let init_output = clean_git_cmd()
+            .arg("-C")
+            .arg(dir)
+            .arg("init")
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            init_output.status.success(),
+            "git init failed: {}",
+            String::from_utf8_lossy(&init_output.stderr)
+        );
+
+        // Create .githooks directory
+        std::fs::create_dir_all(dir.join(".githooks")).unwrap();
+
+        // Run configure_hooks
+        let result = configure_hooks(dir).await;
+        assert!(result.is_ok(), "configure_hooks failed: {:?}", result);
+
+        // Verify core.hooksPath was set locally
+        let output = clean_git_cmd()
+            .arg("-C")
+            .arg(dir)
+            .arg("config")
+            .arg("--local")
+            .arg("core.hooksPath")
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git config --local core.hooksPath failed: status={:?}, stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            ".githooks",
+            "unexpected core.hooksPath value"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_configure_hooks_skips_when_no_githooks_dir() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let dir = temp_dir.path();
+
+        // Initialize a git repo (no .githooks directory)
+        let init_output = clean_git_cmd()
+            .arg("-C")
+            .arg(dir)
+            .arg("init")
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            init_output.status.success(),
+            "git init failed: {}",
+            String::from_utf8_lossy(&init_output.stderr)
+        );
+
+        // Run configure_hooks — should be a no-op
+        let result = configure_hooks(dir).await;
+        assert!(result.is_ok(), "configure_hooks failed: {:?}", result);
+
+        // Verify core.hooksPath was NOT set locally
+        let output = clean_git_cmd()
+            .arg("-C")
+            .arg(dir)
+            .arg("config")
+            .arg("--local")
+            .arg("core.hooksPath")
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            !output.status.success(),
+            "core.hooksPath should not be set locally when .githooks doesn't exist"
+        );
     }
 
     // Integration tests that actually clone a repository
