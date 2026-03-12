@@ -542,8 +542,6 @@ async fn poll_once(
     }
 
     // Check merge readiness and update label on transitions.
-    // Fetch all reviews (not just new ones) for readiness evaluation.
-    let all_reviews = get_all_reviews(owner, repo, pr_number).await?;
     *was_ready = update_readiness_label(
         owner,
         repo,
