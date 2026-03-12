@@ -90,6 +90,12 @@ enum Commands {
             help = "Agent backend to use (claude, codex). Defaults to claude."
         )]
         agent: Option<String>,
+
+        #[arg(
+            long,
+            help = "Skip PR lifecycle monitoring after PR creation (fire-and-forget mode)"
+        )]
+        no_watch: bool,
     },
     #[command(about = "Review a GitHub pull request")]
     Review {
@@ -281,16 +287,20 @@ async fn main() {
             monitor_timeout,
             force_new,
             agent,
+            no_watch,
         } => {
             let agent_name = agent.unwrap_or_else(|| agent_registry::DEFAULT_AGENT.to_string());
             fix::handle_fix(
                 &issue,
-                timeout,
-                review_timeout,
-                monitor_timeout,
-                cli.quiet,
-                force_new,
-                &agent_name,
+                fix::FixOptions {
+                    timeout,
+                    review_timeout,
+                    monitor_timeout,
+                    quiet: cli.quiet,
+                    force_new,
+                    agent_name,
+                    no_watch,
+                },
             )
             .await
         }

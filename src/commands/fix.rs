@@ -28,6 +28,16 @@ use tokio::process::Command as TokioCommand;
 use tokio::time::{timeout, Duration};
 use uuid::Uuid;
 
+pub struct FixOptions {
+    pub timeout: Option<String>,
+    pub review_timeout: Option<String>,
+    pub monitor_timeout: Option<String>,
+    pub quiet: bool,
+    pub force_new: bool,
+    pub agent_name: String,
+    pub no_watch: bool,
+}
+
 /// Maximum size of the output buffer for test detection (in bytes)
 const MAX_OUTPUT_BUFFER_SIZE: usize = 10000;
 
@@ -1542,23 +1552,16 @@ async fn monitor_ci_after_fix(
 ///
 /// If a previous session for the same issue was interrupted, it will
 /// automatically resume from the last completed phase.
-pub async fn handle_fix(
-    issue: &str,
-    timeout_opt: Option<String>,
-    review_timeout_opt: Option<String>,
-    monitor_timeout_opt: Option<String>,
-    quiet: bool,
-    force_new: bool,
-    agent_name: &str,
-) -> Result<i32> {
+pub async fn handle_fix(issue: &str, opts: FixOptions) -> Result<i32> {
     // Parse review timeout if provided
-    let review_timeout = review_timeout_opt
+    let review_timeout = opts
+        .review_timeout
         .map(|s| parse_timeout(&s))
         .transpose()
         .context("Invalid --review-timeout value")?;
 
     // Parse monitor timeout if provided; default to 24 hours
-    let monitor_timeout = match monitor_timeout_opt {
+    let monitor_timeout = match opts.monitor_timeout {
         Some(s) => {
             let d = parse_timeout(&s).context("Invalid --monitor-timeout value")?;
             if d.is_zero() {
@@ -1569,19 +1572,25 @@ pub async fn handle_fix(
         None => Duration::from_secs(24 * 3600),
     };
 
+    let timeout_opt = opts.timeout;
+    let quiet = opts.quiet;
+    let force_new = opts.force_new;
+    let agent_name = opts.agent_name;
+    let no_watch = opts.no_watch;
+
     // Phase 1: Resolve issue (always runs - need fresh issue details)
     let issue_ctx = resolve_issue(issue).await?;
 
     // Validate agent name and create backend early (fail fast on unknown agents)
-    let backend = agent_registry::resolve_backend(agent_name)?;
+    let backend = agent_registry::resolve_backend(&agent_name)?;
 
     // Determine whether to resume an existing session or start fresh
     let (wt_ctx, resume_phase) = if force_new {
-        (setup_worktree(&issue_ctx, agent_name).await?, None)
+        (setup_worktree(&issue_ctx, &agent_name).await?, None)
     } else {
         match check_existing_minions(&issue_ctx.owner, &issue_ctx.repo, issue_ctx.issue_num).await?
         {
-            ExistingMinionCheck::None => (setup_worktree(&issue_ctx, agent_name).await?, None),
+            ExistingMinionCheck::None => (setup_worktree(&issue_ctx, &agent_name).await?, None),
             ExistingMinionCheck::Resumable(minion_id, info) => {
                 let phase = info.orchestration_phase.clone();
                 println!(
@@ -1722,17 +1731,24 @@ pub async fn handle_fix(
 
     // Phase 5: Monitor PR lifecycle (review + polling)
     if let Some(ref pr_num) = pr_number {
-        update_orchestration_phase(&wt_ctx.minion_id, OrchestrationPhase::MonitoringPr).await;
-        monitor_pr_lifecycle(
-            &*backend,
-            &issue_ctx,
-            &wt_ctx,
-            pr_num,
-            timeout_opt.as_deref(),
-            review_timeout,
-            monitor_timeout,
-        )
-        .await;
+        if no_watch {
+            println!(
+                "PR #{} created. Skipping lifecycle monitoring (--no-watch).",
+                pr_num
+            );
+        } else {
+            update_orchestration_phase(&wt_ctx.minion_id, OrchestrationPhase::MonitoringPr).await;
+            monitor_pr_lifecycle(
+                &*backend,
+                &issue_ctx,
+                &wt_ctx,
+                pr_num,
+                timeout_opt.as_deref(),
+                review_timeout,
+                monitor_timeout,
+            )
+            .await;
+        }
     }
 
     // CI monitoring
