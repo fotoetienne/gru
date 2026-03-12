@@ -134,9 +134,15 @@ pub async fn handle_resume(
         session_id: session_uuid,
     };
 
-    // Update orchestration phase
     // Resolve the agent backend from registry (use stored agent name)
-    let backend = agent_registry::resolve_backend(&agent_name)?;
+    let backend = match agent_registry::resolve_backend(&agent_name) {
+        Ok(b) => b,
+        Err(e) => {
+            // Revert registry to Stopped since we claimed Autonomous but can't proceed
+            revert_to_stopped(&minion.minion_id).await;
+            return Err(e.context("Failed to resolve agent backend for resume"));
+        }
+    };
 
     update_orchestration_phase(&minion.minion_id, OrchestrationPhase::RunningAgent).await;
 
