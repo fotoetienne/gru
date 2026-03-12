@@ -1,4 +1,5 @@
 pub mod attach;
+pub mod chat;
 pub mod clean;
 pub mod fix;
 pub mod init;
