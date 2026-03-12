@@ -124,6 +124,7 @@ async fn gh_api_with_retry(repo: &str, args: &[&str], max_retries: u32) -> Resul
 struct PullRequest {
     state: String,
     merged: bool,
+    draft: Option<bool>,
     head: Head,
     /// GitHub's mergeable field: true, false, or null (still computing).
     mergeable: Option<bool>,
@@ -137,6 +138,7 @@ struct Head {
 #[derive(Debug, Deserialize)]
 struct Review {
     id: u64,
+    state: Option<String>,
     submitted_at: DateTime<Utc>,
     #[allow(dead_code)]
     // Available for future use; currently only id and submitted_at are accessed
@@ -167,6 +169,7 @@ struct ApiReviewComment {
 
 #[derive(Debug, Deserialize)]
 struct CheckRun {
+    status: Option<String>,
     conclusion: Option<String>,
 }
 
@@ -179,6 +182,232 @@ fn is_failed_check(check_run: &CheckRun) -> bool {
         check_run.conclusion.as_deref(),
         Some("failure") | Some("cancelled") | Some("timed_out") | Some("action_required")
     )
+}
+
+/// Check if a CI check run is still in progress (not yet completed).
+///
+/// A check is pending when it has no conclusion yet. The `status` field is used
+/// as a secondary signal but only when `conclusion` is `None`, to avoid marking
+/// a completed-but-failed check as pending.
+fn is_pending_check(check_run: &CheckRun) -> bool {
+    check_run.conclusion.is_none()
+        && matches!(
+            check_run.status.as_deref(),
+            None | Some("queued") | Some("in_progress")
+        )
+}
+
+/// Result of a merge-readiness evaluation.
+#[derive(Debug, Clone)]
+pub struct MergeReadiness {
+    pub ready: bool,
+    pub reasons: Vec<String>,
+}
+
+/// Evaluate whether a PR is ready to merge based on CI checks, reviews, and draft status.
+fn evaluate_merge_readiness(
+    pr: &PullRequest,
+    check_runs: &[CheckRun],
+    reviews: &[Review],
+) -> MergeReadiness {
+    let mut reasons = Vec::new();
+
+    // Check draft status
+    if pr.draft.unwrap_or(false) {
+        reasons.push("PR is still a draft".to_string());
+    }
+
+    // Check CI: must have at least one check, none failed, none pending
+    if check_runs.is_empty() {
+        reasons.push("No CI checks found".to_string());
+    } else {
+        let failed = check_runs.iter().filter(|c| is_failed_check(c)).count();
+        let pending = check_runs.iter().filter(|c| is_pending_check(c)).count();
+
+        if failed > 0 {
+            reasons.push(format!("{} CI check(s) failed", failed));
+        }
+        if pending > 0 {
+            reasons.push(format!("{} CI check(s) still pending", pending));
+        }
+    }
+
+    // Check reviews: need at least one APPROVED review.
+    // Use only the latest review per reviewer to handle superseded reviews
+    // (e.g., reviewer approves, then later requests changes).
+    let mut latest_by_reviewer: std::collections::HashMap<&str, &Review> =
+        std::collections::HashMap::new();
+    for review in reviews {
+        let login = review.user.login.as_str();
+        if latest_by_reviewer
+            .get(login)
+            .map_or(true, |prev| review.submitted_at > prev.submitted_at)
+        {
+            latest_by_reviewer.insert(login, review);
+        }
+    }
+    let has_approval = latest_by_reviewer
+        .values()
+        .any(|r| r.state.as_deref() == Some("APPROVED"));
+    if !has_approval {
+        reasons.push("No approving review".to_string());
+    }
+
+    MergeReadiness {
+        ready: reasons.is_empty(),
+        reasons,
+    }
+}
+
+const READY_TO_MERGE_LABEL: &str = "ready-to-merge";
+
+/// Ensure the `ready-to-merge` label exists in the repository, creating it if needed.
+pub async fn ensure_ready_to_merge_label(owner: &str, repo: &str) -> Result<()> {
+    let repo_full = format!("{owner}/{repo}");
+    let endpoint = format!("repos/{repo_full}/labels");
+    let name_field = format!("name={READY_TO_MERGE_LABEL}");
+
+    let output = gh_api_with_retry(
+        &repo_full,
+        &[
+            "api",
+            &endpoint,
+            "-X",
+            "POST",
+            "-f",
+            &name_field,
+            "-f",
+            "color=0e8a16",
+            "-f",
+            "description=All merge-readiness checks pass",
+        ],
+        DEFAULT_MAX_RETRIES,
+    )
+    .await?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        // 422 means label already exists - that's fine (idempotent)
+        if !stderr.contains("already_exists") {
+            log::warn!("Failed to create ready-to-merge label: {}", stderr.trim());
+        }
+    }
+
+    Ok(())
+}
+
+/// Check if a PR currently has the `ready-to-merge` label.
+async fn has_ready_to_merge_label(owner: &str, repo: &str, pr_number: &str) -> Result<bool> {
+    let repo_full = format!("{owner}/{repo}");
+    let endpoint = format!("repos/{repo_full}/issues/{pr_number}/labels");
+    let output = gh_api_with_retry(&repo_full, &["api", &endpoint], DEFAULT_MAX_RETRIES).await?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("Failed to fetch labels for PR #{}: {}", pr_number, stderr);
+    }
+
+    #[derive(Deserialize)]
+    struct Label {
+        name: String,
+    }
+
+    let labels: Vec<Label> =
+        serde_json::from_slice(&output.stdout).context("Failed to parse labels JSON")?;
+    Ok(labels.iter().any(|l| l.name == READY_TO_MERGE_LABEL))
+}
+
+/// Add the `ready-to-merge` label to a PR.
+async fn add_ready_to_merge_label(owner: &str, repo: &str, pr_number: &str) -> Result<()> {
+    let repo_full = format!("{owner}/{repo}");
+    let endpoint = format!("repos/{repo_full}/issues/{pr_number}/labels");
+    let output = gh_api_with_retry(
+        &repo_full,
+        &[
+            "api",
+            &endpoint,
+            "-X",
+            "POST",
+            "-f",
+            &format!("labels[]={READY_TO_MERGE_LABEL}"),
+        ],
+        DEFAULT_MAX_RETRIES,
+    )
+    .await?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!(
+            "Failed to add ready-to-merge label to PR #{}: {}",
+            pr_number,
+            stderr
+        );
+    }
+
+    Ok(())
+}
+
+/// Remove the `ready-to-merge` label from a PR.
+async fn remove_ready_to_merge_label(owner: &str, repo: &str, pr_number: &str) -> Result<()> {
+    let repo_full = format!("{owner}/{repo}");
+    let label_encoded = READY_TO_MERGE_LABEL; // No special chars to encode
+    let endpoint = format!("repos/{repo_full}/issues/{pr_number}/labels/{label_encoded}");
+    let output = gh_api_with_retry(
+        &repo_full,
+        &["api", &endpoint, "-X", "DELETE"],
+        DEFAULT_MAX_RETRIES,
+    )
+    .await?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        // 404 means label wasn't present - that's fine (idempotent)
+        if !stderr.contains("404") && !stderr.contains("Not Found") {
+            anyhow::bail!(
+                "Failed to remove ready-to-merge label from PR #{}: {}",
+                pr_number,
+                stderr
+            );
+        }
+    }
+
+    Ok(())
+}
+
+/// Check merge readiness and update the `ready-to-merge` label accordingly.
+///
+/// Tracks transitions: adds label when becoming ready, removes when regressing.
+/// Returns the current readiness state for the caller to track.
+async fn update_readiness_label(
+    owner: &str,
+    repo: &str,
+    pr_number: &str,
+    pr: &PullRequest,
+    check_runs: &[CheckRun],
+    reviews: &[Review],
+    was_ready: bool,
+) -> bool {
+    let readiness = evaluate_merge_readiness(pr, check_runs, reviews);
+
+    if readiness.ready && !was_ready {
+        // Transition: not ready → ready
+        match add_ready_to_merge_label(owner, repo, pr_number).await {
+            Ok(()) => println!("✅ PR #{} is ready to merge", pr_number),
+            Err(e) => log::warn!("Failed to add ready-to-merge label: {}", e),
+        }
+    } else if !readiness.ready && was_ready {
+        // Transition: ready → not ready
+        let reason = readiness.reasons.join(", ");
+        match remove_ready_to_merge_label(owner, repo, pr_number).await {
+            Ok(()) => println!(
+                "⚠️  PR #{} is no longer ready to merge ({})",
+                pr_number, reason
+            ),
+            Err(e) => log::warn!("Failed to remove ready-to-merge label: {}", e),
+        }
+    }
+
+    readiness.ready
 }
 
 #[derive(Debug, Deserialize)]
@@ -211,6 +440,12 @@ pub async fn monitor_pr(
 
     let mut last_check_time = baseline.unwrap_or_else(Utc::now);
 
+    // Track merge-readiness state across polls to detect transitions.
+    // Seed from the current label state so we don't add/remove on first poll.
+    let mut was_ready = has_ready_to_merge_label(owner, repo, pr_number)
+        .await
+        .unwrap_or(false);
+
     // Register the Ctrl+C listener once to avoid signal loss between iterations
     let ctrl_c = tokio::signal::ctrl_c();
     tokio::pin!(ctrl_c);
@@ -226,7 +461,7 @@ pub async fn monitor_pr(
 
         // Race the polling iteration against Ctrl+C
         tokio::select! {
-            result = poll_once(owner, repo, pr_number, &mut last_check_time) => {
+            result = poll_once(owner, repo, pr_number, &mut last_check_time, &mut was_ready) => {
                 if let Some(monitor_result) = result? {
                     return Ok((monitor_result, last_check_time));
                 }
@@ -246,7 +481,7 @@ pub async fn monitor_pr(
     }
 }
 
-/// Perform a single polling iteration: check PR state, reviews, and CI.
+/// Perform a single polling iteration: check PR state, reviews, CI, and merge readiness.
 ///
 /// Returns `Ok(Some(result))` if an actionable event was detected,
 /// or `Ok(None)` if nothing happened and the caller should sleep and retry.
@@ -255,6 +490,7 @@ async fn poll_once(
     repo: &str,
     pr_number: &str,
     last_check_time: &mut DateTime<Utc>,
+    was_ready: &mut bool,
 ) -> Result<Option<MonitorResult>> {
     // Fetch PR state
     let pr = get_pr(owner, repo, pr_number).await?;
@@ -269,12 +505,21 @@ async fn poll_once(
         }
     }
 
+    // Fetch all reviews once, then filter for new ones to avoid a double API call.
+    // The full list is reused below for merge-readiness evaluation.
     // Check for new reviews BEFORE merge conflicts so that reviewer feedback
     // is never silently dropped when conflicts and reviews overlap.
-    let reviews = get_reviews_since(owner, repo, pr_number, *last_check_time).await?;
-    if !reviews.is_empty() {
-        // Fetch detailed comments for the new reviews
-        let comments = get_review_comments(owner, repo, pr_number, &reviews).await?;
+    let all_reviews = get_all_reviews(owner, repo, pr_number).await?;
+    let has_new_reviews = all_reviews
+        .iter()
+        .any(|r| r.submitted_at >= *last_check_time);
+    if has_new_reviews {
+        // Extract only the new reviews for comment fetching
+        let new_reviews: Vec<Review> = all_reviews
+            .into_iter()
+            .filter(|r| r.submitted_at >= *last_check_time)
+            .collect();
+        let comments = get_review_comments(owner, repo, pr_number, &new_reviews).await?;
         // Advance past these reviews so they are not re-fetched if the caller
         // passes the returned last_check_time back as the next baseline.
         *last_check_time = Utc::now();
@@ -295,6 +540,20 @@ async fn poll_once(
     if failed_checks > 0 {
         return Ok(Some(MonitorResult::FailedChecks(failed_checks)));
     }
+
+    // Check merge readiness and update label on transitions.
+    // Fetch all reviews (not just new ones) for readiness evaluation.
+    let all_reviews = get_all_reviews(owner, repo, pr_number).await?;
+    *was_ready = update_readiness_label(
+        owner,
+        repo,
+        pr_number,
+        &pr,
+        &check_runs,
+        &all_reviews,
+        *was_ready,
+    )
+    .await;
 
     // Update last check time
     *last_check_time = Utc::now();
@@ -352,24 +611,6 @@ async fn get_all_reviews(owner: &str, repo: &str, pr_number: &str) -> Result<Vec
         serde_json::from_slice(&output.stdout).context("Failed to parse reviews JSON response")?;
 
     Ok(reviews)
-}
-
-/// Fetch reviews submitted after a given time
-async fn get_reviews_since(
-    owner: &str,
-    repo: &str,
-    pr_number: &str,
-    since: DateTime<Utc>,
-) -> Result<Vec<Review>> {
-    let reviews = get_all_reviews(owner, repo, pr_number).await?;
-
-    // Filter to reviews submitted at or after 'since' (use >= to avoid missing exact timestamps)
-    let new_reviews: Vec<Review> = reviews
-        .into_iter()
-        .filter(|r| r.submitted_at >= since)
-        .collect();
-
-    Ok(new_reviews)
 }
 
 /// Fetch review comments for specific reviews with retry logic for transient failures
@@ -912,84 +1153,62 @@ mod tests {
     // ========================================================================
     // These tests use the shared is_failed_check function from production code
 
+    /// Helper to create a CheckRun with only a conclusion (status defaults to None)
+    fn make_check(conclusion: Option<&str>) -> CheckRun {
+        CheckRun {
+            status: None,
+            conclusion: conclusion.map(|s| s.to_string()),
+        }
+    }
+
     #[test]
     fn test_failed_check_detection_failure() {
-        let check = CheckRun {
-            conclusion: Some("failure".to_string()),
-        };
-        assert!(is_failed_check(&check));
+        assert!(is_failed_check(&make_check(Some("failure"))));
     }
 
     #[test]
     fn test_failed_check_detection_cancelled() {
-        let check = CheckRun {
-            conclusion: Some("cancelled".to_string()),
-        };
-        assert!(is_failed_check(&check));
+        assert!(is_failed_check(&make_check(Some("cancelled"))));
     }
 
     #[test]
     fn test_failed_check_detection_timed_out() {
-        let check = CheckRun {
-            conclusion: Some("timed_out".to_string()),
-        };
-        assert!(is_failed_check(&check));
+        assert!(is_failed_check(&make_check(Some("timed_out"))));
     }
 
     #[test]
     fn test_failed_check_detection_action_required() {
-        let check = CheckRun {
-            conclusion: Some("action_required".to_string()),
-        };
-        assert!(is_failed_check(&check));
+        assert!(is_failed_check(&make_check(Some("action_required"))));
     }
 
     #[test]
     fn test_successful_check_not_counted_as_failure() {
-        let check = CheckRun {
-            conclusion: Some("success".to_string()),
-        };
-        assert!(!is_failed_check(&check));
+        assert!(!is_failed_check(&make_check(Some("success"))));
     }
 
     #[test]
     fn test_skipped_check_not_counted_as_failure() {
-        let check = CheckRun {
-            conclusion: Some("skipped".to_string()),
-        };
-        assert!(!is_failed_check(&check));
+        assert!(!is_failed_check(&make_check(Some("skipped"))));
     }
 
     #[test]
     fn test_neutral_check_not_counted_as_failure() {
-        let check = CheckRun {
-            conclusion: Some("neutral".to_string()),
-        };
-        assert!(!is_failed_check(&check));
+        assert!(!is_failed_check(&make_check(Some("neutral"))));
     }
 
     #[test]
     fn test_in_progress_check_not_counted_as_failure() {
-        let check = CheckRun { conclusion: None };
-        assert!(!is_failed_check(&check));
+        assert!(!is_failed_check(&make_check(None)));
     }
 
     #[test]
     fn test_multiple_checks_mixed_results() {
         let checks = [
-            CheckRun {
-                conclusion: Some("success".to_string()),
-            },
-            CheckRun {
-                conclusion: Some("failure".to_string()),
-            },
-            CheckRun { conclusion: None },
-            CheckRun {
-                conclusion: Some("cancelled".to_string()),
-            },
-            CheckRun {
-                conclusion: Some("success".to_string()),
-            },
+            make_check(Some("success")),
+            make_check(Some("failure")),
+            make_check(None),
+            make_check(Some("cancelled")),
+            make_check(Some("success")),
         ];
         let failed_count = checks.iter().filter(|c| is_failed_check(c)).count();
         assert_eq!(failed_count, 2); // failure + cancelled
@@ -998,18 +1217,10 @@ mod tests {
     #[test]
     fn test_all_failure_states_detected() {
         let checks = [
-            CheckRun {
-                conclusion: Some("failure".to_string()),
-            },
-            CheckRun {
-                conclusion: Some("cancelled".to_string()),
-            },
-            CheckRun {
-                conclusion: Some("timed_out".to_string()),
-            },
-            CheckRun {
-                conclusion: Some("action_required".to_string()),
-            },
+            make_check(Some("failure")),
+            make_check(Some("cancelled")),
+            make_check(Some("timed_out")),
+            make_check(Some("action_required")),
         ];
         assert!(checks.iter().all(is_failed_check));
     }
@@ -1025,7 +1236,7 @@ mod tests {
     // Review Timestamp Filtering Tests
     // ========================================================================
 
-    /// Helper to filter reviews by timestamp (mirrors get_reviews_since logic)
+    /// Helper to filter reviews by timestamp
     fn filter_reviews_since(reviews: Vec<Review>, since: DateTime<Utc>) -> Vec<Review> {
         reviews
             .into_iter()
@@ -1036,6 +1247,7 @@ mod tests {
     fn make_review(id: u64, timestamp: &str) -> Review {
         Review {
             id,
+            state: None,
             submitted_at: timestamp.parse().unwrap(),
             user: User {
                 login: "reviewer".to_string(),
@@ -1303,5 +1515,271 @@ mod tests {
 
         let pr: PullRequest = serde_json::from_str(json).unwrap();
         assert_eq!(pr.mergeable, None);
+    }
+
+    // ========================================================================
+    // Merge Readiness Tests
+    // ========================================================================
+
+    fn make_pr(draft: bool) -> PullRequest {
+        PullRequest {
+            state: "open".to_string(),
+            merged: false,
+            draft: Some(draft),
+            head: Head {
+                sha: "abc123".to_string(),
+            },
+            mergeable: Some(true),
+        }
+    }
+
+    fn make_approved_review(id: u64) -> Review {
+        Review {
+            id,
+            state: Some("APPROVED".to_string()),
+            submitted_at: "2024-06-15T10:00:00Z".parse().unwrap(),
+            user: User {
+                login: "reviewer".to_string(),
+            },
+        }
+    }
+
+    fn make_changes_requested_review(id: u64) -> Review {
+        Review {
+            id,
+            state: Some("CHANGES_REQUESTED".to_string()),
+            submitted_at: "2024-06-15T10:00:00Z".parse().unwrap(),
+            user: User {
+                login: "reviewer".to_string(),
+            },
+        }
+    }
+
+    fn make_completed_check(conclusion: &str) -> CheckRun {
+        CheckRun {
+            status: Some("completed".to_string()),
+            conclusion: Some(conclusion.to_string()),
+        }
+    }
+
+    #[test]
+    fn test_merge_readiness_all_conditions_met() {
+        let pr = make_pr(false);
+        let checks = vec![make_completed_check("success")];
+        let reviews = vec![make_approved_review(1)];
+
+        let result = evaluate_merge_readiness(&pr, &checks, &reviews);
+        assert!(result.ready);
+        assert!(result.reasons.is_empty());
+    }
+
+    #[test]
+    fn test_merge_readiness_draft_pr_not_ready() {
+        let pr = make_pr(true);
+        let checks = vec![make_completed_check("success")];
+        let reviews = vec![make_approved_review(1)];
+
+        let result = evaluate_merge_readiness(&pr, &checks, &reviews);
+        assert!(!result.ready);
+        assert!(result.reasons.iter().any(|r| r.contains("draft")));
+    }
+
+    #[test]
+    fn test_merge_readiness_no_checks_not_ready() {
+        let pr = make_pr(false);
+        let checks: Vec<CheckRun> = vec![];
+        let reviews = vec![make_approved_review(1)];
+
+        let result = evaluate_merge_readiness(&pr, &checks, &reviews);
+        assert!(!result.ready);
+        assert!(result.reasons.iter().any(|r| r.contains("No CI checks")));
+    }
+
+    #[test]
+    fn test_merge_readiness_failed_checks_not_ready() {
+        let pr = make_pr(false);
+        let checks = vec![
+            make_completed_check("success"),
+            make_completed_check("failure"),
+        ];
+        let reviews = vec![make_approved_review(1)];
+
+        let result = evaluate_merge_readiness(&pr, &checks, &reviews);
+        assert!(!result.ready);
+        assert!(result.reasons.iter().any(|r| r.contains("failed")));
+    }
+
+    #[test]
+    fn test_merge_readiness_pending_checks_not_ready() {
+        let pr = make_pr(false);
+        let checks = vec![make_completed_check("success"), make_check(None)];
+        let reviews = vec![make_approved_review(1)];
+
+        let result = evaluate_merge_readiness(&pr, &checks, &reviews);
+        assert!(!result.ready);
+        assert!(result.reasons.iter().any(|r| r.contains("pending")));
+    }
+
+    #[test]
+    fn test_merge_readiness_no_approval_not_ready() {
+        let pr = make_pr(false);
+        let checks = vec![make_completed_check("success")];
+        let reviews = vec![make_changes_requested_review(1)];
+
+        let result = evaluate_merge_readiness(&pr, &checks, &reviews);
+        assert!(!result.ready);
+        assert!(result.reasons.iter().any(|r| r.contains("approving")));
+    }
+
+    #[test]
+    fn test_merge_readiness_no_reviews_not_ready() {
+        let pr = make_pr(false);
+        let checks = vec![make_completed_check("success")];
+        let reviews: Vec<Review> = vec![];
+
+        let result = evaluate_merge_readiness(&pr, &checks, &reviews);
+        assert!(!result.ready);
+        assert!(result.reasons.iter().any(|r| r.contains("approving")));
+    }
+
+    #[test]
+    fn test_merge_readiness_multiple_issues() {
+        let pr = make_pr(true); // draft
+        let checks: Vec<CheckRun> = vec![]; // no checks
+        let reviews: Vec<Review> = vec![]; // no reviews
+
+        let result = evaluate_merge_readiness(&pr, &checks, &reviews);
+        assert!(!result.ready);
+        assert_eq!(result.reasons.len(), 3);
+    }
+
+    #[test]
+    fn test_merge_readiness_skipped_checks_ok() {
+        let pr = make_pr(false);
+        let checks = vec![
+            make_completed_check("success"),
+            make_completed_check("skipped"),
+        ];
+        let reviews = vec![make_approved_review(1)];
+
+        let result = evaluate_merge_readiness(&pr, &checks, &reviews);
+        assert!(result.ready);
+    }
+
+    #[test]
+    fn test_merge_readiness_neutral_checks_ok() {
+        let pr = make_pr(false);
+        let checks = vec![
+            make_completed_check("success"),
+            make_completed_check("neutral"),
+        ];
+        let reviews = vec![make_approved_review(1)];
+
+        let result = evaluate_merge_readiness(&pr, &checks, &reviews);
+        assert!(result.ready);
+    }
+
+    #[test]
+    fn test_pending_check_detection() {
+        // No conclusion = pending
+        let check = make_check(None);
+        assert!(is_pending_check(&check));
+
+        // Queued status = pending
+        let check = CheckRun {
+            status: Some("queued".to_string()),
+            conclusion: None,
+        };
+        assert!(is_pending_check(&check));
+
+        // In progress status = pending
+        let check = CheckRun {
+            status: Some("in_progress".to_string()),
+            conclusion: None,
+        };
+        assert!(is_pending_check(&check));
+
+        // Completed with success = not pending
+        let check = make_completed_check("success");
+        assert!(!is_pending_check(&check));
+
+        // Completed with failure = not pending (even if status says in_progress)
+        let check = CheckRun {
+            status: Some("in_progress".to_string()),
+            conclusion: Some("failure".to_string()),
+        };
+        assert!(!is_pending_check(&check));
+    }
+
+    #[test]
+    fn test_merge_readiness_superseded_approval() {
+        // Reviewer approves first, then requests changes - should NOT be ready
+        let pr = make_pr(false);
+        let checks = vec![make_completed_check("success")];
+        let reviews = vec![
+            Review {
+                id: 1,
+                state: Some("APPROVED".to_string()),
+                submitted_at: "2024-06-15T10:00:00Z".parse().unwrap(),
+                user: User {
+                    login: "alice".to_string(),
+                },
+            },
+            Review {
+                id: 2,
+                state: Some("CHANGES_REQUESTED".to_string()),
+                submitted_at: "2024-06-15T11:00:00Z".parse().unwrap(),
+                user: User {
+                    login: "alice".to_string(),
+                },
+            },
+        ];
+
+        let result = evaluate_merge_readiness(&pr, &checks, &reviews);
+        assert!(!result.ready);
+        assert!(result.reasons.iter().any(|r| r.contains("approving")));
+    }
+
+    #[test]
+    fn test_merge_readiness_multiple_reviewers_one_approves() {
+        // Two reviewers: alice approves, bob requests changes - should be ready
+        // (at least one approval from latest reviews)
+        let pr = make_pr(false);
+        let checks = vec![make_completed_check("success")];
+        let reviews = vec![
+            Review {
+                id: 1,
+                state: Some("APPROVED".to_string()),
+                submitted_at: "2024-06-15T10:00:00Z".parse().unwrap(),
+                user: User {
+                    login: "alice".to_string(),
+                },
+            },
+            Review {
+                id: 2,
+                state: Some("CHANGES_REQUESTED".to_string()),
+                submitted_at: "2024-06-15T10:00:00Z".parse().unwrap(),
+                user: User {
+                    login: "bob".to_string(),
+                },
+            },
+        ];
+
+        let result = evaluate_merge_readiness(&pr, &checks, &reviews);
+        assert!(result.ready);
+    }
+
+    #[test]
+    fn test_merge_readiness_steady_state_ready() {
+        // Already ready, still ready - should remain ready
+        let pr = make_pr(false);
+        let checks = vec![make_completed_check("success")];
+        let reviews = vec![make_approved_review(1)];
+
+        let result = evaluate_merge_readiness(&pr, &checks, &reviews);
+        assert!(result.ready);
+        // Calling again should still be ready
+        let result2 = evaluate_merge_readiness(&pr, &checks, &reviews);
+        assert!(result2.ready);
     }
 }

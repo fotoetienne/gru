@@ -1210,6 +1210,12 @@ async fn monitor_pr_lifecycle(
     monitor_timeout: Duration,
     backend: &dyn AgentBackend,
 ) {
+    // Ensure the ready-to-merge label exists in the repo
+    if let Err(e) = pr_monitor::ensure_ready_to_merge_label(&issue_ctx.owner, &issue_ctx.repo).await
+    {
+        log::warn!("⚠️  Failed to ensure ready-to-merge label: {}", e);
+    }
+
     // Auto-trigger review for Minion-created PRs
     println!("\n🔍 Starting automated PR review...");
     match trigger_pr_review(pr_number, &wt_ctx.checkout_path, review_timeout).await {
