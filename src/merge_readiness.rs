@@ -70,9 +70,12 @@ pub async fn check_merge_readiness(
     )?;
 
     // Sequential: needs head SHA from get_pr_details above
-    let check_runs = get_check_runs(owner, repo, &pr.head_sha).await?;
+    let (check_runs, combined_status) = tokio::try_join!(
+        get_check_runs(owner, repo, &pr.head_sha),
+        get_combined_status(owner, repo, &pr.head_sha),
+    )?;
 
-    let ci_passing = evaluate_ci(&check_runs);
+    let ci_passing = evaluate_ci(&check_runs) && evaluate_combined_status(&combined_status);
     let review_approved = evaluate_reviews(&reviews);
     let no_conflicts = pr.mergeable == Some(true);
     let no_unresolved_threads = unresolved_count == 0;
@@ -120,6 +123,14 @@ struct ReviewUser {
 struct CheckRun {
     conclusion: Option<String>,
     status: Option<String>,
+}
+
+/// Combined commit status from the legacy Statuses API.
+#[derive(Debug, Deserialize)]
+struct CombinedStatus {
+    /// One of: success, pending, failure, error
+    state: String,
+    total_count: u64,
 }
 
 // GraphQL response types for review threads
@@ -312,6 +323,18 @@ async fn get_check_runs(owner: &str, repo: &str, sha: &str) -> Result<Vec<CheckR
     Ok(check_runs)
 }
 
+/// Fetch the combined commit status (legacy Statuses API) for a given SHA.
+async fn get_combined_status(owner: &str, repo: &str, sha: &str) -> Result<CombinedStatus> {
+    let repo_full = format!("{owner}/{repo}");
+    let endpoint = format!("repos/{repo_full}/commits/{sha}/status");
+    let output = gh_api_with_retry(&repo_full, &["api", &endpoint], DEFAULT_MAX_RETRIES).await?;
+
+    let status: CombinedStatus =
+        serde_json::from_slice(&output.stdout).context("Failed to parse combined status JSON")?;
+
+    Ok(status)
+}
+
 async fn get_unresolved_thread_count(owner: &str, repo: &str, pr_number: u64) -> Result<usize> {
     let repo_full = format!("{owner}/{repo}");
     // Use GraphQL variables to avoid injection via owner/repo strings
@@ -387,8 +410,9 @@ async fn get_unresolved_thread_count(owner: &str, repo: &str, pr_number: u64) ->
 
 // --- Evaluation logic (pure functions, easy to test) ---
 
-/// CI passes when every check run is complete with `success` or `skipped`.
+/// Check Runs API: passes when every check run is complete with `success` or `skipped`.
 /// Any pending/in-progress run or a failing conclusion means CI is not passing.
+/// Returns `true` when no check runs exist (repo may use only legacy statuses).
 fn evaluate_ci(check_runs: &[CheckRun]) -> bool {
     if check_runs.is_empty() {
         // No checks configured — treat as passing
@@ -402,6 +426,16 @@ fn evaluate_ci(check_runs: &[CheckRun]) -> bool {
         }
         matches!(cr.conclusion.as_deref(), Some("success") | Some("skipped"))
     })
+}
+
+/// Legacy Statuses API: passes when the combined state is `success`, or when
+/// no statuses exist (total_count == 0). Repos using only Check Runs will have
+/// total_count == 0 here, which is fine since `evaluate_ci` covers those.
+fn evaluate_combined_status(status: &CombinedStatus) -> bool {
+    if status.total_count == 0 {
+        return true;
+    }
+    status.state == "success"
 }
 
 /// Reviews pass when there is at least one APPROVED review and no outstanding
@@ -551,6 +585,54 @@ mod tests {
     #[test]
     fn test_ci_no_checks() {
         assert!(evaluate_ci(&[]));
+    }
+
+    // --- evaluate_combined_status tests ---
+
+    #[test]
+    fn test_combined_status_success() {
+        let status = CombinedStatus {
+            state: "success".into(),
+            total_count: 2,
+        };
+        assert!(evaluate_combined_status(&status));
+    }
+
+    #[test]
+    fn test_combined_status_pending() {
+        let status = CombinedStatus {
+            state: "pending".into(),
+            total_count: 1,
+        };
+        assert!(!evaluate_combined_status(&status));
+    }
+
+    #[test]
+    fn test_combined_status_failure() {
+        let status = CombinedStatus {
+            state: "failure".into(),
+            total_count: 3,
+        };
+        assert!(!evaluate_combined_status(&status));
+    }
+
+    #[test]
+    fn test_combined_status_error() {
+        let status = CombinedStatus {
+            state: "error".into(),
+            total_count: 1,
+        };
+        assert!(!evaluate_combined_status(&status));
+    }
+
+    #[test]
+    fn test_combined_status_no_statuses() {
+        // No legacy statuses configured — pass through (check runs cover CI)
+        let status = CombinedStatus {
+            state: "pending".into(),
+            total_count: 0,
+        };
+        assert!(evaluate_combined_status(&status));
     }
 
     // --- evaluate_reviews tests ---
