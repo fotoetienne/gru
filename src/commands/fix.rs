@@ -1145,6 +1145,7 @@ async fn monitor_pr_lifecycle(
 
     let monitor_start = tokio::time::Instant::now();
     let mut review_round = 0;
+    let mut ci_escalated = false;
     loop {
         // Compute remaining time so the timeout spans the entire lifecycle,
         // not just a single monitor_pr invocation.
@@ -1238,16 +1239,62 @@ async fn monitor_pr_lifecycle(
                 }
             }
             Ok(MonitorResult::FailedChecks(count)) => {
+                if ci_escalated {
+                    // Already escalated — wait for human intervention
+                    println!(
+                        "ℹ️  CI still failing ({} check(s)) on PR #{}, waiting for human fix",
+                        count, pr_number
+                    );
+                    // Continue monitoring for merge/close/review events
+                    continue;
+                }
+
                 println!(
-                    "❌ Detected {} failed CI check(s) on PR #{}",
+                    "❌ Detected {} failed CI check(s) on PR #{}, attempting auto-fix...",
                     count, pr_number
                 );
-                println!(
-                    "   Review the checks at: https://github.com/{}/{}/pull/{}/checks",
-                    issue_ctx.owner, issue_ctx.repo, pr_number
-                );
-                println!("   Fix issues and push updates to the branch");
-                break;
+
+                // Parse pr_number for the CI fix API
+                let pr_num_u64 = match pr_number.parse::<u64>() {
+                    Ok(n) => n,
+                    Err(_) => {
+                        println!("⚠️  Could not parse PR number, skipping CI auto-fix");
+                        println!("🔄 Continuing to monitor PR for other events...\n");
+                        continue;
+                    }
+                };
+
+                match ci::monitor_and_fix_ci(
+                    &issue_ctx.owner,
+                    &issue_ctx.repo,
+                    pr_num_u64,
+                    &wt_ctx.branch_name,
+                    &wt_ctx.checkout_path,
+                )
+                .await
+                {
+                    Ok(true) => {
+                        println!("✅ CI checks now pass after auto-fix");
+                        println!("🔄 Continuing to monitor PR...\n");
+                    }
+                    Ok(false) => {
+                        ci_escalated = true;
+                        println!("⚠️  CI auto-fix escalated to human after max attempts");
+                        println!(
+                            "   Review the checks at: https://github.com/{}/{}/pull/{}/checks",
+                            issue_ctx.owner, issue_ctx.repo, pr_number
+                        );
+                        println!("🔄 Continuing to monitor PR for other events...\n");
+                    }
+                    Err(e) => {
+                        println!("⚠️  CI auto-fix error: {}", e);
+                        println!(
+                            "   Review the checks at: https://github.com/{}/{}/pull/{}/checks",
+                            issue_ctx.owner, issue_ctx.repo, pr_number
+                        );
+                        println!("🔄 Will retry CI auto-fix on subsequent monitoring cycles...\n");
+                    }
+                }
             }
             Ok(MonitorResult::Timeout) => {
                 // Use the lifecycle-level start time for an accurate total elapsed display

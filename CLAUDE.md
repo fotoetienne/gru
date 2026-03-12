@@ -237,7 +237,7 @@ Located in `.claude/skills/`:
 
 ### Error Handling
 - Retry with exponential backoff for transient failures
-- CI auto-fix: max 3 attempts (`MAX_FIX_ATTEMPTS` in `ci.rs`), then escalate
+- CI auto-fix: max 2 attempts (`MAX_CI_FIX_ATTEMPTS` in `ci.rs`), then escalate
 - PR monitor API retries: max 5 attempts (`DEFAULT_MAX_RETRIES` in `pr_monitor.rs`)
 - Escalate via comments with `minion:blocked` label
 - CI failures analyzed and auto-fixed when possible
