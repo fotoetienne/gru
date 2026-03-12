@@ -21,6 +21,7 @@ use uuid::Uuid;
 ///
 /// Implements `AgentBackend` by spawning `codex exec --json --full-auto`
 /// and parsing the resulting JSONL event stream.
+#[derive(Default)]
 pub struct CodexBackend;
 
 impl CodexBackend {
@@ -188,6 +189,10 @@ fn parse_codex_event(line: &str) -> Option<AgentEvent> {
         }
 
         "turn.failed" => {
+            // Codex may nest error info in the top-level `error` field (same
+            // shape as `"type":"error"` events) or in a turn-specific field.
+            // We try `error.message` first; if absent, fall back to a generic message.
+            // TODO: verify against real Codex output once available.
             let message = event
                 .error
                 .and_then(|e| e.message)
