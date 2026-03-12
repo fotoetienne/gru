@@ -71,9 +71,14 @@ pub async fn handle_chat(repo_flag: Option<String>, verbose: bool) -> Result<i32
 async fn detect_project_context(repo_flag: Option<String>) -> Option<(PathBuf, String, String)> {
     // If --repo flag provided as owner/repo, use CWD with that context
     if let Some(repo) = repo_flag {
-        if let Some((owner, name)) = repo.split_once('/') {
-            let cwd = std::env::current_dir().ok()?;
-            return Some((cwd, owner.to_string(), name.to_string()));
+        match repo.split_once('/') {
+            Some((owner, name)) => {
+                let cwd = std::env::current_dir().ok()?;
+                return Some((cwd, owner.to_string(), name.to_string()));
+            }
+            None => {
+                log::warn!("Ignoring --repo '{}': expected 'owner/repo' format", repo);
+            }
         }
     }
 
@@ -111,10 +116,17 @@ async fn build_in_repo_prompt(repo_root: &Path, owner: &str, repo_name: &str) ->
 
     if let Some(claude_md_content) = claude_md {
         prompt.push_str("\n\nProject context (from CLAUDE.md):\n");
-        // Truncate very large CLAUDE.md to avoid exceeding prompt limits
+        // Truncate very large CLAUDE.md to avoid exceeding prompt limits.
+        // Use floor_char_boundary to avoid splitting multi-byte UTF-8 characters.
         let max_len = 8000;
         if claude_md_content.len() > max_len {
-            prompt.push_str(&claude_md_content[..max_len]);
+            // Find the last valid UTF-8 char boundary at or before max_len.
+            // Can't use str::floor_char_boundary (requires Rust 1.91, MSRV is 1.73).
+            let mut boundary = max_len;
+            while boundary > 0 && !claude_md_content.is_char_boundary(boundary) {
+                boundary -= 1;
+            }
+            prompt.push_str(&claude_md_content[..boundary]);
             prompt.push_str("\n\n[CLAUDE.md truncated — read the full file for more details]");
         } else {
             prompt.push_str(&claude_md_content);
@@ -155,6 +167,8 @@ fn signal_child(child: &mut tokio::process::Child) {
     #[cfg(unix)]
     {
         if let Some(pid) = child.id() {
+            // SAFETY: kill with SIGTERM is safe — it requests graceful termination.
+            // The PID was just obtained from the child handle.
             unsafe {
                 libc::kill(pid as i32, libc::SIGTERM);
             }
@@ -213,13 +227,14 @@ mod tests {
         let tmp = std::env::temp_dir().join("gru-chat-test-truncate");
         let _ = tokio::fs::create_dir_all(&tmp).await;
         let claude_md = tmp.join("CLAUDE.md");
-        let large_content = "x".repeat(10000);
+        // Use multi-byte UTF-8 characters (emoji) to verify char-boundary-safe truncation
+        let large_content = "🦀".repeat(3000); // 3000 × 4 bytes = 12000 bytes
         tokio::fs::write(&claude_md, &large_content).await.unwrap();
 
         let prompt = build_in_repo_prompt(&tmp, "owner", "repo").await;
         assert!(prompt.contains("[CLAUDE.md truncated"));
-        // Should not contain the full 10000 chars
-        assert!(prompt.len() < 10000 + 500); // prompt overhead + truncated content
+        // Verify we didn't panic on a multi-byte boundary
+        assert!(prompt.len() < 12000 + 500);
 
         let _ = tokio::fs::remove_dir_all(&tmp).await;
     }
@@ -234,11 +249,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_detect_project_context_no_repo() {
-        // When run in /tmp (not a git repo), should return None
-        let result = detect_project_context(None).await;
-        // This may or may not be None depending on whether /tmp is in a git repo
-        // Just verify it doesn't panic
-        let _ = result;
+    async fn test_detect_project_context_with_repo_flag() {
+        let result = detect_project_context(Some("myowner/myrepo".to_string())).await;
+        let (_, owner, repo) = result.expect("--repo flag should produce context");
+        assert_eq!(owner, "myowner");
+        assert_eq!(repo, "myrepo");
+    }
+
+    #[tokio::test]
+    async fn test_detect_project_context_invalid_repo_flag() {
+        // Invalid format (no slash) should fall through to git detection
+        // which will likely fail in a test environment — just verify no panic
+        let _ = detect_project_context(Some("noslash".to_string())).await;
     }
 }
