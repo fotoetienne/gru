@@ -155,7 +155,7 @@ pub async fn handle_review(pr_arg: Option<String>) -> Result<i32> {
         pid: None,
         mode: MinionMode::Autonomous,
         last_activity: now,
-        orchestration_phase: OrchestrationPhase::RunningClaude,
+        orchestration_phase: OrchestrationPhase::RunningAgent,
         token_usage: None,
         agent_backend: DEFAULT_AGENT_NAME.to_string(),
     };

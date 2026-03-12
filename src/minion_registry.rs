@@ -66,7 +66,8 @@ impl std::fmt::Display for MinionMode {
 /// Used to resume interrupted sessions from the correct phase.
 ///
 /// Variant order matters: derives `PartialOrd`/`Ord` so earlier phases compare
-/// less than later ones (e.g., `Setup < RunningClaude < CreatingPr`).
+/// less than later ones (e.g., `Setup < RunningAgent < CreatingPr`).
+/// Note: `running_claude` is accepted as a legacy alias for `running_agent`.
 /// `Failed` sorts last since it is a terminal state.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
@@ -74,9 +75,10 @@ pub enum OrchestrationPhase {
     /// Initial state - worktree setup in progress or not started
     #[default]
     Setup,
-    /// Worktree created, Claude session running
-    RunningClaude,
-    /// Claude completed, PR creation in progress
+    /// Worktree created, agent session running
+    #[serde(alias = "running_claude")]
+    RunningAgent,
+    /// Agent completed, PR creation in progress
     CreatingPr,
     /// PR created, monitoring lifecycle (reviews, CI)
     MonitoringPr,
@@ -820,8 +822,8 @@ mod tests {
         let setup = serde_json::to_string(&OrchestrationPhase::Setup).unwrap();
         assert_eq!(setup, r#""setup""#);
 
-        let running = serde_json::to_string(&OrchestrationPhase::RunningClaude).unwrap();
-        assert_eq!(running, r#""running_claude""#);
+        let running = serde_json::to_string(&OrchestrationPhase::RunningAgent).unwrap();
+        assert_eq!(running, r#""running_agent""#);
 
         let creating_pr = serde_json::to_string(&OrchestrationPhase::CreatingPr).unwrap();
         assert_eq!(creating_pr, r#""creating_pr""#);
@@ -835,9 +837,11 @@ mod tests {
         let failed = serde_json::to_string(&OrchestrationPhase::Failed).unwrap();
         assert_eq!(failed, r#""failed""#);
 
-        // Verify deserialization
+        // Verify deserialization of both old and new names
+        let phase: OrchestrationPhase = serde_json::from_str(r#""running_agent""#).unwrap();
+        assert_eq!(phase, OrchestrationPhase::RunningAgent);
         let phase: OrchestrationPhase = serde_json::from_str(r#""running_claude""#).unwrap();
-        assert_eq!(phase, OrchestrationPhase::RunningClaude);
+        assert_eq!(phase, OrchestrationPhase::RunningAgent);
     }
 
     #[test]
@@ -850,7 +854,7 @@ mod tests {
         let temp_dir = tempdir().unwrap();
 
         let info = MinionInfo {
-            orchestration_phase: OrchestrationPhase::RunningClaude,
+            orchestration_phase: OrchestrationPhase::RunningAgent,
             ..test_minion_info()
         };
 
@@ -865,7 +869,7 @@ mod tests {
             let retrieved = registry.get("M001").unwrap();
             assert_eq!(
                 retrieved.orchestration_phase,
-                OrchestrationPhase::RunningClaude
+                OrchestrationPhase::RunningAgent
             );
         }
     }
