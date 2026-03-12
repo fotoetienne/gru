@@ -1,10 +1,10 @@
 use crate::agent::{AgentBackend, AgentEvent};
+use crate::agent_registry::{AgentRegistry, DEFAULT_AGENT_NAME};
 use crate::agent_runner::{
     is_stuck_or_timeout_error, parse_timeout, run_agent_with_stream_monitoring,
     EXIT_CODE_SIGNAL_TERMINATED,
 };
 use crate::ci;
-use crate::claude_backend::ClaudeBackend;
 use crate::git;
 use crate::github::{gh_command_for_repo, GitHubClient};
 use crate::minion;
@@ -722,6 +722,7 @@ async fn setup_worktree(ctx: &IssueContext) -> Result<WorktreeContext> {
         last_activity: now,
         orchestration_phase: OrchestrationPhase::Setup,
         token_usage: None,
+        agent_backend: DEFAULT_AGENT_NAME.to_string(),
     };
 
     let minion_id_clone = minion_id.clone();
@@ -1216,9 +1217,10 @@ async fn monitor_pr_lifecycle(
 
                 println!("🔄 Re-invoking to address review feedback...\n");
 
-                let backend = ClaudeBackend::new();
+                let review_registry = AgentRegistry::default_registry();
+                let backend = review_registry.default_backend();
                 match invoke_agent_for_reviews(
-                    &backend,
+                    backend,
                     &wt_ctx.checkout_path,
                     &wt_ctx.minion_dir,
                     &wt_ctx.session_id,
@@ -1453,7 +1455,8 @@ pub async fn handle_fix(
     }
 
     // Phase 3: Run agent (skip if already past this phase)
-    let backend = ClaudeBackend::new();
+    let registry = AgentRegistry::default_registry();
+    let backend = registry.default_backend();
     let agent_result = if start_phase <= OrchestrationPhase::RunningClaude {
         update_orchestration_phase(&wt_ctx.minion_id, OrchestrationPhase::RunningClaude).await;
 
@@ -1462,9 +1465,9 @@ pub async fn handle_fix(
         // never used, so resume would fail.
         let use_resume = is_resume && start_phase > OrchestrationPhase::Setup;
         let result = if use_resume {
-            resume_agent_session(&backend, &issue_ctx, &wt_ctx, quiet, timeout_opt.as_deref()).await
+            resume_agent_session(backend, &issue_ctx, &wt_ctx, quiet, timeout_opt.as_deref()).await
         } else {
-            run_agent_session(&backend, &issue_ctx, &wt_ctx, quiet, timeout_opt.as_deref()).await
+            run_agent_session(backend, &issue_ctx, &wt_ctx, quiet, timeout_opt.as_deref()).await
         };
 
         match result {

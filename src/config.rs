@@ -9,6 +9,42 @@ use std::time::Duration;
 pub struct LabConfig {
     #[serde(default)]
     pub daemon: DaemonConfig,
+
+    #[serde(default)]
+    pub agent: AgentConfig,
+}
+
+/// Agent backend configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentConfig {
+    /// Which agent backend to use by default (e.g., "claude")
+    #[serde(default = "default_agent_name")]
+    pub default: String,
+
+    /// Claude-specific configuration ([agent.claude] in TOML)
+    #[serde(default)]
+    pub claude: ClaudeAgentConfig,
+}
+
+impl Default for AgentConfig {
+    fn default() -> Self {
+        Self {
+            default: default_agent_name(),
+            claude: ClaudeAgentConfig::default(),
+        }
+    }
+}
+
+/// Claude-specific agent configuration
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ClaudeAgentConfig {
+    /// Override the binary path for Claude Code CLI
+    #[serde(default)]
+    pub binary: Option<String>,
+}
+
+fn default_agent_name() -> String {
+    "claude".to_string()
 }
 
 /// Daemon configuration
@@ -218,5 +254,69 @@ repos = ["owner/repo"]
         config.daemon.poll_interval_secs = 45;
 
         assert_eq!(config.poll_interval(), Duration::from_secs(45));
+    }
+
+    #[test]
+    fn test_agent_config_defaults() {
+        let config = AgentConfig::default();
+        assert_eq!(config.default, "claude");
+        assert!(config.claude.binary.is_none());
+    }
+
+    #[test]
+    fn test_agent_config_missing_section_defaults_to_claude() {
+        let config_toml = r#"
+[daemon]
+repos = ["owner/repo"]
+"#;
+        let mut temp_file = NamedTempFile::new().unwrap();
+        temp_file.write_all(config_toml.as_bytes()).unwrap();
+        temp_file.flush().unwrap();
+
+        let config = LabConfig::load(temp_file.path()).unwrap();
+        assert_eq!(config.agent.default, "claude");
+        assert!(config.agent.claude.binary.is_none());
+    }
+
+    #[test]
+    fn test_agent_config_with_agent_section() {
+        let config_toml = r#"
+[daemon]
+repos = ["owner/repo"]
+
+[agent]
+default = "claude"
+
+[agent.claude]
+binary = "/usr/local/bin/claude"
+"#;
+        let mut temp_file = NamedTempFile::new().unwrap();
+        temp_file.write_all(config_toml.as_bytes()).unwrap();
+        temp_file.flush().unwrap();
+
+        let config = LabConfig::load(temp_file.path()).unwrap();
+        assert_eq!(config.agent.default, "claude");
+        assert_eq!(
+            config.agent.claude.binary.as_deref(),
+            Some("/usr/local/bin/claude")
+        );
+    }
+
+    #[test]
+    fn test_agent_config_custom_default() {
+        let config_toml = r#"
+[daemon]
+repos = ["owner/repo"]
+
+[agent]
+default = "aider"
+"#;
+        let mut temp_file = NamedTempFile::new().unwrap();
+        temp_file.write_all(config_toml.as_bytes()).unwrap();
+        temp_file.flush().unwrap();
+
+        // Parsing succeeds (validation happens in AgentRegistry, not config parsing)
+        let config = LabConfig::load(temp_file.path()).unwrap();
+        assert_eq!(config.agent.default, "aider");
     }
 }

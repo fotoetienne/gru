@@ -1,4 +1,5 @@
 mod agent;
+mod agent_registry;
 mod agent_runner;
 mod ci;
 mod claude_backend;
