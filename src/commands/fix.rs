@@ -38,6 +38,10 @@ const TRIM_OUTPUT_BUFFER_SIZE: usize = 5000;
 /// After this limit, the user must handle additional reviews manually
 const MAX_REVIEW_ROUNDS: usize = 5;
 
+/// Maximum number of auto-rebase attempts per monitoring session
+/// After this limit, the minion escalates via PR comment
+const MAX_REBASE_ATTEMPTS: usize = 2;
+
 // ---------------------------------------------------------------------------
 // Phase context structs
 // ---------------------------------------------------------------------------
@@ -267,6 +271,85 @@ async fn handle_cli_fetch_result(result: Result<crate::github::IssueInfo>) -> Op
         Err(e) => {
             eprintln!("⚠️  Failed to fetch issue details via CLI: {}", e);
             None
+        }
+    }
+}
+
+/// Attempts to auto-rebase the worktree branch onto its base branch.
+///
+/// Returns `Ok(true)` if the rebase succeeded (clean or Claude resolved conflicts),
+/// `Ok(false)` if Claude couldn't resolve conflicts, or `Err` on unexpected failures.
+async fn auto_rebase_pr(worktree_path: &Path) -> Result<bool> {
+    use super::rebase::{
+        abort_rebase, attempt_rebase, detect_base_branch, fetch_origin, force_push,
+        run_agent_rebase, RebaseOutcome,
+    };
+
+    // Fetch latest from origin
+    println!("📡 Fetching latest changes from origin...");
+    fetch_origin(worktree_path).await?;
+
+    // Detect the base branch
+    let base_branch = detect_base_branch(worktree_path).await?;
+    println!("🔄 Rebasing onto origin/{}...", base_branch);
+
+    // Attempt the rebase
+    match attempt_rebase(worktree_path, &base_branch).await? {
+        RebaseOutcome::Clean { commit_count } => {
+            println!(
+                "✅ Clean rebase: {} commit{} replayed",
+                commit_count,
+                if commit_count == 1 { "" } else { "s" }
+            );
+            force_push(worktree_path).await?;
+            println!("🚀 Force-pushed rebased branch");
+            Ok(true)
+        }
+        RebaseOutcome::Conflicts => {
+            println!("⚠️  Conflicts detected, launching agent to resolve...");
+            abort_rebase(worktree_path).await?;
+
+            let exit_code = run_agent_rebase(worktree_path).await?;
+            if exit_code == 0 {
+                // Defensively force push in case the /rebase skill didn't push
+                force_push(worktree_path).await?;
+                println!("🚀 Force-pushed rebased branch");
+                Ok(true)
+            } else {
+                log::warn!("Agent rebase exited with code {}", exit_code);
+                Ok(false)
+            }
+        }
+    }
+}
+
+/// Posts an escalation comment on a PR when auto-rebase fails.
+async fn post_escalation_comment(owner: &str, repo: &str, pr_number: &str, message: &str) {
+    let repo_full = format!("{}/{}", owner, repo);
+    let gh_cmd = gh_command_for_repo(&repo_full);
+    let body = format!("🤖 **Minion Escalation**\n\n{}", message);
+
+    let result = TokioCommand::new(gh_cmd)
+        .args([
+            "pr", "comment", pr_number, "--repo", &repo_full, "--body", &body,
+        ])
+        .output()
+        .await;
+
+    match result {
+        Ok(output) if output.status.success() => {
+            log::info!("Posted escalation comment on PR #{}", pr_number);
+        }
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            log::warn!(
+                "Failed to post escalation comment on PR #{}: {}",
+                pr_number,
+                stderr.trim()
+            );
+        }
+        Err(e) => {
+            log::warn!("Failed to run gh pr comment: {}", e);
         }
     }
 }
@@ -1147,6 +1230,7 @@ async fn monitor_pr_lifecycle(
     let monitor_start = tokio::time::Instant::now();
     let mut review_round = 0;
     let mut ci_escalated = false;
+    let mut rebase_attempts = 0;
     loop {
         // Compute remaining time so the timeout spans the entire lifecycle,
         // not just a single monitor_pr invocation.
@@ -1295,6 +1379,57 @@ async fn monitor_pr_lifecycle(
                             issue_ctx.owner, issue_ctx.repo, pr_number
                         );
                         println!("🔄 Will retry CI auto-fix on subsequent monitoring cycles...\n");
+                    }
+                }
+            }
+            Ok(MonitorResult::MergeConflict) => {
+                rebase_attempts += 1;
+                println!(
+                    "⚠️  Merge conflict detected on PR #{} (rebase attempt {}/{})",
+                    pr_number, rebase_attempts, MAX_REBASE_ATTEMPTS
+                );
+
+                if rebase_attempts > MAX_REBASE_ATTEMPTS {
+                    println!(
+                        "❌ Reached maximum rebase attempts ({}), escalating",
+                        MAX_REBASE_ATTEMPTS
+                    );
+                    post_escalation_comment(
+                        &issue_ctx.owner,
+                        &issue_ctx.repo,
+                        pr_number,
+                        "Auto-rebase failed after multiple attempts. Manual conflict resolution required.",
+                    )
+                    .await;
+                    break;
+                }
+
+                match auto_rebase_pr(&wt_ctx.checkout_path).await {
+                    Ok(true) => {
+                        println!("✅ Rebase succeeded, continuing to monitor PR...\n");
+                    }
+                    Ok(false) => {
+                        // Claude couldn't resolve conflicts
+                        println!("❌ Could not resolve merge conflicts automatically");
+                        post_escalation_comment(
+                            &issue_ctx.owner,
+                            &issue_ctx.repo,
+                            pr_number,
+                            "Auto-rebase failed: could not resolve merge conflicts automatically. Manual intervention required.",
+                        )
+                        .await;
+                        break;
+                    }
+                    Err(e) => {
+                        log::warn!("⚠️  Auto-rebase error: {}", e);
+                        post_escalation_comment(
+                            &issue_ctx.owner,
+                            &issue_ctx.repo,
+                            pr_number,
+                            &format!("Auto-rebase encountered an error: {}. Manual intervention required.", e),
+                        )
+                        .await;
+                        break;
                     }
                 }
             }

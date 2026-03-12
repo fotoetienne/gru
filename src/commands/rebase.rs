@@ -86,7 +86,7 @@ pub async fn handle_rebase(target: Option<String>) -> Result<i32> {
 }
 
 /// Outcome of a rebase attempt
-enum RebaseOutcome {
+pub(crate) enum RebaseOutcome {
     /// Rebase completed cleanly
     Clean { commit_count: usize },
     /// Rebase hit conflicts
@@ -146,7 +146,7 @@ async fn check_clean_worktree(worktree_path: &Path) -> Result<()> {
 }
 
 /// Fetches the latest changes from origin in a worktree.
-async fn fetch_origin(worktree_path: &Path) -> Result<()> {
+pub(crate) async fn fetch_origin(worktree_path: &Path) -> Result<()> {
     let output = Command::new("git")
         .arg("-C")
         .arg(worktree_path)
@@ -185,7 +185,7 @@ async fn get_remote_url(worktree_path: &Path) -> Result<String> {
 ///
 /// First checks if there's a PR associated with this branch (which specifies a base),
 /// then falls back to detecting the default branch from the remote.
-async fn detect_base_branch(worktree_path: &Path) -> Result<String> {
+pub(crate) async fn detect_base_branch(worktree_path: &Path) -> Result<String> {
     // Get current branch name
     let branch = get_current_branch(worktree_path).await?;
 
@@ -296,7 +296,10 @@ async fn is_up_to_date(worktree_path: &Path, base_branch: &str) -> Result<bool> 
 }
 
 /// Attempts a git rebase onto the base branch.
-async fn attempt_rebase(worktree_path: &Path, base_branch: &str) -> Result<RebaseOutcome> {
+pub(crate) async fn attempt_rebase(
+    worktree_path: &Path,
+    base_branch: &str,
+) -> Result<RebaseOutcome> {
     let remote_ref = format!("origin/{}", base_branch);
 
     // Count commits that will be replayed (for reporting)
@@ -346,7 +349,7 @@ async fn attempt_rebase(worktree_path: &Path, base_branch: &str) -> Result<Rebas
 }
 
 /// Aborts an in-progress rebase.
-async fn abort_rebase(worktree_path: &Path) -> Result<()> {
+pub(crate) async fn abort_rebase(worktree_path: &Path) -> Result<()> {
     let output = Command::new("git")
         .arg("-C")
         .arg(worktree_path)
@@ -367,7 +370,7 @@ async fn abort_rebase(worktree_path: &Path) -> Result<()> {
 ///
 /// Explicitly specifies `origin HEAD` to avoid relying on upstream tracking
 /// configuration, which may not be set in worktrees created from bare repos.
-async fn force_push(worktree_path: &Path) -> Result<()> {
+pub(crate) async fn force_push(worktree_path: &Path) -> Result<()> {
     let output = Command::new("git")
         .arg("-C")
         .arg(worktree_path)
@@ -392,7 +395,7 @@ async fn force_push(worktree_path: &Path) -> Result<()> {
 /// Spawns the agent with the `/rebase` command to resolve conflicts.
 ///
 /// Returns the agent's exit code.
-async fn run_agent_rebase(worktree_path: &Path) -> Result<i32> {
+pub(crate) async fn run_agent_rebase(worktree_path: &Path) -> Result<i32> {
     let registry = AgentRegistry::default_registry();
     let backend = registry.default_backend();
     let session_id = Uuid::new_v4();

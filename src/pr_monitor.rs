@@ -125,6 +125,8 @@ struct PullRequest {
     state: String,
     merged: bool,
     head: Head,
+    /// GitHub's mergeable field: true, false, or null (still computing).
+    mergeable: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -270,6 +272,13 @@ async fn poll_once(
         }
     }
 
+    // Check merge conflict status.
+    // mergeable == Some(false) means GitHub detected conflicts.
+    // mergeable == None means GitHub is still computing — skip and re-check next cycle.
+    if pr.mergeable == Some(false) {
+        return Ok(Some(MonitorResult::MergeConflict));
+    }
+
     // Check for new reviews (use >= to avoid missing reviews at exact timestamp)
     let reviews = get_reviews_since(owner, repo, pr_number, *last_check_time).await?;
     if !reviews.is_empty() {
@@ -302,6 +311,8 @@ pub enum MonitorResult {
     NewReviews(Vec<ReviewComment>),
     /// CI checks failed (count)
     FailedChecks(usize),
+    /// PR has merge conflicts (mergeable: false)
+    MergeConflict,
     /// Monitoring timed out after the configured duration
     Timeout,
     /// Monitoring was interrupted by the user (e.g., Ctrl+C)
@@ -1217,5 +1228,79 @@ mod tests {
         let result = MonitorResult::Interrupted;
         let debug = format!("{:?}", result);
         assert!(debug.contains("Interrupted"));
+    }
+
+    // ========================================================================
+    // MonitorResult::MergeConflict Tests
+    // ========================================================================
+
+    #[test]
+    fn test_merge_conflict_variant() {
+        let result = MonitorResult::MergeConflict;
+        assert!(matches!(result, MonitorResult::MergeConflict));
+    }
+
+    #[test]
+    fn test_merge_conflict_variant_debug_format() {
+        let result = MonitorResult::MergeConflict;
+        let debug = format!("{:?}", result);
+        assert!(debug.contains("MergeConflict"));
+    }
+
+    // ========================================================================
+    // PullRequest Mergeable Field Tests
+    // ========================================================================
+
+    #[test]
+    fn test_pull_request_deserialize_mergeable_true() {
+        let json = r#"{
+            "state": "open",
+            "merged": false,
+            "head": {"sha": "abc123"},
+            "mergeable": true
+        }"#;
+
+        let pr: PullRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(pr.mergeable, Some(true));
+    }
+
+    #[test]
+    fn test_pull_request_deserialize_mergeable_false() {
+        let json = r#"{
+            "state": "open",
+            "merged": false,
+            "head": {"sha": "abc123"},
+            "mergeable": false
+        }"#;
+
+        let pr: PullRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(pr.mergeable, Some(false));
+    }
+
+    #[test]
+    fn test_pull_request_deserialize_mergeable_null() {
+        // GitHub returns null when still computing mergeable status
+        let json = r#"{
+            "state": "open",
+            "merged": false,
+            "head": {"sha": "abc123"},
+            "mergeable": null
+        }"#;
+
+        let pr: PullRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(pr.mergeable, None);
+    }
+
+    #[test]
+    fn test_pull_request_deserialize_mergeable_missing() {
+        // The field may be absent in some API responses
+        let json = r#"{
+            "state": "open",
+            "merged": false,
+            "head": {"sha": "abc123"}
+        }"#;
+
+        let pr: PullRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(pr.mergeable, None);
     }
 }
