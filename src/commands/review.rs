@@ -24,6 +24,9 @@ use uuid::Uuid;
 /// Handles the review command by setting up workspace and spawning autonomous Claude agent with stream parsing
 /// Returns the exit code from the claude process
 pub async fn handle_review(pr_arg: Option<String>, agent_name: &str) -> Result<i32> {
+    // Validate agent name early, before any side effects (registry, worktree)
+    let backend = agent_registry::resolve_backend(agent_name)?;
+
     // Resolve PR information from various input formats
     let (owner, repo, pr_num, branch) = match pr_arg {
         None => resolve_pr_from_current_worktree().await?,
@@ -180,7 +183,6 @@ pub async fn handle_review(pr_arg: Option<String>, agent_name: &str) -> Result<i
     let progress = std::sync::Arc::new(ProgressDisplay::new(config));
 
     // Build the command with flags for autonomous stream-json output
-    let backend = agent_registry::resolve_backend(agent_name)?;
     let cmd = backend.build_command(&checkout_path, &session_id, &review_prompt);
 
     // Build on_spawn callback to record the child PID in the registry

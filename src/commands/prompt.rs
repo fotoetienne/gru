@@ -635,6 +635,9 @@ pub async fn handle_prompt(prompt: &str, opts: PromptOptions) -> Result<i32> {
 
     println!("📂 Workspace: {}", workspace_path.display());
 
+    // Resolve the agent backend early, before any registry/state side effects
+    let backend = agent_registry::resolve_backend(&agent_name)?;
+
     // Register minion in registry
     let repo_display = if let (Some(ref owner), Some(ref repo)) = (&context_owner, &context_repo) {
         format!("{}/{}", owner, repo)
@@ -663,9 +666,6 @@ pub async fn handle_prompt(prompt: &str, opts: PromptOptions) -> Result<i32> {
 
     let minion_id_clone = minion_id.clone();
     with_registry(move |registry| registry.register(minion_id_clone, registry_info)).await?;
-
-    // Resolve the agent backend
-    let backend = agent_registry::resolve_backend(&agent_name)?;
 
     println!("🤖 Launching {}...\n", backend.name());
 
