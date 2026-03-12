@@ -125,6 +125,8 @@ struct PullRequest {
     state: String,
     merged: bool,
     head: Head,
+    /// GitHub's mergeable field: true, false, or null (still computing).
+    mergeable: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -184,33 +186,30 @@ struct CheckRunsResponse {
     check_runs: Vec<CheckRun>,
 }
 
-/// Monitor a PR for review comments, CI failures, and merge/close events.
+/// Monitor a PR for actionable events (reviews, CI failures, merge conflicts, etc.).
 ///
-/// This function polls the PR every 30 seconds and:
-/// - Detects when the PR is merged (exits successfully)
-/// - Detects when the PR is closed without merging (exits with message)
-/// - Detects new review comments (returns for handling)
-/// - Detects CI failures (returns for handling)
-/// - Detects Ctrl+C (returns `MonitorResult::Interrupted` for graceful shutdown)
+/// `baseline` optionally provides a timestamp to seed the review tracker.
+/// When `Some`, reviews posted after that time will be detected on the first poll,
+/// which lets the caller preserve review tracking across re-entries (e.g. after a
+/// rebase). When `None`, `last_check_time` is seeded to `Utc::now()` so that
+/// pre-existing reviews aren't re-detected.
 ///
-/// # Arguments
-/// * `worktree_path` - Reserved for future use (e.g., reading local git state, logging)
-/// * `max_duration` - Optional maximum duration before returning `MonitorResult::Timeout`
-///
-/// Returns `Ok(MonitorResult)` when an event requires action or the PR reaches a terminal state.
+/// Returns `(MonitorResult, DateTime<Utc>)` where the second element is the
+/// internal `last_check_time` at the time the event was detected. Callers
+/// should pass this value as `baseline` on the next invocation so that:
+/// - Already-handled reviews are not re-fetched.
+/// - Reviews posted during event handling (rebase, review response) are caught.
 pub async fn monitor_pr(
     owner: &str,
     repo: &str,
     pr_number: &str,
     _worktree_path: &Path,
     max_duration: Option<Duration>,
-) -> Result<MonitorResult> {
+    baseline: Option<DateTime<Utc>>,
+) -> Result<(MonitorResult, DateTime<Utc>)> {
     let start_time = Instant::now();
 
-    // Seed baseline to "now" so that pre-existing reviews aren't re-detected
-    // on the first poll.  The get_reviews_since filter uses >= which would
-    // otherwise match the last existing review's submitted_at timestamp.
-    let mut last_check_time = Utc::now();
+    let mut last_check_time = baseline.unwrap_or_else(Utc::now);
 
     // Register the Ctrl+C listener once to avoid signal loss between iterations
     let ctrl_c = tokio::signal::ctrl_c();
@@ -221,7 +220,7 @@ pub async fn monitor_pr(
         if let Some(max) = max_duration {
             let elapsed = start_time.elapsed();
             if elapsed >= max {
-                return Ok(MonitorResult::Timeout);
+                return Ok((MonitorResult::Timeout, last_check_time));
             }
         }
 
@@ -229,11 +228,11 @@ pub async fn monitor_pr(
         tokio::select! {
             result = poll_once(owner, repo, pr_number, &mut last_check_time) => {
                 if let Some(monitor_result) = result? {
-                    return Ok(monitor_result);
+                    return Ok((monitor_result, last_check_time));
                 }
             }
             _ = &mut ctrl_c => {
-                return Ok(MonitorResult::Interrupted);
+                return Ok((MonitorResult::Interrupted, last_check_time));
             }
         }
 
@@ -241,7 +240,7 @@ pub async fn monitor_pr(
         tokio::select! {
             _ = sleep(Duration::from_secs(POLL_INTERVAL_SECS)) => {}
             _ = &mut ctrl_c => {
-                return Ok(MonitorResult::Interrupted);
+                return Ok((MonitorResult::Interrupted, last_check_time));
             }
         }
     }
@@ -270,12 +269,23 @@ async fn poll_once(
         }
     }
 
-    // Check for new reviews (use >= to avoid missing reviews at exact timestamp)
+    // Check for new reviews BEFORE merge conflicts so that reviewer feedback
+    // is never silently dropped when conflicts and reviews overlap.
     let reviews = get_reviews_since(owner, repo, pr_number, *last_check_time).await?;
     if !reviews.is_empty() {
         // Fetch detailed comments for the new reviews
         let comments = get_review_comments(owner, repo, pr_number, &reviews).await?;
+        // Advance past these reviews so they are not re-fetched if the caller
+        // passes the returned last_check_time back as the next baseline.
+        *last_check_time = Utc::now();
         return Ok(Some(MonitorResult::NewReviews(comments)));
+    }
+
+    // Check merge conflict status.
+    // mergeable == Some(false) means GitHub detected conflicts.
+    // mergeable == None means GitHub is still computing — skip and re-check next cycle.
+    if pr.mergeable == Some(false) {
+        return Ok(Some(MonitorResult::MergeConflict));
     }
 
     // Check for failed CI runs - include all error states
@@ -302,6 +312,8 @@ pub enum MonitorResult {
     NewReviews(Vec<ReviewComment>),
     /// CI checks failed (count)
     FailedChecks(usize),
+    /// PR has merge conflicts (mergeable: false)
+    MergeConflict,
     /// Monitoring timed out after the configured duration
     Timeout,
     /// Monitoring was interrupted by the user (e.g., Ctrl+C)
@@ -1217,5 +1229,79 @@ mod tests {
         let result = MonitorResult::Interrupted;
         let debug = format!("{:?}", result);
         assert!(debug.contains("Interrupted"));
+    }
+
+    // ========================================================================
+    // MonitorResult::MergeConflict Tests
+    // ========================================================================
+
+    #[test]
+    fn test_merge_conflict_variant() {
+        let result = MonitorResult::MergeConflict;
+        assert!(matches!(result, MonitorResult::MergeConflict));
+    }
+
+    #[test]
+    fn test_merge_conflict_variant_debug_format() {
+        let result = MonitorResult::MergeConflict;
+        let debug = format!("{:?}", result);
+        assert!(debug.contains("MergeConflict"));
+    }
+
+    // ========================================================================
+    // PullRequest Mergeable Field Tests
+    // ========================================================================
+
+    #[test]
+    fn test_pull_request_deserialize_mergeable_true() {
+        let json = r#"{
+            "state": "open",
+            "merged": false,
+            "head": {"sha": "abc123"},
+            "mergeable": true
+        }"#;
+
+        let pr: PullRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(pr.mergeable, Some(true));
+    }
+
+    #[test]
+    fn test_pull_request_deserialize_mergeable_false() {
+        let json = r#"{
+            "state": "open",
+            "merged": false,
+            "head": {"sha": "abc123"},
+            "mergeable": false
+        }"#;
+
+        let pr: PullRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(pr.mergeable, Some(false));
+    }
+
+    #[test]
+    fn test_pull_request_deserialize_mergeable_null() {
+        // GitHub returns null when still computing mergeable status
+        let json = r#"{
+            "state": "open",
+            "merged": false,
+            "head": {"sha": "abc123"},
+            "mergeable": null
+        }"#;
+
+        let pr: PullRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(pr.mergeable, None);
+    }
+
+    #[test]
+    fn test_pull_request_deserialize_mergeable_missing() {
+        // The field may be absent in some API responses
+        let json = r#"{
+            "state": "open",
+            "merged": false,
+            "head": {"sha": "abc123"}
+        }"#;
+
+        let pr: PullRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(pr.mergeable, None);
     }
 }
