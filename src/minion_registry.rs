@@ -78,7 +78,7 @@ pub enum OrchestrationPhase {
     /// Worktree created, agent session running
     #[serde(alias = "running_claude")]
     RunningAgent,
-    /// Claude completed, PR creation in progress
+    /// Agent completed, PR creation in progress
     CreatingPr,
     /// PR created, monitoring lifecycle (reviews, CI)
     MonitoringPr,
