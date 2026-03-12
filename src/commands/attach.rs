@@ -4,7 +4,6 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use std::process::Stdio;
 use tokio::process::Command;
-use tokio::time::Duration;
 
 /// Typed errors from the attach command that callers can match on via
 /// `downcast_ref::<AttachError>()` instead of brittle string matching.
@@ -39,10 +38,6 @@ impl std::fmt::Display for AttachError {
 }
 
 impl std::error::Error for AttachError {}
-
-/// Grace period for the child process to exit after receiving a signal
-/// before we force-kill it.
-const CTRL_C_GRACE_SECS: u64 = 5;
 
 /// Handles the attach command to attach to a Minion's Claude session
 /// Returns 0 on success, 1 on error
@@ -162,29 +157,7 @@ pub async fn handle_attach(
     // Without this select!, SIGINT would kill gru immediately (default OS behavior),
     // skipping registry cleanup. By catching ctrl_c(), we ensure the "mode=Stopped"
     // update always runs.
-    let status = tokio::select! {
-        result = child.wait() => result.context("Failed to wait for claude process")?,
-        _ = tokio::signal::ctrl_c() => {
-            // Explicitly signal the child to terminate in case it didn't receive
-            // the SIGINT (different process group, platform differences, etc.)
-            signal_child(&mut child);
-
-            // Wait with a grace period, then force-kill if still running
-            match tokio::time::timeout(
-                Duration::from_secs(CTRL_C_GRACE_SECS),
-                child.wait(),
-            )
-            .await
-            {
-                Ok(result) => result.context("Failed to wait for claude after interrupt")?,
-                Err(_) => {
-                    log::warn!("Claude process did not exit within {}s, force-killing", CTRL_C_GRACE_SECS);
-                    let _ = child.kill().await;
-                    child.wait().await.context("Failed to reap claude after force-kill")?
-                }
-            }
-        }
-    };
+    let status = super::child_process::wait_with_ctrlc_handling(&mut child).await?;
 
     // Update registry: mode=Stopped, pid=None
     let mid = minion.minion_id.clone();
@@ -240,27 +213,6 @@ async fn prompt_auto_resume() -> bool {
 fn is_affirmative(input: &str) -> bool {
     let answer = input.trim().to_lowercase();
     answer.is_empty() || answer == "y" || answer == "yes"
-}
-
-/// Send a termination signal to the child process.
-/// On Unix, sends SIGTERM for graceful shutdown.
-/// On other platforms, attempts kill (there is no graceful signal equivalent).
-fn signal_child(child: &mut tokio::process::Child) {
-    #[cfg(unix)]
-    {
-        if let Some(pid) = child.id() {
-            // SAFETY: kill with SIGTERM is safe — it requests graceful termination.
-            // The PID was just obtained from the child handle.
-            unsafe {
-                libc::kill(pid as i32, libc::SIGTERM);
-            }
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        // No graceful signal on non-Unix; start_kill is best-effort
-        let _ = child.start_kill();
-    }
 }
 
 /// Atomically checks if the minion is available and claims it as Interactive.
