@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use log::info;
+
 use std::path::{Path, PathBuf};
 use tokio::process::Command;
 
@@ -246,6 +246,36 @@ async fn configure_hooks(worktree_path: &Path) -> Result<()> {
         return Ok(());
     }
 
+    // Check if core.hooksPath is already set — don't overwrite existing config
+    let existing = Command::new("git")
+        .arg("-C")
+        .arg(worktree_path)
+        .arg("config")
+        .arg("core.hooksPath")
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .output()
+        .await
+        .ok();
+
+    if let Some(ref out) = existing {
+        if out.status.success() {
+            let current = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if !current.is_empty() && current != ".githooks" {
+                log::debug!(
+                    "core.hooksPath already set to '{}' in {}, skipping",
+                    current,
+                    worktree_path.display()
+                );
+                return Ok(());
+            }
+            if current == ".githooks" {
+                return Ok(());
+            }
+        }
+    }
+
     let output = Command::new("git")
         .arg("-C")
         .arg(worktree_path)
@@ -267,7 +297,7 @@ async fn configure_hooks(worktree_path: &Path) -> Result<()> {
         anyhow::bail!("Failed to configure git hooks: {}", stderr);
     }
 
-    info!(
+    log::info!(
         "Configured core.hooksPath=.githooks in {}",
         worktree_path.display()
     );
@@ -1172,13 +1202,18 @@ mod tests {
         let dir = temp_dir.path();
 
         // Initialize a git repo
-        clean_git_cmd()
+        let init_output = clean_git_cmd()
             .arg("-C")
             .arg(dir)
             .arg("init")
             .output()
             .await
             .unwrap();
+        assert!(
+            init_output.status.success(),
+            "git init failed: {}",
+            String::from_utf8_lossy(&init_output.stderr)
+        );
 
         // Create .githooks directory
         std::fs::create_dir_all(dir.join(".githooks")).unwrap();
@@ -1197,7 +1232,17 @@ mod tests {
             .output()
             .await
             .unwrap();
-        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), ".githooks");
+        assert!(
+            output.status.success(),
+            "git config --local core.hooksPath failed: status={:?}, stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            ".githooks",
+            "unexpected core.hooksPath value"
+        );
     }
 
     #[tokio::test]
@@ -1206,13 +1251,18 @@ mod tests {
         let dir = temp_dir.path();
 
         // Initialize a git repo (no .githooks directory)
-        clean_git_cmd()
+        let init_output = clean_git_cmd()
             .arg("-C")
             .arg(dir)
             .arg("init")
             .output()
             .await
             .unwrap();
+        assert!(
+            init_output.status.success(),
+            "git init failed: {}",
+            String::from_utf8_lossy(&init_output.stderr)
+        );
 
         // Run configure_hooks — should be a no-op
         let result = configure_hooks(dir).await;
