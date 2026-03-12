@@ -252,6 +252,9 @@ async fn configure_hooks(worktree_path: &Path) -> Result<()> {
         .arg("config")
         .arg("core.hooksPath")
         .arg(".githooks")
+        // Clear git env vars that may be inherited from a parent git process
+        // (e.g., pre-commit hook), which would cause git to operate on the
+        // parent repo instead of the target worktree.
         .env_remove("GIT_DIR")
         .env_remove("GIT_WORK_TREE")
         .env_remove("GIT_INDEX_FILE")
@@ -605,7 +608,13 @@ impl GitRepo {
             );
         }
 
-        configure_hooks(worktree_path).await?;
+        if let Err(e) = configure_hooks(worktree_path).await {
+            log::warn!(
+                "Failed to configure git hooks in {}: {}",
+                worktree_path.display(),
+                e
+            );
+        }
 
         Ok(())
     }
@@ -670,7 +679,13 @@ impl GitRepo {
             );
         }
 
-        configure_hooks(worktree_path).await?;
+        if let Err(e) = configure_hooks(worktree_path).await {
+            log::warn!(
+                "Failed to configure git hooks in {}: {}",
+                worktree_path.display(),
+                e
+            );
+        }
 
         Ok(())
     }
