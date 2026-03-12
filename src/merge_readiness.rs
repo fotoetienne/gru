@@ -122,11 +122,6 @@ struct CheckRun {
     status: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
-struct CheckRunsApiResponse {
-    check_runs: Vec<CheckRun>,
-}
-
 // GraphQL response types for review threads
 #[derive(Debug, Deserialize)]
 struct GraphQlResponse {
@@ -195,18 +190,18 @@ async fn gh_api_with_retry(repo: &str, args: &[&str], max_retries: u32) -> Resul
         }
 
         let stderr = String::from_utf8_lossy(&output.stderr);
-        attempts += 1;
 
         if attempts >= max_retries || !is_retryable_error(&stderr) {
             anyhow::bail!(
                 "GitHub API call failed after {} attempt(s): {} {} — {}",
-                attempts,
+                attempts + 1,
                 gh_cmd,
                 args_str,
                 stderr.trim()
             );
         }
 
+        attempts += 1;
         let delay = std::cmp::min(BASE_DELAY_SECS.pow(attempts), MAX_DELAY_SECS);
         log::warn!(
             "Retrying ({}/{}) after {}s: {} {}",
@@ -264,15 +259,27 @@ async fn get_pr_details(owner: &str, repo: &str, pr_number: &str) -> Result<PrDe
 async fn get_reviews(owner: &str, repo: &str, pr_number: &str) -> Result<Vec<ReviewApiResponse>> {
     let repo_full = format!("{owner}/{repo}");
     let endpoint = format!("repos/{repo_full}/pulls/{pr_number}/reviews");
+    // --paginate with --jq '.[]' streams one JSON object per line across pages
     let output = gh_api_with_retry(
         &repo_full,
-        &["api", "--paginate", &endpoint],
+        &["api", "--paginate", &endpoint, "--jq", ".[]"],
         DEFAULT_MAX_RETRIES,
     )
     .await?;
 
-    let reviews: Vec<ReviewApiResponse> =
-        serde_json::from_slice(&output.stdout).context("Failed to parse reviews JSON")?;
+    let stdout =
+        std::str::from_utf8(&output.stdout).context("Failed to decode reviews stdout as UTF-8")?;
+
+    let mut reviews = Vec::new();
+    for line in stdout.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let review: ReviewApiResponse =
+            serde_json::from_str(line).context("Failed to parse review JSON line")?;
+        reviews.push(review);
+    }
 
     Ok(reviews)
 }
@@ -280,18 +287,29 @@ async fn get_reviews(owner: &str, repo: &str, pr_number: &str) -> Result<Vec<Rev
 async fn get_check_runs(owner: &str, repo: &str, sha: &str) -> Result<Vec<CheckRun>> {
     let repo_full = format!("{owner}/{repo}");
     let endpoint = format!("repos/{repo_full}/commits/{sha}/check-runs");
-    // --paginate ensures we get all check runs (default page size is 30)
+    // --paginate with --jq streams individual check run objects, one per line
     let output = gh_api_with_retry(
         &repo_full,
-        &["api", "--paginate", &endpoint],
+        &["api", "--paginate", &endpoint, "--jq", ".check_runs[]"],
         DEFAULT_MAX_RETRIES,
     )
     .await?;
 
-    let response: CheckRunsApiResponse =
-        serde_json::from_slice(&output.stdout).context("Failed to parse check runs JSON")?;
+    let stdout = std::str::from_utf8(&output.stdout)
+        .context("Failed to decode check runs stdout as UTF-8")?;
 
-    Ok(response.check_runs)
+    let mut check_runs = Vec::new();
+    for line in stdout.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let check_run: CheckRun =
+            serde_json::from_str(line).context("Failed to parse check run JSON line")?;
+        check_runs.push(check_run);
+    }
+
+    Ok(check_runs)
 }
 
 async fn get_unresolved_thread_count(owner: &str, repo: &str, pr_number: u64) -> Result<usize> {
@@ -309,7 +327,10 @@ async fn get_unresolved_thread_count(owner: &str, repo: &str, pr_number: u64) ->
     }";
     let owner_var = format!("owner={owner}");
     let repo_var = format!("repo={repo}");
-    let pr_var = format!("pr={pr_number}");
+    let pr_i32: i32 = pr_number
+        .try_into()
+        .context("PR number exceeds GraphQL Int (32-bit) range")?;
+    let pr_var = format!("pr={pr_i32}");
     let output = gh_api_with_retry(
         &repo_full,
         &[
@@ -345,7 +366,7 @@ async fn get_unresolved_thread_count(owner: &str, repo: &str, pr_number: u64) ->
         .and_then(|r| r.pull_request);
 
     let Some(pr_data) = pr_data else {
-        return Ok(0);
+        anyhow::bail!("PR #{pr_number} not found in GraphQL response for {owner}/{repo}");
     };
 
     if pr_data.review_threads.page_info.has_next_page {
@@ -379,10 +400,7 @@ fn evaluate_ci(check_runs: &[CheckRun]) -> bool {
         if cr.status.as_deref() != Some("completed") {
             return false;
         }
-        matches!(
-            cr.conclusion.as_deref(),
-            Some("success") | Some("skipped") | Some("neutral")
-        )
+        matches!(cr.conclusion.as_deref(), Some("success") | Some("skipped"))
     })
 }
 
@@ -445,7 +463,8 @@ mod tests {
     }
 
     #[test]
-    fn test_ci_with_neutral() {
+    fn test_ci_with_neutral_not_passing() {
+        // neutral is not in the passing set (only success and skipped are)
         let runs = vec![
             CheckRun {
                 conclusion: Some("success".into()),
@@ -456,7 +475,7 @@ mod tests {
                 status: Some("completed".into()),
             },
         ];
-        assert!(evaluate_ci(&runs));
+        assert!(!evaluate_ci(&runs));
     }
 
     #[test]
