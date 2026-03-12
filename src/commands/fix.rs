@@ -1733,31 +1733,38 @@ pub async fn handle_fix(issue: &str, opts: FixOptions) -> Result<i32> {
         }
     };
 
-    // Phase 5: Monitor PR lifecycle (review + polling)
-    if let Some(ref pr_num) = pr_number {
-        if no_watch {
+    let agent_exit_code = || {
+        agent_result
+            .as_ref()
+            .map(|r| r.status.code().unwrap_or(EXIT_CODE_SIGNAL_TERMINATED))
+            .unwrap_or(0)
+    };
+
+    // --no-watch: skip all monitoring (PR lifecycle + CI) for fire-and-forget mode
+    if no_watch {
+        if let Some(ref pr_num) = pr_number {
             println!(
                 "PR #{} created. Skipping lifecycle monitoring (--no-watch).",
                 pr_num
             );
-            update_orchestration_phase(&wt_ctx.minion_id, OrchestrationPhase::Completed).await;
-            let exit_code = agent_result
-                .map(|r| r.status.code().unwrap_or(EXIT_CODE_SIGNAL_TERMINATED))
-                .unwrap_or(0);
-            return Ok(exit_code);
-        } else {
-            update_orchestration_phase(&wt_ctx.minion_id, OrchestrationPhase::MonitoringPr).await;
-            monitor_pr_lifecycle(
-                &*backend,
-                &issue_ctx,
-                &wt_ctx,
-                pr_num,
-                timeout_opt.as_deref(),
-                review_timeout,
-                monitor_timeout,
-            )
-            .await;
         }
+        update_orchestration_phase(&wt_ctx.minion_id, OrchestrationPhase::Completed).await;
+        return Ok(agent_exit_code());
+    }
+
+    // Phase 5: Monitor PR lifecycle (review + polling)
+    if let Some(ref pr_num) = pr_number {
+        update_orchestration_phase(&wt_ctx.minion_id, OrchestrationPhase::MonitoringPr).await;
+        monitor_pr_lifecycle(
+            &*backend,
+            &issue_ctx,
+            &wt_ctx,
+            pr_num,
+            timeout_opt.as_deref(),
+            review_timeout,
+            monitor_timeout,
+        )
+        .await;
     }
 
     // CI monitoring
@@ -1788,11 +1795,7 @@ pub async fn handle_fix(issue: &str, opts: FixOptions) -> Result<i32> {
 
     update_orchestration_phase(&wt_ctx.minion_id, OrchestrationPhase::Completed).await;
 
-    let exit_code = agent_result
-        .map(|r| r.status.code().unwrap_or(EXIT_CODE_SIGNAL_TERMINATED))
-        .unwrap_or(0);
-
-    Ok(exit_code)
+    Ok(agent_exit_code())
 }
 
 #[cfg(test)]
@@ -2011,5 +2014,63 @@ CUSTOM: Fix #{{ issue_number }} - {{ issue_title }}"#,
         let err: anyhow::Error = AgentRunnerError::InactivityStuck { minutes: 15 }.into();
         let wrapped = err.context("Claude session failed");
         assert!(is_stuck_or_timeout_error(&wrapped));
+    }
+
+    #[test]
+    fn test_fix_options_no_watch_default_false() {
+        let opts = FixOptions {
+            timeout: None,
+            review_timeout: None,
+            monitor_timeout: None,
+            quiet: false,
+            force_new: false,
+            agent_name: "claude".to_string(),
+            no_watch: false,
+        };
+        assert!(!opts.no_watch);
+    }
+
+    #[test]
+    fn test_fix_options_no_watch_set() {
+        let opts = FixOptions {
+            timeout: None,
+            review_timeout: None,
+            monitor_timeout: None,
+            quiet: false,
+            force_new: false,
+            agent_name: "claude".to_string(),
+            no_watch: true,
+        };
+        assert!(opts.no_watch);
+    }
+
+    #[test]
+    fn test_fix_options_destructuring() {
+        // Verify all fields can be destructured as handle_fix does
+        let opts = FixOptions {
+            timeout: Some("10m".to_string()),
+            review_timeout: Some("5m".to_string()),
+            monitor_timeout: Some("1h".to_string()),
+            quiet: true,
+            force_new: true,
+            agent_name: "codex".to_string(),
+            no_watch: true,
+        };
+        let FixOptions {
+            timeout,
+            review_timeout,
+            monitor_timeout,
+            quiet,
+            force_new,
+            agent_name,
+            no_watch,
+        } = opts;
+        assert_eq!(timeout.as_deref(), Some("10m"));
+        assert_eq!(review_timeout.as_deref(), Some("5m"));
+        assert_eq!(monitor_timeout.as_deref(), Some("1h"));
+        assert!(quiet);
+        assert!(force_new);
+        assert_eq!(agent_name, "codex");
+        assert!(no_watch);
     }
 }
