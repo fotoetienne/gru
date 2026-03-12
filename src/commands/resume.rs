@@ -1,5 +1,5 @@
-use crate::agent::AgentEvent;
-use crate::agent_registry::AgentRegistry;
+use crate::agent::{AgentBackend, AgentEvent};
+use crate::agent_registry;
 use crate::agent_runner::{
     is_stuck_or_timeout_error, run_agent_with_stream_monitoring, EXIT_CODE_SIGNAL_TERMINATED,
 };
@@ -83,7 +83,7 @@ pub async fn handle_resume(
     // Atomically check registry state and claim as Autonomous
     let registry_info = check_and_claim_session(&minion.minion_id).await?;
 
-    let (session_id, owner, repo, issue_num, branch_name) = match registry_info {
+    let (session_id, owner, repo, issue_num, branch_name, agent_name) = match registry_info {
         Some(info) => info,
         None => {
             bail!(
@@ -134,12 +134,28 @@ pub async fn handle_resume(
         session_id: session_uuid,
     };
 
-    // Update orchestration phase
+    // Resolve the agent backend from registry (use stored agent name)
+    let backend = match agent_registry::resolve_backend(&agent_name) {
+        Ok(b) => b,
+        Err(e) => {
+            // Revert registry to Stopped since we claimed Autonomous but can't proceed
+            revert_to_stopped(&minion.minion_id).await;
+            return Err(e.context("Failed to resolve agent backend for resume"));
+        }
+    };
+
     update_orchestration_phase(&minion.minion_id, OrchestrationPhase::RunningAgent).await;
 
-    // Run Claude in autonomous mode with stream monitoring
-    let claude_result =
-        run_autonomous_agent(&wt_ctx, &prompt, quiet, timeout_opt.as_deref(), issue_num).await;
+    // Run agent in autonomous mode with stream monitoring
+    let claude_result = run_autonomous_agent(
+        &*backend,
+        &wt_ctx,
+        &prompt,
+        quiet,
+        timeout_opt.as_deref(),
+        issue_num,
+    )
+    .await;
 
     match claude_result {
         Ok(status) => {
@@ -208,14 +224,13 @@ async fn revert_to_stopped(minion_id: &str) {
 /// Spawns the agent with resume and stream-json output, tracks progress,
 /// and updates the registry with PID/mode during execution.
 async fn run_autonomous_agent(
+    backend: &dyn AgentBackend,
     wt_ctx: &WorktreeContext,
     prompt: &str,
     quiet: bool,
     timeout_opt: Option<&str>,
     issue_num: u64,
 ) -> Result<std::process::ExitStatus> {
-    let registry = AgentRegistry::default_registry();
-    let backend = registry.default_backend();
     let mut cmd = backend
         .build_resume_command(&wt_ctx.checkout_path, &wt_ctx.session_id, prompt)
         .context("Agent backend does not support resume")?;
@@ -282,7 +297,7 @@ async fn run_autonomous_agent(
 /// Errors with [`ResumeError::AlreadyRunning`] if the minion has a live process.
 async fn check_and_claim_session(
     minion_id: &str,
-) -> Result<Option<(String, String, String, u64, String)>> {
+) -> Result<Option<(String, String, String, u64, String, String)>> {
     let id = minion_id.to_string();
     let result = with_registry(move |reg| {
         let info_data = reg.get(&id).map(|info| {
@@ -293,11 +308,12 @@ async fn check_and_claim_session(
                 info.repo.clone(),
                 info.issue,
                 info.branch.clone(),
+                info.agent_name.clone(),
             )
         });
 
         match info_data {
-            Some((session_id, mode, pid, repo, issue, branch)) => {
+            Some((session_id, mode, pid, repo, issue, branch, agent_name)) => {
                 // Check if already running
                 if mode != MinionMode::Stopped {
                     match pid {
@@ -345,7 +361,9 @@ async fn check_and_claim_session(
                         )
                     })?;
 
-                Ok(Some((session_id, owner, repo_name, issue, branch)))
+                Ok(Some((
+                    session_id, owner, repo_name, issue, branch, agent_name,
+                )))
             }
             None => Ok(None),
         }

@@ -1,5 +1,5 @@
 use crate::agent::{AgentBackend, AgentEvent};
-use crate::agent_registry::{AgentRegistry, DEFAULT_AGENT_NAME};
+use crate::agent_registry;
 use crate::agent_runner::{
     is_stuck_or_timeout_error, parse_timeout, run_agent_with_stream_monitoring,
     EXIT_CODE_SIGNAL_TERMINATED,
@@ -744,7 +744,7 @@ async fn fetch_issue_details(
 
 /// Sets up the workspace: generates minion ID, clones repo, creates worktree,
 /// registers the minion in the registry.
-async fn setup_worktree(ctx: &IssueContext) -> Result<WorktreeContext> {
+async fn setup_worktree(ctx: &IssueContext, agent_name: &str) -> Result<WorktreeContext> {
     let minion_id = minion::generate_minion_id().context("Failed to generate Minion ID")?;
     println!("📋 Generated Minion ID: {}", minion_id);
 
@@ -810,7 +810,7 @@ async fn setup_worktree(ctx: &IssueContext) -> Result<WorktreeContext> {
         last_activity: now,
         orchestration_phase: OrchestrationPhase::Setup,
         token_usage: None,
-        agent_backend: DEFAULT_AGENT_NAME.to_string(),
+        agent_name: agent_name.to_string(),
     };
 
     let minion_id_clone = minion_id.clone();
@@ -1202,13 +1202,13 @@ pub(crate) async fn handle_pr_creation(
 /// Monitors a PR for reviews, CI failures, and merge/close events.
 /// Handles automatic review rounds up to MAX_REVIEW_ROUNDS.
 async fn monitor_pr_lifecycle(
+    backend: &dyn AgentBackend,
     issue_ctx: &IssueContext,
     wt_ctx: &WorktreeContext,
     pr_number: &str,
     timeout_opt: Option<&str>,
     review_timeout: Option<Duration>,
     monitor_timeout: Duration,
-    backend: &dyn AgentBackend,
 ) {
     // Auto-trigger review for Minion-created PRs
     println!("\n🔍 Starting automated PR review...");
@@ -1543,7 +1543,7 @@ pub async fn handle_fix(
     monitor_timeout_opt: Option<String>,
     quiet: bool,
     force_new: bool,
-    agent: Option<String>,
+    agent_name: &str,
 ) -> Result<i32> {
     // Parse review timeout if provided
     let review_timeout = review_timeout_opt
@@ -1566,13 +1566,16 @@ pub async fn handle_fix(
     // Phase 1: Resolve issue (always runs - need fresh issue details)
     let issue_ctx = resolve_issue(issue).await?;
 
+    // Validate agent name and create backend early (fail fast on unknown agents)
+    let backend = agent_registry::resolve_backend(agent_name)?;
+
     // Determine whether to resume an existing session or start fresh
     let (wt_ctx, resume_phase) = if force_new {
-        (setup_worktree(&issue_ctx).await?, None)
+        (setup_worktree(&issue_ctx, agent_name).await?, None)
     } else {
         match check_existing_minions(&issue_ctx.owner, &issue_ctx.repo, issue_ctx.issue_num).await?
         {
-            ExistingMinionCheck::None => (setup_worktree(&issue_ctx).await?, None),
+            ExistingMinionCheck::None => (setup_worktree(&issue_ctx, agent_name).await?, None),
             ExistingMinionCheck::Resumable(minion_id, info) => {
                 let phase = info.orchestration_phase.clone();
                 println!(
@@ -1613,13 +1616,6 @@ pub async fn handle_fix(
     }
 
     // Phase 3: Run agent (skip if already past this phase)
-    let registry = AgentRegistry::default_registry();
-    let backend = match agent.as_deref() {
-        Some(name) => registry
-            .get(name)
-            .context("Failed to select agent backend")?,
-        None => registry.default_backend(),
-    };
     let agent_result = if start_phase <= OrchestrationPhase::RunningAgent {
         update_orchestration_phase(&wt_ctx.minion_id, OrchestrationPhase::RunningAgent).await;
 
@@ -1628,9 +1624,23 @@ pub async fn handle_fix(
         // never used, so resume would fail.
         let use_resume = is_resume && start_phase > OrchestrationPhase::Setup;
         let result = if use_resume {
-            resume_agent_session(backend, &issue_ctx, &wt_ctx, quiet, timeout_opt.as_deref()).await
+            resume_agent_session(
+                &*backend,
+                &issue_ctx,
+                &wt_ctx,
+                quiet,
+                timeout_opt.as_deref(),
+            )
+            .await
         } else {
-            run_agent_session(backend, &issue_ctx, &wt_ctx, quiet, timeout_opt.as_deref()).await
+            run_agent_session(
+                &*backend,
+                &issue_ctx,
+                &wt_ctx,
+                quiet,
+                timeout_opt.as_deref(),
+            )
+            .await
         };
 
         match result {
@@ -1708,13 +1718,13 @@ pub async fn handle_fix(
     if let Some(ref pr_num) = pr_number {
         update_orchestration_phase(&wt_ctx.minion_id, OrchestrationPhase::MonitoringPr).await;
         monitor_pr_lifecycle(
+            &*backend,
             &issue_ctx,
             &wt_ctx,
             pr_num,
             timeout_opt.as_deref(),
             review_timeout,
             monitor_timeout,
-            backend,
         )
         .await;
     }
