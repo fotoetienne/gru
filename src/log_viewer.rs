@@ -8,7 +8,7 @@ use crate::agent::AgentEvent;
 use crate::minion_registry::{is_process_alive, with_registry};
 use crate::progress::{ProgressConfig, ProgressDisplay};
 use anyhow::{Context, Result};
-use std::io::{BufRead, Seek, SeekFrom};
+use std::io::{BufRead, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::signal;
@@ -160,6 +160,263 @@ fn read_new_events(events_path: &Path, position: u64, progress: &ProgressDisplay
         .stream_position()
         .context("Failed to get stream position")?;
     Ok(new_position)
+}
+
+/// Replays the last `n` events from an events.jsonl file through a ProgressDisplay.
+/// Returns the byte position after replay (for subsequent tailing).
+pub fn replay_last_n_events(
+    events_path: &Path,
+    n: usize,
+    progress: &ProgressDisplay,
+) -> Result<u64> {
+    let file = std::fs::File::open(events_path)
+        .with_context(|| format!("Failed to open {}", events_path.display()))?;
+    let mut reader = std::io::BufReader::new(file);
+
+    // First pass: collect all events
+    let mut events: Vec<AgentEvent> = Vec::new();
+    let mut line_buf = Vec::new();
+    loop {
+        line_buf.clear();
+        let bytes_read = reader
+            .read_until(b'\n', &mut line_buf)
+            .context("Failed to read line from events.jsonl")?;
+        if bytes_read == 0 {
+            break;
+        }
+        let line = String::from_utf8_lossy(&line_buf);
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Ok(event) = serde_json::from_str::<AgentEvent>(trimmed) {
+            events.push(event);
+        }
+    }
+
+    // Replay only the last N events
+    let start = events.len().saturating_sub(n);
+    for event in &events[start..] {
+        progress.handle_event(event);
+    }
+
+    let position = reader
+        .stream_position()
+        .context("Failed to get stream position")?;
+    Ok(position)
+}
+
+/// Replays all events from an events.jsonl file as raw JSONL to stdout.
+/// Returns the byte position after replay.
+pub fn replay_events_raw(events_path: &Path) -> Result<u64> {
+    let file = std::fs::File::open(events_path)
+        .with_context(|| format!("Failed to open {}", events_path.display()))?;
+    let mut reader = std::io::BufReader::new(file);
+    let stdout = std::io::stdout();
+    let mut stdout = stdout.lock();
+    let mut line_buf = Vec::new();
+
+    loop {
+        line_buf.clear();
+        let bytes_read = reader
+            .read_until(b'\n', &mut line_buf)
+            .context("Failed to read line from events.jsonl")?;
+        if bytes_read == 0 {
+            break;
+        }
+        stdout.write_all(&line_buf)?;
+    }
+
+    let position = reader
+        .stream_position()
+        .context("Failed to get stream position")?;
+    Ok(position)
+}
+
+/// Replays the last N lines from an events.jsonl file as raw JSONL to stdout.
+/// Returns the byte position after replay.
+pub fn replay_last_n_events_raw(events_path: &Path, n: usize) -> Result<u64> {
+    let file = std::fs::File::open(events_path)
+        .with_context(|| format!("Failed to open {}", events_path.display()))?;
+    let mut reader = std::io::BufReader::new(file);
+    let mut lines: Vec<Vec<u8>> = Vec::new();
+    let mut line_buf = Vec::new();
+
+    loop {
+        line_buf.clear();
+        let bytes_read = reader
+            .read_until(b'\n', &mut line_buf)
+            .context("Failed to read line from events.jsonl")?;
+        if bytes_read == 0 {
+            break;
+        }
+        lines.push(line_buf.clone());
+    }
+
+    let stdout = std::io::stdout();
+    let mut stdout = stdout.lock();
+    let start = lines.len().saturating_sub(n);
+    for line in &lines[start..] {
+        stdout.write_all(line)?;
+    }
+
+    let position = reader
+        .stream_position()
+        .context("Failed to get stream position")?;
+    Ok(position)
+}
+
+/// Tails an events.jsonl file in raw JSONL mode.
+/// Replays history (optionally last N lines) then follows live events.
+pub async fn tail_events_raw(
+    events_path: PathBuf,
+    minion_id: &str,
+    last_n: Option<usize>,
+) -> Result<()> {
+    let mid = minion_id.to_string();
+    let worker_pid = with_registry(move |reg| Ok(reg.get(&mid).and_then(|info| info.pid)))
+        .await
+        .unwrap_or(None);
+
+    // Wait for events file
+    let mut waited = Duration::ZERO;
+    let max_wait = Duration::from_secs(30);
+    while !events_path.exists() {
+        if waited >= max_wait {
+            anyhow::bail!(
+                "Timed out waiting for events file: {}",
+                events_path.display()
+            );
+        }
+        if !is_pid_alive(worker_pid) {
+            anyhow::bail!("Worker exited before creating events file.");
+        }
+        tokio::time::sleep(TAIL_POLL_INTERVAL).await;
+        waited += TAIL_POLL_INTERVAL;
+    }
+
+    // Replay existing events
+    let mut position = match last_n {
+        Some(n) => replay_last_n_events_raw(&events_path, n)?,
+        None => replay_events_raw(&events_path)?,
+    };
+
+    // Follow new events
+    loop {
+        tokio::select! {
+            _ = signal::ctrl_c() => {
+                break;
+            }
+            _ = tokio::time::sleep(TAIL_POLL_INTERVAL) => {
+                position = read_new_events_raw(&events_path, position)?;
+                if !is_pid_alive(worker_pid) {
+                    let _ = read_new_events_raw(&events_path, position);
+                    break;
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Reads new raw events from a file starting at the given byte position.
+fn read_new_events_raw(events_path: &Path, position: u64) -> Result<u64> {
+    let mut file = std::fs::File::open(events_path)
+        .with_context(|| format!("Failed to open {}", events_path.display()))?;
+
+    let metadata = file.metadata().context("Failed to get file metadata")?;
+    if metadata.len() <= position {
+        return Ok(position);
+    }
+
+    file.seek(SeekFrom::Start(position))
+        .context("Failed to seek in events file")?;
+
+    let mut reader = std::io::BufReader::new(file);
+    let stdout = std::io::stdout();
+    let mut stdout = stdout.lock();
+    let mut line_buf = Vec::new();
+
+    loop {
+        line_buf.clear();
+        let bytes_read = reader
+            .read_until(b'\n', &mut line_buf)
+            .context("Failed to read line")?;
+        if bytes_read == 0 {
+            break;
+        }
+        stdout.write_all(&line_buf)?;
+    }
+
+    let new_position = reader
+        .stream_position()
+        .context("Failed to get stream position")?;
+    Ok(new_position)
+}
+
+/// Tails events with last-N support (formatted mode).
+pub async fn tail_events_last_n(
+    events_path: PathBuf,
+    minion_id: &str,
+    issue_num: &str,
+    quiet: bool,
+    last_n: Option<usize>,
+) -> Result<()> {
+    let config = ProgressConfig {
+        minion_id: minion_id.to_string(),
+        issue: issue_num.to_string(),
+        quiet,
+    };
+    let progress = ProgressDisplay::new(config);
+
+    let mid = minion_id.to_string();
+    let worker_pid = with_registry(move |reg| Ok(reg.get(&mid).and_then(|info| info.pid)))
+        .await
+        .unwrap_or(None);
+
+    // Wait for events file
+    let mut waited = Duration::ZERO;
+    let max_wait = Duration::from_secs(30);
+    while !events_path.exists() {
+        if waited >= max_wait {
+            anyhow::bail!(
+                "Timed out waiting for events file: {}",
+                events_path.display()
+            );
+        }
+        if !is_pid_alive(worker_pid) {
+            anyhow::bail!("Worker exited before creating events file.");
+        }
+        tokio::time::sleep(TAIL_POLL_INTERVAL).await;
+        waited += TAIL_POLL_INTERVAL;
+    }
+
+    // Replay existing events (last N or all)
+    let mut position = match last_n {
+        Some(n) => replay_last_n_events(&events_path, n, &progress)?,
+        None => replay_events(&events_path, &progress)?,
+    };
+
+    // Follow new events
+    loop {
+        tokio::select! {
+            _ = signal::ctrl_c() => {
+                progress.finish_with_message("Detached from minion (worker continues in background)");
+                break;
+            }
+            _ = tokio::time::sleep(TAIL_POLL_INTERVAL) => {
+                position = read_new_events(&events_path, position, &progress)?;
+                if !is_pid_alive(worker_pid) {
+                    let _ = read_new_events(&events_path, position, &progress);
+                    progress.finish_with_message("Minion has finished");
+                    break;
+                }
+            }
+        }
+    }
+
+    Ok(())
 }
 
 /// Checks if a worker process is alive using a cached PID.
