@@ -188,9 +188,13 @@ const AUTO_MERGE_LABEL: &str = labels::AUTO_MERGE;
 
 /// Ensure the `gru:ready-to-merge` label exists in the repository, creating it if needed.
 pub async fn ensure_ready_to_merge_label(owner: &str, repo: &str) -> Result<()> {
+    let (color, description) =
+        labels::get_label_info(READY_TO_MERGE_LABEL).expect("READY_TO_MERGE must be in ALL_LABELS");
     let repo_full = format!("{owner}/{repo}");
     let endpoint = format!("repos/{repo_full}/labels");
     let name_field = format!("name={READY_TO_MERGE_LABEL}");
+    let color_field = format!("color={color}");
+    let desc_field = format!("description={description}");
 
     let output = gh_api_with_retry(
         &repo_full,
@@ -202,9 +206,9 @@ pub async fn ensure_ready_to_merge_label(owner: &str, repo: &str) -> Result<()> 
             "-f",
             &name_field,
             "-f",
-            "color=0e8a16",
+            &color_field,
             "-f",
-            "description=All merge-readiness checks pass",
+            &desc_field,
         ],
         DEFAULT_MAX_RETRIES,
     )
@@ -260,9 +264,13 @@ async fn has_auto_merge_label(owner: &str, repo: &str, pr_number: &str) -> Resul
 
 /// Ensure the `gru:auto-merge` label exists in the repository, creating it if needed.
 pub async fn ensure_auto_merge_label(owner: &str, repo: &str) -> Result<()> {
+    let (color, description) =
+        labels::get_label_info(AUTO_MERGE_LABEL).expect("AUTO_MERGE must be in ALL_LABELS");
     let repo_full = format!("{owner}/{repo}");
     let endpoint = format!("repos/{repo_full}/labels");
     let name_field = format!("name={AUTO_MERGE_LABEL}");
+    let color_field = format!("color={color}");
+    let desc_field = format!("description={description}");
 
     let output = gh_api_with_retry(
         &repo_full,
@@ -274,9 +282,9 @@ pub async fn ensure_auto_merge_label(owner: &str, repo: &str) -> Result<()> {
             "-f",
             &name_field,
             "-f",
-            "color=5319e7",
+            &color_field,
             "-f",
-            "description=Gru will auto-merge this PR when all checks pass",
+            &desc_field,
         ],
         DEFAULT_MAX_RETRIES,
     )
@@ -286,7 +294,11 @@ pub async fn ensure_auto_merge_label(owner: &str, repo: &str) -> Result<()> {
         let stderr = String::from_utf8_lossy(&output.stderr);
         // 422 means label already exists - that's fine (idempotent)
         if !stderr.contains("already_exists") {
-            log::warn!("Failed to create gru:auto-merge label: {}", stderr.trim());
+            log::warn!(
+                "Failed to create {} label: {}",
+                AUTO_MERGE_LABEL,
+                stderr.trim()
+            );
         }
     }
 
@@ -323,7 +335,7 @@ pub async fn add_auto_merge_label(owner: &str, repo: &str, pr_number: &str) -> R
     Ok(())
 }
 
-/// Add the `ready-to-merge` label to a PR.
+/// Add the `gru:ready-to-merge` label to a PR.
 async fn add_ready_to_merge_label(owner: &str, repo: &str, pr_number: &str) -> Result<()> {
     let repo_full = format!("{owner}/{repo}");
     let endpoint = format!("repos/{repo_full}/issues/{pr_number}/labels");

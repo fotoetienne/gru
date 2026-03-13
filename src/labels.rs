@@ -85,6 +85,15 @@ const BLOCKED_OLD: &[&str] = &["minion:blocked"];
 /// Old names for READY_TO_MERGE.
 const READY_TO_MERGE_OLD: &[&str] = &["ready-to-merge"];
 
+/// Look up the color and description for a label by its canonical name.
+/// Returns `Some((color, description))` if found in `ALL_LABELS`.
+pub fn get_label_info(canonical: &str) -> Option<(&'static str, &'static str)> {
+    ALL_LABELS
+        .iter()
+        .find(|(name, _, _)| *name == canonical)
+        .map(|(_, color, desc)| (*color, *desc))
+}
+
 /// Check if a label name matches the given canonical label (new or old name).
 pub fn matches_label(actual: &str, canonical: &str) -> bool {
     if actual == canonical {

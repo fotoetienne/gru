@@ -524,8 +524,13 @@ impl GitHubClient {
         let gh_cmd = gh_command_for_repo(&repo_full);
 
         // Use gh api to PATCH the label with new_name
-        // URL-encode the label name (colons need encoding)
-        let encoded_name = old_name.replace(':', "%3A");
+        // URL-encode reserved characters for use in a path segment
+        let encoded_name = old_name
+            .replace('%', "%25") // must come first to avoid double-encoding
+            .replace('/', "%2F")
+            .replace('#', "%23")
+            .replace('?', "%3F")
+            .replace(':', "%3A");
         let endpoint = format!("repos/{}/labels/{}", repo_full, encoded_name);
         let name_field = format!("name={}", new_name);
 
@@ -653,13 +658,13 @@ pub async fn mark_pr_ready_via_cli(
 ///
 /// Uses GitHub's search qualifiers to exclude:
 /// - Issues in GitHub's native blocked state (`-is:blocked`)
-/// - Issues labeled `minion:blocked` (`-label:minion:blocked`)
-/// - Issues already claimed (`-label:in-progress`)
+/// - Issues labeled `gru:blocked` or `minion:blocked` (old name)
+/// - Issues already claimed (`gru:in-progress` or `in-progress` old name)
 ///
 /// # Arguments
 /// * `owner` - Repository owner
 /// * `repo` - Repository name
-/// * `label` - Label to search for (e.g., "ready-for-minion")
+/// * `label` - Label to search for (e.g., "gru:todo")
 ///
 /// # Returns
 /// List of issue numbers matching the search criteria (capped at 100)

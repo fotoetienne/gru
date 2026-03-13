@@ -681,10 +681,14 @@ pub async fn add_needs_human_review_label(owner: &str, repo: &str, pr_number: &s
 
 /// Ensure the `gru:needs-human-review` label exists in the repository.
 pub async fn ensure_needs_human_review_label(owner: &str, repo: &str) -> Result<()> {
+    let (color, description) = labels::get_label_info(NEEDS_HUMAN_REVIEW_LABEL)
+        .expect("NEEDS_HUMAN_REVIEW must be in ALL_LABELS");
     let repo_full = format!("{owner}/{repo}");
     let gh_cmd = gh_command_for_repo(&repo_full);
     let endpoint = format!("repos/{repo_full}/labels");
     let name_field = format!("name={NEEDS_HUMAN_REVIEW_LABEL}");
+    let color_field = format!("color={color}");
+    let desc_field = format!("description={description}");
 
     let output = TokioCommand::new(gh_cmd)
         .args([
@@ -695,9 +699,9 @@ pub async fn ensure_needs_human_review_label(owner: &str, repo: &str) -> Result<
             "-f",
             &name_field,
             "-f",
-            "color=d93f0b",
+            &color_field,
             "-f",
-            "description=Gru merge judge needs human review before merging",
+            &desc_field,
         ])
         .output()
         .await?;
@@ -706,7 +710,8 @@ pub async fn ensure_needs_human_review_label(owner: &str, repo: &str) -> Result<
         let stderr = String::from_utf8_lossy(&output.stderr);
         if !stderr.contains("already_exists") {
             log::warn!(
-                "Failed to create gru:needs-human-review label: {}",
+                "Failed to create {} label: {}",
+                NEEDS_HUMAN_REVIEW_LABEL,
                 stderr.trim()
             );
         }
@@ -750,7 +755,9 @@ pub async fn has_needs_human_review_label(
 
     let labels: Vec<Label> =
         serde_json::from_slice(&output.stdout).context("Failed to parse labels JSON")?;
-    Ok(labels.iter().any(|l| l.name == NEEDS_HUMAN_REVIEW_LABEL))
+    Ok(labels
+        .iter()
+        .any(|l| labels::matches_label(&l.name, NEEDS_HUMAN_REVIEW_LABEL)))
 }
 
 /// Post an escalation comment explaining why the judge escalated.

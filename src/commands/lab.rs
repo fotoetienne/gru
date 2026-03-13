@@ -427,8 +427,8 @@ async fn spawn_minion(repo: &str, issue_number: u64) -> Result<Child> {
 
 /// Fallback issue listing using octocrab API with client-side filtering.
 /// Used when the gh CLI is unavailable. Cannot filter GitHub-native blocked state
-/// (no API equivalent of `-is:blocked`), but does filter out `minion:blocked` and
-/// `in-progress` labels.
+/// (no API equivalent of `-is:blocked`), but does filter out `gru:blocked` and
+/// `gru:in-progress` labels (accepting both old and new names).
 async fn fallback_list_issues(owner: &str, repo: &str, label: &str) -> Result<Vec<u64>> {
     let client = GitHubClient::from_env(owner, repo).await?;
     let issues = client.list_issues_with_label(owner, repo, label).await?;
