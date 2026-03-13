@@ -38,6 +38,23 @@ where
     .context("Registry task panicked")?
 }
 
+/// Reverts a minion's registry entry to Stopped mode (best-effort).
+///
+/// Used when a command has claimed a session (e.g. as Interactive or Autonomous)
+/// but cannot proceed (spawn failure, bad session ID, unsupported backend, etc.).
+/// Errors are silently ignored since this is a cleanup path.
+pub async fn revert_to_stopped(minion_id: &str) {
+    let mid = minion_id.to_string();
+    let _ = with_registry(move |reg| {
+        reg.update(&mid, |info| {
+            info.mode = MinionMode::Stopped;
+            info.pid = None;
+            info.last_activity = Utc::now();
+        })
+    })
+    .await;
+}
+
 /// The execution mode of a Minion session
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
