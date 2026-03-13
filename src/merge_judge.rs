@@ -755,9 +755,7 @@ pub async fn has_needs_human_review_label(
 
     let labels: Vec<Label> =
         serde_json::from_slice(&output.stdout).context("Failed to parse labels JSON")?;
-    Ok(labels
-        .iter()
-        .any(|l| labels::matches_label(&l.name, NEEDS_HUMAN_REVIEW_LABEL)))
+    Ok(labels.iter().any(|l| l.name == NEEDS_HUMAN_REVIEW_LABEL))
 }
 
 /// Post an escalation comment explaining why the judge escalated.

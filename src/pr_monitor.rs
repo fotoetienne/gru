@@ -246,9 +246,7 @@ async fn has_label(owner: &str, repo: &str, pr_number: &str, label_name: &str) -
 
     let fetched_labels: Vec<Label> =
         serde_json::from_slice(&output.stdout).context("Failed to parse labels JSON")?;
-    Ok(fetched_labels
-        .iter()
-        .any(|l| labels::matches_label(&l.name, label_name)))
+    Ok(fetched_labels.iter().any(|l| l.name == label_name))
 }
 
 /// Check if a PR currently has the `ready-to-merge` label.
@@ -365,11 +363,9 @@ async fn add_ready_to_merge_label(owner: &str, repo: &str, pr_number: &str) -> R
 }
 
 /// Remove the `gru:ready-to-merge` label from a PR.
-/// Also removes the old `ready-to-merge` label if present.
 async fn remove_ready_to_merge_label(owner: &str, repo: &str, pr_number: &str) -> Result<()> {
     let repo_full = format!("{owner}/{repo}");
 
-    // Remove new label (URL-encode the colon)
     let label_encoded = READY_TO_MERGE_LABEL.replace(':', "%3A");
     let endpoint = format!("repos/{repo_full}/issues/{pr_number}/labels/{label_encoded}");
     let output = gh_api_with_retry(
@@ -390,15 +386,6 @@ async fn remove_ready_to_merge_label(owner: &str, repo: &str, pr_number: &str) -
             );
         }
     }
-
-    // Also remove old label name if present (ignore errors)
-    let old_endpoint = format!("repos/{repo_full}/issues/{pr_number}/labels/ready-to-merge");
-    let _ = gh_api_with_retry(
-        &repo_full,
-        &["api", &old_endpoint, "-X", "DELETE"],
-        DEFAULT_MAX_RETRIES,
-    )
-    .await;
 
     Ok(())
 }

@@ -222,7 +222,7 @@ Located in `.claude/skills/`:
 ### GitHub Integration
 - Never stage files with `git add -A` - always be explicit
 - Authentication priority: `gh` CLI token (`gh auth token`), then `GRU_GITHUB_TOKEN` env var as fallback
-- Labels drive state machine: `ready-for-minion` → `in-progress` → `minion:done`/`minion:failed`
+- Labels drive state machine: `gru:todo` → `gru:in-progress` → `gru:done`/`gru:failed`
 - Comments use YAML frontmatter for structured events
 - Issue/PR parsing supports both numbers (when in repo) and full GitHub URLs
 
@@ -239,7 +239,7 @@ Located in `.claude/skills/`:
 - Retry with exponential backoff for transient failures
 - CI auto-fix: max 2 attempts (`MAX_CI_FIX_ATTEMPTS` in `ci.rs`), then escalate
 - PR monitor API retries: max 5 attempts (`DEFAULT_MAX_RETRIES` in `pr_monitor.rs`)
-- Escalate via comments with `minion:blocked` label
+- Escalate via comments with `gru:blocked` label
 - CI failures analyzed and auto-fixed when possible
 - Proper context in error messages using `anyhow::Context`
 
