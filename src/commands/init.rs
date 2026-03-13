@@ -174,7 +174,7 @@ pub async fn handle_init(repo_arg: String) -> Result<i32> {
         );
     }
 
-    // 6. Check for ready issues
+    // 5. Check for ready issues
     println!("\n🔍 Checking for ready issues...");
     match github_client
         .list_issues_with_label(&owner, &repo, labels::TODO)

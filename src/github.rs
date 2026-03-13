@@ -372,7 +372,7 @@ impl GitHubClient {
         // Remove todo label if present
         let _ = self.remove_label(owner, repo, issue, labels::TODO).await;
 
-        // Add in-progress label (new name)
+        // Add in-progress label
         self.add_label(owner, repo, issue, labels::IN_PROGRESS)
             .await?;
 
