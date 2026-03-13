@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 
 use std::path::{Path, PathBuf};
+use tempfile::NamedTempFile;
 use tokio::process::Command;
 
 /// Default branch names to try when creating new worktrees, in priority order.
@@ -12,25 +13,94 @@ use tokio::process::Command;
 /// We try both patterns to handle existing repos with different configurations.
 const DEFAULT_BRANCHES: &[&str] = &["main", "origin/main", "master", "origin/master"];
 
-/// Creates a git `Command` pre-configured with credential helper authentication.
+/// Holds temporary resources needed for authenticated git commands.
 ///
-/// If a token is provided, the command will include `-c credential.helper=...` to
-/// inject the token via a credential helper. This avoids duplicating the credential
-/// setup logic across clone and fetch operations.
+/// The `GIT_ASKPASS` script file must outlive the git `Command` execution.
+/// Keep this struct alive until the command completes.
+struct AuthenticatedGitCommand {
+    cmd: Command,
+    /// Temp file for the GIT_ASKPASS script. Must remain alive while cmd runs.
+    _askpass_file: Option<NamedTempFile>,
+}
+
+/// Creates a git `Command` pre-configured with `GIT_ASKPASS` authentication.
 ///
-/// Note: Git spawns a shell to execute credential.helper values prefixed with `!`.
-/// The single-quote escaping applies at the shell level that git invokes,
-/// not at the `Command::arg` level (which does not invoke a shell).
-fn git_command_with_auth(token: Option<&str>) -> Command {
+/// If a token is provided, creates a temporary script that outputs the token on
+/// stdout. Git invokes this script when it needs credentials, so the token never
+/// appears in command-line arguments (visible in `/proc/*/cmdline`) or git error
+/// messages. The token is passed via `GRU_ASKPASS_TOKEN` env var to the child
+/// process, which is visible in `/proc/*/environ` (same-uid only) — standard
+/// practice for passing secrets to subprocesses.
+///
+/// The returned `AuthenticatedGitCommand` must be kept alive until the command
+/// finishes so the temporary askpass script file is not deleted prematurely.
+fn git_command_with_auth(token: Option<&str>) -> Result<AuthenticatedGitCommand> {
+    use std::io::Write;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+
     let mut cmd = Command::new("git");
-    if let Some(token) = token {
-        let safe_token = token.replace('\'', "'\\''");
-        cmd.arg("-c").arg(format!(
-            "credential.helper=!f() {{ echo username=oauth2; echo password='{}'; }}; f",
-            safe_token
-        ));
+    // Always disable interactive prompts for non-interactive operation
+    cmd.env("GIT_TERMINAL_PROMPT", "0");
+
+    let askpass_file = if let Some(token) = token {
+        // Write a script that reads the token from an env var, keeping
+        // the token out of the file content entirely.
+        let mut file = NamedTempFile::new().context("Failed to create GIT_ASKPASS temp file")?;
+        writeln!(
+            file,
+            "#!/bin/sh\ncase \"$1\" in\n*assword*) printf '%s\\n' \"$GRU_ASKPASS_TOKEN\" ;;\n*) echo x-access-token ;;\nesac"
+        )
+            .context("Failed to write GIT_ASKPASS script")?;
+        file.flush().context("Failed to flush GIT_ASKPASS script")?;
+
+        // Make the script executable
+        #[cfg(unix)]
+        {
+            let metadata = file
+                .as_file()
+                .metadata()
+                .context("Failed to read GIT_ASKPASS file metadata")?;
+            let mut perms = metadata.permissions();
+            perms.set_mode(0o700);
+            file.as_file()
+                .set_permissions(perms)
+                .context("Failed to set GIT_ASKPASS file permissions")?;
+        }
+
+        cmd.env("GIT_ASKPASS", file.path());
+        // Pass the token via env var so it never appears in the script file
+        cmd.env("GRU_ASKPASS_TOKEN", token);
+        Some(file)
+    } else {
+        None
+    };
+
+    Ok(AuthenticatedGitCommand {
+        cmd,
+        _askpass_file: askpass_file,
+    })
+}
+
+/// Redacts credential-related content from git error output.
+///
+/// Strips any `credential.helper` configuration values from stderr to prevent
+/// accidental credential exposure in logs or error messages.
+fn redact_credentials(stderr: &str) -> String {
+    let mut result = String::with_capacity(stderr.len());
+    for line in stderr.lines() {
+        if !result.is_empty() {
+            result.push('\n');
+        }
+        // Redact credential.helper values that may appear in verbose git output
+        if let Some(idx) = line.find("credential.helper") {
+            result.push_str(&line[..idx]);
+            result.push_str("credential.helper=<REDACTED>");
+        } else {
+            result.push_str(line);
+        }
     }
-    cmd
+    result
 }
 
 /// Detects if the current directory is within a git repository
@@ -376,7 +446,12 @@ impl GitRepo {
                     continue;
                 }
 
-                let output = git_command_with_auth(token.as_deref())
+                let auth = git_command_with_auth(token.as_deref())?;
+                let AuthenticatedGitCommand {
+                    mut cmd,
+                    _askpass_file,
+                } = auth;
+                let output = cmd
                     .arg("-C")
                     .arg(&self.bare_path)
                     .arg("fetch")
@@ -418,7 +493,7 @@ impl GitRepo {
                         "git fetch failed for branch '{}' with exit code {:?}: {}",
                         branch,
                         output.status.code(),
-                        stderr.trim()
+                        redact_credentials(stderr.trim())
                     );
                 }
             }
@@ -446,13 +521,16 @@ impl GitRepo {
                     .context("Failed to create parent directory for bare repository")?;
             }
 
-            let mut cmd = git_command_with_auth(token.as_deref());
+            let auth = git_command_with_auth(token.as_deref())?;
+            let AuthenticatedGitCommand {
+                mut cmd,
+                _askpass_file,
+            } = auth;
 
             cmd.arg("clone")
                 .arg("--bare")
                 .arg(&url)
-                .arg(&self.bare_path)
-                .env("GIT_TERMINAL_PROMPT", "0"); // Disable interactive prompts
+                .arg(&self.bare_path);
 
             let output = cmd.output().await.context("Failed to execute git clone")?;
 
@@ -461,7 +539,7 @@ impl GitRepo {
                 anyhow::bail!(
                     "git clone failed with exit code {:?}: {}",
                     output.status.code(),
-                    stderr
+                    redact_credentials(&stderr)
                 );
             }
 
@@ -953,7 +1031,16 @@ impl GitRepo {
         // +refs/heads/branch:refs/heads/branch ensures we:
         // 1. Fetch from the remote's refs/heads/branch
         // 2. Update the local refs/heads/branch (even if non-fast-forward due to +)
-        let output = Command::new("git")
+        let token = std::env::var("GRU_GITHUB_TOKEN")
+            .ok()
+            .filter(|t| !t.is_empty());
+
+        let auth = git_command_with_auth(token.as_deref())?;
+        let AuthenticatedGitCommand {
+            mut cmd,
+            _askpass_file,
+        } = auth;
+        let output = cmd
             .arg("-C")
             .arg(&self.bare_path)
             .arg("fetch")
@@ -973,7 +1060,7 @@ impl GitRepo {
                 branch_name,
                 self.bare_path.display(),
                 output.status.code(),
-                stderr.trim()
+                redact_credentials(stderr.trim())
             );
         }
 
@@ -1394,6 +1481,82 @@ mod tests {
         assert!(
             !output.status.success(),
             "core.hooksPath should not be set locally when .githooks doesn't exist"
+        );
+    }
+
+    #[test]
+    fn test_redact_credentials_removes_credential_helper() {
+        let input = "fatal: could not read Username for 'https://github.com': credential.helper=!f() { echo username=oauth2; echo password='ghp_secret123'; }; f";
+        let result = redact_credentials(input);
+        assert!(
+            !result.contains("ghp_secret123"),
+            "Token should be redacted from output"
+        );
+        assert!(
+            result.contains("credential.helper=<REDACTED>"),
+            "Should contain redacted placeholder"
+        );
+    }
+
+    #[test]
+    fn test_redact_credentials_preserves_safe_output() {
+        let input = "fatal: repository 'https://github.com/owner/repo.git' not found";
+        let result = redact_credentials(input);
+        assert_eq!(result, input, "Safe output should be unchanged");
+    }
+
+    #[test]
+    fn test_redact_credentials_handles_multiline() {
+        let input = "line 1\ncredential.helper=!secret stuff\nline 3";
+        let result = redact_credentials(input);
+        assert!(
+            !result.contains("secret stuff"),
+            "Secret should be redacted"
+        );
+        assert!(result.contains("line 1"), "Non-secret lines preserved");
+        assert!(result.contains("line 3"), "Non-secret lines preserved");
+    }
+
+    #[test]
+    fn test_git_command_with_auth_no_token() {
+        let auth = git_command_with_auth(None).unwrap();
+        assert!(
+            auth._askpass_file.is_none(),
+            "No askpass file should be created without a token"
+        );
+    }
+
+    #[test]
+    fn test_git_command_with_auth_with_token() {
+        let auth = git_command_with_auth(Some("test-token-123")).unwrap();
+        assert!(
+            auth._askpass_file.is_some(),
+            "Askpass file should be created with a token"
+        );
+        let file = auth._askpass_file.as_ref().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let metadata = file.as_file().metadata().unwrap();
+            assert_eq!(
+                metadata.permissions().mode() & 0o700,
+                0o700,
+                "Askpass script should be executable"
+            );
+        }
+        // Script should reference the env var, NOT contain the actual token
+        let content = std::fs::read_to_string(file.path()).unwrap();
+        assert!(
+            content.contains("GRU_ASKPASS_TOKEN"),
+            "Askpass script should reference the env var"
+        );
+        assert!(
+            !content.contains("test-token-123"),
+            "Askpass script must NOT contain the raw token"
+        );
+        assert!(
+            content.starts_with("#!/bin/sh"),
+            "Askpass script should be a shell script"
         );
     }
 

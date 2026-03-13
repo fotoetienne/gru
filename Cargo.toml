@@ -22,10 +22,10 @@ tokio = { version = "1.49", features = ["fs", "io-std", "io-util", "macros", "pr
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1.21", features = ["v4"] }
 fs2 = "0.4"
+tempfile = "3.26"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
 [dev-dependencies]
 serial_test = "3.4"
-tempfile = "3.26"
