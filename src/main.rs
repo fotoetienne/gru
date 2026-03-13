@@ -96,6 +96,12 @@ enum Commands {
             help = "Skip PR lifecycle monitoring after PR creation (fire-and-forget mode)"
         )]
         no_watch: bool,
+
+        #[arg(
+            long,
+            help = "Auto-merge PR when all readiness checks pass (adds gru:auto-merge label)"
+        )]
+        auto_merge: bool,
     },
     #[command(about = "Review a GitHub pull request")]
     Review {
@@ -288,6 +294,7 @@ async fn main() {
             force_new,
             agent,
             no_watch,
+            auto_merge,
         } => {
             let agent_name = agent.unwrap_or_else(|| agent_registry::DEFAULT_AGENT.to_string());
             fix::handle_fix(
@@ -300,6 +307,7 @@ async fn main() {
                     force_new,
                     agent_name,
                     no_watch,
+                    auto_merge,
                 },
             )
             .await
