@@ -168,6 +168,21 @@ impl AgentBackend for ClaudeBackend {
             prompt,
         ))
     }
+
+    fn build_interactive_resume_command(
+        &self,
+        worktree_path: &Path,
+        session_id: &Uuid,
+    ) -> Option<TokioCommand> {
+        let mut cmd = TokioCommand::new("claude");
+        cmd.arg("--resume")
+            .arg(session_id.to_string())
+            .current_dir(worktree_path)
+            .stdin(std::process::Stdio::inherit())
+            .stdout(std::process::Stdio::inherit())
+            .stderr(std::process::Stdio::inherit());
+        Some(cmd)
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -154,6 +154,19 @@ pub trait AgentBackend: Send + Sync {
         session_id: &Uuid,
         prompt: &str,
     ) -> Option<TokioCommand>;
+
+    /// Build the command to interactively resume an existing agent session.
+    ///
+    /// Unlike `build_resume_command` (which produces a headless/stream-json command
+    /// for autonomous mode), this produces an interactive command suitable for
+    /// `gru attach` — with inherited stdio, no `--print`, and no `--output-format`.
+    ///
+    /// Returns `None` if the backend does not support interactive resume.
+    fn build_interactive_resume_command(
+        &self,
+        worktree_path: &Path,
+        session_id: &Uuid,
+    ) -> Option<TokioCommand>;
 }
 
 #[cfg(test)]

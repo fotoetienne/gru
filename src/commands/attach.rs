@@ -1,9 +1,11 @@
+use crate::agent_registry;
 use crate::minion_registry::{is_process_alive, with_registry, MinionMode};
 use crate::minion_resolver;
 use anyhow::{Context, Result};
 use chrono::Utc;
 use std::process::Stdio;
 use tokio::process::Command;
+use uuid::Uuid;
 
 /// Typed errors from the attach command that callers can match on via
 /// `downcast_ref::<AttachError>()` instead of brittle string matching.
@@ -88,10 +90,22 @@ pub async fn handle_attach(
 
     let checkout_path = minion.checkout_path();
 
-    // Atomically check registry state, get session_id, and claim as Interactive.
+    // Atomically check registry state, get session_id + agent_name, and claim as Interactive.
     // This prevents TOCTOU races where two `gru attach` calls could both see
     // mode=Stopped and proceed simultaneously.
-    let session_id = check_and_claim_session(&minion.minion_id).await?;
+    let registry_data = check_and_claim_session(&minion.minion_id).await?;
+
+    // Extract session_id and agent_name; default to "claude" when not in registry
+    let (session_id, agent_name) = match registry_data {
+        Some((sid, name)) => (Some(sid), name),
+        None => (None, agent_registry::DEFAULT_AGENT.to_string()),
+    };
+
+    // Resolve the agent backend from the stored agent name
+    let backend = agent_registry::resolve_backend(&agent_name).context(format!(
+        "Failed to resolve agent backend '{}' for attach",
+        agent_name
+    ))?;
 
     println!("🔌 Attaching to Minion {}...", minion.minion_id);
     if yolo {
@@ -99,23 +113,47 @@ pub async fn handle_attach(
     }
     println!("📂 Workspace: {}", checkout_path.display());
 
-    // Build claude command for interactive mode (no --print, no --output-format)
-    let mut cmd = Command::new("claude");
-    match &session_id {
+    // Build command for interactive mode via the resolved backend
+    let mut cmd = match &session_id {
         Some(sid) => {
-            cmd.arg("--resume").arg(sid);
+            let session_uuid =
+                Uuid::parse_str(sid).context("Failed to parse session ID from registry")?;
+            match backend.build_interactive_resume_command(&checkout_path, &session_uuid) {
+                Some(c) => c,
+                None => {
+                    // Revert registry to Stopped since backend doesn't support interactive mode
+                    let mid = minion.minion_id.clone();
+                    let _ = with_registry(move |reg| {
+                        reg.update(&mid, |info| {
+                            info.mode = MinionMode::Stopped;
+                            info.pid = None;
+                            info.last_activity = Utc::now();
+                        })
+                    })
+                    .await;
+                    anyhow::bail!(
+                        "Agent backend '{}' does not support interactive mode. \
+                         Use 'gru resume {}' for autonomous mode instead.",
+                        agent_name,
+                        minion.minion_id
+                    );
+                }
+            }
         }
         None => {
-            cmd.arg("-r");
+            // No session_id — fallback to claude -r (legacy behavior for unregistered minions)
+            let mut c = Command::new("claude");
+            c.arg("-r")
+                .current_dir(&checkout_path)
+                .stdin(Stdio::inherit())
+                .stdout(Stdio::inherit())
+                .stderr(Stdio::inherit());
+            c
         }
-    }
+    };
     if yolo {
         cmd.arg("--dangerously-skip-permissions");
     }
-    cmd.current_dir(&checkout_path)
-        .stdin(Stdio::inherit())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit());
 
     // Spawn claude process (not exec - we need to update registry after exit)
     let mut child = match cmd.spawn() {
@@ -131,10 +169,10 @@ pub async fn handle_attach(
                 })
             })
             .await;
-            return Err(e).context(
-                "Failed to start claude. Is Claude CLI installed and in your PATH?\n\
-                 See: https://claude.com/claude-code",
-            );
+            return Err(e).context(format!(
+                "Failed to start agent '{}'. Is the CLI installed and in your PATH?",
+                agent_name
+            ));
         }
     };
 
@@ -153,7 +191,7 @@ pub async fn handle_attach(
     })
     .await;
 
-    // Wait for claude to exit, handling Ctrl-C gracefully.
+    // Wait for agent to exit, handling Ctrl-C gracefully.
     // Without this select!, SIGINT would kill gru immediately (default OS behavior),
     // skipping registry cleanup. By catching ctrl_c(), we ensure the "mode=Stopped"
     // update always runs.
@@ -221,21 +259,26 @@ fn is_affirmative(input: &str) -> bool {
 /// call, which holds an exclusive file lock for the duration. This prevents
 /// TOCTOU races between concurrent `gru attach` calls.
 ///
-/// Returns the session_id if the minion is found in the registry.
+/// Returns the (session_id, agent_name) if the minion is found in the registry.
 /// Errors with [`AttachError::AlreadyRunning`] if the minion has a live process.
 /// Errors with [`AttachError::InconsistentState`] if the mode is non-Stopped but
 /// no PID is recorded (ambiguous state that needs manual recovery).
 /// Returns None if the minion is not in the registry (allows attach without registry).
-async fn check_and_claim_session(minion_id: &str) -> Result<Option<String>> {
+async fn check_and_claim_session(minion_id: &str) -> Result<Option<(String, String)>> {
     let id = minion_id.to_string();
     let result = with_registry(move |reg| {
         // Clone data from the immutable borrow before mutating
-        let info_data = reg
-            .get(&id)
-            .map(|info| (info.session_id.clone(), info.mode.clone(), info.pid));
+        let info_data = reg.get(&id).map(|info| {
+            (
+                info.session_id.clone(),
+                info.mode.clone(),
+                info.pid,
+                info.agent_name.clone(),
+            )
+        });
 
         match info_data {
-            Some((session_id, mode, pid)) => {
+            Some((session_id, mode, pid, agent_name)) => {
                 // Treat any non-Stopped mode as an exclusive lock by default.
                 // Only allow recovery when there is a PID and it is confirmed dead,
                 // and bring the entry back to a consistent Stopped state before
@@ -284,7 +327,7 @@ async fn check_and_claim_session(minion_id: &str) -> Result<Option<String>> {
                     info.mode = MinionMode::Interactive;
                     info.last_activity = Utc::now();
                 })?;
-                Ok(Some(session_id))
+                Ok(Some((session_id, agent_name)))
             }
             None => Ok(None), // Not in registry
         }

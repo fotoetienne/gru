@@ -58,6 +58,15 @@ impl AgentBackend for CodexBackend {
         // but it relies on its own session persistence, not Gru's session ID.
         Some(build_codex_resume_command(worktree_path, prompt))
     }
+
+    fn build_interactive_resume_command(
+        &self,
+        _worktree_path: &Path,
+        _session_id: &Uuid,
+    ) -> Option<TokioCommand> {
+        // Codex CLI does not support interactive resume mode
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------
