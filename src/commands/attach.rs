@@ -1,5 +1,5 @@
 use crate::agent_registry;
-use crate::minion_registry::{is_process_alive, with_registry, MinionMode};
+use crate::minion_registry::{is_process_alive, revert_to_stopped, with_registry, MinionMode};
 use crate::minion_resolver;
 use anyhow::{Context, Result};
 use chrono::Utc;
@@ -41,18 +41,18 @@ impl std::fmt::Display for AttachError {
 
 impl std::error::Error for AttachError {}
 
-/// Handles the attach command to attach to a Minion's Claude session
-/// Returns 0 on success, 1 on error
+/// Handles the attach command to interactively attach to a Minion's agent session.
+/// Returns 0 on success, 1 on error.
 ///
-/// This command attaches to a stopped Minion's session interactively,
-/// allowing you to unstick it without losing conversation context.
+/// Reads the `agent_name` from the minion registry and resolves the correct
+/// backend via `agent_registry::resolve_backend`. The backend's
+/// `build_interactive_resume_command` method builds the CLI invocation.
+/// Backends that don't support interactive mode (e.g. Codex) return `None`,
+/// producing a clear error suggesting `gru resume` for autonomous mode.
 ///
-/// It is functionally equivalent to:
+/// For the default Claude backend this is equivalent to:
 /// ```bash
-/// # With session_id from registry:
 /// cd $(gru path <id>) && claude --resume <session-id>
-/// # Without registry (fallback):
-/// cd $(gru path <id>) && claude -r
 /// ```
 ///
 /// The ID argument supports smart resolution (same as gru path):
@@ -66,10 +66,7 @@ impl std::error::Error for AttachError {}
 /// - During attach: updates registry with PID after spawn
 /// - After exit: updates registry with mode=Stopped and clears PID
 /// - Signal handling: Ctrl-C is caught to ensure registry cleanup runs
-///
-/// Note: This command is identical to `gru resume` - both attach to the
-/// same Claude session interactively. The `attach` name is used for
-/// consistency with documentation and expected UX.
+/// - On error: registry is reverted to Stopped via [`revert_to_stopped`]
 pub async fn handle_attach(
     id: String,
     yolo: bool,
@@ -247,20 +244,6 @@ async fn prompt_auto_resume() -> bool {
         }
         _ = tokio::signal::ctrl_c() => false,
     }
-}
-
-/// Reverts the registry to Stopped mode (best-effort).
-/// Used when claim succeeded but we can't proceed with the spawn.
-async fn revert_to_stopped(minion_id: &str) {
-    let mid = minion_id.to_string();
-    let _ = with_registry(move |reg| {
-        reg.update(&mid, |info| {
-            info.mode = MinionMode::Stopped;
-            info.pid = None;
-            info.last_activity = Utc::now();
-        })
-    })
-    .await;
 }
 
 /// Returns `true` if the input is an affirmative answer (empty, "y", or "yes").

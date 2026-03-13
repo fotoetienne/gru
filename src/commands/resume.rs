@@ -8,7 +8,8 @@ use crate::commands::fix::{
 };
 use crate::github::GitHubClient;
 use crate::minion_registry::{
-    is_process_alive, with_registry, MinionMode, MinionRegistry, OrchestrationPhase,
+    is_process_alive, revert_to_stopped, with_registry, MinionMode, MinionRegistry,
+    OrchestrationPhase,
 };
 use crate::minion_resolver;
 use crate::progress::{ProgressConfig, ProgressDisplay};
@@ -203,20 +204,6 @@ pub async fn handle_resume(
     update_orchestration_phase(&minion.minion_id, OrchestrationPhase::Completed).await;
     println!("✅ Resume completed for Minion {}", minion.minion_id);
     Ok(0)
-}
-
-/// Reverts the registry to Stopped mode (best-effort).
-/// Used when claim succeeded but we can't proceed with the spawn.
-async fn revert_to_stopped(minion_id: &str) {
-    let mid = minion_id.to_string();
-    let _ = with_registry(move |reg| {
-        reg.update(&mid, |info| {
-            info.mode = MinionMode::Stopped;
-            info.pid = None;
-            info.last_activity = Utc::now();
-        })
-    })
-    .await;
 }
 
 /// Runs the agent in autonomous mode with stream monitoring.
