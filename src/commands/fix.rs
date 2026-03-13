@@ -2152,6 +2152,15 @@ pub async fn handle_fix(issue: &str, opts: FixOptions) -> Result<i32> {
                     "🔄 Resuming interrupted session {} (phase: {:?})",
                     minion_id, phase
                 );
+                // Increment attempt_count for this auto-resume
+                let mid = minion_id.clone();
+                with_registry(move |reg| {
+                    reg.update(&mid, |info| {
+                        info.attempt_count += 1;
+                    })
+                })
+                .await
+                .ok();
                 let session_id = Uuid::parse_str(&info.session_id)
                     .context("Failed to parse session ID from registry")?;
                 let checkout_path = info.checkout_path();
