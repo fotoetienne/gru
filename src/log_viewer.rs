@@ -59,6 +59,7 @@ pub async fn tail_events(
     let progress = ProgressDisplay::new(config);
 
     // Wait for events file to be created (worker may not have written yet)
+    let mid = minion_id.to_string();
     let mut waited = Duration::ZERO;
     let max_wait = Duration::from_secs(30);
     while !events_path.exists() {
@@ -68,6 +69,10 @@ pub async fn tail_events(
                 events_path.display()
             );
         }
+        // Fail fast if worker died before creating events file
+        if !is_worker_alive(&mid).await {
+            anyhow::bail!("Worker exited before creating events file. Check gru.log for details.");
+        }
         tokio::time::sleep(TAIL_POLL_INTERVAL).await;
         waited += TAIL_POLL_INTERVAL;
     }
@@ -76,7 +81,6 @@ pub async fn tail_events(
     let mut position = replay_events(&events_path, &progress)?;
 
     // Follow new events with poll-based tailing
-    let mid = minion_id.to_string();
     loop {
         tokio::select! {
             _ = signal::ctrl_c() => {

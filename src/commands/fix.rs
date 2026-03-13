@@ -1793,10 +1793,27 @@ async fn spawn_worker(
     cmd.stdout(std::process::Stdio::from(log_file));
     cmd.stderr(std::process::Stdio::from(stderr_file));
 
+    // Create a new session so the worker survives terminal close / SIGHUP
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            });
+        }
+    }
+
     let child = cmd
         .spawn()
         .context("Failed to spawn background worker process")?;
     let pid = child.id();
+
+    // Reap child in background to prevent zombie processes
+    std::thread::spawn(move || {
+        let _ = child.wait_with_output();
+    });
 
     // Record worker PID in registry
     let mid = minion_id.to_string();
@@ -1878,13 +1895,14 @@ async fn run_worker(minion_id: &str, issue: &str, opts: FixOptions) -> Result<i3
 
     // Determine resume phase from registry
     let start_phase = info.orchestration_phase.clone();
-    let is_resume = start_phase > OrchestrationPhase::Setup;
 
     // Phase 3: Run agent
     let agent_result = if start_phase <= OrchestrationPhase::RunningAgent {
         update_orchestration_phase(&wt_ctx.minion_id, OrchestrationPhase::RunningAgent).await;
 
-        let use_resume = is_resume && start_phase > OrchestrationPhase::Setup;
+        // Use --resume only if the agent has already run (session ID was used).
+        // If interrupted during Setup, the session was never started.
+        let use_resume = start_phase > OrchestrationPhase::Setup;
         let result = if use_resume {
             resume_agent_session(
                 &*backend,
