@@ -191,10 +191,30 @@ fn find_by_minion_id_from_list(minion_id: &str, minions: &[MinionInfo]) -> Optio
     minions.iter().find(|m| m.minion_id == minion_id).cloned()
 }
 
+/// Parse the numeric counter from a minion ID (e.g., "M0j8" -> Some(656)).
+/// Returns None if the ID doesn't start with 'M' or contains invalid base36.
+fn parse_minion_counter(id: &str) -> Option<u64> {
+    let digits = id.strip_prefix('M').or_else(|| id.strip_prefix('m'))?;
+    if digits.is_empty() {
+        return None;
+    }
+    let mut result: u64 = 0;
+    for c in digits.chars() {
+        let digit = match c {
+            '0'..='9' => (c as u64) - ('0' as u64),
+            'a'..='z' => (c as u64) - ('a' as u64) + 10,
+            'A'..='Z' => (c as u64) - ('A' as u64) + 10, // legacy uppercase
+            _ => return None,
+        };
+        result = result.checked_mul(36)?.checked_add(digit)?;
+    }
+    Some(result)
+}
+
 /// Find a minion by issue number from a pre-scanned list.
 /// When multiple minions match the same issue, prefers:
 /// 1. Active/running minions over stopped ones
-/// 2. Higher (more recent) minion ID as tiebreaker
+/// 2. Higher (more recent) minion ID as tiebreaker (compared numerically)
 fn find_by_issue_number_from_list(issue_num: u64, minions: &[MinionInfo]) -> Option<MinionInfo> {
     minions
         .iter()
@@ -202,9 +222,11 @@ fn find_by_issue_number_from_list(issue_num: u64, minions: &[MinionInfo]) -> Opt
         .max_by(|a, b| {
             let a_active = a.status == "Active";
             let b_active = b.status == "Active";
-            a_active
-                .cmp(&b_active)
-                .then_with(|| a.minion_id.cmp(&b.minion_id))
+            a_active.cmp(&b_active).then_with(|| {
+                let a_counter = parse_minion_counter(&a.minion_id);
+                let b_counter = parse_minion_counter(&b.minion_id);
+                a_counter.cmp(&b_counter)
+            })
         })
         .cloned()
 }
@@ -716,6 +738,33 @@ mod tests {
         let result = find_by_issue_number_from_list(353, &minions);
         assert!(result.is_some());
         assert_eq!(result.unwrap().minion_id, "M0j8");
+    }
+
+    #[test]
+    fn test_find_by_issue_tiebreaks_across_id_widths() {
+        // M0zz (counter 1295) vs M100 (counter 1296) — different base36 widths
+        // Lexicographic would incorrectly pick M0zz; numeric comparison picks M100
+        let minions = vec![
+            test_minion_with_status("M0zz", Some(42), "owner/repo", "Stopped"),
+            test_minion_with_status("M100", Some(42), "owner/repo", "Stopped"),
+        ];
+        let result = find_by_issue_number_from_list(42, &minions);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().minion_id, "M100");
+    }
+
+    #[test]
+    fn test_parse_minion_counter() {
+        assert_eq!(parse_minion_counter("M000"), Some(0));
+        assert_eq!(parse_minion_counter("M001"), Some(1));
+        assert_eq!(parse_minion_counter("M00a"), Some(10));
+        assert_eq!(parse_minion_counter("M0zz"), Some(1295));
+        assert_eq!(parse_minion_counter("M100"), Some(1296));
+        // Legacy uppercase
+        assert_eq!(parse_minion_counter("M00A"), Some(10));
+        // Invalid
+        assert_eq!(parse_minion_counter(""), None);
+        assert_eq!(parse_minion_counter("X001"), None);
     }
 
     #[test]
