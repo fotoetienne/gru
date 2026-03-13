@@ -250,9 +250,8 @@ async fn get_pr_base_branch(worktree_path: &Path, branch: &str) -> Result<Option
     let remote_url = get_remote_url(worktree_path).await?;
     let (host, owner, repo) = git::parse_github_remote(&remote_url, &github_hosts)?;
     let repo_full = format!("{}/{}", owner, repo);
-    let gh_cmd = github::gh_command_for_host(&host);
 
-    let output = Command::new(gh_cmd)
+    let output = github::gh_cli_command(&host)
         .args([
             "pr",
             "view",

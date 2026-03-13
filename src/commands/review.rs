@@ -18,7 +18,6 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use std::env;
 use std::path::Path;
-use tokio::process::Command as TokioCommand;
 use uuid::Uuid;
 
 /// Handles the review command by setting up workspace and spawning autonomous Claude agent with stream parsing
@@ -28,7 +27,7 @@ pub async fn handle_review(pr_arg: Option<String>, agent_name: &str) -> Result<i
     let backend = agent_registry::resolve_backend(agent_name)?;
 
     // Resolve PR information from various input formats
-    let (owner, repo, pr_num, branch) = match pr_arg {
+    let (owner, repo, pr_num, branch, host) = match pr_arg {
         None => resolve_pr_from_current_worktree().await?,
         Some(arg) => resolve_pr_from_arg(&arg).await?,
     };
@@ -47,8 +46,7 @@ pub async fn handle_review(pr_arg: Option<String>, agent_name: &str) -> Result<i
 
     // Create bare repository path
     let bare_path = workspace.repos().join(&owner).join(format!("{}.git", repo));
-    let host = crate::github::infer_github_host(&owner);
-    let git_repo = git::GitRepo::new(&owner, &repo, host, bare_path);
+    let git_repo = git::GitRepo::new(&owner, &repo, &host, bare_path);
 
     // Ensure bare repository is cloned/updated
     println!("📦 Ensuring repository is cloned...");
@@ -255,7 +253,7 @@ pub async fn handle_review(pr_arg: Option<String>, agent_name: &str) -> Result<i
 
 /// Resolves PR information from the current worktree directory
 /// Reads the .gru_pr_state.json file to get the PR number
-async fn resolve_pr_from_current_worktree() -> Result<(String, String, String, String)> {
+async fn resolve_pr_from_current_worktree() -> Result<(String, String, String, String, String)> {
     // Detect current directory as git repository
     let current_dir = env::current_dir().context("Failed to get current directory")?;
 
@@ -278,7 +276,7 @@ async fn resolve_pr_from_current_worktree() -> Result<(String, String, String, S
 
 /// Resolves PR information from a user-provided argument
 /// Handles Minion IDs, issue numbers, PR numbers, and URLs
-async fn resolve_pr_from_arg(arg: &str) -> Result<(String, String, String, String)> {
+async fn resolve_pr_from_arg(arg: &str) -> Result<(String, String, String, String, String)> {
     let mut errors = Vec::new();
 
     // Strategy 1: Try as Minion ID (if it looks like one)
@@ -332,7 +330,9 @@ fn looks_like_minion_id(s: &str) -> bool {
 }
 
 /// Resolves PR information from a Minion ID
-async fn resolve_pr_from_minion_id(minion_id: &str) -> Result<(String, String, String, String)> {
+async fn resolve_pr_from_minion_id(
+    minion_id: &str,
+) -> Result<(String, String, String, String, String)> {
     let minion = minion_resolver::resolve_minion(minion_id).await?;
 
     // Load PR state from the minion's worktree
@@ -348,7 +348,7 @@ async fn resolve_pr_from_minion_id(minion_id: &str) -> Result<(String, String, S
 }
 
 /// Fetches PR information (owner, repo, pr_num, branch) given a PR number
-async fn get_pr_info_from_number(pr_num: &str) -> Result<(String, String, String, String)> {
+async fn get_pr_info_from_number(pr_num: &str) -> Result<(String, String, String, String, String)> {
     // Validate that pr_num is actually a number to provide better error messages
     pr_num
         .parse::<u64>()
@@ -373,10 +373,9 @@ async fn find_pr_for_issue(issue_num: u64) -> Result<String> {
     let (host, det_owner, det_repo) = git::parse_github_remote(&remote_url, &github_hosts)
         .context("Failed to parse GitHub remote URL")?;
     let repo_full = format!("{}/{}", det_owner, det_repo);
-    let gh_cmd = github::gh_command_for_host(&host);
     // Safe: issue_num is validated as u64 by the type system, which can only contain digits.
     // This prevents command injection as the format string will never contain shell metacharacters.
-    let output = TokioCommand::new(gh_cmd)
+    let output = github::gh_cli_command(&host)
         .args([
             "pr",
             "list",
@@ -426,9 +425,8 @@ async fn find_pr_for_issue(issue_num: u64) -> Result<String> {
 async fn find_issue_for_pr(owner: &str, repo: &str, pr_num: &str) -> Result<u64> {
     let repo_full = format!("{}/{}", owner, repo);
     let host = crate::github::infer_github_host(owner);
-    let gh_cmd = github::gh_command_for_host(host);
     // Safe: pr_num is already validated as a number earlier in the call chain
-    let output = TokioCommand::new(gh_cmd)
+    let output = github::gh_cli_command(host)
         .args([
             "pr",
             "view",

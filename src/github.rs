@@ -561,13 +561,8 @@ pub async fn mark_pr_ready_via_cli(
     pr_number: &str,
 ) -> Result<()> {
     let repo_full = format!("{}/{}", owner, repo);
-    let gh_cmd = gh_command_for_host(host);
-    let mut cmd = Command::new(gh_cmd);
-    cmd.args(["pr", "ready", pr_number, "--repo", &repo_full]);
-    if host != "github.com" {
-        cmd.env("GH_HOST", host);
-    }
-    let output = cmd
+    let output = gh_cli_command(host)
+        .args(["pr", "ready", pr_number, "--repo", &repo_full])
         .output()
         .await
         .context("Failed to execute gh pr ready command")?;
@@ -617,27 +612,22 @@ pub async fn list_ready_issues_via_cli(
     label: &str,
 ) -> Result<Vec<u64>> {
     let repo_full = format!("{}/{}", owner, repo);
-    let gh_cmd = gh_command_for_host(host);
     let search_query = build_ready_issues_search_query(label);
-    let mut cmd = Command::new(gh_cmd);
-    cmd.args([
-        "issue",
-        "list",
-        "--repo",
-        &repo_full,
-        "--search",
-        &search_query,
-        "--state",
-        "open",
-        "--json",
-        "number",
-        "--limit",
-        "100",
-    ]);
-    if host != "github.com" {
-        cmd.env("GH_HOST", host);
-    }
-    let output = cmd
+    let output = gh_cli_command(host)
+        .args([
+            "issue",
+            "list",
+            "--repo",
+            &repo_full,
+            "--search",
+            &search_query,
+            "--state",
+            "open",
+            "--json",
+            "number",
+            "--limit",
+            "100",
+        ])
         .output()
         .await
         .context("Failed to execute gh issue list command")?;
@@ -677,21 +667,16 @@ pub async fn get_issue_via_cli(
     number: u64,
 ) -> Result<IssueInfo> {
     let repo_full = format!("{}/{}", owner, repo);
-    let gh_cmd = gh_command_for_host(host);
-    let mut cmd = Command::new(gh_cmd);
-    cmd.args([
-        "issue",
-        "view",
-        &number.to_string(),
-        "--repo",
-        &repo_full,
-        "--json",
-        "number,title,body",
-    ]);
-    if host != "github.com" {
-        cmd.env("GH_HOST", host);
-    }
-    let output = cmd
+    let output = gh_cli_command(host)
+        .args([
+            "issue",
+            "view",
+            &number.to_string(),
+            "--repo",
+            &repo_full,
+            "--json",
+            "number,title,body",
+        ])
         .output()
         .await
         .context("Failed to execute gh issue view command")?;
@@ -740,21 +725,16 @@ pub struct PrInfo {
 /// * `number` - PR number
 pub async fn get_pr_via_cli(owner: &str, repo: &str, host: &str, number: u64) -> Result<PrInfo> {
     let repo_full = format!("{}/{}", owner, repo);
-    let gh_cmd = gh_command_for_host(host);
-    let mut cmd = Command::new(gh_cmd);
-    cmd.args([
-        "pr",
-        "view",
-        &number.to_string(),
-        "--repo",
-        &repo_full,
-        "--json",
-        "title,body,headRefName",
-    ]);
-    if host != "github.com" {
-        cmd.env("GH_HOST", host);
-    }
-    let output = cmd
+    let output = gh_cli_command(host)
+        .args([
+            "pr",
+            "view",
+            &number.to_string(),
+            "--repo",
+            &repo_full,
+            "--json",
+            "title,body,headRefName",
+        ])
         .output()
         .await
         .context("Failed to execute gh pr view command")?;
@@ -798,19 +778,11 @@ pub async fn create_draft_pr_via_cli(
     body: &str,
 ) -> Result<String> {
     let repo_full = format!("{}/{}", owner, repo);
-    let gh_cmd = gh_command_for_host(host);
-    let mut cmd = Command::new(gh_cmd);
-    cmd.args([
-        "pr", "create", "--repo", &repo_full, "--head", branch, "--base", base, "--title", title,
-        "--body", body, "--draft",
-    ]);
-
-    // Set GH_HOST for non-github.com hosts so gh CLI authenticates correctly
-    if host != "github.com" {
-        cmd.env("GH_HOST", host);
-    }
-
-    let output = cmd
+    let output = gh_cli_command(host)
+        .args([
+            "pr", "create", "--repo", &repo_full, "--head", branch, "--base", base, "--title",
+            title, "--body", body, "--draft",
+        ])
         .output()
         .await
         .context("Failed to execute gh pr create command")?;

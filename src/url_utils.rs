@@ -1,7 +1,6 @@
 use crate::git;
 use crate::github;
 use anyhow::{Context, Result};
-use tokio::process::Command;
 
 /// The type of resource referenced in a GitHub URL
 #[derive(Debug, Clone, PartialEq)]
@@ -163,12 +162,13 @@ fn build_pr_view_args(pr_num: &str, repo: Option<&str>) -> Vec<String> {
 /// Supports both plain PR numbers and GitHub URLs.
 /// `github_hosts` should contain all recognized hosts (e.g., `["github.com", "ghe.example.com"]`).
 /// For plain numbers, fetches metadata from GitHub to get branch info.
+/// Returns `(owner, repo, pr_number, branch, host)`.
 pub async fn parse_pr_info(
     pr: &str,
     github_hosts: &[String],
-) -> Result<(String, String, String, String)> {
+) -> Result<(String, String, String, String, String)> {
     // Extract PR number, gh command, and optional repo qualifier
-    let (pr_num, gh_cmd, repo_flag) = if pr.parse::<u32>().is_ok() {
+    let (pr_num, detected_host, repo_flag) = if pr.parse::<u32>().is_ok() {
         // Plain number: detect repo from current directory to pick gh vs ghe
         git::detect_git_repo()
             .await
@@ -178,8 +178,7 @@ pub async fn parse_pr_info(
             .context("Failed to get GitHub remote")?;
         let (host, _det_owner, _det_repo) = git::parse_github_remote(&remote_url, github_hosts)
             .context("Failed to parse GitHub remote URL")?;
-        let cmd = github::gh_command_for_host(&host);
-        (pr.to_string(), cmd.to_string(), None)
+        (pr.to_string(), host, None)
     } else if let Some(parsed) = parse_github_url(pr, github_hosts) {
         if parsed.resource_type != GitHubResourceType::Pull {
             // Parsed successfully but wrong resource type (e.g., issue URL given for review command)
@@ -189,8 +188,7 @@ pub async fn parse_pr_info(
             );
         }
         let repo_full = format!("{}/{}", parsed.owner, parsed.repo);
-        let cmd = github::gh_command_for_host(&parsed.host);
-        (parsed.number.to_string(), cmd.to_string(), Some(repo_full))
+        (parsed.number.to_string(), parsed.host, Some(repo_full))
     } else {
         anyhow::bail!(
             "Invalid PR format. Expected: <number> or <github-url>\n\
@@ -202,7 +200,7 @@ pub async fn parse_pr_info(
 
     // Fetch PR metadata from GitHub to get branch and repo info
     let args = build_pr_view_args(&pr_num, repo_flag.as_deref());
-    let output = Command::new(gh_cmd)
+    let output = github::gh_cli_command(&detected_host)
         .args(&args)
         .output()
         .await
@@ -229,7 +227,7 @@ pub async fn parse_pr_info(
         .context("Missing owner in PR metadata")?
         .to_string();
 
-    Ok((owner, repo, pr_num, branch))
+    Ok((owner, repo, pr_num, branch, detected_host))
 }
 
 #[cfg(test)]

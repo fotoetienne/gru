@@ -34,7 +34,9 @@ fn parse_params(params: &[String]) -> Result<HashMap<String, String>> {
 }
 
 /// Fetches issue data from GitHub and populates a PromptContext
-async fn fetch_issue_context(issue_str: &str) -> Result<(PromptContext, String, String, u64)> {
+async fn fetch_issue_context(
+    issue_str: &str,
+) -> Result<(PromptContext, String, String, String, u64)> {
     let github_hosts = crate::config::load_github_hosts();
     let (owner, repo, issue_num_str, host) = parse_issue_info(issue_str, &github_hosts).await?;
     let issue_number: u64 = issue_num_str
@@ -87,7 +89,7 @@ async fn fetch_issue_context(issue_str: &str) -> Result<(PromptContext, String, 
         context.issue_title.as_deref().unwrap_or("(no title)")
     );
 
-    Ok((context, owner, repo, issue_number))
+    Ok((context, owner, repo, host, issue_number))
 }
 
 /// Parses a PR argument (number or URL) into (owner, repo, pr_number)
@@ -503,11 +505,11 @@ pub async fn handle_prompt(prompt: &str, opts: PromptOptions) -> Result<i32> {
     let mut pr_branch: Option<String> = None;
 
     if let Some(ref issue_str) = issue_opt {
-        let (issue_ctx, owner, repo, issue_num) = fetch_issue_context(issue_str).await?;
+        let (issue_ctx, owner, repo, host, issue_num) = fetch_issue_context(issue_str).await?;
         context = issue_ctx;
         context_owner = Some(owner);
         context_repo = Some(repo);
-        context_host = Some("github.com".to_string()); // default; issue context doesn't return host yet
+        context_host = Some(host);
         issue_number_val = Some(issue_num);
     }
 

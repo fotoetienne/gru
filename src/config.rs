@@ -138,9 +138,15 @@ impl LabConfig {
     /// Returns the full list of GitHub hosts, always including `github.com`.
     pub fn all_github_hosts(&self) -> Vec<String> {
         let mut hosts = vec!["github.com".to_string()];
-        for h in &self.github_hosts {
-            let h = h.trim().to_string();
-            if !h.is_empty() && h != "github.com" {
+        for raw in &self.github_hosts {
+            // Normalize: strip whitespace, scheme prefixes, and trailing slashes
+            let h = raw
+                .trim()
+                .trim_start_matches("https://")
+                .trim_start_matches("http://")
+                .trim_end_matches('/')
+                .to_string();
+            if !h.is_empty() && !hosts.contains(&h) {
                 hosts.push(h);
             }
         }

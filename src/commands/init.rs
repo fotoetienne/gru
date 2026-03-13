@@ -68,11 +68,13 @@ pub async fn handle_init(repo_arg: String) -> Result<i32> {
     // Parse repository source
     let repo_source = parse_repo_source(&repo_arg)?;
 
-    // Resolve to owner/repo format
-    let (owner, repo) = match repo_source {
+    // Resolve to owner/repo/host format
+    let (owner, repo, host) = match repo_source {
         RepoSource::GitHub(github_repo) => {
             let parts: Vec<&str> = github_repo.split('/').collect();
-            (parts[0].to_string(), parts[1].to_string())
+            let owner = parts[0].to_string();
+            let host = crate::github::infer_github_host(&owner).to_string();
+            (owner, parts[1].to_string(), host)
         }
         RepoSource::CurrentDir => {
             println!("🔍 Detecting repository from current directory...");
@@ -122,8 +124,7 @@ pub async fn handle_init(repo_arg: String) -> Result<i32> {
     // 3. Clone/update bare repository
     println!("\n📦 Setting up repository mirror...");
     let bare_repo_path = workspace.repos().join(&owner).join(format!("{}.git", repo));
-    let host = crate::github::infer_github_host(&owner);
-    let git_repo = GitRepo::new(&owner, &repo, host, bare_repo_path.clone());
+    let git_repo = GitRepo::new(&owner, &repo, &host, bare_repo_path.clone());
 
     match git_repo.ensure_bare_clone().await {
         Ok(()) => {
@@ -206,7 +207,7 @@ pub async fn handle_init(repo_arg: String) -> Result<i32> {
 }
 
 /// Detect repository from current directory's git remote
-async fn detect_current_repo() -> Result<(String, String)> {
+async fn detect_current_repo() -> Result<(String, String, String)> {
     use crate::git::{detect_git_repo, get_github_remote, parse_github_remote};
 
     // Check if we're in a git repo
@@ -219,12 +220,12 @@ async fn detect_current_repo() -> Result<(String, String)> {
         .context("No GitHub remote found in current repository")?;
 
     // Parse owner/repo from remote URL
-    let (_host, owner, repo) = parse_github_remote(&remote_url, &github_hosts)
+    let (host, owner, repo) = parse_github_remote(&remote_url, &github_hosts)
         .context("Could not parse GitHub owner/repo from remote URL")?;
 
     println!("  Detected: {}/{}", owner, repo);
 
-    Ok((owner, repo))
+    Ok((owner, repo, host))
 }
 
 #[cfg(test)]

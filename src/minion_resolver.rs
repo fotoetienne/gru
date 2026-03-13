@@ -6,7 +6,6 @@ use anyhow::{Context, Result};
 use once_cell::sync::Lazy;
 use regex::Regex;
 use std::path::PathBuf;
-use tokio::process::Command;
 
 /// Regex for extracting issue links from PR bodies
 static ISSUE_LINK_REGEX: Lazy<Regex> = Lazy::new(|| {
@@ -398,9 +397,8 @@ async fn resolve_issue_from_pr(pr_num: u64) -> Result<u64> {
     let (host, det_owner, det_repo) = git::parse_github_remote(&remote_url, &github_hosts)
         .context("Failed to parse GitHub remote URL")?;
     let repo_full = format!("{}/{}", det_owner, det_repo);
-    let gh_cmd = github::gh_command_for_host(&host);
     // Use gh CLI to get linked issue from PR body
-    let output = Command::new(gh_cmd)
+    let output = github::gh_cli_command(&host)
         .args([
             "pr",
             "view",
