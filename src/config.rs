@@ -153,6 +153,61 @@ impl LabConfig {
         hosts
     }
 
+    /// Generate default config file content with commented-out options.
+    pub fn default_config_toml() -> &'static str {
+        r#"# Gru configuration file
+# Uncomment and modify options as needed.
+
+# # Additional GitHub hosts beyond github.com (e.g., GitHub Enterprise instances).
+# # github.com is always included by default — only list extra hosts here.
+# github_hosts = ["ghe.example.com"]
+
+# [daemon]
+# # Repositories to monitor (required for `gru lab`)
+# repos = ["owner/repo"]
+#
+# # Polling interval in seconds (default: 30)
+# poll_interval_secs = 30
+#
+# # Maximum concurrent Minion slots (default: 2)
+# max_slots = 2
+#
+# # Label to watch for issues (default: "ready-for-minion")
+# label = "ready-for-minion"
+
+# [agent]
+# # Which agent backend to use (default: "claude")
+# default = "claude"
+
+# [agent.claude]
+# # Override the Claude Code CLI binary path
+# binary = "/usr/local/bin/claude"
+
+# [merge]
+# # Confidence threshold (1-10) for the merge-readiness judge (default: 8)
+# confidence_threshold = 8
+"#
+    }
+
+    /// Write the default config file to the given path if it doesn't exist.
+    /// Returns Ok(true) if the file was created, Ok(false) if it already existed.
+    pub fn write_default_config(path: &Path) -> Result<bool> {
+        if path.exists() {
+            return Ok(false);
+        }
+
+        // Ensure parent directory exists
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("Failed to create directory: {}", parent.display()))?;
+        }
+
+        fs::write(path, Self::default_config_toml())
+            .with_context(|| format!("Failed to write config file: {}", path.display()))?;
+
+        Ok(true)
+    }
+
     /// Load configuration from file (validates daemon config — use for `gru lab`).
     pub fn load(path: &Path) -> Result<Self> {
         let contents = fs::read_to_string(path)
@@ -414,6 +469,79 @@ repos = ["owner/repo"]
 
         let config = LabConfig::load(temp_file.path()).unwrap();
         assert_eq!(config.merge.confidence_threshold, 8);
+    }
+
+    #[test]
+    fn test_default_config_toml_is_valid_when_uncommented() {
+        // Verify the config options parse as valid TOML when uncommented.
+        // Skip header/description comments that aren't TOML config lines.
+        let template = LabConfig::default_config_toml();
+        let uncommented: String = template
+            .lines()
+            .map(|line| {
+                let trimmed = line.trim();
+                if let Some(stripped) = trimmed.strip_prefix("# ") {
+                    // Only uncomment lines that look like TOML (key=val or [section])
+                    let s = stripped.trim();
+                    if s.starts_with('[') || s.contains(" = ") {
+                        return stripped.to_string();
+                    }
+                    // Keep description comments as-is
+                    format!("# {}", stripped)
+                } else {
+                    line.to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let config: LabConfig = toml::from_str(&uncommented)
+            .expect("Default config template should be valid TOML when uncommented");
+        assert_eq!(config.daemon.poll_interval_secs, 30);
+        assert_eq!(config.daemon.max_slots, 2);
+        assert_eq!(config.daemon.label, "ready-for-minion");
+        assert_eq!(config.agent.default, "claude");
+        assert_eq!(config.merge.confidence_threshold, 8);
+    }
+
+    #[test]
+    fn test_write_default_config_creates_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+
+        let created = LabConfig::write_default_config(&config_path).unwrap();
+        assert!(created);
+        assert!(config_path.exists());
+
+        let contents = fs::read_to_string(&config_path).unwrap();
+        assert!(contents.contains("[daemon]"));
+        assert!(contents.contains("poll_interval_secs"));
+    }
+
+    #[test]
+    fn test_write_default_config_skips_existing() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+
+        // Write custom content first
+        fs::write(&config_path, "custom config").unwrap();
+
+        let created = LabConfig::write_default_config(&config_path).unwrap();
+        assert!(!created);
+
+        // Verify content was not overwritten
+        let contents = fs::read_to_string(&config_path).unwrap();
+        assert_eq!(contents, "custom config");
+    }
+
+    #[test]
+    fn test_write_default_config_creates_parent_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("nested").join("dir").join("config.toml");
+
+        let created = LabConfig::write_default_config(&config_path).unwrap();
+        assert!(created);
+        assert!(config_path.exists());
     }
 
     #[test]
