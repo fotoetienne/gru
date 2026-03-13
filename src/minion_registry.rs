@@ -104,6 +104,19 @@ pub enum OrchestrationPhase {
     Failed,
 }
 
+impl OrchestrationPhase {
+    /// Returns true if this phase represents an active (in-progress) state
+    /// that can be resumed after interruption.
+    pub fn is_active(&self) -> bool {
+        matches!(
+            self,
+            OrchestrationPhase::RunningAgent
+                | OrchestrationPhase::CreatingPr
+                | OrchestrationPhase::MonitoringPr
+        )
+    }
+}
+
 /// Generates a default session ID for backwards compatibility
 fn default_session_id() -> String {
     uuid::Uuid::new_v4().to_string()
@@ -932,6 +945,16 @@ mod tests {
             assert_eq!(retrieved.attempt_count, 3);
             assert!(retrieved.no_watch);
         }
+    }
+
+    #[test]
+    fn test_orchestration_phase_is_active() {
+        assert!(!OrchestrationPhase::Setup.is_active());
+        assert!(OrchestrationPhase::RunningAgent.is_active());
+        assert!(OrchestrationPhase::CreatingPr.is_active());
+        assert!(OrchestrationPhase::MonitoringPr.is_active());
+        assert!(!OrchestrationPhase::Completed.is_active());
+        assert!(!OrchestrationPhase::Failed.is_active());
     }
 
     #[test]

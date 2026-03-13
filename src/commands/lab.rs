@@ -1,13 +1,19 @@
 use crate::config::{parse_repo_entry, LabConfig};
 use crate::github::{list_ready_issues_via_cli, GitHubClient};
 use crate::labels;
-use crate::minion_registry::{is_process_alive, with_registry};
+use crate::minion_registry::{
+    is_process_alive, with_registry, MinionInfo, MinionMode, OrchestrationPhase,
+};
 use anyhow::{Context, Result};
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
 use tokio::process::Child;
 use tokio::time::sleep;
+
+/// Maximum number of attempts before a minion is marked as failed
+const MAX_RESUME_ATTEMPTS: u32 = 3;
 
 /// Handles the lab daemon command
 pub async fn handle_lab(
@@ -176,6 +182,184 @@ async fn shutdown_children(children: &mut [Child]) {
     }
 }
 
+/// Information about a resumable minion found in the registry
+struct ResumableMinion {
+    minion_id: String,
+    info: MinionInfo,
+}
+
+/// Build the set of `owner/repo` strings that this Lab instance monitors.
+fn configured_repos(config: &LabConfig) -> HashSet<String> {
+    config
+        .daemon
+        .repos
+        .iter()
+        .filter_map(|spec| {
+            let (_host, owner, repo) = parse_repo_entry(spec)?;
+            Some(format!("{}/{}", owner, repo))
+        })
+        .collect()
+}
+
+/// Resolve the host for a given `owner/repo` from the Lab config.
+/// Returns `None` if the repo is not in the config.
+fn host_for_repo(config: &LabConfig, owner_repo: &str) -> Option<String> {
+    for spec in &config.daemon.repos {
+        if let Some((host, owner, repo)) = parse_repo_entry(spec) {
+            if format!("{}/{}", owner, repo) == owner_repo {
+                return Some(host);
+            }
+        }
+    }
+    None
+}
+
+/// Scan the registry for minions that can be resumed.
+///
+/// A minion is resumable if:
+/// - Its process is not running (mode is Stopped, or mode is Autonomous/Interactive
+///   but the PID is dead — e.g. after SIGKILL before cleanup could run)
+/// - Its orchestration phase is active (RunningAgent, CreatingPr, or MonitoringPr)
+/// - Its worktree still exists on disk
+/// - Its repo is in the Lab config
+async fn find_resumable_minions(config: &LabConfig) -> Result<Vec<ResumableMinion>> {
+    let repos = configured_repos(config);
+    with_registry(move |registry| {
+        let resumable = registry
+            .list()
+            .into_iter()
+            .filter(|(_id, info)| {
+                let process_dead =
+                    info.mode == MinionMode::Stopped || !info.pid.is_some_and(is_process_alive);
+                process_dead
+                    && info.orchestration_phase.is_active()
+                    && info.worktree.exists()
+                    && repos.contains(&info.repo)
+            })
+            .map(|(minion_id, info)| ResumableMinion { minion_id, info })
+            .collect();
+        Ok(resumable)
+    })
+    .await
+}
+
+/// Mark a minion as failed in the registry and post an escalation comment on the issue.
+async fn mark_exhausted_minion(minion_id: &str, info: &MinionInfo, host: &str) {
+    let mid = minion_id.to_string();
+    // Update registry to Failed
+    if let Err(e) = with_registry(move |reg| {
+        reg.update(&mid, |i| {
+            i.orchestration_phase = OrchestrationPhase::Failed;
+        })
+    })
+    .await
+    {
+        log::warn!(
+            "Failed to mark minion {} as exhausted in registry: {}",
+            minion_id,
+            e
+        );
+    }
+
+    // Post escalation comment and mark failed on GitHub
+    let (owner, repo_name) = match info.repo.split_once('/') {
+        Some(parts) => parts,
+        None => return,
+    };
+    if let Ok(client) = GitHubClient::from_env_with_host(owner, repo_name, host).await {
+        let comment = format!(
+            "⚠️ **Minion {} has exceeded the maximum resume attempts ({}).**\n\n\
+             Phase at failure: `{:?}`\n\n\
+             This issue needs human attention.",
+            minion_id, MAX_RESUME_ATTEMPTS, info.orchestration_phase,
+        );
+        let _ = client
+            .post_comment(owner, repo_name, info.issue, &comment)
+            .await;
+        let _ = client.mark_issue_failed(owner, repo_name, info.issue).await;
+    }
+}
+
+/// Resume interrupted minions, filling available slots before new issue claims.
+///
+/// Returns the number of minions successfully resumed.
+async fn resume_interrupted_minions(
+    config: &LabConfig,
+    children: &mut Vec<Child>,
+    available: &mut usize,
+) -> Result<usize> {
+    if *available == 0 {
+        return Ok(0);
+    }
+
+    let resumable = find_resumable_minions(config).await?;
+    if resumable.is_empty() {
+        return Ok(0);
+    }
+
+    println!(
+        "🔄 Found {} resumable Minion(s) from previous session",
+        resumable.len()
+    );
+
+    let mut resumed = 0;
+
+    for candidate in resumable {
+        if *available == 0 {
+            break;
+        }
+
+        let host = match host_for_repo(config, &candidate.info.repo) {
+            Some(h) => h,
+            None => continue, // repo no longer in config
+        };
+
+        // Skip minions that have exceeded max attempts
+        if candidate.info.attempt_count >= MAX_RESUME_ATTEMPTS {
+            println!(
+                "⏭️  Skipping {} (issue #{}, {}): attempt_count {} >= max {}",
+                candidate.minion_id,
+                candidate.info.issue,
+                candidate.info.repo,
+                candidate.info.attempt_count,
+                MAX_RESUME_ATTEMPTS,
+            );
+            mark_exhausted_minion(&candidate.minion_id, &candidate.info, &host).await;
+            continue;
+        }
+
+        println!(
+            "♻️  Resuming {} (issue #{}, {}, phase: {:?})",
+            candidate.minion_id,
+            candidate.info.issue,
+            candidate.info.repo,
+            candidate.info.orchestration_phase,
+        );
+
+        match spawn_minion(&candidate.info.repo, &host, candidate.info.issue).await {
+            Ok(child) => {
+                children.push(child);
+                resumed += 1;
+                *available -= 1;
+            }
+            Err(e) => {
+                log::warn!(
+                    "⚠️  Failed to resume {} for issue #{}: {}",
+                    candidate.minion_id,
+                    candidate.info.issue,
+                    e
+                );
+            }
+        }
+    }
+
+    if resumed > 0 {
+        println!("✅ Resumed {} Minion(s)", resumed);
+    }
+
+    Ok(resumed)
+}
+
 /// Poll GitHub for ready issues and spawn Minions if slots are available
 async fn poll_and_spawn(config: &LabConfig, children: &mut Vec<Child>) -> Result<()> {
     // Prune stale registry entries (worktrees that no longer exist)
@@ -189,7 +373,16 @@ async fn poll_and_spawn(config: &LabConfig, children: &mut Vec<Child>) -> Result
         return Ok(());
     }
 
-    let mut spawned = 0;
+    // Resume interrupted minions first, before claiming new issues
+    let resumed = resume_interrupted_minions(config, children, &mut available).await?;
+    let mut spawned = resumed;
+
+    if available == 0 {
+        if spawned > 0 {
+            println!();
+        }
+        return Ok(());
+    }
 
     // Poll each configured repository
     for repo_spec in &config.daemon.repos {
@@ -536,5 +729,69 @@ mod tests {
         assert!(crate::github::build_issue_url_with_host("justrepo", "github.com", 1).is_none());
         assert!(crate::github::build_issue_url_with_host("/repo", "github.com", 1).is_none());
         assert!(crate::github::build_issue_url_with_host("owner/", "github.com", 1).is_none());
+    }
+
+    // --- configured_repos / host_for_repo tests ---
+
+    fn test_lab_config(repos: Vec<&str>) -> LabConfig {
+        let mut config = LabConfig::default();
+        config.daemon.repos = repos.into_iter().map(String::from).collect();
+        config.daemon.max_slots = 2;
+        config
+    }
+
+    #[test]
+    fn test_configured_repos_basic() {
+        let config = test_lab_config(vec!["owner/repo1", "owner/repo2"]);
+        let repos = configured_repos(&config);
+        assert_eq!(repos.len(), 2);
+        assert!(repos.contains("owner/repo1"));
+        assert!(repos.contains("owner/repo2"));
+    }
+
+    #[test]
+    fn test_configured_repos_with_host() {
+        let config = test_lab_config(vec!["ghe.corp.com/owner/repo1", "owner/repo2"]);
+        let repos = configured_repos(&config);
+        assert_eq!(repos.len(), 2);
+        assert!(repos.contains("owner/repo1"));
+        assert!(repos.contains("owner/repo2"));
+    }
+
+    #[test]
+    fn test_configured_repos_skips_invalid() {
+        let config = test_lab_config(vec!["owner/repo1", "invalid", ""]);
+        let repos = configured_repos(&config);
+        assert_eq!(repos.len(), 1);
+        assert!(repos.contains("owner/repo1"));
+    }
+
+    #[test]
+    fn test_host_for_repo_github_com() {
+        let config = test_lab_config(vec!["owner/repo1"]);
+        assert_eq!(
+            host_for_repo(&config, "owner/repo1"),
+            Some("github.com".to_string())
+        );
+    }
+
+    #[test]
+    fn test_host_for_repo_ghe() {
+        let config = test_lab_config(vec!["ghe.corp.com/owner/repo1"]);
+        assert_eq!(
+            host_for_repo(&config, "owner/repo1"),
+            Some("ghe.corp.com".to_string())
+        );
+    }
+
+    #[test]
+    fn test_host_for_repo_not_found() {
+        let config = test_lab_config(vec!["owner/repo1"]);
+        assert_eq!(host_for_repo(&config, "other/repo"), None);
+    }
+
+    #[test]
+    fn test_max_resume_attempts_constant() {
+        assert_eq!(MAX_RESUME_ATTEMPTS, 3);
     }
 }
