@@ -1,6 +1,7 @@
 use anyhow::{bail, Context, Result};
 use std::path::PathBuf;
 
+use crate::config::LabConfig;
 use crate::git::GitRepo;
 use crate::github::GitHubClient;
 use crate::workspace::Workspace;
@@ -121,7 +122,22 @@ pub async fn handle_init(repo_arg: String) -> Result<i32> {
     println!("\n📁 Setting up workspace...");
     let workspace = Workspace::new().context("Failed to initialize workspace")?;
 
-    // 3. Clone/update bare repository
+    // 3. Generate default config file
+    println!("\n⚙️  Checking configuration...");
+    let config_path = LabConfig::default_path()?;
+    match LabConfig::write_default_config(&config_path) {
+        Ok(true) => {
+            println!("✓ Created default config: {}", config_path.display());
+        }
+        Ok(false) => {
+            println!("  • Config exists: {}", config_path.display());
+        }
+        Err(e) => {
+            log::warn!("  ⚠️  Could not create config file: {}", e);
+        }
+    }
+
+    // 4. Clone/update bare repository
     println!("\n📦 Setting up repository mirror...");
     let bare_repo_path = workspace.repos().join(&owner).join(format!("{}.git", repo));
     let git_repo = GitRepo::new(&owner, &repo, &host, bare_repo_path.clone());
@@ -140,7 +156,7 @@ pub async fn handle_init(repo_arg: String) -> Result<i32> {
         }
     }
 
-    // 4. Create required labels
+    // 5. Create required labels
     println!("\n🏷️  Configuring labels...");
     let mut labels_failed = Vec::new();
 
@@ -170,7 +186,7 @@ pub async fn handle_init(repo_arg: String) -> Result<i32> {
         );
     }
 
-    // 5. Check for ready issues
+    // 6. Check for ready issues
     println!("\n🔍 Checking for ready issues...");
     match github_client
         .list_issues_with_label(&owner, &repo, "ready-for-minion")
