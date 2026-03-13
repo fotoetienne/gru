@@ -40,6 +40,11 @@ pub struct FixOptions {
     pub agent_name: String,
     pub no_watch: bool,
     pub auto_merge: bool,
+    /// Detach immediately after spawning background worker (don't follow logs).
+    pub detach: bool,
+    /// Internal: run as background worker for a previously-registered minion.
+    /// Value is the minion ID to look up in the registry.
+    pub worker: Option<String>,
 }
 
 /// Maximum size of the output buffer for test detection (in bytes)
@@ -1734,37 +1739,123 @@ async fn monitor_ci_after_fix(
 // Orchestrator
 // ---------------------------------------------------------------------------
 
-/// Handles the fix command by delegating to the agent backend.
-/// Returns the exit code from the agent process.
+/// Spawns the current binary as a background worker process.
 ///
-/// Orchestrates 5 phases:
-/// 1. `resolve_issue` - Parse issue, check duplicates, fetch details
-/// 2. `setup_worktree` - Clone repo, create worktree, register minion
-/// 3. `run_agent_session` - Build prompt, run agent, track progress
-/// 4. `handle_pr_creation` - Push check, create PR, update labels
-/// 5. `monitor_pr_lifecycle` - Review, poll for updates, handle feedback
+/// The worker runs with `--worker <minion_id>` and inherits all other flags.
+/// Stdout/stderr are redirected to `gru.log` in the minion directory.
+/// Returns the child PID on success.
+async fn spawn_worker(
+    issue: &str,
+    minion_id: &str,
+    minion_dir: &Path,
+    opts: &FixOptions,
+) -> Result<u32> {
+    let gru_exe = std::env::current_exe().context("Failed to determine gru executable path")?;
+
+    let log_path = minion_dir.join("gru.log");
+    let log_file = std::fs::File::create(&log_path)
+        .with_context(|| format!("Failed to create log file: {}", log_path.display()))?;
+    let stderr_file = log_file
+        .try_clone()
+        .context("Failed to clone log file handle")?;
+
+    let mut cmd = std::process::Command::new(gru_exe);
+    cmd.arg("do").arg(issue);
+    cmd.arg("--worker").arg(minion_id);
+
+    // Forward relevant flags
+    if let Some(ref t) = opts.timeout {
+        cmd.arg("--timeout").arg(t);
+    }
+    if let Some(ref t) = opts.review_timeout {
+        cmd.arg("--review-timeout").arg(t);
+    }
+    if let Some(ref t) = opts.monitor_timeout {
+        cmd.arg("--monitor-timeout").arg(t);
+    }
+    if opts.force_new {
+        cmd.arg("--force-new");
+    }
+    if opts.agent_name != crate::agent_registry::DEFAULT_AGENT {
+        cmd.arg("--agent").arg(&opts.agent_name);
+    }
+    if opts.no_watch {
+        cmd.arg("--no-watch");
+    }
+    if opts.auto_merge {
+        cmd.arg("--auto-merge");
+    }
+    if opts.quiet {
+        cmd.arg("--quiet");
+    }
+
+    cmd.stdin(std::process::Stdio::null());
+    cmd.stdout(std::process::Stdio::from(log_file));
+    cmd.stderr(std::process::Stdio::from(stderr_file));
+
+    // Create a new session so the worker survives terminal close / SIGHUP
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
+
+    let child = cmd
+        .spawn()
+        .context("Failed to spawn background worker process")?;
+    let pid = child.id();
+
+    // Reap child in background to prevent zombie processes
+    std::thread::spawn(move || {
+        let _ = child.wait_with_output();
+    });
+
+    // Record worker PID in registry
+    let mid = minion_id.to_string();
+    if let Err(e) = with_registry(move |reg| {
+        reg.update(&mid, |info| {
+            info.pid = Some(pid);
+            info.mode = MinionMode::Autonomous;
+            info.last_activity = Utc::now();
+        })
+    })
+    .await
+    {
+        log::warn!("Failed to record worker PID in registry: {}", e);
+    }
+
+    Ok(pid)
+}
+
+/// Worker entry point: runs phases 3-5 for a previously-registered minion.
 ///
-/// If a previous session for the same issue was interrupted, it will
-/// automatically resume from the last completed phase.
-pub async fn handle_fix(issue: &str, opts: FixOptions) -> Result<i32> {
+/// Looks up the minion in the registry by ID, resolves the agent backend,
+/// and runs the agent session, PR creation, and monitoring phases.
+async fn run_worker(minion_id: &str, issue: &str, opts: FixOptions) -> Result<i32> {
     let FixOptions {
         timeout: timeout_opt,
         review_timeout: review_timeout_opt,
         monitor_timeout: monitor_timeout_opt,
         quiet,
-        force_new,
         agent_name,
         no_watch,
         auto_merge,
+        ..
     } = opts;
 
-    // Parse review timeout if provided
+    // Parse review/monitor timeouts
     let review_timeout = review_timeout_opt
         .map(|s| parse_timeout(&s))
         .transpose()
         .context("Invalid --review-timeout value")?;
 
-    // Parse monitor timeout if provided; default to 24 hours
     let monitor_timeout = match monitor_timeout_opt {
         Some(s) => {
             let d = parse_timeout(&s).context("Invalid --monitor-timeout value")?;
@@ -1776,69 +1867,47 @@ pub async fn handle_fix(issue: &str, opts: FixOptions) -> Result<i32> {
         None => Duration::from_secs(24 * 3600),
     };
 
-    // Load configured GitHub hosts (github.com always included)
-    let github_hosts = crate::config::load_github_hosts();
+    // Look up minion in registry
+    let mid = minion_id.to_string();
+    let registry_info = with_registry(move |reg| Ok(reg.get(&mid).cloned())).await?;
 
-    // Phase 1: Resolve issue (always runs - need fresh issue details)
-    let issue_ctx = resolve_issue(issue, &github_hosts).await?;
+    let info =
+        registry_info.with_context(|| format!("Minion {} not found in registry", minion_id))?;
 
-    // Validate agent name and create backend early (fail fast on unknown agents)
-    let backend = agent_registry::resolve_backend(&agent_name)?;
-
-    // Determine whether to resume an existing session or start fresh
-    let (wt_ctx, resume_phase) = if force_new {
-        (setup_worktree(&issue_ctx, &agent_name).await?, None)
-    } else {
-        match check_existing_minions(&issue_ctx.owner, &issue_ctx.repo, issue_ctx.issue_num).await?
-        {
-            ExistingMinionCheck::None => (setup_worktree(&issue_ctx, &agent_name).await?, None),
-            ExistingMinionCheck::Resumable(minion_id, info) => {
-                let phase = info.orchestration_phase.clone();
-                println!(
-                    "🔄 Resuming interrupted session {} (phase: {:?})",
-                    minion_id, phase
-                );
-                let session_id = Uuid::parse_str(&info.session_id)
-                    .context("Failed to parse session ID from registry")?;
-                let checkout_path = info.checkout_path();
-                let wt_ctx = WorktreeContext {
-                    minion_id,
-                    branch_name: info.branch,
-                    minion_dir: info.worktree,
-                    checkout_path,
-                    session_id,
-                };
-                (wt_ctx, Some(phase))
-            }
-            ExistingMinionCheck::AlreadyRunning => return Ok(1),
-        }
-    };
-
-    // Determine the starting phase for the orchestration
-    let is_resume = resume_phase.is_some();
-    let start_phase = resume_phase.unwrap_or(OrchestrationPhase::Setup);
-
-    // Claim the issue on fresh starts (skip on resume — already claimed)
-    if !is_resume {
-        if let Some(ref client) = issue_ctx.github_client {
-            claim_issue(
-                client,
-                &issue_ctx.owner,
-                &issue_ctx.repo,
-                issue_ctx.issue_num,
-            )
-            .await;
-        }
+    // Validate repo format
+    if !info.repo.contains('/') {
+        anyhow::bail!("Invalid repo format in registry: '{}'", info.repo);
     }
 
-    // Phase 3: Run agent (skip if already past this phase)
+    let session_id =
+        Uuid::parse_str(&info.session_id).context("Failed to parse session ID from registry")?;
+
+    let checkout_path = info.checkout_path();
+    let wt_ctx = WorktreeContext {
+        minion_id: minion_id.to_string(),
+        branch_name: info.branch.clone(),
+        minion_dir: info.worktree.clone(),
+        checkout_path,
+        session_id,
+    };
+
+    // Resolve backend and issue context
+    let backend = agent_registry::resolve_backend(&agent_name)?;
+
+    // Fetch fresh issue details for the worker
+    let github_hosts = crate::config::load_github_hosts();
+    let issue_ctx = resolve_issue(issue, &github_hosts).await?;
+
+    // Determine resume phase from registry
+    let start_phase = info.orchestration_phase.clone();
+
+    // Phase 3: Run agent
     let agent_result = if start_phase <= OrchestrationPhase::RunningAgent {
         update_orchestration_phase(&wt_ctx.minion_id, OrchestrationPhase::RunningAgent).await;
 
-        // Only use --resume if we're resuming a session that actually ran the agent.
-        // If interrupted during Setup (before the agent ever ran), the session ID was
-        // never used, so resume would fail.
-        let use_resume = is_resume && start_phase > OrchestrationPhase::Setup;
+        // Use --resume only if the agent has already run (session ID was used).
+        // If interrupted during Setup, the session was never started.
+        let use_resume = start_phase > OrchestrationPhase::Setup;
         let result = if use_resume {
             resume_agent_session(
                 &*backend,
@@ -1862,8 +1931,6 @@ pub async fn handle_fix(issue: &str, opts: FixOptions) -> Result<i32> {
         match result {
             Ok(result) => Some(result),
             Err(e) if is_stuck_or_timeout_error(&e) => {
-                // Mark as Failed so the next `gru do` won't retry indefinitely.
-                // The user can explicitly `--force-new` to start a fresh session.
                 update_orchestration_phase(&wt_ctx.minion_id, OrchestrationPhase::Failed).await;
                 log::error!("🚨 {:#}", e);
                 if let Some(ref client) = issue_ctx.github_client {
@@ -1880,12 +1947,11 @@ pub async fn handle_fix(issue: &str, opts: FixOptions) -> Result<i32> {
             Err(e) => return Err(e),
         }
     } else {
-        // Skipping Claude phase — already completed in a previous run
         println!("⏭️  Skipping agent session (already completed)");
         None
     };
 
-    // Check Claude result if we ran it
+    // Check agent result
     if let Some(ref result) = agent_result {
         if !result.status.success() {
             update_orchestration_phase(&wt_ctx.minion_id, OrchestrationPhase::Failed).await;
@@ -1908,23 +1974,23 @@ pub async fn handle_fix(issue: &str, opts: FixOptions) -> Result<i32> {
         }
     }
 
-    // Phase 4: Create PR (skip if already past this phase)
+    // Phase 4: Create PR
     let pr_number = if start_phase <= OrchestrationPhase::CreatingPr {
         update_orchestration_phase(&wt_ctx.minion_id, OrchestrationPhase::CreatingPr).await;
         handle_pr_creation(&issue_ctx, &wt_ctx).await?
     } else {
-        // Already past PR creation — look up the PR from registry
         println!("⏭️  Skipping PR creation (already completed)");
-        let minion_id = wt_ctx.minion_id.clone();
+        let minion_id_owned = wt_ctx.minion_id.clone();
         let existing_pr = with_registry(move |registry| {
-            Ok(registry.get(&minion_id).and_then(|info| info.pr.clone()))
+            Ok(registry
+                .get(&minion_id_owned)
+                .and_then(|info| info.pr.clone()))
         })
         .await?;
 
         if existing_pr.is_some() {
             existing_pr
         } else {
-            // PR number not found in registry (crash during PR creation) — re-run
             log::info!("ℹ️  PR not found in registry, retrying PR creation");
             handle_pr_creation(&issue_ctx, &wt_ctx).await?
         }
@@ -1933,7 +1999,6 @@ pub async fn handle_fix(issue: &str, opts: FixOptions) -> Result<i32> {
     // Add gru:auto-merge label if --auto-merge flag was set
     if auto_merge {
         if let Some(ref pr_num) = pr_number {
-            // Ensure the label exists in the repo first
             if let Err(e) =
                 pr_monitor::ensure_auto_merge_label(&issue_ctx.owner, &issue_ctx.repo).await
             {
@@ -1954,7 +2019,6 @@ pub async fn handle_fix(issue: &str, opts: FixOptions) -> Result<i32> {
             .unwrap_or(0)
     };
 
-    // --no-watch: skip all monitoring (PR lifecycle + CI) for fire-and-forget mode
     if no_watch {
         if let Some(ref pr_num) = pr_number {
             println!(
@@ -1966,7 +2030,7 @@ pub async fn handle_fix(issue: &str, opts: FixOptions) -> Result<i32> {
         return Ok(agent_exit_code());
     }
 
-    // Phase 5: Monitor PR lifecycle (review + polling)
+    // Phase 5: Monitor PR lifecycle
     if let Some(ref pr_num) = pr_number {
         update_orchestration_phase(&wt_ctx.minion_id, OrchestrationPhase::MonitoringPr).await;
         monitor_pr_lifecycle(
@@ -2009,7 +2073,125 @@ pub async fn handle_fix(issue: &str, opts: FixOptions) -> Result<i32> {
 
     update_orchestration_phase(&wt_ctx.minion_id, OrchestrationPhase::Completed).await;
 
+    // Clear PID from registry on clean exit
+    let mid_cleanup = minion_id.to_string();
+    let _ = with_registry(move |reg| {
+        reg.update(&mid_cleanup, |info| {
+            info.pid = None;
+            info.mode = MinionMode::Stopped;
+        })
+    })
+    .await;
+
     Ok(agent_exit_code())
+}
+
+/// Handles the fix command by delegating to the agent backend.
+/// Returns the exit code from the agent process.
+///
+/// In normal (foreground) mode, orchestrates:
+/// 1. `resolve_issue` - Parse issue, check duplicates, fetch details
+/// 2. `setup_worktree` - Clone repo, create worktree, register minion
+/// 3. Spawn background worker process
+/// 4. Auto-tail events.jsonl (unless --detach)
+///
+/// In worker mode (--worker <minion_id>), runs phases 3-5 directly:
+/// 3. `run_agent_session` - Build prompt, run agent, track progress
+/// 4. `handle_pr_creation` - Push check, create PR, update labels
+/// 5. `monitor_pr_lifecycle` - Review, poll for updates, handle feedback
+///
+/// If a previous session for the same issue was interrupted, it will
+/// automatically resume from the last completed phase.
+pub async fn handle_fix(issue: &str, opts: FixOptions) -> Result<i32> {
+    // Worker mode: run phases 3-5 directly (background process)
+    if let Some(ref minion_id) = opts.worker {
+        let mid = minion_id.clone();
+        return run_worker(&mid, issue, opts).await;
+    }
+
+    let quiet = opts.quiet;
+    let force_new = opts.force_new;
+    let detach = opts.detach;
+    let agent_name = &opts.agent_name;
+
+    // Validate agent name early (fail fast on unknown agents)
+    let _backend = agent_registry::resolve_backend(agent_name)?;
+
+    // Phase 1: Resolve issue
+    let github_hosts = crate::config::load_github_hosts();
+    let issue_ctx = resolve_issue(issue, &github_hosts).await?;
+
+    // Phase 2: Determine whether to resume or start fresh
+    let (wt_ctx, is_fresh) = if force_new {
+        (setup_worktree(&issue_ctx, agent_name).await?, true)
+    } else {
+        match check_existing_minions(&issue_ctx.owner, &issue_ctx.repo, issue_ctx.issue_num).await?
+        {
+            ExistingMinionCheck::None => (setup_worktree(&issue_ctx, agent_name).await?, true),
+            ExistingMinionCheck::Resumable(minion_id, info) => {
+                let phase = info.orchestration_phase.clone();
+                println!(
+                    "🔄 Resuming interrupted session {} (phase: {:?})",
+                    minion_id, phase
+                );
+                let session_id = Uuid::parse_str(&info.session_id)
+                    .context("Failed to parse session ID from registry")?;
+                let checkout_path = info.checkout_path();
+                (
+                    WorktreeContext {
+                        minion_id,
+                        branch_name: info.branch,
+                        minion_dir: info.worktree,
+                        checkout_path,
+                        session_id,
+                    },
+                    false,
+                )
+            }
+            ExistingMinionCheck::AlreadyRunning => return Ok(1),
+        }
+    };
+
+    // Claim the issue on fresh starts (skip on resume — already claimed)
+    if is_fresh {
+        if let Some(ref client) = issue_ctx.github_client {
+            claim_issue(
+                client,
+                &issue_ctx.owner,
+                &issue_ctx.repo,
+                issue_ctx.issue_num,
+            )
+            .await;
+        }
+    }
+
+    // Phase 3: Spawn background worker
+    let worker_pid = spawn_worker(issue, &wt_ctx.minion_id, &wt_ctx.minion_dir, &opts).await?;
+
+    println!(
+        "Minion {} spawned for issue #{} (PID: {})",
+        wt_ctx.minion_id, issue_ctx.issue_num, worker_pid
+    );
+
+    if detach {
+        println!(
+            "Detached. Use `gru logs {}` to follow progress, `gru stop {}` to cancel.",
+            wt_ctx.minion_id, wt_ctx.minion_id
+        );
+        return Ok(0);
+    }
+
+    // Auto-tail events
+    println!(
+        "Streaming progress... (Ctrl+C to detach, `gru stop {}` to cancel)\n",
+        wt_ctx.minion_id
+    );
+
+    let events_path = wt_ctx.minion_dir.join("events.jsonl");
+    let issue_str = issue_ctx.issue_num.to_string();
+    crate::log_viewer::tail_events(events_path, &wt_ctx.minion_id, &issue_str, quiet).await?;
+
+    Ok(0)
 }
 
 #[cfg(test)]
@@ -2252,6 +2434,8 @@ CUSTOM: Fix #{{ issue_number }} - {{ issue_title }}"#,
             agent_name: "claude".to_string(),
             no_watch: false,
             auto_merge: false,
+            detach: false,
+            worker: None,
         };
         assert!(!opts.no_watch);
     }
@@ -2267,6 +2451,8 @@ CUSTOM: Fix #{{ issue_number }} - {{ issue_title }}"#,
             agent_name: "claude".to_string(),
             no_watch: true,
             auto_merge: false,
+            detach: false,
+            worker: None,
         };
         assert!(opts.no_watch);
     }
@@ -2282,6 +2468,8 @@ CUSTOM: Fix #{{ issue_number }} - {{ issue_title }}"#,
             agent_name: "claude".to_string(),
             no_watch: false,
             auto_merge: true,
+            detach: false,
+            worker: None,
         };
         assert!(opts.auto_merge);
     }
@@ -2298,6 +2486,8 @@ CUSTOM: Fix #{{ issue_number }} - {{ issue_title }}"#,
             agent_name: "codex".to_string(),
             no_watch: true,
             auto_merge: true,
+            detach: true,
+            worker: Some("M001".to_string()),
         };
         let FixOptions {
             timeout,
@@ -2308,6 +2498,7 @@ CUSTOM: Fix #{{ issue_number }} - {{ issue_title }}"#,
             agent_name,
             no_watch,
             auto_merge,
+            ..
         } = opts;
         assert_eq!(timeout.as_deref(), Some("10m"));
         assert_eq!(review_timeout.as_deref(), Some("5m"));

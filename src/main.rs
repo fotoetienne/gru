@@ -10,6 +10,7 @@ mod config;
 mod git;
 mod github;
 pub(crate) mod labels;
+mod log_viewer;
 mod merge_judge;
 mod merge_readiness;
 mod minion;
@@ -30,8 +31,8 @@ mod worktree_scanner;
 
 use clap::{Parser, Subcommand};
 use commands::{
-    attach, chat, clean, fix, init, lab, path, prompt, prompts, rebase, resume, review, status,
-    stop,
+    attach, chat, clean, fix, init, lab, logs, path, prompt, prompts, rebase, resume, review,
+    status, stop,
 };
 
 /// CLI structure for the Gru agent orchestrator
@@ -115,6 +116,31 @@ enum Commands {
             help = "Auto-merge PR when all readiness checks pass (adds gru:auto-merge label). Requires lifecycle monitoring (incompatible with --no-watch)."
         )]
         auto_merge: bool,
+
+        #[arg(
+            short = 'd',
+            long,
+            help = "Detach immediately after spawning the background worker (don't follow logs)"
+        )]
+        detach: bool,
+
+        #[arg(
+            long,
+            hide = true,
+            help = "Internal flag: run as background worker process for a previously-registered minion"
+        )]
+        worker: Option<String>,
+    },
+    #[command(about = "View logs from a Minion's event stream")]
+    Logs {
+        #[arg(help = "Minion ID, issue number, or PR number (e.g., M001, 42)")]
+        id: String,
+
+        #[arg(
+            long = "no-follow",
+            help = "Replay history only, don't follow live events"
+        )]
+        no_follow: bool,
     },
     #[command(about = "Review a GitHub pull request")]
     Review {
@@ -200,6 +226,9 @@ enum Commands {
     Stop {
         #[arg(help = "Minion ID, issue number, or PR number (e.g., M0tk, 42)")]
         id: String,
+
+        #[arg(long, help = "Force kill (SIGKILL instead of SIGTERM)")]
+        force: bool,
     },
     #[command(about = "Run an ad-hoc prompt with an agent")]
     Prompt {
@@ -309,6 +338,8 @@ async fn main() {
             agent,
             no_watch,
             auto_merge,
+            detach,
+            worker,
         } => {
             let agent_name = agent.unwrap_or_else(|| agent_registry::DEFAULT_AGENT.to_string());
             fix::handle_fix(
@@ -322,10 +353,13 @@ async fn main() {
                     agent_name,
                     no_watch,
                     auto_merge,
+                    detach,
+                    worker,
                 },
             )
             .await
         }
+        Commands::Logs { id, no_follow } => logs::handle_logs(id, !no_follow, cli.quiet).await,
         Commands::Review { pr, agent } => {
             let agent_name = agent.unwrap_or_else(|| agent_registry::DEFAULT_AGENT.to_string());
             review::handle_review(pr, &agent_name).await
@@ -348,7 +382,7 @@ async fn main() {
             base_branch,
         } => clean::handle_clean(dry_run, force, &base_branch).await,
         Commands::Status { id, verbose } => status::handle_status(id, verbose).await,
-        Commands::Stop { id } => stop::handle_stop(id).await,
+        Commands::Stop { id, force } => stop::handle_stop(id, force).await,
         Commands::Prompt {
             prompt,
             info,
