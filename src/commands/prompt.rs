@@ -680,6 +680,9 @@ pub async fn handle_prompt(prompt: &str, opts: PromptOptions) -> Result<i32> {
         orchestration_phase: OrchestrationPhase::RunningAgent,
         token_usage: None,
         agent_name: agent_name.clone(),
+        timeout_deadline: None,
+        attempt_count: 0,
+        no_watch: false,
     };
 
     let minion_id_clone = minion_id.clone();
