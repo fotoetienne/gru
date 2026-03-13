@@ -42,15 +42,28 @@ pub async fn handle_tail(
         is_minion_running(&minion.minion_id).await
     };
 
-    let n = last_n.unwrap_or(DEFAULT_LAST_N);
+    // In follow mode, default to showing last 20 events before tailing.
+    // In no-follow mode, default to showing all events (like `gru logs`).
+    let effective_n = if follow {
+        Some(last_n.unwrap_or(DEFAULT_LAST_N))
+    } else {
+        last_n
+    };
 
     if raw {
         if follow {
-            log_viewer::tail_events_raw(events_path, &minion.minion_id, Some(n))
+            log_viewer::tail_events_raw(events_path, &minion.minion_id, effective_n)
                 .await
                 .context("Failed to tail events")?;
         } else {
-            log_viewer::replay_last_n_events_raw(&events_path, n)?;
+            match effective_n {
+                Some(n) => {
+                    log_viewer::replay_last_n_events_raw(&events_path, n)?;
+                }
+                None => {
+                    log_viewer::replay_events_raw(&events_path)?;
+                }
+            }
         }
     } else if follow {
         if !quiet {
@@ -61,25 +74,43 @@ pub async fn handle_tail(
             eprintln!("Press Ctrl+C to detach\n");
         }
 
-        log_viewer::tail_events_last_n(events_path, &minion.minion_id, &issue_str, quiet, Some(n))
-            .await
-            .context("Failed to tail events")?;
+        log_viewer::tail_events_last_n(
+            events_path,
+            &minion.minion_id,
+            &issue_str,
+            quiet,
+            effective_n,
+        )
+        .await
+        .context("Failed to tail events")?;
     } else {
-        if !quiet {
-            eprintln!(
-                "Replaying last {} events for Minion {} (issue #{})...\n",
-                n, minion.minion_id, issue_str
-            );
-        }
-
         let config = crate::progress::ProgressConfig {
             minion_id: minion.minion_id.clone(),
-            issue: issue_str,
+            issue: issue_str.clone(),
             quiet,
         };
         let progress = crate::progress::ProgressDisplay::new(config);
 
-        log_viewer::replay_last_n_events(&events_path, n, &progress)?;
+        match effective_n {
+            Some(n) => {
+                if !quiet {
+                    eprintln!(
+                        "Replaying last {} events for Minion {} (issue #{})...\n",
+                        n, minion.minion_id, issue_str
+                    );
+                }
+                log_viewer::replay_last_n_events(&events_path, n, &progress)?;
+            }
+            None => {
+                if !quiet {
+                    eprintln!(
+                        "Replaying all events for Minion {} (issue #{})...\n",
+                        minion.minion_id, issue_str
+                    );
+                }
+                log_viewer::replay_events(&events_path, &progress)?;
+            }
+        }
         progress.finish_with_message(&format!("End of logs for Minion {}", minion.minion_id));
     }
 

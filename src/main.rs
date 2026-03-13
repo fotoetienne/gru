@@ -159,7 +159,7 @@ enum Commands {
         #[arg(
             short = 'n',
             long = "lines",
-            help = "Number of events to show before following (default: 20)"
+            help = "Number of events to show (default: all for stopped, 20 before following for running)"
         )]
         lines: Option<usize>,
     },
