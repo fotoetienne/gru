@@ -26,9 +26,11 @@ struct AuthenticatedGitCommand {
 /// Creates a git `Command` pre-configured with `GIT_ASKPASS` authentication.
 ///
 /// If a token is provided, creates a temporary script that outputs the token on
-/// stdout. Git invokes this script when it needs a password, so the token never
-/// appears in command-line arguments, environment variable values visible in
-/// `/proc`, or error messages.
+/// stdout. Git invokes this script when it needs credentials, so the token never
+/// appears in command-line arguments (visible in `/proc/*/cmdline`) or git error
+/// messages. The token is passed via `GRU_ASKPASS_TOKEN` env var to the child
+/// process, which is visible in `/proc/*/environ` (same-uid only) — standard
+/// practice for passing secrets to subprocesses.
 ///
 /// The returned `AuthenticatedGitCommand` must be kept alive until the command
 /// finishes so the temporary askpass script file is not deleted prematurely.
@@ -45,7 +47,10 @@ fn git_command_with_auth(token: Option<&str>) -> Result<AuthenticatedGitCommand>
         // Write a script that reads the token from an env var, keeping
         // the token out of the file content entirely.
         let mut file = NamedTempFile::new().context("Failed to create GIT_ASKPASS temp file")?;
-        writeln!(file, "#!/bin/sh\necho \"$GRU_ASKPASS_TOKEN\"")
+        writeln!(
+            file,
+            "#!/bin/sh\ncase \"$1\" in\n*assword*) printf '%s\\n' \"$GRU_ASKPASS_TOKEN\" ;;\n*) echo x-access-token ;;\nesac"
+        )
             .context("Failed to write GIT_ASKPASS script")?;
         file.flush().context("Failed to flush GIT_ASKPASS script")?;
 
@@ -79,8 +84,8 @@ fn git_command_with_auth(token: Option<&str>) -> Result<AuthenticatedGitCommand>
 
 /// Redacts credential-related content from git error output.
 ///
-/// Strips any `credential.helper` configuration values and known token patterns
-/// from stderr to prevent accidental credential exposure in logs or error messages.
+/// Strips any `credential.helper` configuration values from stderr to prevent
+/// accidental credential exposure in logs or error messages.
 fn redact_credentials(stderr: &str) -> String {
     let mut result = String::with_capacity(stderr.len());
     for line in stderr.lines() {
