@@ -1,8 +1,8 @@
 //! Event log viewer for replaying and tailing `events.jsonl`.
 //!
 //! Provides functionality to replay historical events and follow live events
-//! in real-time (poll-based, no external dependencies). Used by `gru logs`
-//! and the auto-tail feature of `gru do`.
+//! in real-time (poll-based, no external dependencies). Used by `gru logs`,
+//! `gru tail`, and the auto-tail feature of `gru do`.
 
 use crate::agent::AgentEvent;
 use crate::minion_registry::{is_process_alive, with_registry};
@@ -15,6 +15,107 @@ use tokio::signal;
 
 /// Poll interval for checking new events in tail mode.
 const TAIL_POLL_INTERVAL: Duration = Duration::from_millis(500);
+
+/// Output mode for tail follow loops. Determines how events are replayed and streamed.
+enum TailOutput<'a> {
+    /// Formatted output through ProgressDisplay.
+    Formatted { progress: &'a ProgressDisplay },
+    /// Raw JSONL output to stdout.
+    Raw,
+}
+
+impl TailOutput<'_> {
+    fn replay(&self, events_path: &Path, last_n: Option<usize>) -> Result<u64> {
+        match self {
+            TailOutput::Formatted { progress } => match last_n {
+                Some(n) => replay_last_n_events(events_path, n, progress),
+                None => replay_events(events_path, progress),
+            },
+            TailOutput::Raw => match last_n {
+                Some(n) => replay_last_n_events_raw(events_path, n),
+                None => replay_events_raw(events_path),
+            },
+        }
+    }
+
+    fn read_new(&self, events_path: &Path, position: u64) -> Result<u64> {
+        match self {
+            TailOutput::Formatted { progress } => read_new_events(events_path, position, progress),
+            TailOutput::Raw => read_new_events_raw(events_path, position),
+        }
+    }
+
+    fn on_detach(&self) {
+        if let TailOutput::Formatted { progress } = self {
+            progress.finish_with_message("Detached from minion (worker continues in background)");
+        }
+    }
+
+    fn on_finish(&self) {
+        if let TailOutput::Formatted { progress } = self {
+            progress.finish_with_message("Minion has finished");
+        }
+    }
+}
+
+/// Core follow loop shared by all tail variants.
+///
+/// Looks up the worker PID, waits for the events file to appear (up to 30s),
+/// replays existing events, then polls for new events until the worker exits
+/// or Ctrl+C is pressed.
+async fn tail_follow(
+    events_path: &Path,
+    minion_id: &str,
+    last_n: Option<usize>,
+    output: &TailOutput<'_>,
+) -> Result<()> {
+    let mid = minion_id.to_string();
+    let worker_pid = with_registry(move |reg| Ok(reg.get(&mid).and_then(|info| info.pid)))
+        .await
+        .unwrap_or(None);
+
+    // Wait for events file to be created (worker may not have written yet)
+    let mut waited = Duration::ZERO;
+    let max_wait = Duration::from_secs(30);
+    while !events_path.exists() {
+        if waited >= max_wait {
+            anyhow::bail!(
+                "Timed out waiting for events file: {}",
+                events_path.display()
+            );
+        }
+        if !is_pid_alive(worker_pid) {
+            anyhow::bail!("Worker exited before creating events file. Check gru.log for details.");
+        }
+        tokio::time::sleep(TAIL_POLL_INTERVAL).await;
+        waited += TAIL_POLL_INTERVAL;
+    }
+
+    // Replay existing events
+    let mut position = output.replay(events_path, last_n)?;
+
+    // Follow new events with poll-based tailing
+    loop {
+        tokio::select! {
+            _ = signal::ctrl_c() => {
+                output.on_detach();
+                break;
+            }
+            _ = tokio::time::sleep(TAIL_POLL_INTERVAL) => {
+                position = output.read_new(events_path, position)?;
+
+                if !is_pid_alive(worker_pid) {
+                    // Read any final events
+                    let _ = output.read_new(events_path, position);
+                    output.on_finish();
+                    break;
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
 
 /// Replays all existing events from an events.jsonl file through a ProgressDisplay.
 /// Returns the byte position after replay (for subsequent tailing).
@@ -49,7 +150,7 @@ pub fn replay_events(events_path: &Path, progress: &ProgressDisplay) -> Result<u
     Ok(position)
 }
 
-/// Tails an events.jsonl file, replaying history then following live events.
+/// Tails an events.jsonl file, replaying all history then following live events.
 ///
 /// Exits when:
 /// - The minion process is no longer alive (checked via PID in registry)
@@ -67,57 +168,10 @@ pub async fn tail_events(
         quiet,
     };
     let progress = ProgressDisplay::new(config);
-
-    // Look up PID once for liveness checks (avoid re-loading registry every poll)
-    let mid = minion_id.to_string();
-    let worker_pid = with_registry(move |reg| Ok(reg.get(&mid).and_then(|info| info.pid)))
-        .await
-        .unwrap_or(None);
-
-    // Wait for events file to be created (worker may not have written yet)
-    let mut waited = Duration::ZERO;
-    let max_wait = Duration::from_secs(30);
-    while !events_path.exists() {
-        if waited >= max_wait {
-            anyhow::bail!(
-                "Timed out waiting for events file: {}",
-                events_path.display()
-            );
-        }
-        // Fail fast if worker died before creating events file
-        if !is_pid_alive(worker_pid) {
-            anyhow::bail!("Worker exited before creating events file. Check gru.log for details.");
-        }
-        tokio::time::sleep(TAIL_POLL_INTERVAL).await;
-        waited += TAIL_POLL_INTERVAL;
-    }
-
-    // Replay existing events
-    let mut position = replay_events(&events_path, &progress)?;
-
-    // Follow new events with poll-based tailing
-    loop {
-        tokio::select! {
-            _ = signal::ctrl_c() => {
-                progress.finish_with_message("Detached from minion (worker continues in background)");
-                break;
-            }
-            _ = tokio::time::sleep(TAIL_POLL_INTERVAL) => {
-                // Read new events from the file
-                position = read_new_events(&events_path, position, &progress)?;
-
-                // Check if worker is still alive (using cached PID)
-                if !is_pid_alive(worker_pid) {
-                    // Read any final events
-                    let _ = read_new_events(&events_path, position, &progress);
-                    progress.finish_with_message("Minion has finished");
-                    break;
-                }
-            }
-        }
-    }
-
-    Ok(())
+    let output = TailOutput::Formatted {
+        progress: &progress,
+    };
+    tail_follow(&events_path, minion_id, None, &output).await
 }
 
 /// Reads new events from a file starting at the given byte position.
@@ -273,51 +327,8 @@ pub async fn tail_events_raw(
     minion_id: &str,
     last_n: Option<usize>,
 ) -> Result<()> {
-    let mid = minion_id.to_string();
-    let worker_pid = with_registry(move |reg| Ok(reg.get(&mid).and_then(|info| info.pid)))
-        .await
-        .unwrap_or(None);
-
-    // Wait for events file
-    let mut waited = Duration::ZERO;
-    let max_wait = Duration::from_secs(30);
-    while !events_path.exists() {
-        if waited >= max_wait {
-            anyhow::bail!(
-                "Timed out waiting for events file: {}",
-                events_path.display()
-            );
-        }
-        if !is_pid_alive(worker_pid) {
-            anyhow::bail!("Worker exited before creating events file.");
-        }
-        tokio::time::sleep(TAIL_POLL_INTERVAL).await;
-        waited += TAIL_POLL_INTERVAL;
-    }
-
-    // Replay existing events
-    let mut position = match last_n {
-        Some(n) => replay_last_n_events_raw(&events_path, n)?,
-        None => replay_events_raw(&events_path)?,
-    };
-
-    // Follow new events
-    loop {
-        tokio::select! {
-            _ = signal::ctrl_c() => {
-                break;
-            }
-            _ = tokio::time::sleep(TAIL_POLL_INTERVAL) => {
-                position = read_new_events_raw(&events_path, position)?;
-                if !is_pid_alive(worker_pid) {
-                    let _ = read_new_events_raw(&events_path, position);
-                    break;
-                }
-            }
-        }
-    }
-
-    Ok(())
+    let output = TailOutput::Raw;
+    tail_follow(&events_path, minion_id, last_n, &output).await
 }
 
 /// Reads new raw events from a file starting at the given byte position.
@@ -369,54 +380,10 @@ pub async fn tail_events_last_n(
         quiet,
     };
     let progress = ProgressDisplay::new(config);
-
-    let mid = minion_id.to_string();
-    let worker_pid = with_registry(move |reg| Ok(reg.get(&mid).and_then(|info| info.pid)))
-        .await
-        .unwrap_or(None);
-
-    // Wait for events file
-    let mut waited = Duration::ZERO;
-    let max_wait = Duration::from_secs(30);
-    while !events_path.exists() {
-        if waited >= max_wait {
-            anyhow::bail!(
-                "Timed out waiting for events file: {}",
-                events_path.display()
-            );
-        }
-        if !is_pid_alive(worker_pid) {
-            anyhow::bail!("Worker exited before creating events file.");
-        }
-        tokio::time::sleep(TAIL_POLL_INTERVAL).await;
-        waited += TAIL_POLL_INTERVAL;
-    }
-
-    // Replay existing events (last N or all)
-    let mut position = match last_n {
-        Some(n) => replay_last_n_events(&events_path, n, &progress)?,
-        None => replay_events(&events_path, &progress)?,
+    let output = TailOutput::Formatted {
+        progress: &progress,
     };
-
-    // Follow new events
-    loop {
-        tokio::select! {
-            _ = signal::ctrl_c() => {
-                progress.finish_with_message("Detached from minion (worker continues in background)");
-                break;
-            }
-            _ = tokio::time::sleep(TAIL_POLL_INTERVAL) => {
-                position = read_new_events(&events_path, position, &progress)?;
-                if !is_pid_alive(worker_pid) {
-                    let _ = read_new_events(&events_path, position, &progress);
-                    progress.finish_with_message("Minion has finished");
-                    break;
-                }
-            }
-        }
-    }
-
-    Ok(())
+    tail_follow(&events_path, minion_id, last_n, &output).await
 }
 
 /// Checks if a worker process is alive using a cached PID.

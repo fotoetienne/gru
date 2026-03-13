@@ -27,11 +27,11 @@ pub async fn handle_logs(id: String, follow: bool, quiet: bool) -> Result<i32> {
 
     if follow {
         // Replay + follow live events (like docker logs -f)
-        println!(
+        eprintln!(
             "Streaming logs for Minion {} (issue #{})...",
             minion.minion_id, issue_str
         );
-        println!("Press Ctrl+C to detach\n");
+        eprintln!("Press Ctrl+C to detach\n");
 
         log_viewer::tail_events(events_path, &minion.minion_id, &issue_str, quiet)
             .await

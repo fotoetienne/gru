@@ -21,15 +21,6 @@ pub async fn handle_tail(
 
     let events_path = minion.worktree_path.join("events.jsonl");
 
-    if !events_path.exists() {
-        eprintln!(
-            "No events found for Minion {} ({})",
-            minion.minion_id,
-            events_path.display()
-        );
-        return Ok(1);
-    }
-
     let issue_str = minion
         .issue_number
         .map(|n| n.to_string())
@@ -41,6 +32,18 @@ pub async fn handle_tail(
     } else {
         is_minion_running(&minion.minion_id).await
     };
+
+    // Only check for missing events file when not following.
+    // In follow mode, the log_viewer's wait-for-file logic handles files
+    // that haven't been created yet (e.g., minion just started).
+    if !follow && !events_path.exists() {
+        eprintln!(
+            "No events found for Minion {} ({})",
+            minion.minion_id,
+            events_path.display()
+        );
+        return Ok(1);
+    }
 
     // In follow mode, default to showing last 20 events before tailing.
     // In no-follow mode, default to showing all events (like `gru logs`).
