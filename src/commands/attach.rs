@@ -102,10 +102,16 @@ pub async fn handle_attach(
     };
 
     // Resolve the agent backend from the stored agent name
-    let backend = agent_registry::resolve_backend(&agent_name).context(format!(
-        "Failed to resolve agent backend '{}' for attach",
-        agent_name
-    ))?;
+    let backend = match agent_registry::resolve_backend(&agent_name) {
+        Ok(b) => b,
+        Err(e) => {
+            revert_to_stopped(&minion.minion_id).await;
+            return Err(e).context(format!(
+                "Failed to resolve agent backend '{}' for attach",
+                agent_name
+            ));
+        }
+    };
 
     println!("🔌 Attaching to Minion {}...", minion.minion_id);
     if yolo {
@@ -116,21 +122,19 @@ pub async fn handle_attach(
     // Build command for interactive mode via the resolved backend
     let mut cmd = match &session_id {
         Some(sid) => {
-            let session_uuid =
-                Uuid::parse_str(sid).context("Failed to parse session ID from registry")?;
+            let session_uuid = match Uuid::parse_str(sid) {
+                Ok(uuid) => uuid,
+                Err(e) => {
+                    revert_to_stopped(&minion.minion_id).await;
+                    return Err(
+                        anyhow::anyhow!(e).context("Failed to parse session ID from registry")
+                    );
+                }
+            };
             match backend.build_interactive_resume_command(&checkout_path, &session_uuid) {
                 Some(c) => c,
                 None => {
-                    // Revert registry to Stopped since backend doesn't support interactive mode
-                    let mid = minion.minion_id.clone();
-                    let _ = with_registry(move |reg| {
-                        reg.update(&mid, |info| {
-                            info.mode = MinionMode::Stopped;
-                            info.pid = None;
-                            info.last_activity = Utc::now();
-                        })
-                    })
-                    .await;
+                    revert_to_stopped(&minion.minion_id).await;
                     anyhow::bail!(
                         "Agent backend '{}' does not support interactive mode. \
                          Use 'gru resume {}' for autonomous mode instead.",
@@ -141,7 +145,14 @@ pub async fn handle_attach(
             }
         }
         None => {
-            // No session_id — fallback to claude -r (legacy behavior for unregistered minions)
+            // No session_id — legacy fallback only makes sense for Claude.
+            // For any other backend we cannot safely guess at the session.
+            if agent_name != agent_registry::DEFAULT_AGENT {
+                anyhow::bail!(
+                    "Cannot attach to Minion with agent '{}': no session ID in registry",
+                    agent_name
+                );
+            }
             let mut c = Command::new("claude");
             c.arg("-r")
                 .current_dir(&checkout_path)
@@ -155,20 +166,11 @@ pub async fn handle_attach(
         cmd.arg("--dangerously-skip-permissions");
     }
 
-    // Spawn claude process (not exec - we need to update registry after exit)
+    // Spawn agent process (not exec - we need to update registry after exit)
     let mut child = match cmd.spawn() {
         Ok(child) => child,
         Err(e) => {
-            // Spawn failed - revert registry to Stopped
-            let mid = minion.minion_id.clone();
-            let _ = with_registry(move |reg| {
-                reg.update(&mid, |info| {
-                    info.mode = MinionMode::Stopped;
-                    info.pid = None;
-                    info.last_activity = Utc::now();
-                })
-            })
-            .await;
+            revert_to_stopped(&minion.minion_id).await;
             return Err(e).context(format!(
                 "Failed to start agent '{}'. Is the CLI installed and in your PATH?",
                 agent_name
@@ -245,6 +247,20 @@ async fn prompt_auto_resume() -> bool {
         }
         _ = tokio::signal::ctrl_c() => false,
     }
+}
+
+/// Reverts the registry to Stopped mode (best-effort).
+/// Used when claim succeeded but we can't proceed with the spawn.
+async fn revert_to_stopped(minion_id: &str) {
+    let mid = minion_id.to_string();
+    let _ = with_registry(move |reg| {
+        reg.update(&mid, |info| {
+            info.mode = MinionMode::Stopped;
+            info.pid = None;
+            info.last_activity = Utc::now();
+        })
+    })
+    .await;
 }
 
 /// Returns `true` if the input is an affirmative answer (empty, "y", or "yes").

@@ -343,6 +343,26 @@ mod tests {
         assert!(b.build_resume_command(&path, &id, "p").is_some());
     }
 
+    #[test]
+    fn test_build_interactive_resume_command() {
+        let b = backend();
+        let path = std::path::PathBuf::from("/tmp/worktree");
+        let session_id = Uuid::nil();
+        let cmd = b
+            .build_interactive_resume_command(&path, &session_id)
+            .expect("interactive resume should be supported");
+        let inner = cmd.as_std();
+
+        assert_eq!(inner.get_program(), "claude");
+        let args: Vec<&std::ffi::OsStr> = inner.get_args().collect();
+        assert!(args.contains(&"--resume".as_ref()));
+        assert!(args.contains(&session_id.to_string().as_ref()));
+        // Interactive mode should NOT have --print or --output-format
+        assert!(!args.contains(&"--print".as_ref()));
+        assert!(!args.contains(&"--output-format".as_ref()));
+        assert!(!args.contains(&"stream-json".as_ref()));
+    }
+
     // ---- parse_event tests ----
 
     #[test]

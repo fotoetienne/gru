@@ -420,6 +420,14 @@ mod tests {
         assert!(b.build_resume_command(&path, &id, "p").is_some());
     }
 
+    #[test]
+    fn test_interactive_resume_not_supported() {
+        let b = backend();
+        let path = std::path::PathBuf::from("/tmp");
+        let id = Uuid::nil();
+        assert!(b.build_interactive_resume_command(&path, &id).is_none());
+    }
+
     // ---- parse_event tests ----
 
     #[test]
