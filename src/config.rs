@@ -154,6 +154,11 @@ impl LabConfig {
     }
 
     /// Generate default config file content with commented-out options.
+    ///
+    /// Comment convention:
+    /// - `# [section]` — single `#` for TOML section headers
+    /// - `# # description` / `# key = value` — double `#` for descriptions,
+    ///   single `#` + space for option lines (so uncommenting removes one `#` layer)
     pub fn default_config_toml() -> &'static str {
         r#"# Gru configuration file
 # Uncomment and modify options as needed.
