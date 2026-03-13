@@ -94,6 +94,24 @@ pub fn get_label_info(canonical: &str) -> Option<(&'static str, &'static str)> {
         .map(|(_, color, desc)| (*color, *desc))
 }
 
+/// Return the counterpart label name for backward-compatible querying.
+///
+/// If given a new name, returns the old name (if one exists).
+/// If given an old name, returns the new name.
+/// Returns `None` if the label has no counterpart (e.g., unchanged labels).
+pub fn counterpart_label(label: &str) -> Option<&'static str> {
+    // Check if it's a new name → return old name
+    for (old, new) in MIGRATIONS {
+        if label == *new {
+            return Some(old);
+        }
+        if label == *old {
+            return Some(new);
+        }
+    }
+    None
+}
+
 /// Check if a label name matches the given canonical label (new or old name).
 pub fn matches_label(actual: &str, canonical: &str) -> bool {
     if actual == canonical {
@@ -173,6 +191,41 @@ mod tests {
     #[test]
     fn test_all_labels_count() {
         assert_eq!(ALL_LABELS.len(), 8);
+    }
+
+    #[test]
+    fn test_counterpart_label_new_to_old() {
+        assert_eq!(counterpart_label(TODO), Some("ready-for-minion"));
+        assert_eq!(counterpart_label(IN_PROGRESS), Some("in-progress"));
+        assert_eq!(counterpart_label(DONE), Some("minion:done"));
+        assert_eq!(counterpart_label(BLOCKED), Some("minion:blocked"));
+        assert_eq!(counterpart_label(READY_TO_MERGE), Some("ready-to-merge"));
+    }
+
+    #[test]
+    fn test_counterpart_label_old_to_new() {
+        assert_eq!(counterpart_label("ready-for-minion"), Some(TODO));
+        assert_eq!(counterpart_label("in-progress"), Some(IN_PROGRESS));
+        assert_eq!(counterpart_label("minion:done"), Some(DONE));
+    }
+
+    #[test]
+    fn test_counterpart_label_unchanged_returns_none() {
+        assert_eq!(counterpart_label(AUTO_MERGE), None);
+        assert_eq!(counterpart_label(NEEDS_HUMAN_REVIEW), None);
+        assert_eq!(counterpart_label("random-label"), None);
+    }
+
+    #[test]
+    fn test_get_label_info_found() {
+        let (color, desc) = get_label_info(TODO).unwrap();
+        assert_eq!(color, "0075ca");
+        assert!(!desc.is_empty());
+    }
+
+    #[test]
+    fn test_get_label_info_not_found() {
+        assert!(get_label_info("nonexistent").is_none());
     }
 
     #[test]

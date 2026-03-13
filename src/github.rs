@@ -523,8 +523,9 @@ impl GitHubClient {
         let repo_full = format!("{}/{}", owner, repo);
         let gh_cmd = gh_command_for_repo(&repo_full);
 
-        // Use gh api to PATCH the label with new_name
-        // URL-encode reserved characters for use in a path segment
+        // Use gh api to PATCH the label with new_name, color, and description.
+        // GitHub's label update API uses `new_name` (not `name`) for renames.
+        // URL-encode reserved characters for use in a path segment.
         let encoded_name = old_name
             .replace('%', "%25") // must come first to avoid double-encoding
             .replace('/', "%2F")
@@ -532,10 +533,20 @@ impl GitHubClient {
             .replace('?', "%3F")
             .replace(':', "%3A");
         let endpoint = format!("repos/{}/labels/{}", repo_full, encoded_name);
-        let name_field = format!("name={}", new_name);
+        let new_name_field = format!("new_name={}", new_name);
+
+        // Also update color and description so migrated labels get the standardized values
+        let mut args = vec!["api", &endpoint, "-X", "PATCH", "-f", &new_name_field];
+        let color_field;
+        let desc_field;
+        if let Some((color, description)) = labels::get_label_info(new_name) {
+            color_field = format!("color={}", color);
+            desc_field = format!("description={}", description);
+            args.extend_from_slice(&["-f", &color_field, "-f", &desc_field]);
+        }
 
         let output = Command::new(gh_cmd)
-            .args(["api", &endpoint, "-X", "PATCH", "-f", &name_field])
+            .args(&args)
             .output()
             .await
             .context(format!(

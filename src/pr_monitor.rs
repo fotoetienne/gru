@@ -1,4 +1,5 @@
 use crate::github;
+use crate::labels;
 use crate::merge_readiness;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -180,8 +181,6 @@ fn is_failed_check(check_run: &CheckRun) -> bool {
         Some("failure") | Some("cancelled") | Some("timed_out") | Some("action_required")
     )
 }
-
-use crate::labels;
 
 const READY_TO_MERGE_LABEL: &str = labels::READY_TO_MERGE;
 const AUTO_MERGE_LABEL: &str = labels::AUTO_MERGE;

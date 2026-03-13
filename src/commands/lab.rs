@@ -429,9 +429,25 @@ async fn spawn_minion(repo: &str, issue_number: u64) -> Result<Child> {
 /// Used when the gh CLI is unavailable. Cannot filter GitHub-native blocked state
 /// (no API equivalent of `-is:blocked`), but does filter out `gru:blocked` and
 /// `gru:in-progress` labels (accepting both old and new names).
+///
+/// If the configured label has a counterpart (old↔new), both are queried so that
+/// repos in any migration state are covered.
 async fn fallback_list_issues(owner: &str, repo: &str, label: &str) -> Result<Vec<u64>> {
     let client = GitHubClient::from_env(owner, repo).await?;
-    let issues = client.list_issues_with_label(owner, repo, label).await?;
+    let mut issues = client.list_issues_with_label(owner, repo, label).await?;
+
+    // Also fetch issues under the counterpart label name (old↔new) for backward compat
+    if let Some(alt_label) = labels::counterpart_label(label) {
+        if let Ok(alt_issues) = client.list_issues_with_label(owner, repo, alt_label).await {
+            let existing: std::collections::HashSet<u64> =
+                issues.iter().map(|i| i.number).collect();
+            for issue in alt_issues {
+                if !existing.contains(&issue.number) {
+                    issues.push(issue);
+                }
+            }
+        }
+    }
 
     let filtered: Vec<u64> = issues
         .into_iter()
