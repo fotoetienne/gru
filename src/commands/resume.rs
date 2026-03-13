@@ -96,6 +96,16 @@ pub async fn handle_resume(
         }
     };
 
+    // Increment attempt_count for this resume
+    let mid = minion.minion_id.clone();
+    with_registry(move |reg| {
+        reg.update(&mid, |info| {
+            info.attempt_count += 1;
+        })
+    })
+    .await
+    .ok(); // Best-effort: don't fail the resume if counter update fails
+
     let session_uuid = match Uuid::parse_str(&session_id) {
         Ok(uuid) => uuid,
         Err(e) => {
