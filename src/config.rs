@@ -12,6 +12,30 @@ pub struct LabConfig {
 
     #[serde(default)]
     pub agent: AgentConfig,
+
+    #[serde(default)]
+    pub merge: MergeConfig,
+}
+
+/// Merge judge configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MergeConfig {
+    /// Confidence threshold (1-10) for the merge-readiness judge.
+    /// Only merge when the judge's confidence >= this value.
+    #[serde(default = "default_confidence_threshold")]
+    pub confidence_threshold: u8,
+}
+
+impl Default for MergeConfig {
+    fn default() -> Self {
+        Self {
+            confidence_threshold: default_confidence_threshold(),
+        }
+    }
+}
+
+fn default_confidence_threshold() -> u8 {
+    8
 }
 
 /// Agent backend configuration
@@ -91,7 +115,7 @@ fn default_label() -> String {
 }
 
 impl LabConfig {
-    /// Load configuration from file
+    /// Load configuration from file (validates daemon config — use for `gru lab`).
     pub fn load(path: &Path) -> Result<Self> {
         let contents = fs::read_to_string(path)
             .with_context(|| format!("Failed to read config file: {}", path.display()))?;
@@ -100,6 +124,20 @@ impl LabConfig {
             .with_context(|| format!("Failed to parse config file: {}", path.display()))?;
 
         config.validate()?;
+
+        Ok(config)
+    }
+
+    /// Load configuration without daemon validation.
+    ///
+    /// Use this for non-daemon commands (e.g., `gru do`) that only need
+    /// agent/merge config but may not have `[daemon].repos` configured.
+    pub fn load_partial(path: &Path) -> Result<Self> {
+        let contents = fs::read_to_string(path)
+            .with_context(|| format!("Failed to read config file: {}", path.display()))?;
+
+        let config: LabConfig = toml::from_str(&contents)
+            .with_context(|| format!("Failed to parse config file: {}", path.display()))?;
 
         Ok(config)
     }
@@ -318,5 +356,42 @@ default = "aider"
         // Parsing succeeds (validation happens in AgentRegistry, not config parsing)
         let config = LabConfig::load(temp_file.path()).unwrap();
         assert_eq!(config.agent.default, "aider");
+    }
+
+    #[test]
+    fn test_merge_config_defaults() {
+        let config = MergeConfig::default();
+        assert_eq!(config.confidence_threshold, 8);
+    }
+
+    #[test]
+    fn test_merge_config_missing_section_uses_defaults() {
+        let config_toml = r#"
+[daemon]
+repos = ["owner/repo"]
+"#;
+        let mut temp_file = NamedTempFile::new().unwrap();
+        temp_file.write_all(config_toml.as_bytes()).unwrap();
+        temp_file.flush().unwrap();
+
+        let config = LabConfig::load(temp_file.path()).unwrap();
+        assert_eq!(config.merge.confidence_threshold, 8);
+    }
+
+    #[test]
+    fn test_merge_config_custom_threshold() {
+        let config_toml = r#"
+[daemon]
+repos = ["owner/repo"]
+
+[merge]
+confidence_threshold = 6
+"#;
+        let mut temp_file = NamedTempFile::new().unwrap();
+        temp_file.write_all(config_toml.as_bytes()).unwrap();
+        temp_file.flush().unwrap();
+
+        let config = LabConfig::load(temp_file.path()).unwrap();
+        assert_eq!(config.merge.confidence_threshold, 6);
     }
 }
