@@ -1,4 +1,4 @@
-use crate::config::LabConfig;
+use crate::config::{parse_repo_entry, LabConfig};
 use crate::github::{list_ready_issues_via_cli, GitHubClient};
 use crate::labels;
 use crate::minion_registry::{is_process_alive, with_registry};
@@ -176,34 +176,6 @@ async fn shutdown_children(children: &mut [Child]) {
     }
 }
 
-/// Parse a repository spec into `(host, owner, repo)`.
-///
-/// Accepts two formats:
-/// - `"owner/repo"` → `(None, "owner", "repo")`
-/// - `"host.example.com/owner/repo"` → `(Some("host.example.com"), "owner", "repo")`
-///
-/// A first segment containing a dot is treated as a hostname.
-fn parse_repo_spec(spec: &str) -> Option<(Option<&str>, &str, &str)> {
-    let mut parts = spec.splitn(4, '/');
-    let first = parts.next().filter(|s| !s.is_empty())?;
-    let second = parts.next().filter(|s| !s.is_empty())?;
-
-    match parts.next() {
-        None => {
-            // Two parts: owner/repo
-            Some((None, first, second))
-        }
-        Some(third) if !third.is_empty() => {
-            // Three parts: host/owner/repo (host must contain a dot)
-            if !first.contains('.') || parts.next().is_some() {
-                return None;
-            }
-            Some((Some(first), second, third))
-        }
-        _ => None,
-    }
-}
-
 /// Poll GitHub for ready issues and spawn Minions if slots are available
 async fn poll_and_spawn(config: &LabConfig, children: &mut Vec<Child>) -> Result<()> {
     // Prune stale registry entries (worktrees that no longer exist)
@@ -226,20 +198,19 @@ async fn poll_and_spawn(config: &LabConfig, children: &mut Vec<Child>) -> Result
         }
 
         // Parse owner/repo or host/owner/repo
-        let (parsed_host, owner, repo) = match parse_repo_spec(repo_spec) {
+        let (host, owner, repo) = match parse_repo_entry(repo_spec) {
             Some(parsed) => parsed,
             None => {
                 log::warn!("⚠️  Invalid repo format: '{}', skipping", repo_spec);
                 continue;
             }
         };
-        let host = parsed_host.unwrap_or("github.com");
 
         // Fetch ready issues, excluding blocked ones (both GitHub-blocked and minion:blocked).
         // Try CLI first (supports -is:blocked qualifier), fall back to octocrab with
         // client-side filtering if CLI is unavailable.
         let issue_numbers =
-            match list_ready_issues_via_cli(owner, repo, host, &config.daemon.label).await {
+            match list_ready_issues_via_cli(&owner, &repo, &host, &config.daemon.label).await {
                 Ok(numbers) => numbers,
                 Err(cli_err) => {
                     log::warn!(
@@ -247,7 +218,7 @@ async fn poll_and_spawn(config: &LabConfig, children: &mut Vec<Child>) -> Result
                         repo_spec,
                         cli_err
                     );
-                    match fallback_list_issues(owner, repo, host, &config.daemon.label).await {
+                    match fallback_list_issues(&owner, &repo, &host, &config.daemon.label).await {
                         Ok(numbers) => numbers,
                         Err(e) => {
                             log::warn!("⚠️  API fallback also failed for {}: {}", repo_spec, e);
@@ -258,7 +229,7 @@ async fn poll_and_spawn(config: &LabConfig, children: &mut Vec<Child>) -> Result
             };
 
         // Create GitHub client for claiming issues
-        let client = match GitHubClient::from_env_with_host(owner, repo, host).await {
+        let client = match GitHubClient::from_env_with_host(&owner, &repo, &host).await {
             Ok(client) => client,
             Err(e) => {
                 log::warn!(
@@ -282,10 +253,10 @@ async fn poll_and_spawn(config: &LabConfig, children: &mut Vec<Child>) -> Result
             }
 
             // Try to claim the issue
-            match client.claim_issue(owner, repo, issue_number).await {
+            match client.claim_issue(&owner, &repo, issue_number).await {
                 Ok(true) => {
                     // Successfully claimed, spawn Minion
-                    match spawn_minion(repo_spec, host, issue_number).await {
+                    match spawn_minion(repo_spec, &host, issue_number).await {
                         Ok(child) => {
                             children.push(child);
                             println!(
@@ -304,7 +275,7 @@ async fn poll_and_spawn(config: &LabConfig, children: &mut Vec<Child>) -> Result
                             );
                             // Unclaim the issue since we failed to spawn
                             if let Err(e) = client
-                                .remove_label(owner, repo, issue_number, labels::IN_PROGRESS)
+                                .remove_label(&owner, &repo, issue_number, labels::IN_PROGRESS)
                                 .await
                             {
                                 log::warn!("⚠️  Failed to remove in-progress label: {}", e);
@@ -401,8 +372,18 @@ async fn spawn_minion(repo: &str, host: &str, issue_number: u64) -> Result<Child
     std::fs::create_dir_all(&log_dir)
         .with_context(|| format!("Failed to create log directory: {}", log_dir.display()))?;
 
+    // Include host in log filename to avoid collisions when the same owner/repo
+    // exists on different hosts (e.g., github.com/org/svc vs ghe.corp.com/org/svc).
+    let safe_host = if host == "github.com" {
+        String::new()
+    } else {
+        format!("{}-", host.replace('.', "-"))
+    };
     let safe_repo = repo.replace('/', "-");
-    let log_path = log_dir.join(format!("{}-issue-{}.log", safe_repo, issue_number));
+    let log_path = log_dir.join(format!(
+        "{}{}-issue-{}.log",
+        safe_host, safe_repo, issue_number
+    ));
     let stdout_file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -494,61 +475,19 @@ mod tests {
     }
 
     #[test]
-    fn test_log_path_construction() {
+    fn test_log_path_github_com() {
         let safe_repo = "owner/repo".replace('/', "-");
         let log_name = format!("{}-issue-{}.log", safe_repo, 42);
         assert_eq!(log_name, "owner-repo-issue-42.log");
     }
 
-    // --- parse_repo_spec tests ---
-
     #[test]
-    fn test_parse_repo_spec_owner_repo() {
-        assert_eq!(parse_repo_spec("owner/repo"), Some((None, "owner", "repo")));
-    }
-
-    #[test]
-    fn test_parse_repo_spec_with_hyphens() {
-        assert_eq!(
-            parse_repo_spec("my-org/my-repo"),
-            Some((None, "my-org", "my-repo"))
-        );
-    }
-
-    #[test]
-    fn test_parse_repo_spec_host_owner_repo() {
-        assert_eq!(
-            parse_repo_spec("ghe.netflix.net/corp/service"),
-            Some((Some("ghe.netflix.net"), "corp", "service"))
-        );
-    }
-
-    #[test]
-    fn test_parse_repo_spec_no_slash() {
-        assert_eq!(parse_repo_spec("justrepo"), None);
-    }
-
-    #[test]
-    fn test_parse_repo_spec_three_parts_no_dot() {
-        // "a/b/c" is rejected because "a" doesn't look like a hostname
-        assert_eq!(parse_repo_spec("a/b/c"), None);
-    }
-
-    #[test]
-    fn test_parse_repo_spec_too_many_slashes() {
-        assert_eq!(parse_repo_spec("a/b/c/d"), None);
-    }
-
-    #[test]
-    fn test_parse_repo_spec_empty() {
-        assert_eq!(parse_repo_spec(""), None);
-    }
-
-    #[test]
-    fn test_parse_repo_spec_empty_parts() {
-        assert_eq!(parse_repo_spec("/repo"), None);
-        assert_eq!(parse_repo_spec("owner/"), None);
-        assert_eq!(parse_repo_spec("/"), None);
+    fn test_log_path_ghe_includes_host() {
+        let host = "ghe.netflix.net";
+        let safe_host = format!("{}-", host.replace('.', "-"));
+        let safe_repo = "corp/service".replace('/', "-");
+        let log_name = format!("{}{}-issue-{}.log", safe_host, safe_repo, 42);
+        assert_eq!(log_name, "ghe-netflix-net-corp-service-issue-42.log");
     }
 
     // --- issue URL construction tests ---
