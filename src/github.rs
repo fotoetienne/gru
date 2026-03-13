@@ -12,14 +12,11 @@ use crate::labels;
 /// Try to extract GitHub token from gh/ghe CLI
 ///
 /// # Arguments
-/// * `owner` - Repository owner (used to infer hostname)
-/// * `repo` - Repository name (currently unused, but available for future enhancements)
+/// * `host` - GitHub hostname (e.g., "github.com" or "ghe.netflix.net")
 ///
 /// Returns the token if successfully extracted, or None if gh/ghe is not available
-async fn try_get_token_from_cli(owner: &str, _repo: &str) -> Option<String> {
-    // Infer which CLI to use based on hostname
-    let host = infer_github_host(owner);
-    let gh_cmd = if host.contains("ghe.") { "ghe" } else { "gh" };
+async fn try_get_token_from_cli_for_host(host: &str) -> Option<String> {
+    let gh_cmd = gh_command_for_host(host);
 
     // Try to get token from CLI
     let output = Command::new(gh_cmd)
@@ -85,15 +82,14 @@ pub fn gh_cli_command(host: &str) -> Command {
     cmd
 }
 
-/// Build a full GitHub issue URL for a repo in "owner/repo" format.
+/// Build a full GitHub issue URL for a repo in "owner/repo" format, with an explicit host.
 ///
 /// Returns `Some(url)` when `repo` is a valid `owner/repo` string, otherwise `None`.
-pub fn build_issue_url(repo: &str, issue_number: u64) -> Option<String> {
+pub fn build_issue_url_with_host(repo: &str, host: &str, issue_number: u64) -> Option<String> {
     let (owner, repo_name) = repo.split_once('/')?;
     if owner.is_empty() || repo_name.is_empty() || repo_name.contains('/') {
         return None;
     }
-    let host = infer_github_host(owner);
     Some(format!(
         "https://{}/{}/{}/issues/{}",
         host, owner, repo_name, issue_number
@@ -124,11 +120,10 @@ pub fn gh_command_for_repo(repo: &str) -> &'static str {
 /// 3. Return error with helpful message
 ///
 /// # Arguments
-/// * `owner` - Repository owner (used to infer hostname)
-/// * `repo` - Repository name
-async fn get_github_token(owner: &str, repo: &str) -> Result<String> {
+/// * `host` - GitHub hostname (e.g., "github.com" or "ghe.netflix.net")
+async fn get_github_token_for_host(host: &str) -> Result<String> {
     // Try CLI first
-    if let Some(token) = try_get_token_from_cli(owner, repo).await {
+    if let Some(token) = try_get_token_from_cli_for_host(host).await {
         return Ok(token);
     }
 
@@ -140,8 +135,7 @@ async fn get_github_token(owner: &str, repo: &str) -> Result<String> {
     }
 
     // Provide helpful error message
-    let host = infer_github_host(owner);
-    let gh_cmd = if host.contains("ghe.") { "ghe" } else { "gh" };
+    let gh_cmd = gh_command_for_host(host);
 
     Err(anyhow!(
         "No GitHub authentication found.\n\n\
@@ -167,39 +161,50 @@ pub struct GitHubClient {
 }
 
 impl GitHubClient {
-    /// Initialize a new GitHub client with the provided token
+    /// Initialize a new GitHub client targeting a specific host.
     ///
-    /// # Arguments
-    /// * `token` - GitHub personal access token
-    ///
-    /// Returns an error if the token is empty or invalid.
-    pub fn new(token: String) -> Result<Self> {
+    /// For non-`github.com` hosts, sets the octocrab `base_uri` to
+    /// `https://{host}/api/v3` for GitHub Enterprise compatibility.
+    pub fn new_with_host(token: String, host: &str) -> Result<Self> {
         if token.is_empty() {
             return Err(anyhow!("GitHub token is empty"));
         }
 
-        let client = Octocrab::builder()
-            .personal_token(token)
-            .build()
-            .context("Failed to build GitHub client")?;
+        let mut builder = Octocrab::builder().personal_token(token);
+
+        if host != "github.com" {
+            let base_uri = format!("https://{}/api/v3", host);
+            builder = builder.base_uri(base_uri).context("Invalid GHE base URI")?;
+        }
+
+        let client = builder.build().context("Failed to build GitHub client")?;
 
         Ok(Self { client })
     }
 
-    /// Initialize a new GitHub client with token from environment or gh/ghe CLI
+    /// Initialize a new GitHub client for a specific host.
     ///
-    /// Priority order:
-    /// 1. Try gh/ghe CLI (respects existing authentication)
-    /// 2. Fall back to GRU_GITHUB_TOKEN environment variable
+    /// For non-`github.com` hosts, sets the octocrab `base_uri` to
+    /// `https://{host}/api/v3` for GitHub Enterprise compatibility.
     ///
     /// # Arguments
-    /// * `owner` - Repository owner (used to infer hostname)
+    /// * `owner` - Repository owner
     /// * `repo` - Repository name
+    /// * `host` - GitHub hostname (e.g., "github.com" or "ghe.netflix.net")
+    pub async fn from_env_with_host(owner: &str, repo: &str, host: &str) -> Result<Self> {
+        let _ = (owner, repo); // reserved for future per-repo logic
+        let token = get_github_token_for_host(host).await?;
+        Self::new_with_host(token, host)
+    }
+
+    /// Initialize a new GitHub client, inferring the host from the owner.
     ///
-    /// Returns an error if no authentication is found.
+    /// This is a convenience wrapper around `from_env_with_host` for callers
+    /// that don't have an explicit host (e.g., ad-hoc commands working from
+    /// a local git checkout). Prefer `from_env_with_host` when the host is known.
     pub async fn from_env(owner: &str, repo: &str) -> Result<Self> {
-        let token = get_github_token(owner, repo).await?;
-        Self::new(token)
+        let host = infer_github_host(owner);
+        Self::from_env_with_host(owner, repo, host).await
     }
 
     /// Try to initialize a new GitHub client with token from environment or gh/ghe CLI
@@ -210,9 +215,10 @@ impl GitHubClient {
     /// # Arguments
     /// * `owner` - Repository owner (used to infer hostname)
     /// * `repo` - Repository name
-    pub async fn try_from_env(owner: &str, repo: &str) -> Option<Self> {
-        let token = get_github_token(owner, repo).await.ok()?;
-        Self::new(token).ok()
+    pub async fn try_from_env(owner: &str, _repo: &str) -> Option<Self> {
+        let host = infer_github_host(owner);
+        let token = get_github_token_for_host(host).await.ok()?;
+        Self::new_with_host(token, host).ok()
     }
 
     /// Fetch issue details
@@ -944,7 +950,7 @@ mod tests {
     #[test]
     fn test_new_with_empty_token() {
         // Should fail with empty token
-        let result = GitHubClient::new(String::new());
+        let result = GitHubClient::new_with_host(String::new(), "github.com");
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("empty"));
     }
@@ -952,7 +958,14 @@ mod tests {
     #[tokio::test]
     async fn test_new_with_valid_token() {
         // Should succeed with valid token format
-        let result = GitHubClient::new("ghp_test123".to_string());
+        let result = GitHubClient::new_with_host("ghp_test123".to_string(), "github.com");
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_new_with_host_ghe() {
+        // Should succeed and configure GHE base URI
+        let result = GitHubClient::new_with_host("ghp_test123".to_string(), "ghe.netflix.net");
         assert!(result.is_ok());
     }
 

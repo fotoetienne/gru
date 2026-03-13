@@ -7,11 +7,6 @@ use std::time::Duration;
 /// Configuration for Gru Lab daemon mode
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct LabConfig {
-    /// Additional GitHub hosts beyond github.com (e.g., GitHub Enterprise instances).
-    /// `github.com` is always included by default — only list extra hosts here.
-    #[serde(default)]
-    pub github_hosts: Vec<String>,
-
     #[serde(default)]
     pub daemon: DaemonConfig,
 
@@ -134,20 +129,55 @@ fn default_label() -> String {
     crate::labels::TODO.to_string()
 }
 
+/// Parse a repo entry from the config into `(host, owner, repo)`.
+///
+/// Accepts two formats:
+/// - `"owner/repo"` → `("github.com", "owner", "repo")`
+/// - `"host/owner/repo"` → `("host", "owner", "repo")`
+///
+/// A first segment containing a dot (`.`) is treated as a hostname.
+/// Returns `None` if the format is invalid.
+pub fn parse_repo_entry(spec: &str) -> Option<(String, String, String)> {
+    let parts: Vec<&str> = spec.splitn(4, '/').collect();
+    match parts.len() {
+        2 => {
+            let (owner, repo) = (parts[0], parts[1]);
+            if owner.is_empty() || repo.is_empty() {
+                return None;
+            }
+            Some((
+                "github.com".to_string(),
+                owner.to_string(),
+                repo.to_string(),
+            ))
+        }
+        3 => {
+            let (host, owner, repo) = (parts[0], parts[1], parts[2]);
+            if host.is_empty() || owner.is_empty() || repo.is_empty() {
+                return None;
+            }
+            // Require the first segment to look like a hostname (contains a dot)
+            if !host.contains('.') {
+                return None;
+            }
+            Some((host.to_string(), owner.to_string(), repo.to_string()))
+        }
+        _ => None,
+    }
+}
+
 impl LabConfig {
     /// Returns the full list of GitHub hosts, always including `github.com`.
+    ///
+    /// Hosts are derived from `daemon.repos` entries: `host/owner/repo` entries
+    /// contribute the host part, while plain `owner/repo` entries imply `github.com`.
     pub fn all_github_hosts(&self) -> Vec<String> {
         let mut hosts = vec!["github.com".to_string()];
-        for raw in &self.github_hosts {
-            // Normalize: strip whitespace, scheme prefixes, and trailing slashes
-            let h = raw
-                .trim()
-                .trim_start_matches("https://")
-                .trim_start_matches("http://")
-                .trim_end_matches('/')
-                .to_string();
-            if !h.is_empty() && !hosts.contains(&h) {
-                hosts.push(h);
+        for repo in &self.daemon.repos {
+            if let Some((host, _, _)) = parse_repo_entry(repo) {
+                if !hosts.contains(&host) {
+                    hosts.push(host);
+                }
             }
         }
         hosts
@@ -163,13 +193,10 @@ impl LabConfig {
         r#"# Gru configuration file
 # Uncomment and modify options as needed.
 
-# # Additional GitHub hosts beyond github.com (e.g., GitHub Enterprise instances).
-# # github.com is always included by default — only list extra hosts here.
-# github_hosts = ["ghe.example.com"]
-
 # [daemon]
-# # Repositories to monitor (required for `gru lab`)
-# repos = ["owner/repo"]
+# # Repositories to monitor (required for `gru lab`).
+# # Use "owner/repo" for github.com, or "host/owner/repo" for GitHub Enterprise.
+# repos = ["owner/repo", "ghe.example.com/org/repo"]
 #
 # # Polling interval in seconds (default: 30)
 # poll_interval_secs = 30
@@ -271,11 +298,13 @@ impl LabConfig {
             anyhow::bail!("poll_interval_secs must be at least 1");
         }
 
-        // Validate repo format (owner/repo)
+        // Validate repo format: "owner/repo" or "host/owner/repo"
         for repo in &self.daemon.repos {
-            let parts: Vec<&str> = repo.split('/').collect();
-            if parts.len() != 2 || parts[0].is_empty() || parts[1].is_empty() {
-                anyhow::bail!("Invalid repo format: '{}'. Expected 'owner/repo'", repo);
+            if parse_repo_entry(repo).is_none() {
+                anyhow::bail!(
+                    "Invalid repo format: '{}'. Expected 'owner/repo' or 'host/owner/repo'",
+                    repo
+                );
             }
         }
 
@@ -583,12 +612,10 @@ confidence_threshold = 6
     }
 
     #[test]
-    fn test_github_hosts_with_extra() {
+    fn test_github_hosts_derived_from_repos() {
         let config_toml = r#"
-github_hosts = ["ghe.example.com", "git.corp.net"]
-
 [daemon]
-repos = ["owner/repo"]
+repos = ["owner/repo", "ghe.example.com/org/service", "git.corp.net/team/app"]
 "#;
         let mut temp_file = NamedTempFile::new().unwrap();
         temp_file.write_all(config_toml.as_bytes()).unwrap();
@@ -600,12 +627,10 @@ repos = ["owner/repo"]
     }
 
     #[test]
-    fn test_github_hosts_deduplicates_github_com() {
+    fn test_github_hosts_deduplicates() {
         let config_toml = r#"
-github_hosts = ["github.com", "ghe.example.com"]
-
 [daemon]
-repos = ["owner/repo"]
+repos = ["owner/repo1", "ghe.example.com/org/svc1", "ghe.example.com/org/svc2"]
 "#;
         let mut temp_file = NamedTempFile::new().unwrap();
         temp_file.write_all(config_toml.as_bytes()).unwrap();
@@ -613,7 +638,59 @@ repos = ["owner/repo"]
 
         let config = LabConfig::load(temp_file.path()).unwrap();
         let hosts = config.all_github_hosts();
-        // github.com should only appear once
         assert_eq!(hosts, vec!["github.com", "ghe.example.com"]);
+    }
+
+    // --- parse_repo_entry tests ---
+
+    #[test]
+    fn test_parse_repo_entry_owner_repo() {
+        let result = parse_repo_entry("owner/repo");
+        assert_eq!(
+            result,
+            Some((
+                "github.com".to_string(),
+                "owner".to_string(),
+                "repo".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn test_parse_repo_entry_host_owner_repo() {
+        let result = parse_repo_entry("ghe.example.com/org/service");
+        assert_eq!(
+            result,
+            Some((
+                "ghe.example.com".to_string(),
+                "org".to_string(),
+                "service".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn test_parse_repo_entry_no_dot_in_three_parts_rejected() {
+        // "a/b/c" where "a" has no dot should be rejected (not a valid host)
+        assert_eq!(parse_repo_entry("a/b/c"), None);
+    }
+
+    #[test]
+    fn test_parse_repo_entry_empty_parts() {
+        assert_eq!(parse_repo_entry(""), None);
+        assert_eq!(parse_repo_entry("/repo"), None);
+        assert_eq!(parse_repo_entry("owner/"), None);
+        assert_eq!(parse_repo_entry("host.com//repo"), None);
+        assert_eq!(parse_repo_entry("host.com/owner/"), None);
+    }
+
+    #[test]
+    fn test_parse_repo_entry_too_many_slashes() {
+        assert_eq!(parse_repo_entry("a/b/c/d"), None);
+    }
+
+    #[test]
+    fn test_parse_repo_entry_single_segment() {
+        assert_eq!(parse_repo_entry("justrepo"), None);
     }
 }
