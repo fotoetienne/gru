@@ -928,10 +928,7 @@ mod tests {
         {
             let registry = MinionRegistry::load(Some(temp_dir.path())).unwrap();
             let retrieved = registry.get("M001").unwrap();
-            assert_eq!(
-                retrieved.timeout_deadline.unwrap().timestamp(),
-                deadline.timestamp()
-            );
+            assert_eq!(retrieved.timeout_deadline.unwrap(), deadline);
             assert_eq!(retrieved.attempt_count, 3);
             assert!(retrieved.no_watch);
         }
