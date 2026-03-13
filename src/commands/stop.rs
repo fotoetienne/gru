@@ -219,6 +219,7 @@ mod tests {
         assert_eq!(result.unwrap(), 0);
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_send_signal_nonexistent_pid() {
         // High PID that doesn't exist

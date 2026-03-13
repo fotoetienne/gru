@@ -137,12 +137,10 @@ enum Commands {
         id: String,
 
         #[arg(
-            short,
-            long,
-            default_value_t = true,
-            help = "Follow live events in real-time (default: true). Use --no-follow to replay history only."
+            long = "no-follow",
+            help = "Replay history only, don't follow live events"
         )]
-        follow: bool,
+        no_follow: bool,
     },
     #[command(about = "Review a GitHub pull request")]
     Review {
@@ -361,7 +359,7 @@ async fn main() {
             )
             .await
         }
-        Commands::Logs { id, follow } => logs::handle_logs(id, follow, cli.quiet).await,
+        Commands::Logs { id, no_follow } => logs::handle_logs(id, !no_follow, cli.quiet).await,
         Commands::Review { pr, agent } => {
             let agent_name = agent.unwrap_or_else(|| agent_registry::DEFAULT_AGENT.to_string());
             review::handle_review(pr, &agent_name).await

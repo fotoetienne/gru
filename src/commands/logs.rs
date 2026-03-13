@@ -37,7 +37,7 @@ pub async fn handle_logs(id: String, follow: bool, quiet: bool) -> Result<i32> {
             .await
             .context("Failed to tail events")?;
     } else {
-        // Replay only (no follow)
+        // Replay only (reuse log_viewer for consistent formatting)
         let config = crate::progress::ProgressConfig {
             minion_id: minion.minion_id.clone(),
             issue: issue_str,
@@ -45,20 +45,7 @@ pub async fn handle_logs(id: String, follow: bool, quiet: bool) -> Result<i32> {
         };
         let progress = crate::progress::ProgressDisplay::new(config);
 
-        let file = std::fs::File::open(&events_path)
-            .with_context(|| format!("Failed to open {}", events_path.display()))?;
-        let reader = std::io::BufReader::new(file);
-        use std::io::BufRead;
-        for line in reader.lines() {
-            let line = line.context("Failed to read line from events.jsonl")?;
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-            if let Ok(event) = serde_json::from_str::<crate::agent::AgentEvent>(trimmed) {
-                progress.handle_event(&event);
-            }
-        }
+        log_viewer::replay_events(&events_path, &progress)?;
         progress.finish_with_message(&format!("End of logs for Minion {}", minion.minion_id));
     }
 

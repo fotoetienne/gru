@@ -17,16 +17,22 @@ use tokio::signal;
 const TAIL_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 /// Replays all existing events from an events.jsonl file through a ProgressDisplay.
-/// Returns the file position after replay (for subsequent tailing).
-fn replay_events(events_path: &Path, progress: &ProgressDisplay) -> Result<u64> {
+/// Returns the byte position after replay (for subsequent tailing).
+pub fn replay_events(events_path: &Path, progress: &ProgressDisplay) -> Result<u64> {
     let file = std::fs::File::open(events_path)
         .with_context(|| format!("Failed to open {}", events_path.display()))?;
-    let reader = std::io::BufReader::new(file);
-    let mut position = 0u64;
+    let mut reader = std::io::BufReader::new(file);
+    let mut line_buf = Vec::new();
 
-    for line in reader.lines() {
-        let line = line.context("Failed to read line from events.jsonl")?;
-        position += line.len() as u64 + 1; // +1 for newline
+    loop {
+        line_buf.clear();
+        let bytes_read = reader
+            .read_until(b'\n', &mut line_buf)
+            .context("Failed to read line from events.jsonl")?;
+        if bytes_read == 0 {
+            break;
+        }
+        let line = String::from_utf8_lossy(&line_buf);
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
@@ -36,6 +42,10 @@ fn replay_events(events_path: &Path, progress: &ProgressDisplay) -> Result<u64> 
         }
     }
 
+    // Get exact file position from the reader
+    let position = reader
+        .stream_position()
+        .context("Failed to get stream position")?;
     Ok(position)
 }
 
@@ -58,8 +68,13 @@ pub async fn tail_events(
     };
     let progress = ProgressDisplay::new(config);
 
-    // Wait for events file to be created (worker may not have written yet)
+    // Look up PID once for liveness checks (avoid re-loading registry every poll)
     let mid = minion_id.to_string();
+    let worker_pid = with_registry(move |reg| Ok(reg.get(&mid).and_then(|info| info.pid)))
+        .await
+        .unwrap_or(None);
+
+    // Wait for events file to be created (worker may not have written yet)
     let mut waited = Duration::ZERO;
     let max_wait = Duration::from_secs(30);
     while !events_path.exists() {
@@ -70,7 +85,7 @@ pub async fn tail_events(
             );
         }
         // Fail fast if worker died before creating events file
-        if !is_worker_alive(&mid).await {
+        if !is_pid_alive(worker_pid) {
             anyhow::bail!("Worker exited before creating events file. Check gru.log for details.");
         }
         tokio::time::sleep(TAIL_POLL_INTERVAL).await;
@@ -91,8 +106,8 @@ pub async fn tail_events(
                 // Read new events from the file
                 position = read_new_events(&events_path, position, &progress)?;
 
-                // Check if worker is still alive
-                if !is_worker_alive(&mid).await {
+                // Check if worker is still alive (using cached PID)
+                if !is_pid_alive(worker_pid) {
                     // Read any final events
                     let _ = read_new_events(&events_path, position, &progress);
                     progress.finish_with_message("Minion has finished");
@@ -106,7 +121,7 @@ pub async fn tail_events(
 }
 
 /// Reads new events from a file starting at the given byte position.
-/// Returns the new position after reading.
+/// Returns the new byte position after reading.
 fn read_new_events(events_path: &Path, position: u64, progress: &ProgressDisplay) -> Result<u64> {
     let mut file = std::fs::File::open(events_path)
         .with_context(|| format!("Failed to open {}", events_path.display()))?;
@@ -120,12 +135,18 @@ fn read_new_events(events_path: &Path, position: u64, progress: &ProgressDisplay
     file.seek(SeekFrom::Start(position))
         .context("Failed to seek in events file")?;
 
-    let reader = std::io::BufReader::new(file);
-    let mut new_position = position;
+    let mut reader = std::io::BufReader::new(file);
+    let mut line_buf = Vec::new();
 
-    for line in reader.lines() {
-        let line = line.context("Failed to read line")?;
-        new_position += line.len() as u64 + 1;
+    loop {
+        line_buf.clear();
+        let bytes_read = reader
+            .read_until(b'\n', &mut line_buf)
+            .context("Failed to read line")?;
+        if bytes_read == 0 {
+            break;
+        }
+        let line = String::from_utf8_lossy(&line_buf);
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
@@ -135,21 +156,15 @@ fn read_new_events(events_path: &Path, position: u64, progress: &ProgressDisplay
         }
     }
 
+    let new_position = reader
+        .stream_position()
+        .context("Failed to get stream position")?;
     Ok(new_position)
 }
 
-/// Checks if the worker process for a minion is still alive.
-async fn is_worker_alive(minion_id: &str) -> bool {
-    let mid = minion_id.to_string();
-    with_registry(move |reg| {
-        Ok(reg
-            .get(&mid)
-            .and_then(|info| info.pid)
-            .map(is_process_alive)
-            .unwrap_or(false))
-    })
-    .await
-    .unwrap_or_default()
+/// Checks if a worker process is alive using a cached PID.
+fn is_pid_alive(pid: Option<u32>) -> bool {
+    pid.map(is_process_alive).unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -188,7 +203,9 @@ mod tests {
         };
         let progress = ProgressDisplay::new(config);
         let pos = replay_events(tmp.path(), &progress).unwrap();
-        assert!(pos > 0);
+        // Position should match the actual file size
+        let file_len = tmp.as_file().metadata().unwrap().len();
+        assert_eq!(pos, file_len);
     }
 
     #[test]
@@ -206,9 +223,9 @@ mod tests {
             quiet: true,
         };
         let progress = ProgressDisplay::new(config);
-        // Should not error on invalid JSON lines
         let pos = replay_events(tmp.path(), &progress).unwrap();
-        assert!(pos > 0);
+        let file_len = tmp.as_file().metadata().unwrap().len();
+        assert_eq!(pos, file_len);
     }
 
     #[test]
@@ -230,5 +247,15 @@ mod tests {
         // Position at end of file - should return same position
         let pos = read_new_events(tmp.path(), file_len, &progress).unwrap();
         assert_eq!(pos, file_len);
+    }
+
+    #[test]
+    fn test_is_pid_alive_none() {
+        assert!(!is_pid_alive(None));
+    }
+
+    #[test]
+    fn test_is_pid_alive_current_process() {
+        assert!(is_pid_alive(Some(std::process::id())));
     }
 }

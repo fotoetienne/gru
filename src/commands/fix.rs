@@ -1799,7 +1799,9 @@ async fn spawn_worker(
         use std::os::unix::process::CommandExt;
         unsafe {
             cmd.pre_exec(|| {
-                libc::setsid();
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
                 Ok(())
             });
         }
@@ -1817,14 +1819,17 @@ async fn spawn_worker(
 
     // Record worker PID in registry
     let mid = minion_id.to_string();
-    let _ = with_registry(move |reg| {
+    if let Err(e) = with_registry(move |reg| {
         reg.update(&mid, |info| {
             info.pid = Some(pid);
             info.mode = MinionMode::Autonomous;
             info.last_activity = Utc::now();
         })
     })
-    .await;
+    .await
+    {
+        log::warn!("Failed to record worker PID in registry: {}", e);
+    }
 
     Ok(pid)
 }
@@ -2117,12 +2122,12 @@ pub async fn handle_fix(issue: &str, opts: FixOptions) -> Result<i32> {
     let issue_ctx = resolve_issue(issue, &github_hosts).await?;
 
     // Phase 2: Determine whether to resume or start fresh
-    let wt_ctx = if force_new {
-        setup_worktree(&issue_ctx, agent_name).await?
+    let (wt_ctx, is_fresh) = if force_new {
+        (setup_worktree(&issue_ctx, agent_name).await?, true)
     } else {
         match check_existing_minions(&issue_ctx.owner, &issue_ctx.repo, issue_ctx.issue_num).await?
         {
-            ExistingMinionCheck::None => setup_worktree(&issue_ctx, agent_name).await?,
+            ExistingMinionCheck::None => (setup_worktree(&issue_ctx, agent_name).await?, true),
             ExistingMinionCheck::Resumable(minion_id, info) => {
                 let phase = info.orchestration_phase.clone();
                 println!(
@@ -2132,27 +2137,32 @@ pub async fn handle_fix(issue: &str, opts: FixOptions) -> Result<i32> {
                 let session_id = Uuid::parse_str(&info.session_id)
                     .context("Failed to parse session ID from registry")?;
                 let checkout_path = info.checkout_path();
-                WorktreeContext {
-                    minion_id,
-                    branch_name: info.branch,
-                    minion_dir: info.worktree,
-                    checkout_path,
-                    session_id,
-                }
+                (
+                    WorktreeContext {
+                        minion_id,
+                        branch_name: info.branch,
+                        minion_dir: info.worktree,
+                        checkout_path,
+                        session_id,
+                    },
+                    false,
+                )
             }
             ExistingMinionCheck::AlreadyRunning => return Ok(1),
         }
     };
 
-    // Claim the issue on fresh starts
-    if let Some(ref client) = issue_ctx.github_client {
-        claim_issue(
-            client,
-            &issue_ctx.owner,
-            &issue_ctx.repo,
-            issue_ctx.issue_num,
-        )
-        .await;
+    // Claim the issue on fresh starts (skip on resume — already claimed)
+    if is_fresh {
+        if let Some(ref client) = issue_ctx.github_client {
+            claim_issue(
+                client,
+                &issue_ctx.owner,
+                &issue_ctx.repo,
+                issue_ctx.issue_num,
+            )
+            .await;
+        }
     }
 
     // Phase 3: Spawn background worker
