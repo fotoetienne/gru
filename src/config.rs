@@ -204,8 +204,8 @@ impl LabConfig {
 # # Maximum concurrent Minion slots (default: 2)
 # max_slots = 2
 #
-# # Label to watch for issues (default: "ready-for-minion")
-# label = "ready-for-minion"
+# # Label to watch for issues (default: "gru:todo")
+# label = "gru:todo"
 
 # [agent]
 # # Which agent backend to use (default: "claude")
@@ -542,7 +542,7 @@ repos = ["owner/repo"]
             .expect("Default config template should be valid TOML when uncommented");
         assert_eq!(config.daemon.poll_interval_secs, 30);
         assert_eq!(config.daemon.max_slots, 2);
-        assert_eq!(config.daemon.label, "ready-for-minion");
+        assert_eq!(config.daemon.label, "gru:todo");
         assert_eq!(config.agent.default, "claude");
         assert_eq!(config.merge.confidence_threshold, 8);
     }

@@ -246,9 +246,7 @@ async fn has_label(owner: &str, repo: &str, pr_number: &str, label_name: &str) -
 
     let fetched_labels: Vec<Label> =
         serde_json::from_slice(&output.stdout).context("Failed to parse labels JSON")?;
-    Ok(fetched_labels
-        .iter()
-        .any(|l| labels::matches_label(&l.name, label_name)))
+    Ok(fetched_labels.iter().any(|l| l.name == label_name))
 }
 
 /// Check if a PR currently has the `ready-to-merge` label.

@@ -144,20 +144,7 @@ pub async fn handle_init(repo_arg: String) -> Result<i32> {
         }
     }
 
-    // 4. Migrate old labels to new names (rename via API)
-    println!("\n🏷️  Migrating old labels...");
-    for (old_name, new_name) in labels::MIGRATIONS {
-        match github_client
-            .rename_label(&owner, &repo, old_name, new_name)
-            .await
-        {
-            Ok(true) => println!("  ✓ Renamed: {} → {}", old_name, new_name),
-            Ok(false) => {} // Old label didn't exist, nothing to migrate
-            Err(e) => log::warn!("  ⚠️  Failed to rename {} → {}: {}", old_name, new_name, e),
-        }
-    }
-
-    // 5. Create all required labels (idempotent)
+    // 4. Create all required labels (idempotent)
     println!("\n🏷️  Configuring labels...");
     let mut labels_failed = Vec::new();
 

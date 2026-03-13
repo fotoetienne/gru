@@ -208,7 +208,7 @@ async fn poll_and_spawn(config: &LabConfig, children: &mut Vec<Child>) -> Result
         // Canonical owner/repo form for registry lookups and issue URL building
         let repo_full = format!("{}/{}", owner, repo);
 
-        // Fetch ready issues, excluding blocked ones (both GitHub-blocked and minion:blocked).
+        // Fetch ready issues, excluding blocked ones (both GitHub-blocked and gru:blocked).
         // Try CLI first (supports -is:blocked qualifier), fall back to octocrab with
         // client-side filtering if CLI is unavailable.
         let issue_numbers =
@@ -437,10 +437,7 @@ async fn spawn_minion(repo: &str, host: &str, issue_number: u64) -> Result<Child
 /// Fallback issue listing using octocrab API with client-side filtering.
 /// Used when the gh CLI is unavailable. Cannot filter GitHub-native blocked state
 /// (no API equivalent of `-is:blocked`), but does filter out `gru:blocked` and
-/// `gru:in-progress` labels (accepting both old and new names).
-///
-/// If the configured label has a counterpart (old↔new), both are queried so that
-/// repos in any migration state are covered.
+/// `gru:in-progress` labels.
 async fn fallback_list_issues(
     owner: &str,
     repo: &str,
@@ -448,20 +445,7 @@ async fn fallback_list_issues(
     label: &str,
 ) -> Result<Vec<u64>> {
     let client = GitHubClient::from_env_with_host(owner, repo, host).await?;
-    let mut issues = client.list_issues_with_label(owner, repo, label).await?;
-
-    // Also fetch issues under the counterpart label name (old↔new) for backward compat
-    if let Some(alt_label) = labels::counterpart_label(label) {
-        if let Ok(alt_issues) = client.list_issues_with_label(owner, repo, alt_label).await {
-            let existing: std::collections::HashSet<u64> =
-                issues.iter().map(|i| i.number).collect();
-            for issue in alt_issues {
-                if !existing.contains(&issue.number) {
-                    issues.push(issue);
-                }
-            }
-        }
-    }
+    let issues = client.list_issues_with_label(owner, repo, label).await?;
 
     let filtered: Vec<u64> = issues
         .into_iter()

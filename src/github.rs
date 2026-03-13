@@ -369,11 +369,8 @@ impl GitHubClient {
             return Ok(false);
         }
 
-        // Remove todo label if present — try both old and new names
+        // Remove todo label if present
         let _ = self.remove_label(owner, repo, issue, labels::TODO).await;
-        let _ = self
-            .remove_label(owner, repo, issue, "ready-for-minion")
-            .await;
 
         // Add in-progress label (new name)
         self.add_label(owner, repo, issue, labels::IN_PROGRESS)
@@ -389,13 +386,11 @@ impl GitHubClient {
     /// * `repo` - Repository name
     /// * `issue` - Issue number
     pub async fn mark_issue_done(&self, owner: &str, repo: &str, issue: u64) -> Result<()> {
-        // Remove in-progress labels (both old and new, ignore errors - may not exist)
+        // Remove in-progress label (ignore errors - may not exist)
         let _ = self
             .remove_label(owner, repo, issue, labels::IN_PROGRESS)
             .await;
-        let _ = self.remove_label(owner, repo, issue, "in-progress").await;
 
-        // Add done label (new name)
         self.add_label(owner, repo, issue, labels::DONE).await?;
 
         Ok(())
@@ -408,13 +403,11 @@ impl GitHubClient {
     /// * `repo` - Repository name
     /// * `issue` - Issue number
     pub async fn mark_issue_failed(&self, owner: &str, repo: &str, issue: u64) -> Result<()> {
-        // Remove in-progress labels (both old and new, ignore errors - may not exist)
+        // Remove in-progress label (ignore errors - may not exist)
         let _ = self
             .remove_label(owner, repo, issue, labels::IN_PROGRESS)
             .await;
-        let _ = self.remove_label(owner, repo, issue, "in-progress").await;
 
-        // Add failed label (new name)
         self.add_label(owner, repo, issue, labels::FAILED).await?;
 
         Ok(())
@@ -433,17 +426,13 @@ impl GitHubClient {
     /// * `repo` - Repository name
     /// * `issue` - Issue number
     pub async fn mark_issue_blocked(&self, owner: &str, repo: &str, issue: u64) -> Result<()> {
-        // Remove any existing state labels — both old and new names (ignore errors)
+        // Remove any existing state labels (ignore errors)
         let _ = self
             .remove_label(owner, repo, issue, labels::IN_PROGRESS)
             .await;
-        let _ = self.remove_label(owner, repo, issue, "in-progress").await;
         let _ = self.remove_label(owner, repo, issue, labels::DONE).await;
-        let _ = self.remove_label(owner, repo, issue, "minion:done").await;
         let _ = self.remove_label(owner, repo, issue, labels::FAILED).await;
-        let _ = self.remove_label(owner, repo, issue, "minion:failed").await;
 
-        // Add blocked label (new name)
         self.add_label(owner, repo, issue, labels::BLOCKED).await?;
 
         Ok(())
@@ -508,75 +497,6 @@ impl GitHubClient {
                 }
             }
         }
-    }
-
-    /// Rename a label in a repository.
-    ///
-    /// Used during migration from old label names to new ones.
-    ///
-    /// # Returns
-    /// * `Ok(true)` - Label was renamed
-    /// * `Ok(false)` - Old label doesn't exist (nothing to rename)
-    /// * `Err(_)` - Failed to rename label
-    pub async fn rename_label(
-        &self,
-        owner: &str,
-        repo: &str,
-        old_name: &str,
-        new_name: &str,
-    ) -> Result<bool> {
-        let repo_full = format!("{}/{}", owner, repo);
-        let gh_cmd = gh_command_for_repo(&repo_full);
-
-        // Use gh api to PATCH the label with new_name, color, and description.
-        // GitHub's label update API uses `new_name` (not `name`) for renames.
-        // URL-encode reserved characters for use in a path segment.
-        let encoded_name = old_name
-            .replace('%', "%25") // must come first to avoid double-encoding
-            .replace('/', "%2F")
-            .replace('#', "%23")
-            .replace('?', "%3F")
-            .replace(':', "%3A");
-        let endpoint = format!("repos/{}/labels/{}", repo_full, encoded_name);
-        let new_name_field = format!("new_name={}", new_name);
-
-        // Also update color and description so migrated labels get the standardized values
-        let mut args = vec!["api", &endpoint, "-X", "PATCH", "-f", &new_name_field];
-        let color_field;
-        let desc_field;
-        if let Some((color, description)) = labels::get_label_info(new_name) {
-            color_field = format!("color={}", color);
-            desc_field = format!("description={}", description);
-            args.extend_from_slice(&["-f", &color_field, "-f", &desc_field]);
-        }
-
-        let output = Command::new(gh_cmd)
-            .args(&args)
-            .output()
-            .await
-            .context(format!(
-                "Failed to rename label '{}' to '{}'",
-                old_name, new_name
-            ))?;
-
-        if output.status.success() {
-            return Ok(true);
-        }
-
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        // 404 means the old label doesn't exist — nothing to rename
-        if stderr.contains("404") || stderr.contains("Not Found") {
-            return Ok(false);
-        }
-
-        Err(anyhow!(
-            "Failed to rename label '{}' to '{}' in {}/{}: {}",
-            old_name,
-            new_name,
-            owner,
-            repo,
-            stderr.trim()
-        ))
     }
 
     /// List all issues with a specific label
@@ -674,8 +594,8 @@ pub async fn mark_pr_ready_via_cli(
 ///
 /// Uses GitHub's search qualifiers to exclude:
 /// - Issues in GitHub's native blocked state (`-is:blocked`)
-/// - Issues labeled `gru:blocked` or `minion:blocked` (old name)
-/// - Issues already claimed (`gru:in-progress` or `in-progress` old name)
+/// - Issues labeled `gru:blocked`
+/// - Issues already claimed (`gru:in-progress`)
 ///
 /// # Arguments
 /// * `owner` - Repository owner
@@ -686,11 +606,10 @@ pub async fn mark_pr_ready_via_cli(
 /// List of issue numbers matching the search criteria (capped at 100)
 /// Build a GitHub search query that finds issues with the given label while excluding
 /// blocked and in-progress issues. Escapes special characters in the label.
-/// Accepts both old and new label names during migration.
 fn build_ready_issues_search_query(label: &str) -> String {
     let escaped_label = label.replace('\\', "\\\\").replace('"', "\\\"");
     format!(
-        "label:\"{}\" -is:blocked -label:\"{}\" -label:\"minion:blocked\" -label:\"{}\" -label:in-progress",
+        "label:\"{}\" -is:blocked -label:\"{}\" -label:\"{}\"",
         escaped_label,
         labels::BLOCKED,
         labels::IN_PROGRESS,
@@ -1207,7 +1126,7 @@ mod tests {
         let query = build_ready_issues_search_query("gru:todo");
         assert_eq!(
             query,
-            "label:\"gru:todo\" -is:blocked -label:\"gru:blocked\" -label:\"minion:blocked\" -label:\"gru:in-progress\" -label:in-progress"
+            "label:\"gru:todo\" -is:blocked -label:\"gru:blocked\" -label:\"gru:in-progress\""
         );
     }
 
