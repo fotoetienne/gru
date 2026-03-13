@@ -27,8 +27,8 @@ pub struct MinionInfo {
     /// The top-level minion directory (metadata lives here).
     /// Use `checkout_path()` to get the git worktree location.
     pub worktree_path: PathBuf,
-    #[allow(dead_code)]
-    // Populated by resolver; callers currently only use minion_id/worktree_path
+    /// Used by find_by_issue_number_from_list to rank candidates.
+    /// Values: "Active", "Stopped" (from registry), "Idle" (from filesystem scan).
     pub status: String,
     #[allow(dead_code)]
     // Populated by resolver; callers currently only use minion_id/worktree_path
@@ -191,11 +191,43 @@ fn find_by_minion_id_from_list(minion_id: &str, minions: &[MinionInfo]) -> Optio
     minions.iter().find(|m| m.minion_id == minion_id).cloned()
 }
 
-/// Find a minion by issue number from a pre-scanned list
+/// Parse the numeric counter from a minion ID (e.g., "M0j8" -> Some(656)).
+/// Returns None if the ID doesn't start with 'M' or contains invalid base36.
+fn parse_minion_counter(id: &str) -> Option<u64> {
+    let digits = id.strip_prefix('M').or_else(|| id.strip_prefix('m'))?;
+    if digits.is_empty() {
+        return None;
+    }
+    let mut result: u64 = 0;
+    for c in digits.chars() {
+        let digit = match c {
+            '0'..='9' => (c as u64) - ('0' as u64),
+            'a'..='z' => (c as u64) - ('a' as u64) + 10,
+            'A'..='Z' => (c as u64) - ('A' as u64) + 10, // legacy uppercase
+            _ => return None,
+        };
+        result = result.checked_mul(36)?.checked_add(digit)?;
+    }
+    Some(result)
+}
+
+/// Find a minion by issue number from a pre-scanned list.
+/// When multiple minions match the same issue, prefers:
+/// 1. Active/running minions over stopped ones
+/// 2. Higher (more recent) minion ID as tiebreaker (compared numerically)
 fn find_by_issue_number_from_list(issue_num: u64, minions: &[MinionInfo]) -> Option<MinionInfo> {
     minions
         .iter()
-        .find(|m| m.issue_number == Some(issue_num))
+        .filter(|m| m.issue_number == Some(issue_num))
+        .max_by(|a, b| {
+            let a_active = a.status == "Active";
+            let b_active = b.status == "Active";
+            a_active.cmp(&b_active).then_with(|| {
+                let a_counter = parse_minion_counter(&a.minion_id);
+                let b_counter = parse_minion_counter(&b.minion_id);
+                a_counter.cmp(&b_counter)
+            })
+        })
         .cloned()
 }
 
@@ -446,13 +478,23 @@ mod tests {
 
     /// Helper to create a MinionInfo for testing
     fn test_minion(id: &str, issue: Option<u64>, repo: &str) -> MinionInfo {
+        test_minion_with_status(id, issue, repo, "Stopped")
+    }
+
+    /// Helper to create a MinionInfo with a specific status
+    fn test_minion_with_status(
+        id: &str,
+        issue: Option<u64>,
+        repo: &str,
+        status: &str,
+    ) -> MinionInfo {
         MinionInfo {
             minion_id: id.to_string(),
             issue_number: issue,
             repo_name: repo.to_string(),
             branch: format!("minion/issue-{}-{}", issue.unwrap_or(0), id),
             worktree_path: PathBuf::from(format!("/tmp/test/{}", id)),
-            status: "Stopped".to_string(),
+            status: status.to_string(),
             uptime: "1m".to_string(),
         }
     }
@@ -635,5 +677,104 @@ mod tests {
     fn test_parse_issue_from_branch_no_minion_id() {
         // Missing the trailing ID part after number-hyphen
         assert_eq!(parse_issue_from_branch("minion/issue-42"), None);
+    }
+
+    // --- Multi-minion issue resolution tests ---
+
+    #[test]
+    fn test_find_by_issue_prefers_active_over_stopped() {
+        let minions = vec![
+            test_minion_with_status("M0j7", Some(353), "owner/repo", "Stopped"),
+            test_minion_with_status("M0j8", Some(353), "owner/repo", "Active"),
+        ];
+        let result = find_by_issue_number_from_list(353, &minions);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().minion_id, "M0j8");
+    }
+
+    #[test]
+    fn test_find_by_issue_prefers_active_regardless_of_order() {
+        // Active minion listed first, stopped second
+        let minions = vec![
+            test_minion_with_status("M0j8", Some(353), "owner/repo", "Active"),
+            test_minion_with_status("M0j7", Some(353), "owner/repo", "Stopped"),
+        ];
+        let result = find_by_issue_number_from_list(353, &minions);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().minion_id, "M0j8");
+    }
+
+    #[test]
+    fn test_find_by_issue_tiebreaks_by_most_recent_id() {
+        // Both stopped — should pick M0j8 (higher/more recent ID)
+        let minions = vec![
+            test_minion_with_status("M0j7", Some(353), "owner/repo", "Stopped"),
+            test_minion_with_status("M0j8", Some(353), "owner/repo", "Stopped"),
+        ];
+        let result = find_by_issue_number_from_list(353, &minions);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().minion_id, "M0j8");
+    }
+
+    #[test]
+    fn test_find_by_issue_tiebreaks_active_by_most_recent_id() {
+        // Both active — should pick higher ID
+        let minions = vec![
+            test_minion_with_status("M0j7", Some(353), "owner/repo", "Active"),
+            test_minion_with_status("M0j8", Some(353), "owner/repo", "Active"),
+        ];
+        let result = find_by_issue_number_from_list(353, &minions);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().minion_id, "M0j8");
+    }
+
+    #[test]
+    fn test_find_by_issue_prefers_active_over_idle() {
+        // Filesystem scan produces "Idle" instead of "Stopped"
+        let minions = vec![
+            test_minion_with_status("M0j7", Some(353), "owner/repo", "Idle"),
+            test_minion_with_status("M0j8", Some(353), "owner/repo", "Active"),
+        ];
+        let result = find_by_issue_number_from_list(353, &minions);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().minion_id, "M0j8");
+    }
+
+    #[test]
+    fn test_find_by_issue_tiebreaks_across_id_widths() {
+        // M0zz (counter 1295) vs M100 (counter 1296) — different base36 widths
+        // Lexicographic would incorrectly pick M0zz; numeric comparison picks M100
+        let minions = vec![
+            test_minion_with_status("M0zz", Some(42), "owner/repo", "Stopped"),
+            test_minion_with_status("M100", Some(42), "owner/repo", "Stopped"),
+        ];
+        let result = find_by_issue_number_from_list(42, &minions);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().minion_id, "M100");
+    }
+
+    #[test]
+    fn test_parse_minion_counter() {
+        assert_eq!(parse_minion_counter("M000"), Some(0));
+        assert_eq!(parse_minion_counter("M001"), Some(1));
+        assert_eq!(parse_minion_counter("M00a"), Some(10));
+        assert_eq!(parse_minion_counter("M0zz"), Some(1295));
+        assert_eq!(parse_minion_counter("M100"), Some(1296));
+        // Legacy uppercase
+        assert_eq!(parse_minion_counter("M00A"), Some(10));
+        // Invalid
+        assert_eq!(parse_minion_counter(""), None);
+        assert_eq!(parse_minion_counter("X001"), None);
+    }
+
+    #[test]
+    fn test_find_by_issue_single_match_still_works() {
+        let minions = vec![
+            test_minion("M001", Some(42), "owner/repo"),
+            test_minion("M002", Some(99), "owner/repo"),
+        ];
+        let result = find_by_issue_number_from_list(42, &minions);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().minion_id, "M001");
     }
 }
