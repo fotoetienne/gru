@@ -4,6 +4,7 @@ use crate::agent_runner::{
     is_stuck_or_timeout_error, parse_timeout, run_agent_with_stream_monitoring,
     EXIT_CODE_SIGNAL_TERMINATED,
 };
+
 use crate::ci;
 use crate::config::LabConfig;
 use crate::git;
@@ -783,7 +784,11 @@ async fn fetch_issue_details(
 
 /// Sets up the workspace: generates minion ID, clones repo, creates worktree,
 /// registers the minion in the registry.
-async fn setup_worktree(ctx: &IssueContext, agent_name: &str) -> Result<WorktreeContext> {
+async fn setup_worktree(
+    ctx: &IssueContext,
+    agent_name: &str,
+    opts: &FixOptions,
+) -> Result<WorktreeContext> {
     let minion_id = minion::generate_minion_id().context("Failed to generate Minion ID")?;
     println!("📋 Generated Minion ID: {}", minion_id);
 
@@ -833,6 +838,18 @@ async fn setup_worktree(ctx: &IssueContext, agent_name: &str) -> Result<Worktree
 
     // Register the Minion in the registry (worktree field stores the minion_dir)
     let now = Utc::now();
+    let timeout_deadline = opts
+        .timeout
+        .as_deref()
+        .map(parse_timeout)
+        .transpose()
+        .context("Invalid --timeout value")?
+        .map(|dur| {
+            chrono::TimeDelta::from_std(dur)
+                .map_err(|_| anyhow::anyhow!("--timeout value is too large to represent"))
+        })
+        .transpose()?
+        .map(|delta| now + delta);
     let registry_info = RegistryMinionInfo {
         repo: repo_name.clone(),
         issue: ctx.issue_num,
@@ -850,9 +867,9 @@ async fn setup_worktree(ctx: &IssueContext, agent_name: &str) -> Result<Worktree
         orchestration_phase: OrchestrationPhase::Setup,
         token_usage: None,
         agent_name: agent_name.to_string(),
-        timeout_deadline: None,
-        attempt_count: 0,
-        no_watch: false,
+        timeout_deadline,
+        attempt_count: 1,
+        no_watch: opts.no_watch,
     };
 
     let minion_id_clone = minion_id.clone();
@@ -2126,17 +2143,28 @@ pub async fn handle_fix(issue: &str, opts: FixOptions) -> Result<i32> {
 
     // Phase 2: Determine whether to resume or start fresh
     let (wt_ctx, is_fresh) = if force_new {
-        (setup_worktree(&issue_ctx, agent_name).await?, true)
+        (setup_worktree(&issue_ctx, agent_name, &opts).await?, true)
     } else {
         match check_existing_minions(&issue_ctx.owner, &issue_ctx.repo, issue_ctx.issue_num).await?
         {
-            ExistingMinionCheck::None => (setup_worktree(&issue_ctx, agent_name).await?, true),
+            ExistingMinionCheck::None => {
+                (setup_worktree(&issue_ctx, agent_name, &opts).await?, true)
+            }
             ExistingMinionCheck::Resumable(minion_id, info) => {
                 let phase = info.orchestration_phase.clone();
                 println!(
                     "🔄 Resuming interrupted session {} (phase: {:?})",
                     minion_id, phase
                 );
+                // Increment attempt_count for this auto-resume
+                let mid = minion_id.clone();
+                with_registry(move |reg| {
+                    reg.update(&mid, |info| {
+                        info.attempt_count = info.attempt_count.saturating_add(1);
+                    })
+                })
+                .await
+                .ok();
                 let session_id = Uuid::parse_str(&info.session_id)
                     .context("Failed to parse session ID from registry")?;
                 let checkout_path = info.checkout_path();
