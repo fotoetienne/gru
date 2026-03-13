@@ -32,7 +32,7 @@ mod worktree_scanner;
 use clap::{Parser, Subcommand};
 use commands::{
     attach, chat, clean, fix, init, lab, logs, path, prompt, prompts, rebase, resume, review,
-    status, stop,
+    status, stop, tail,
 };
 
 /// CLI structure for the Gru agent orchestrator
@@ -141,6 +141,27 @@ enum Commands {
             help = "Replay history only, don't follow live events"
         )]
         no_follow: bool,
+    },
+    #[command(about = "Stream a Minion's event log (follow mode auto-detected)")]
+    Tail {
+        #[arg(help = "Minion ID, issue number, or PR number (e.g., M0tk, 42)")]
+        id: String,
+
+        #[arg(
+            long = "no-follow",
+            help = "Don't follow live events, just replay history"
+        )]
+        no_follow: bool,
+
+        #[arg(long, help = "Output raw JSONL for piping/scripting")]
+        raw: bool,
+
+        #[arg(
+            short = 'n',
+            long = "lines",
+            help = "Number of events to show (default: all for stopped, 20 before following for running)"
+        )]
+        lines: Option<usize>,
     },
     #[command(about = "Review a GitHub pull request")]
     Review {
@@ -360,6 +381,12 @@ async fn main() {
             .await
         }
         Commands::Logs { id, no_follow } => logs::handle_logs(id, !no_follow, cli.quiet).await,
+        Commands::Tail {
+            id,
+            no_follow,
+            raw,
+            lines,
+        } => tail::handle_tail(id, no_follow, raw, lines, cli.quiet).await,
         Commands::Review { pr, agent } => {
             let agent_name = agent.unwrap_or_else(|| agent_registry::DEFAULT_AGENT.to_string());
             review::handle_review(pr, &agent_name).await
