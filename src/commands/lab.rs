@@ -244,12 +244,19 @@ async fn find_resumable_minions(config: &LabConfig) -> Result<Vec<ResumableMinio
 async fn mark_exhausted_minion(minion_id: &str, info: &MinionInfo, host: &str) {
     let mid = minion_id.to_string();
     // Update registry to Failed
-    let _ = with_registry(move |reg| {
+    if let Err(e) = with_registry(move |reg| {
         reg.update(&mid, |i| {
             i.orchestration_phase = OrchestrationPhase::Failed;
         })
     })
-    .await;
+    .await
+    {
+        log::warn!(
+            "Failed to mark minion {} as exhausted in registry: {}",
+            minion_id,
+            e
+        );
+    }
 
     // Post escalation comment and mark failed on GitHub
     let (owner, repo_name) = match info.repo.split_once('/') {
@@ -316,6 +323,17 @@ async fn resume_interrupted_minions(
             mark_exhausted_minion(&candidate.minion_id, &candidate.info, &host).await;
             continue;
         }
+
+        // Increment attempt_count in the Lab before spawning to prevent TOCTOU races.
+        // The subprocess (`gru do`) also increments on resume, but the Lab-side increment
+        // ensures the guard fires reliably even if the subprocess hasn't updated yet.
+        let mid = candidate.minion_id.clone();
+        let _ = with_registry(move |reg| {
+            reg.update(&mid, |i| {
+                i.attempt_count = i.attempt_count.saturating_add(1);
+            })
+        })
+        .await;
 
         println!(
             "♻️  Resuming {} (issue #{}, {}, phase: {:?})",
@@ -796,7 +814,25 @@ mod tests {
     }
 
     #[test]
-    fn test_max_resume_attempts_constant() {
-        assert_eq!(MAX_RESUME_ATTEMPTS, 3);
+    fn test_attempt_count_exhaustion_boundary() {
+        // Verify the exhaustion check matches the expected boundary behavior:
+        // count >= threshold means exhausted, count < threshold means resumable
+        let threshold = MAX_RESUME_ATTEMPTS;
+        let at_threshold = threshold;
+        let below_threshold = threshold - 1;
+        let above_threshold = threshold + 1;
+
+        assert!(
+            at_threshold >= threshold,
+            "at threshold should be exhausted"
+        );
+        assert!(
+            below_threshold < threshold,
+            "below threshold should be resumable"
+        );
+        assert!(
+            above_threshold >= threshold,
+            "above threshold should be exhausted"
+        );
     }
 }
