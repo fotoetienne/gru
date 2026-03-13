@@ -13,6 +13,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
+use tokio::io::AsyncWriteExt;
 use tokio::process::Command as TokioCommand;
 
 use crate::github::gh_command_for_repo;
@@ -22,6 +23,9 @@ pub const DEFAULT_CONFIDENCE_THRESHOLD: u8 = 8;
 
 /// Maximum consecutive wait responses before the judge must decide merge or escalate.
 const MAX_CONSECUTIVE_WAITS: u32 = 3;
+
+/// Maximum wait duration the LLM can request (in minutes).
+const MAX_WAIT_MINUTES: u64 = 120;
 
 /// Label applied when the judge escalates for human review.
 const NEEDS_HUMAN_REVIEW_LABEL: &str = "gru:needs-human-review";
@@ -71,8 +75,8 @@ pub struct JudgeState {
     consecutive_waits: u32,
     /// When the current wait expires (if any).
     wait_until: Option<DateTime<Utc>>,
-    /// Whether the judge has escalated (applied `gru:needs-human-review`).
-    has_escalated: bool,
+    /// Whether the judge has escalated and the label was confirmed applied.
+    label_applied: bool,
 }
 
 impl JudgeState {
@@ -81,7 +85,7 @@ impl JudgeState {
             last_fingerprint: None,
             consecutive_waits: 0,
             wait_until: None,
-            has_escalated: false,
+            label_applied: false,
         }
     }
 
@@ -123,7 +127,8 @@ impl JudgeState {
             JudgeAction::Escalate => {
                 self.consecutive_waits = 0;
                 self.wait_until = None;
-                self.has_escalated = true;
+                // Note: label_applied is set by the caller after the label is
+                // actually applied, not here.
             }
             JudgeAction::Merge => {
                 self.consecutive_waits = 0;
@@ -137,41 +142,50 @@ impl JudgeState {
         self.consecutive_waits
     }
 
-    /// Returns true if the judge has previously escalated.
-    pub fn has_escalated(&self) -> bool {
-        self.has_escalated
+    /// Mark that the escalation label was successfully applied.
+    pub fn mark_label_applied(&mut self) {
+        self.label_applied = true;
+    }
+
+    /// Returns true if the label was previously applied by the judge.
+    pub fn label_was_applied(&self) -> bool {
+        self.label_applied
     }
 
     /// Note that `gru:needs-human-review` was cleared by a human.
-    /// Only has effect if the judge previously escalated.
+    /// Only has effect if the label was previously applied.
     pub fn mark_escalation_cleared(&mut self) {
-        if self.has_escalated {
-            self.has_escalated = false;
+        if self.label_applied {
+            self.label_applied = false;
             // Reset fingerprint so the judge re-evaluates on next check.
             self.last_fingerprint = None;
         }
     }
 }
 
-/// Fetch the full PR context for the judge prompt via `gh`.
-///
-/// Also returns the head SHA and total comment count for fingerprinting.
-async fn fetch_pr_context(owner: &str, repo: &str, pr_number: &str) -> Result<PrContext> {
+/// Lightweight fingerprint fetch — only head SHA + comment counts.
+/// Used to check `should_invoke` before fetching full context.
+pub async fn get_pr_fingerprint(
+    owner: &str,
+    repo: &str,
+    pr_number: &str,
+) -> Result<PrStateFingerprint> {
     let repo_full = format!("{owner}/{repo}");
     let gh_cmd = gh_command_for_repo(&repo_full);
 
-    // Fetch PR details (for head SHA), diff, comments, and reviews in parallel.
-    let pr_details_fut = {
+    let pr_fut = {
         let gh = gh_cmd.to_string();
-        let rf = repo_full.clone();
-        let pr = pr_number.to_string();
+        let ep = format!("repos/{repo_full}/pulls/{pr_number}");
         async move {
-            let endpoint = format!("repos/{rf}/pulls/{pr}");
             let output = TokioCommand::new(&gh)
-                .args(["api", &endpoint])
+                .args(["api", &ep])
                 .output()
                 .await
-                .context("Failed to fetch PR details")?;
+                .context("Failed to fetch PR for fingerprint")?;
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                anyhow::bail!("Failed to fetch PR details: {}", stderr.trim());
+            }
             #[derive(Deserialize)]
             struct PrHead {
                 head: Head,
@@ -180,12 +194,73 @@ async fn fetch_pr_context(owner: &str, repo: &str, pr_number: &str) -> Result<Pr
             struct Head {
                 sha: String,
             }
-            let pr: PrHead = serde_json::from_slice(&output.stdout)
-                .context("Failed to parse PR details JSON")?;
+            let pr: PrHead =
+                serde_json::from_slice(&output.stdout).context("Failed to parse PR JSON")?;
             Ok::<String, anyhow::Error>(pr.head.sha)
         }
     };
 
+    let ic_fut = {
+        let gh = gh_cmd.to_string();
+        let ep = format!("repos/{repo_full}/issues/{pr_number}/comments");
+        async move {
+            let output = TokioCommand::new(&gh)
+                .args(["api", &ep, "--paginate", "--jq", "length"])
+                .output()
+                .await?;
+            Ok::<usize, anyhow::Error>(parse_paginated_lengths(&output.stdout))
+        }
+    };
+
+    let rv_fut = {
+        let gh = gh_cmd.to_string();
+        let ep = format!("repos/{repo_full}/pulls/{pr_number}/reviews");
+        async move {
+            let output = TokioCommand::new(&gh)
+                .args(["api", &ep, "--paginate", "--jq", "length"])
+                .output()
+                .await?;
+            Ok::<usize, anyhow::Error>(parse_paginated_lengths(&output.stdout))
+        }
+    };
+
+    let rc_fut = {
+        let gh = gh_cmd.to_string();
+        let ep = format!("repos/{repo_full}/pulls/{pr_number}/comments");
+        async move {
+            let output = TokioCommand::new(&gh)
+                .args(["api", &ep, "--paginate", "--jq", "length"])
+                .output()
+                .await?;
+            Ok::<usize, anyhow::Error>(parse_paginated_lengths(&output.stdout))
+        }
+    };
+
+    let (head_sha, ic, rv, rc) = tokio::try_join!(pr_fut, ic_fut, rv_fut, rc_fut)?;
+
+    Ok(PrStateFingerprint {
+        head_sha,
+        comment_count: ic + rv + rc,
+    })
+}
+
+/// Parse the output of `gh api --paginate --jq "length"`.
+/// Each page outputs a number on its own line; sum them.
+fn parse_paginated_lengths(stdout: &[u8]) -> usize {
+    String::from_utf8_lossy(stdout)
+        .lines()
+        .filter_map(|l| l.trim().parse::<usize>().ok())
+        .sum()
+}
+
+/// Fetch the full PR context for the judge prompt via `gh`.
+async fn fetch_pr_context(owner: &str, repo: &str, pr_number: &str) -> Result<PrContext> {
+    let repo_full = format!("{owner}/{repo}");
+    let gh_cmd = gh_command_for_repo(&repo_full);
+
+    // Fetch diff, comments, reviews, and review comments in parallel.
+    // Use `--paginate --jq '.[]'` to flatten multi-page JSON arrays into
+    // a newline-delimited JSON stream, then wrap in `[...]` for valid JSON.
     let diff_fut = {
         let gh = gh_cmd.to_string();
         let rf = repo_full.clone();
@@ -196,6 +271,10 @@ async fn fetch_pr_context(owner: &str, repo: &str, pr_number: &str) -> Result<Pr
                 .output()
                 .await
                 .context("Failed to fetch PR diff")?;
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                anyhow::bail!("Failed to fetch PR diff: {}", stderr.trim());
+            }
             Ok::<String, anyhow::Error>(String::from_utf8_lossy(&output.stdout).to_string())
         }
     };
@@ -207,11 +286,15 @@ async fn fetch_pr_context(owner: &str, repo: &str, pr_number: &str) -> Result<Pr
         async move {
             let endpoint = format!("repos/{rf}/issues/{pr}/comments");
             let output = TokioCommand::new(&gh)
-                .args(["api", &endpoint, "--paginate"])
+                .args(["api", &endpoint, "--paginate", "--jq", ".[]"])
                 .output()
                 .await
                 .context("Failed to fetch PR comments")?;
-            Ok::<String, anyhow::Error>(String::from_utf8_lossy(&output.stdout).to_string())
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                anyhow::bail!("Failed to fetch PR comments: {}", stderr.trim());
+            }
+            Ok::<String, anyhow::Error>(wrap_ndjson(&output.stdout))
         }
     };
 
@@ -222,11 +305,15 @@ async fn fetch_pr_context(owner: &str, repo: &str, pr_number: &str) -> Result<Pr
         async move {
             let endpoint = format!("repos/{rf}/pulls/{pr}/reviews");
             let output = TokioCommand::new(&gh)
-                .args(["api", &endpoint, "--paginate"])
+                .args(["api", &endpoint, "--paginate", "--jq", ".[]"])
                 .output()
                 .await
                 .context("Failed to fetch PR reviews")?;
-            Ok::<String, anyhow::Error>(String::from_utf8_lossy(&output.stdout).to_string())
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                anyhow::bail!("Failed to fetch PR reviews: {}", stderr.trim());
+            }
+            Ok::<String, anyhow::Error>(wrap_ndjson(&output.stdout))
         }
     };
 
@@ -237,51 +324,47 @@ async fn fetch_pr_context(owner: &str, repo: &str, pr_number: &str) -> Result<Pr
         async move {
             let endpoint = format!("repos/{rf}/pulls/{pr}/comments");
             let output = TokioCommand::new(&gh)
-                .args(["api", &endpoint, "--paginate"])
+                .args(["api", &endpoint, "--paginate", "--jq", ".[]"])
                 .output()
                 .await
                 .context("Failed to fetch review comments")?;
-            Ok::<String, anyhow::Error>(String::from_utf8_lossy(&output.stdout).to_string())
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                anyhow::bail!("Failed to fetch review comments: {}", stderr.trim());
+            }
+            Ok::<String, anyhow::Error>(wrap_ndjson(&output.stdout))
         }
     };
 
-    let (head_sha, diff, comments, reviews, review_comments) = tokio::try_join!(
-        pr_details_fut,
-        diff_fut,
-        comments_fut,
-        reviews_fut,
-        review_comments_fut
-    )?;
-
-    // Count total comments for fingerprinting (all 3 sources for consistency).
-    let comment_count = count_json_array_items(&comments)
-        + count_json_array_items(&reviews)
-        + count_json_array_items(&review_comments);
+    let (diff, comments, reviews, review_comments) =
+        tokio::try_join!(diff_fut, comments_fut, reviews_fut, review_comments_fut)?;
 
     Ok(PrContext {
-        head_sha,
         diff,
         comments,
         reviews,
         review_comments,
-        comment_count,
     })
 }
 
-/// Count items in a JSON array string. Returns 0 on parse failure.
-fn count_json_array_items(json: &str) -> usize {
-    serde_json::from_str::<Vec<serde_json::Value>>(json)
-        .map(|v| v.len())
-        .unwrap_or(0)
+/// Wrap newline-delimited JSON objects into a JSON array string.
+fn wrap_ndjson(stdout: &[u8]) -> String {
+    let raw = String::from_utf8_lossy(stdout);
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return "[]".to_string();
+    }
+    // Each line from `--jq '.[]'` is a complete JSON object.
+    // Join them with commas and wrap in brackets.
+    let items: Vec<&str> = trimmed.lines().collect();
+    format!("[{}]", items.join(","))
 }
 
 struct PrContext {
-    head_sha: String,
     diff: String,
     comments: String,
     reviews: String,
     review_comments: String,
-    comment_count: usize,
 }
 
 /// Build the judge prompt with full PR context.
@@ -292,11 +375,15 @@ fn build_judge_prompt(
     confidence_threshold: u8,
 ) -> String {
     let force_decide = if consecutive_waits >= MAX_CONSECUTIVE_WAITS - 1 {
-        "\n\nIMPORTANT: This is your final evaluation opportunity. You have already returned \
-         \"wait\" multiple times with no PR state changes. You MUST choose either \"merge\" \
-         or \"escalate\" — do NOT return \"wait\" again.\n"
+        format!(
+            "\n\nIMPORTANT: This is your final evaluation opportunity (attempt {} of {}). \
+             You have already returned \"wait\" multiple times with no PR state changes. \
+             You MUST choose either \"merge\" or \"escalate\" — do NOT return \"wait\" again.\n",
+            consecutive_waits + 1,
+            MAX_CONSECUTIVE_WAITS
+        )
     } else {
-        ""
+        String::new()
     };
 
     format!(
@@ -319,7 +406,7 @@ The merge confidence threshold is {confidence_threshold}/10. Only recommend "mer
 ## Available actions
 
 - **merge** — All feedback genuinely addressed. Conversations wrapped up. Proceed with merge.
-- **wait** — Not confident yet, but the situation may resolve on its own. Specify wait_minutes.
+- **wait** — Not confident yet, but the situation may resolve on its own. Specify wait_minutes (max {max_wait}).
   Examples: reviewer posted recently and agent just responded; reviewer said "I'll look again".
 - **escalate** — Not confident this will resolve without human input. Explain what's unresolved.
 {force_decide}
@@ -361,6 +448,7 @@ Respond with ONLY a JSON object, no other text:
 ```"#,
         pr_number = pr_number,
         confidence_threshold = confidence_threshold,
+        max_wait = MAX_WAIT_MINUTES,
         force_decide = force_decide,
         diff = truncate_if_needed(&context.diff, 50_000),
         comments = truncate_if_needed(&context.comments, 20_000),
@@ -385,22 +473,36 @@ fn truncate_if_needed(s: &str, max_bytes: usize) -> String {
     }
 }
 
-/// Invoke the LLM judge via Claude CLI and parse the response.
+/// Invoke the LLM judge via Claude CLI, passing the prompt via stdin.
 async fn invoke_judge_cli(worktree_path: &std::path::Path, prompt: &str) -> Result<JudgeResponse> {
-    let output = TokioCommand::new("claude")
+    let mut child = TokioCommand::new("claude")
         .arg("--print")
         .arg("--output-format")
         .arg("text")
         .arg("--dangerously-skip-permissions")
         .arg("--max-turns")
         .arg("1")
-        .arg(prompt)
+        .arg("-") // read prompt from stdin
         .current_dir(worktree_path)
+        .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
-        .output()
+        .spawn()
+        .context("Failed to spawn Claude CLI for merge judge")?;
+
+    // Write prompt to stdin.
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin
+            .write_all(prompt.as_bytes())
+            .await
+            .context("Failed to write prompt to Claude stdin")?;
+        // Drop closes stdin, signaling EOF.
+    }
+
+    let output = child
+        .wait_with_output()
         .await
-        .context("Failed to invoke Claude CLI for merge judge")?;
+        .context("Failed to wait for Claude CLI")?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -422,8 +524,8 @@ fn parse_judge_response(text: &str) -> Result<JudgeResponse> {
     let action = match raw.action.as_str() {
         "merge" => JudgeAction::Merge,
         "wait" => {
-            let minutes = raw.wait_minutes.unwrap_or(15);
-            JudgeAction::Wait(Duration::from_secs(minutes * 60))
+            let minutes = raw.wait_minutes.unwrap_or(15).min(MAX_WAIT_MINUTES);
+            JudgeAction::Wait(Duration::from_secs(minutes.saturating_mul(60)))
         }
         "escalate" => JudgeAction::Escalate,
         other => anyhow::bail!("Unknown judge action: {}", other),
@@ -475,14 +577,15 @@ fn extract_json(text: &str) -> Option<&str> {
 // Public API
 // ---------------------------------------------------------------------------
 
-/// Run the merge-readiness judge and return its decision.
+/// Run the merge-readiness judge and return its decision, or `None` if
+/// invocation was skipped (PR state unchanged, no timer expired).
 ///
 /// This is the main entry point. It:
-/// 1. Fetches full PR context (including head SHA and comment counts)
-/// 2. Computes a fingerprint to decide whether invocation is needed
-/// 3. Builds the judge prompt
-/// 4. Invokes the LLM
-/// 5. Parses and returns the response
+/// 1. Fetches a lightweight fingerprint to check if invocation is needed
+/// 2. If needed, fetches full PR context
+/// 3. Builds the judge prompt and invokes the LLM
+/// 4. Enforces max consecutive waits (coerces to escalate)
+/// 5. Returns the response
 pub async fn evaluate(
     owner: &str,
     repo: &str,
@@ -490,20 +593,17 @@ pub async fn evaluate(
     worktree_path: &std::path::Path,
     state: &mut JudgeState,
     confidence_threshold: u8,
-) -> Result<JudgeResponse> {
-    // Fetch context first — the fingerprint is derived from the same data.
-    let context = fetch_pr_context(owner, repo, pr_number).await?;
-
-    let fingerprint = PrStateFingerprint {
-        head_sha: context.head_sha.clone(),
-        comment_count: context.comment_count,
-    };
+) -> Result<Option<JudgeResponse>> {
+    // Lightweight fingerprint check first to avoid fetching full context.
+    let fingerprint = get_pr_fingerprint(owner, repo, pr_number).await?;
 
     if !state.should_invoke(&fingerprint) {
-        anyhow::bail!("Judge invocation skipped — PR state unchanged and no wait timer expired");
+        return Ok(None);
     }
 
     println!("🧑‍⚖️ Invoking merge-readiness judge for PR #{}...", pr_number);
+
+    let context = fetch_pr_context(owner, repo, pr_number).await?;
 
     let prompt = build_judge_prompt(
         pr_number,
@@ -512,7 +612,24 @@ pub async fn evaluate(
         confidence_threshold,
     );
 
-    let response = invoke_judge_cli(worktree_path, &prompt).await?;
+    let mut response = invoke_judge_cli(worktree_path, &prompt).await?;
+
+    // Hard guard: if we've hit max consecutive waits and the LLM still says
+    // "wait", coerce to "escalate" to prevent infinite wait loops.
+    if state.consecutive_waits() >= MAX_CONSECUTIVE_WAITS - 1 {
+        if let JudgeAction::Wait(_) = &response.action {
+            log::warn!(
+                "Judge returned 'wait' after {} consecutive waits — coercing to 'escalate'",
+                state.consecutive_waits() + 1
+            );
+            response.action = JudgeAction::Escalate;
+            response.reasoning = format!(
+                "{} [Coerced to escalate after {} consecutive wait responses]",
+                response.reasoning,
+                state.consecutive_waits() + 1
+            );
+        }
+    }
 
     // Update state with the same fingerprint used for gating.
     state.record_response(fingerprint, &response);
@@ -528,7 +645,7 @@ pub async fn evaluate(
     );
     println!("   Reasoning: {}", response.reasoning);
 
-    Ok(response)
+    Ok(Some(response))
 }
 
 /// Apply the `gru:needs-human-review` label to a PR.
@@ -598,6 +715,9 @@ pub async fn ensure_needs_human_review_label(owner: &str, repo: &str) -> Result<
 }
 
 /// Check if the `gru:needs-human-review` label is present on a PR.
+///
+/// Returns `Err` on API failures — the caller should treat errors
+/// conservatively (do not proceed with merge if the check fails).
 pub async fn has_needs_human_review_label(
     owner: &str,
     repo: &str,
@@ -614,7 +734,12 @@ pub async fn has_needs_human_review_label(
         .context("Failed to fetch labels")?;
 
     if !output.status.success() {
-        return Ok(false);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!(
+            "Failed to fetch labels for PR #{}: {}",
+            pr_number,
+            stderr.trim()
+        );
     }
 
     #[derive(Deserialize)]
@@ -622,7 +747,8 @@ pub async fn has_needs_human_review_label(
         name: String,
     }
 
-    let labels: Vec<Label> = serde_json::from_slice(&output.stdout).unwrap_or_default();
+    let labels: Vec<Label> =
+        serde_json::from_slice(&output.stdout).context("Failed to parse labels JSON")?;
     Ok(labels.iter().any(|l| l.name == NEEDS_HUMAN_REVIEW_LABEL))
 }
 
@@ -695,6 +821,16 @@ mod tests {
         let text = r#"{"confidence": 5, "action": "wait", "reasoning": "Need more time."}"#;
         let resp = parse_judge_response(text).unwrap();
         assert_eq!(resp.action, JudgeAction::Wait(Duration::from_secs(900)));
+    }
+
+    #[test]
+    fn test_parse_judge_response_wait_clamped() {
+        let text = r#"{"confidence": 5, "action": "wait", "wait_minutes": 9999, "reasoning": "Long wait."}"#;
+        let resp = parse_judge_response(text).unwrap();
+        assert_eq!(
+            resp.action,
+            JudgeAction::Wait(Duration::from_secs(MAX_WAIT_MINUTES * 60))
+        );
     }
 
     #[test]
@@ -830,6 +966,52 @@ That's my verdict."#;
     }
 
     #[test]
+    fn test_judge_state_escalation_label_tracking() {
+        let mut state = JudgeState::new();
+        assert!(!state.label_was_applied());
+
+        // Marking label applied works.
+        state.mark_label_applied();
+        assert!(state.label_was_applied());
+
+        // Clearing escalation resets fingerprint.
+        let fp = PrStateFingerprint {
+            head_sha: "abc".to_string(),
+            comment_count: 1,
+        };
+        let resp = JudgeResponse {
+            confidence: 3,
+            action: JudgeAction::Escalate,
+            reasoning: "needs review".to_string(),
+        };
+        state.record_response(fp.clone(), &resp);
+        assert!(!state.should_invoke(&fp)); // Same state, shouldn't invoke.
+
+        state.mark_escalation_cleared();
+        assert!(!state.label_was_applied());
+        assert!(state.should_invoke(&fp)); // Fingerprint reset, should invoke.
+    }
+
+    #[test]
+    fn test_judge_state_mark_escalation_cleared_noop_without_label() {
+        let mut state = JudgeState::new();
+        let fp = PrStateFingerprint {
+            head_sha: "abc".to_string(),
+            comment_count: 1,
+        };
+        let resp = JudgeResponse {
+            confidence: 9,
+            action: JudgeAction::Merge,
+            reasoning: "ok".to_string(),
+        };
+        state.record_response(fp.clone(), &resp);
+
+        // Clearing without label_applied should be a no-op.
+        state.mark_escalation_cleared();
+        assert!(!state.should_invoke(&fp)); // Fingerprint NOT reset.
+    }
+
+    #[test]
     fn test_truncate_if_needed() {
         let s = "hello world";
         assert_eq!(truncate_if_needed(s, 100), s);
@@ -842,26 +1024,46 @@ That's my verdict."#;
         let s = "héllo";
         // 'é' is 2 bytes, so "hé" = 3 bytes. Truncating at 2 should give "h" + notice.
         let result = truncate_if_needed(s, 2);
-        assert!(result.starts_with("h"));
+        assert!(result.starts_with('h'));
         assert!(result.contains("[Content truncated"));
     }
 
     #[test]
-    fn test_count_json_array_items() {
-        assert_eq!(count_json_array_items("[]"), 0);
-        assert_eq!(count_json_array_items("[1,2,3]"), 3);
-        assert_eq!(count_json_array_items("not json"), 0);
+    fn test_wrap_ndjson_empty() {
+        assert_eq!(wrap_ndjson(b""), "[]");
+        assert_eq!(wrap_ndjson(b"  \n  "), "[]");
+    }
+
+    #[test]
+    fn test_wrap_ndjson_single_object() {
+        let input = br#"{"id":1,"body":"hello"}"#;
+        let result = wrap_ndjson(input);
+        assert_eq!(result, r#"[{"id":1,"body":"hello"}]"#);
+    }
+
+    #[test]
+    fn test_wrap_ndjson_multiple_objects() {
+        let input = b"{\"id\":1}\n{\"id\":2}\n{\"id\":3}";
+        let result = wrap_ndjson(input);
+        let parsed: Vec<serde_json::Value> = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed.len(), 3);
+    }
+
+    #[test]
+    fn test_parse_paginated_lengths() {
+        assert_eq!(parse_paginated_lengths(b"5\n3\n2\n"), 10);
+        assert_eq!(parse_paginated_lengths(b"0\n"), 0);
+        assert_eq!(parse_paginated_lengths(b""), 0);
+        assert_eq!(parse_paginated_lengths(b"10\n"), 10);
     }
 
     #[test]
     fn test_build_judge_prompt_includes_threshold() {
         let ctx = PrContext {
-            head_sha: "abc123".to_string(),
             diff: "some diff".to_string(),
             comments: "[]".to_string(),
             reviews: "[]".to_string(),
             review_comments: "[]".to_string(),
-            comment_count: 0,
         };
         let prompt = build_judge_prompt("42", &ctx, 0, 8);
         assert!(prompt.contains("confidence threshold is 8/10"));
@@ -871,15 +1073,14 @@ That's my verdict."#;
     #[test]
     fn test_build_judge_prompt_force_decide_on_max_waits() {
         let ctx = PrContext {
-            head_sha: "abc123".to_string(),
             diff: "diff".to_string(),
             comments: "[]".to_string(),
             reviews: "[]".to_string(),
             review_comments: "[]".to_string(),
-            comment_count: 0,
         };
         // MAX_CONSECUTIVE_WAITS - 1 = 2, so at 2 consecutive waits, force decide.
         let prompt = build_judge_prompt("42", &ctx, 2, 8);
         assert!(prompt.contains("IMPORTANT: This is your final evaluation"));
+        assert!(prompt.contains("attempt 3 of 3"));
     }
 }

@@ -115,7 +115,7 @@ fn default_label() -> String {
 }
 
 impl LabConfig {
-    /// Load configuration from file
+    /// Load configuration from file (validates daemon config — use for `gru lab`).
     pub fn load(path: &Path) -> Result<Self> {
         let contents = fs::read_to_string(path)
             .with_context(|| format!("Failed to read config file: {}", path.display()))?;
@@ -124,6 +124,20 @@ impl LabConfig {
             .with_context(|| format!("Failed to parse config file: {}", path.display()))?;
 
         config.validate()?;
+
+        Ok(config)
+    }
+
+    /// Load configuration without daemon validation.
+    ///
+    /// Use this for non-daemon commands (e.g., `gru do`) that only need
+    /// agent/merge config but may not have `[daemon].repos` configured.
+    pub fn load_partial(path: &Path) -> Result<Self> {
+        let contents = fs::read_to_string(path)
+            .with_context(|| format!("Failed to read config file: {}", path.display()))?;
+
+        let config: LabConfig = toml::from_str(&contents)
+            .with_context(|| format!("Failed to parse config file: {}", path.display()))?;
 
         Ok(config)
     }

@@ -1249,28 +1249,6 @@ async fn monitor_pr_lifecycle(
         }
     }
 
-    // Ensure the gru:needs-human-review label exists for potential escalations.
-    if let Err(e) =
-        merge_judge::ensure_needs_human_review_label(&issue_ctx.owner, &issue_ctx.repo).await
-    {
-        log::warn!("⚠️  Failed to ensure gru:needs-human-review label: {}", e);
-    }
-
-    // Load merge confidence threshold from config (falls back to default).
-    // Clamp to 1-10 to prevent misconfigured values from breaking the judge.
-    let confidence_threshold = LabConfig::default_path()
-        .ok()
-        .and_then(|p| {
-            LabConfig::load(&p)
-                .map_err(|e| {
-                    log::warn!("Failed to load config for merge threshold: {e}, using default");
-                    e
-                })
-                .ok()
-        })
-        .map(|c| c.merge.confidence_threshold.clamp(1, 10))
-        .unwrap_or(merge_judge::DEFAULT_CONFIDENCE_THRESHOLD);
-
     // Start monitoring the PR for review comments, CI failures, and merge/close events
     println!("\n👀 Monitoring PR for updates (polling every 30s)...");
     println!("   Press Ctrl+C to stop monitoring\n");
@@ -1280,6 +1258,21 @@ async fn monitor_pr_lifecycle(
     let mut ci_escalated = false;
     let mut rebase_attempts = 0;
     let mut judge_state = JudgeState::new();
+    let mut judge_label_ensured = false;
+    // Load merge confidence threshold from config (falls back to default).
+    // Uses load_partial to avoid requiring [daemon].repos for non-daemon commands.
+    let confidence_threshold = LabConfig::default_path()
+        .ok()
+        .and_then(|p| {
+            LabConfig::load_partial(&p)
+                .map_err(|e| {
+                    log::warn!("Failed to load config for merge threshold: {e}, using default");
+                    e
+                })
+                .ok()
+        })
+        .map(|c| c.merge.confidence_threshold.clamp(1, 10))
+        .unwrap_or(merge_judge::DEFAULT_CONFIDENCE_THRESHOLD);
     // Track review baseline across monitor_pr re-entries so reviews posted
     // before/during event handling (e.g. rebase) are not silently dropped.
     let mut review_baseline: Option<chrono::DateTime<chrono::Utc>> = None;
@@ -1329,8 +1322,23 @@ async fn monitor_pr_lifecycle(
                 break;
             }
             Ok((MonitorResult::ReadyToMerge, _)) => {
+                // Lazily ensure the gru:needs-human-review label exists on
+                // first ReadyToMerge, rather than unconditionally at startup.
+                if !judge_label_ensured {
+                    if let Err(e) = merge_judge::ensure_needs_human_review_label(
+                        &issue_ctx.owner,
+                        &issue_ctx.repo,
+                    )
+                    .await
+                    {
+                        log::warn!("⚠️  Failed to ensure gru:needs-human-review label: {}", e);
+                    }
+                    judge_label_ensured = true;
+                }
+
                 // Check if gru:needs-human-review was previously applied and
                 // not yet cleared — skip judge until human removes it.
+                // On API failure, be conservative and skip (don't proceed).
                 match merge_judge::has_needs_human_review_label(
                     &issue_ctx.owner,
                     &issue_ctx.repo,
@@ -1346,13 +1354,19 @@ async fn monitor_pr_lifecycle(
                         continue;
                     }
                     Ok(false) => {
-                        // If label was removed since our last escalation, note it.
-                        if judge_state.has_escalated() {
+                        // Only clear escalation if we previously confirmed the
+                        // label was applied. This prevents premature clearing if
+                        // the label add previously failed.
+                        if judge_state.label_was_applied() {
                             judge_state.mark_escalation_cleared();
                         }
                     }
                     Err(e) => {
-                        log::warn!("Failed to check needs-human-review label: {}", e);
+                        log::warn!(
+                            "Failed to check needs-human-review label: {} — skipping judge",
+                            e
+                        );
+                        continue;
                     }
                 }
 
@@ -1367,7 +1381,7 @@ async fn monitor_pr_lifecycle(
                 )
                 .await
                 {
-                    Ok(response) => match &response.action {
+                    Ok(Some(response)) => match &response.action {
                         JudgeAction::Merge => {
                             println!(
                                 "🚀 Judge approved merge for PR #{} (confidence: {}/10)",
@@ -1376,12 +1390,15 @@ async fn monitor_pr_lifecycle(
                             let repo_full = format!("{}/{}", issue_ctx.owner, issue_ctx.repo);
                             let gh_cmd = crate::github::gh_command_for_repo(&repo_full);
                             match TokioCommand::new(gh_cmd)
-                                .args(["pr", "merge", pr_number, "--squash", "-R", &repo_full])
+                                .args([
+                                    "pr", "merge", pr_number, "--squash", "--auto", "-R",
+                                    &repo_full,
+                                ])
                                 .output()
                                 .await
                             {
                                 Ok(output) if output.status.success() => {
-                                    println!("✅ PR #{} was auto-merged!", pr_number);
+                                    println!("✅ Auto-merge queued for PR #{}!", pr_number);
                                     println!("🎉 Issue {} is complete!", issue_ctx.issue_num);
                                     break;
                                 }
@@ -1414,14 +1431,17 @@ async fn monitor_pr_lifecycle(
                                 pr_number, response.confidence
                             );
                             // Apply label and post comment.
-                            if let Err(e) = merge_judge::add_needs_human_review_label(
+                            match merge_judge::add_needs_human_review_label(
                                 &issue_ctx.owner,
                                 &issue_ctx.repo,
                                 pr_number,
                             )
                             .await
                             {
-                                log::warn!("Failed to add needs-human-review label: {}", e);
+                                Ok(()) => judge_state.mark_label_applied(),
+                                Err(e) => {
+                                    log::warn!("Failed to add needs-human-review label: {}", e);
+                                }
                             }
                             merge_judge::post_judge_escalation_comment(
                                 &issue_ctx.owner,
@@ -1433,15 +1453,13 @@ async fn monitor_pr_lifecycle(
                             println!("🔄 Continuing to monitor PR...\n");
                         }
                     },
+                    Ok(None) => {
+                        // Judge invocation skipped (same state, no timer expired).
+                        log::debug!("Judge invocation skipped — PR state unchanged");
+                    }
                     Err(e) => {
-                        // Judge invocation failed or was skipped (same state).
-                        let err_msg = format!("{}", e);
-                        if err_msg.contains("skipped") {
-                            log::debug!("Judge invocation skipped: {}", e);
-                        } else {
-                            log::warn!("⚠️  Merge judge failed: {}", e);
-                            println!("🔄 Will retry on next poll cycle...");
-                        }
+                        log::warn!("⚠️  Merge judge failed: {}", e);
+                        println!("🔄 Will retry on next poll cycle...");
                     }
                 }
             }
