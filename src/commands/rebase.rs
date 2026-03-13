@@ -246,12 +246,12 @@ async fn get_current_branch(worktree_path: &Path) -> Result<String> {
 /// Tries to get the base branch from an associated PR via GitHub CLI.
 async fn get_pr_base_branch(worktree_path: &Path, branch: &str) -> Result<Option<String>> {
     // Detect repo from the worktree (not CWD) to pick gh vs ghe
+    let github_hosts = crate::config::load_github_hosts();
     let remote_url = get_remote_url(worktree_path).await?;
-    let (owner, repo) = git::parse_github_remote(&remote_url)?;
+    let (host, owner, repo) = git::parse_github_remote(&remote_url, &github_hosts)?;
     let repo_full = format!("{}/{}", owner, repo);
-    let gh_cmd = github::gh_command_for_repo(&repo_full);
 
-    let output = Command::new(gh_cmd)
+    let output = github::gh_cli_command(&host)
         .args([
             "pr",
             "view",

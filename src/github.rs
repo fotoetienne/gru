@@ -40,7 +40,10 @@ async fn try_get_token_from_cli(owner: &str, _repo: &str) -> Option<String> {
     Some(token)
 }
 
-/// Infer GitHub hostname from repository owner
+/// Infer GitHub hostname from repository owner.
+///
+/// This is a fallback heuristic used when the host isn't known from a URL.
+/// Prefer using the host from `parse_github_remote` or `parse_github_url` when available.
 ///
 /// # Arguments
 /// * `owner` - Repository owner (user or organization)
@@ -54,6 +57,30 @@ pub(crate) fn infer_github_host(owner: &str) -> &'static str {
     } else {
         "github.com"
     }
+}
+
+/// Returns the correct `gh` CLI command for a given GitHub host.
+///
+/// Returns `"ghe"` for non-`github.com` hosts, `"gh"` otherwise.
+pub fn gh_command_for_host(host: &str) -> &'static str {
+    if host == "github.com" {
+        "gh"
+    } else {
+        "ghe"
+    }
+}
+
+/// Creates a pre-configured `tokio::process::Command` for the `gh`/`ghe` CLI.
+///
+/// Selects the right binary (`gh` vs `ghe`) and sets `GH_HOST` for
+/// non-`github.com` hosts so authentication targets the correct server.
+pub fn gh_cli_command(host: &str) -> Command {
+    let gh_cmd = gh_command_for_host(host);
+    let mut cmd = Command::new(gh_cmd);
+    if host != "github.com" {
+        cmd.env("GH_HOST", host);
+    }
+    cmd
 }
 
 /// Build a full GitHub issue URL for a repo in "owner/repo" format.
@@ -527,17 +554,15 @@ impl GitHubClient {
 /// * `owner` - Repository owner
 /// * `repo` - Repository name
 /// * `pr_number` - PR number
-pub async fn mark_pr_ready_via_cli(owner: &str, repo: &str, pr_number: &str) -> Result<()> {
+pub async fn mark_pr_ready_via_cli(
+    owner: &str,
+    repo: &str,
+    host: &str,
+    pr_number: &str,
+) -> Result<()> {
     let repo_full = format!("{}/{}", owner, repo);
-    let gh_cmd = gh_command_for_repo(&repo_full);
-    let output = Command::new(gh_cmd)
-        .args([
-            "pr",
-            "ready",
-            pr_number,
-            "--repo",
-            &format!("{}/{}", owner, repo),
-        ])
+    let output = gh_cli_command(host)
+        .args(["pr", "ready", pr_number, "--repo", &repo_full])
         .output()
         .await
         .context("Failed to execute gh pr ready command")?;
@@ -580,11 +605,15 @@ fn build_ready_issues_search_query(label: &str) -> String {
     )
 }
 
-pub async fn list_ready_issues_via_cli(owner: &str, repo: &str, label: &str) -> Result<Vec<u64>> {
+pub async fn list_ready_issues_via_cli(
+    owner: &str,
+    repo: &str,
+    host: &str,
+    label: &str,
+) -> Result<Vec<u64>> {
     let repo_full = format!("{}/{}", owner, repo);
-    let gh_cmd = gh_command_for_repo(&repo_full);
     let search_query = build_ready_issues_search_query(label);
-    let output = Command::new(gh_cmd)
+    let output = gh_cli_command(host)
         .args([
             "issue",
             "list",
@@ -631,16 +660,20 @@ struct IssueNumber {
 /// * `owner` - Repository owner (user or organization)
 /// * `repo` - Repository name
 /// * `number` - Issue number
-pub async fn get_issue_via_cli(owner: &str, repo: &str, number: u64) -> Result<IssueInfo> {
+pub async fn get_issue_via_cli(
+    owner: &str,
+    repo: &str,
+    host: &str,
+    number: u64,
+) -> Result<IssueInfo> {
     let repo_full = format!("{}/{}", owner, repo);
-    let gh_cmd = gh_command_for_repo(&repo_full);
-    let output = Command::new(gh_cmd)
+    let output = gh_cli_command(host)
         .args([
             "issue",
             "view",
             &number.to_string(),
             "--repo",
-            &format!("{}/{}", owner, repo),
+            &repo_full,
             "--json",
             "number,title,body",
         ])
@@ -690,16 +723,15 @@ pub struct PrInfo {
 /// * `owner` - Repository owner (user or organization)
 /// * `repo` - Repository name
 /// * `number` - PR number
-pub async fn get_pr_via_cli(owner: &str, repo: &str, number: u64) -> Result<PrInfo> {
+pub async fn get_pr_via_cli(owner: &str, repo: &str, host: &str, number: u64) -> Result<PrInfo> {
     let repo_full = format!("{}/{}", owner, repo);
-    let gh_cmd = gh_command_for_repo(&repo_full);
-    let output = Command::new(gh_cmd)
+    let output = gh_cli_command(host)
         .args([
             "pr",
             "view",
             &number.to_string(),
             "--repo",
-            &format!("{}/{}", owner, repo),
+            &repo_full,
             "--json",
             "title,body,headRefName",
         ])
@@ -739,14 +771,14 @@ pub async fn get_pr_via_cli(owner: &str, repo: &str, number: u64) -> Result<PrIn
 pub async fn create_draft_pr_via_cli(
     owner: &str,
     repo: &str,
+    host: &str,
     branch: &str,
     base: &str,
     title: &str,
     body: &str,
 ) -> Result<String> {
     let repo_full = format!("{}/{}", owner, repo);
-    let gh_cmd = gh_command_for_repo(&repo_full);
-    let output = Command::new(gh_cmd)
+    let output = gh_cli_command(host)
         .args([
             "pr", "create", "--repo", &repo_full, "--head", branch, "--base", base, "--title",
             title, "--body", body, "--draft",
@@ -769,10 +801,14 @@ pub async fn create_draft_pr_via_cli(
     let stdout = String::from_utf8_lossy(&output.stdout);
     let pr_url = stdout.trim();
 
-    // Validate URL format (gh returns URL like https://github.com/owner/repo/pull/123)
-    // Only accept HTTPS URLs for security
-    if !pr_url.starts_with("https://github.com/") {
-        return Err(anyhow!("Expected GitHub HTTPS URL, got: {}", pr_url));
+    // Validate URL format (gh returns URL like https://<host>/owner/repo/pull/123)
+    let expected_prefix = format!("https://{}/", host);
+    if !pr_url.starts_with(&expected_prefix) {
+        return Err(anyhow!(
+            "Expected GitHub HTTPS URL starting with {}, got: {}",
+            expected_prefix,
+            pr_url
+        ));
     }
 
     // Remove any query parameters or fragments before parsing
@@ -786,14 +822,15 @@ pub async fn create_draft_pr_via_cli(
         .unwrap();
 
     // Parse PR number from path segments
-    // Expected format: https://github.com/owner/repo/pull/123
+    // Expected format: https://<host>/owner/repo/pull/123
     let segments: Vec<&str> = url_path.split('/').collect();
 
-    // segments should be: ["https:", "", "github.com", "owner", "repo", "pull", "123"]
+    // segments should be: ["https:", "", "<host>", "owner", "repo", "pull", "123"]
     if segments.len() < 7 || segments[5] != "pull" {
         return Err(anyhow!(
-            "Unexpected GitHub PR URL format: {}. Expected: https://github.com/owner/repo/pull/NUMBER",
-            pr_url
+            "Unexpected GitHub PR URL format: {}. Expected: https://{}/owner/repo/pull/NUMBER",
+            pr_url,
+            host
         ));
     }
 
@@ -899,6 +936,23 @@ mod tests {
     #[test]
     fn test_gh_command_for_repo_empty() {
         assert_eq!(gh_command_for_repo(""), "gh");
+    }
+
+    // --- gh_command_for_host tests ---
+
+    #[test]
+    fn test_gh_command_for_host_github_com() {
+        assert_eq!(gh_command_for_host("github.com"), "gh");
+    }
+
+    #[test]
+    fn test_gh_command_for_host_ghe() {
+        assert_eq!(gh_command_for_host("ghe.netflix.net"), "ghe");
+    }
+
+    #[test]
+    fn test_gh_command_for_host_custom() {
+        assert_eq!(gh_command_for_host("git.example.com"), "ghe");
     }
 
     // --- IssueInfo deserialization tests ---

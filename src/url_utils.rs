@@ -1,7 +1,6 @@
 use crate::git;
 use crate::github;
 use anyhow::{Context, Result};
-use tokio::process::Command;
 
 /// The type of resource referenced in a GitHub URL
 #[derive(Debug, Clone, PartialEq)]
@@ -13,6 +12,8 @@ pub enum GitHubResourceType {
 /// Parsed components of a GitHub URL
 #[derive(Debug, Clone)]
 pub struct GitHubUrl {
+    /// GitHub hostname (e.g., "github.com" or "ghe.example.com")
+    pub host: String,
     pub owner: String,
     pub repo: String,
     pub resource_type: GitHubResourceType,
@@ -30,60 +31,71 @@ fn clean_url(url: &str) -> &str {
         .trim_end_matches('/')
 }
 
-/// Known GitHub hosts (public and enterprise).
-const KNOWN_GITHUB_HOSTS: &[&str] = &["https://github.com/", "https://ghe.netflix.net/"];
-
 /// Parses a GitHub issue or PR URL into its components.
+///
+/// `github_hosts` should contain all recognized hosts (e.g., `["github.com", "ghe.example.com"]`).
 ///
 /// Handles URLs like:
 /// - `https://github.com/owner/repo/issues/42`
 /// - `https://github.com/owner/repo/pull/42`
-/// - `https://ghe.netflix.net/owner/repo/issues/42`
+/// - `https://<configured-ghe-host>/owner/repo/issues/42`
 /// - URLs with query params, fragments, and trailing slashes
 ///
 /// Returns `None` if the URL is not a valid GitHub issue/PR URL.
-pub fn parse_github_url(url: &str) -> Option<GitHubUrl> {
+pub fn parse_github_url(url: &str, github_hosts: &[String]) -> Option<GitHubUrl> {
     let cleaned = clean_url(url);
-    let host_prefix = KNOWN_GITHUB_HOSTS
-        .iter()
-        .find(|&&h| cleaned.starts_with(h))?;
-    let path = cleaned.strip_prefix(host_prefix)?;
-    let parts: Vec<&str> = path.split('/').collect();
 
-    if parts.len() != 4 {
-        return None;
+    for host in github_hosts {
+        let prefix = format!("https://{}/", host);
+        if let Some(path) = cleaned.strip_prefix(&prefix) {
+            let parts: Vec<&str> = path.split('/').collect();
+
+            if parts.len() != 4 {
+                continue;
+            }
+
+            let owner = parts[0];
+            let repo = parts[1];
+            let resource_type_str = parts[2];
+            let number_str = parts[3];
+
+            if owner.is_empty() || repo.is_empty() {
+                continue;
+            }
+
+            let resource_type = match resource_type_str {
+                "issues" => GitHubResourceType::Issue,
+                "pull" => GitHubResourceType::Pull,
+                _ => continue,
+            };
+
+            let number = match number_str.parse::<u32>() {
+                Ok(n) => n,
+                Err(_) => continue,
+            };
+
+            return Some(GitHubUrl {
+                host: host.clone(),
+                owner: owner.to_string(),
+                repo: repo.to_string(),
+                resource_type,
+                number,
+            });
+        }
     }
 
-    let owner = parts[0];
-    let repo = parts[1];
-    let resource_type_str = parts[2];
-    let number_str = parts[3];
-
-    if owner.is_empty() || repo.is_empty() {
-        return None;
-    }
-
-    let resource_type = match resource_type_str {
-        "issues" => GitHubResourceType::Issue,
-        "pull" => GitHubResourceType::Pull,
-        _ => return None,
-    };
-
-    let number = number_str.parse::<u32>().ok()?;
-
-    Some(GitHubUrl {
-        owner: owner.to_string(),
-        repo: repo.to_string(),
-        resource_type,
-        number,
-    })
+    None
 }
 
-/// Extracts owner, repo, and issue number from an issue argument.
+/// Extracts owner, repo, host, and issue number from an issue argument.
 ///
 /// Supports both plain issue numbers (auto-detects from current directory) and GitHub URLs.
-/// Validates the input format as part of parsing (no separate validation step needed).
-pub async fn parse_issue_info(issue: &str) -> Result<(String, String, String)> {
+/// `github_hosts` should contain all recognized hosts (e.g., `["github.com", "ghe.example.com"]`).
+/// Returns `(owner, repo, issue_number, host)`.
+pub async fn parse_issue_info(
+    issue: &str,
+    github_hosts: &[String],
+) -> Result<(String, String, String, String)> {
     // Check if it's a plain number
     if let Ok(num) = issue.parse::<u32>() {
         // Auto-detect repository from current directory
@@ -91,20 +103,25 @@ pub async fn parse_issue_info(issue: &str) -> Result<(String, String, String)> {
             .await
             .context("Failed to detect git repository")?;
 
-        let remote_url = git::get_github_remote()
+        let remote_url = git::get_github_remote(github_hosts)
             .await
             .context("Failed to get GitHub remote")?;
 
-        let (owner, repo) =
-            git::parse_github_remote(&remote_url).context("Failed to parse GitHub remote URL")?;
+        let (host, owner, repo) = git::parse_github_remote(&remote_url, github_hosts)
+            .context("Failed to parse GitHub remote URL")?;
 
-        return Ok((owner, repo, num.to_string()));
+        return Ok((owner, repo, num.to_string(), host));
     }
 
     // Try parsing as a GitHub URL
-    if let Some(parsed) = parse_github_url(issue) {
+    if let Some(parsed) = parse_github_url(issue, github_hosts) {
         if parsed.resource_type == GitHubResourceType::Issue {
-            return Ok((parsed.owner, parsed.repo, parsed.number.to_string()));
+            return Ok((
+                parsed.owner,
+                parsed.repo,
+                parsed.number.to_string(),
+                parsed.host,
+            ));
         }
         // Parsed successfully but wrong resource type (e.g., PR URL given for issue command)
         anyhow::bail!(
@@ -143,23 +160,26 @@ fn build_pr_view_args(pr_num: &str, repo: Option<&str>) -> Vec<String> {
 /// Extracts owner, repo, PR number, and branch name from a PR argument.
 ///
 /// Supports both plain PR numbers and GitHub URLs.
+/// `github_hosts` should contain all recognized hosts (e.g., `["github.com", "ghe.example.com"]`).
 /// For plain numbers, fetches metadata from GitHub to get branch info.
-/// Validates the input format as part of parsing (no separate validation step needed).
-pub async fn parse_pr_info(pr: &str) -> Result<(String, String, String, String)> {
+/// Returns `(owner, repo, pr_number, branch, host)`.
+pub async fn parse_pr_info(
+    pr: &str,
+    github_hosts: &[String],
+) -> Result<(String, String, String, String, String)> {
     // Extract PR number, gh command, and optional repo qualifier
-    let (pr_num, gh_cmd, repo_flag) = if pr.parse::<u32>().is_ok() {
+    let (pr_num, detected_host, repo_flag) = if pr.parse::<u32>().is_ok() {
         // Plain number: detect repo from current directory to pick gh vs ghe
         git::detect_git_repo()
             .await
             .context("Failed to detect git repository")?;
-        let remote_url = git::get_github_remote()
+        let remote_url = git::get_github_remote(github_hosts)
             .await
             .context("Failed to get GitHub remote")?;
-        let (det_owner, det_repo) =
-            git::parse_github_remote(&remote_url).context("Failed to parse GitHub remote URL")?;
-        let cmd = github::gh_command_for_repo(&format!("{}/{}", det_owner, det_repo));
-        (pr.to_string(), cmd, None)
-    } else if let Some(parsed) = parse_github_url(pr) {
+        let (host, _det_owner, _det_repo) = git::parse_github_remote(&remote_url, github_hosts)
+            .context("Failed to parse GitHub remote URL")?;
+        (pr.to_string(), host, None)
+    } else if let Some(parsed) = parse_github_url(pr, github_hosts) {
         if parsed.resource_type != GitHubResourceType::Pull {
             // Parsed successfully but wrong resource type (e.g., issue URL given for review command)
             anyhow::bail!(
@@ -168,8 +188,7 @@ pub async fn parse_pr_info(pr: &str) -> Result<(String, String, String, String)>
             );
         }
         let repo_full = format!("{}/{}", parsed.owner, parsed.repo);
-        let cmd = github::gh_command_for_repo(&repo_full);
-        (parsed.number.to_string(), cmd, Some(repo_full))
+        (parsed.number.to_string(), parsed.host, Some(repo_full))
     } else {
         anyhow::bail!(
             "Invalid PR format. Expected: <number> or <github-url>\n\
@@ -181,7 +200,7 @@ pub async fn parse_pr_info(pr: &str) -> Result<(String, String, String, String)>
 
     // Fetch PR metadata from GitHub to get branch and repo info
     let args = build_pr_view_args(&pr_num, repo_flag.as_deref());
-    let output = Command::new(gh_cmd)
+    let output = github::gh_cli_command(&detected_host)
         .args(&args)
         .output()
         .await
@@ -208,18 +227,31 @@ pub async fn parse_pr_info(pr: &str) -> Result<(String, String, String, String)>
         .context("Missing owner in PR metadata")?
         .to_string();
 
-    Ok((owner, repo, pr_num, branch))
+    Ok((owner, repo, pr_num, branch, detected_host))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn default_hosts() -> Vec<String> {
+        vec!["github.com".to_string()]
+    }
+
+    fn hosts_with_ghe() -> Vec<String> {
+        vec!["github.com".to_string(), "ghe.netflix.net".to_string()]
+    }
+
     // --- parse_github_url tests ---
 
     #[test]
     fn test_parse_github_url_issue() {
-        let result = parse_github_url("https://github.com/fotoetienne/gru/issues/42").unwrap();
+        let result = parse_github_url(
+            "https://github.com/fotoetienne/gru/issues/42",
+            &default_hosts(),
+        )
+        .unwrap();
+        assert_eq!(result.host, "github.com");
         assert_eq!(result.owner, "fotoetienne");
         assert_eq!(result.repo, "gru");
         assert_eq!(result.resource_type, GitHubResourceType::Issue);
@@ -228,8 +260,12 @@ mod tests {
 
     #[test]
     fn test_parse_github_url_ghe_issue() {
-        let result =
-            parse_github_url("https://ghe.netflix.net/netflix/some-service/issues/99").unwrap();
+        let result = parse_github_url(
+            "https://ghe.netflix.net/netflix/some-service/issues/99",
+            &hosts_with_ghe(),
+        )
+        .unwrap();
+        assert_eq!(result.host, "ghe.netflix.net");
         assert_eq!(result.owner, "netflix");
         assert_eq!(result.repo, "some-service");
         assert_eq!(result.resource_type, GitHubResourceType::Issue);
@@ -238,8 +274,12 @@ mod tests {
 
     #[test]
     fn test_parse_github_url_ghe_pull() {
-        let result =
-            parse_github_url("https://ghe.netflix.net/netflix/some-service/pull/10").unwrap();
+        let result = parse_github_url(
+            "https://ghe.netflix.net/netflix/some-service/pull/10",
+            &hosts_with_ghe(),
+        )
+        .unwrap();
+        assert_eq!(result.host, "ghe.netflix.net");
         assert_eq!(result.owner, "netflix");
         assert_eq!(result.repo, "some-service");
         assert_eq!(result.resource_type, GitHubResourceType::Pull);
@@ -247,8 +287,22 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_github_url_ghe_not_recognized_without_config() {
+        // GHE URLs should NOT parse if the host isn't configured
+        assert!(parse_github_url(
+            "https://ghe.netflix.net/netflix/some-service/issues/99",
+            &default_hosts(),
+        )
+        .is_none());
+    }
+
+    #[test]
     fn test_parse_github_url_pull() {
-        let result = parse_github_url("https://github.com/owner/repo-name/pull/123").unwrap();
+        let result = parse_github_url(
+            "https://github.com/owner/repo-name/pull/123",
+            &default_hosts(),
+        )
+        .unwrap();
         assert_eq!(result.owner, "owner");
         assert_eq!(result.repo, "repo-name");
         assert_eq!(result.resource_type, GitHubResourceType::Pull);
@@ -257,27 +311,38 @@ mod tests {
 
     #[test]
     fn test_parse_github_url_strips_query_params() {
-        let result = parse_github_url("https://github.com/owner/repo/issues/42?foo=bar").unwrap();
+        let result = parse_github_url(
+            "https://github.com/owner/repo/issues/42?foo=bar",
+            &default_hosts(),
+        )
+        .unwrap();
         assert_eq!(result.number, 42);
     }
 
     #[test]
     fn test_parse_github_url_strips_fragments() {
-        let result =
-            parse_github_url("https://github.com/owner/repo/issues/42#comment-123").unwrap();
+        let result = parse_github_url(
+            "https://github.com/owner/repo/issues/42#comment-123",
+            &default_hosts(),
+        )
+        .unwrap();
         assert_eq!(result.number, 42);
     }
 
     #[test]
     fn test_parse_github_url_strips_trailing_slash() {
-        let result = parse_github_url("https://github.com/owner/repo/pull/42/").unwrap();
+        let result =
+            parse_github_url("https://github.com/owner/repo/pull/42/", &default_hosts()).unwrap();
         assert_eq!(result.number, 42);
     }
 
     #[test]
     fn test_parse_github_url_combined_edge_cases() {
-        let result =
-            parse_github_url("https://github.com/owner/repo/issues/42/?foo=bar#comment").unwrap();
+        let result = parse_github_url(
+            "https://github.com/owner/repo/issues/42/?foo=bar#comment",
+            &default_hosts(),
+        )
+        .unwrap();
         assert_eq!(result.owner, "owner");
         assert_eq!(result.repo, "repo");
         assert_eq!(result.number, 42);
@@ -285,64 +350,79 @@ mod tests {
 
     #[test]
     fn test_parse_github_url_rejects_non_github() {
-        assert!(parse_github_url("https://example.com/issues/42").is_none());
+        assert!(parse_github_url("https://example.com/issues/42", &default_hosts()).is_none());
     }
 
     #[test]
     fn test_parse_github_url_rejects_http() {
         // parse_github_url only accepts https:// web URLs;
         // use git::parse_github_remote for git remote URLs (which accept http:// and SSH)
-        assert!(parse_github_url("http://github.com/owner/repo/issues/42").is_none());
+        assert!(
+            parse_github_url("http://github.com/owner/repo/issues/42", &default_hosts()).is_none()
+        );
     }
 
     #[test]
     fn test_parse_github_url_rejects_empty_owner() {
-        assert!(parse_github_url("https://github.com//repo/issues/42").is_none());
+        assert!(parse_github_url("https://github.com//repo/issues/42", &default_hosts()).is_none());
     }
 
     #[test]
     fn test_parse_github_url_rejects_empty_repo() {
-        assert!(parse_github_url("https://github.com/owner//issues/42").is_none());
+        assert!(
+            parse_github_url("https://github.com/owner//issues/42", &default_hosts()).is_none()
+        );
     }
 
     #[test]
     fn test_parse_github_url_rejects_missing_number() {
-        assert!(parse_github_url("https://github.com/owner/repo/issues/").is_none());
+        assert!(
+            parse_github_url("https://github.com/owner/repo/issues/", &default_hosts()).is_none()
+        );
     }
 
     #[test]
     fn test_parse_github_url_rejects_non_numeric_number() {
-        assert!(parse_github_url("https://github.com/owner/repo/issues/abc").is_none());
+        assert!(
+            parse_github_url("https://github.com/owner/repo/issues/abc", &default_hosts())
+                .is_none()
+        );
     }
 
     #[test]
     fn test_parse_github_url_rejects_unknown_resource_type() {
-        assert!(parse_github_url("https://github.com/owner/repo/wiki/42").is_none());
+        assert!(
+            parse_github_url("https://github.com/owner/repo/wiki/42", &default_hosts()).is_none()
+        );
     }
 
     #[test]
     fn test_parse_github_url_rejects_incomplete_path() {
-        assert!(parse_github_url("https://github.com/owner/repo").is_none());
-        assert!(parse_github_url("https://github.com/owner").is_none());
-        assert!(parse_github_url("https://github.com/issues/").is_none());
+        assert!(parse_github_url("https://github.com/owner/repo", &default_hosts()).is_none());
+        assert!(parse_github_url("https://github.com/owner", &default_hosts()).is_none());
+        assert!(parse_github_url("https://github.com/issues/", &default_hosts()).is_none());
     }
 
     // --- parse_issue_info tests (URL paths only; plain numbers need git context) ---
 
     #[tokio::test]
     async fn test_parse_issue_info_with_url() {
-        let result = parse_issue_info("https://github.com/fotoetienne/gru/issues/42")
-            .await
-            .unwrap();
+        let result = parse_issue_info(
+            "https://github.com/fotoetienne/gru/issues/42",
+            &default_hosts(),
+        )
+        .await
+        .unwrap();
         assert_eq!(result.0, "fotoetienne");
         assert_eq!(result.1, "gru");
         assert_eq!(result.2, "42");
+        assert_eq!(result.3, "github.com");
     }
 
     #[tokio::test]
     async fn test_parse_issue_info_url_normalizes_number() {
         // Leading zeros are normalized by parsing through u32
-        let result = parse_issue_info("https://github.com/owner/repo/issues/042")
+        let result = parse_issue_info("https://github.com/owner/repo/issues/042", &default_hosts())
             .await
             .unwrap();
         assert_eq!(result.2, "42");
@@ -350,9 +430,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_parse_issue_info_with_url_and_query_params() {
-        let result = parse_issue_info("https://github.com/owner/repo/issues/123?foo=bar")
-            .await
-            .unwrap();
+        let result = parse_issue_info(
+            "https://github.com/owner/repo/issues/123?foo=bar",
+            &default_hosts(),
+        )
+        .await
+        .unwrap();
         assert_eq!(result.0, "owner");
         assert_eq!(result.1, "repo");
         assert_eq!(result.2, "123");
@@ -360,14 +443,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_parse_issue_info_rejects_invalid() {
-        assert!(parse_issue_info("not-a-number").await.is_err());
-        assert!(parse_issue_info("").await.is_err());
-        assert!(parse_issue_info("-42").await.is_err());
+        let hosts = default_hosts();
+        assert!(parse_issue_info("not-a-number", &hosts).await.is_err());
+        assert!(parse_issue_info("", &hosts).await.is_err());
+        assert!(parse_issue_info("-42", &hosts).await.is_err());
     }
 
     #[tokio::test]
     async fn test_parse_issue_info_rejects_pr_url_with_specific_message() {
-        let err = parse_issue_info("https://github.com/owner/repo/pull/42")
+        let err = parse_issue_info("https://github.com/owner/repo/pull/42", &default_hosts())
             .await
             .unwrap_err();
         let msg = err.to_string();
@@ -410,14 +494,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_parse_pr_info_rejects_invalid() {
-        assert!(parse_pr_info("not-a-number").await.is_err());
-        assert!(parse_pr_info("").await.is_err());
-        assert!(parse_pr_info("-42").await.is_err());
+        let hosts = default_hosts();
+        assert!(parse_pr_info("not-a-number", &hosts).await.is_err());
+        assert!(parse_pr_info("", &hosts).await.is_err());
+        assert!(parse_pr_info("-42", &hosts).await.is_err());
     }
 
     #[tokio::test]
     async fn test_parse_pr_info_rejects_issue_url_with_specific_message() {
-        let err = parse_pr_info("https://github.com/owner/repo/issues/42")
+        let err = parse_pr_info("https://github.com/owner/repo/issues/42", &default_hosts())
             .await
             .unwrap_err();
         let msg = err.to_string();

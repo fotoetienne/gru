@@ -185,9 +185,11 @@ pub async fn handle_resume(
         }
     };
 
+    let host = crate::github::infer_github_host(&owner);
     let issue_ctx = IssueContext {
         owner,
         repo,
+        host: host.to_string(),
         issue_num,
         details: None,
         github_client,
