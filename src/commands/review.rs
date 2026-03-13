@@ -160,6 +160,9 @@ pub async fn handle_review(pr_arg: Option<String>, agent_name: &str) -> Result<i
         orchestration_phase: OrchestrationPhase::RunningAgent,
         token_usage: None,
         agent_name: agent_name.to_string(),
+        timeout_deadline: None,
+        attempt_count: 0,
+        no_watch: false,
     };
 
     // Register the Minion (spawn_blocking to avoid holding lock during review)

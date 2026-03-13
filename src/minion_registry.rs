@@ -158,6 +158,15 @@ pub struct MinionInfo {
     /// Name of the agent backend used by this minion (e.g., "claude", "codex")
     #[serde(default = "default_agent_name")]
     pub agent_name: String,
+    /// Absolute deadline after which the minion should be timed out
+    #[serde(default)]
+    pub timeout_deadline: Option<DateTime<Utc>>,
+    /// Number of attempts made for this minion (for retry tracking)
+    #[serde(default)]
+    pub attempt_count: u32,
+    /// Whether to skip watching (PR monitoring) after agent completes
+    #[serde(default)]
+    pub no_watch: bool,
 }
 
 /// Default agent name for backwards compatibility with existing registry entries
@@ -477,6 +486,9 @@ mod tests {
             orchestration_phase: OrchestrationPhase::Setup,
             token_usage: None,
             agent_name: "claude".to_string(),
+            timeout_deadline: None,
+            attempt_count: 0,
+            no_watch: false,
         }
     }
 
@@ -739,6 +751,10 @@ mod tests {
         assert!(!info.session_id.is_empty());
         // token_usage should default to None for old registry entries
         assert!(info.token_usage.is_none());
+        // New fields should default correctly
+        assert!(info.timeout_deadline.is_none());
+        assert_eq!(info.attempt_count, 0);
+        assert!(!info.no_watch);
     }
 
     #[test]
@@ -888,6 +904,36 @@ mod tests {
                 retrieved.orchestration_phase,
                 OrchestrationPhase::RunningAgent
             );
+        }
+    }
+
+    #[test]
+    fn test_new_fields_persisted() {
+        let temp_dir = tempdir().unwrap();
+        let deadline = Utc::now() + chrono::Duration::hours(1);
+
+        let info = MinionInfo {
+            timeout_deadline: Some(deadline),
+            attempt_count: 3,
+            no_watch: true,
+            ..test_minion_info()
+        };
+
+        {
+            let mut registry = MinionRegistry::load(Some(temp_dir.path())).unwrap();
+            registry.register("M001".to_string(), info).unwrap();
+        }
+
+        // Reload and verify
+        {
+            let registry = MinionRegistry::load(Some(temp_dir.path())).unwrap();
+            let retrieved = registry.get("M001").unwrap();
+            assert_eq!(
+                retrieved.timeout_deadline.unwrap().timestamp(),
+                deadline.timestamp()
+            );
+            assert_eq!(retrieved.attempt_count, 3);
+            assert!(retrieved.no_watch);
         }
     }
 

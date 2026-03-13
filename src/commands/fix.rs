@@ -850,6 +850,9 @@ async fn setup_worktree(ctx: &IssueContext, agent_name: &str) -> Result<Worktree
         orchestration_phase: OrchestrationPhase::Setup,
         token_usage: None,
         agent_name: agent_name.to_string(),
+        timeout_deadline: None,
+        attempt_count: 0,
+        no_watch: false,
     };
 
     let minion_id_clone = minion_id.clone();
