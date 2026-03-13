@@ -5,6 +5,7 @@ pub mod clean;
 pub mod fix;
 pub mod init;
 pub mod lab;
+pub mod logs;
 pub mod path;
 pub mod prompt;
 pub mod prompts;

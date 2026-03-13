@@ -1,23 +1,35 @@
-use crate::minion_registry::{with_registry, MinionMode};
+use crate::minion_registry::{is_process_alive, with_registry, MinionMode};
 use crate::minion_resolver;
 use anyhow::{Context, Result};
 use std::path::Path;
 use tokio::process::Command;
 
-/// Handles the stop command to terminate a running Minion
-/// Returns 0 on success, 1 on error
+/// Sends a signal to a process using libc::kill.
+/// Returns true if the signal was delivered successfully.
+#[cfg(unix)]
+fn send_signal(pid: u32, signal: i32) -> bool {
+    unsafe { libc::kill(pid as i32, signal) == 0 }
+}
+
+#[cfg(not(unix))]
+fn send_signal(_pid: u32, _signal: i32) -> bool {
+    false
+}
+
+/// Handles the stop command to terminate a running Minion.
+/// Returns 0 on success, 1 on error.
 ///
-/// This command terminates a running Minion by:
-/// 1. Resolving the minion ID to find the worktree
-/// 2. Sending SIGTERM to any Claude processes running in that worktree
-/// 3. Updating the minion registry to mark it as "stopped"
+/// Termination strategy:
+/// 1. Look up PID from the minion registry (primary path for background workers)
+/// 2. Fall back to ps/lsof scanning for legacy minions without PID in registry
+/// 3. Update registry to mark minion as stopped
 ///
 /// The ID argument supports smart resolution:
 /// - Exact minion ID (e.g., M0tk)
 /// - With M prefix (e.g., 12 -> M12)
 /// - Issue number (finds minion working on that issue)
 /// - PR number (finds minion via linked issue)
-pub async fn handle_stop(id: String) -> Result<i32> {
+pub async fn handle_stop(id: String, force: bool) -> Result<i32> {
     // Resolve the minion ID to get the worktree path
     let minion = minion_resolver::resolve_minion(&id).await?;
 
@@ -33,7 +45,6 @@ pub async fn handle_stop(id: String) -> Result<i32> {
         );
         println!("   Removing from registry...");
 
-        // Remove from registry since worktree is gone
         let minion_id = minion.minion_id.clone();
         with_registry(move |registry| {
             registry.remove(&minion_id)?;
@@ -45,16 +56,24 @@ pub async fn handle_stop(id: String) -> Result<i32> {
         return Ok(0);
     }
 
-    // Try to terminate Claude processes running in this worktree
-    let terminated = terminate_claude_in_worktree(&checkout_path).await?;
+    // Try PID-based termination first (primary path for background workers)
+    let pid_terminated = terminate_via_registry_pid(&minion.minion_id, force).await;
 
-    if terminated > 0 {
+    if pid_terminated {
         println!(
-            "🔪 Terminated {} Claude process(es) in worktree",
-            terminated
+            "🔪 Terminated Minion {} worker process{}",
+            minion.minion_id,
+            if force { " (forced)" } else { "" }
         );
     } else {
-        println!("ℹ️  No active Claude processes found in worktree");
+        // Fall back to ps/lsof scanning for legacy minions or if PID wasn't in registry
+        let terminated = terminate_claude_in_worktree(&checkout_path).await?;
+
+        if terminated > 0 {
+            println!("🔪 Terminated {} process(es) in worktree", terminated);
+        } else {
+            println!("ℹ️  No active processes found for minion");
+        }
     }
 
     // Update registry to mark minion as stopped
@@ -72,7 +91,6 @@ pub async fn handle_stop(id: String) -> Result<i32> {
             println!("📝 Updated registry: status = stopped");
         }
         Err(e) => {
-            // Minion might not be in registry (old worktree), that's okay
             log::warn!("⚠️  Could not update registry: {}", e);
         }
     }
@@ -84,11 +102,37 @@ pub async fn handle_stop(id: String) -> Result<i32> {
     Ok(0)
 }
 
-/// Terminates Claude processes running in the specified worktree
-/// Returns the number of processes terminated
+/// Terminates a minion's worker process using the PID stored in the registry.
+/// Returns true if a process was found and signalled.
+async fn terminate_via_registry_pid(minion_id: &str, force: bool) -> bool {
+    let mid = minion_id.to_string();
+    let pid = match with_registry(move |reg| Ok(reg.get(&mid).and_then(|info| info.pid))).await {
+        Ok(Some(pid)) => pid,
+        _ => return false,
+    };
+
+    if !is_process_alive(pid) {
+        return false;
+    }
+
+    let signal = if force { libc::SIGKILL } else { libc::SIGTERM };
+
+    if send_signal(pid, signal) {
+        log::info!(
+            "Sent {} to worker process (PID: {})",
+            if force { "SIGKILL" } else { "SIGTERM" },
+            pid
+        );
+        true
+    } else {
+        log::warn!("Failed to send signal to PID {}", pid);
+        false
+    }
+}
+
+/// Terminates Claude processes running in the specified worktree (legacy fallback).
+/// Returns the number of processes terminated.
 async fn terminate_claude_in_worktree(worktree_path: &Path) -> Result<usize> {
-    // Get list of claude processes with their working directories
-    // We use `ps` with format options to get PID and working directory
     let output = Command::new("ps")
         .args(["-eo", "pid,command"])
         .output()
@@ -105,35 +149,28 @@ async fn terminate_claude_in_worktree(worktree_path: &Path) -> Result<usize> {
 
     let mut terminated = 0;
 
-    // Find claude processes that might be running in this worktree
-    // We look for processes with 'claude' in the command that also reference the worktree
     for line in ps_output.lines() {
         let line = line.trim();
 
-        // Skip header line
         if line.starts_with("PID") || line.is_empty() {
             continue;
         }
 
-        // Check if this is a claude process
-        if !line.contains("claude") {
+        if !line.contains("claude") && !line.contains("gru") {
             continue;
         }
 
-        // Parse PID from the line (first column)
         let parts: Vec<&str> = line.split_whitespace().collect();
         if parts.is_empty() {
             continue;
         }
 
-        let pid_str = parts[0];
-        let pid: u32 = match pid_str.parse() {
+        let pid: u32 = match parts[0].parse() {
             Ok(p) => p,
             Err(_) => continue,
         };
 
         // Check if this process is associated with our worktree
-        // We do this by checking if any files opened by the process are within the worktree path
         let cwd_check = Command::new("lsof")
             .args(["-p", &pid.to_string(), "-Fn"])
             .output()
@@ -144,33 +181,15 @@ async fn terminate_claude_in_worktree(worktree_path: &Path) -> Result<usize> {
                 let lsof_output = String::from_utf8_lossy(&output.stdout);
                 lsof_output.contains(&*worktree_str)
             }
-            Err(_) => {
-                // lsof might not be available or process might have exited
-                // Fall back to checking if the process command line references the worktree path
-                line.contains(&*worktree_str)
-            }
+            Err(_) => line.contains(&*worktree_str),
         };
 
         if is_in_worktree {
-            // Send SIGTERM to the process
-            // Note: There's a race condition where the process could exit between the ps/lsof
-            // check and the kill call. This is handled gracefully - we warn but don't fail.
-            let kill_result = Command::new("kill")
-                .args(["-TERM", &pid.to_string()])
-                .output()
-                .await;
-
-            match kill_result {
-                Ok(output) if output.status.success() => {
-                    log::info!("Sent SIGTERM to claude process (PID: {})", pid);
-                    terminated += 1;
-                }
-                Ok(_) => {
-                    log::warn!("Failed to terminate process {}", pid);
-                }
-                Err(e) => {
-                    log::warn!("Failed to send signal to process {}: {}", pid, e);
-                }
+            if send_signal(pid, libc::SIGTERM) {
+                log::info!("Sent SIGTERM to process (PID: {})", pid);
+                terminated += 1;
+            } else {
+                log::warn!("Failed to terminate process {}", pid);
             }
         }
     }
@@ -184,11 +203,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_stop_with_invalid_id() {
-        // Test that handle_stop returns an error for an invalid ID
-        let result = handle_stop("nonexistent-minion-xyz".to_string()).await;
+        let result = handle_stop("nonexistent-minion-xyz".to_string(), false).await;
         assert!(result.is_err());
 
-        // Verify the error message suggests using gru status
         let err_msg = format!("{:#}", result.unwrap_err());
         assert!(err_msg.contains("Could not resolve ID"));
         assert!(err_msg.contains("gru status"));
@@ -196,10 +213,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_terminate_claude_in_worktree_nonexistent() {
-        // Test with a non-existent directory - should return 0 (no processes found)
         let temp_path = std::env::temp_dir().join("gru-test-nonexistent-worktree");
         let result = terminate_claude_in_worktree(&temp_path).await;
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), 0);
+    }
+
+    #[test]
+    fn test_send_signal_nonexistent_pid() {
+        // High PID that doesn't exist
+        assert!(!send_signal(4_194_304, libc::SIGTERM));
     }
 }
