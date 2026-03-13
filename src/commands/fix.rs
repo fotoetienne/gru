@@ -844,7 +844,11 @@ async fn setup_worktree(
         .map(parse_timeout)
         .transpose()
         .context("Invalid --timeout value")?
-        .and_then(|dur| chrono::TimeDelta::from_std(dur).ok())
+        .map(|dur| {
+            chrono::TimeDelta::from_std(dur)
+                .map_err(|_| anyhow::anyhow!("--timeout value is too large to represent"))
+        })
+        .transpose()?
         .map(|delta| now + delta);
     let registry_info = RegistryMinionInfo {
         repo: repo_name.clone(),
@@ -2156,7 +2160,7 @@ pub async fn handle_fix(issue: &str, opts: FixOptions) -> Result<i32> {
                 let mid = minion_id.clone();
                 with_registry(move |reg| {
                     reg.update(&mid, |info| {
-                        info.attempt_count += 1;
+                        info.attempt_count = info.attempt_count.saturating_add(1);
                     })
                 })
                 .await

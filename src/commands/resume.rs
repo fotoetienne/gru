@@ -100,7 +100,7 @@ pub async fn handle_resume(
     let mid = minion.minion_id.clone();
     with_registry(move |reg| {
         reg.update(&mid, |info| {
-            info.attempt_count += 1;
+            info.attempt_count = info.attempt_count.saturating_add(1);
         })
     })
     .await
