@@ -364,7 +364,7 @@ impl GitHubClient {
         let current_labels: Vec<String> =
             issue_info.labels.iter().map(|l| l.name.clone()).collect();
 
-        // If already has in-progress (new or old name), another Minion claimed it
+        // If already in-progress, another Minion claimed it
         if labels::has_label(&current_labels, labels::IN_PROGRESS) {
             return Ok(false);
         }
@@ -418,7 +418,7 @@ impl GitHubClient {
     /// Used when a minion is stuck (inactivity timeout), the task times out,
     /// or CI fix attempts are exhausted. Signals that human intervention is needed.
     ///
-    /// Removes in-progress, done, and failed labels (both old and new) if present
+    /// Removes in-progress, done, and failed labels if present
     /// to ensure a clean state transition regardless of which phase triggered the block.
     ///
     /// # Arguments

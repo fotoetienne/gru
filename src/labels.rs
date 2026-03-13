@@ -84,6 +84,13 @@ mod tests {
     }
 
     #[test]
+    fn test_has_label_rejects_old_names() {
+        let labels = vec!["ready-for-minion".to_string(), "in-progress".to_string()];
+        assert!(!has_label(&labels, TODO));
+        assert!(!has_label(&labels, IN_PROGRESS));
+    }
+
+    #[test]
     fn test_all_labels_unique_colors() {
         let colors: Vec<&str> = ALL_LABELS.iter().map(|(_, c, _)| *c).collect();
         let unique: std::collections::HashSet<&str> = colors.iter().copied().collect();
