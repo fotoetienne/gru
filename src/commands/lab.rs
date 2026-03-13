@@ -205,6 +205,8 @@ async fn poll_and_spawn(config: &LabConfig, children: &mut Vec<Child>) -> Result
                 continue;
             }
         };
+        // Canonical owner/repo form for registry lookups and issue URL building
+        let repo_full = format!("{}/{}", owner, repo);
 
         // Fetch ready issues, excluding blocked ones (both GitHub-blocked and minion:blocked).
         // Try CLI first (supports -is:blocked qualifier), fall back to octocrab with
@@ -248,7 +250,7 @@ async fn poll_and_spawn(config: &LabConfig, children: &mut Vec<Child>) -> Result
             }
 
             // Check if issue is already being worked on (by a live process)
-            if is_issue_claimed(repo_spec, issue_number).await? {
+            if is_issue_claimed(&repo_full, issue_number).await? {
                 continue;
             }
 
@@ -256,7 +258,7 @@ async fn poll_and_spawn(config: &LabConfig, children: &mut Vec<Child>) -> Result
             match client.claim_issue(&owner, &repo, issue_number).await {
                 Ok(true) => {
                     // Successfully claimed, spawn Minion
-                    match spawn_minion(repo_spec, &host, issue_number).await {
+                    match spawn_minion(&repo_full, &host, issue_number).await {
                         Ok(child) => {
                             children.push(child);
                             println!(
@@ -374,10 +376,21 @@ async fn spawn_minion(repo: &str, host: &str, issue_number: u64) -> Result<Child
 
     // Include host in log filename to avoid collisions when the same owner/repo
     // exists on different hosts (e.g., github.com/org/svc vs ghe.corp.com/org/svc).
+    // Sanitize by replacing any non-alphanumeric characters with hyphens.
     let safe_host = if host == "github.com" {
         String::new()
     } else {
-        format!("{}-", host.replace('.', "-"))
+        let sanitized: String = host
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '-'
+                }
+            })
+            .collect();
+        format!("{}-", sanitized)
     };
     let safe_repo = repo.replace('/', "-");
     let log_path = log_dir.join(format!(
@@ -484,10 +497,36 @@ mod tests {
     #[test]
     fn test_log_path_ghe_includes_host() {
         let host = "ghe.netflix.net";
-        let safe_host = format!("{}-", host.replace('.', "-"));
+        let sanitized: String = host
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '-'
+                }
+            })
+            .collect();
+        let safe_host = format!("{}-", sanitized);
         let safe_repo = "corp/service".replace('/', "-");
         let log_name = format!("{}{}-issue-{}.log", safe_host, safe_repo, 42);
         assert_eq!(log_name, "ghe-netflix-net-corp-service-issue-42.log");
+    }
+
+    #[test]
+    fn test_log_path_host_with_port_is_sanitized() {
+        let host = "ghe.example.com:8443";
+        let sanitized: String = host
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '-'
+                }
+            })
+            .collect();
+        assert_eq!(sanitized, "ghe-example-com-8443");
     }
 
     // --- issue URL construction tests ---

@@ -214,7 +214,6 @@ impl GitHubClient {
     ///
     /// # Arguments
     /// * `owner` - Repository owner (used to infer hostname)
-    /// * `repo` - Repository name
     pub async fn try_from_env(owner: &str, _repo: &str) -> Option<Self> {
         let host = infer_github_host(owner);
         let token = get_github_token_for_host(host).await.ok()?;
