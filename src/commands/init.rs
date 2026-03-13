@@ -122,7 +122,8 @@ pub async fn handle_init(repo_arg: String) -> Result<i32> {
     // 3. Clone/update bare repository
     println!("\n📦 Setting up repository mirror...");
     let bare_repo_path = workspace.repos().join(&owner).join(format!("{}.git", repo));
-    let git_repo = GitRepo::new(&owner, &repo, bare_repo_path.clone());
+    let host = crate::github::infer_github_host(&owner);
+    let git_repo = GitRepo::new(&owner, &repo, host, bare_repo_path.clone());
 
     match git_repo.ensure_bare_clone().await {
         Ok(()) => {
@@ -212,12 +213,13 @@ async fn detect_current_repo() -> Result<(String, String)> {
     let _git_dir = detect_git_repo().await.context("Not in a git repository")?;
 
     // Get the remote URL (function doesn't need git_dir - it uses current directory)
-    let remote_url = get_github_remote()
+    let github_hosts = crate::config::load_github_hosts();
+    let remote_url = get_github_remote(&github_hosts)
         .await
         .context("No GitHub remote found in current repository")?;
 
     // Parse owner/repo from remote URL
-    let (owner, repo) = parse_github_remote(&remote_url)
+    let (_host, owner, repo) = parse_github_remote(&remote_url, &github_hosts)
         .context("Could not parse GitHub owner/repo from remote URL")?;
 
     println!("  Detected: {}/{}", owner, repo);

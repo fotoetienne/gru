@@ -61,7 +61,7 @@ pub async fn detect_git_repo() -> Result<PathBuf> {
 
 /// Gets the GitHub remote URL from the current git repository
 /// Tries "origin" first, then falls back to the first GitHub remote found
-pub async fn get_github_remote() -> Result<String> {
+pub async fn get_github_remote(github_hosts: &[String]) -> Result<String> {
     // Use `git remote -v` to get all remotes and their URLs in one call
     let output = Command::new("git")
         .arg("remote")
@@ -88,7 +88,7 @@ pub async fn get_github_remote() -> Result<String> {
         let remote_url = parts.next();
 
         if let (Some(name), Some(url)) = (remote_name, remote_url) {
-            if is_github_url(url) {
+            if is_github_url(url, github_hosts) {
                 // Prioritize "origin" remote
                 if name == "origin" && origin_url.is_none() {
                     origin_url = Some(url.to_string());
@@ -108,47 +108,63 @@ pub async fn get_github_remote() -> Result<String> {
     })
 }
 
-/// Checks if a URL is a GitHub URL
-/// Only matches URLs that start with recognized GitHub URL patterns
-fn is_github_url(url: &str) -> bool {
-    url.starts_with("https://github.com/")
-        || url.starts_with("http://github.com/")
-        || url.starts_with("git@github.com:")
+/// Checks if a URL is a GitHub URL (including configured GHE hosts).
+///
+/// `github_hosts` should contain all recognized hosts (e.g., `["github.com", "ghe.example.com"]`).
+fn is_github_url(url: &str, github_hosts: &[String]) -> bool {
+    for host in github_hosts {
+        if url.starts_with(&format!("https://{}/", host))
+            || url.starts_with(&format!("http://{}/", host))
+            || url.starts_with(&format!("git@{}:", host))
+        {
+            return true;
+        }
+    }
+    false
 }
 
-/// Parses a GitHub remote URL to extract owner and repo name
-/// Supports both HTTPS and SSH formats:
-/// - https://github.com/owner/repo.git
-/// - git@github.com:owner/repo.git
-pub fn parse_github_remote(url: &str) -> Result<(String, String)> {
-    if !is_github_url(url) {
+/// Parses a GitHub remote URL to extract host, owner, and repo name.
+///
+/// Supports both HTTPS and SSH formats for any configured GitHub host:
+/// - `https://<host>/owner/repo.git`
+/// - `git@<host>:owner/repo.git`
+///
+/// `github_hosts` should contain all recognized hosts (e.g., `["github.com", "ghe.example.com"]`).
+pub fn parse_github_remote(url: &str, github_hosts: &[String]) -> Result<(String, String, String)> {
+    if !is_github_url(url, github_hosts) {
         anyhow::bail!("Not a GitHub URL: {}", url);
     }
 
-    // Handle HTTPS format
-    if url.starts_with("https://github.com/") || url.starts_with("http://github.com/") {
-        let path = url
-            .trim_start_matches("https://github.com/")
-            .trim_start_matches("http://github.com/")
-            .trim_end_matches(".git")
-            .trim_end_matches('/');
+    for host in github_hosts {
+        let https_prefix = format!("https://{}/", host);
+        let http_prefix = format!("http://{}/", host);
+        let ssh_prefix = format!("git@{}:", host);
 
-        let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
-        if parts.len() >= 2 && !parts[0].is_empty() && !parts[1].is_empty() {
-            return Ok((parts[0].to_string(), parts[1].to_string()));
+        // Handle HTTPS format
+        if url.starts_with(&https_prefix) || url.starts_with(&http_prefix) {
+            let path = url
+                .trim_start_matches(&https_prefix)
+                .trim_start_matches(&http_prefix)
+                .trim_end_matches(".git")
+                .trim_end_matches('/');
+
+            let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+            if parts.len() >= 2 && !parts[0].is_empty() && !parts[1].is_empty() {
+                return Ok((host.clone(), parts[0].to_string(), parts[1].to_string()));
+            }
         }
-    }
 
-    // Handle SSH format: git@github.com:owner/repo.git
-    if url.starts_with("git@github.com:") {
-        let path = url
-            .trim_start_matches("git@github.com:")
-            .trim_end_matches(".git")
-            .trim_end_matches('/');
+        // Handle SSH format: git@<host>:owner/repo.git
+        if url.starts_with(&ssh_prefix) {
+            let path = url
+                .trim_start_matches(&ssh_prefix)
+                .trim_end_matches(".git")
+                .trim_end_matches('/');
 
-        let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
-        if parts.len() >= 2 && !parts[0].is_empty() && !parts[1].is_empty() {
-            return Ok((parts[0].to_string(), parts[1].to_string()));
+            let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+            if parts.len() >= 2 && !parts[0].is_empty() && !parts[1].is_empty() {
+                return Ok((host.clone(), parts[0].to_string(), parts[1].to_string()));
+            }
         }
     }
 
@@ -308,15 +324,23 @@ async fn configure_hooks(worktree_path: &Path) -> Result<()> {
 pub struct GitRepo {
     owner: String,
     repo: String,
+    /// GitHub hostname (e.g., "github.com" or "ghe.example.com")
+    host: String,
     bare_path: PathBuf,
 }
 
 impl GitRepo {
     /// Create a new GitRepo instance
-    pub fn new(owner: impl Into<String>, repo: impl Into<String>, bare_path: PathBuf) -> Self {
+    pub fn new(
+        owner: impl Into<String>,
+        repo: impl Into<String>,
+        host: impl Into<String>,
+        bare_path: PathBuf,
+    ) -> Self {
         Self {
             owner: owner.into(),
             repo: repo.into(),
+            host: host.into(),
             bare_path,
         }
     }
@@ -413,7 +437,7 @@ impl GitRepo {
             }
         } else {
             // Clone as bare repository
-            let url = format!("https://github.com/{}/{}.git", self.owner, self.repo);
+            let url = format!("https://{}/{}/{}.git", self.host, self.owner, self.repo);
 
             // Create parent directory if it doesn't exist
             if let Some(parent) = self.bare_path.parent() {
@@ -962,61 +986,126 @@ mod tests {
     use super::*;
     use std::env;
 
+    fn default_hosts() -> Vec<String> {
+        vec!["github.com".to_string()]
+    }
+
+    fn hosts_with_ghe() -> Vec<String> {
+        vec!["github.com".to_string(), "ghe.example.com".to_string()]
+    }
+
     #[test]
     fn test_parse_github_remote_https() {
-        let result = parse_github_remote("https://github.com/owner/repo.git").unwrap();
-        assert_eq!(result.0, "owner");
-        assert_eq!(result.1, "repo");
+        let result =
+            parse_github_remote("https://github.com/owner/repo.git", &default_hosts()).unwrap();
+        assert_eq!(result.0, "github.com");
+        assert_eq!(result.1, "owner");
+        assert_eq!(result.2, "repo");
     }
 
     #[test]
     fn test_parse_github_remote_https_without_git_extension() {
-        let result = parse_github_remote("https://github.com/owner/repo").unwrap();
-        assert_eq!(result.0, "owner");
-        assert_eq!(result.1, "repo");
+        let result =
+            parse_github_remote("https://github.com/owner/repo", &default_hosts()).unwrap();
+        assert_eq!(result.0, "github.com");
+        assert_eq!(result.1, "owner");
+        assert_eq!(result.2, "repo");
     }
 
     #[test]
     fn test_parse_github_remote_ssh() {
-        let result = parse_github_remote("git@github.com:owner/repo.git").unwrap();
-        assert_eq!(result.0, "owner");
-        assert_eq!(result.1, "repo");
+        let result =
+            parse_github_remote("git@github.com:owner/repo.git", &default_hosts()).unwrap();
+        assert_eq!(result.0, "github.com");
+        assert_eq!(result.1, "owner");
+        assert_eq!(result.2, "repo");
     }
 
     #[test]
     fn test_parse_github_remote_ssh_without_git_extension() {
-        let result = parse_github_remote("git@github.com:owner/repo").unwrap();
-        assert_eq!(result.0, "owner");
-        assert_eq!(result.1, "repo");
+        let result = parse_github_remote("git@github.com:owner/repo", &default_hosts()).unwrap();
+        assert_eq!(result.0, "github.com");
+        assert_eq!(result.1, "owner");
+        assert_eq!(result.2, "repo");
+    }
+
+    #[test]
+    fn test_parse_github_remote_ghe_https() {
+        let result = parse_github_remote(
+            "https://ghe.example.com/netflix/service.git",
+            &hosts_with_ghe(),
+        )
+        .unwrap();
+        assert_eq!(result.0, "ghe.example.com");
+        assert_eq!(result.1, "netflix");
+        assert_eq!(result.2, "service");
+    }
+
+    #[test]
+    fn test_parse_github_remote_ghe_ssh() {
+        let result =
+            parse_github_remote("git@ghe.example.com:netflix/service.git", &hosts_with_ghe())
+                .unwrap();
+        assert_eq!(result.0, "ghe.example.com");
+        assert_eq!(result.1, "netflix");
+        assert_eq!(result.2, "service");
     }
 
     #[test]
     fn test_parse_github_remote_rejects_non_github() {
-        let result = parse_github_remote("https://gitlab.com/owner/repo.git");
+        let result = parse_github_remote("https://gitlab.com/owner/repo.git", &default_hosts());
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("Not a GitHub URL"));
     }
 
     #[test]
+    fn test_parse_github_remote_rejects_unconfigured_host() {
+        // ghe.example.com not in default hosts
+        let result =
+            parse_github_remote("https://ghe.example.com/owner/repo.git", &default_hosts());
+        assert!(result.is_err());
+    }
+
+    #[test]
     fn test_parse_github_remote_rejects_invalid_format() {
-        let result = parse_github_remote("https://github.com/incomplete");
+        let result = parse_github_remote("https://github.com/incomplete", &default_hosts());
         assert!(result.is_err());
     }
 
     #[test]
     fn test_is_github_url() {
+        let hosts = default_hosts();
         // Valid GitHub URLs
-        assert!(is_github_url("https://github.com/owner/repo.git"));
-        assert!(is_github_url("http://github.com/owner/repo.git"));
-        assert!(is_github_url("git@github.com:owner/repo.git"));
+        assert!(is_github_url("https://github.com/owner/repo.git", &hosts));
+        assert!(is_github_url("http://github.com/owner/repo.git", &hosts));
+        assert!(is_github_url("git@github.com:owner/repo.git", &hosts));
 
         // Invalid - not GitHub
-        assert!(!is_github_url("https://gitlab.com/owner/repo.git"));
+        assert!(!is_github_url("https://gitlab.com/owner/repo.git", &hosts));
 
         // Invalid - security: malicious URLs that contain "github.com" but aren't GitHub
-        assert!(!is_github_url("https://evil.com/github.com/malware.git"));
-        assert!(!is_github_url("https://github.com.attacker.com/repo.git"));
-        assert!(!is_github_url("user@attacker.com:github.com:malware.git"));
+        assert!(!is_github_url(
+            "https://evil.com/github.com/malware.git",
+            &hosts
+        ));
+        assert!(!is_github_url(
+            "https://github.com.attacker.com/repo.git",
+            &hosts
+        ));
+        assert!(!is_github_url(
+            "user@attacker.com:github.com:malware.git",
+            &hosts
+        ));
+    }
+
+    #[test]
+    fn test_is_github_url_with_ghe() {
+        let hosts = hosts_with_ghe();
+        assert!(is_github_url(
+            "https://ghe.example.com/owner/repo.git",
+            &hosts
+        ));
+        assert!(is_github_url("git@ghe.example.com:owner/repo.git", &hosts));
     }
 
     #[test]
@@ -1069,9 +1158,15 @@ mod tests {
 
     #[test]
     fn test_git_repo_new() {
-        let repo = GitRepo::new("owner", "repo", PathBuf::from("/tmp/repo.git"));
+        let repo = GitRepo::new(
+            "owner",
+            "repo",
+            "github.com",
+            PathBuf::from("/tmp/repo.git"),
+        );
         assert_eq!(repo.owner, "owner");
         assert_eq!(repo.repo, "repo");
+        assert_eq!(repo.host, "github.com");
         assert_eq!(repo.bare_path, PathBuf::from("/tmp/repo.git"));
     }
 
@@ -1080,6 +1175,7 @@ mod tests {
         let repo = GitRepo::new(
             "owner",
             "repo",
+            "github.com",
             PathBuf::from("/tmp/nonexistent-bare-repo.git"),
         );
         let result = repo
@@ -1098,6 +1194,7 @@ mod tests {
         let repo = GitRepo::new(
             "owner",
             "repo",
+            "github.com",
             PathBuf::from("/tmp/nonexistent-bare-repo.git"),
         );
         let result = repo.cleanup_worktree(Path::new("/tmp/test-worktree")).await;
@@ -1111,7 +1208,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_worktree_rejects_empty_branch_name() {
-        let repo = GitRepo::new("owner", "repo", PathBuf::from("/tmp/test-repo.git"));
+        let repo = GitRepo::new(
+            "owner",
+            "repo",
+            "github.com",
+            PathBuf::from("/tmp/test-repo.git"),
+        );
         let result = repo
             .create_worktree("", Path::new("/tmp/test-worktree"))
             .await;
@@ -1125,7 +1227,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_worktree_rejects_branch_starting_with_dash() {
-        let repo = GitRepo::new("owner", "repo", PathBuf::from("/tmp/test-repo.git"));
+        let repo = GitRepo::new(
+            "owner",
+            "repo",
+            "github.com",
+            PathBuf::from("/tmp/test-repo.git"),
+        );
         let result = repo
             .create_worktree("-branch", Path::new("/tmp/test-worktree"))
             .await;
@@ -1139,7 +1246,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_worktree_rejects_invalid_branch_names() {
-        let repo = GitRepo::new("owner", "repo", PathBuf::from("/tmp/test-repo.git"));
+        let repo = GitRepo::new(
+            "owner",
+            "repo",
+            "github.com",
+            PathBuf::from("/tmp/test-repo.git"),
+        );
 
         // Test various invalid branch names
         let invalid_names = vec![
@@ -1175,6 +1287,7 @@ mod tests {
         let repo = GitRepo::new(
             "owner",
             "repo",
+            "github.com",
             PathBuf::from("/tmp/nonexistent-bare-repo.git"),
         );
         let result = repo.find_worktree_for_branch("test-branch").await;
@@ -1304,7 +1417,7 @@ mod tests {
         let _ = fs::remove_dir_all(&worktree_path);
 
         // Test cloning a real repository (using the gru repo itself)
-        let repo = GitRepo::new("fotoetienne", "gru", bare_path.clone());
+        let repo = GitRepo::new("fotoetienne", "gru", "github.com", bare_path.clone());
 
         // Test ensure_bare_clone (first time - should clone)
         let result = repo.ensure_bare_clone().await;

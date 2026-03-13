@@ -221,24 +221,25 @@ async fn poll_and_spawn(config: &LabConfig, children: &mut Vec<Child>) -> Result
         // Fetch ready issues, excluding blocked ones (both GitHub-blocked and minion:blocked).
         // Try CLI first (supports -is:blocked qualifier), fall back to octocrab with
         // client-side filtering if CLI is unavailable.
-        let issue_numbers = match list_ready_issues_via_cli(owner, repo, &config.daemon.label).await
-        {
-            Ok(numbers) => numbers,
-            Err(cli_err) => {
-                log::warn!(
-                    "⚠️  CLI issue fetch failed for {}: {}, trying API fallback",
-                    repo_spec,
-                    cli_err
-                );
-                match fallback_list_issues(owner, repo, &config.daemon.label).await {
-                    Ok(numbers) => numbers,
-                    Err(e) => {
-                        log::warn!("⚠️  API fallback also failed for {}: {}", repo_spec, e);
-                        continue;
+        let host = crate::github::infer_github_host(owner);
+        let issue_numbers =
+            match list_ready_issues_via_cli(owner, repo, host, &config.daemon.label).await {
+                Ok(numbers) => numbers,
+                Err(cli_err) => {
+                    log::warn!(
+                        "⚠️  CLI issue fetch failed for {}: {}, trying API fallback",
+                        repo_spec,
+                        cli_err
+                    );
+                    match fallback_list_issues(owner, repo, &config.daemon.label).await {
+                        Ok(numbers) => numbers,
+                        Err(e) => {
+                            log::warn!("⚠️  API fallback also failed for {}: {}", repo_spec, e);
+                            continue;
+                        }
                     }
                 }
-            }
-        };
+            };
 
         // Create GitHub client for claiming issues
         let client = match GitHubClient::from_env(owner, repo).await {

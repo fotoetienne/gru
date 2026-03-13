@@ -47,7 +47,8 @@ pub async fn handle_review(pr_arg: Option<String>, agent_name: &str) -> Result<i
 
     // Create bare repository path
     let bare_path = workspace.repos().join(&owner).join(format!("{}.git", repo));
-    let git_repo = git::GitRepo::new(&owner, &repo, bare_path);
+    let host = crate::github::infer_github_host(&owner);
+    let git_repo = git::GitRepo::new(&owner, &repo, host, bare_path);
 
     // Ensure bare repository is cloned/updated
     println!("📦 Ensuring repository is cloned...");
@@ -289,7 +290,8 @@ async fn resolve_pr_from_arg(arg: &str) -> Result<(String, String, String, Strin
     }
 
     // Strategy 2: Try as PR number or URL (existing behavior)
-    match parse_pr_info(arg).await {
+    let github_hosts = crate::config::load_github_hosts();
+    match parse_pr_info(arg, &github_hosts).await {
         Ok(pr_info) => return Ok(pr_info),
         Err(e) => errors.push(format!("PR number/URL '{}': {:#}", arg, e)),
     }
@@ -353,7 +355,8 @@ async fn get_pr_info_from_number(pr_num: &str) -> Result<(String, String, String
         .with_context(|| format!("Invalid PR number format: '{}'", pr_num))?;
 
     // Use parse_pr_info which fetches metadata from GitHub
-    parse_pr_info(pr_num).await
+    let github_hosts = crate::config::load_github_hosts();
+    parse_pr_info(pr_num, &github_hosts).await
 }
 
 /// Finds a PR number associated with an issue number
@@ -363,13 +366,14 @@ async fn find_pr_for_issue(issue_num: u64) -> Result<String> {
     git::detect_git_repo()
         .await
         .context("Failed to detect git repository")?;
-    let remote_url = git::get_github_remote()
+    let github_hosts = crate::config::load_github_hosts();
+    let remote_url = git::get_github_remote(&github_hosts)
         .await
         .context("Failed to get GitHub remote")?;
-    let (det_owner, det_repo) =
-        git::parse_github_remote(&remote_url).context("Failed to parse GitHub remote URL")?;
+    let (host, det_owner, det_repo) = git::parse_github_remote(&remote_url, &github_hosts)
+        .context("Failed to parse GitHub remote URL")?;
     let repo_full = format!("{}/{}", det_owner, det_repo);
-    let gh_cmd = github::gh_command_for_repo(&repo_full);
+    let gh_cmd = github::gh_command_for_host(&host);
     // Safe: issue_num is validated as u64 by the type system, which can only contain digits.
     // This prevents command injection as the format string will never contain shell metacharacters.
     let output = TokioCommand::new(gh_cmd)
@@ -421,7 +425,8 @@ async fn find_pr_for_issue(issue_num: u64) -> Result<String> {
 /// Returns the first linked issue number, or 0 if no issues are linked
 async fn find_issue_for_pr(owner: &str, repo: &str, pr_num: &str) -> Result<u64> {
     let repo_full = format!("{}/{}", owner, repo);
-    let gh_cmd = github::gh_command_for_repo(&repo_full);
+    let host = crate::github::infer_github_host(owner);
+    let gh_cmd = github::gh_command_for_host(host);
     // Safe: pr_num is already validated as a number earlier in the call chain
     let output = TokioCommand::new(gh_cmd)
         .args([
@@ -490,7 +495,8 @@ async fn fetch_pr_details(owner: &str, repo: &str, pr_num: u64) -> Result<PrDeta
         }
     }
 
-    let info = github::get_pr_via_cli(owner, repo, pr_num)
+    let host = crate::github::infer_github_host(owner);
+    let info = github::get_pr_via_cli(owner, repo, host, pr_num)
         .await
         .context("Failed to fetch PR details via gh CLI")?;
     Ok(PrDetails {

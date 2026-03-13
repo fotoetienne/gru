@@ -419,8 +419,9 @@ async fn extract_repo_from_git_config(path: &Path) -> Result<String> {
 
     let url = String::from_utf8_lossy(&output.stdout).trim().to_string();
 
-    let (owner, repo) =
-        git::parse_github_remote(&url).context("Failed to parse repo from remote URL")?;
+    let github_hosts = crate::config::load_github_hosts();
+    let (_host, owner, repo) = git::parse_github_remote(&url, &github_hosts)
+        .context("Failed to parse repo from remote URL")?;
     Ok(format!("{}/{}", owner, repo))
 }
 

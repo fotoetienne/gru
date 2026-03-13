@@ -7,7 +7,7 @@ use crate::agent_runner::{
 use crate::ci;
 use crate::config::LabConfig;
 use crate::git;
-use crate::github::{gh_command_for_repo, GitHubClient};
+use crate::github::GitHubClient;
 use crate::merge_judge::{self, JudgeAction, JudgeState};
 use crate::minion;
 use crate::minion_registry::{
@@ -65,6 +65,8 @@ const MAX_REBASE_ATTEMPTS: usize = 2;
 pub(crate) struct IssueContext {
     pub owner: String,
     pub repo: String,
+    /// GitHub hostname (e.g., "github.com" or "ghe.example.com")
+    pub host: String,
     pub issue_num: u64,
     /// Fetched issue details: (title, body, labels). None if fetch failed.
     pub details: Option<IssueDetails>,
@@ -103,11 +105,15 @@ pub(crate) struct AgentResult {
 /// Uses the `gh`/`ghe` CLI instead of local git tracking refs, because gru
 /// worktrees are backed by bare repos whose `origin` remote points to the
 /// local bare repo — not to GitHub.
-pub(crate) async fn is_branch_pushed(owner: &str, repo: &str, branch_name: &str) -> Result<bool> {
+pub(crate) async fn is_branch_pushed(
+    owner: &str,
+    repo: &str,
+    host: &str,
+    branch_name: &str,
+) -> Result<bool> {
     let repo_full = format!("{}/{}", owner, repo);
-    let gh_cmd = gh_command_for_repo(&repo_full);
     let endpoint = format!("repos/{}/git/ref/heads/{}", repo_full, branch_name);
-    let output = TokioCommand::new(gh_cmd)
+    let output = crate::github::gh_cli_command(host)
         .args(["api", &endpoint, "--silent"])
         .output()
         .await
@@ -148,6 +154,7 @@ fn create_wip_template(minion_id: &str, issue_num: u64, issue_title: &str) -> (S
 async fn create_pr_for_issue(
     owner: &str,
     repo: &str,
+    host: &str,
     branch_name: &str,
     issue_num: u64,
     minion_id: &str,
@@ -184,7 +191,7 @@ async fn create_pr_for_issue(
             Err(_) => "Fix issue".to_string(),
         }
     } else {
-        match crate::github::get_issue_via_cli(owner, repo, issue_num).await {
+        match crate::github::get_issue_via_cli(owner, repo, host, issue_num).await {
             Ok(info) => info.title,
             Err(_) => "Fix issue".to_string(),
         }
@@ -241,6 +248,7 @@ async fn create_pr_for_issue(
     let pr_number = crate::github::create_draft_pr_via_cli(
         owner,
         repo,
+        host,
         branch_name,
         &base_branch,
         &pr_title,
@@ -251,7 +259,7 @@ async fn create_pr_for_issue(
 
     // Mark ready if description was provided
     if should_mark_ready {
-        match crate::github::mark_pr_ready_via_cli(owner, repo, &pr_number).await {
+        match crate::github::mark_pr_ready_via_cli(owner, repo, host, &pr_number).await {
             Ok(_) => {
                 println!("✅ PR #{} marked ready for review", pr_number);
             }
@@ -343,12 +351,17 @@ async fn auto_rebase_pr(worktree_path: &Path) -> Result<bool> {
 }
 
 /// Posts an escalation comment on a PR when auto-rebase fails.
-async fn post_escalation_comment(owner: &str, repo: &str, pr_number: &str, message: &str) {
+async fn post_escalation_comment(
+    owner: &str,
+    repo: &str,
+    host: &str,
+    pr_number: &str,
+    message: &str,
+) {
     let repo_full = format!("{}/{}", owner, repo);
-    let gh_cmd = gh_command_for_repo(&repo_full);
     let body = format!("🤖 **Minion Escalation**\n\n{}", message);
 
-    let result = TokioCommand::new(gh_cmd)
+    let result = crate::github::gh_cli_command(host)
         .args([
             "pr", "comment", pr_number, "--repo", &repo_full, "--body", &body,
         ])
@@ -541,8 +554,8 @@ async fn try_post_progress_comment(
 /// Note: Does NOT claim the issue — that happens after worktree setup to avoid
 /// marking issues as in-progress when setup fails.
 /// Note: Existing minion check is done in `handle_fix` to support resume logic.
-async fn resolve_issue(issue: &str) -> Result<IssueContext> {
-    let (owner, repo, issue_num_str) = parse_issue_info(issue).await?;
+async fn resolve_issue(issue: &str, github_hosts: &[String]) -> Result<IssueContext> {
+    let (owner, repo, issue_num_str, host) = parse_issue_info(issue, github_hosts).await?;
     let issue_num: u64 = issue_num_str
         .parse()
         .context("Failed to parse issue number")?;
@@ -559,11 +572,12 @@ async fn resolve_issue(issue: &str) -> Result<IssueContext> {
     };
 
     // Fetch issue details
-    let details = fetch_issue_details(&owner, &repo, issue_num, &github_client).await;
+    let details = fetch_issue_details(&owner, &repo, &host, issue_num, &github_client).await;
 
     Ok(IssueContext {
         owner,
         repo,
+        host,
         issue_num,
         details,
         github_client,
@@ -712,6 +726,7 @@ async fn claim_issue(client: &GitHubClient, owner: &str, repo: &str, issue_num: 
 async fn fetch_issue_details(
     owner: &str,
     repo: &str,
+    host: &str,
     issue_num: u64,
     github_client: &Option<GitHubClient>,
 ) -> Option<IssueDetails> {
@@ -734,7 +749,8 @@ async fn fetch_issue_details(
             Err(e) => {
                 eprintln!("⚠️  Failed to fetch issue details via API: {}", e);
                 eprintln!("   Falling back to gh CLI...");
-                let cli_result = crate::github::get_issue_via_cli(owner, repo, issue_num).await;
+                let cli_result =
+                    crate::github::get_issue_via_cli(owner, repo, host, issue_num).await;
                 let result = handle_cli_fetch_result(cli_result).await;
                 if result.is_none() {
                     eprintln!("   Fix authentication with: gh auth login");
@@ -743,7 +759,7 @@ async fn fetch_issue_details(
             }
         }
     } else {
-        let cli_result = crate::github::get_issue_via_cli(owner, repo, issue_num).await;
+        let cli_result = crate::github::get_issue_via_cli(owner, repo, host, issue_num).await;
         let result = handle_cli_fetch_result(cli_result).await;
         if result.is_none() {
             eprintln!("   Fix authentication with: gh auth login");
@@ -773,7 +789,7 @@ async fn setup_worktree(ctx: &IssueContext, agent_name: &str) -> Result<Worktree
         .repos()
         .join(&ctx.owner)
         .join(format!("{}.git", ctx.repo));
-    let git_repo = git::GitRepo::new(&ctx.owner, &ctx.repo, bare_path);
+    let git_repo = git::GitRepo::new(&ctx.owner, &ctx.repo, &ctx.host, bare_path);
 
     println!("📦 Ensuring repository is cloned...");
     git_repo
@@ -1116,8 +1132,13 @@ pub(crate) async fn handle_pr_creation(
     wt_ctx: &WorktreeContext,
 ) -> Result<Option<String>> {
     println!("\n🔍 Checking if branch was pushed...");
-    let branch_pushed =
-        is_branch_pushed(&issue_ctx.owner, &issue_ctx.repo, &wt_ctx.branch_name).await?;
+    let branch_pushed = is_branch_pushed(
+        &issue_ctx.owner,
+        &issue_ctx.repo,
+        &issue_ctx.host,
+        &wt_ctx.branch_name,
+    )
+    .await?;
 
     if !branch_pushed {
         println!("ℹ️  Branch was not pushed. No PR will be created.");
@@ -1135,6 +1156,7 @@ pub(crate) async fn handle_pr_creation(
     match create_pr_for_issue(
         &issue_ctx.owner,
         &issue_ctx.repo,
+        &issue_ctx.host,
         &wt_ctx.branch_name,
         issue_ctx.issue_num,
         &wt_ctx.minion_id,
@@ -1388,8 +1410,7 @@ async fn monitor_pr_lifecycle(
                                 pr_number, response.confidence
                             );
                             let repo_full = format!("{}/{}", issue_ctx.owner, issue_ctx.repo);
-                            let gh_cmd = crate::github::gh_command_for_repo(&repo_full);
-                            match TokioCommand::new(gh_cmd)
+                            match crate::github::gh_cli_command(&issue_ctx.host)
                                 .args([
                                     "pr", "merge", pr_number, "--squash", "--auto", "-R",
                                     &repo_full,
@@ -1582,6 +1603,7 @@ async fn monitor_pr_lifecycle(
                     post_escalation_comment(
                         &issue_ctx.owner,
                         &issue_ctx.repo,
+                        &issue_ctx.host,
                         pr_number,
                         "Auto-rebase failed after multiple attempts. Manual conflict resolution required.",
                     )
@@ -1614,6 +1636,7 @@ async fn monitor_pr_lifecycle(
                         post_escalation_comment(
                             &issue_ctx.owner,
                             &issue_ctx.repo,
+                            &issue_ctx.host,
                             pr_number,
                             "Auto-rebase failed: could not resolve merge conflicts automatically. Manual intervention required.",
                         )
@@ -1625,6 +1648,7 @@ async fn monitor_pr_lifecycle(
                         post_escalation_comment(
                             &issue_ctx.owner,
                             &issue_ctx.repo,
+                            &issue_ctx.host,
                             pr_number,
                             "Auto-rebase encountered an unexpected error. Check Minion logs for details.",
                         )
@@ -1744,8 +1768,11 @@ pub async fn handle_fix(issue: &str, opts: FixOptions) -> Result<i32> {
         None => Duration::from_secs(24 * 3600),
     };
 
+    // Load configured GitHub hosts (github.com always included)
+    let github_hosts = crate::config::load_github_hosts();
+
     // Phase 1: Resolve issue (always runs - need fresh issue details)
-    let issue_ctx = resolve_issue(issue).await?;
+    let issue_ctx = resolve_issue(issue, &github_hosts).await?;
 
     // Validate agent name and create backend early (fail fast on unknown agents)
     let backend = agent_registry::resolve_backend(&agent_name)?;
@@ -1985,7 +2012,13 @@ mod tests {
     #[tokio::test]
     async fn test_is_branch_pushed_nonexistent() {
         // Test with a nonexistent branch — gh api should return 404 → Ok(false)
-        let result = is_branch_pushed("fotoetienne", "gru", "nonexistent-branch-xyz-12345").await;
+        let result = is_branch_pushed(
+            "fotoetienne",
+            "gru",
+            "github.com",
+            "nonexistent-branch-xyz-12345",
+        )
+        .await;
 
         // gh api returns 404 for nonexistent branches, which we map to Ok(false)
         // Skip assertion if gh CLI is not available (e.g., CI without auth)
@@ -2026,6 +2059,7 @@ mod tests {
         let ctx = IssueContext {
             owner: "octocat".to_string(),
             repo: "hello-world".to_string(),
+            host: "github.com".to_string(),
             issue_num: 42,
             details: Some(IssueDetails {
                 title: "Fix the widget".to_string(),
@@ -2051,6 +2085,7 @@ mod tests {
         let ctx = IssueContext {
             owner: "octocat".to_string(),
             repo: "hello-world".to_string(),
+            host: "github.com".to_string(),
             issue_num: 42,
             details: None,
             github_client: None,
@@ -2068,6 +2103,7 @@ mod tests {
         let ctx = IssueContext {
             owner: "octocat".to_string(),
             repo: "hello-world".to_string(),
+            host: "github.com".to_string(),
             issue_num: 7,
             details: Some(IssueDetails {
                 title: "Add feature".to_string(),
@@ -2090,6 +2126,7 @@ mod tests {
         let ctx = IssueContext {
             owner: "myorg".to_string(),
             repo: "myproject".to_string(),
+            host: "github.com".to_string(),
             issue_num: 99,
             details: Some(IssueDetails {
                 title: "Template test".to_string(),
@@ -2140,6 +2177,7 @@ CUSTOM: Fix #{{ issue_number }} - {{ issue_title }}"#,
         let ctx = IssueContext {
             owner: "owner".to_string(),
             repo: "repo".to_string(),
+            host: "github.com".to_string(),
             issue_num: 55,
             details: Some(IssueDetails {
                 title: "Custom test".to_string(),

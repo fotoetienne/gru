@@ -7,6 +7,11 @@ use std::time::Duration;
 /// Configuration for Gru Lab daemon mode
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct LabConfig {
+    /// Additional GitHub hosts beyond github.com (e.g., GitHub Enterprise instances).
+    /// `github.com` is always included by default — only list extra hosts here.
+    #[serde(default)]
+    pub github_hosts: Vec<String>,
+
     #[serde(default)]
     pub daemon: DaemonConfig,
 
@@ -102,6 +107,21 @@ impl Default for DaemonConfig {
     }
 }
 
+/// Load just the `github_hosts` from config, returning `["github.com"]` on any error.
+///
+/// This is a convenience for callers that need host info but don't require
+/// full daemon config validation.
+pub fn load_github_hosts() -> Vec<String> {
+    let path = match LabConfig::default_path() {
+        Ok(p) => p,
+        Err(_) => return vec!["github.com".to_string()],
+    };
+    match LabConfig::load_partial(&path) {
+        Ok(cfg) => cfg.all_github_hosts(),
+        Err(_) => vec!["github.com".to_string()],
+    }
+}
+
 fn default_poll_interval() -> u64 {
     30
 }
@@ -115,6 +135,18 @@ fn default_label() -> String {
 }
 
 impl LabConfig {
+    /// Returns the full list of GitHub hosts, always including `github.com`.
+    pub fn all_github_hosts(&self) -> Vec<String> {
+        let mut hosts = vec!["github.com".to_string()];
+        for h in &self.github_hosts {
+            let h = h.trim().to_string();
+            if !h.is_empty() && h != "github.com" {
+                hosts.push(h);
+            }
+        }
+        hosts
+    }
+
     /// Load configuration from file (validates daemon config — use for `gru lab`).
     pub fn load(path: &Path) -> Result<Self> {
         let contents = fs::read_to_string(path)
@@ -393,5 +425,47 @@ confidence_threshold = 6
 
         let config = LabConfig::load(temp_file.path()).unwrap();
         assert_eq!(config.merge.confidence_threshold, 6);
+    }
+
+    #[test]
+    fn test_github_hosts_default() {
+        let config = LabConfig::default();
+        let hosts = config.all_github_hosts();
+        assert_eq!(hosts, vec!["github.com"]);
+    }
+
+    #[test]
+    fn test_github_hosts_with_extra() {
+        let config_toml = r#"
+github_hosts = ["ghe.example.com", "git.corp.net"]
+
+[daemon]
+repos = ["owner/repo"]
+"#;
+        let mut temp_file = NamedTempFile::new().unwrap();
+        temp_file.write_all(config_toml.as_bytes()).unwrap();
+        temp_file.flush().unwrap();
+
+        let config = LabConfig::load(temp_file.path()).unwrap();
+        let hosts = config.all_github_hosts();
+        assert_eq!(hosts, vec!["github.com", "ghe.example.com", "git.corp.net"]);
+    }
+
+    #[test]
+    fn test_github_hosts_deduplicates_github_com() {
+        let config_toml = r#"
+github_hosts = ["github.com", "ghe.example.com"]
+
+[daemon]
+repos = ["owner/repo"]
+"#;
+        let mut temp_file = NamedTempFile::new().unwrap();
+        temp_file.write_all(config_toml.as_bytes()).unwrap();
+        temp_file.flush().unwrap();
+
+        let config = LabConfig::load(temp_file.path()).unwrap();
+        let hosts = config.all_github_hosts();
+        // github.com should only appear once
+        assert_eq!(hosts, vec!["github.com", "ghe.example.com"]);
     }
 }

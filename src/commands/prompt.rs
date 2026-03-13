@@ -35,7 +35,8 @@ fn parse_params(params: &[String]) -> Result<HashMap<String, String>> {
 
 /// Fetches issue data from GitHub and populates a PromptContext
 async fn fetch_issue_context(issue_str: &str) -> Result<(PromptContext, String, String, u64)> {
-    let (owner, repo, issue_num_str) = parse_issue_info(issue_str).await?;
+    let github_hosts = crate::config::load_github_hosts();
+    let (owner, repo, issue_num_str, host) = parse_issue_info(issue_str, &github_hosts).await?;
     let issue_number: u64 = issue_num_str
         .parse()
         .context("Failed to parse issue number")?;
@@ -62,7 +63,7 @@ async fn fetch_issue_context(issue_str: &str) -> Result<(PromptContext, String, 
                     "Failed to fetch issue via API: {}. Falling back to gh CLI...",
                     e
                 );
-                let info = crate::github::get_issue_via_cli(&owner, &repo, issue_number)
+                let info = crate::github::get_issue_via_cli(&owner, &repo, &host, issue_number)
                     .await
                     .context("Failed to fetch issue via gh CLI")?;
                 context.issue_title = Some(info.title);
@@ -70,7 +71,7 @@ async fn fetch_issue_context(issue_str: &str) -> Result<(PromptContext, String, 
             }
         }
     } else {
-        let info = crate::github::get_issue_via_cli(&owner, &repo, issue_number)
+        let info = crate::github::get_issue_via_cli(&owner, &repo, &host, issue_number)
             .await
             .context(
                 "Failed to fetch issue. Ensure gh is installed and authenticated, \
@@ -93,26 +94,28 @@ async fn fetch_issue_context(issue_str: &str) -> Result<(PromptContext, String, 
 ///
 /// For plain numbers, auto-detects the repository from the current directory.
 /// For URLs, extracts components directly.
-async fn parse_pr_arg(pr_str: &str) -> Result<(String, String, u64)> {
+async fn parse_pr_arg(pr_str: &str) -> Result<(String, String, String, u64)> {
+    let github_hosts = crate::config::load_github_hosts();
+
     if let Ok(num) = pr_str.parse::<u64>() {
         // Auto-detect repository from current directory
         git::detect_git_repo()
             .await
             .context("Failed to detect git repository")?;
 
-        let remote_url = git::get_github_remote()
+        let remote_url = git::get_github_remote(&github_hosts)
             .await
             .context("Failed to get GitHub remote")?;
 
-        let (owner, repo) =
-            git::parse_github_remote(&remote_url).context("Failed to parse GitHub remote URL")?;
+        let (host, owner, repo) = git::parse_github_remote(&remote_url, &github_hosts)
+            .context("Failed to parse GitHub remote URL")?;
 
-        return Ok((owner, repo, num));
+        return Ok((owner, repo, host, num));
     }
 
-    if let Some(parsed) = parse_github_url(pr_str) {
+    if let Some(parsed) = parse_github_url(pr_str, &github_hosts) {
         if parsed.resource_type == GitHubResourceType::Pull {
-            return Ok((parsed.owner, parsed.repo, parsed.number as u64));
+            return Ok((parsed.owner, parsed.repo, parsed.host, parsed.number as u64));
         }
         anyhow::bail!(
             "Expected a GitHub pull request URL, but got an issue URL.\n\
@@ -130,8 +133,8 @@ async fn parse_pr_arg(pr_str: &str) -> Result<(String, String, u64)> {
 
 /// Fetches PR data from GitHub and populates a PromptContext.
 /// Returns (context, owner, repo, branch_name).
-async fn fetch_pr_context(pr_str: &str) -> Result<(PromptContext, String, String, String)> {
-    let (owner, repo, pr_number) = parse_pr_arg(pr_str).await?;
+async fn fetch_pr_context(pr_str: &str) -> Result<(PromptContext, String, String, String, String)> {
+    let (owner, repo, host, pr_number) = parse_pr_arg(pr_str).await?;
 
     println!("🔗 Fetching PR #{} from {}/{}...", pr_number, owner, repo);
 
@@ -155,7 +158,7 @@ async fn fetch_pr_context(pr_str: &str) -> Result<(PromptContext, String, String
                     "Failed to fetch PR via API: {}. Falling back to gh CLI...",
                     e
                 );
-                let info = crate::github::get_pr_via_cli(&owner, &repo, pr_number)
+                let info = crate::github::get_pr_via_cli(&owner, &repo, &host, pr_number)
                     .await
                     .context("Failed to fetch PR via gh CLI")?;
                 context.pr_title = Some(info.title);
@@ -164,7 +167,7 @@ async fn fetch_pr_context(pr_str: &str) -> Result<(PromptContext, String, String
             }
         }
     } else {
-        let info = crate::github::get_pr_via_cli(&owner, &repo, pr_number)
+        let info = crate::github::get_pr_via_cli(&owner, &repo, &host, pr_number)
             .await
             .context(
                 "Failed to fetch PR. Ensure gh is installed and authenticated, \
@@ -181,18 +184,23 @@ async fn fetch_pr_context(pr_str: &str) -> Result<(PromptContext, String, String
         context.pr_title.as_deref().unwrap_or("(no title)")
     );
 
-    Ok((context, owner, repo, branch_name))
+    Ok((context, owner, repo, host, branch_name))
 }
 
 /// Sets up a worktree for a PR by finding an existing one for the branch, or falling back to CWD
-async fn setup_pr_worktree(owner: &str, repo: &str, branch_name: &str) -> Result<Option<PathBuf>> {
+async fn setup_pr_worktree(
+    owner: &str,
+    repo: &str,
+    host: &str,
+    branch_name: &str,
+) -> Result<Option<PathBuf>> {
     let workspace = workspace::Workspace::new().context("Failed to initialize Gru workspace")?;
 
     let bare_path = workspace.repos().join(owner).join(format!("{}.git", repo));
 
     // Only look for existing worktrees if the bare repo exists
     if bare_path.exists() {
-        let git_repo = git::GitRepo::new(owner, repo, bare_path);
+        let git_repo = git::GitRepo::new(owner, repo, host, bare_path);
         if let Some(existing_path) = git_repo
             .find_worktree_for_branch(branch_name)
             .await
@@ -213,6 +221,7 @@ async fn setup_pr_worktree(owner: &str, repo: &str, branch_name: &str) -> Result
 async fn setup_issue_worktree(
     owner: &str,
     repo: &str,
+    host: &str,
     issue_number: u64,
     minion_id: &str,
 ) -> Result<(PathBuf, String)> {
@@ -220,7 +229,7 @@ async fn setup_issue_worktree(
 
     // Create bare repository path
     let bare_path = workspace.repos().join(owner).join(format!("{}.git", repo));
-    let git_repo = git::GitRepo::new(owner, repo, bare_path);
+    let git_repo = git::GitRepo::new(owner, repo, host, bare_path);
 
     println!("📦 Ensuring repository is cloned...");
     git_repo
@@ -486,9 +495,11 @@ pub async fn handle_prompt(prompt: &str, opts: PromptOptions) -> Result<i32> {
     let mut context = PromptContext::new();
     let mut context_owner: Option<String> = None;
     let mut context_repo: Option<String> = None;
+    let mut context_host: Option<String> = None;
     let mut issue_number_val: Option<u64> = None;
     let mut pr_owner: Option<String> = None;
     let mut pr_repo: Option<String> = None;
+    let mut pr_host: Option<String> = None;
     let mut pr_branch: Option<String> = None;
 
     if let Some(ref issue_str) = issue_opt {
@@ -496,11 +507,12 @@ pub async fn handle_prompt(prompt: &str, opts: PromptOptions) -> Result<i32> {
         context = issue_ctx;
         context_owner = Some(owner);
         context_repo = Some(repo);
+        context_host = Some("github.com".to_string()); // default; issue context doesn't return host yet
         issue_number_val = Some(issue_num);
     }
 
     if let Some(ref pr_str) = pr_opt {
-        let (pr_ctx, owner, repo, branch) = fetch_pr_context(pr_str).await?;
+        let (pr_ctx, owner, repo, host, branch) = fetch_pr_context(pr_str).await?;
         // Merge PR context into existing context (issue fields are preserved)
         context.pr_number = pr_ctx.pr_number;
         context.pr_title = pr_ctx.pr_title;
@@ -508,6 +520,7 @@ pub async fn handle_prompt(prompt: &str, opts: PromptOptions) -> Result<i32> {
         // Track PR's repo separately for worktree lookup
         pr_owner = Some(owner.clone());
         pr_repo = Some(repo.clone());
+        pr_host = Some(host.clone());
         // Set repo info from PR if not already set by --issue
         if context_owner.is_none() {
             context_owner = Some(owner);
@@ -569,7 +582,9 @@ pub async fn handle_prompt(prompt: &str, opts: PromptOptions) -> Result<i32> {
         let repo = context_repo.as_deref().unwrap();
         let issue_num = issue_number_val.unwrap();
 
-        let (wt_path, branch) = setup_issue_worktree(owner, repo, issue_num, &minion_id).await?;
+        let host = context_host.as_deref().unwrap_or("github.com");
+        let (wt_path, branch) =
+            setup_issue_worktree(owner, repo, host, issue_num, &minion_id).await?;
         context.worktree_path = Some(wt_path.clone());
         context.branch_name = Some(branch.clone());
         let run_dir = wt_path.clone();
@@ -581,7 +596,8 @@ pub async fn handle_prompt(prompt: &str, opts: PromptOptions) -> Result<i32> {
         let repo = pr_repo.as_deref().unwrap();
         let branch = pr_branch.as_deref().unwrap();
 
-        if let Some(wt_path) = setup_pr_worktree(owner, repo, branch).await? {
+        let host = pr_host.as_deref().unwrap_or("github.com");
+        if let Some(wt_path) = setup_pr_worktree(owner, repo, host, branch).await? {
             context.worktree_path = Some(wt_path.clone());
             context.branch_name = Some(branch.to_string());
             let run_dir = wt_path.clone();
@@ -913,7 +929,8 @@ mod tests {
             .unwrap();
         assert_eq!(result.0, "fotoetienne");
         assert_eq!(result.1, "gru");
-        assert_eq!(result.2, 42);
+        assert_eq!(result.2, "github.com");
+        assert_eq!(result.3, 42);
     }
 
     #[tokio::test]
@@ -923,7 +940,8 @@ mod tests {
             .unwrap();
         assert_eq!(result.0, "owner");
         assert_eq!(result.1, "repo");
-        assert_eq!(result.2, 123);
+        assert_eq!(result.2, "github.com");
+        assert_eq!(result.3, 123);
     }
 
     #[tokio::test]
