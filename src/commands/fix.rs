@@ -498,7 +498,7 @@ async fn trigger_pr_review(
 async fn try_mark_issue_blocked(client: &GitHubClient, owner: &str, repo: &str, issue_num: u64) {
     match client.mark_issue_blocked(owner, repo, issue_num).await {
         Ok(()) => {
-            println!("🏷️  Updated issue label to 'minion:blocked'");
+            println!("🏷️  Updated issue label to '{}'", crate::labels::BLOCKED);
         }
         Err(e) => {
             log::warn!("⚠️  Failed to update issue label: {}", e);
@@ -705,7 +705,11 @@ async fn check_existing_minions(
 async fn claim_issue(client: &GitHubClient, owner: &str, repo: &str, issue_num: u64) {
     match client.claim_issue(owner, repo, issue_num).await {
         Ok(true) => {
-            println!("🏷️  Added 'in-progress' label to issue #{}", issue_num);
+            println!(
+                "🏷️  Added '{}' label to issue #{}",
+                crate::labels::IN_PROGRESS,
+                issue_num
+            );
         }
         Ok(false) => {
             log::warn!(
@@ -1197,7 +1201,7 @@ pub(crate) async fn handle_pr_creation(
                     .await
                 {
                     Ok(()) => {
-                        println!("🏷️  Updated issue label to 'minion:done'");
+                        println!("🏷️  Updated issue label to '{}'", crate::labels::DONE);
                     }
                     Err(e) => {
                         log::warn!("⚠️  Failed to update issue label: {}", e);
@@ -1246,10 +1250,14 @@ async fn monitor_pr_lifecycle(
     review_timeout: Option<Duration>,
     monitor_timeout: Duration,
 ) {
-    // Ensure the ready-to-merge label exists in the repo
+    // Ensure the gru:ready-to-merge label exists in the repo
     if let Err(e) = pr_monitor::ensure_ready_to_merge_label(&issue_ctx.owner, &issue_ctx.repo).await
     {
-        log::warn!("⚠️  Failed to ensure ready-to-merge label: {}", e);
+        log::warn!(
+            "⚠️  Failed to ensure {} label: {}",
+            crate::labels::READY_TO_MERGE,
+            e
+        );
     }
 
     // Auto-trigger review for Minion-created PRs
@@ -1888,7 +1896,7 @@ pub async fn handle_fix(issue: &str, opts: FixOptions) -> Result<i32> {
                     .await
                 {
                     Ok(()) => {
-                        println!("🏷️  Updated issue label to 'minion:failed'");
+                        println!("🏷️  Updated issue label to '{}'", crate::labels::FAILED);
                     }
                     Err(e) => {
                         log::warn!("⚠️  Failed to update issue label: {}", e);

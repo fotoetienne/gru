@@ -134,7 +134,7 @@ fn build_no_repo_prompt() -> String {
      - Gru spawns \"Minions\" — autonomous Claude Code sessions that work on GitHub issues\n\
      - Each Minion works in an isolated git worktree\n\
      - Minions claim issues, implement fixes, create PRs, and respond to reviews\n\
-     - GitHub labels drive the workflow: `ready-for-minion` → `in-progress` → `minion:done`\n\
+     - GitHub labels drive the workflow: `gru:todo` → `gru:in-progress` → `gru:done`\n\
      \n\
      Be friendly and helpful. This may be their first time using Gru."
         .to_string()

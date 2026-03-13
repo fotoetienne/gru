@@ -9,6 +9,7 @@ mod commands;
 mod config;
 mod git;
 mod github;
+pub(crate) mod labels;
 mod merge_judge;
 mod merge_readiness;
 mod minion;

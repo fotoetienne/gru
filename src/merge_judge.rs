@@ -17,6 +17,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::process::Command as TokioCommand;
 
 use crate::github::gh_command_for_repo;
+use crate::labels;
 
 /// Default confidence threshold (1-10). Only merge when confidence >= this.
 pub const DEFAULT_CONFIDENCE_THRESHOLD: u8 = 8;
@@ -28,7 +29,7 @@ const MAX_CONSECUTIVE_WAITS: u32 = 3;
 const MAX_WAIT_MINUTES: u64 = 120;
 
 /// Label applied when the judge escalates for human review.
-const NEEDS_HUMAN_REVIEW_LABEL: &str = "gru:needs-human-review";
+const NEEDS_HUMAN_REVIEW_LABEL: &str = labels::NEEDS_HUMAN_REVIEW;
 
 /// Action the judge can take.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -680,10 +681,14 @@ pub async fn add_needs_human_review_label(owner: &str, repo: &str, pr_number: &s
 
 /// Ensure the `gru:needs-human-review` label exists in the repository.
 pub async fn ensure_needs_human_review_label(owner: &str, repo: &str) -> Result<()> {
+    let (color, description) = labels::get_label_info(NEEDS_HUMAN_REVIEW_LABEL)
+        .expect("NEEDS_HUMAN_REVIEW must be in ALL_LABELS");
     let repo_full = format!("{owner}/{repo}");
     let gh_cmd = gh_command_for_repo(&repo_full);
     let endpoint = format!("repos/{repo_full}/labels");
     let name_field = format!("name={NEEDS_HUMAN_REVIEW_LABEL}");
+    let color_field = format!("color={color}");
+    let desc_field = format!("description={description}");
 
     let output = TokioCommand::new(gh_cmd)
         .args([
@@ -694,9 +699,9 @@ pub async fn ensure_needs_human_review_label(owner: &str, repo: &str) -> Result<
             "-f",
             &name_field,
             "-f",
-            "color=d93f0b",
+            &color_field,
             "-f",
-            "description=Gru merge judge needs human review before merging",
+            &desc_field,
         ])
         .output()
         .await?;
@@ -705,7 +710,8 @@ pub async fn ensure_needs_human_review_label(owner: &str, repo: &str) -> Result<
         let stderr = String::from_utf8_lossy(&output.stderr);
         if !stderr.contains("already_exists") {
             log::warn!(
-                "Failed to create gru:needs-human-review label: {}",
+                "Failed to create {} label: {}",
+                NEEDS_HUMAN_REVIEW_LABEL,
                 stderr.trim()
             );
         }
@@ -749,7 +755,9 @@ pub async fn has_needs_human_review_label(
 
     let labels: Vec<Label> =
         serde_json::from_slice(&output.stdout).context("Failed to parse labels JSON")?;
-    Ok(labels.iter().any(|l| l.name == NEEDS_HUMAN_REVIEW_LABEL))
+    Ok(labels
+        .iter()
+        .any(|l| labels::matches_label(&l.name, NEEDS_HUMAN_REVIEW_LABEL)))
 }
 
 /// Post an escalation comment explaining why the judge escalated.

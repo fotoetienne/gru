@@ -1,4 +1,5 @@
 use crate::github;
+use crate::labels;
 use crate::merge_readiness;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -181,14 +182,18 @@ fn is_failed_check(check_run: &CheckRun) -> bool {
     )
 }
 
-const READY_TO_MERGE_LABEL: &str = "ready-to-merge";
-const AUTO_MERGE_LABEL: &str = "gru:auto-merge";
+const READY_TO_MERGE_LABEL: &str = labels::READY_TO_MERGE;
+const AUTO_MERGE_LABEL: &str = labels::AUTO_MERGE;
 
-/// Ensure the `ready-to-merge` label exists in the repository, creating it if needed.
+/// Ensure the `gru:ready-to-merge` label exists in the repository, creating it if needed.
 pub async fn ensure_ready_to_merge_label(owner: &str, repo: &str) -> Result<()> {
+    let (color, description) =
+        labels::get_label_info(READY_TO_MERGE_LABEL).expect("READY_TO_MERGE must be in ALL_LABELS");
     let repo_full = format!("{owner}/{repo}");
     let endpoint = format!("repos/{repo_full}/labels");
     let name_field = format!("name={READY_TO_MERGE_LABEL}");
+    let color_field = format!("color={color}");
+    let desc_field = format!("description={description}");
 
     let output = gh_api_with_retry(
         &repo_full,
@@ -200,9 +205,9 @@ pub async fn ensure_ready_to_merge_label(owner: &str, repo: &str) -> Result<()> 
             "-f",
             &name_field,
             "-f",
-            "color=0e8a16",
+            &color_field,
             "-f",
-            "description=All merge-readiness checks pass",
+            &desc_field,
         ],
         DEFAULT_MAX_RETRIES,
     )
@@ -212,7 +217,11 @@ pub async fn ensure_ready_to_merge_label(owner: &str, repo: &str) -> Result<()> 
         let stderr = String::from_utf8_lossy(&output.stderr);
         // 422 means label already exists - that's fine (idempotent)
         if !stderr.contains("already_exists") {
-            log::warn!("Failed to create ready-to-merge label: {}", stderr.trim());
+            log::warn!(
+                "Failed to create {} label: {}",
+                READY_TO_MERGE_LABEL,
+                stderr.trim()
+            );
         }
     }
 
@@ -235,9 +244,11 @@ async fn has_label(owner: &str, repo: &str, pr_number: &str, label_name: &str) -
         name: String,
     }
 
-    let labels: Vec<Label> =
+    let fetched_labels: Vec<Label> =
         serde_json::from_slice(&output.stdout).context("Failed to parse labels JSON")?;
-    Ok(labels.iter().any(|l| l.name == label_name))
+    Ok(fetched_labels
+        .iter()
+        .any(|l| labels::matches_label(&l.name, label_name)))
 }
 
 /// Check if a PR currently has the `ready-to-merge` label.
@@ -252,9 +263,13 @@ async fn has_auto_merge_label(owner: &str, repo: &str, pr_number: &str) -> Resul
 
 /// Ensure the `gru:auto-merge` label exists in the repository, creating it if needed.
 pub async fn ensure_auto_merge_label(owner: &str, repo: &str) -> Result<()> {
+    let (color, description) =
+        labels::get_label_info(AUTO_MERGE_LABEL).expect("AUTO_MERGE must be in ALL_LABELS");
     let repo_full = format!("{owner}/{repo}");
     let endpoint = format!("repos/{repo_full}/labels");
     let name_field = format!("name={AUTO_MERGE_LABEL}");
+    let color_field = format!("color={color}");
+    let desc_field = format!("description={description}");
 
     let output = gh_api_with_retry(
         &repo_full,
@@ -266,9 +281,9 @@ pub async fn ensure_auto_merge_label(owner: &str, repo: &str) -> Result<()> {
             "-f",
             &name_field,
             "-f",
-            "color=5319e7",
+            &color_field,
             "-f",
-            "description=Gru will auto-merge this PR when all checks pass",
+            &desc_field,
         ],
         DEFAULT_MAX_RETRIES,
     )
@@ -278,7 +293,11 @@ pub async fn ensure_auto_merge_label(owner: &str, repo: &str) -> Result<()> {
         let stderr = String::from_utf8_lossy(&output.stderr);
         // 422 means label already exists - that's fine (idempotent)
         if !stderr.contains("already_exists") {
-            log::warn!("Failed to create gru:auto-merge label: {}", stderr.trim());
+            log::warn!(
+                "Failed to create {} label: {}",
+                AUTO_MERGE_LABEL,
+                stderr.trim()
+            );
         }
     }
 
@@ -315,7 +334,7 @@ pub async fn add_auto_merge_label(owner: &str, repo: &str, pr_number: &str) -> R
     Ok(())
 }
 
-/// Add the `ready-to-merge` label to a PR.
+/// Add the `gru:ready-to-merge` label to a PR.
 async fn add_ready_to_merge_label(owner: &str, repo: &str, pr_number: &str) -> Result<()> {
     let repo_full = format!("{owner}/{repo}");
     let endpoint = format!("repos/{repo_full}/issues/{pr_number}/labels");
@@ -345,10 +364,13 @@ async fn add_ready_to_merge_label(owner: &str, repo: &str, pr_number: &str) -> R
     Ok(())
 }
 
-/// Remove the `ready-to-merge` label from a PR.
+/// Remove the `gru:ready-to-merge` label from a PR.
+/// Also removes the old `ready-to-merge` label if present.
 async fn remove_ready_to_merge_label(owner: &str, repo: &str, pr_number: &str) -> Result<()> {
     let repo_full = format!("{owner}/{repo}");
-    let label_encoded = READY_TO_MERGE_LABEL; // No special chars to encode
+
+    // Remove new label (URL-encode the colon)
+    let label_encoded = READY_TO_MERGE_LABEL.replace(':', "%3A");
     let endpoint = format!("repos/{repo_full}/issues/{pr_number}/labels/{label_encoded}");
     let output = gh_api_with_retry(
         &repo_full,
@@ -359,15 +381,24 @@ async fn remove_ready_to_merge_label(owner: &str, repo: &str, pr_number: &str) -
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        // 404 means label wasn't present - that's fine (idempotent)
         if !stderr.contains("404") && !stderr.contains("Not Found") {
             anyhow::bail!(
-                "Failed to remove ready-to-merge label from PR #{}: {}",
+                "Failed to remove {} label from PR #{}: {}",
+                READY_TO_MERGE_LABEL,
                 pr_number,
                 stderr
             );
         }
     }
+
+    // Also remove old label name if present (ignore errors)
+    let old_endpoint = format!("repos/{repo_full}/issues/{pr_number}/labels/ready-to-merge");
+    let _ = gh_api_with_retry(
+        &repo_full,
+        &["api", &old_endpoint, "-X", "DELETE"],
+        DEFAULT_MAX_RETRIES,
+    )
+    .await;
 
     Ok(())
 }

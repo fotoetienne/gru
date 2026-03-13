@@ -1,5 +1,6 @@
 use crate::config::LabConfig;
 use crate::github::{list_ready_issues_via_cli, GitHubClient};
+use crate::labels;
 use crate::minion_registry::{is_process_alive, with_registry};
 use anyhow::{Context, Result};
 use std::path::PathBuf;
@@ -288,7 +289,7 @@ async fn poll_and_spawn(config: &LabConfig, children: &mut Vec<Child>) -> Result
                             );
                             // Unclaim the issue since we failed to spawn
                             if let Err(e) = client
-                                .remove_label(owner, repo, issue_number, "in-progress")
+                                .remove_label(owner, repo, issue_number, labels::IN_PROGRESS)
                                 .await
                             {
                                 log::warn!("⚠️  Failed to remove in-progress label: {}", e);
@@ -426,20 +427,34 @@ async fn spawn_minion(repo: &str, issue_number: u64) -> Result<Child> {
 
 /// Fallback issue listing using octocrab API with client-side filtering.
 /// Used when the gh CLI is unavailable. Cannot filter GitHub-native blocked state
-/// (no API equivalent of `-is:blocked`), but does filter out `minion:blocked` and
-/// `in-progress` labels.
+/// (no API equivalent of `-is:blocked`), but does filter out `gru:blocked` and
+/// `gru:in-progress` labels (accepting both old and new names).
+///
+/// If the configured label has a counterpart (old↔new), both are queried so that
+/// repos in any migration state are covered.
 async fn fallback_list_issues(owner: &str, repo: &str, label: &str) -> Result<Vec<u64>> {
     let client = GitHubClient::from_env(owner, repo).await?;
-    let issues = client.list_issues_with_label(owner, repo, label).await?;
+    let mut issues = client.list_issues_with_label(owner, repo, label).await?;
 
-    let blocked_labels = ["minion:blocked", "in-progress"];
+    // Also fetch issues under the counterpart label name (old↔new) for backward compat
+    if let Some(alt_label) = labels::counterpart_label(label) {
+        if let Ok(alt_issues) = client.list_issues_with_label(owner, repo, alt_label).await {
+            let existing: std::collections::HashSet<u64> =
+                issues.iter().map(|i| i.number).collect();
+            for issue in alt_issues {
+                if !existing.contains(&issue.number) {
+                    issues.push(issue);
+                }
+            }
+        }
+    }
+
     let filtered: Vec<u64> = issues
         .into_iter()
         .filter(|issue| {
-            !issue
-                .labels
-                .iter()
-                .any(|l| blocked_labels.contains(&l.name.as_str()))
+            let label_names: Vec<String> = issue.labels.iter().map(|l| l.name.clone()).collect();
+            !labels::has_label(&label_names, labels::BLOCKED)
+                && !labels::has_label(&label_names, labels::IN_PROGRESS)
         })
         .map(|issue| issue.number)
         .collect();

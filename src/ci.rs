@@ -1,4 +1,5 @@
 use crate::github;
+use crate::labels;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -606,7 +607,7 @@ pub async fn post_escalation_comment(
         }
     }
 
-    body.push_str("\n**Labels:** `minion:blocked`\n");
+    body.push_str(&format!("\n**Labels:** `{}`\n", labels::BLOCKED));
 
     let gh_cmd = github::gh_command_for_repo(&repo_full);
     let output = Command::new(gh_cmd)
@@ -639,7 +640,7 @@ pub async fn post_escalation_comment(
             "--repo",
             &repo_full,
             "--add-label",
-            "minion:blocked",
+            labels::BLOCKED,
         ])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
