@@ -191,21 +191,30 @@ impl LabConfig {
 
     /// Write the default config file to the given path if it doesn't exist.
     /// Returns Ok(true) if the file was created, Ok(false) if it already existed.
+    /// Uses create_new to atomically check existence and create in one operation.
     pub fn write_default_config(path: &Path) -> Result<bool> {
-        if path.exists() {
-            return Ok(false);
-        }
+        use std::io::Write;
 
-        // Ensure parent directory exists
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)
                 .with_context(|| format!("Failed to create directory: {}", parent.display()))?;
         }
 
-        fs::write(path, Self::default_config_toml())
-            .with_context(|| format!("Failed to write config file: {}", path.display()))?;
-
-        Ok(true)
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+        {
+            Ok(mut file) => {
+                file.write_all(Self::default_config_toml().as_bytes())
+                    .with_context(|| format!("Failed to write config file: {}", path.display()))?;
+                Ok(true)
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+            Err(e) => {
+                Err(e).with_context(|| format!("Failed to create config file: {}", path.display()))
+            }
+        }
     }
 
     /// Load configuration from file (validates daemon config — use for `gru lab`).
