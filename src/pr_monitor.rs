@@ -1,4 +1,5 @@
 use crate::github;
+use crate::merge_readiness;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
@@ -124,7 +125,6 @@ async fn gh_api_with_retry(repo: &str, args: &[&str], max_retries: u32) -> Resul
 struct PullRequest {
     state: String,
     merged: bool,
-    draft: Option<bool>,
     head: Head,
     /// GitHub's mergeable field: true, false, or null (still computing).
     mergeable: Option<bool>,
@@ -138,10 +138,8 @@ struct Head {
 #[derive(Debug, Deserialize)]
 struct Review {
     id: u64,
-    state: Option<String>,
     submitted_at: DateTime<Utc>,
     #[allow(dead_code)]
-    // Available for future use; currently only id and submitted_at are accessed
     user: User,
 }
 
@@ -169,7 +167,6 @@ struct ApiReviewComment {
 
 #[derive(Debug, Deserialize)]
 struct CheckRun {
-    status: Option<String>,
     conclusion: Option<String>,
 }
 
@@ -184,82 +181,8 @@ fn is_failed_check(check_run: &CheckRun) -> bool {
     )
 }
 
-/// Check if a CI check run is still in progress (not yet completed).
-///
-/// A check is pending when it has no conclusion yet. The `status` field is used
-/// as a secondary signal but only when `conclusion` is `None`, to avoid marking
-/// a completed-but-failed check as pending.
-fn is_pending_check(check_run: &CheckRun) -> bool {
-    check_run.conclusion.is_none()
-        && matches!(
-            check_run.status.as_deref(),
-            None | Some("queued") | Some("in_progress")
-        )
-}
-
-/// Result of a merge-readiness evaluation.
-#[derive(Debug, Clone)]
-pub struct MergeReadiness {
-    pub ready: bool,
-    pub reasons: Vec<String>,
-}
-
-/// Evaluate whether a PR is ready to merge based on CI checks, reviews, and draft status.
-fn evaluate_merge_readiness(
-    pr: &PullRequest,
-    check_runs: &[CheckRun],
-    reviews: &[Review],
-) -> MergeReadiness {
-    let mut reasons = Vec::new();
-
-    // Check draft status
-    if pr.draft.unwrap_or(false) {
-        reasons.push("PR is still a draft".to_string());
-    }
-
-    // Check CI: must have at least one check, none failed, none pending
-    if check_runs.is_empty() {
-        reasons.push("No CI checks found".to_string());
-    } else {
-        let failed = check_runs.iter().filter(|c| is_failed_check(c)).count();
-        let pending = check_runs.iter().filter(|c| is_pending_check(c)).count();
-
-        if failed > 0 {
-            reasons.push(format!("{} CI check(s) failed", failed));
-        }
-        if pending > 0 {
-            reasons.push(format!("{} CI check(s) still pending", pending));
-        }
-    }
-
-    // Check reviews: need at least one APPROVED review.
-    // Use only the latest review per reviewer to handle superseded reviews
-    // (e.g., reviewer approves, then later requests changes).
-    let mut latest_by_reviewer: std::collections::HashMap<&str, &Review> =
-        std::collections::HashMap::new();
-    for review in reviews {
-        let login = review.user.login.as_str();
-        if latest_by_reviewer
-            .get(login)
-            .map_or(true, |prev| review.submitted_at > prev.submitted_at)
-        {
-            latest_by_reviewer.insert(login, review);
-        }
-    }
-    let has_approval = latest_by_reviewer
-        .values()
-        .any(|r| r.state.as_deref() == Some("APPROVED"));
-    if !has_approval {
-        reasons.push("No approving review".to_string());
-    }
-
-    MergeReadiness {
-        ready: reasons.is_empty(),
-        reasons,
-    }
-}
-
 const READY_TO_MERGE_LABEL: &str = "ready-to-merge";
+const AUTO_MERGE_LABEL: &str = "gru:auto-merge";
 
 /// Ensure the `ready-to-merge` label exists in the repository, creating it if needed.
 pub async fn ensure_ready_to_merge_label(owner: &str, repo: &str) -> Result<()> {
@@ -296,8 +219,8 @@ pub async fn ensure_ready_to_merge_label(owner: &str, repo: &str) -> Result<()> 
     Ok(())
 }
 
-/// Check if a PR currently has the `ready-to-merge` label.
-async fn has_ready_to_merge_label(owner: &str, repo: &str, pr_number: &str) -> Result<bool> {
+/// Check if a PR currently has a specific label.
+async fn has_label(owner: &str, repo: &str, pr_number: &str, label_name: &str) -> Result<bool> {
     let repo_full = format!("{owner}/{repo}");
     let endpoint = format!("repos/{repo_full}/issues/{pr_number}/labels");
     let output = gh_api_with_retry(&repo_full, &["api", &endpoint], DEFAULT_MAX_RETRIES).await?;
@@ -314,7 +237,82 @@ async fn has_ready_to_merge_label(owner: &str, repo: &str, pr_number: &str) -> R
 
     let labels: Vec<Label> =
         serde_json::from_slice(&output.stdout).context("Failed to parse labels JSON")?;
-    Ok(labels.iter().any(|l| l.name == READY_TO_MERGE_LABEL))
+    Ok(labels.iter().any(|l| l.name == label_name))
+}
+
+/// Check if a PR currently has the `ready-to-merge` label.
+async fn has_ready_to_merge_label(owner: &str, repo: &str, pr_number: &str) -> Result<bool> {
+    has_label(owner, repo, pr_number, READY_TO_MERGE_LABEL).await
+}
+
+/// Check if a PR currently has the `gru:auto-merge` label.
+async fn has_auto_merge_label(owner: &str, repo: &str, pr_number: &str) -> Result<bool> {
+    has_label(owner, repo, pr_number, AUTO_MERGE_LABEL).await
+}
+
+/// Ensure the `gru:auto-merge` label exists in the repository, creating it if needed.
+pub async fn ensure_auto_merge_label(owner: &str, repo: &str) -> Result<()> {
+    let repo_full = format!("{owner}/{repo}");
+    let endpoint = format!("repos/{repo_full}/labels");
+    let name_field = format!("name={AUTO_MERGE_LABEL}");
+
+    let output = gh_api_with_retry(
+        &repo_full,
+        &[
+            "api",
+            &endpoint,
+            "-X",
+            "POST",
+            "-f",
+            &name_field,
+            "-f",
+            "color=5319e7",
+            "-f",
+            "description=Gru will auto-merge this PR when all checks pass",
+        ],
+        DEFAULT_MAX_RETRIES,
+    )
+    .await?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        // 422 means label already exists - that's fine (idempotent)
+        if !stderr.contains("already_exists") {
+            log::warn!("Failed to create gru:auto-merge label: {}", stderr.trim());
+        }
+    }
+
+    Ok(())
+}
+
+/// Add the `gru:auto-merge` label to a PR.
+pub async fn add_auto_merge_label(owner: &str, repo: &str, pr_number: &str) -> Result<()> {
+    let repo_full = format!("{owner}/{repo}");
+    let gh_cmd = github::gh_command_for_repo(&repo_full);
+    let output = tokio::process::Command::new(gh_cmd)
+        .args([
+            "pr",
+            "edit",
+            pr_number,
+            "--add-label",
+            AUTO_MERGE_LABEL,
+            "-R",
+            &repo_full,
+        ])
+        .output()
+        .await
+        .context("Failed to add gru:auto-merge label")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!(
+            "Failed to add gru:auto-merge label to PR #{}: {}",
+            pr_number,
+            stderr
+        );
+    }
+
+    Ok(())
 }
 
 /// Add the `ready-to-merge` label to a PR.
@@ -374,30 +372,37 @@ async fn remove_ready_to_merge_label(owner: &str, repo: &str, pr_number: &str) -
     Ok(())
 }
 
-/// Check merge readiness and update the `ready-to-merge` label accordingly.
+/// Check merge readiness using the unified module and update the `ready-to-merge` label.
 ///
 /// Tracks transitions: adds label when becoming ready, removes when regressing.
-/// Returns the current readiness state for the caller to track.
+/// Returns `Some(readiness)` if all readiness checks pass, or `None` if not ready
+/// or if the readiness check failed. The `was_ready` bool is updated in place.
 async fn update_readiness_label(
     owner: &str,
     repo: &str,
     pr_number: &str,
-    pr: &PullRequest,
-    check_runs: &[CheckRun],
-    reviews: &[Review],
-    was_ready: bool,
-) -> bool {
-    let readiness = evaluate_merge_readiness(pr, check_runs, reviews);
+    pr_number_u64: u64,
+    was_ready: &mut bool,
+) -> Option<merge_readiness::MergeReadiness> {
+    let readiness = match merge_readiness::check_merge_readiness(owner, repo, pr_number_u64).await {
+        Ok(r) => r,
+        Err(e) => {
+            log::warn!("Failed to check merge readiness: {}", e);
+            return None;
+        }
+    };
 
-    if readiness.ready && !was_ready {
+    let is_ready = readiness.is_ready();
+
+    if is_ready && !*was_ready {
         // Transition: not ready → ready
         match add_ready_to_merge_label(owner, repo, pr_number).await {
             Ok(()) => println!("✅ PR #{} is ready to merge", pr_number),
             Err(e) => log::warn!("Failed to add ready-to-merge label: {}", e),
         }
-    } else if !readiness.ready && was_ready {
+    } else if !is_ready && *was_ready {
         // Transition: ready → not ready
-        let reason = readiness.reasons.join(", ");
+        let reason = readiness.failure_reasons().join(", ");
         match remove_ready_to_merge_label(owner, repo, pr_number).await {
             Ok(()) => println!(
                 "⚠️  PR #{} is no longer ready to merge ({})",
@@ -407,7 +412,13 @@ async fn update_readiness_label(
         }
     }
 
-    readiness.ready
+    *was_ready = is_ready;
+
+    if is_ready {
+        Some(readiness)
+    } else {
+        None
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -541,17 +552,38 @@ async fn poll_once(
         return Ok(Some(MonitorResult::FailedChecks(failed_checks)));
     }
 
-    // Check merge readiness and update label on transitions.
-    *was_ready = update_readiness_label(
-        owner,
-        repo,
-        pr_number,
-        &pr,
-        &check_runs,
-        &all_reviews,
-        *was_ready,
-    )
-    .await;
+    // Check merge readiness (via unified module) and update label on transitions.
+    let pr_number_u64: u64 = match pr_number.parse() {
+        Ok(n) => n,
+        Err(_) => {
+            log::warn!(
+                "Could not parse PR number '{}', skipping readiness check",
+                pr_number
+            );
+            *last_check_time = Utc::now();
+            return Ok(None);
+        }
+    };
+    if update_readiness_label(owner, repo, pr_number, pr_number_u64, was_ready)
+        .await
+        .is_some()
+    {
+        // PR is ready — check if gru:auto-merge label is present
+        match has_auto_merge_label(owner, repo, pr_number).await {
+            Ok(true) => {
+                *last_check_time = Utc::now();
+                return Ok(Some(MonitorResult::ReadyToMerge));
+            }
+            Ok(false) => {}
+            Err(e) => {
+                log::warn!(
+                    "Failed to check gru:auto-merge label on PR #{}: {}",
+                    pr_number,
+                    e
+                );
+            }
+        }
+    }
 
     // Update last check time
     *last_check_time = Utc::now();
@@ -571,6 +603,8 @@ pub enum MonitorResult {
     FailedChecks(usize),
     /// PR has merge conflicts (mergeable: false)
     MergeConflict,
+    /// All readiness checks pass and `gru:auto-merge` label is present
+    ReadyToMerge,
     /// Monitoring timed out after the configured duration
     Timeout,
     /// Monitoring was interrupted by the user (e.g., Ctrl+C)
@@ -1154,7 +1188,6 @@ mod tests {
     /// Helper to create a CheckRun with only a conclusion (status defaults to None)
     fn make_check(conclusion: Option<&str>) -> CheckRun {
         CheckRun {
-            status: None,
             conclusion: conclusion.map(|s| s.to_string()),
         }
     }
@@ -1245,7 +1278,6 @@ mod tests {
     fn make_review(id: u64, timestamp: &str) -> Review {
         Review {
             id,
-            state: None,
             submitted_at: timestamp.parse().unwrap(),
             user: User {
                 login: "reviewer".to_string(),
@@ -1515,269 +1547,5 @@ mod tests {
         assert_eq!(pr.mergeable, None);
     }
 
-    // ========================================================================
-    // Merge Readiness Tests
-    // ========================================================================
-
-    fn make_pr(draft: bool) -> PullRequest {
-        PullRequest {
-            state: "open".to_string(),
-            merged: false,
-            draft: Some(draft),
-            head: Head {
-                sha: "abc123".to_string(),
-            },
-            mergeable: Some(true),
-        }
-    }
-
-    fn make_approved_review(id: u64) -> Review {
-        Review {
-            id,
-            state: Some("APPROVED".to_string()),
-            submitted_at: "2024-06-15T10:00:00Z".parse().unwrap(),
-            user: User {
-                login: "reviewer".to_string(),
-            },
-        }
-    }
-
-    fn make_changes_requested_review(id: u64) -> Review {
-        Review {
-            id,
-            state: Some("CHANGES_REQUESTED".to_string()),
-            submitted_at: "2024-06-15T10:00:00Z".parse().unwrap(),
-            user: User {
-                login: "reviewer".to_string(),
-            },
-        }
-    }
-
-    fn make_completed_check(conclusion: &str) -> CheckRun {
-        CheckRun {
-            status: Some("completed".to_string()),
-            conclusion: Some(conclusion.to_string()),
-        }
-    }
-
-    #[test]
-    fn test_merge_readiness_all_conditions_met() {
-        let pr = make_pr(false);
-        let checks = vec![make_completed_check("success")];
-        let reviews = vec![make_approved_review(1)];
-
-        let result = evaluate_merge_readiness(&pr, &checks, &reviews);
-        assert!(result.ready);
-        assert!(result.reasons.is_empty());
-    }
-
-    #[test]
-    fn test_merge_readiness_draft_pr_not_ready() {
-        let pr = make_pr(true);
-        let checks = vec![make_completed_check("success")];
-        let reviews = vec![make_approved_review(1)];
-
-        let result = evaluate_merge_readiness(&pr, &checks, &reviews);
-        assert!(!result.ready);
-        assert!(result.reasons.iter().any(|r| r.contains("draft")));
-    }
-
-    #[test]
-    fn test_merge_readiness_no_checks_not_ready() {
-        let pr = make_pr(false);
-        let checks: Vec<CheckRun> = vec![];
-        let reviews = vec![make_approved_review(1)];
-
-        let result = evaluate_merge_readiness(&pr, &checks, &reviews);
-        assert!(!result.ready);
-        assert!(result.reasons.iter().any(|r| r.contains("No CI checks")));
-    }
-
-    #[test]
-    fn test_merge_readiness_failed_checks_not_ready() {
-        let pr = make_pr(false);
-        let checks = vec![
-            make_completed_check("success"),
-            make_completed_check("failure"),
-        ];
-        let reviews = vec![make_approved_review(1)];
-
-        let result = evaluate_merge_readiness(&pr, &checks, &reviews);
-        assert!(!result.ready);
-        assert!(result.reasons.iter().any(|r| r.contains("failed")));
-    }
-
-    #[test]
-    fn test_merge_readiness_pending_checks_not_ready() {
-        let pr = make_pr(false);
-        let checks = vec![make_completed_check("success"), make_check(None)];
-        let reviews = vec![make_approved_review(1)];
-
-        let result = evaluate_merge_readiness(&pr, &checks, &reviews);
-        assert!(!result.ready);
-        assert!(result.reasons.iter().any(|r| r.contains("pending")));
-    }
-
-    #[test]
-    fn test_merge_readiness_no_approval_not_ready() {
-        let pr = make_pr(false);
-        let checks = vec![make_completed_check("success")];
-        let reviews = vec![make_changes_requested_review(1)];
-
-        let result = evaluate_merge_readiness(&pr, &checks, &reviews);
-        assert!(!result.ready);
-        assert!(result.reasons.iter().any(|r| r.contains("approving")));
-    }
-
-    #[test]
-    fn test_merge_readiness_no_reviews_not_ready() {
-        let pr = make_pr(false);
-        let checks = vec![make_completed_check("success")];
-        let reviews: Vec<Review> = vec![];
-
-        let result = evaluate_merge_readiness(&pr, &checks, &reviews);
-        assert!(!result.ready);
-        assert!(result.reasons.iter().any(|r| r.contains("approving")));
-    }
-
-    #[test]
-    fn test_merge_readiness_multiple_issues() {
-        let pr = make_pr(true); // draft
-        let checks: Vec<CheckRun> = vec![]; // no checks
-        let reviews: Vec<Review> = vec![]; // no reviews
-
-        let result = evaluate_merge_readiness(&pr, &checks, &reviews);
-        assert!(!result.ready);
-        assert_eq!(result.reasons.len(), 3);
-    }
-
-    #[test]
-    fn test_merge_readiness_skipped_checks_ok() {
-        let pr = make_pr(false);
-        let checks = vec![
-            make_completed_check("success"),
-            make_completed_check("skipped"),
-        ];
-        let reviews = vec![make_approved_review(1)];
-
-        let result = evaluate_merge_readiness(&pr, &checks, &reviews);
-        assert!(result.ready);
-    }
-
-    #[test]
-    fn test_merge_readiness_neutral_checks_ok() {
-        let pr = make_pr(false);
-        let checks = vec![
-            make_completed_check("success"),
-            make_completed_check("neutral"),
-        ];
-        let reviews = vec![make_approved_review(1)];
-
-        let result = evaluate_merge_readiness(&pr, &checks, &reviews);
-        assert!(result.ready);
-    }
-
-    #[test]
-    fn test_pending_check_detection() {
-        // No conclusion = pending
-        let check = make_check(None);
-        assert!(is_pending_check(&check));
-
-        // Queued status = pending
-        let check = CheckRun {
-            status: Some("queued".to_string()),
-            conclusion: None,
-        };
-        assert!(is_pending_check(&check));
-
-        // In progress status = pending
-        let check = CheckRun {
-            status: Some("in_progress".to_string()),
-            conclusion: None,
-        };
-        assert!(is_pending_check(&check));
-
-        // Completed with success = not pending
-        let check = make_completed_check("success");
-        assert!(!is_pending_check(&check));
-
-        // Completed with failure = not pending (even if status says in_progress)
-        let check = CheckRun {
-            status: Some("in_progress".to_string()),
-            conclusion: Some("failure".to_string()),
-        };
-        assert!(!is_pending_check(&check));
-    }
-
-    #[test]
-    fn test_merge_readiness_superseded_approval() {
-        // Reviewer approves first, then requests changes - should NOT be ready
-        let pr = make_pr(false);
-        let checks = vec![make_completed_check("success")];
-        let reviews = vec![
-            Review {
-                id: 1,
-                state: Some("APPROVED".to_string()),
-                submitted_at: "2024-06-15T10:00:00Z".parse().unwrap(),
-                user: User {
-                    login: "alice".to_string(),
-                },
-            },
-            Review {
-                id: 2,
-                state: Some("CHANGES_REQUESTED".to_string()),
-                submitted_at: "2024-06-15T11:00:00Z".parse().unwrap(),
-                user: User {
-                    login: "alice".to_string(),
-                },
-            },
-        ];
-
-        let result = evaluate_merge_readiness(&pr, &checks, &reviews);
-        assert!(!result.ready);
-        assert!(result.reasons.iter().any(|r| r.contains("approving")));
-    }
-
-    #[test]
-    fn test_merge_readiness_multiple_reviewers_one_approves() {
-        // Two reviewers: alice approves, bob requests changes - should be ready
-        // (at least one approval from latest reviews)
-        let pr = make_pr(false);
-        let checks = vec![make_completed_check("success")];
-        let reviews = vec![
-            Review {
-                id: 1,
-                state: Some("APPROVED".to_string()),
-                submitted_at: "2024-06-15T10:00:00Z".parse().unwrap(),
-                user: User {
-                    login: "alice".to_string(),
-                },
-            },
-            Review {
-                id: 2,
-                state: Some("CHANGES_REQUESTED".to_string()),
-                submitted_at: "2024-06-15T10:00:00Z".parse().unwrap(),
-                user: User {
-                    login: "bob".to_string(),
-                },
-            },
-        ];
-
-        let result = evaluate_merge_readiness(&pr, &checks, &reviews);
-        assert!(result.ready);
-    }
-
-    #[test]
-    fn test_merge_readiness_steady_state_ready() {
-        // Already ready, still ready - should remain ready
-        let pr = make_pr(false);
-        let checks = vec![make_completed_check("success")];
-        let reviews = vec![make_approved_review(1)];
-
-        let result = evaluate_merge_readiness(&pr, &checks, &reviews);
-        assert!(result.ready);
-        // Calling again should still be ready
-        let result2 = evaluate_merge_readiness(&pr, &checks, &reviews);
-        assert!(result2.ready);
-    }
+    // Merge readiness tests are in the unified merge_readiness module.
 }

@@ -1,8 +1,13 @@
-//! Deterministic merge-readiness check for GitHub PRs.
+//! Unified deterministic merge-readiness check for GitHub PRs.
 //!
-//! This module is consumed by the PR lifecycle features introduced in Phase 5.
-//! The `allow(dead_code)` will be removed once consumers exist.
-#![allow(dead_code)]
+//! Replaces the previous dead-code implementation and the inline
+//! `evaluate_merge_readiness` in `pr_monitor.rs` with a single source of truth.
+//!
+//! **Deterministic checks (all must pass):**
+//! 1. Not draft — fast bail-out
+//! 2. CI passing — Check Runs API + Combined Status API (legacy)
+//! 3. Review approved — last-state-per-reviewer, DISMISSED clears prior state
+//! 4. No merge conflicts — `mergeable` field from GitHub API
 
 use crate::github;
 use anyhow::{Context, Result};
@@ -20,20 +25,38 @@ const MAX_DELAY_SECS: u64 = 60;
 /// to merge only when all fields are `true`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MergeReadiness {
-    /// All CI check runs passed (success or skipped), none pending/in-progress.
+    /// PR is not a draft.
+    pub not_draft: bool,
+    /// All CI check runs passed (success, skipped, or neutral), none pending/in-progress.
     pub ci_passing: bool,
     /// At least one APPROVED review, no outstanding CHANGES_REQUESTED.
     pub review_approved: bool,
-    /// No merge conflicts (GitHub's `mergeable` field is `true`).
+    /// No merge conflicts. `false` when GitHub's `mergeable` is `Some(false)` or `None`.
     pub no_conflicts: bool,
-    /// No unresolved review threads.
-    pub no_unresolved_threads: bool,
 }
 
 impl MergeReadiness {
     /// Returns `true` if all merge prerequisites are satisfied.
     pub fn is_ready(&self) -> bool {
-        self.ci_passing && self.review_approved && self.no_conflicts && self.no_unresolved_threads
+        self.not_draft && self.ci_passing && self.review_approved && self.no_conflicts
+    }
+
+    /// Returns human-readable reasons for any failing checks.
+    pub fn failure_reasons(&self) -> Vec<String> {
+        let mut reasons = Vec::new();
+        if !self.not_draft {
+            reasons.push("PR is still a draft".to_string());
+        }
+        if !self.ci_passing {
+            reasons.push("CI checks not passing".to_string());
+        }
+        if !self.review_approved {
+            reasons.push("No approving review or outstanding changes requested".to_string());
+        }
+        if !self.no_conflicts {
+            reasons.push("Merge conflicts or mergeability unknown".to_string());
+        }
+        reasons
     }
 }
 
@@ -42,11 +65,11 @@ impl fmt::Display for MergeReadiness {
         let check = |ok: bool| if ok { "pass" } else { "FAIL" };
         write!(
             f,
-            "ci={} reviews={} conflicts={} threads={}",
+            "draft={} ci={} reviews={} conflicts={}",
+            check(self.not_draft),
             check(self.ci_passing),
             check(self.review_approved),
             check(self.no_conflicts),
-            check(self.no_unresolved_threads),
         )
     }
 }
@@ -62,12 +85,21 @@ pub async fn check_merge_readiness(
 ) -> Result<MergeReadiness> {
     let pr_str = pr_number.to_string();
 
-    // Fetch PR details (for mergeable + head SHA), reviews, and review threads concurrently
-    let (pr, reviews, unresolved_count) = tokio::try_join!(
+    // Fetch PR details (for draft, mergeable, head SHA) and reviews concurrently
+    let (pr, reviews) = tokio::try_join!(
         get_pr_details(owner, repo, &pr_str),
         get_reviews(owner, repo, &pr_str),
-        get_unresolved_thread_count(owner, repo, pr_number),
     )?;
+
+    // Fast bail-out: draft PRs are never ready
+    if pr.draft {
+        return Ok(MergeReadiness {
+            not_draft: false,
+            ci_passing: false,
+            review_approved: false,
+            no_conflicts: false,
+        });
+    }
 
     // Sequential: needs head SHA from get_pr_details above
     let (check_runs, combined_status) = tokio::try_join!(
@@ -78,13 +110,12 @@ pub async fn check_merge_readiness(
     let ci_passing = evaluate_ci(&check_runs) && evaluate_combined_status(&combined_status);
     let review_approved = evaluate_reviews(&reviews);
     let no_conflicts = pr.mergeable == Some(true);
-    let no_unresolved_threads = unresolved_count == 0;
 
     Ok(MergeReadiness {
+        not_draft: true,
         ci_passing,
         review_approved,
         no_conflicts,
-        no_unresolved_threads,
     })
 }
 
@@ -93,6 +124,7 @@ pub async fn check_merge_readiness(
 #[derive(Debug)]
 struct PrDetails {
     head_sha: String,
+    draft: bool,
     /// `None` means GitHub hasn't computed mergeability yet.
     mergeable: Option<bool>,
 }
@@ -101,6 +133,8 @@ struct PrDetails {
 struct PrApiResponse {
     head: HeadRef,
     mergeable: Option<bool>,
+    #[serde(default)]
+    draft: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -109,14 +143,14 @@ struct HeadRef {
 }
 
 #[derive(Debug, Deserialize)]
-struct ReviewApiResponse {
-    state: String,
-    user: ReviewUser,
+pub(crate) struct ReviewApiResponse {
+    pub(crate) state: String,
+    pub(crate) user: ReviewUser,
 }
 
 #[derive(Debug, Deserialize)]
-struct ReviewUser {
-    login: String,
+pub(crate) struct ReviewUser {
+    pub(crate) login: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -131,55 +165,6 @@ struct CombinedStatus {
     /// One of: success, pending, failure, error
     state: String,
     total_count: u64,
-}
-
-// GraphQL response types for review threads
-#[derive(Debug, Deserialize)]
-struct GraphQlResponse {
-    data: Option<GraphQlData>,
-    errors: Option<Vec<GraphQlError>>,
-}
-
-#[derive(Debug, Deserialize)]
-struct GraphQlError {
-    message: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct GraphQlData {
-    repository: Option<GraphQlRepository>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct GraphQlRepository {
-    pull_request: Option<GraphQlPullRequest>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct GraphQlPullRequest {
-    review_threads: GraphQlThreadConnection,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct GraphQlThreadConnection {
-    nodes: Vec<GraphQlThread>,
-    page_info: GraphQlPageInfo,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct GraphQlPageInfo {
-    has_next_page: bool,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct GraphQlThread {
-    is_resolved: bool,
 }
 
 // --- API helpers ---
@@ -263,6 +248,7 @@ async fn get_pr_details(owner: &str, repo: &str, pr_number: &str) -> Result<PrDe
 
     Ok(PrDetails {
         head_sha: pr.head.sha,
+        draft: pr.draft,
         mergeable: pr.mergeable,
     })
 }
@@ -335,96 +321,25 @@ async fn get_combined_status(owner: &str, repo: &str, sha: &str) -> Result<Combi
     Ok(status)
 }
 
-async fn get_unresolved_thread_count(owner: &str, repo: &str, pr_number: u64) -> Result<usize> {
-    let repo_full = format!("{owner}/{repo}");
-    // Use GraphQL variables to avoid injection via owner/repo strings
-    let query = "query($owner:String!,$repo:String!,$pr:Int!) { \
-        repository(owner:$owner, name:$repo) { \
-            pullRequest(number:$pr) { \
-                reviewThreads(first:100) { \
-                    nodes { isResolved } \
-                    pageInfo { hasNextPage } \
-                } \
-            } \
-        } \
-    }";
-    let owner_var = format!("owner={owner}");
-    let repo_var = format!("repo={repo}");
-    let pr_i32: i32 = pr_number
-        .try_into()
-        .context("PR number exceeds GraphQL Int (32-bit) range")?;
-    let pr_var = format!("pr={pr_i32}");
-    let output = gh_api_with_retry(
-        &repo_full,
-        &[
-            "api",
-            "graphql",
-            "-f",
-            &format!("query={query}"),
-            "-F",
-            &owner_var,
-            "-F",
-            &repo_var,
-            "-F",
-            &pr_var,
-        ],
-        DEFAULT_MAX_RETRIES,
-    )
-    .await?;
-
-    let response: GraphQlResponse =
-        serde_json::from_slice(&output.stdout).context("Failed to parse GraphQL response")?;
-
-    // Surface GraphQL-level errors
-    if let Some(errors) = &response.errors {
-        if !errors.is_empty() {
-            let messages: Vec<&str> = errors.iter().map(|e| e.message.as_str()).collect();
-            anyhow::bail!("GraphQL errors: {}", messages.join("; "));
-        }
-    }
-
-    let pr_data = response
-        .data
-        .and_then(|d| d.repository)
-        .and_then(|r| r.pull_request);
-
-    let Some(pr_data) = pr_data else {
-        anyhow::bail!("PR #{pr_number} not found in GraphQL response for {owner}/{repo}");
-    };
-
-    if pr_data.review_threads.page_info.has_next_page {
-        anyhow::bail!(
-            "PR #{pr_number} has more than 100 review threads; pagination not yet supported"
-        );
-    }
-
-    let count = pr_data
-        .review_threads
-        .nodes
-        .iter()
-        .filter(|t| !t.is_resolved)
-        .count();
-
-    Ok(count)
-}
-
 // --- Evaluation logic (pure functions, easy to test) ---
 
-/// Check Runs API: passes when every check run is complete with `success` or `skipped`.
+/// Check Runs API: passes when every check run is complete with `success`, `skipped`, or `neutral`.
+/// `neutral` is treated as passing to match GitHub branch protection behavior.
 /// Any pending/in-progress run or a failing conclusion means CI is not passing.
-/// Returns `true` when no check runs exist (repo may use only legacy statuses).
+/// Returns `true` when no check runs exist (repo may use only legacy statuses or no CI).
 fn evaluate_ci(check_runs: &[CheckRun]) -> bool {
     if check_runs.is_empty() {
-        // No checks configured — treat as passing
         return true;
     }
 
     check_runs.iter().all(|cr| {
-        // A run that hasn't completed yet is not passing
         if cr.status.as_deref() != Some("completed") {
             return false;
         }
-        matches!(cr.conclusion.as_deref(), Some("success") | Some("skipped"))
+        matches!(
+            cr.conclusion.as_deref(),
+            Some("success") | Some("skipped") | Some("neutral")
+        )
     })
 }
 
@@ -441,6 +356,9 @@ fn evaluate_combined_status(status: &CombinedStatus) -> bool {
 /// Reviews pass when there is at least one APPROVED review and no outstanding
 /// CHANGES_REQUESTED from any reviewer. A reviewer who first requested changes
 /// then later approved is considered approved (last state per reviewer wins).
+///
+/// DISMISSED reviews clear the reviewer's prior state entirely, fixing a bug
+/// where a dismissed CHANGES_REQUESTED would still block.
 fn evaluate_reviews(reviews: &[ReviewApiResponse]) -> bool {
     use std::collections::HashMap;
 
@@ -448,9 +366,17 @@ fn evaluate_reviews(reviews: &[ReviewApiResponse]) -> bool {
     let mut reviewer_state: HashMap<&str, &str> = HashMap::new();
     for review in reviews {
         let state = review.state.as_str();
-        // Only track meaningful states; COMMENTED/PENDING/DISMISSED don't change approval
-        if state == "APPROVED" || state == "CHANGES_REQUESTED" {
-            reviewer_state.insert(&review.user.login, state);
+        match state {
+            "APPROVED" | "CHANGES_REQUESTED" => {
+                reviewer_state.insert(&review.user.login, state);
+            }
+            "DISMISSED" => {
+                // DISMISSED clears the reviewer's prior state
+                reviewer_state.remove(review.user.login.as_str());
+            }
+            _ => {
+                // COMMENTED, PENDING — don't change approval state
+            }
         }
     }
 
@@ -497,8 +423,8 @@ mod tests {
     }
 
     #[test]
-    fn test_ci_with_neutral_not_passing() {
-        // neutral is not in the passing set (only success and skipped are)
+    fn test_ci_with_neutral_passing() {
+        // neutral is treated as passing (matches GitHub branch protection)
         let runs = vec![
             CheckRun {
                 conclusion: Some("success".into()),
@@ -509,7 +435,7 @@ mod tests {
                 status: Some("completed".into()),
             },
         ];
-        assert!(!evaluate_ci(&runs));
+        assert!(evaluate_ci(&runs));
     }
 
     #[test]
@@ -574,7 +500,6 @@ mod tests {
 
     #[test]
     fn test_ci_no_status_no_conclusion() {
-        // A check run with neither status nor conclusion set
         let runs = vec![CheckRun {
             conclusion: None,
             status: None,
@@ -627,7 +552,6 @@ mod tests {
 
     #[test]
     fn test_combined_status_no_statuses() {
-        // No legacy statuses configured — pass through (check runs cover CI)
         let status = CombinedStatus {
             state: "pending".into(),
             total_count: 0,
@@ -739,8 +663,35 @@ mod tests {
     }
 
     #[test]
-    fn test_reviews_dismissed_does_not_count() {
-        // DISMISSED state should be ignored - only APPROVED and CHANGES_REQUESTED matter
+    fn test_reviews_dismissed_clears_prior_state() {
+        // DISMISSED should clear the reviewer's prior CHANGES_REQUESTED
+        let reviews = vec![
+            ReviewApiResponse {
+                state: "CHANGES_REQUESTED".into(),
+                user: ReviewUser {
+                    login: "bob".into(),
+                },
+            },
+            ReviewApiResponse {
+                state: "APPROVED".into(),
+                user: ReviewUser {
+                    login: "alice".into(),
+                },
+            },
+            ReviewApiResponse {
+                state: "DISMISSED".into(),
+                user: ReviewUser {
+                    login: "bob".into(),
+                },
+            },
+        ];
+        // Bob's CHANGES_REQUESTED was dismissed, Alice approved → ready
+        assert!(evaluate_reviews(&reviews));
+    }
+
+    #[test]
+    fn test_reviews_dismissed_alone_not_sufficient() {
+        // DISMISSED alone doesn't count as approval
         let reviews = vec![ReviewApiResponse {
             state: "DISMISSED".into(),
             user: ReviewUser {
@@ -774,21 +725,32 @@ mod tests {
     #[test]
     fn test_merge_readiness_all_passing() {
         let mr = MergeReadiness {
+            not_draft: true,
             ci_passing: true,
             review_approved: true,
             no_conflicts: true,
-            no_unresolved_threads: true,
         };
         assert!(mr.is_ready());
     }
 
     #[test]
+    fn test_merge_readiness_draft() {
+        let mr = MergeReadiness {
+            not_draft: false,
+            ci_passing: true,
+            review_approved: true,
+            no_conflicts: true,
+        };
+        assert!(!mr.is_ready());
+    }
+
+    #[test]
     fn test_merge_readiness_ci_failing() {
         let mr = MergeReadiness {
+            not_draft: true,
             ci_passing: false,
             review_approved: true,
             no_conflicts: true,
-            no_unresolved_threads: true,
         };
         assert!(!mr.is_ready());
     }
@@ -796,10 +758,10 @@ mod tests {
     #[test]
     fn test_merge_readiness_not_approved() {
         let mr = MergeReadiness {
+            not_draft: true,
             ci_passing: true,
             review_approved: false,
             no_conflicts: true,
-            no_unresolved_threads: true,
         };
         assert!(!mr.is_ready());
     }
@@ -807,21 +769,10 @@ mod tests {
     #[test]
     fn test_merge_readiness_has_conflicts() {
         let mr = MergeReadiness {
+            not_draft: true,
             ci_passing: true,
             review_approved: true,
             no_conflicts: false,
-            no_unresolved_threads: true,
-        };
-        assert!(!mr.is_ready());
-    }
-
-    #[test]
-    fn test_merge_readiness_unresolved_threads() {
-        let mr = MergeReadiness {
-            ci_passing: true,
-            review_approved: true,
-            no_conflicts: true,
-            no_unresolved_threads: false,
         };
         assert!(!mr.is_ready());
     }
@@ -829,44 +780,68 @@ mod tests {
     #[test]
     fn test_merge_readiness_display() {
         let mr = MergeReadiness {
+            not_draft: true,
             ci_passing: true,
             review_approved: false,
             no_conflicts: true,
-            no_unresolved_threads: true,
         };
         let s = mr.to_string();
         assert!(s.contains("ci=pass"));
         assert!(s.contains("reviews=FAIL"));
         assert!(s.contains("conflicts=pass"));
-        assert!(s.contains("threads=pass"));
+        assert!(s.contains("draft=pass"));
     }
 
     #[test]
     fn test_merge_readiness_all_failing_display() {
         let mr = MergeReadiness {
+            not_draft: false,
             ci_passing: false,
             review_approved: false,
             no_conflicts: false,
-            no_unresolved_threads: false,
         };
         assert!(!mr.is_ready());
         let s = mr.to_string();
+        assert!(s.contains("draft=FAIL"));
         assert!(s.contains("ci=FAIL"));
         assert!(s.contains("reviews=FAIL"));
         assert!(s.contains("conflicts=FAIL"));
-        assert!(s.contains("threads=FAIL"));
+    }
+
+    #[test]
+    fn test_merge_readiness_failure_reasons() {
+        let mr = MergeReadiness {
+            not_draft: true,
+            ci_passing: false,
+            review_approved: true,
+            no_conflicts: false,
+        };
+        let reasons = mr.failure_reasons();
+        assert_eq!(reasons.len(), 2);
+        assert!(reasons.iter().any(|r| r.contains("CI")));
+        assert!(reasons.iter().any(|r| r.contains("conflicts")));
+    }
+
+    #[test]
+    fn test_merge_readiness_no_failure_reasons_when_ready() {
+        let mr = MergeReadiness {
+            not_draft: true,
+            ci_passing: true,
+            review_approved: true,
+            no_conflicts: true,
+        };
+        assert!(mr.failure_reasons().is_empty());
     }
 
     // --- mergeable field edge cases ---
 
     #[test]
     fn test_mergeable_null_treated_as_not_ready() {
-        // When GitHub hasn't computed mergeability yet, mergeable is null/None
         let pr = PrDetails {
             head_sha: "abc123".into(),
+            draft: false,
             mergeable: None,
         };
-        // None != Some(true), so no_conflicts should be false
         assert!(pr.mergeable != Some(true));
     }
 
@@ -874,6 +849,7 @@ mod tests {
     fn test_mergeable_false_treated_as_not_ready() {
         let pr = PrDetails {
             head_sha: "abc123".into(),
+            draft: false,
             mergeable: Some(false),
         };
         assert!(pr.mergeable != Some(true));
@@ -883,6 +859,7 @@ mod tests {
     fn test_mergeable_true_is_ready() {
         let pr = PrDetails {
             head_sha: "abc123".into(),
+            draft: false,
             mergeable: Some(true),
         };
         assert!(pr.mergeable == Some(true));

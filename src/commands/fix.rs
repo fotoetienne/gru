@@ -37,6 +37,7 @@ pub struct FixOptions {
     pub force_new: bool,
     pub agent_name: String,
     pub no_watch: bool,
+    pub auto_merge: bool,
 }
 
 /// Maximum size of the output buffer for test detection (in bytes)
@@ -1302,6 +1303,39 @@ async fn monitor_pr_lifecycle(
                 println!("   The issue may need to be reopened or addressed differently");
                 break;
             }
+            Ok((MonitorResult::ReadyToMerge, _)) => {
+                println!(
+                    "🚀 All checks pass and gru:auto-merge is set — merging PR #{}...",
+                    pr_number
+                );
+                let repo_full = format!("{}/{}", issue_ctx.owner, issue_ctx.repo);
+                let gh_cmd = crate::github::gh_command_for_repo(&repo_full);
+                match TokioCommand::new(gh_cmd)
+                    .args(["pr", "merge", pr_number, "--squash", "-R", &repo_full])
+                    .output()
+                    .await
+                {
+                    Ok(output) if output.status.success() => {
+                        println!("✅ PR #{} was auto-merged!", pr_number);
+                        println!("🎉 Issue {} is complete!", issue_ctx.issue_num);
+                        break;
+                    }
+                    Ok(output) => {
+                        let stderr = String::from_utf8_lossy(&output.stderr);
+                        log::warn!(
+                            "⚠️  Auto-merge failed for PR #{}: {}",
+                            pr_number,
+                            stderr.trim()
+                        );
+                        println!("🔄 Will retry on next poll cycle...");
+                        // Continue monitoring — merge may succeed on next attempt
+                    }
+                    Err(e) => {
+                        log::warn!("⚠️  Failed to run merge command: {}", e);
+                        println!("🔄 Will retry on next poll cycle...");
+                    }
+                }
+            }
             Ok((MonitorResult::NewReviews(comments), check_time)) => {
                 review_round += 1;
                 let count = comments.len();
@@ -1562,6 +1596,7 @@ pub async fn handle_fix(issue: &str, opts: FixOptions) -> Result<i32> {
         force_new,
         agent_name,
         no_watch,
+        auto_merge,
     } = opts;
 
     // Parse review timeout if provided
@@ -1732,6 +1767,23 @@ pub async fn handle_fix(issue: &str, opts: FixOptions) -> Result<i32> {
             handle_pr_creation(&issue_ctx, &wt_ctx).await?
         }
     };
+
+    // Add gru:auto-merge label if --auto-merge flag was set
+    if auto_merge {
+        if let Some(ref pr_num) = pr_number {
+            // Ensure the label exists in the repo first
+            if let Err(e) =
+                pr_monitor::ensure_auto_merge_label(&issue_ctx.owner, &issue_ctx.repo).await
+            {
+                log::warn!("⚠️  Failed to ensure gru:auto-merge label: {}", e);
+            }
+            match pr_monitor::add_auto_merge_label(&issue_ctx.owner, &issue_ctx.repo, pr_num).await
+            {
+                Ok(()) => println!("🏷️  Added gru:auto-merge label to PR #{}", pr_num),
+                Err(e) => log::warn!("⚠️  Failed to add gru:auto-merge label: {}", e),
+            }
+        }
+    }
 
     let agent_exit_code = || {
         agent_result
@@ -2026,6 +2078,7 @@ CUSTOM: Fix #{{ issue_number }} - {{ issue_title }}"#,
             force_new: false,
             agent_name: "claude".to_string(),
             no_watch: false,
+            auto_merge: false,
         };
         assert!(!opts.no_watch);
     }
@@ -2040,8 +2093,24 @@ CUSTOM: Fix #{{ issue_number }} - {{ issue_title }}"#,
             force_new: false,
             agent_name: "claude".to_string(),
             no_watch: true,
+            auto_merge: false,
         };
         assert!(opts.no_watch);
+    }
+
+    #[test]
+    fn test_fix_options_auto_merge() {
+        let opts = FixOptions {
+            timeout: None,
+            review_timeout: None,
+            monitor_timeout: None,
+            quiet: false,
+            force_new: false,
+            agent_name: "claude".to_string(),
+            no_watch: false,
+            auto_merge: true,
+        };
+        assert!(opts.auto_merge);
     }
 
     #[test]
@@ -2055,6 +2124,7 @@ CUSTOM: Fix #{{ issue_number }} - {{ issue_title }}"#,
             force_new: true,
             agent_name: "codex".to_string(),
             no_watch: true,
+            auto_merge: true,
         };
         let FixOptions {
             timeout,
@@ -2064,6 +2134,7 @@ CUSTOM: Fix #{{ issue_number }} - {{ issue_title }}"#,
             force_new,
             agent_name,
             no_watch,
+            auto_merge,
         } = opts;
         assert_eq!(timeout.as_deref(), Some("10m"));
         assert_eq!(review_timeout.as_deref(), Some("5m"));
@@ -2072,5 +2143,6 @@ CUSTOM: Fix #{{ issue_number }} - {{ issue_title }}"#,
         assert!(force_new);
         assert_eq!(agent_name, "codex");
         assert!(no_watch);
+        assert!(auto_merge);
     }
 }
