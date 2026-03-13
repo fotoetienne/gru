@@ -375,8 +375,8 @@ async fn remove_ready_to_merge_label(owner: &str, repo: &str, pr_number: &str) -
 /// Check merge readiness using the unified module and update the `ready-to-merge` label.
 ///
 /// Tracks transitions: adds label when becoming ready, removes when regressing.
-/// Returns `Some(readiness)` if ready and `gru:auto-merge` label is present,
-/// or `None` otherwise. The `was_ready` bool is updated in place.
+/// Returns `Some(readiness)` if all readiness checks pass, or `None` if not ready
+/// or if the readiness check failed. The `was_ready` bool is updated in place.
 async fn update_readiness_label(
     owner: &str,
     repo: &str,
@@ -569,12 +569,19 @@ async fn poll_once(
         .is_some()
     {
         // PR is ready — check if gru:auto-merge label is present
-        if has_auto_merge_label(owner, repo, pr_number)
-            .await
-            .unwrap_or(false)
-        {
-            *last_check_time = Utc::now();
-            return Ok(Some(MonitorResult::ReadyToMerge));
+        match has_auto_merge_label(owner, repo, pr_number).await {
+            Ok(true) => {
+                *last_check_time = Utc::now();
+                return Ok(Some(MonitorResult::ReadyToMerge));
+            }
+            Ok(false) => {}
+            Err(e) => {
+                log::warn!(
+                    "Failed to check gru:auto-merge label on PR #{}: {}",
+                    pr_number,
+                    e
+                );
+            }
         }
     }
 

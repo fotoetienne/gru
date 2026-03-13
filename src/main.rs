@@ -93,13 +93,15 @@ enum Commands {
 
         #[arg(
             long,
+            conflicts_with = "auto_merge",
             help = "Skip PR lifecycle monitoring after PR creation (fire-and-forget mode)"
         )]
         no_watch: bool,
 
         #[arg(
             long,
-            help = "Auto-merge PR when all readiness checks pass (adds gru:auto-merge label)"
+            conflicts_with = "no_watch",
+            help = "Auto-merge PR when all readiness checks pass (adds gru:auto-merge label). Requires lifecycle monitoring (incompatible with --no-watch)."
         )]
         auto_merge: bool,
     },
