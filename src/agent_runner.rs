@@ -68,7 +68,7 @@ impl std::fmt::Display for AgentRunnerError {
 impl std::error::Error for AgentRunnerError {}
 
 /// Returns true if the error indicates the task is stuck or timed out,
-/// meaning it should be labeled `minion:blocked` instead of `minion:failed`.
+/// meaning it should be labeled `gru:blocked` instead of `gru:failed`.
 pub fn is_stuck_or_timeout_error(err: &anyhow::Error) -> bool {
     err.downcast_ref::<AgentRunnerError>().is_some()
 }

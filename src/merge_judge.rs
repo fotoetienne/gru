@@ -17,6 +17,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::process::Command as TokioCommand;
 
 use crate::github::gh_command_for_repo;
+use crate::labels;
 
 /// Default confidence threshold (1-10). Only merge when confidence >= this.
 pub const DEFAULT_CONFIDENCE_THRESHOLD: u8 = 8;
@@ -28,7 +29,7 @@ const MAX_CONSECUTIVE_WAITS: u32 = 3;
 const MAX_WAIT_MINUTES: u64 = 120;
 
 /// Label applied when the judge escalates for human review.
-const NEEDS_HUMAN_REVIEW_LABEL: &str = "gru:needs-human-review";
+const NEEDS_HUMAN_REVIEW_LABEL: &str = labels::NEEDS_HUMAN_REVIEW;
 
 /// Action the judge can take.
 #[derive(Debug, Clone, PartialEq, Eq)]

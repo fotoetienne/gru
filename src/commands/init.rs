@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use crate::config::LabConfig;
 use crate::git::GitRepo;
 use crate::github::GitHubClient;
+use crate::labels;
 use crate::workspace::Workspace;
 
 /// Repository source type for initialization
@@ -50,19 +51,6 @@ pub fn parse_repo_source(arg: &str) -> Result<RepoSource> {
         arg
     );
 }
-
-/// Labels to create during initialization
-const REQUIRED_LABELS: &[(&str, &str, &str)] = &[
-    (
-        "ready-for-minion",
-        "0e8a16",
-        "Issue ready for autonomous agent",
-    ),
-    ("in-progress", "fbca04", "Agent actively working"),
-    ("minion:done", "0e8a16", "Agent completed successfully"),
-    ("minion:failed", "d73a4a", "Agent encountered failure"),
-    ("minion:blocked", "b60205", "Agent blocked, needs human"),
-];
 
 /// Initialize a repository for use with Gru
 pub async fn handle_init(repo_arg: String) -> Result<i32> {
@@ -156,11 +144,24 @@ pub async fn handle_init(repo_arg: String) -> Result<i32> {
         }
     }
 
-    // 5. Create required labels
+    // 4. Migrate old labels to new names (rename via API)
+    println!("\n🏷️  Migrating old labels...");
+    for (old_name, new_name) in labels::MIGRATIONS {
+        match github_client
+            .rename_label(&owner, &repo, old_name, new_name)
+            .await
+        {
+            Ok(true) => println!("  ✓ Renamed: {} → {}", old_name, new_name),
+            Ok(false) => {} // Old label didn't exist, nothing to migrate
+            Err(e) => log::warn!("  ⚠️  Failed to rename {} → {}: {}", old_name, new_name, e),
+        }
+    }
+
+    // 5. Create all required labels (idempotent)
     println!("\n🏷️  Configuring labels...");
     let mut labels_failed = Vec::new();
 
-    for (name, color, description) in REQUIRED_LABELS {
+    for (name, color, description) in labels::ALL_LABELS {
         match github_client
             .create_label(&owner, &repo, name, color, description)
             .await
@@ -189,16 +190,17 @@ pub async fn handle_init(repo_arg: String) -> Result<i32> {
     // 6. Check for ready issues
     println!("\n🔍 Checking for ready issues...");
     match github_client
-        .list_issues_with_label(&owner, &repo, "ready-for-minion")
+        .list_issues_with_label(&owner, &repo, labels::TODO)
         .await
     {
         Ok(issues) => {
             if issues.is_empty() {
-                println!("  No issues labeled 'ready-for-minion' yet");
+                println!("  No issues labeled '{}' yet", labels::TODO);
             } else {
                 println!(
-                    "✓ Found {} issue(s) labeled 'ready-for-minion'",
-                    issues.len()
+                    "✓ Found {} issue(s) labeled '{}'",
+                    issues.len(),
+                    labels::TODO
                 );
             }
         }
@@ -212,7 +214,7 @@ pub async fn handle_init(repo_arg: String) -> Result<i32> {
     println!("✓ Repository is ready!\n");
     println!("Next steps:");
     println!("  1. Mark an issue as ready:");
-    println!("     gh issue edit 42 --add-label ready-for-minion");
+    println!("     gh issue edit 42 --add-label {}", labels::TODO);
     println!("  2. Start a Minion:");
     println!("     gru do {}/{}#42", owner, repo);
     println!("  3. Check status:");

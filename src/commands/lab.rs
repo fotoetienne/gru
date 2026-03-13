@@ -1,5 +1,6 @@
 use crate::config::LabConfig;
 use crate::github::{list_ready_issues_via_cli, GitHubClient};
+use crate::labels;
 use crate::minion_registry::{is_process_alive, with_registry};
 use anyhow::{Context, Result};
 use std::path::PathBuf;
@@ -288,7 +289,7 @@ async fn poll_and_spawn(config: &LabConfig, children: &mut Vec<Child>) -> Result
                             );
                             // Unclaim the issue since we failed to spawn
                             if let Err(e) = client
-                                .remove_label(owner, repo, issue_number, "in-progress")
+                                .remove_label(owner, repo, issue_number, labels::IN_PROGRESS)
                                 .await
                             {
                                 log::warn!("⚠️  Failed to remove in-progress label: {}", e);
@@ -432,14 +433,12 @@ async fn fallback_list_issues(owner: &str, repo: &str, label: &str) -> Result<Ve
     let client = GitHubClient::from_env(owner, repo).await?;
     let issues = client.list_issues_with_label(owner, repo, label).await?;
 
-    let blocked_labels = ["minion:blocked", "in-progress"];
     let filtered: Vec<u64> = issues
         .into_iter()
         .filter(|issue| {
-            !issue
-                .labels
-                .iter()
-                .any(|l| blocked_labels.contains(&l.name.as_str()))
+            let label_names: Vec<String> = issue.labels.iter().map(|l| l.name.clone()).collect();
+            !labels::has_label(&label_names, labels::BLOCKED)
+                && !labels::has_label(&label_names, labels::IN_PROGRESS)
         })
         .map(|issue| issue.number)
         .collect();

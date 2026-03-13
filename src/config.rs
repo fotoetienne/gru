@@ -79,7 +79,7 @@ fn default_agent_name() -> String {
 /// Daemon configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DaemonConfig {
-    /// Repositories to monitor for ready-for-minion issues
+    /// Repositories to monitor for gru:todo issues
     #[serde(default)]
     pub repos: Vec<String>,
 
@@ -91,7 +91,7 @@ pub struct DaemonConfig {
     #[serde(default = "default_max_slots")]
     pub max_slots: usize,
 
-    /// Label to watch for issues (default: "ready-for-minion")
+    /// Label to watch for issues (default: "gru:todo")
     #[serde(default = "default_label")]
     pub label: String,
 }
@@ -131,7 +131,7 @@ fn default_max_slots() -> usize {
 }
 
 fn default_label() -> String {
-    "ready-for-minion".to_string()
+    crate::labels::TODO.to_string()
 }
 
 impl LabConfig {
@@ -353,7 +353,7 @@ repos = ["owner/repo"]
 
         assert_eq!(config.daemon.poll_interval_secs, 30);
         assert_eq!(config.daemon.max_slots, 2);
-        assert_eq!(config.daemon.label, "ready-for-minion");
+        assert_eq!(config.daemon.label, "gru:todo");
     }
 
     #[test]
