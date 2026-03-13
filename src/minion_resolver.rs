@@ -27,8 +27,8 @@ pub struct MinionInfo {
     /// The top-level minion directory (metadata lives here).
     /// Use `checkout_path()` to get the git worktree location.
     pub worktree_path: PathBuf,
-    #[allow(dead_code)]
-    // Populated by resolver; callers currently only use minion_id/worktree_path
+    /// Used by find_by_issue_number_from_list to rank candidates.
+    /// Values: "Active", "Stopped" (from registry), "Idle" (from filesystem scan).
     pub status: String,
     #[allow(dead_code)]
     // Populated by resolver; callers currently only use minion_id/worktree_path
@@ -699,6 +699,18 @@ mod tests {
         // Both active — should pick higher ID
         let minions = vec![
             test_minion_with_status("M0j7", Some(353), "owner/repo", "Active"),
+            test_minion_with_status("M0j8", Some(353), "owner/repo", "Active"),
+        ];
+        let result = find_by_issue_number_from_list(353, &minions);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().minion_id, "M0j8");
+    }
+
+    #[test]
+    fn test_find_by_issue_prefers_active_over_idle() {
+        // Filesystem scan produces "Idle" instead of "Stopped"
+        let minions = vec![
+            test_minion_with_status("M0j7", Some(353), "owner/repo", "Idle"),
             test_minion_with_status("M0j8", Some(353), "owner/repo", "Active"),
         ];
         let result = find_by_issue_number_from_list(353, &minions);
