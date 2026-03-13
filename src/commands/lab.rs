@@ -1,4 +1,4 @@
-use crate::config::LabConfig;
+use crate::config::{parse_repo_entry, LabConfig};
 use crate::github::{list_ready_issues_via_cli, GitHubClient};
 use crate::labels;
 use crate::minion_registry::{is_process_alive, with_registry};
@@ -176,19 +176,6 @@ async fn shutdown_children(children: &mut [Child]) {
     }
 }
 
-/// Parse a repository spec in "owner/repo" format.
-/// Returns `Some((owner, repo))` if valid, `None` otherwise.
-fn parse_repo_spec(spec: &str) -> Option<(&str, &str)> {
-    let mut parts = spec.splitn(3, '/');
-    let owner = parts.next().filter(|s| !s.is_empty())?;
-    let repo = parts.next().filter(|s| !s.is_empty())?;
-    // Reject specs with more than one slash (e.g., "a/b/c")
-    if parts.next().is_some() {
-        return None;
-    }
-    Some((owner, repo))
-}
-
 /// Poll GitHub for ready issues and spawn Minions if slots are available
 async fn poll_and_spawn(config: &LabConfig, children: &mut Vec<Child>) -> Result<()> {
     // Prune stale registry entries (worktrees that no longer exist)
@@ -210,21 +197,22 @@ async fn poll_and_spawn(config: &LabConfig, children: &mut Vec<Child>) -> Result
             break;
         }
 
-        // Parse owner/repo
-        let (owner, repo) = match parse_repo_spec(repo_spec) {
+        // Parse owner/repo or host/owner/repo
+        let (host, owner, repo) = match parse_repo_entry(repo_spec) {
             Some(parsed) => parsed,
             None => {
                 log::warn!("⚠️  Invalid repo format: '{}', skipping", repo_spec);
                 continue;
             }
         };
+        // Canonical owner/repo form for registry lookups and issue URL building
+        let repo_full = format!("{}/{}", owner, repo);
 
         // Fetch ready issues, excluding blocked ones (both GitHub-blocked and minion:blocked).
         // Try CLI first (supports -is:blocked qualifier), fall back to octocrab with
         // client-side filtering if CLI is unavailable.
-        let host = crate::github::infer_github_host(owner);
         let issue_numbers =
-            match list_ready_issues_via_cli(owner, repo, host, &config.daemon.label).await {
+            match list_ready_issues_via_cli(&owner, &repo, &host, &config.daemon.label).await {
                 Ok(numbers) => numbers,
                 Err(cli_err) => {
                     log::warn!(
@@ -232,7 +220,7 @@ async fn poll_and_spawn(config: &LabConfig, children: &mut Vec<Child>) -> Result
                         repo_spec,
                         cli_err
                     );
-                    match fallback_list_issues(owner, repo, &config.daemon.label).await {
+                    match fallback_list_issues(&owner, &repo, &host, &config.daemon.label).await {
                         Ok(numbers) => numbers,
                         Err(e) => {
                             log::warn!("⚠️  API fallback also failed for {}: {}", repo_spec, e);
@@ -243,7 +231,7 @@ async fn poll_and_spawn(config: &LabConfig, children: &mut Vec<Child>) -> Result
             };
 
         // Create GitHub client for claiming issues
-        let client = match GitHubClient::from_env(owner, repo).await {
+        let client = match GitHubClient::from_env_with_host(&owner, &repo, &host).await {
             Ok(client) => client,
             Err(e) => {
                 log::warn!(
@@ -262,15 +250,15 @@ async fn poll_and_spawn(config: &LabConfig, children: &mut Vec<Child>) -> Result
             }
 
             // Check if issue is already being worked on (by a live process)
-            if is_issue_claimed(repo_spec, issue_number).await? {
+            if is_issue_claimed(&repo_full, issue_number).await? {
                 continue;
             }
 
             // Try to claim the issue
-            match client.claim_issue(owner, repo, issue_number).await {
+            match client.claim_issue(&owner, &repo, issue_number).await {
                 Ok(true) => {
                     // Successfully claimed, spawn Minion
-                    match spawn_minion(repo_spec, issue_number).await {
+                    match spawn_minion(&repo_full, &host, issue_number).await {
                         Ok(child) => {
                             children.push(child);
                             println!(
@@ -289,7 +277,7 @@ async fn poll_and_spawn(config: &LabConfig, children: &mut Vec<Child>) -> Result
                             );
                             // Unclaim the issue since we failed to spawn
                             if let Err(e) = client
-                                .remove_label(owner, repo, issue_number, labels::IN_PROGRESS)
+                                .remove_label(&owner, &repo, issue_number, labels::IN_PROGRESS)
                                 .await
                             {
                                 log::warn!("⚠️  Failed to remove in-progress label: {}", e);
@@ -373,8 +361,8 @@ async fn is_issue_claimed(repo: &str, issue_number: u64) -> Result<bool> {
 
 /// Spawn a Minion to work on an issue using the `gru do` command.
 /// Returns the child process handle for lifecycle tracking.
-async fn spawn_minion(repo: &str, issue_number: u64) -> Result<Child> {
-    let issue_ref = crate::github::build_issue_url(repo, issue_number)
+async fn spawn_minion(repo: &str, host: &str, issue_number: u64) -> Result<Child> {
+    let issue_ref = crate::github::build_issue_url_with_host(repo, host, issue_number)
         .with_context(|| format!("Invalid repo format: '{}'", repo))?;
 
     // Get the current executable path
@@ -386,8 +374,29 @@ async fn spawn_minion(repo: &str, issue_number: u64) -> Result<Child> {
     std::fs::create_dir_all(&log_dir)
         .with_context(|| format!("Failed to create log directory: {}", log_dir.display()))?;
 
+    // Include host in log filename to avoid collisions when the same owner/repo
+    // exists on different hosts (e.g., github.com/org/svc vs ghe.corp.com/org/svc).
+    // Sanitize by replacing any non-alphanumeric characters with hyphens.
+    let safe_host = if host == "github.com" {
+        String::new()
+    } else {
+        let sanitized: String = host
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '-'
+                }
+            })
+            .collect();
+        format!("{}-", sanitized)
+    };
     let safe_repo = repo.replace('/', "-");
-    let log_path = log_dir.join(format!("{}-issue-{}.log", safe_repo, issue_number));
+    let log_path = log_dir.join(format!(
+        "{}{}-issue-{}.log",
+        safe_host, safe_repo, issue_number
+    ));
     let stdout_file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -432,8 +441,13 @@ async fn spawn_minion(repo: &str, issue_number: u64) -> Result<Child> {
 ///
 /// If the configured label has a counterpart (old↔new), both are queried so that
 /// repos in any migration state are covered.
-async fn fallback_list_issues(owner: &str, repo: &str, label: &str) -> Result<Vec<u64>> {
-    let client = GitHubClient::from_env(owner, repo).await?;
+async fn fallback_list_issues(
+    owner: &str,
+    repo: &str,
+    host: &str,
+    label: &str,
+) -> Result<Vec<u64>> {
+    let client = GitHubClient::from_env_with_host(owner, repo, host).await?;
     let mut issues = client.list_issues_with_label(owner, repo, label).await?;
 
     // Also fetch issues under the counterpart label name (old↔new) for backward compat
@@ -474,72 +488,69 @@ mod tests {
     }
 
     #[test]
-    fn test_log_path_construction() {
+    fn test_log_path_github_com() {
         let safe_repo = "owner/repo".replace('/', "-");
         let log_name = format!("{}-issue-{}.log", safe_repo, 42);
         assert_eq!(log_name, "owner-repo-issue-42.log");
     }
 
-    // --- parse_repo_spec tests ---
-
     #[test]
-    fn test_parse_repo_spec_valid() {
-        assert_eq!(parse_repo_spec("owner/repo"), Some(("owner", "repo")));
+    fn test_log_path_ghe_includes_host() {
+        let host = "ghe.netflix.net";
+        let sanitized: String = host
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '-'
+                }
+            })
+            .collect();
+        let safe_host = format!("{}-", sanitized);
+        let safe_repo = "corp/service".replace('/', "-");
+        let log_name = format!("{}{}-issue-{}.log", safe_host, safe_repo, 42);
+        assert_eq!(log_name, "ghe-netflix-net-corp-service-issue-42.log");
     }
 
     #[test]
-    fn test_parse_repo_spec_with_hyphens() {
-        assert_eq!(
-            parse_repo_spec("my-org/my-repo"),
-            Some(("my-org", "my-repo"))
-        );
-    }
-
-    #[test]
-    fn test_parse_repo_spec_no_slash() {
-        assert_eq!(parse_repo_spec("justrepo"), None);
-    }
-
-    #[test]
-    fn test_parse_repo_spec_too_many_slashes() {
-        assert_eq!(parse_repo_spec("a/b/c"), None);
-    }
-
-    #[test]
-    fn test_parse_repo_spec_empty() {
-        assert_eq!(parse_repo_spec(""), None);
-    }
-
-    #[test]
-    fn test_parse_repo_spec_empty_parts() {
-        assert_eq!(parse_repo_spec("/repo"), None);
-        assert_eq!(parse_repo_spec("owner/"), None);
-        assert_eq!(parse_repo_spec("/"), None);
+    fn test_log_path_host_with_port_is_sanitized() {
+        let host = "ghe.example.com:8443";
+        let sanitized: String = host
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '-'
+                }
+            })
+            .collect();
+        assert_eq!(sanitized, "ghe-example-com-8443");
     }
 
     // --- issue URL construction tests ---
 
     #[test]
     fn test_issue_ref_builds_full_github_url() {
-        let url = crate::github::build_issue_url("fotoetienne/gru", 42).unwrap();
+        let url =
+            crate::github::build_issue_url_with_host("fotoetienne/gru", "github.com", 42).unwrap();
         assert_eq!(url, "https://github.com/fotoetienne/gru/issues/42");
     }
 
     #[test]
-    fn test_issue_ref_builds_ghe_url_for_netflix() {
-        let url = crate::github::build_issue_url("netflix/some-service", 99).unwrap();
-        assert_eq!(
-            url,
-            "https://ghe.netflix.net/netflix/some-service/issues/99"
-        );
+    fn test_issue_ref_builds_ghe_url() {
+        let url =
+            crate::github::build_issue_url_with_host("corp/some-service", "ghe.netflix.net", 99)
+                .unwrap();
+        assert_eq!(url, "https://ghe.netflix.net/corp/some-service/issues/99");
     }
 
     #[test]
-    fn test_build_issue_url_rejects_invalid_repo() {
-        assert!(crate::github::build_issue_url("", 1).is_none());
-        assert!(crate::github::build_issue_url("justrepo", 1).is_none());
-        assert!(crate::github::build_issue_url("/repo", 1).is_none());
-        assert!(crate::github::build_issue_url("owner/", 1).is_none());
-        assert!(crate::github::build_issue_url("a/b/c", 1).is_none());
+    fn test_build_issue_url_with_host_rejects_invalid() {
+        assert!(crate::github::build_issue_url_with_host("", "github.com", 1).is_none());
+        assert!(crate::github::build_issue_url_with_host("justrepo", "github.com", 1).is_none());
+        assert!(crate::github::build_issue_url_with_host("/repo", "github.com", 1).is_none());
+        assert!(crate::github::build_issue_url_with_host("owner/", "github.com", 1).is_none());
     }
 }
