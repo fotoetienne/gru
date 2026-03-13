@@ -217,7 +217,8 @@ fn host_for_repo(config: &LabConfig, owner_repo: &str) -> Option<String> {
 /// Scan the registry for minions that can be resumed.
 ///
 /// A minion is resumable if:
-/// - Its mode is Stopped (no live process)
+/// - Its process is not running (mode is Stopped, or mode is Autonomous/Interactive
+///   but the PID is dead — e.g. after SIGKILL before cleanup could run)
 /// - Its orchestration phase is active (RunningAgent, CreatingPr, or MonitoringPr)
 /// - Its worktree still exists on disk
 /// - Its repo is in the Lab config
@@ -228,7 +229,9 @@ async fn find_resumable_minions(config: &LabConfig) -> Result<Vec<ResumableMinio
             .list()
             .into_iter()
             .filter(|(_id, info)| {
-                info.mode == MinionMode::Stopped
+                let process_dead =
+                    info.mode == MinionMode::Stopped || !info.pid.is_some_and(is_process_alive);
+                process_dead
                     && info.orchestration_phase.is_active()
                     && info.worktree.exists()
                     && repos.contains(&info.repo)
@@ -314,26 +317,16 @@ async fn resume_interrupted_minions(
         // Skip minions that have exceeded max attempts
         if candidate.info.attempt_count >= MAX_RESUME_ATTEMPTS {
             println!(
-                "⏭️  Skipping {} (issue #{}, {}): exceeded max attempts ({})",
+                "⏭️  Skipping {} (issue #{}, {}): attempt_count {} >= max {}",
                 candidate.minion_id,
                 candidate.info.issue,
                 candidate.info.repo,
                 candidate.info.attempt_count,
+                MAX_RESUME_ATTEMPTS,
             );
             mark_exhausted_minion(&candidate.minion_id, &candidate.info, &host).await;
             continue;
         }
-
-        // Increment attempt_count in the Lab before spawning to prevent TOCTOU races.
-        // The subprocess (`gru do`) also increments on resume, but the Lab-side increment
-        // ensures the guard fires reliably even if the subprocess hasn't updated yet.
-        let mid = candidate.minion_id.clone();
-        let _ = with_registry(move |reg| {
-            reg.update(&mid, |i| {
-                i.attempt_count = i.attempt_count.saturating_add(1);
-            })
-        })
-        .await;
 
         println!(
             "♻️  Resuming {} (issue #{}, {}, phase: {:?})",
@@ -814,25 +807,7 @@ mod tests {
     }
 
     #[test]
-    fn test_attempt_count_exhaustion_boundary() {
-        // Verify the exhaustion check matches the expected boundary behavior:
-        // count >= threshold means exhausted, count < threshold means resumable
-        let threshold = MAX_RESUME_ATTEMPTS;
-        let at_threshold = threshold;
-        let below_threshold = threshold - 1;
-        let above_threshold = threshold + 1;
-
-        assert!(
-            at_threshold >= threshold,
-            "at threshold should be exhausted"
-        );
-        assert!(
-            below_threshold < threshold,
-            "below threshold should be resumable"
-        );
-        assert!(
-            above_threshold >= threshold,
-            "above threshold should be exhausted"
-        );
+    fn test_max_resume_attempts_constant() {
+        assert_eq!(MAX_RESUME_ATTEMPTS, 3);
     }
 }
