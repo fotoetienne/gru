@@ -28,7 +28,8 @@ mod worktree_scanner;
 
 use clap::{Parser, Subcommand};
 use commands::{
-    attach, clean, fix, init, lab, path, prompt, prompts, rebase, resume, review, status, stop,
+    attach, chat, clean, fix, init, lab, path, prompt, prompts, rebase, resume, review, status,
+    stop,
 };
 
 /// CLI structure for the Gru agent orchestrator
@@ -54,6 +55,14 @@ enum Commands {
             help = "Repository to initialize: 'owner/repo' for GitHub, '.' for current directory, or a path. Defaults to current directory."
         )]
         repo: Option<String>,
+    },
+    #[command(about = "Start an interactive project-aware chat session")]
+    Chat {
+        #[arg(long, help = "Repository context as 'owner/repo'")]
+        repo: Option<String>,
+
+        #[arg(short, long, help = "Show additional context information")]
+        verbose: bool,
     },
     #[command(about = "Work on a GitHub issue", alias = "fix")]
     Do {
@@ -280,6 +289,7 @@ async fn main() {
 
     let result = match cli.command {
         Commands::Init { repo } => init::handle_init(repo.unwrap_or_else(|| ".".to_string())).await,
+        Commands::Chat { repo, verbose } => chat::handle_chat(repo, verbose).await,
         Commands::Do {
             issue,
             timeout,

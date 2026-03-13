@@ -1,4 +1,6 @@
 pub mod attach;
+pub mod chat;
+pub mod child_process;
 pub mod clean;
 pub mod fix;
 pub mod init;

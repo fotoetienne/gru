@@ -26,7 +26,7 @@ use anyhow::{bail, Result};
 /// `.gru/prompts/*.md` files don't use these reserved names.
 #[cfg_attr(not(test), allow(dead_code))]
 pub const RESERVED_COMMANDS: &[&str] = &[
-    "status", "attach", "stop", "lab", "tower", "up", "prompts", "help", "version",
+    "status", "attach", "chat", "stop", "lab", "tower", "up", "prompts", "help", "version",
 ];
 
 /// Validates that a given name is not a reserved command
