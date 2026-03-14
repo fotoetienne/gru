@@ -27,9 +27,10 @@ const POST_PUSH_DELAY_SECS: u64 = 60;
 const CI_FIX_TIMEOUT_SECS: u64 = 1200;
 
 /// The status of a CI check run
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum CheckStatus {
+    #[default]
     Queued,
     InProgress,
     Completed,
@@ -47,6 +48,22 @@ pub enum CheckConclusion {
     Neutral,
     Skipped,
     Stale,
+    /// Catch-all for unknown or future conclusion values from the GitHub API.
+    #[serde(other)]
+    Unknown,
+}
+
+impl CheckConclusion {
+    /// Returns true if this conclusion represents a CI failure.
+    pub fn is_failed(&self) -> bool {
+        matches!(
+            self,
+            CheckConclusion::Failure
+                | CheckConclusion::Cancelled
+                | CheckConclusion::TimedOut
+                | CheckConclusion::ActionRequired
+        )
+    }
 }
 
 impl fmt::Display for CheckConclusion {
@@ -60,14 +77,22 @@ impl fmt::Display for CheckConclusion {
             CheckConclusion::Neutral => write!(f, "neutral"),
             CheckConclusion::Skipped => write!(f, "skipped"),
             CheckConclusion::Stale => write!(f, "stale"),
+            CheckConclusion::Unknown => write!(f, "unknown"),
         }
     }
 }
 
-/// Represents a CI check run from GitHub
+/// Represents a CI check run from GitHub.
+///
+/// This is the canonical CheckRun type used across the codebase.
+/// Fields other than `conclusion` have defaults so the struct can be
+/// deserialized from both the rich `--jq`-transformed output (ci.rs)
+/// and the raw GitHub API response (pr_monitor.rs).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CheckRun {
+    #[serde(default)]
     pub name: String,
+    #[serde(default)]
     pub status: CheckStatus,
     pub conclusion: Option<CheckConclusion>,
     /// Duration string from GitHub (e.g., "2m 34s")

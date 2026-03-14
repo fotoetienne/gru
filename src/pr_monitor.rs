@@ -1,3 +1,4 @@
+use crate::ci::CheckRun;
 use crate::github;
 use crate::labels;
 use crate::merge_readiness;
@@ -166,20 +167,12 @@ struct ApiReviewComment {
     user: User,
 }
 
-#[derive(Debug, Deserialize)]
-struct CheckRun {
-    conclusion: Option<String>,
-}
-
 /// Check if a CI check run conclusion indicates a failure.
 ///
 /// Failed states include: failure, cancelled, timed_out, action_required.
 /// Non-failed states include: success, skipped, neutral, and in-progress (None).
 fn is_failed_check(check_run: &CheckRun) -> bool {
-    matches!(
-        check_run.conclusion.as_deref(),
-        Some("failure") | Some("cancelled") | Some("timed_out") | Some("action_required")
-    )
+    check_run.conclusion.as_ref().is_some_and(|c| c.is_failed())
 }
 
 const READY_TO_MERGE_LABEL: &str = labels::READY_TO_MERGE;
@@ -1042,22 +1035,24 @@ mod tests {
 
     #[test]
     fn test_check_run_deserialize_failure() {
+        use crate::ci::CheckConclusion;
         let json = r#"{
             "conclusion": "failure"
         }"#;
 
         let check: CheckRun = serde_json::from_str(json).unwrap();
-        assert_eq!(check.conclusion, Some("failure".to_string()));
+        assert_eq!(check.conclusion, Some(CheckConclusion::Failure));
     }
 
     #[test]
     fn test_check_run_deserialize_success() {
+        use crate::ci::CheckConclusion;
         let json = r#"{
             "conclusion": "success"
         }"#;
 
         let check: CheckRun = serde_json::from_str(json).unwrap();
-        assert_eq!(check.conclusion, Some("success".to_string()));
+        assert_eq!(check.conclusion, Some(CheckConclusion::Success));
     }
 
     #[test]
@@ -1073,6 +1068,7 @@ mod tests {
 
     #[test]
     fn test_check_run_deserialize_with_extra_fields() {
+        use crate::ci::{CheckConclusion, CheckStatus};
         let json = r#"{
             "id": 123456,
             "name": "build",
@@ -1083,11 +1079,32 @@ mod tests {
         }"#;
 
         let check: CheckRun = serde_json::from_str(json).unwrap();
-        assert_eq!(check.conclusion, Some("success".to_string()));
+        assert_eq!(check.conclusion, Some(CheckConclusion::Success));
+        assert_eq!(check.name, "build");
+        assert_eq!(check.status, CheckStatus::Completed);
+    }
+
+    #[test]
+    fn test_check_run_deserialize_in_progress_status() {
+        use crate::ci::CheckStatus;
+        let json = r#"{"status": "in_progress", "conclusion": null}"#;
+        let check: CheckRun = serde_json::from_str(json).unwrap();
+        assert_eq!(check.status, CheckStatus::InProgress);
+        assert!(check.conclusion.is_none());
+    }
+
+    #[test]
+    fn test_check_run_deserialize_unknown_conclusion() {
+        use crate::ci::CheckConclusion;
+        let json = r#"{"conclusion": "some_future_value"}"#;
+        let check: CheckRun = serde_json::from_str(json).unwrap();
+        assert_eq!(check.conclusion, Some(CheckConclusion::Unknown));
+        assert!(!is_failed_check(&check));
     }
 
     #[test]
     fn test_check_runs_response_deserialize() {
+        use crate::ci::CheckConclusion;
         let json = r#"{
             "total_count": 3,
             "check_runs": [
@@ -1101,11 +1118,11 @@ mod tests {
         assert_eq!(response.check_runs.len(), 3);
         assert_eq!(
             response.check_runs[0].conclusion,
-            Some("success".to_string())
+            Some(CheckConclusion::Success)
         );
         assert_eq!(
             response.check_runs[1].conclusion,
-            Some("failure".to_string())
+            Some(CheckConclusion::Failure)
         );
         assert!(response.check_runs[2].conclusion.is_none());
     }
@@ -1203,46 +1220,69 @@ mod tests {
     // ========================================================================
     // These tests use the shared is_failed_check function from production code
 
-    /// Helper to create a CheckRun with only a conclusion (status defaults to None)
-    fn make_check(conclusion: Option<&str>) -> CheckRun {
+    /// Helper to create a CheckRun with only a conclusion
+    fn make_check(conclusion: Option<crate::ci::CheckConclusion>) -> CheckRun {
         CheckRun {
-            conclusion: conclusion.map(|s| s.to_string()),
+            name: String::new(),
+            status: Default::default(),
+            conclusion,
+            duration: None,
+            output: None,
         }
     }
 
     #[test]
     fn test_failed_check_detection_failure() {
-        assert!(is_failed_check(&make_check(Some("failure"))));
+        use crate::ci::CheckConclusion;
+        assert!(is_failed_check(&make_check(Some(CheckConclusion::Failure))));
     }
 
     #[test]
     fn test_failed_check_detection_cancelled() {
-        assert!(is_failed_check(&make_check(Some("cancelled"))));
+        use crate::ci::CheckConclusion;
+        assert!(is_failed_check(&make_check(Some(
+            CheckConclusion::Cancelled
+        ))));
     }
 
     #[test]
     fn test_failed_check_detection_timed_out() {
-        assert!(is_failed_check(&make_check(Some("timed_out"))));
+        use crate::ci::CheckConclusion;
+        assert!(is_failed_check(&make_check(Some(
+            CheckConclusion::TimedOut
+        ))));
     }
 
     #[test]
     fn test_failed_check_detection_action_required() {
-        assert!(is_failed_check(&make_check(Some("action_required"))));
+        use crate::ci::CheckConclusion;
+        assert!(is_failed_check(&make_check(Some(
+            CheckConclusion::ActionRequired
+        ))));
     }
 
     #[test]
     fn test_successful_check_not_counted_as_failure() {
-        assert!(!is_failed_check(&make_check(Some("success"))));
+        use crate::ci::CheckConclusion;
+        assert!(!is_failed_check(&make_check(Some(
+            CheckConclusion::Success
+        ))));
     }
 
     #[test]
     fn test_skipped_check_not_counted_as_failure() {
-        assert!(!is_failed_check(&make_check(Some("skipped"))));
+        use crate::ci::CheckConclusion;
+        assert!(!is_failed_check(&make_check(Some(
+            CheckConclusion::Skipped
+        ))));
     }
 
     #[test]
     fn test_neutral_check_not_counted_as_failure() {
-        assert!(!is_failed_check(&make_check(Some("neutral"))));
+        use crate::ci::CheckConclusion;
+        assert!(!is_failed_check(&make_check(Some(
+            CheckConclusion::Neutral
+        ))));
     }
 
     #[test]
@@ -1252,12 +1292,13 @@ mod tests {
 
     #[test]
     fn test_multiple_checks_mixed_results() {
+        use crate::ci::CheckConclusion;
         let checks = [
-            make_check(Some("success")),
-            make_check(Some("failure")),
+            make_check(Some(CheckConclusion::Success)),
+            make_check(Some(CheckConclusion::Failure)),
             make_check(None),
-            make_check(Some("cancelled")),
-            make_check(Some("success")),
+            make_check(Some(CheckConclusion::Cancelled)),
+            make_check(Some(CheckConclusion::Success)),
         ];
         let failed_count = checks.iter().filter(|c| is_failed_check(c)).count();
         assert_eq!(failed_count, 2); // failure + cancelled
@@ -1265,11 +1306,12 @@ mod tests {
 
     #[test]
     fn test_all_failure_states_detected() {
+        use crate::ci::CheckConclusion;
         let checks = [
-            make_check(Some("failure")),
-            make_check(Some("cancelled")),
-            make_check(Some("timed_out")),
-            make_check(Some("action_required")),
+            make_check(Some(CheckConclusion::Failure)),
+            make_check(Some(CheckConclusion::Cancelled)),
+            make_check(Some(CheckConclusion::TimedOut)),
+            make_check(Some(CheckConclusion::ActionRequired)),
         ];
         assert!(checks.iter().all(is_failed_check));
     }
