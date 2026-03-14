@@ -424,31 +424,42 @@ pub struct PromptOptions {
     pub agent_name: String,
 }
 
-/// Handles the prompt command by launching Claude with an ad-hoc prompt
-/// Returns the exit code from the claude process
-pub async fn handle_prompt(prompt: &str, opts: PromptOptions) -> Result<i32> {
-    let issue_opt = opts.issue;
-    let pr_opt = opts.pr;
-    let no_worktree = opts.no_worktree;
-    let worktree_opt = opts.worktree;
-    let params = opts.params;
-    let timeout_opt = opts.timeout;
-    let quiet = opts.quiet;
-    let agent_name = opts.agent_name;
-    // Validate prompt doesn't start with flags (security check)
-    let trimmed_prompt = prompt.trim();
-    if trimmed_prompt.starts_with('-') {
+/// Contextual information gathered from --issue and --pr flags
+struct FetchedContext {
+    context: PromptContext,
+    issue_number: Option<u64>,
+    /// Owner/repo from --issue, or from --pr when no --issue is given.
+    owner: Option<String>,
+    repo: Option<String>,
+    /// Host from --issue only; used exclusively for issue worktree creation.
+    host: Option<String>,
+    /// PR-specific owner/repo/host (may differ from issue)
+    pr_owner: Option<String>,
+    pr_repo: Option<String>,
+    pr_host: Option<String>,
+    pr_branch: Option<String>,
+}
+
+/// Resolved workspace paths after worktree setup
+struct WorkspaceSetup {
+    workspace_path: PathBuf,
+    branch_name: String,
+    run_dir: PathBuf,
+}
+
+/// Validates the raw prompt input: rejects flag-like and empty prompts,
+/// and validates the --worktree path if provided.
+fn validate_prompt_input(prompt: &str, worktree_opt: &Option<String>) -> Result<()> {
+    let trimmed = prompt.trim();
+    if trimmed.starts_with('-') {
         anyhow::bail!(
             "Prompt cannot start with '-' (looks like a command flag). \
              Use quotes around your prompt: gru prompt \"your prompt here\""
         );
     }
-
-    if trimmed_prompt.is_empty() {
+    if trimmed.is_empty() {
         anyhow::bail!("Prompt cannot be empty");
     }
-
-    // Validate --worktree path early, before any network calls or state changes
     if let Some(ref wt) = worktree_opt {
         let p = PathBuf::from(wt);
         if !p.exists() {
@@ -462,202 +473,223 @@ pub async fn handle_prompt(prompt: &str, opts: PromptOptions) -> Result<i32> {
             anyhow::bail!("Worktree path is not a directory: {}", p.display());
         }
     }
+    Ok(())
+}
 
-    // Parse custom parameters
-    let custom_params = parse_params(&params)?;
-
-    // Try to resolve the prompt as a file-based prompt name.
-    // If it matches a loaded prompt file, use its content and validate requirements.
-    // Otherwise, treat it as ad-hoc prompt text.
-    // Use git toplevel (not cwd) so prompts are found from subdirectories.
+/// Resolves prompt text: if `prompt` matches a loaded prompt file, validates and
+/// returns its content; otherwise returns the prompt as-is.
+async fn resolve_prompt_text(
+    prompt: &str,
+    has_issue: bool,
+    has_pr: bool,
+    custom_params: &HashMap<String, String>,
+) -> Result<String> {
+    let trimmed = prompt.trim();
     let repo_root = git::detect_git_repo().await.ok();
     let loaded_prompts = prompt_loader::load_prompts(repo_root.as_deref()).unwrap_or_else(|e| {
         log::warn!("Failed to load prompt files: {}", e);
         HashMap::new()
     });
-    let resolved_prompt = if let Some(file_prompt) = loaded_prompts.get(trimmed_prompt) {
-        // Validate prompt syntax (non-empty content, valid param names)
+    if let Some(file_prompt) = loaded_prompts.get(trimmed) {
         prompt_loader::validate_prompt(file_prompt)?;
-
-        // Validate requirements before proceeding
         prompt_loader::validate_prompt_requirements(
             &file_prompt.name,
             &file_prompt.metadata,
-            issue_opt.is_some(),
-            pr_opt.is_some(),
-            &custom_params,
+            has_issue,
+            has_pr,
+            custom_params,
         )?;
-
-        file_prompt.content.clone()
+        Ok(file_prompt.content.clone())
     } else {
-        trimmed_prompt.to_string()
-    };
+        Ok(trimmed.to_string())
+    }
+}
 
-    // Build prompt context from --issue and --pr flags and custom params
+/// Fetches issue and PR context from GitHub based on --issue and --pr flags.
+async fn build_prompt_context(
+    issue_opt: &Option<String>,
+    pr_opt: &Option<String>,
+    custom_params: HashMap<String, String>,
+) -> Result<FetchedContext> {
     let mut context = PromptContext::new();
-    let mut context_owner: Option<String> = None;
-    let mut context_repo: Option<String> = None;
-    let mut context_host: Option<String> = None;
-    let mut issue_number_val: Option<u64> = None;
+    let mut owner: Option<String> = None;
+    let mut repo: Option<String> = None;
+    let mut host: Option<String> = None;
+    let mut issue_number: Option<u64> = None;
     let mut pr_owner: Option<String> = None;
     let mut pr_repo: Option<String> = None;
     let mut pr_host: Option<String> = None;
     let mut pr_branch: Option<String> = None;
 
     if let Some(ref issue_str) = issue_opt {
-        let (issue_ctx, owner, repo, host, issue_num) = fetch_issue_context(issue_str).await?;
+        let (issue_ctx, o, r, h, num) = fetch_issue_context(issue_str).await?;
         context = issue_ctx;
-        context_owner = Some(owner);
-        context_repo = Some(repo);
-        context_host = Some(host);
-        issue_number_val = Some(issue_num);
+        owner = Some(o);
+        repo = Some(r);
+        host = Some(h);
+        issue_number = Some(num);
     }
 
     if let Some(ref pr_str) = pr_opt {
-        let (pr_ctx, owner, repo, host, branch) = fetch_pr_context(pr_str).await?;
-        // Merge PR context into existing context (issue fields are preserved)
+        let (pr_ctx, o, r, h, branch) = fetch_pr_context(pr_str).await?;
         context.pr_number = pr_ctx.pr_number;
         context.pr_title = pr_ctx.pr_title;
         context.pr_body = pr_ctx.pr_body;
-        // Track PR's repo separately for worktree lookup
-        pr_owner = Some(owner.clone());
-        pr_repo = Some(repo.clone());
-        pr_host = Some(host.clone());
-        // Set repo info from PR if not already set by --issue
-        if context_owner.is_none() {
-            context_owner = Some(owner);
+        pr_owner = Some(o.clone());
+        pr_repo = Some(r.clone());
+        pr_host = Some(h.clone());
+        if owner.is_none() {
+            owner = Some(o);
             context.repo_owner = pr_ctx.repo_owner;
         }
-        if context_repo.is_none() {
-            context_repo = Some(repo);
+        if repo.is_none() {
+            repo = Some(r);
             context.repo_name = pr_ctx.repo_name;
         }
         pr_branch = Some(branch);
     }
 
-    // Apply custom params (these override standard variables)
     context.params = custom_params;
 
-    // Generate a unique minion ID for session tracking
-    let minion_id = minion::generate_minion_id().context("Failed to generate Minion ID")?;
-    println!("🆔 Session: {}", minion_id);
+    Ok(FetchedContext {
+        context,
+        issue_number,
+        owner,
+        repo,
+        host,
+        pr_owner,
+        pr_repo,
+        pr_host,
+        pr_branch,
+    })
+}
 
-    // Generate a unique session ID (UUID) for Claude's --session-id flag.
-    // Created early so the registry can record the actual session ID.
-    let session_id = Uuid::new_v4();
+/// Sets up the workspace/worktree and run directory based on the flags provided.
+///
+/// Priority order:
+///   1. --worktree <path>: use explicit path
+///   2. --no-worktree: force CWD even when --issue/--pr provided
+///   3. --issue: auto-create worktree for issue
+///   4. --pr: reuse existing worktree or fall back to CWD
+///   5. Default: ad-hoc workspace with CWD as run directory
+async fn setup_prompt_workspace(
+    fetched: &mut FetchedContext,
+    opts: &PromptOptions,
+    minion_id: &str,
+    workspace: &workspace::Workspace,
+) -> Result<WorkspaceSetup> {
+    let has_context = opts.issue.is_some() || opts.pr.is_some();
+    let use_auto_worktree = !opts.no_worktree && opts.worktree.is_none();
 
-    // Initialize workspace
-    let workspace = workspace::Workspace::new().context("Failed to initialize Gru workspace")?;
-
-    // Set up worktree or ad-hoc workspace.
-    // Priority order:
-    //   1. --worktree <path>: use explicit path (validated to exist)
-    //   2. --no-worktree: force CWD even when --issue/--pr provided
-    //   3. --issue: auto-create worktree for issue
-    //   4. --pr: reuse existing worktree or fall back to CWD
-    //   5. Default: ad-hoc workspace with CWD as run directory
-    //
-    // When both --issue and --pr are provided, --issue wins for worktree creation
-    // since Claude runs in the issue worktree. PR template variables are still
-    // populated regardless of which worktree is used.
-    let has_context = issue_opt.is_some() || pr_opt.is_some();
-    let use_auto_worktree = !no_worktree && worktree_opt.is_none();
-    let (workspace_path, branch_name, run_dir) = if let Some(ref explicit_path) = worktree_opt {
-        // --worktree <path>: use the explicit path as both workspace and run directory.
-        // Path existence and is_dir checks were already done at the top of the function.
+    if let Some(ref explicit_path) = opts.worktree {
         let wt_path = PathBuf::from(explicit_path)
             .canonicalize()
             .with_context(|| format!("Failed to resolve worktree path: {}", explicit_path))?;
-        if !quiet {
+        if !opts.quiet {
             println!("📂 Using explicit worktree: {}", wt_path.display());
         }
-        context.worktree_path = Some(wt_path.clone());
-        // Preserve PR branch name for registry and template context
-        let branch = pr_branch.clone().unwrap_or_default();
+        fetched.context.worktree_path = Some(wt_path.clone());
+        let branch = fetched.pr_branch.clone().unwrap_or_default();
         if !branch.is_empty() {
-            context.branch_name = Some(branch.clone());
+            fetched.context.branch_name = Some(branch.clone());
         }
         let run_dir = wt_path.clone();
-        (wt_path, branch, run_dir)
-    } else if issue_opt.is_some() && use_auto_worktree {
-        let owner = context_owner.as_deref().unwrap();
-        let repo = context_repo.as_deref().unwrap();
-        let issue_num = issue_number_val.unwrap();
-
-        let host = context_host.as_deref().unwrap_or("github.com");
+        Ok(WorkspaceSetup {
+            workspace_path: wt_path,
+            branch_name: branch,
+            run_dir,
+        })
+    } else if opts.issue.is_some() && use_auto_worktree {
+        let owner = fetched.owner.as_deref().unwrap();
+        let repo = fetched.repo.as_deref().unwrap();
+        let issue_num = fetched.issue_number.unwrap();
+        let host = fetched.host.as_deref().unwrap_or("github.com");
         let (wt_path, branch) =
-            setup_issue_worktree(owner, repo, host, issue_num, &minion_id).await?;
-        context.worktree_path = Some(wt_path.clone());
-        context.branch_name = Some(branch.clone());
+            setup_issue_worktree(owner, repo, host, issue_num, minion_id).await?;
+        fetched.context.worktree_path = Some(wt_path.clone());
+        fetched.context.branch_name = Some(branch.clone());
         let run_dir = wt_path.clone();
-        (wt_path, branch, run_dir)
-    } else if pr_opt.is_some() && use_auto_worktree {
-        // --pr: try to find an existing worktree for the PR branch, fall back to CWD
-        // Use the PR's own owner/repo for worktree lookup (may differ from --issue repo)
-        let owner = pr_owner.as_deref().unwrap();
-        let repo = pr_repo.as_deref().unwrap();
-        let branch = pr_branch.as_deref().unwrap();
-
-        let host = pr_host.as_deref().unwrap_or("github.com");
+        Ok(WorkspaceSetup {
+            workspace_path: wt_path,
+            branch_name: branch,
+            run_dir,
+        })
+    } else if opts.pr.is_some() && use_auto_worktree {
+        let owner = fetched.pr_owner.as_deref().unwrap();
+        let repo = fetched.pr_repo.as_deref().unwrap();
+        let branch = fetched.pr_branch.as_deref().unwrap();
+        let host = fetched.pr_host.as_deref().unwrap_or("github.com");
         if let Some(wt_path) = setup_pr_worktree(owner, repo, host, branch).await? {
-            context.worktree_path = Some(wt_path.clone());
-            context.branch_name = Some(branch.to_string());
+            fetched.context.worktree_path = Some(wt_path.clone());
+            fetched.context.branch_name = Some(branch.to_string());
             let run_dir = wt_path.clone();
-            (wt_path, branch.to_string(), run_dir)
+            Ok(WorkspaceSetup {
+                workspace_path: wt_path,
+                branch_name: branch.to_string(),
+                run_dir,
+            })
         } else {
             println!("ℹ️  No existing worktree found for PR branch - using current directory");
             let run_dir =
                 std::env::current_dir().context("Failed to get current working directory")?;
             let wt_path = run_dir.clone();
-            context.worktree_path = Some(wt_path.clone());
-            context.branch_name = Some(branch.to_string());
-            (wt_path, branch.to_string(), run_dir)
+            fetched.context.worktree_path = Some(wt_path.clone());
+            fetched.context.branch_name = Some(branch.to_string());
+            Ok(WorkspaceSetup {
+                workspace_path: wt_path,
+                branch_name: branch.to_string(),
+                run_dir,
+            })
         }
-    } else if no_worktree && has_context {
-        // --no-worktree: use the current directory as both the
-        // workspace and the run directory so the registry matches reality.
-        println!("ℹ️  Running without worktree - Claude will work in the current directory");
+    } else if opts.no_worktree && has_context {
+        println!("ℹ️  Running without worktree - agent will work in the current directory");
         let run_dir = std::env::current_dir().context("Failed to get current working directory")?;
         let wt_path = run_dir.clone();
-        context.worktree_path = Some(wt_path.clone());
-        // Preserve PR branch name for registry and template context
-        let branch = pr_branch.clone().unwrap_or_default();
+        fetched.context.worktree_path = Some(wt_path.clone());
+        let branch = fetched.pr_branch.clone().unwrap_or_default();
         if !branch.is_empty() {
-            context.branch_name = Some(branch.clone());
+            fetched.context.branch_name = Some(branch.clone());
         }
-        (wt_path, branch, run_dir)
+        Ok(WorkspaceSetup {
+            workspace_path: wt_path,
+            branch_name: branch,
+            run_dir,
+        })
     } else {
-        // Ad-hoc workspace: ~/.gru/work/ad-hoc/<minion-id>/
         let wt_path = workspace
-            .work_dir("ad-hoc", &minion_id)
+            .work_dir("ad-hoc", minion_id)
             .context("Failed to compute workspace path")?;
         tokio::fs::create_dir_all(&wt_path)
             .await
             .context("Failed to create workspace directory")?;
         let run_dir = std::env::current_dir().context("Failed to get current working directory")?;
-        (wt_path, String::new(), run_dir)
-    };
+        Ok(WorkspaceSetup {
+            workspace_path: wt_path,
+            branch_name: String::new(),
+            run_dir,
+        })
+    }
+}
 
-    // Set cwd to the actual execution directory (after worktree decision)
-    context.cwd = Some(run_dir.clone());
+/// Session identifiers and run-time options for agent execution.
+struct AgentRunConfig<'a> {
+    minion_id: &'a str,
+    session_id: &'a Uuid,
+    agent_name: &'a str,
+    rendered_prompt: &'a str,
+    timeout_opt: Option<&'a str>,
+    quiet: bool,
+}
 
-    // Render the prompt with variable substitution
-    let variables = context.to_variables();
-    let rendered_prompt = render_template(&resolved_prompt, &variables);
+/// Registers the minion, runs the agent, cleans up registry, and returns the exit code.
+async fn register_and_run_agent(
+    cfg: &AgentRunConfig<'_>,
+    fetched: &FetchedContext,
+    ws: &WorkspaceSetup,
+) -> Result<i32> {
+    let backend = agent_registry::resolve_backend(cfg.agent_name)?;
 
-    // Save rendered prompt to file for debugging and audit trail
-    let prompt_file = workspace_path.join("prompt.txt");
-    tokio::fs::write(&prompt_file, &rendered_prompt)
-        .await
-        .context("Failed to save prompt to workspace")?;
-
-    println!("📂 Workspace: {}", workspace_path.display());
-
-    // Resolve the agent backend early, before any registry/state side effects
-    let backend = agent_registry::resolve_backend(&agent_name)?;
-
-    // Register minion in registry
-    let repo_display = if let (Some(ref owner), Some(ref repo)) = (&context_owner, &context_repo) {
+    let repo_display = if let (Some(ref owner), Some(ref repo)) = (&fetched.owner, &fetched.repo) {
         format!("{}/{}", owner, repo)
     } else {
         "ad-hoc".to_string()
@@ -665,62 +697,65 @@ pub async fn handle_prompt(prompt: &str, opts: PromptOptions) -> Result<i32> {
     let now = Utc::now();
     let registry_info = RegistryMinionInfo {
         repo: repo_display,
-        issue: issue_number_val.unwrap_or(0),
+        issue: fetched.issue_number.unwrap_or(0),
         command: "prompt".to_string(),
-        prompt: rendered_prompt.chars().take(200).collect(),
+        prompt: cfg.rendered_prompt.chars().take(200).collect(),
         started_at: now,
-        branch: branch_name,
-        worktree: workspace_path.clone(),
+        branch: ws.branch_name.clone(),
+        worktree: ws.workspace_path.clone(),
         status: "active".to_string(),
         pr: None,
-        session_id: session_id.to_string(),
+        session_id: cfg.session_id.to_string(),
         pid: None,
         mode: MinionMode::Autonomous,
         last_activity: now,
         orchestration_phase: OrchestrationPhase::RunningAgent,
         token_usage: None,
-        agent_name: agent_name.clone(),
+        agent_name: cfg.agent_name.to_string(),
         timeout_deadline: None,
         attempt_count: 0,
         no_watch: false,
     };
 
-    let minion_id_clone = minion_id.clone();
-    with_registry(move |registry| registry.register(minion_id_clone, registry_info)).await?;
+    let minion_id_owned = cfg.minion_id.to_string();
+    with_registry(move |registry| registry.register(minion_id_owned, registry_info)).await?;
 
     println!("🤖 Launching {}...\n", backend.name());
 
     // Create progress display
-    let issue_display = if let Some(issue_num) = issue_number_val {
+    let issue_display = if let Some(issue_num) = fetched.issue_number {
         format!(
             "#{}: {}",
             issue_num,
-            context.issue_title.as_deref().unwrap_or("(no title)")
+            fetched
+                .context
+                .issue_title
+                .as_deref()
+                .unwrap_or("(no title)")
         )
-    } else if let Some(pr_num) = context.pr_number {
+    } else if let Some(pr_num) = fetched.context.pr_number {
         format!(
             "PR #{}: {}",
             pr_num,
-            context.pr_title.as_deref().unwrap_or("(no title)")
+            fetched.context.pr_title.as_deref().unwrap_or("(no title)")
         )
     } else {
-        format!("ad-hoc: {}", rendered_prompt)
+        format!("ad-hoc: {}", cfg.rendered_prompt)
     };
     let config = ProgressConfig {
-        minion_id: minion_id.clone(),
+        minion_id: cfg.minion_id.to_string(),
         issue: issue_display,
-        quiet,
+        quiet: cfg.quiet,
     };
     let progress = std::sync::Arc::new(ProgressDisplay::new(config));
 
-    // Build the command with flags for non-interactive stream-json output
-    let mut cmd = backend.build_command(&run_dir, &session_id, &rendered_prompt);
-    cmd.env("GRU_WORKSPACE", &minion_id);
+    let mut cmd = backend.build_command(&ws.run_dir, cfg.session_id, cfg.rendered_prompt);
+    cmd.env("GRU_WORKSPACE", cfg.minion_id);
 
     // Record child PID on spawn; mode is already set to Autonomous at registration.
+    let minion_id = cfg.minion_id.to_string();
     let on_spawn = MinionRegistry::pid_callback(minion_id.clone(), None);
 
-    // Run agent with stream monitoring
     let progress_cb = std::sync::Arc::clone(&progress);
     let output_callback = move |event: &AgentEvent| {
         progress_cb.handle_event(event);
@@ -729,17 +764,16 @@ pub async fn handle_prompt(prompt: &str, opts: PromptOptions) -> Result<i32> {
     let run_result = run_agent_with_stream_monitoring(
         cmd,
         &*backend,
-        &workspace_path,
-        timeout_opt.as_deref(),
+        &ws.workspace_path,
+        cfg.timeout_opt,
         Some(output_callback),
         Some(on_spawn),
     )
     .await;
 
     // Best-effort cleanup: clear PID, set mode to Stopped, and save token usage.
-    // Token usage is persisted regardless of exit status (Ok with non-zero exit) because
-    // cost data is valuable even for failed tasks. Only stream-level errors (timeout, stuck)
-    // result in Err, in which case partial usage is not saved.
+    // Token usage is persisted regardless of exit status because cost data is
+    // valuable even for failed tasks.
     let token_usage = run_result.as_ref().ok().map(|r| r.token_usage.clone());
     let cleanup_id = minion_id.clone();
     let _ = with_registry(move |registry| {
@@ -757,7 +791,6 @@ pub async fn handle_prompt(prompt: &str, opts: PromptOptions) -> Result<i32> {
     let agent_run = run_result?;
     let status = agent_run.status;
 
-    // Log token usage
     if agent_run.token_usage.total_tokens() > 0 {
         log::info!(
             "📊 Token usage: {}",
@@ -765,25 +798,96 @@ pub async fn handle_prompt(prompt: &str, opts: PromptOptions) -> Result<i32> {
         );
     }
 
-    // Finish the progress display and return appropriate exit code
     if status.success() {
         progress.finish_with_message("✅ Task completed");
-        println!("\n📁 Session workspace: {}", workspace_path.display());
-        println!("💡 To resume this session, use: gru resume {}", minion_id);
+        println!("\n📁 Session workspace: {}", ws.workspace_path.display());
+        println!(
+            "💡 To resume this session, use: gru resume {}",
+            cfg.minion_id
+        );
         Ok(0)
     } else {
         let exit_code = status.code().unwrap_or(EXIT_CODE_SIGNAL_TERMINATED);
         progress.finish_with_message(&format!("❌ Task failed (exit code: {})", exit_code));
         println!(
             "\n📝 Events saved to: {}",
-            workspace_path.join("events.jsonl").display()
+            ws.workspace_path.join("events.jsonl").display()
         );
         println!(
             "📄 Prompt saved to: {}",
-            workspace_path.join("prompt.txt").display()
+            ws.workspace_path.join("prompt.txt").display()
         );
         Ok(exit_code)
     }
+}
+
+/// Renders the prompt template with context variables and saves it to the workspace.
+async fn render_and_save_prompt(
+    resolved_prompt: &str,
+    fetched: &mut FetchedContext,
+    ws: &WorkspaceSetup,
+) -> Result<String> {
+    fetched.context.cwd = Some(ws.run_dir.clone());
+    let variables = fetched.context.to_variables();
+    let rendered = render_template(resolved_prompt, &variables);
+
+    let prompt_file = ws.workspace_path.join("prompt.txt");
+    tokio::fs::write(&prompt_file, &rendered)
+        .await
+        .context("Failed to save prompt to workspace")?;
+    println!("📂 Workspace: {}", ws.workspace_path.display());
+
+    Ok(rendered)
+}
+
+/// Handles the prompt command by launching an agent with an ad-hoc prompt.
+/// Returns the exit code from the agent process.
+///
+/// Phases:
+///   1. Validate input and agent backend
+///   2. Resolve prompt text (file-based or ad-hoc)
+///   3. Build context from --issue / --pr flags
+///   4. Set up workspace / worktree
+///   5. Render prompt template
+///   6. Register minion, run agent, clean up
+pub async fn handle_prompt(prompt: &str, opts: PromptOptions) -> Result<i32> {
+    // Phase 1: Validate input and agent backend
+    validate_prompt_input(prompt, &opts.worktree)?;
+    agent_registry::resolve_backend(&opts.agent_name)?;
+
+    // Phase 2: Resolve prompt text
+    let custom_params = parse_params(&opts.params)?;
+    let resolved_prompt = resolve_prompt_text(
+        prompt,
+        opts.issue.is_some(),
+        opts.pr.is_some(),
+        &custom_params,
+    )
+    .await?;
+
+    // Phase 3: Build context from --issue / --pr
+    let mut fetched = build_prompt_context(&opts.issue, &opts.pr, custom_params).await?;
+
+    // Phase 4: Set up workspace
+    let minion_id = minion::generate_minion_id().context("Failed to generate Minion ID")?;
+    println!("🆔 Session: {}", minion_id);
+    let session_id = Uuid::new_v4();
+    let workspace = workspace::Workspace::new().context("Failed to initialize Gru workspace")?;
+    let ws = setup_prompt_workspace(&mut fetched, &opts, &minion_id, &workspace).await?;
+
+    // Phase 5: Render prompt template
+    let rendered_prompt = render_and_save_prompt(&resolved_prompt, &mut fetched, &ws).await?;
+
+    // Phase 6: Register minion, run agent, clean up
+    let run_cfg = AgentRunConfig {
+        minion_id: &minion_id,
+        session_id: &session_id,
+        agent_name: &opts.agent_name,
+        rendered_prompt: &rendered_prompt,
+        timeout_opt: opts.timeout.as_deref(),
+        quiet: opts.quiet,
+    };
+    register_and_run_agent(&run_cfg, &fetched, &ws).await
 }
 
 #[cfg(test)]
