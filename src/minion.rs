@@ -2,8 +2,7 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Seek, Write};
 use std::path::Path;
 
-use fs2::FileExt;
-
+use crate::file_lock::lock_with_timeout;
 use crate::workspace::Workspace;
 
 /// Generates a unique Minion ID using a monotonic counter
@@ -41,8 +40,8 @@ pub fn generate_minion_id_with_state(state_dir: Option<&Path>) -> io::Result<Str
         .truncate(false)
         .open(&counter_path)?;
 
-    // Lock the file for exclusive access
-    file.lock_exclusive()?;
+    // Lock the file for exclusive access (with timeout to avoid deadlock)
+    lock_with_timeout(&file)?;
 
     // Read current counter value
     let metadata = file.metadata()?;

@@ -1,6 +1,5 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
@@ -8,6 +7,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use crate::agent::TokenUsage;
+use crate::file_lock::lock_with_timeout;
 use crate::workspace::Workspace;
 
 /// Async helper that loads the registry inside `spawn_blocking`, runs the
@@ -303,9 +303,8 @@ impl MinionRegistry {
             .open(&lock_path)
             .with_context(|| format!("Failed to open lock file: {:?}", lock_path))?;
 
-        // Acquire exclusive lock - this will block if another process holds the lock
-        lock_file
-            .lock_exclusive()
+        // Acquire exclusive lock with timeout to avoid deadlock from hung processes
+        lock_with_timeout(&lock_file)
             .with_context(|| format!("Failed to acquire exclusive lock on {:?}", lock_path))?;
 
         // Load existing registry or create new one
@@ -430,21 +429,34 @@ impl MinionRegistry {
     /// `last_activity`.
     ///
     /// The callback uses synchronous `MinionRegistry::load` because the
-    /// `on_spawn` contract is `FnOnce(u32) + Send` (not async).
+    /// `on_spawn` contract is `FnOnce(u32) + Send` (not async). The registry
+    /// update is dispatched to a background thread so that lock contention
+    /// (with retry backoff) does not block the Tokio worker thread.
     pub fn pid_callback(
         minion_id: String,
         mode: Option<MinionMode>,
     ) -> Box<dyn FnOnce(u32) + Send> {
         Box::new(move |pid: u32| {
-            if let Ok(mut registry) = MinionRegistry::load(None) {
-                let _ = registry.update(&minion_id, |info| {
-                    info.pid = Some(pid);
-                    if let Some(m) = mode {
-                        info.mode = m;
+            let _ = std::thread::Builder::new()
+                .name("pid-callback".into())
+                .spawn(move || match MinionRegistry::load(None) {
+                    Ok(mut registry) => {
+                        if let Err(e) = registry.update(&minion_id, |info| {
+                            info.pid = Some(pid);
+                            if let Some(m) = mode {
+                                info.mode = m;
+                            }
+                            info.last_activity = Utc::now();
+                        }) {
+                            log::warn!(
+                                "pid_callback: failed to update registry for {minion_id}: {e:#}"
+                            );
+                        }
                     }
-                    info.last_activity = Utc::now();
+                    Err(e) => {
+                        log::warn!("pid_callback: failed to load registry for {minion_id}: {e:#}");
+                    }
                 });
-            }
         })
     }
 

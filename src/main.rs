@@ -7,6 +7,7 @@ mod claude_runner;
 mod codex_backend;
 mod commands;
 mod config;
+mod file_lock;
 mod git;
 mod github;
 pub(crate) mod labels;
