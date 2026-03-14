@@ -194,33 +194,33 @@ fn default_max_resume_attempts() -> u32 {
 /// - `"host/owner/repo"` → `("host", "owner", "repo")` (legacy, host must contain `.`)
 /// - `"name:owner/repo"` → resolves name via `github_hosts` map (e.g., `"netflix:corp/service"`)
 ///
-/// The `github_hosts` parameter is used to resolve named host references.
-/// Pass `None` or an empty map if named references aren't needed.
-pub fn parse_repo_entry(spec: &str) -> Option<(String, String, String)> {
-    parse_repo_entry_with_hosts(spec, &HashMap::new())
-}
-
-/// Parse a repo entry with access to the `github_hosts` config map for resolving
-/// named host references (e.g., `"netflix:corp/service"`).
+/// Pass `&HashMap::new()` for `github_hosts` if named references aren't needed.
 pub fn parse_repo_entry_with_hosts(
     spec: &str,
     github_hosts: &HashMap<String, GhHostConfig>,
 ) -> Option<(String, String, String)> {
-    // Check for "name:owner/repo" format
+    // Check for "name:owner/repo" format.
+    // Only treat as named reference if name looks like an identifier (no dots/slashes),
+    // to avoid matching SSH URLs like "git@github.com:owner/repo".
     if let Some((name, rest)) = spec.split_once(':') {
         if name.is_empty() {
+            // Reject empty prefix like ":owner/repo"
             return None;
         }
-        let host_config = github_hosts.get(name)?;
-        let parts: Vec<&str> = rest.splitn(3, '/').collect();
-        if parts.len() != 2 || parts[0].is_empty() || parts[1].is_empty() {
-            return None;
+        if !name.contains('.') && !name.contains('/') {
+            // Looks like a named host reference (identifier, no dots/slashes)
+            let host_config = github_hosts.get(name)?;
+            let parts: Vec<&str> = rest.splitn(3, '/').collect();
+            if parts.len() != 2 || parts[0].is_empty() || parts[1].is_empty() {
+                return None;
+            }
+            return Some((
+                host_config.host.clone(),
+                parts[0].to_string(),
+                parts[1].to_string(),
+            ));
         }
-        return Some((
-            host_config.host.clone(),
-            parts[0].to_string(),
-            parts[1].to_string(),
-        ));
+        // Contains dots/slashes (e.g., SSH URL "git@host:owner/repo") — fall through
     }
 
     let parts: Vec<&str> = spec.splitn(4, '/').collect();
@@ -286,13 +286,6 @@ impl HostRegistry {
         }
 
         Self { hosts }
-    }
-
-    /// Resolve a config name (e.g., "netflix") to its hostname.
-    /// Used by later phases (Phase 2+) to resolve named references.
-    #[allow(dead_code)]
-    pub fn host_for_name<'a>(&self, name: &str, config: &'a LabConfig) -> Option<&'a str> {
-        config.github_hosts.get(name).map(|c| c.host.as_str())
     }
 
     /// All known hostnames (always includes `github.com`).
@@ -440,6 +433,20 @@ impl LabConfig {
 
         if self.daemon.max_resume_attempts == 0 {
             anyhow::bail!("max_resume_attempts must be at least 1");
+        }
+
+        // Validate github_hosts entries
+        for (name, gh_host) in &self.github_hosts {
+            if gh_host.host.is_empty() {
+                anyhow::bail!("[github_hosts.{}]: 'host' must not be empty", name);
+            }
+            if !gh_host.host.contains('.') {
+                anyhow::bail!(
+                    "[github_hosts.{}]: 'host' value '{}' does not look like a hostname (no dot)",
+                    name,
+                    gh_host.host
+                );
+            }
         }
 
         // Validate repo format and host name references
@@ -839,6 +846,11 @@ repos = ["owner/repo1", "ghe.example.com/org/svc1", "ghe.example.com/org/svc2"]
 
     // --- parse_repo_entry tests ---
 
+    /// Convenience wrapper for tests that don't need named host resolution.
+    fn parse_repo_entry(spec: &str) -> Option<(String, String, String)> {
+        parse_repo_entry_with_hosts(spec, &HashMap::new())
+    }
+
     #[test]
     fn test_parse_repo_entry_owner_repo() {
         let result = parse_repo_entry("owner/repo");
@@ -1036,24 +1048,6 @@ repos = ["owner/repo1", "ghe.example.com/org/svc1", "ghe.example.com/org/svc2"]
         assert_eq!(registry.web_url_for("ghe.corp.com"), "https://ghe.corp.com");
     }
 
-    #[test]
-    fn test_host_registry_host_for_name() {
-        let mut config = LabConfig::default();
-        config.github_hosts.insert(
-            "netflix".to_string(),
-            GhHostConfig {
-                host: "git.netflix.net".to_string(),
-                web_url: None,
-            },
-        );
-        let registry = HostRegistry::from_config(&config);
-        assert_eq!(
-            registry.host_for_name("netflix", &config),
-            Some("git.netflix.net")
-        );
-        assert_eq!(registry.host_for_name("unknown", &config), None);
-    }
-
     // --- Validation tests for named host references ---
 
     #[test]
@@ -1084,6 +1078,36 @@ repos = ["owner/repo1", "ghe.example.com/org/svc1", "ghe.example.com/org/svc2"]
         config.daemon.repos = vec![":owner/repo".to_string()];
         let err = config.validate().unwrap_err();
         assert!(err.to_string().contains("Empty host name prefix"));
+    }
+
+    #[test]
+    fn test_validate_github_host_empty_host() {
+        let mut config = LabConfig::default();
+        config.github_hosts.insert(
+            "bad".to_string(),
+            GhHostConfig {
+                host: "".to_string(),
+                web_url: None,
+            },
+        );
+        config.daemon.repos = vec!["owner/repo".to_string()];
+        let err = config.validate().unwrap_err();
+        assert!(err.to_string().contains("'host' must not be empty"));
+    }
+
+    #[test]
+    fn test_validate_github_host_no_dot() {
+        let mut config = LabConfig::default();
+        config.github_hosts.insert(
+            "bad".to_string(),
+            GhHostConfig {
+                host: "localhost".to_string(),
+                web_url: None,
+            },
+        );
+        config.daemon.repos = vec!["owner/repo".to_string()];
+        let err = config.validate().unwrap_err();
+        assert!(err.to_string().contains("does not look like a hostname"));
     }
 
     // --- Config parsing with github_hosts ---
