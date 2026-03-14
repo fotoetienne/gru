@@ -579,8 +579,6 @@ pub async fn post_escalation_comment(
     failed_checks: &[CheckRun],
     attempts: u32,
 ) -> Result<()> {
-    let repo_full = format!("{}/{}", owner, repo);
-
     let mut body = format!(
         "## 🚨 CI Fix Escalation\n\n\
          Automated CI fix failed after **{}/{}** attempts. Human intervention required.\n\n\
@@ -609,45 +607,7 @@ pub async fn post_escalation_comment(
 
     body.push_str(&format!("\n**Labels:** `{}`\n", labels::BLOCKED));
 
-    let gh_cmd = github::gh_command_for_repo(&repo_full);
-    let output = Command::new(gh_cmd)
-        .args([
-            "pr",
-            "comment",
-            &pr_number.to_string(),
-            "--repo",
-            &repo_full,
-            "--body",
-            &body,
-        ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .await
-        .context("Failed to post escalation comment")?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("Failed to post escalation comment: {}", stderr);
-    }
-
-    // Add the blocked label
-    let _ = Command::new(gh_cmd)
-        .args([
-            "pr",
-            "edit",
-            &pr_number.to_string(),
-            "--repo",
-            &repo_full,
-            "--add-label",
-            labels::BLOCKED,
-        ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .await;
-
-    Ok(())
+    post_escalation_comment_body(owner, repo, pr_number, &body).await
 }
 
 /// Post an escalation comment when CI exhaustion occurs due to timeout or no-commits.
@@ -658,8 +618,6 @@ pub async fn post_exhaustion_escalation_comment(
     reason: &str,
     attempts: u32,
 ) -> Result<()> {
-    let repo_full = format!("{}/{}", owner, repo);
-
     let body = format!(
         "## 🚨 CI Fix Escalation\n\n\
          Automated CI fix failed after **{}/{}** attempts. Human intervention required.\n\n\
@@ -672,7 +630,19 @@ pub async fn post_exhaustion_escalation_comment(
         labels::BLOCKED
     );
 
+    post_escalation_comment_body(owner, repo, pr_number, &body).await
+}
+
+/// Posts an escalation comment body to a PR and adds the blocked label.
+async fn post_escalation_comment_body(
+    owner: &str,
+    repo: &str,
+    pr_number: u64,
+    body: &str,
+) -> Result<()> {
+    let repo_full = format!("{}/{}", owner, repo);
     let gh_cmd = github::gh_command_for_repo(&repo_full);
+
     let output = Command::new(gh_cmd)
         .args([
             "pr",
@@ -681,7 +651,7 @@ pub async fn post_exhaustion_escalation_comment(
             "--repo",
             &repo_full,
             "--body",
-            &body,
+            body,
         ])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
