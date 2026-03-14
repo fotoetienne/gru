@@ -439,15 +439,22 @@ impl MinionRegistry {
         Box::new(move |pid: u32| {
             let _ = std::thread::Builder::new()
                 .name("pid-callback".into())
-                .spawn(move || {
-                    if let Ok(mut registry) = MinionRegistry::load(None) {
-                        let _ = registry.update(&minion_id, |info| {
+                .spawn(move || match MinionRegistry::load(None) {
+                    Ok(mut registry) => {
+                        if let Err(e) = registry.update(&minion_id, |info| {
                             info.pid = Some(pid);
                             if let Some(m) = mode {
                                 info.mode = m;
                             }
                             info.last_activity = Utc::now();
-                        });
+                        }) {
+                            log::warn!(
+                                "pid_callback: failed to update registry for {minion_id}: {e:#}"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        log::warn!("pid_callback: failed to load registry for {minion_id}: {e:#}");
                     }
                 });
         })
