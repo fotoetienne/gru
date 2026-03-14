@@ -224,7 +224,7 @@ async fn run_agent_session_inner(
     let agent_run = run_result?;
 
     // Post final completion comment
-    if let Some(ref client) = issue_ctx.github_client {
+    {
         progress_tracker.set_phase(MinionPhase::Completed);
 
         let final_message = if agent_run.status.success() {
@@ -244,7 +244,7 @@ async fn run_agent_session_inner(
         let comment_body = update.format_comment();
 
         try_post_progress_comment(
-            client,
+            &issue_ctx.host,
             &issue_ctx.owner,
             &issue_ctx.repo,
             issue_ctx.issue_num,

@@ -1,4 +1,3 @@
-use crate::github::GitHubClient;
 use std::path::PathBuf;
 use std::process::ExitStatus;
 use uuid::Uuid;
@@ -44,7 +43,6 @@ pub(crate) struct IssueContext {
     pub issue_num: u64,
     /// Fetched issue details: (title, body, labels). None if fetch failed.
     pub details: Option<IssueDetails>,
-    pub github_client: Option<GitHubClient>,
 }
 
 /// Fetched issue metadata from GitHub.

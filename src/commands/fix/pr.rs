@@ -1,5 +1,4 @@
 use super::types::{IssueContext, WorktreeContext};
-use crate::github::GitHubClient;
 use crate::minion_registry::with_registry;
 use crate::pr_state::PrState;
 use anyhow::{Context, Result};
@@ -91,11 +90,6 @@ async fn create_pr_for_issue(
     // Get issue title - use provided title if available, otherwise fetch
     let issue_title = if let Some(title) = issue_title_opt {
         title.to_string()
-    } else if let Some(github_client) = GitHubClient::try_from_env_with_host(host).await {
-        match github_client.get_issue(owner, repo, issue_num).await {
-            Ok(issue) => issue.title,
-            Err(_) => "Fix issue".to_string(),
-        }
     } else {
         match crate::github::get_issue_via_cli(owner, repo, host, issue_num).await {
             Ok(info) => info.title,
@@ -249,22 +243,24 @@ pub(crate) async fn handle_pr_creation(
 
             println!("✅ Draft PR created: #{}", pr_number);
             println!(
-                "🔗 View PR at: https://github.com/{}/{}/pull/{}",
-                issue_ctx.owner, issue_ctx.repo, pr_number
+                "🔗 View PR at: https://{}/{}/{}/pull/{}",
+                issue_ctx.host, issue_ctx.owner, issue_ctx.repo, pr_number
             );
 
             // Mark issue as done (fire-and-forget)
-            if let Some(ref client) = issue_ctx.github_client {
-                match client
-                    .mark_issue_done(&issue_ctx.owner, &issue_ctx.repo, issue_ctx.issue_num)
-                    .await
-                {
-                    Ok(()) => {
-                        println!("🏷️  Updated issue label to '{}'", crate::labels::DONE);
-                    }
-                    Err(e) => {
-                        log::warn!("⚠️  Failed to update issue label: {}", e);
-                    }
+            match crate::github::mark_issue_done_via_cli(
+                &issue_ctx.host,
+                &issue_ctx.owner,
+                &issue_ctx.repo,
+                issue_ctx.issue_num,
+            )
+            .await
+            {
+                Ok(()) => {
+                    println!("🏷️  Updated issue label to '{}'", crate::labels::DONE);
+                }
+                Err(e) => {
+                    log::warn!("⚠️  Failed to update issue label: {}", e);
                 }
             }
 
@@ -278,7 +274,8 @@ pub(crate) async fn handle_pr_creation(
                     wt_ctx.branch_name
                 );
                 log::info!(
-                    "   Check: https://github.com/{}/{}/pulls",
+                    "   Check: https://{}/{}/{}/pulls",
+                    issue_ctx.host,
                     issue_ctx.owner,
                     issue_ctx.repo
                 );

@@ -1,27 +1,11 @@
 use super::types::{ExistingMinionCheck, IssueContext, IssueDetails};
-use crate::github::GitHubClient;
 use crate::minion_registry::{is_process_alive, with_registry, MinionMode, OrchestrationPhase};
 use crate::url_utils::parse_issue_info;
 use anyhow::{Context, Result};
 
-/// Handles GitHub CLI fetch result with fallback
-fn handle_cli_fetch_result(result: Result<crate::github::IssueInfo>) -> Option<IssueDetails> {
-    match result {
-        Ok(info) => Some(IssueDetails {
-            title: info.title,
-            body: info.body.unwrap_or_default(),
-            labels: String::new(), // CLI doesn't return labels in IssueInfo
-        }),
-        Err(e) => {
-            eprintln!("⚠️  Failed to fetch issue details via CLI: {}", e);
-            None
-        }
-    }
-}
-
 /// Resolves an issue argument into validated context.
 ///
-/// Parses the issue string, initializes the GitHub client, and fetches issue details.
+/// Parses the issue string and fetches issue details via gh CLI.
 /// Note: Does NOT claim the issue — that happens after worktree setup to avoid
 /// marking issues as in-progress when setup fails.
 /// Note: Existing minion check is done in `handle_fix` to support resume logic.
@@ -31,19 +15,8 @@ pub(crate) async fn resolve_issue(issue: &str, github_hosts: &[String]) -> Resul
         .parse()
         .context("Failed to parse issue number")?;
 
-    // Initialize GitHub client (optional - only if token is available)
-    let github_client = match GitHubClient::from_env_with_host(&owner, &repo, &host).await {
-        Ok(client) => Some(client),
-        Err(err) => {
-            eprintln!(
-                "⚠️  GitHub authentication error - progress comments will not be posted: {err}"
-            );
-            None
-        }
-    };
-
-    // Fetch issue details
-    let details = fetch_issue_details(&owner, &repo, &host, issue_num, &github_client).await;
+    // Fetch issue details via CLI
+    let details = fetch_issue_details(&owner, &repo, &host, issue_num).await;
 
     Ok(IssueContext {
         owner,
@@ -51,7 +24,6 @@ pub(crate) async fn resolve_issue(issue: &str, github_hosts: &[String]) -> Resul
         host,
         issue_num,
         details,
-        github_client,
     })
 }
 
@@ -162,23 +134,42 @@ pub(super) async fn check_existing_minions(
     Ok(ExistingMinionCheck::None)
 }
 
-/// Claims an issue by adding the in-progress label.
-pub(super) async fn claim_issue(client: &GitHubClient, owner: &str, repo: &str, issue_num: u64) {
-    match client.claim_issue(owner, repo, issue_num).await {
-        Ok(true) => {
+/// Claims an issue by adding the in-progress label via CLI.
+///
+/// Fetches current labels first to detect race conditions (another minion
+/// already claimed the issue). Returns silently on errors since claiming
+/// is fire-and-forget.
+pub(super) async fn claim_issue(host: &str, owner: &str, repo: &str, issue_num: u64) {
+    // Check current labels to detect race conditions
+    match crate::github::get_issue_via_cli(owner, repo, host, issue_num).await {
+        Ok(info) => {
+            let has_in_progress = info
+                .labels
+                .iter()
+                .any(|l| l.name == crate::labels::IN_PROGRESS);
+            if has_in_progress {
+                log::warn!(
+                    "⚠️  Issue #{} is already claimed by another Minion",
+                    issue_num
+                );
+                log::warn!("   This may indicate a race condition or multiple gru instances.");
+                log::warn!("   Continuing anyway; will proceed to create or reuse a worktree...");
+                return;
+            }
+        }
+        Err(e) => {
+            log::warn!("⚠️  Failed to check issue labels: {}", e);
+            log::warn!("   Proceeding with claim attempt anyway...");
+        }
+    }
+
+    match crate::github::claim_issue_via_cli(host, owner, repo, issue_num).await {
+        Ok(()) => {
             println!(
                 "🏷️  Added '{}' label to issue #{}",
                 crate::labels::IN_PROGRESS,
                 issue_num
             );
-        }
-        Ok(false) => {
-            log::warn!(
-                "⚠️  Issue #{} is already claimed by another Minion",
-                issue_num
-            );
-            log::warn!("   This may indicate a race condition or multiple gru instances.");
-            log::warn!("   Continuing anyway; will proceed to create or reuse a worktree...");
         }
         Err(e) => {
             log::warn!("⚠️  Failed to add label to issue: {}", e);
@@ -187,48 +178,31 @@ pub(super) async fn claim_issue(client: &GitHubClient, owner: &str, repo: &str, 
     }
 }
 
-/// Fetches issue details from GitHub API with CLI fallback.
+/// Fetches issue details from GitHub using the gh CLI.
 async fn fetch_issue_details(
     owner: &str,
     repo: &str,
     host: &str,
     issue_num: u64,
-    github_client: &Option<GitHubClient>,
 ) -> Option<IssueDetails> {
-    if let Some(ref client) = github_client {
-        match client.get_issue(owner, repo, issue_num).await {
-            Ok(issue) => {
-                let labels = issue
-                    .labels
-                    .iter()
-                    .map(|l| l.name.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                let body = issue.body.unwrap_or_default();
-                Some(IssueDetails {
-                    title: issue.title,
-                    body,
-                    labels,
-                })
-            }
-            Err(e) => {
-                eprintln!("⚠️  Failed to fetch issue details via API: {}", e);
-                eprintln!("   Falling back to gh CLI...");
-                let cli_result =
-                    crate::github::get_issue_via_cli(owner, repo, host, issue_num).await;
-                let result = handle_cli_fetch_result(cli_result);
-                if result.is_none() {
-                    eprintln!("   Fix authentication with: gh auth login");
-                }
-                result
-            }
+    match crate::github::get_issue_via_cli(owner, repo, host, issue_num).await {
+        Ok(info) => {
+            let labels = info
+                .labels
+                .iter()
+                .map(|l| l.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            Some(IssueDetails {
+                title: info.title,
+                body: info.body.unwrap_or_default(),
+                labels,
+            })
         }
-    } else {
-        let cli_result = crate::github::get_issue_via_cli(owner, repo, host, issue_num).await;
-        let result = handle_cli_fetch_result(cli_result);
-        if result.is_none() {
+        Err(e) => {
+            eprintln!("⚠️  Failed to fetch issue details via CLI: {}", e);
             eprintln!("   Fix authentication with: gh auth login");
+            None
         }
-        result
     }
 }
