@@ -387,7 +387,7 @@ pub async fn handle_clean(dry_run: bool, force: bool, base_branch: &str) -> Resu
         println!("Cleanable worktrees:\n");
         for (wt, status) in &cleanable {
             let reason = match status {
-                worktree_scanner::WorktreeStatus::Merged => "branch merged",
+                worktree_scanner::WorktreeStatus::Merged => "no unmerged commits",
                 worktree_scanner::WorktreeStatus::PrMerged => "PR merged",
                 worktree_scanner::WorktreeStatus::IssueClosed => "issue closed",
                 worktree_scanner::WorktreeStatus::RemoteDeleted => "remote deleted",

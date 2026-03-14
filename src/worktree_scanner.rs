@@ -22,7 +22,8 @@ pub struct Worktree {
 /// Status of a worktree indicating whether it can be cleaned
 #[derive(Debug, PartialEq)]
 pub enum WorktreeStatus {
-    /// Branch has been merged into the base branch
+    /// Branch has no unmerged commits relative to the base branch (either fully
+    /// merged or freshly created with no new commits yet)
     Merged,
     /// PR was merged on GitHub (e.g., squash merge where commit hashes differ)
     PrMerged,
