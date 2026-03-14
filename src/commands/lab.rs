@@ -1,4 +1,4 @@
-use crate::config::{parse_repo_entry, LabConfig};
+use crate::config::{parse_repo_entry_with_hosts, LabConfig};
 use crate::github::{list_ready_issues_via_cli, GitHubClient};
 use crate::labels;
 use crate::minion_registry::{
@@ -199,7 +199,7 @@ fn configured_repos(config: &LabConfig) -> HashSet<String> {
         .repos
         .iter()
         .filter_map(|spec| {
-            let (_host, owner, repo) = parse_repo_entry(spec)?;
+            let (_host, owner, repo) = parse_repo_entry_with_hosts(spec, &config.github_hosts)?;
             Some(format!("{}/{}", owner, repo))
         })
         .collect()
@@ -209,7 +209,7 @@ fn configured_repos(config: &LabConfig) -> HashSet<String> {
 /// Returns `None` if the repo is not in the config.
 fn host_for_repo(config: &LabConfig, owner_repo: &str) -> Option<String> {
     for spec in &config.daemon.repos {
-        if let Some((host, owner, repo)) = parse_repo_entry(spec) {
+        if let Some((host, owner, repo)) = parse_repo_entry_with_hosts(spec, &config.github_hosts) {
             if format!("{}/{}", owner, repo) == owner_repo {
                 return Some(host);
             }
@@ -423,8 +423,9 @@ async fn poll_and_spawn(
             break;
         }
 
-        // Parse owner/repo or host/owner/repo
-        let (host, owner, repo) = match parse_repo_entry(repo_spec) {
+        // Parse owner/repo, host/owner/repo, or name:owner/repo
+        let (host, owner, repo) = match parse_repo_entry_with_hosts(repo_spec, &config.github_hosts)
+        {
             Some(parsed) => parsed,
             None => {
                 log::warn!("⚠️  Invalid repo format: '{}', skipping", repo_spec);

@@ -57,7 +57,9 @@ pub(crate) fn infer_github_host(owner: &str) -> String {
     let cfg = crate::config::try_load_config();
     if let Some(cfg) = cfg {
         for repo_spec in &cfg.daemon.repos {
-            if let Some((host, repo_owner, _repo)) = crate::config::parse_repo_entry(repo_spec) {
+            if let Some((host, repo_owner, _repo)) =
+                crate::config::parse_repo_entry_with_hosts(repo_spec, &cfg.github_hosts)
+            {
                 if repo_owner == owner && host != "github.com" {
                     return host;
                 }

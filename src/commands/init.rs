@@ -219,7 +219,7 @@ async fn detect_current_repo() -> Result<(String, String, String)> {
     let _git_dir = detect_git_repo().await.context("Not in a git repository")?;
 
     // Get the remote URL (function doesn't need git_dir - it uses current directory)
-    let github_hosts = crate::config::load_github_hosts();
+    let github_hosts = crate::config::load_host_registry().all_hosts();
     let remote_url = get_github_remote(&github_hosts)
         .await
         .context("No GitHub remote found in current repository")?;

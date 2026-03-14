@@ -284,7 +284,7 @@ async fn resolve_pr_from_arg(arg: &str) -> Result<(String, String, String, Strin
     }
 
     // Strategy 2: Try as PR number or URL (existing behavior)
-    let github_hosts = crate::config::load_github_hosts();
+    let github_hosts = crate::config::load_host_registry().all_hosts();
     match parse_pr_info(arg, &github_hosts).await {
         Ok(pr_info) => return Ok(pr_info),
         Err(e) => errors.push(format!("PR number/URL '{}': {:#}", arg, e)),
@@ -351,7 +351,7 @@ async fn get_pr_info_from_number(pr_num: &str) -> Result<(String, String, String
         .with_context(|| format!("Invalid PR number format: '{}'", pr_num))?;
 
     // Use parse_pr_info which fetches metadata from GitHub
-    let github_hosts = crate::config::load_github_hosts();
+    let github_hosts = crate::config::load_host_registry().all_hosts();
     parse_pr_info(pr_num, &github_hosts).await
 }
 
@@ -362,7 +362,7 @@ async fn find_pr_for_issue(issue_num: u64) -> Result<String> {
     git::detect_git_repo()
         .await
         .context("Failed to detect git repository")?;
-    let github_hosts = crate::config::load_github_hosts();
+    let github_hosts = crate::config::load_host_registry().all_hosts();
     let remote_url = git::get_github_remote(&github_hosts)
         .await
         .context("Failed to get GitHub remote")?;

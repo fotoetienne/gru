@@ -37,7 +37,7 @@ fn parse_params(params: &[String]) -> Result<HashMap<String, String>> {
 async fn fetch_issue_context(
     issue_str: &str,
 ) -> Result<(PromptContext, String, String, String, u64)> {
-    let github_hosts = crate::config::load_github_hosts();
+    let github_hosts = crate::config::load_host_registry().all_hosts();
     let (owner, repo, issue_num_str, host) = parse_issue_info(issue_str, &github_hosts).await?;
     let issue_number: u64 = issue_num_str
         .parse()
@@ -97,7 +97,7 @@ async fn fetch_issue_context(
 /// For plain numbers, auto-detects the repository from the current directory.
 /// For URLs, extracts components directly.
 async fn parse_pr_arg(pr_str: &str) -> Result<(String, String, String, u64)> {
-    let github_hosts = crate::config::load_github_hosts();
+    let github_hosts = crate::config::load_host_registry().all_hosts();
 
     if let Ok(num) = pr_str.parse::<u64>() {
         // Auto-detect repository from current directory
