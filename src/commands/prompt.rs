@@ -2,7 +2,7 @@ use crate::agent::AgentEvent;
 use crate::agent_registry;
 use crate::agent_runner::{run_agent_with_stream_monitoring, EXIT_CODE_SIGNAL_TERMINATED};
 use crate::git;
-use crate::github::GitHubClient;
+use crate::github;
 use crate::minion;
 use crate::minion_registry::{
     with_registry, MinionInfo as RegistryMinionInfo, MinionMode, MinionRegistry, OrchestrationPhase,
@@ -53,35 +53,11 @@ async fn fetch_issue_context(
     context.repo_owner = Some(owner.clone());
     context.repo_name = Some(repo.clone());
 
-    // Try API first, fall back to CLI
-    if let Some(github_client) = GitHubClient::try_from_env_with_host(&host).await {
-        match github_client.get_issue(&owner, &repo, issue_number).await {
-            Ok(issue) => {
-                context.issue_title = Some(issue.title.clone());
-                context.issue_body = Some(issue.body.unwrap_or_default());
-            }
-            Err(e) => {
-                log::warn!(
-                    "Failed to fetch issue via API: {}. Falling back to gh CLI...",
-                    e
-                );
-                let info = crate::github::get_issue_via_cli(&owner, &repo, &host, issue_number)
-                    .await
-                    .context("Failed to fetch issue via gh CLI")?;
-                context.issue_title = Some(info.title);
-                context.issue_body = Some(info.body.unwrap_or_default());
-            }
-        }
-    } else {
-        let info = crate::github::get_issue_via_cli(&owner, &repo, &host, issue_number)
-            .await
-            .context(
-                "Failed to fetch issue. Ensure gh is installed and authenticated, \
-                 or set GRU_GITHUB_TOKEN.",
-            )?;
-        context.issue_title = Some(info.title);
-        context.issue_body = Some(info.body.unwrap_or_default());
-    }
+    let info = github::get_issue_via_cli(&owner, &repo, &host, issue_number)
+        .await
+        .context("Failed to fetch issue. Ensure gh is installed and authenticated.")?;
+    context.issue_title = Some(info.title);
+    context.issue_body = Some(info.body.unwrap_or_default());
 
     println!(
         "   Issue #{}: {}",
@@ -145,40 +121,12 @@ async fn fetch_pr_context(pr_str: &str) -> Result<(PromptContext, String, String
     context.repo_owner = Some(owner.clone());
     context.repo_name = Some(repo.clone());
 
-    let branch_name;
-
-    // Try API first, fall back to CLI
-    if let Some(github_client) = GitHubClient::try_from_env_with_host(&host).await {
-        match github_client.get_pr(&owner, &repo, pr_number).await {
-            Ok(pr) => {
-                context.pr_title = Some(pr.title.clone().unwrap_or_default());
-                context.pr_body = Some(pr.body.unwrap_or_default());
-                branch_name = pr.head.ref_field.clone();
-            }
-            Err(e) => {
-                log::warn!(
-                    "Failed to fetch PR via API: {}. Falling back to gh CLI...",
-                    e
-                );
-                let info = crate::github::get_pr_via_cli(&owner, &repo, &host, pr_number)
-                    .await
-                    .context("Failed to fetch PR via gh CLI")?;
-                context.pr_title = Some(info.title);
-                context.pr_body = Some(info.body.unwrap_or_default());
-                branch_name = info.head_ref_name;
-            }
-        }
-    } else {
-        let info = crate::github::get_pr_via_cli(&owner, &repo, &host, pr_number)
-            .await
-            .context(
-                "Failed to fetch PR. Ensure gh is installed and authenticated, \
-                 or set GRU_GITHUB_TOKEN.",
-            )?;
-        context.pr_title = Some(info.title);
-        context.pr_body = Some(info.body.unwrap_or_default());
-        branch_name = info.head_ref_name;
-    }
+    let info = github::get_pr_via_cli(&owner, &repo, &host, pr_number)
+        .await
+        .context("Failed to fetch PR. Ensure gh is installed and authenticated.")?;
+    context.pr_title = Some(info.title);
+    context.pr_body = Some(info.body.unwrap_or_default());
+    let branch_name = info.head_ref_name;
 
     println!(
         "   PR #{}: {}",

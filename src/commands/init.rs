@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 use crate::config::LabConfig;
 use crate::git::GitRepo;
-use crate::github::GitHubClient;
+use crate::github;
 use crate::labels;
 use crate::workspace::Workspace;
 
@@ -62,7 +62,7 @@ pub async fn handle_init(repo_arg: String) -> Result<i32> {
         RepoSource::GitHub(github_repo) => {
             let parts: Vec<&str> = github_repo.split('/').collect();
             let owner = parts[0].to_string();
-            let host = crate::github::infer_github_host(&owner).to_string();
+            let host = github::infer_github_host(&owner).to_string();
             (owner, parts[1].to_string(), host)
         }
         RepoSource::CurrentDir => {
@@ -76,32 +76,16 @@ pub async fn handle_init(repo_arg: String) -> Result<i32> {
 
     println!("Initializing repository: {}/{}\n", owner, repo);
 
-    // 1. Verify GitHub access
+    // 1. Verify GitHub access via gh CLI
     println!("🔐 Verifying GitHub access...");
-    let github_client = match GitHubClient::from_env_with_host(&owner, &repo, &host).await {
-        Ok(client) => client,
-        Err(_) => {
-            log::error!("\n❌ GitHub token not found or invalid\n");
-            log::warn!(
-                "To use Gru, you need a GitHub personal access token with the following scopes:"
-            );
-            log::error!("  • repo (Full control of private repositories)");
-            log::error!("  • read:org (Read org and team membership)\n");
-            log::error!("Create a token at: https://github.com/settings/tokens\n");
-            log::error!("Then set it as an environment variable:");
-            log::error!("  export GRU_GITHUB_TOKEN=ghp_xxxxxxxxxxxx\n");
-            return Ok(1);
-        }
-    };
-
-    // Validate token by fetching current user
-    match github_client.get_authenticated_user().await {
-        Ok(user) => {
-            println!("✓ Authenticated as: {}", user.login);
+    match github::check_auth_via_cli(&host).await {
+        Ok(()) => {
+            println!("✓ Authenticated via gh CLI");
         }
         Err(e) => {
-            log::error!("\n❌ Failed to authenticate with GitHub: {}", e);
-            log::error!("\nPlease check that your GRU_GITHUB_TOKEN is valid.");
+            log::error!("\n❌ GitHub authentication failed: {}", e);
+            log::warn!("Ensure the GitHub CLI (gh) is installed and authenticated:");
+            log::error!("  gh auth login --hostname {}\n", host);
             return Ok(1);
         }
     }
@@ -144,21 +128,14 @@ pub async fn handle_init(repo_arg: String) -> Result<i32> {
         }
     }
 
-    // 4. Create all required labels (idempotent)
+    // 4. Create all required labels (idempotent via --force)
     println!("\n🏷️  Configuring labels...");
     let mut labels_failed = Vec::new();
 
     for (name, color, description) in labels::ALL_LABELS {
-        match github_client
-            .create_label(&owner, &repo, name, color, description)
-            .await
-        {
-            Ok(created) => {
-                if created {
-                    println!("  ✓ Created: {}", name);
-                } else {
-                    println!("  • Exists: {}", name);
-                }
+        match github::create_label_via_cli(&host, &owner, &repo, name, color, description).await {
+            Ok(()) => {
+                println!("  ✓ Ensured: {}", name);
             }
             Err(e) => {
                 labels_failed.push(name.to_string());
@@ -176,10 +153,7 @@ pub async fn handle_init(repo_arg: String) -> Result<i32> {
 
     // 5. Check for ready issues
     println!("\n🔍 Checking for ready issues...");
-    match github_client
-        .list_issues_with_label(&owner, &repo, labels::TODO)
-        .await
-    {
+    match github::list_ready_issues_via_cli(&owner, &repo, &host, labels::TODO).await {
         Ok(issues) => {
             if issues.is_empty() {
                 println!("  No issues labeled '{}' yet", labels::TODO);

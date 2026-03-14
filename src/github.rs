@@ -15,6 +15,7 @@ use crate::labels;
 /// * `host` - GitHub hostname (e.g., "github.com" or "ghe.netflix.net")
 ///
 /// Returns the token if successfully extracted, or None if gh/ghe is not available
+#[allow(dead_code)]
 async fn try_get_token_from_cli_for_host(host: &str) -> Option<String> {
     let gh_cmd = gh_command_for_host(host);
 
@@ -133,6 +134,7 @@ pub fn gh_command_for_repo(repo: &str) -> &'static str {
 ///
 /// # Arguments
 /// * `host` - GitHub hostname (e.g., "github.com" or "ghe.netflix.net")
+#[allow(dead_code)]
 async fn get_github_token_for_host(host: &str) -> Result<String> {
     // Try CLI first
     if let Some(token) = try_get_token_from_cli_for_host(host).await {
@@ -172,6 +174,7 @@ pub struct GitHubClient {
     client: Octocrab,
 }
 
+#[allow(dead_code)]
 impl GitHubClient {
     /// Initialize a new GitHub client targeting a specific host.
     ///
