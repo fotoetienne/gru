@@ -1008,13 +1008,19 @@ mod tests {
     #[test]
     fn test_infer_github_host_netflix_org() {
         let host = infer_github_host("netflix");
-        assert_ne!(host, "github.com", "netflix owner should resolve to a GHE host");
+        assert_ne!(
+            host, "github.com",
+            "netflix owner should resolve to a GHE host"
+        );
     }
 
     #[test]
     fn test_infer_github_host_netflix_substring() {
         let host = infer_github_host("netflix-oss");
-        assert_ne!(host, "github.com", "netflix-oss owner should resolve to a GHE host");
+        assert_ne!(
+            host, "github.com",
+            "netflix-oss owner should resolve to a GHE host"
+        );
     }
 
     #[test]
