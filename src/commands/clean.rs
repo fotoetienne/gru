@@ -4,7 +4,7 @@ use crate::worktree_scanner;
 use anyhow::{Context, Result};
 use std::collections::HashSet;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use tokio::io::AsyncBufReadExt;
 use tokio::process::Command;
 
@@ -55,6 +55,20 @@ fn is_ephemeral_file(path: &Path) -> bool {
     }
 
     false
+}
+
+/// Extract the minion ID from a directory name.
+///
+/// Directory names follow the branch convention `issue-<number>-<minion_id>`
+/// (e.g., `issue-387-M0pf`). Uses `rfind("-M")` to locate the last `-M`
+/// separator and returns everything after the hyphen. If no `-M` is found,
+/// returns the full string as-is (preserving the previous behavior as a fallback).
+fn extract_minion_id_from_dir(dir_name: &str) -> &str {
+    if let Some(pos) = dir_name.rfind("-M") {
+        &dir_name[pos + 1..]
+    } else {
+        dir_name
+    }
 }
 
 /// Check if worktree contains only ephemeral files
@@ -445,10 +459,38 @@ pub async fn handle_clean(dry_run: bool, force: bool, base_branch: &str) -> Resu
     let mut failed = 0;
     // Collect minion IDs to remove from registry in a single batch
     let mut registry_ids_to_remove: Vec<String> = Vec::new();
+    // Collect worktree paths for fallback registry matching.
+    // We store both canonical and raw paths before removal (dirs won't exist after).
+    // We also store the parent (minion_dir) since registry entries store that as `worktree`.
+    let mut registry_paths_to_remove: HashSet<PathBuf> = HashSet::new();
 
     for (wt, _) in cleanable {
         print!("Removing {}... ", wt.path.display());
         std::io::stdout().flush()?;
+
+        // Capture paths before removal for fallback registry matching.
+        // Include both the worktree path and its parent (minion_dir) since
+        // registry entries store the minion_dir as `worktree`.
+        let paths_for_fallback: Vec<PathBuf> = {
+            let mut paths = vec![wt.path.clone()];
+            if let Ok(canonical) = wt.path.canonicalize() {
+                paths.push(canonical);
+            }
+            if wt
+                .path
+                .file_name()
+                .map(|n| n == "checkout")
+                .unwrap_or(false)
+            {
+                if let Some(parent) = wt.path.parent() {
+                    paths.push(parent.to_path_buf());
+                    if let Ok(canonical) = parent.canonicalize() {
+                        paths.push(canonical);
+                    }
+                }
+            }
+            paths
+        };
 
         // Check if worktree has modified/untracked files
         let (has_modified, only_ephemeral) = match check_worktree_files(&wt.path).await {
@@ -549,9 +591,10 @@ pub async fn handle_clean(dry_run: bool, force: bool, base_branch: &str) -> Resu
                 }
             }
 
-            // Queue minion ID for batch registry removal
-            // For new-style layouts, the minion ID is the parent dir name
-            // For legacy layouts, the minion ID is the worktree dir name
+            // Queue minion ID for batch registry removal.
+            // Directory names follow the branch convention: "issue-<number>-<minion_id>"
+            // (e.g., "issue-387-M0pf"), but registry keys are just the minion ID ("M0pf").
+            // Extract the minion ID suffix from the directory name.
             let dir_for_id = if wt
                 .path
                 .file_name()
@@ -564,9 +607,12 @@ pub async fn handle_clean(dry_run: bool, force: bool, base_branch: &str) -> Resu
             };
             if let Some(dir_name) = dir_for_id {
                 if let Some(dir_str) = dir_name.to_str() {
-                    registry_ids_to_remove.push(dir_str.to_string());
+                    let minion_id = extract_minion_id_from_dir(dir_str);
+                    registry_ids_to_remove.push(minion_id.to_string());
                 }
             }
+            // Also record paths for fallback matching
+            registry_paths_to_remove.extend(paths_for_fallback);
         } else {
             println!("✗");
             let stderr = String::from_utf8_lossy(&status.stderr);
@@ -637,10 +683,31 @@ pub async fn handle_clean(dry_run: bool, force: bool, base_branch: &str) -> Resu
         }
     }
 
-    // Batch-remove all cleaned minions from the registry in a single load/save cycle
-    if !registry_ids_to_remove.is_empty() {
+    // Batch-remove all cleaned minions from the registry in a single load/save cycle.
+    // First try by minion ID, then fall back to matching by worktree path for any
+    // entries that weren't found by ID.
+    if !registry_ids_to_remove.is_empty() || !registry_paths_to_remove.is_empty() {
         if let Err(e) = with_registry(move |registry| {
             registry.remove_batch(&registry_ids_to_remove)?;
+
+            // Fallback: find registry entries whose worktree path matches a removed worktree.
+            // We compare against info.worktree (the minion_dir) directly rather than
+            // checkout_path(), since after removal checkout_path() may resolve differently.
+            // Paths were captured (both raw and canonical) before worktree removal.
+            if !registry_paths_to_remove.is_empty() {
+                let ids_by_path: Vec<String> = registry
+                    .list()
+                    .iter()
+                    .filter(|(_id, info)| {
+                        // Match against the stored worktree (minion_dir) path
+                        registry_paths_to_remove.contains(&info.worktree)
+                    })
+                    .map(|(id, _)| id.clone())
+                    .collect();
+                if !ids_by_path.is_empty() {
+                    registry.remove_batch(&ids_by_path)?;
+                }
+            }
             Ok(())
         })
         .await
@@ -762,5 +829,41 @@ mod tests {
         assert!(is_ephemeral_file(Path::new(
             "foo/bar/node_modules/pkg/index.js"
         )));
+    }
+
+    // --- extract_minion_id_from_dir tests ---
+
+    #[test]
+    fn test_extract_minion_id_standard() {
+        assert_eq!(extract_minion_id_from_dir("issue-387-M0pf"), "M0pf");
+        assert_eq!(extract_minion_id_from_dir("issue-42-M001"), "M001");
+        assert_eq!(extract_minion_id_from_dir("issue-1-M0tk"), "M0tk");
+    }
+
+    #[test]
+    fn test_extract_minion_id_large_issue_number() {
+        assert_eq!(extract_minion_id_from_dir("issue-999999-M0ab"), "M0ab");
+    }
+
+    #[test]
+    fn test_extract_minion_id_bare_id() {
+        // If the dir name is already just a minion ID, return it as-is
+        assert_eq!(extract_minion_id_from_dir("M0pf"), "M0pf");
+    }
+
+    #[test]
+    fn test_extract_minion_id_legacy_uppercase() {
+        // Legacy IDs used uppercase letters for base36 digits 10-35
+        assert_eq!(extract_minion_id_from_dir("issue-42-M00A"), "M00A");
+        assert_eq!(extract_minion_id_from_dir("issue-100-MABC"), "MABC");
+    }
+
+    #[test]
+    fn test_extract_minion_id_no_match_fallback() {
+        // If there's no -M pattern, return the full string
+        assert_eq!(
+            extract_minion_id_from_dir("some-other-dir"),
+            "some-other-dir"
+        );
     }
 }
