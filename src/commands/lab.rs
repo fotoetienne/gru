@@ -619,7 +619,8 @@ async fn spawn_minion(repo: &str, host: &str, issue_number: u64) -> Result<Child
     // Create log directory and open log file for this minion's output
     let home = dirs::home_dir().context("Failed to determine home directory")?;
     let log_dir = home.join(".gru").join("state").join("logs");
-    std::fs::create_dir_all(&log_dir)
+    tokio::fs::create_dir_all(&log_dir)
+        .await
         .with_context(|| format!("Failed to create log directory: {}", log_dir.display()))?;
 
     // Include host in log filename to avoid collisions when the same owner/repo
@@ -645,11 +646,13 @@ async fn spawn_minion(repo: &str, host: &str, issue_number: u64) -> Result<Child
         "{}{}-issue-{}.log",
         safe_host, safe_repo, issue_number
     ));
-    let stdout_file = std::fs::OpenOptions::new()
+    let log_file = tokio::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(&log_path)
+        .await
         .with_context(|| format!("Failed to open log file: {}", log_path.display()))?;
+    let stdout_file = log_file.into_std().await;
     let stderr_file = stdout_file
         .try_clone()
         .context("Failed to clone log file handle")?;
