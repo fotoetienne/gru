@@ -80,6 +80,42 @@ pub enum AgentEvent {
     Ping,
 }
 
+/// An `AgentEvent` with an optional timestamp for persistence.
+///
+/// When written to `events.jsonl`, events are wrapped with a `ts` field
+/// recording the wall-clock time (RFC 3339). Legacy events without `ts`
+/// deserialize with `ts: None`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TimestampedEvent {
+    /// Wall-clock timestamp when the event was recorded (RFC 3339).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ts: Option<String>,
+
+    /// The underlying agent event.
+    #[serde(flatten)]
+    pub event: AgentEvent,
+}
+
+impl TimestampedEvent {
+    /// Wraps an `AgentEvent` with the current UTC time.
+    #[cfg(test)]
+    pub fn now(event: AgentEvent) -> Self {
+        Self {
+            ts: Some(chrono::Utc::now().to_rfc3339()),
+            event,
+        }
+    }
+}
+
+/// Borrowing wrapper for serializing an `AgentEvent` with a timestamp
+/// without cloning the event.
+#[derive(Serialize)]
+pub struct TimestampedEventRef<'a> {
+    pub ts: &'a str,
+    #[serde(flatten)]
+    pub event: &'a AgentEvent,
+}
+
 /// Agent-agnostic accumulated token usage.
 ///
 /// Tracks input and output token counts across an entire agent session.
@@ -428,5 +464,47 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert!(value.get("cache_creation_input_tokens").is_none());
         assert!(value.get("cache_read_input_tokens").is_none());
+    }
+
+    #[test]
+    fn test_timestamped_event_roundtrip() {
+        let te = TimestampedEvent::now(AgentEvent::Ping);
+        assert!(te.ts.is_some());
+        let json = serde_json::to_string(&te).unwrap();
+        let deserialized: TimestampedEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(te, deserialized);
+    }
+
+    #[test]
+    fn test_timestamped_event_json_has_ts_and_type() {
+        let te = TimestampedEvent::now(AgentEvent::Started { usage: None });
+        let json = serde_json::to_string(&te).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(value.get("ts").is_some());
+        assert_eq!(value["type"], "started");
+    }
+
+    #[test]
+    fn test_timestamped_event_legacy_without_ts() {
+        // Legacy events (bare AgentEvent JSON) should deserialize with ts: None
+        let json = r#"{"type": "ping"}"#;
+        let te: TimestampedEvent = serde_json::from_str(json).unwrap();
+        assert_eq!(te.ts, None);
+        assert_eq!(te.event, AgentEvent::Ping);
+    }
+
+    #[test]
+    fn test_timestamped_event_legacy_tool_use_without_ts() {
+        let json = r#"{"type":"tool_use","tool_name":"Read","tool_use_id":"abc"}"#;
+        let te: TimestampedEvent = serde_json::from_str(json).unwrap();
+        assert_eq!(te.ts, None);
+        assert_eq!(
+            te.event,
+            AgentEvent::ToolUse {
+                tool_name: "Read".to_string(),
+                tool_use_id: "abc".to_string(),
+                input_summary: None,
+            }
+        );
     }
 }
