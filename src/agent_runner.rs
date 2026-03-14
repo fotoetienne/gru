@@ -5,7 +5,7 @@
 //! agent process's stdout, delegates parsing to `AgentBackend::parse_events()`,
 //! and passes normalized `AgentEvent` values to the caller's callback.
 
-use crate::agent::{AgentBackend, AgentEvent, TokenUsage};
+use crate::agent::{AgentBackend, AgentEvent, TimestampedEvent, TokenUsage};
 use anyhow::{Context, Result};
 use std::path::Path;
 use std::time::Instant;
@@ -128,6 +128,9 @@ pub fn parse_timeout(timeout_str: &str) -> Result<Duration> {
 }
 
 /// Logs an `AgentEvent` to events.jsonl in the given directory.
+///
+/// Each event is wrapped in a `TimestampedEvent` so the wall-clock time
+/// is persisted alongside the event data.
 async fn log_event(dir: &Path, event: &AgentEvent) -> Result<()> {
     let events_file = dir.join("events.jsonl");
     let mut file = OpenOptions::new()
@@ -137,7 +140,8 @@ async fn log_event(dir: &Path, event: &AgentEvent) -> Result<()> {
         .await
         .context("Failed to open events.jsonl")?;
 
-    let json = serde_json::to_string(event)?;
+    let timestamped = TimestampedEvent::now(event.clone());
+    let json = serde_json::to_string(&timestamped)?;
     file.write_all(json.as_bytes()).await?;
     file.write_all(b"\n").await?;
     file.flush().await?;

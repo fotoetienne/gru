@@ -4,7 +4,7 @@
 //! in real-time (poll-based, no external dependencies). Used by `gru logs`,
 //! `gru tail`, and the auto-tail feature of `gru do`.
 
-use crate::agent::AgentEvent;
+use crate::agent::TimestampedEvent;
 use crate::minion_registry::{is_process_alive, with_registry};
 use crate::progress::{ProgressConfig, ProgressDisplay};
 use anyhow::{Context, Result};
@@ -138,8 +138,8 @@ pub fn replay_events(events_path: &Path, progress: &ProgressDisplay) -> Result<u
         if trimmed.is_empty() {
             continue;
         }
-        if let Ok(event) = serde_json::from_str::<AgentEvent>(trimmed) {
-            progress.handle_event(&event);
+        if let Ok(te) = serde_json::from_str::<TimestampedEvent>(trimmed) {
+            progress.handle_event_with_ts(&te.event, te.ts.as_deref());
         }
     }
 
@@ -205,8 +205,8 @@ fn read_new_events(events_path: &Path, position: u64, progress: &ProgressDisplay
         if trimmed.is_empty() {
             continue;
         }
-        if let Ok(event) = serde_json::from_str::<AgentEvent>(trimmed) {
-            progress.handle_event(&event);
+        if let Ok(te) = serde_json::from_str::<TimestampedEvent>(trimmed) {
+            progress.handle_event_with_ts(&te.event, te.ts.as_deref());
         }
     }
 
@@ -228,7 +228,7 @@ pub fn replay_last_n_events(
     let mut reader = std::io::BufReader::new(file);
 
     // First pass: collect all events
-    let mut events: Vec<AgentEvent> = Vec::new();
+    let mut events: Vec<TimestampedEvent> = Vec::new();
     let mut line_buf = Vec::new();
     loop {
         line_buf.clear();
@@ -243,15 +243,15 @@ pub fn replay_last_n_events(
         if trimmed.is_empty() {
             continue;
         }
-        if let Ok(event) = serde_json::from_str::<AgentEvent>(trimmed) {
-            events.push(event);
+        if let Ok(te) = serde_json::from_str::<TimestampedEvent>(trimmed) {
+            events.push(te);
         }
     }
 
     // Replay only the last N events
     let start = events.len().saturating_sub(n);
-    for event in &events[start..] {
-        progress.handle_event(event);
+    for te in &events[start..] {
+        progress.handle_event_with_ts(&te.event, te.ts.as_deref());
     }
 
     let position = reader

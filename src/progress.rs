@@ -1,6 +1,6 @@
 use crate::agent::AgentEvent;
 use crate::text_buffer::TextBuffer;
-use chrono::Local;
+use chrono::{DateTime, Local};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -91,8 +91,30 @@ impl ProgressDisplay {
         let _ = self.multi.println(event_text);
     }
 
+    /// Format a timestamp string for display.
+    ///
+    /// If `ts` is a valid RFC 3339 timestamp, returns the local `HH:MM:SS`.
+    /// For legacy events without a timestamp, returns `--:--:--`.
+    fn format_timestamp(ts: Option<&str>) -> String {
+        match ts {
+            Some(s) => DateTime::parse_from_rfc3339(s)
+                .map(|dt| dt.with_timezone(&Local).format("%H:%M:%S").to_string())
+                .unwrap_or_else(|_| "--:--:--".to_string()),
+            None => "--:--:--".to_string(),
+        }
+    }
+
     /// Process a normalized agent event and update the display.
+    ///
+    /// When called from live streaming (agent_runner callback), `ts` is `None`
+    /// and the current wall-clock time is used. When replaying from
+    /// `events.jsonl`, the persisted timestamp is passed in.
     pub fn handle_event(&self, event: &AgentEvent) {
+        self.handle_event_with_ts(event, None);
+    }
+
+    /// Process a normalized agent event with an explicit timestamp.
+    pub fn handle_event_with_ts(&self, event: &AgentEvent, ts: Option<&str>) {
         if self.config.quiet {
             // In quiet mode, only show errors
             if let AgentEvent::Error { message } = event {
@@ -106,7 +128,10 @@ impl ProgressDisplay {
             return;
         }
 
-        let timestamp = Local::now().format("%H:%M:%S");
+        let timestamp = match ts {
+            Some(_) => Self::format_timestamp(ts),
+            None => Local::now().format("%H:%M:%S").to_string(),
+        };
 
         match event {
             AgentEvent::Started { .. } => {
@@ -299,5 +324,26 @@ mod tests {
 
         // Verify quiet mode is enabled (output is suppressed in handle_event)
         assert!(display.config.quiet);
+    }
+
+    #[test]
+    fn test_format_timestamp_valid_rfc3339() {
+        let ts = "2025-01-15T14:30:45.123+00:00";
+        let formatted = ProgressDisplay::format_timestamp(Some(ts));
+        // Should produce a valid HH:MM:SS string (exact value depends on local timezone)
+        assert_eq!(formatted.len(), 8);
+        assert!(formatted.contains(':'));
+    }
+
+    #[test]
+    fn test_format_timestamp_none() {
+        let formatted = ProgressDisplay::format_timestamp(None);
+        assert_eq!(formatted, "--:--:--");
+    }
+
+    #[test]
+    fn test_format_timestamp_invalid() {
+        let formatted = ProgressDisplay::format_timestamp(Some("not-a-timestamp"));
+        assert_eq!(formatted, "--:--:--");
     }
 }
