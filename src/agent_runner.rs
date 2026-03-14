@@ -5,7 +5,7 @@
 //! agent process's stdout, delegates parsing to `AgentBackend::parse_events()`,
 //! and passes normalized `AgentEvent` values to the caller's callback.
 
-use crate::agent::{AgentBackend, AgentEvent, TimestampedEvent, TokenUsage};
+use crate::agent::{AgentBackend, AgentEvent, TimestampedEventRef, TokenUsage};
 use anyhow::{Context, Result};
 use std::path::Path;
 use std::time::Instant;
@@ -140,7 +140,8 @@ async fn log_event(dir: &Path, event: &AgentEvent) -> Result<()> {
         .await
         .context("Failed to open events.jsonl")?;
 
-    let timestamped = TimestampedEvent::now(event.clone());
+    let ts = chrono::Utc::now().to_rfc3339();
+    let timestamped = TimestampedEventRef { ts: &ts, event };
     let json = serde_json::to_string(&timestamped)?;
     file.write_all(json.as_bytes()).await?;
     file.write_all(b"\n").await?;
