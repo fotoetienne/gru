@@ -8,7 +8,10 @@ use tokio::process::Command;
 /// Returns true if the signal was delivered successfully.
 #[cfg(unix)]
 fn send_signal(pid: u32, signal: i32) -> bool {
-    unsafe { libc::kill(pid as i32, signal) == 0 }
+    let Ok(pid_i32) = i32::try_from(pid) else {
+        return false;
+    };
+    unsafe { libc::kill(pid_i32, signal) == 0 }
 }
 
 #[cfg(not(unix))]
@@ -154,8 +157,13 @@ async fn terminate_claude_in_worktree(worktree_path: &Path, force: bool) -> Resu
         }
     };
 
-    // pgrep exits 1 when no processes match — that's not an error
-    if !output.status.success() {
+    // pgrep exits 1 when no processes match, 2+ on error
+    let exit_code = output.status.code().unwrap_or(-1);
+    if exit_code == 1 {
+        return Ok(0);
+    } else if exit_code != 0 {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        log::warn!("pgrep exited with code {}: {}", exit_code, stderr.trim());
         return Ok(0);
     }
 
@@ -197,7 +205,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_terminate_claude_in_worktree_nonexistent() {
-        let temp_path = std::env::temp_dir().join("gru-test-nonexistent-worktree");
+        let temp_path = std::env::temp_dir().join("gru-stop-test-sigterm-no-match");
         let result = terminate_claude_in_worktree(&temp_path, false).await;
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), 0);
@@ -205,7 +213,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_terminate_claude_in_worktree_force() {
-        let temp_path = std::env::temp_dir().join("gru-test-nonexistent-worktree-force");
+        let temp_path = std::env::temp_dir().join("gru-stop-test-sigkill-no-match");
         let result = terminate_claude_in_worktree(&temp_path, true).await;
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), 0);
