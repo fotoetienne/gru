@@ -115,7 +115,7 @@ git commit --no-verify
 - `src/pr_monitor.rs` - PR polling for reviews, CI status, and merge state
 - `src/pr_state.rs` - PR state persistence (`.gru_pr_state.json`)
 - `src/worktree_scanner.rs` - Discovers and checks status of worktrees
-- `src/github.rs` - GitHub API client (octocrab + gh/ghe CLI wrappers)
+- `src/github.rs` - GitHub API functions (gh CLI wrappers)
 - `src/url_utils.rs` - Issue/PR URL parsing
 - `src/config.rs` - TOML configuration loader (`~/.gru/config.toml`)
 - `src/prompt_loader.rs` - Built-in and custom prompt file loading
