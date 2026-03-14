@@ -71,7 +71,7 @@ fn calculate_retry_delay(attempt: u32) -> u64 {
 /// Execute a gh API command with retry logic and exponential backoff.
 ///
 /// # Arguments
-/// * `repo` - Repository identifier in "owner/repo" format (used to select `gh` or `ghe`)
+/// * `host` - GitHub hostname (e.g., "github.com" or "git.netflix.net")
 /// * `args` - The arguments to pass to the gh command
 /// * `max_retries` - Maximum number of retry attempts (default: 5)
 ///
