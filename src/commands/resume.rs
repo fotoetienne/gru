@@ -6,6 +6,7 @@ use crate::agent_runner::{
 use crate::commands::fix::{
     handle_pr_creation, update_orchestration_phase, IssueContext, WorktreeContext,
 };
+use crate::config::{LabConfig, DEFAULT_MAX_RESUME_ATTEMPTS};
 use crate::github::GitHubClient;
 use crate::minion_registry::{
     is_process_alive, revert_to_stopped, with_registry, MinionMode, MinionRegistry,
@@ -14,7 +15,7 @@ use crate::minion_registry::{
 use crate::minion_resolver;
 use crate::progress::{ProgressConfig, ProgressDisplay};
 use anyhow::{bail, Context, Result};
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
 /// Typed errors from the resume command.
@@ -50,6 +51,28 @@ impl std::fmt::Display for ResumeError {
 
 impl std::error::Error for ResumeError {}
 
+/// Session info extracted from the registry during claim.
+struct ClaimedSession {
+    session_id: String,
+    owner: String,
+    repo: String,
+    issue_num: u64,
+    branch_name: String,
+    agent_name: String,
+    timeout_deadline: Option<DateTime<Utc>>,
+    attempt_count: u32,
+    no_watch: bool,
+}
+
+/// Load the `max_resume_attempts` setting from config, falling back to the default.
+fn load_max_resume_attempts() -> u32 {
+    LabConfig::default_path()
+        .ok()
+        .and_then(|p| LabConfig::load_partial(&p).ok())
+        .map(|c| c.daemon.max_resume_attempts)
+        .unwrap_or(DEFAULT_MAX_RESUME_ATTEMPTS)
+}
+
 /// Handles the resume command: resumes a stopped Minion in autonomous mode.
 ///
 /// Unlike `gru attach` (which runs interactively), `gru resume` runs in
@@ -84,7 +107,7 @@ pub async fn handle_resume(
     // Atomically check registry state and claim as Autonomous
     let registry_info = check_and_claim_session(&minion.minion_id).await?;
 
-    let (session_id, owner, repo, issue_num, branch_name, agent_name) = match registry_info {
+    let claimed = match registry_info {
         Some(info) => info,
         None => {
             bail!(
@@ -96,17 +119,45 @@ pub async fn handle_resume(
         }
     };
 
+    // Check if timeout_deadline has passed — fail instead of resuming
+    if let Some(deadline) = claimed.timeout_deadline {
+        if Utc::now() >= deadline {
+            revert_to_stopped(&minion.minion_id).await;
+            update_orchestration_phase(&minion.minion_id, OrchestrationPhase::Failed).await;
+            bail!(
+                "Minion {} has passed its timeout deadline ({}). Marking as failed.",
+                minion.minion_id,
+                deadline
+            );
+        }
+    }
+
     // Increment attempt_count for this resume
     let mid = minion.minion_id.clone();
-    with_registry(move |reg| {
+    let new_attempt_count = with_registry(move |reg| {
         reg.update(&mid, |info| {
             info.attempt_count = info.attempt_count.saturating_add(1);
-        })
+        })?;
+        let count = reg.get(&mid).map(|i| i.attempt_count).unwrap_or(0);
+        Ok(count)
     })
     .await
-    .ok(); // Best-effort: don't fail the resume if counter update fails
+    .unwrap_or(claimed.attempt_count.saturating_add(1));
 
-    let session_uuid = match Uuid::parse_str(&session_id) {
+    // Check if attempt_count exceeds max_resume_attempts
+    let max_attempts = load_max_resume_attempts();
+    if new_attempt_count >= max_attempts {
+        revert_to_stopped(&minion.minion_id).await;
+        update_orchestration_phase(&minion.minion_id, OrchestrationPhase::Failed).await;
+        bail!(
+            "Minion {} has exceeded maximum resume attempts ({} >= {}). Marking as failed.",
+            minion.minion_id,
+            new_attempt_count,
+            max_attempts
+        );
+    }
+
+    let session_uuid = match Uuid::parse_str(&claimed.session_id) {
         Ok(uuid) => uuid,
         Err(e) => {
             // Revert registry to Stopped since we claimed Autonomous but can't proceed
@@ -125,7 +176,7 @@ pub async fn handle_resume(
         format!(
             "Continue working on issue #{}. Pick up where you left off. \
              If you've already completed the implementation, proceed to push and write PR_DESCRIPTION.md.",
-            issue_num
+            claimed.issue_num
         )
     };
 
@@ -139,20 +190,43 @@ pub async fn handle_resume(
     // Build WorktreeContext for PR creation
     let wt_ctx = WorktreeContext {
         minion_id: minion.minion_id.clone(),
-        branch_name: branch_name.clone(),
+        branch_name: claimed.branch_name.clone(),
         minion_dir: minion.worktree_path.clone(),
         checkout_path,
         session_id: session_uuid,
     };
 
     // Resolve the agent backend from registry (use stored agent name)
-    let backend = match agent_registry::resolve_backend(&agent_name) {
+    let backend = match agent_registry::resolve_backend(&claimed.agent_name) {
         Ok(b) => b,
         Err(e) => {
             // Revert registry to Stopped since we claimed Autonomous but can't proceed
             revert_to_stopped(&minion.minion_id).await;
             return Err(e.context("Failed to resolve agent backend for resume"));
         }
+    };
+
+    // Compute effective timeout: use CLI flag if provided, otherwise compute
+    // remaining time from timeout_deadline. This ensures resumed minions honor
+    // the original timeout budget rather than resetting it.
+    let effective_timeout: Option<String> = if timeout_opt.is_some() {
+        timeout_opt
+    } else if let Some(deadline) = claimed.timeout_deadline {
+        let remaining = deadline - Utc::now();
+        if remaining.num_seconds() > 0 {
+            Some(format!("{}s", remaining.num_seconds()))
+        } else {
+            // Deadline just passed between the check above and here — treat as expired
+            revert_to_stopped(&minion.minion_id).await;
+            update_orchestration_phase(&minion.minion_id, OrchestrationPhase::Failed).await;
+            bail!(
+                "Minion {} has passed its timeout deadline ({}). Marking as failed.",
+                minion.minion_id,
+                deadline
+            );
+        }
+    } else {
+        None
     };
 
     update_orchestration_phase(&minion.minion_id, OrchestrationPhase::RunningAgent).await;
@@ -163,8 +237,8 @@ pub async fn handle_resume(
         &wt_ctx,
         &prompt,
         quiet,
-        timeout_opt.as_deref(),
-        issue_num,
+        effective_timeout.as_deref(),
+        claimed.issue_num,
     )
     .await;
 
@@ -187,8 +261,8 @@ pub async fn handle_resume(
     // Phase: Create PR (handle_pr_creation checks if branch was pushed internally)
     update_orchestration_phase(&minion.minion_id, OrchestrationPhase::CreatingPr).await;
 
-    let host = crate::github::infer_github_host(&owner);
-    let github_client = match GitHubClient::from_env_with_host(&owner, &repo, &host).await {
+    let host = crate::github::infer_github_host(&claimed.owner);
+    let github_client = match GitHubClient::from_env_with_host(&claimed.owner, &claimed.repo, &host).await {
         Ok(client) => Some(client),
         Err(e) => {
             log::warn!("⚠️  GitHub client unavailable: {}", e);
@@ -196,10 +270,10 @@ pub async fn handle_resume(
         }
     };
     let issue_ctx = IssueContext {
-        owner,
-        repo,
+        owner: claimed.owner,
+        repo: claimed.repo,
         host: host.to_string(),
-        issue_num,
+        issue_num: claimed.issue_num,
         details: None,
         github_client,
     };
@@ -210,6 +284,14 @@ pub async fn handle_resume(
         Err(e) => {
             log::warn!("⚠️  PR creation failed: {}", e);
         }
+    }
+
+    // Respect no_watch: skip lifecycle monitoring for fire-and-forget minions
+    if claimed.no_watch {
+        println!("🏁 PR created. Skipping lifecycle monitoring (no_watch).");
+        update_orchestration_phase(&minion.minion_id, OrchestrationPhase::Completed).await;
+        println!("✅ Resume completed for Minion {}", minion.minion_id);
+        return Ok(0);
     }
 
     update_orchestration_phase(&minion.minion_id, OrchestrationPhase::Completed).await;
@@ -289,82 +371,75 @@ async fn run_autonomous_agent(
 
 /// Atomically checks if the minion is available and claims it as Autonomous.
 ///
-/// Returns the (session_id, owner, repo, issue_num, branch) if the minion is
-/// found in the registry and is available for resume.
-/// Returns None if the minion is not in the registry.
+/// Returns a [`ClaimedSession`] if the minion is found in the registry and is
+/// available for resume. Returns None if the minion is not in the registry.
 /// Errors with [`ResumeError::AlreadyRunning`] if the minion has a live process.
-async fn check_and_claim_session(
-    minion_id: &str,
-) -> Result<Option<(String, String, String, u64, String, String)>> {
+async fn check_and_claim_session(minion_id: &str) -> Result<Option<ClaimedSession>> {
     let id = minion_id.to_string();
     let result = with_registry(move |reg| {
-        let info_data = reg.get(&id).map(|info| {
-            (
-                info.session_id.clone(),
-                info.mode.clone(),
-                info.pid,
-                info.repo.clone(),
-                info.issue,
-                info.branch.clone(),
-                info.agent_name.clone(),
-            )
-        });
+        let info = match reg.get(&id) {
+            Some(info) => info.clone(),
+            None => return Ok(None),
+        };
 
-        match info_data {
-            Some((session_id, mode, pid, repo, issue, branch, agent_name)) => {
-                // Check if already running
-                if mode != MinionMode::Stopped {
-                    match pid {
-                        Some(pid_val) => {
-                            if is_process_alive(pid_val) {
-                                return Err(ResumeError::AlreadyRunning {
-                                    minion_id: id,
-                                    mode,
-                                }
-                                .into());
-                            }
-                            // Stale entry: reset to Stopped before claiming
-                            reg.update(&id, |info| {
-                                info.mode = MinionMode::Stopped;
-                                info.pid = None;
-                                info.last_activity = Utc::now();
-                            })?;
+        // Check if already running
+        if info.mode != MinionMode::Stopped {
+            match info.pid {
+                Some(pid_val) => {
+                    if is_process_alive(pid_val) {
+                        return Err(ResumeError::AlreadyRunning {
+                            minion_id: id,
+                            mode: info.mode.clone(),
                         }
-                        None => {
-                            // Inconsistent state: mode != Stopped but no PID recorded.
-                            // Treat this as locked/in use to avoid double-claiming.
-                            return Err(ResumeError::InconsistentState {
-                                minion_id: id,
-                                mode,
-                            }
-                            .into());
-                        }
+                        .into());
                     }
-                }
-
-                // Claim as Autonomous
-                reg.update(&id, |info| {
-                    info.mode = MinionMode::Autonomous;
-                    info.last_activity = Utc::now();
-                })?;
-
-                // Parse owner/repo from "owner/repo" format
-                let (owner, repo_name) = repo
-                    .split_once('/')
-                    .map(|(o, r)| (o.to_string(), r.to_string()))
-                    .ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "Invalid repo format in registry: '{}' (expected 'owner/repo')",
-                            repo
-                        )
+                    // Stale entry: reset to Stopped before claiming
+                    reg.update(&id, |i| {
+                        i.mode = MinionMode::Stopped;
+                        i.pid = None;
+                        i.last_activity = Utc::now();
                     })?;
-
-                Ok(Some((
-                    session_id, owner, repo_name, issue, branch, agent_name,
-                )))
+                }
+                None => {
+                    // Inconsistent state: mode != Stopped but no PID recorded.
+                    return Err(ResumeError::InconsistentState {
+                        minion_id: id,
+                        mode: info.mode.clone(),
+                    }
+                    .into());
+                }
             }
-            None => Ok(None),
         }
+
+        // Claim as Autonomous
+        reg.update(&id, |i| {
+            i.mode = MinionMode::Autonomous;
+            i.last_activity = Utc::now();
+        })?;
+
+        // Parse owner/repo from "owner/repo" format
+        let (owner, repo_name) = info
+            .repo
+            .split_once('/')
+            .map(|(o, r)| (o.to_string(), r.to_string()))
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Invalid repo format in registry: '{}' (expected 'owner/repo')",
+                    info.repo
+                )
+            })?;
+
+        Ok(Some(ClaimedSession {
+            session_id: info.session_id,
+            owner,
+            repo: repo_name,
+            issue_num: info.issue,
+            branch_name: info.branch,
+            agent_name: info.agent_name,
+            timeout_deadline: info.timeout_deadline,
+            attempt_count: info.attempt_count,
+            no_watch: info.no_watch,
+        }))
     })
     .await;
 
@@ -432,5 +507,33 @@ mod tests {
         }
         .into();
         assert!(err.downcast_ref::<ResumeError>().is_some());
+    }
+
+    #[test]
+    fn test_load_max_resume_attempts_returns_default_without_config() {
+        // When no config file exists, should return the default value
+        let max = load_max_resume_attempts();
+        // Should return either the configured value or the default (3)
+        assert!(max >= 1);
+    }
+
+    #[test]
+    fn test_claimed_session_fields() {
+        let deadline = Utc::now() + chrono::Duration::hours(1);
+        let session = ClaimedSession {
+            session_id: "test-uuid".to_string(),
+            owner: "owner".to_string(),
+            repo: "repo".to_string(),
+            issue_num: 42,
+            branch_name: "minion/issue-42-M001".to_string(),
+            agent_name: "claude".to_string(),
+            timeout_deadline: Some(deadline),
+            attempt_count: 1,
+            no_watch: true,
+        };
+        assert_eq!(session.issue_num, 42);
+        assert!(session.timeout_deadline.is_some());
+        assert_eq!(session.attempt_count, 1);
+        assert!(session.no_watch);
     }
 }

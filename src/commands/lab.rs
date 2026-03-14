@@ -5,15 +5,13 @@ use crate::minion_registry::{
     is_process_alive, with_registry, MinionInfo, MinionMode, OrchestrationPhase,
 };
 use anyhow::{Context, Result};
+use chrono::Utc;
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
 use tokio::process::Child;
 use tokio::time::sleep;
-
-/// Maximum number of attempts before a minion is marked as failed
-const MAX_RESUME_ATTEMPTS: u32 = 3;
 
 /// Handles the lab daemon command
 pub async fn handle_lab(
@@ -250,7 +248,7 @@ async fn find_resumable_minions(config: &LabConfig) -> Result<Vec<ResumableMinio
 }
 
 /// Mark a minion as failed in the registry and post an escalation comment on the issue.
-async fn mark_exhausted_minion(minion_id: &str, info: &MinionInfo, host: &str) {
+async fn mark_exhausted_minion(minion_id: &str, info: &MinionInfo, host: &str, reason: &str) {
     let mid = minion_id.to_string();
     // Update registry to Failed
     if let Err(e) = with_registry(move |reg| {
@@ -274,10 +272,10 @@ async fn mark_exhausted_minion(minion_id: &str, info: &MinionInfo, host: &str) {
     };
     if let Ok(client) = GitHubClient::from_env_with_host(owner, repo_name, host).await {
         let comment = format!(
-            "⚠️ **Minion {} has exceeded the maximum resume attempts ({}).**\n\n\
+            "⚠️ **Minion {} failed: {}.**\n\n\
              Phase at failure: `{:?}`\n\n\
              This issue needs human attention.",
-            minion_id, MAX_RESUME_ATTEMPTS, info.orchestration_phase,
+            minion_id, reason, info.orchestration_phase,
         );
         let _ = client
             .post_comment(owner, repo_name, info.issue, &comment)
@@ -293,6 +291,7 @@ async fn resume_interrupted_minions(
     config: &LabConfig,
     children: &mut Vec<Child>,
     available: &mut usize,
+    max_attempts: u32,
 ) -> Result<usize> {
     if *available == 0 {
         return Ok(0);
@@ -320,17 +319,41 @@ async fn resume_interrupted_minions(
             None => continue, // repo no longer in config
         };
 
+        // Skip minions whose timeout_deadline has passed
+        if let Some(deadline) = candidate.info.timeout_deadline {
+            if Utc::now() >= deadline {
+                println!(
+                    "⏭️  Skipping {} (issue #{}, {}): timeout_deadline has passed",
+                    candidate.minion_id, candidate.info.issue, candidate.info.repo,
+                );
+                mark_exhausted_minion(
+                    &candidate.minion_id,
+                    &candidate.info,
+                    &host,
+                    "timeout deadline has passed",
+                )
+                .await;
+                continue;
+            }
+        }
+
         // Skip minions that have exceeded max attempts
-        if candidate.info.attempt_count >= MAX_RESUME_ATTEMPTS {
+        if candidate.info.attempt_count >= max_attempts {
             println!(
                 "⏭️  Skipping {} (issue #{}, {}): attempt_count {} >= max {}",
                 candidate.minion_id,
                 candidate.info.issue,
                 candidate.info.repo,
                 candidate.info.attempt_count,
-                MAX_RESUME_ATTEMPTS,
+                max_attempts,
             );
-            mark_exhausted_minion(&candidate.minion_id, &candidate.info, &host).await;
+            mark_exhausted_minion(
+                &candidate.minion_id,
+                &candidate.info,
+                &host,
+                &format!("exceeded maximum resume attempts ({})", max_attempts),
+            )
+            .await;
             continue;
         }
 
@@ -384,10 +407,11 @@ async fn poll_and_spawn(
     }
 
     // Resume interrupted minions first, before claiming new issues
+    let max_attempts = config.daemon.max_resume_attempts;
     let resumed = if no_resume {
         0
     } else {
-        resume_interrupted_minions(config, children, &mut available).await?
+        resume_interrupted_minions(config, children, &mut available, max_attempts).await?
     };
     let mut spawned = resumed;
 
@@ -805,7 +829,8 @@ mod tests {
     }
 
     #[test]
-    fn test_max_resume_attempts_constant() {
-        assert_eq!(MAX_RESUME_ATTEMPTS, 3);
+    fn test_max_resume_attempts_default() {
+        let config = LabConfig::default();
+        assert_eq!(config.daemon.max_resume_attempts, 3);
     }
 }
