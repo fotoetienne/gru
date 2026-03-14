@@ -25,6 +25,3 @@ tempfile = "3.26"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
-
-[dev-dependencies]
-serial_test = "3.4"

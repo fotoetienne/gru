@@ -552,9 +552,9 @@ pub async fn check_auth_via_cli(host: &str) -> Result<()> {
 
 /// Claim an issue by transitioning labels: remove the ready label, add gru:in-progress.
 ///
-/// Note: Unlike the old `GitHubClient::claim_issue`, this does not check whether the
-/// issue is already in-progress (race condition guard). Callers should add that
-/// check if needed for multi-instance deployments.
+/// Note: This function does not check whether the issue is already in-progress
+/// before claiming it (no race-condition guard). Callers should verify the
+/// issue state beforehand if multi-instance deployments are a concern.
 ///
 /// # Arguments
 /// * `host` - GitHub hostname
