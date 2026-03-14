@@ -20,21 +20,25 @@ const MAX_BACKOFF: Duration = Duration::from_secs(3);
 /// so a hung process holding the lock cannot deadlock all concurrent callers.
 ///
 /// Retries up to [`MAX_LOCK_ATTEMPTS`] times with exponential backoff starting
-/// at [`INITIAL_BACKOFF`] and capped at [`MAX_BACKOFF`].
+/// at [`INITIAL_BACKOFF`] and capped at [`MAX_BACKOFF`] (~42s total).
 pub fn lock_with_timeout(file: &File) -> io::Result<()> {
+    lock_with_attempts(file, MAX_LOCK_ATTEMPTS)
+}
+
+fn lock_with_attempts(file: &File, max_attempts: u32) -> io::Result<()> {
     let mut backoff = INITIAL_BACKOFF;
 
-    for attempt in 0..MAX_LOCK_ATTEMPTS {
+    for attempt in 0..max_attempts {
         match file.try_lock_exclusive() {
             Ok(()) => return Ok(()),
             Err(e) if is_lock_contention(&e) => {
-                if attempt + 1 == MAX_LOCK_ATTEMPTS {
+                if attempt + 1 == max_attempts {
                     return Err(io::Error::new(
                         io::ErrorKind::TimedOut,
                         format!(
                             "Failed to acquire file lock after {} attempts (~{:.1}s): {}",
-                            MAX_LOCK_ATTEMPTS,
-                            total_backoff_secs(MAX_LOCK_ATTEMPTS),
+                            max_attempts,
+                            total_backoff_secs(max_attempts),
                             e,
                         ),
                     ));
@@ -46,18 +50,27 @@ pub fn lock_with_timeout(file: &File) -> io::Result<()> {
         }
     }
 
-    unreachable!()
+    unreachable!("lock loop exhausted without returning")
 }
 
 /// Returns true if the error represents lock contention (file already locked).
 fn is_lock_contention(e: &io::Error) -> bool {
     // On Unix, try_lock returns EWOULDBLOCK (same as EAGAIN on most platforms).
-    // On Windows, it returns ERROR_LOCK_VIOLATION.
-    matches!(
-        e.kind(),
-        io::ErrorKind::WouldBlock | io::ErrorKind::PermissionDenied
-    ) || e.raw_os_error() == Some(libc::EAGAIN)
-        || e.raw_os_error() == Some(libc::EWOULDBLOCK)
+    if matches!(e.kind(), io::ErrorKind::WouldBlock) {
+        return true;
+    }
+    #[cfg(unix)]
+    {
+        if e.raw_os_error() == Some(libc::EAGAIN) || e.raw_os_error() == Some(libc::EWOULDBLOCK) {
+            return true;
+        }
+    }
+    // On Windows, fs2 maps ERROR_LOCK_VIOLATION to PermissionDenied.
+    #[cfg(windows)]
+    if e.kind() == io::ErrorKind::PermissionDenied {
+        return true;
+    }
+    false
 }
 
 /// Computes the approximate total backoff duration for a given number of attempts.
@@ -111,14 +124,14 @@ mod tests {
             .unwrap();
         holder.lock_exclusive().unwrap();
 
-        // Second file handle tries to acquire
+        // Second file handle tries to acquire with only 2 attempts for speed
         let contender = OpenOptions::new()
             .read(true)
             .write(true)
             .open(&lock_path)
             .unwrap();
 
-        let result = lock_with_timeout(&contender);
+        let result = lock_with_attempts(&contender, 2);
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::TimedOut);
@@ -128,11 +141,24 @@ mod tests {
 
     #[test]
     fn test_is_lock_contention() {
-        let err = io::Error::from_raw_os_error(libc::EWOULDBLOCK);
+        #[cfg(unix)]
+        {
+            let err = io::Error::from_raw_os_error(libc::EWOULDBLOCK);
+            assert!(is_lock_contention(&err));
+        }
+
+        let err = io::Error::new(io::ErrorKind::WouldBlock, "would block");
         assert!(is_lock_contention(&err));
 
         let err = io::Error::new(io::ErrorKind::NotFound, "not found");
         assert!(!is_lock_contention(&err));
+
+        // PermissionDenied should NOT be treated as contention on Unix
+        #[cfg(unix)]
+        {
+            let err = io::Error::new(io::ErrorKind::PermissionDenied, "denied");
+            assert!(!is_lock_contention(&err));
+        }
     }
 
     #[test]

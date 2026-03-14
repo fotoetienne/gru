@@ -7,6 +7,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use crate::agent::TokenUsage;
+use crate::file_lock::lock_with_timeout;
 use crate::workspace::Workspace;
 
 /// Async helper that loads the registry inside `spawn_blocking`, runs the
@@ -303,7 +304,7 @@ impl MinionRegistry {
             .with_context(|| format!("Failed to open lock file: {:?}", lock_path))?;
 
         // Acquire exclusive lock with timeout to avoid deadlock from hung processes
-        crate::file_lock::lock_with_timeout(&lock_file)
+        lock_with_timeout(&lock_file)
             .with_context(|| format!("Failed to acquire exclusive lock on {:?}", lock_path))?;
 
         // Load existing registry or create new one
@@ -428,21 +429,25 @@ impl MinionRegistry {
     /// `last_activity`.
     ///
     /// The callback uses synchronous `MinionRegistry::load` because the
-    /// `on_spawn` contract is `FnOnce(u32) + Send` (not async).
+    /// `on_spawn` contract is `FnOnce(u32) + Send` (not async). The registry
+    /// update is dispatched to a background thread so that lock contention
+    /// (with retry backoff) does not block the Tokio worker thread.
     pub fn pid_callback(
         minion_id: String,
         mode: Option<MinionMode>,
     ) -> Box<dyn FnOnce(u32) + Send> {
         Box::new(move |pid: u32| {
-            if let Ok(mut registry) = MinionRegistry::load(None) {
-                let _ = registry.update(&minion_id, |info| {
-                    info.pid = Some(pid);
-                    if let Some(m) = mode {
-                        info.mode = m;
-                    }
-                    info.last_activity = Utc::now();
-                });
-            }
+            std::thread::spawn(move || {
+                if let Ok(mut registry) = MinionRegistry::load(None) {
+                    let _ = registry.update(&minion_id, |info| {
+                        info.pid = Some(pid);
+                        if let Some(m) = mode {
+                            info.mode = m;
+                        }
+                        info.last_activity = Utc::now();
+                    });
+                }
+            });
         })
     }
 
