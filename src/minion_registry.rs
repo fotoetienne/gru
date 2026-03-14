@@ -222,15 +222,14 @@ impl MinionInfo {
 pub fn is_process_alive(pid: u32) -> bool {
     #[cfg(unix)]
     {
-        // Guard against PIDs above i32::MAX: casting such a value would produce a negative
-        // number, and kill() with a negative pid sends to a process group instead of a
-        // single process.
-        if pid > i32::MAX as u32 {
+        // Guard against PIDs that cannot be represented as a positive i32: kill() with a
+        // negative pid sends to a process group instead of a single process.
+        let Ok(pid_i32) = i32::try_from(pid) else {
             return false;
-        }
+        };
         // kill(pid, 0) is always safe to call — it performs a permission check without
         // delivering any signal.
-        unsafe { libc::kill(pid as i32, 0) == 0 }
+        unsafe { libc::kill(pid_i32, 0) == 0 }
     }
 
     #[cfg(not(unix))]
@@ -815,17 +814,22 @@ mod tests {
 
     #[test]
     fn test_is_process_alive_with_nonexistent_pid() {
-        // Use a high but valid PID (won't overflow i32 to -1 or 0)
         // PID 4194304 exceeds the typical Linux/macOS PID max
         assert!(!is_process_alive(4_194_304));
     }
 
     #[test]
     fn test_is_process_alive_rejects_pid_above_i32_max() {
-        // A PID above i32::MAX would overflow to negative when cast to i32,
-        // causing kill() to target a process group instead of a single process.
+        // PIDs above i32::MAX cannot be safely passed to kill(); verify they are rejected.
         assert!(!is_process_alive(i32::MAX as u32 + 1));
         assert!(!is_process_alive(u32::MAX));
+    }
+
+    #[test]
+    fn test_is_process_alive_allows_i32_max_boundary() {
+        // i32::MAX is the largest PID that can be safely cast; it should not be rejected
+        // by the guard. It almost certainly doesn't exist, so the result is false.
+        assert!(!is_process_alive(i32::MAX as u32));
     }
 
     #[test]
