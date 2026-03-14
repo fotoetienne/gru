@@ -181,11 +181,13 @@ pub struct ConversationMessage {
     pub message: MessageContent,
 }
 
-/// Represents the content of a conversation message
+/// Represents the content of a conversation message.
+/// Content is parsed as raw JSON values to tolerate mixed content types
+/// (e.g., text + tool_result items) without failing deserialization.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct MessageContent {
     pub role: String,
-    pub content: Vec<ToolResult>,
+    pub content: Vec<serde_json::Value>,
 }
 
 /// Represents the output from parsing a stream line.
@@ -202,9 +204,9 @@ pub enum StreamOutput {
     RawLine(String),
 }
 
-/// Parse a trimmed line of Claude Code output into a structured `StreamOutput`.
+/// Parse a trimmed line of Claude Code output into structured `StreamOutput` values.
 ///
-/// Returns `None` if the line is empty or doesn't match any recognized format.
+/// Returns an empty `Vec` if the line is empty or doesn't match any recognized format.
 /// This is the shared parsing logic used by both `EventStream::next_outputs()` and
 /// `ClaudeBackend::parse_events()`.
 pub(crate) fn parse_line(trimmed: &str) -> Vec<StreamOutput> {
@@ -223,15 +225,21 @@ pub(crate) fn parse_line(trimmed: &str) -> Vec<StreamOutput> {
         }
     }
 
-    // Try conversation message (verbose output with tool results)
+    // Try conversation message (verbose output with tool results).
+    // Content is parsed as raw JSON to tolerate mixed content types (e.g., text + tool_result).
     if let Ok(conv_msg) = serde_json::from_str::<ConversationMessage>(trimmed) {
-        if conv_msg.message_type == "user" && !conv_msg.message.content.is_empty() {
-            return conv_msg
+        if conv_msg.message_type == "user" {
+            let results: Vec<StreamOutput> = conv_msg
                 .message
                 .content
                 .into_iter()
+                .filter(|v| v.get("type").and_then(|t| t.as_str()) == Some("tool_result"))
+                .filter_map(|v| serde_json::from_value::<ToolResult>(v).ok())
                 .map(StreamOutput::ToolResult)
                 .collect();
+            if !results.is_empty() {
+                return results;
+            }
         }
     }
 
@@ -322,7 +330,7 @@ impl<R: tokio::io::AsyncRead + Unpin> EventStream<R> {
     }
 
     /// Reads the next line from the stream and attempts to parse it.
-    /// Returns an empty Vec when the stream ends, or one or more outputs per line.
+    /// Returns `None` when the stream ends, or one or more outputs per line.
     /// A single line may yield multiple outputs (e.g., multi-tool-result messages).
     pub async fn next_outputs(&mut self) -> anyhow::Result<Option<Vec<StreamOutput>>> {
         let mut line = String::new();

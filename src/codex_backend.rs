@@ -373,6 +373,17 @@ mod tests {
         CodexBackend::new()
     }
 
+    /// Assert that parse_events returns exactly one event and return it.
+    fn single(events: Vec<AgentEvent>) -> AgentEvent {
+        assert_eq!(
+            events.len(),
+            1,
+            "expected exactly one event, got {}",
+            events.len()
+        );
+        events.into_iter().next().unwrap()
+    }
+
     #[test]
     fn test_name() {
         assert_eq!(backend().name(), "codex");
@@ -434,7 +445,7 @@ mod tests {
     fn test_parse_event_thread_started() {
         let b = backend();
         let line = r#"{"type":"thread.started","thread_id":"thread_abc123"}"#;
-        let event = b.parse_events(line).into_iter().next().unwrap();
+        let event = single(b.parse_events(line));
         assert!(matches!(event, AgentEvent::Started { usage: None }));
     }
 
@@ -442,7 +453,7 @@ mod tests {
     fn test_parse_event_turn_started() {
         let b = backend();
         let line = r#"{"type":"turn.started"}"#;
-        let event = b.parse_events(line).into_iter().next().unwrap();
+        let event = single(b.parse_events(line));
         assert!(matches!(event, AgentEvent::Thinking { text: None }));
     }
 
@@ -450,7 +461,7 @@ mod tests {
     fn test_parse_event_turn_completed_with_usage() {
         let b = backend();
         let line = r#"{"type":"turn.completed","usage":{"input_tokens":1000,"output_tokens":500,"cached_input_tokens":200}}"#;
-        let event = b.parse_events(line).into_iter().next().unwrap();
+        let event = single(b.parse_events(line));
         match event {
             AgentEvent::MessageComplete { stop_reason, usage } => {
                 assert_eq!(stop_reason.as_deref(), Some("end_turn"));
@@ -467,7 +478,7 @@ mod tests {
     fn test_parse_event_turn_completed_no_usage() {
         let b = backend();
         let line = r#"{"type":"turn.completed"}"#;
-        let event = b.parse_events(line).into_iter().next().unwrap();
+        let event = single(b.parse_events(line));
         assert!(matches!(
             event,
             AgentEvent::MessageComplete {
@@ -481,7 +492,7 @@ mod tests {
     fn test_parse_event_turn_failed() {
         let b = backend();
         let line = r#"{"type":"turn.failed"}"#;
-        let event = b.parse_events(line).into_iter().next().unwrap();
+        let event = single(b.parse_events(line));
         assert_eq!(
             event,
             AgentEvent::Error {
@@ -494,7 +505,7 @@ mod tests {
     fn test_parse_event_turn_failed_with_error() {
         let b = backend();
         let line = r#"{"type":"turn.failed","error":{"type":"api_error","message":"context length exceeded"}}"#;
-        let event = b.parse_events(line).into_iter().next().unwrap();
+        let event = single(b.parse_events(line));
         assert_eq!(
             event,
             AgentEvent::Error {
@@ -507,7 +518,7 @@ mod tests {
     fn test_parse_event_item_started_command() {
         let b = backend();
         let line = r#"{"type":"item.started","item":{"id":"item_1","type":"command_execution","command":"bash -lc git status","status":"in_progress"}}"#;
-        let event = b.parse_events(line).into_iter().next().unwrap();
+        let event = single(b.parse_events(line));
         match event {
             AgentEvent::ToolUse {
                 tool_name,
@@ -526,7 +537,7 @@ mod tests {
     fn test_parse_event_item_started_file_change() {
         let b = backend();
         let line = r#"{"type":"item.started","item":{"id":"item_2","type":"file_change","file_path":"src/main.rs","status":"in_progress"}}"#;
-        let event = b.parse_events(line).into_iter().next().unwrap();
+        let event = single(b.parse_events(line));
         match event {
             AgentEvent::ToolUse {
                 tool_name,
@@ -544,7 +555,7 @@ mod tests {
     fn test_parse_event_item_started_message() {
         let b = backend();
         let line = r#"{"type":"item.started","item":{"id":"item_3","type":"message","content":"I'll fix the bug now."}}"#;
-        let event = b.parse_events(line).into_iter().next().unwrap();
+        let event = single(b.parse_events(line));
         assert_eq!(
             event,
             AgentEvent::TextDelta {
@@ -557,7 +568,7 @@ mod tests {
     fn test_parse_event_item_completed_command() {
         let b = backend();
         let line = r#"{"type":"item.completed","item":{"id":"item_1","type":"command_execution","command":"bash -lc git status","status":"completed","output":"On branch main\nnothing to commit"}}"#;
-        let event = b.parse_events(line).into_iter().next().unwrap();
+        let event = single(b.parse_events(line));
         match event {
             AgentEvent::ToolResult {
                 tool_use_id,
@@ -576,7 +587,7 @@ mod tests {
     fn test_parse_event_item_completed_command_failed() {
         let b = backend();
         let line = r#"{"type":"item.completed","item":{"id":"item_1","type":"command_execution","status":"failed","output":"command not found"}}"#;
-        let event = b.parse_events(line).into_iter().next().unwrap();
+        let event = single(b.parse_events(line));
         match event {
             AgentEvent::ToolResult {
                 is_error, content, ..
@@ -592,7 +603,7 @@ mod tests {
     fn test_parse_event_item_completed_file_change() {
         let b = backend();
         let line = r#"{"type":"item.completed","item":{"id":"item_2","type":"file_change","file_path":"src/lib.rs","status":"completed"}}"#;
-        let event = b.parse_events(line).into_iter().next().unwrap();
+        let event = single(b.parse_events(line));
         match event {
             AgentEvent::ToolResult {
                 tool_use_id,
@@ -611,7 +622,7 @@ mod tests {
     fn test_parse_event_item_completed_file_change_failed() {
         let b = backend();
         let line = r#"{"type":"item.completed","item":{"id":"item_3","type":"file_change","file_path":"src/lib.rs","status":"failed"}}"#;
-        let event = b.parse_events(line).into_iter().next().unwrap();
+        let event = single(b.parse_events(line));
         match event {
             AgentEvent::ToolResult {
                 is_error, content, ..
@@ -627,7 +638,7 @@ mod tests {
     fn test_parse_event_error() {
         let b = backend();
         let line = r#"{"type":"error","error":{"type":"api_error","message":"rate limited"}}"#;
-        let event = b.parse_events(line).into_iter().next().unwrap();
+        let event = single(b.parse_events(line));
         assert_eq!(
             event,
             AgentEvent::Error {
@@ -640,7 +651,7 @@ mod tests {
     fn test_parse_event_error_no_message() {
         let b = backend();
         let line = r#"{"type":"error","error":{"type":"unknown"}}"#;
-        let event = b.parse_events(line).into_iter().next().unwrap();
+        let event = single(b.parse_events(line));
         assert_eq!(
             event,
             AgentEvent::Error {
@@ -673,7 +684,7 @@ mod tests {
     fn test_parse_event_message_with_array_content() {
         let b = backend();
         let line = r#"{"type":"item.started","item":{"id":"item_4","type":"message","content":[{"type":"text","text":"Hello "},{"type":"text","text":"world"}]}}"#;
-        let event = b.parse_events(line).into_iter().next().unwrap();
+        let event = single(b.parse_events(line));
         assert_eq!(
             event,
             AgentEvent::TextDelta {
