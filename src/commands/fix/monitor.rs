@@ -5,7 +5,7 @@ use crate::ci;
 use crate::config::LabConfig;
 use crate::merge_judge::{self, JudgeAction, JudgeState};
 use crate::pr_monitor::{self, MonitorResult};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::path::Path;
 use tokio::process::Command as TokioCommand;
 use tokio::time::{timeout, Duration};
@@ -62,8 +62,6 @@ async fn auto_rebase_pr(worktree_path: &Path) -> Result<bool> {
         }
     }
 }
-
-use anyhow::Context;
 
 /// Posts an escalation comment on a PR when auto-rebase fails.
 async fn post_escalation_comment(
