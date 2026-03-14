@@ -745,6 +745,9 @@ pub async fn handle_prompt(prompt: &str, opts: PromptOptions) -> Result<i32> {
     .await;
 
     // Best-effort cleanup: clear PID, set mode to Stopped, and save token usage.
+    // Token usage is persisted regardless of exit status (Ok with non-zero exit) because
+    // cost data is valuable even for failed tasks. Only stream-level errors (timeout, stuck)
+    // result in Err, in which case partial usage is not saved.
     let token_usage = run_result.as_ref().ok().map(|r| r.token_usage.clone());
     let cleanup_id = minion_id.clone();
     let _ = with_registry(move |registry| {
