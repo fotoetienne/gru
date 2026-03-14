@@ -17,6 +17,19 @@ fn lock_or_recover<'a, T>(mutex: &'a Mutex<T>, name: &str) -> MutexGuard<'a, T> 
     }
 }
 
+/// Formats an optional RFC 3339 timestamp for display.
+///
+/// Returns `HH:MM:SS` in local time for valid timestamps, or `--:--:--`
+/// for `None` (legacy events) or unparseable values.
+fn format_timestamp(ts: Option<&str>) -> String {
+    match ts {
+        Some(s) => DateTime::parse_from_rfc3339(s)
+            .map(|dt| dt.with_timezone(&Local).format("%H:%M:%S").to_string())
+            .unwrap_or_else(|_| "--:--:--".to_string()),
+        None => "--:--:--".to_string(),
+    }
+}
+
 /// Maximum characters to display for buffered text chunks.
 /// Since text is now buffered for up to 2 seconds, chunks can be larger.
 /// 200 characters allows ~3-4 lines of text to display coherently.
@@ -96,16 +109,21 @@ impl ProgressDisplay {
     /// Uses the current wall-clock time for the timestamp. Suitable for
     /// live streaming where events are displayed in real-time.
     pub fn handle_event(&self, event: &AgentEvent) {
-        self.handle_event_with_ts(event, None);
+        let ts = Local::now().format("%H:%M:%S").to_string();
+        self.handle_event_inner(event, &ts);
     }
 
     /// Process a normalized agent event with an explicit timestamp.
     ///
     /// When `ts` is a valid RFC 3339 string, it is converted to local
-    /// `HH:MM:SS`. When `ts` is `None` (live streaming) or invalid,
-    /// the current wall-clock time is used. Legacy events without a
-    /// timestamp show `--:--:--`.
+    /// `HH:MM:SS`. When `ts` is `None` (legacy events without a persisted
+    /// timestamp) or unparseable, `--:--:--` is displayed.
     pub fn handle_event_with_ts(&self, event: &AgentEvent, ts: Option<&str>) {
+        let timestamp = format_timestamp(ts);
+        self.handle_event_inner(event, &timestamp);
+    }
+
+    fn handle_event_inner(&self, event: &AgentEvent, timestamp: &str) {
         if self.config.quiet {
             // In quiet mode, only show errors
             if let AgentEvent::Error { message } = event {
@@ -118,14 +136,6 @@ impl ProgressDisplay {
             }
             return;
         }
-
-        let timestamp = ts
-            .map(|s| {
-                DateTime::parse_from_rfc3339(s)
-                    .map(|dt| dt.with_timezone(&Local).format("%H:%M:%S").to_string())
-                    .unwrap_or_else(|_| "--:--:--".to_string())
-            })
-            .unwrap_or_else(|| Local::now().format("%H:%M:%S").to_string());
 
         match event {
             AgentEvent::Started { .. } => {
@@ -336,8 +346,8 @@ mod tests {
     }
 
     #[test]
-    fn test_handle_event_with_ts_none_uses_now() {
-        // Verify handle_event_with_ts doesn't panic with None (live streaming path)
+    fn test_handle_event_with_ts_none_shows_placeholder() {
+        // None = legacy event without persisted timestamp → shows --:--:--
         let config = ProgressConfig {
             minion_id: "M001".to_string(),
             issue: "42".to_string(),
@@ -349,7 +359,7 @@ mod tests {
 
     #[test]
     fn test_handle_event_with_ts_invalid_shows_placeholder() {
-        // Verify handle_event_with_ts doesn't panic with an invalid timestamp
+        // Unparseable timestamp → shows --:--:--
         let config = ProgressConfig {
             minion_id: "M001".to_string(),
             issue: "42".to_string(),
@@ -360,5 +370,22 @@ mod tests {
             &AgentEvent::Started { usage: None },
             Some("not-a-timestamp"),
         );
+    }
+
+    #[test]
+    fn test_format_timestamp_valid() {
+        let ts = format_timestamp(Some("2025-01-15T14:30:45.123+00:00"));
+        assert!(ts.contains(':'));
+        assert_ne!(ts, "--:--:--");
+    }
+
+    #[test]
+    fn test_format_timestamp_none() {
+        assert_eq!(format_timestamp(None), "--:--:--");
+    }
+
+    #[test]
+    fn test_format_timestamp_invalid() {
+        assert_eq!(format_timestamp(Some("garbage")), "--:--:--");
     }
 }
