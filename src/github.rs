@@ -112,9 +112,6 @@ pub fn build_issue_url_with_host(repo: &str, host: &str, issue_number: u64) -> O
     ))
 }
 
-/// Determine the correct `gh` CLI command for a repository.
-///
-/// Returns `"ghe"` for non-`github.com` hosts, `"gh"` otherwise.
 /// Get GitHub token with automatic fallback logic
 ///
 /// Priority order:
