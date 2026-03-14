@@ -1,4 +1,3 @@
-use crate::github::GitHubClient;
 use crate::minion_registry::{with_registry, OrchestrationPhase};
 
 /// Updates the orchestration phase for a minion in the registry.
@@ -22,15 +21,10 @@ pub(crate) async fn update_orchestration_phase(minion_id: &str, phase: Orchestra
     }
 }
 
-/// Attempts to mark an issue as blocked (fire-and-forget).
+/// Attempts to mark an issue as blocked via CLI (fire-and-forget).
 /// Logs success/failure but does not propagate errors.
-pub(super) async fn try_mark_issue_blocked(
-    client: &GitHubClient,
-    owner: &str,
-    repo: &str,
-    issue_num: u64,
-) {
-    match client.mark_issue_blocked(owner, repo, issue_num).await {
+pub(super) async fn try_mark_issue_blocked(host: &str, owner: &str, repo: &str, issue_num: u64) {
+    match crate::github::mark_issue_blocked_via_cli(host, owner, repo, issue_num).await {
         Ok(()) => {
             println!("🏷️  Updated issue label to '{}'", crate::labels::BLOCKED);
         }
@@ -40,16 +34,16 @@ pub(super) async fn try_mark_issue_blocked(
     }
 }
 
-/// Posts a progress comment to the issue (fire-and-forget).
+/// Posts a progress comment to the issue via CLI (fire-and-forget).
 pub(super) async fn try_post_progress_comment(
-    client: &GitHubClient,
+    host: &str,
     owner: &str,
     repo: &str,
     issue_num: u64,
     body: &str,
 ) -> bool {
-    match client.post_comment(owner, repo, issue_num, body).await {
-        Ok(_) => true,
+    match crate::github::post_comment_via_cli(host, owner, repo, issue_num, body).await {
+        Ok(()) => true,
         Err(e) => {
             log::warn!("⚠️  Failed to post progress comment: {}", e);
             false

@@ -397,6 +397,7 @@ impl GitHubClient {
     /// * `owner` - Repository owner
     /// * `repo` - Repository name
     /// * `issue` - Issue number
+    #[allow(dead_code)] // Used by lab.rs (future migration)
     pub async fn mark_issue_done(&self, owner: &str, repo: &str, issue: u64) -> Result<()> {
         // Remove in-progress label (ignore errors - may not exist)
         let _ = self
@@ -437,6 +438,7 @@ impl GitHubClient {
     /// * `owner` - Repository owner
     /// * `repo` - Repository name
     /// * `issue` - Issue number
+    #[allow(dead_code)] // Used by lab.rs (future migration)
     pub async fn mark_issue_blocked(&self, owner: &str, repo: &str, issue: u64) -> Result<()> {
         // Remove any existing state labels (ignore errors)
         let _ = self
@@ -698,7 +700,7 @@ pub async fn get_issue_via_cli(
             "--repo",
             &repo_full,
             "--json",
-            "number,title,body",
+            "number,title,body,labels",
         ])
         .output()
         .await
@@ -729,6 +731,15 @@ pub struct IssueInfo {
     pub number: u64,
     pub title: String,
     pub body: Option<String>,
+    /// Labels attached to the issue (from `gh issue view --json labels`)
+    #[serde(default)]
+    pub labels: Vec<IssueLabel>,
+}
+
+/// Label info returned by `gh issue view --json labels`
+#[derive(Debug, serde::Deserialize)]
+pub struct IssueLabel {
+    pub name: String,
 }
 
 /// Simple struct to hold PR information from gh CLI
@@ -875,7 +886,6 @@ pub async fn create_draft_pr_via_cli(
 /// * `repo` - Repository name
 /// * `number` - Issue or PR number
 /// * `body` - Comment body (markdown supported)
-#[allow(dead_code)]
 pub async fn post_comment_via_cli(
     host: &str,
     owner: &str,
@@ -920,7 +930,6 @@ pub async fn post_comment_via_cli(
 /// * `number` - Issue number
 /// * `add` - Labels to add
 /// * `remove` - Labels to remove
-#[allow(dead_code)]
 pub async fn edit_labels_via_cli(
     host: &str,
     owner: &str,
@@ -1060,7 +1069,6 @@ pub async fn check_auth_via_cli(host: &str) -> Result<()> {
 /// * `owner` - Repository owner
 /// * `repo` - Repository name
 /// * `number` - Issue number
-#[allow(dead_code)]
 pub async fn claim_issue_via_cli(host: &str, owner: &str, repo: &str, number: u64) -> Result<()> {
     edit_labels_via_cli(
         host,
@@ -1080,7 +1088,6 @@ pub async fn claim_issue_via_cli(host: &str, owner: &str, repo: &str, number: u6
 /// * `owner` - Repository owner
 /// * `repo` - Repository name
 /// * `number` - Issue number
-#[allow(dead_code)]
 pub async fn mark_issue_done_via_cli(
     host: &str,
     owner: &str,
@@ -1105,7 +1112,6 @@ pub async fn mark_issue_done_via_cli(
 /// * `owner` - Repository owner
 /// * `repo` - Repository name
 /// * `number` - Issue number
-#[allow(dead_code)]
 pub async fn mark_issue_failed_via_cli(
     host: &str,
     owner: &str,
@@ -1133,7 +1139,6 @@ pub async fn mark_issue_failed_via_cli(
 /// * `owner` - Repository owner
 /// * `repo` - Repository name
 /// * `number` - Issue number
-#[allow(dead_code)]
 pub async fn mark_issue_blocked_via_cli(
     host: &str,
     owner: &str,

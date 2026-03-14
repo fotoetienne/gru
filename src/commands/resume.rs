@@ -7,7 +7,6 @@ use crate::commands::fix::{
     handle_pr_creation, update_orchestration_phase, IssueContext, WorktreeContext,
 };
 use crate::config::{LabConfig, DEFAULT_MAX_RESUME_ATTEMPTS};
-use crate::github::GitHubClient;
 use crate::minion_registry::{
     mark_minion_failed, revert_to_stopped, with_registry, MinionMode, MinionRegistry,
     OrchestrationPhase,
@@ -239,20 +238,12 @@ pub async fn handle_resume(
     update_orchestration_phase(&minion.minion_id, OrchestrationPhase::CreatingPr).await;
 
     let host = crate::github::infer_github_host(&owner);
-    let github_client = match GitHubClient::from_env_with_host(&owner, &repo_name, &host).await {
-        Ok(client) => Some(client),
-        Err(e) => {
-            log::warn!("⚠️  GitHub client unavailable: {}", e);
-            None
-        }
-    };
     let issue_ctx = IssueContext {
         owner,
         repo: repo_name,
         host: host.to_string(),
         issue_num,
         details: None,
-        github_client,
     };
 
     match handle_pr_creation(&issue_ctx, &wt_ctx).await {

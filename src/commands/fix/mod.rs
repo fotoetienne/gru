@@ -223,15 +223,13 @@ async fn run_worker(minion_id: &str, issue: &str, opts: FixOptions) -> Result<i3
             Err(e) if is_stuck_or_timeout_error(&e) => {
                 update_orchestration_phase(&wt_ctx.minion_id, OrchestrationPhase::Failed).await;
                 log::error!("🚨 {:#}", e);
-                if let Some(ref client) = issue_ctx.github_client {
-                    try_mark_issue_blocked(
-                        client,
-                        &issue_ctx.owner,
-                        &issue_ctx.repo,
-                        issue_ctx.issue_num,
-                    )
-                    .await;
-                }
+                try_mark_issue_blocked(
+                    &issue_ctx.host,
+                    &issue_ctx.owner,
+                    &issue_ctx.repo,
+                    issue_ctx.issue_num,
+                )
+                .await;
                 return Ok(1);
             }
             Err(e) => return Err(e),
@@ -246,17 +244,19 @@ async fn run_worker(minion_id: &str, issue: &str, opts: FixOptions) -> Result<i3
         if !result.status.success() {
             update_orchestration_phase(&wt_ctx.minion_id, OrchestrationPhase::Failed).await;
 
-            if let Some(ref client) = issue_ctx.github_client {
-                match client
-                    .mark_issue_failed(&issue_ctx.owner, &issue_ctx.repo, issue_ctx.issue_num)
-                    .await
-                {
-                    Ok(()) => {
-                        println!("🏷️  Updated issue label to '{}'", crate::labels::FAILED);
-                    }
-                    Err(e) => {
-                        log::warn!("⚠️  Failed to update issue label: {}", e);
-                    }
+            match crate::github::mark_issue_failed_via_cli(
+                &issue_ctx.host,
+                &issue_ctx.owner,
+                &issue_ctx.repo,
+                issue_ctx.issue_num,
+            )
+            .await
+            {
+                Ok(()) => {
+                    println!("🏷️  Updated issue label to '{}'", crate::labels::FAILED);
+                }
+                Err(e) => {
+                    log::warn!("⚠️  Failed to update issue label: {}", e);
                 }
             }
 
@@ -347,15 +347,13 @@ async fn run_worker(minion_id: &str, issue: &str, opts: FixOptions) -> Result<i3
         Ok(true) => log::info!("✅ CI checks passed"),
         Ok(false) => {
             log::warn!("⚠️  CI checks failed or were escalated");
-            if let Some(ref client) = issue_ctx.github_client {
-                try_mark_issue_blocked(
-                    client,
-                    &issue_ctx.owner,
-                    &issue_ctx.repo,
-                    issue_ctx.issue_num,
-                )
-                .await;
-            }
+            try_mark_issue_blocked(
+                &issue_ctx.host,
+                &issue_ctx.owner,
+                &issue_ctx.repo,
+                issue_ctx.issue_num,
+            )
+            .await;
             return Ok(1);
         }
         Err(e) => log::warn!("⚠️  CI monitoring error (non-fatal): {}", e),
@@ -455,15 +453,13 @@ pub async fn handle_fix(issue: &str, opts: FixOptions) -> Result<i32> {
 
     // Claim the issue on fresh starts (skip on resume — already claimed)
     if is_fresh {
-        if let Some(ref client) = issue_ctx.github_client {
-            claim_issue(
-                client,
-                &issue_ctx.owner,
-                &issue_ctx.repo,
-                issue_ctx.issue_num,
-            )
-            .await;
-        }
+        claim_issue(
+            &issue_ctx.host,
+            &issue_ctx.owner,
+            &issue_ctx.repo,
+            issue_ctx.issue_num,
+        )
+        .await;
     }
 
     // Phase 3: Spawn background worker
@@ -531,7 +527,6 @@ mod tests {
                 body: "The widget is broken".to_string(),
                 labels: "bug, priority:high".to_string(),
             }),
-            github_client: None,
         };
 
         let prompt = agent::build_fix_prompt(&ctx, &wt_ctx);
@@ -553,7 +548,6 @@ mod tests {
             host: "github.com".to_string(),
             issue_num: 42,
             details: None,
-            github_client: None,
         };
 
         let prompt = agent::build_fix_prompt(&ctx, &wt_ctx);
@@ -575,7 +569,6 @@ mod tests {
                 body: "Please add this feature".to_string(),
                 labels: String::new(),
             }),
-            github_client: None,
         };
 
         let prompt = agent::build_fix_prompt(&ctx, &wt_ctx);
@@ -598,7 +591,6 @@ mod tests {
                 body: "Body content here".to_string(),
                 labels: "enhancement".to_string(),
             }),
-            github_client: None,
         };
 
         let prompt = agent::build_fix_prompt(&ctx, &wt_ctx);
@@ -649,7 +641,6 @@ CUSTOM: Fix #{{ issue_number }} - {{ issue_title }}"#,
                 body: "Custom body".to_string(),
                 labels: String::new(),
             }),
-            github_client: None,
         };
 
         let prompt = agent::build_fix_prompt(&ctx, &wt_ctx);
