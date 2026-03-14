@@ -579,8 +579,6 @@ pub async fn post_escalation_comment(
     failed_checks: &[CheckRun],
     attempts: u32,
 ) -> Result<()> {
-    let repo_full = format!("{}/{}", owner, repo);
-
     let mut body = format!(
         "## 🚨 CI Fix Escalation\n\n\
          Automated CI fix failed after **{}/{}** attempts. Human intervention required.\n\n\
@@ -609,7 +607,42 @@ pub async fn post_escalation_comment(
 
     body.push_str(&format!("\n**Labels:** `{}`\n", labels::BLOCKED));
 
+    post_escalation_comment_body(owner, repo, pr_number, &body).await
+}
+
+/// Post an escalation comment when CI exhaustion occurs due to timeout or no-commits.
+pub async fn post_exhaustion_escalation_comment(
+    owner: &str,
+    repo: &str,
+    pr_number: u64,
+    reason: &str,
+    attempts: u32,
+) -> Result<()> {
+    let body = format!(
+        "## 🚨 CI Fix Escalation\n\n\
+         Automated CI fix failed after **{}/{}** attempts. Human intervention required.\n\n\
+         ### Reason\n\n\
+         {}\n\n\
+         **Labels:** `{}`\n",
+        attempts,
+        MAX_CI_FIX_ATTEMPTS,
+        reason,
+        labels::BLOCKED
+    );
+
+    post_escalation_comment_body(owner, repo, pr_number, &body).await
+}
+
+/// Posts an escalation comment body to a PR and adds the blocked label.
+async fn post_escalation_comment_body(
+    owner: &str,
+    repo: &str,
+    pr_number: u64,
+    body: &str,
+) -> Result<()> {
+    let repo_full = format!("{}/{}", owner, repo);
     let gh_cmd = github::gh_command_for_repo(&repo_full);
+
     let output = Command::new(gh_cmd)
         .args([
             "pr",
@@ -618,7 +651,7 @@ pub async fn post_escalation_comment(
             "--repo",
             &repo_full,
             "--body",
-            &body,
+            body,
         ])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -692,7 +725,20 @@ pub async fn monitor_and_fix_ci(
             CiResult::Timeout => {
                 eprintln!("⏱️  CI checks timed out");
                 if attempt == MAX_CI_FIX_ATTEMPTS {
-                    break;
+                    eprintln!(
+                        "🚨 Max fix attempts ({}) reached with CI timeout, escalating to human",
+                        MAX_CI_FIX_ATTEMPTS
+                    );
+                    post_exhaustion_escalation_comment(
+                        owner,
+                        repo,
+                        pr_number,
+                        "CI checks timed out on all attempts.",
+                        attempt,
+                    )
+                    .await
+                    .unwrap_or_else(|e| eprintln!("⚠️  Failed to post escalation: {}", e));
+                    return Ok(false);
                 }
                 continue;
             }
@@ -745,7 +791,14 @@ pub async fn monitor_and_fix_ci(
                     if attempt < MAX_CI_FIX_ATTEMPTS {
                         continue;
                     }
-                    break;
+                    eprintln!(
+                        "🚨 Max fix attempts ({}) reached with no commits, escalating to human",
+                        MAX_CI_FIX_ATTEMPTS
+                    );
+                    post_escalation_comment(owner, repo, pr_number, &failed_checks, attempt)
+                        .await
+                        .unwrap_or_else(|e| eprintln!("⚠️  Failed to post escalation: {}", e));
+                    return Ok(false);
                 }
 
                 // Push the fix
