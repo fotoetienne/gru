@@ -335,7 +335,7 @@ enum Commands {
         #[arg(long, help = "Maximum concurrent Minion slots (overrides config)")]
         slots: Option<usize>,
 
-        #[arg(long, help = "Skip auto-resuming interrupted Minions on startup")]
+        #[arg(long, help = "Disable auto-resuming interrupted Minions")]
         no_resume: bool,
     },
 }
