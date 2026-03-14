@@ -185,7 +185,7 @@ async fn run_worker(minion_id: &str, issue: &str, opts: FixOptions) -> Result<i3
     let backend = agent_registry::resolve_backend(&agent_name)?;
 
     // Fetch fresh issue details for the worker
-    let github_hosts = crate::config::load_github_hosts();
+    let github_hosts = crate::config::load_host_registry().all_hosts();
     let issue_ctx = resolve_issue(issue, &github_hosts).await?;
 
     // Determine resume phase from registry
@@ -408,7 +408,7 @@ pub async fn handle_fix(issue: &str, opts: FixOptions) -> Result<i32> {
     let _backend = agent_registry::resolve_backend(agent_name)?;
 
     // Phase 1: Resolve issue
-    let github_hosts = crate::config::load_github_hosts();
+    let github_hosts = crate::config::load_host_registry().all_hosts();
     let issue_ctx = resolve_issue(issue, &github_hosts).await?;
 
     // Phase 2: Determine whether to resume or start fresh

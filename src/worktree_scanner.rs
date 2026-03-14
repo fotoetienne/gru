@@ -284,7 +284,7 @@ pub async fn discover_worktrees(repos_dir: &Path) -> Result<Vec<Worktree>> {
     }
 
     // Load configured hosts once for all repos
-    let github_hosts = crate::config::load_github_hosts();
+    let github_hosts = crate::config::load_host_registry().all_hosts();
 
     // Find all bare repositories recursively
     let bare_repos = find_bare_repos(repos_dir).await?;

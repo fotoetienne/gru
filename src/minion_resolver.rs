@@ -422,7 +422,7 @@ async fn resolve_issue_from_pr(pr_num: u64) -> Result<u64> {
     git::detect_git_repo()
         .await
         .context("Failed to detect git repository")?;
-    let github_hosts = crate::config::load_github_hosts();
+    let github_hosts = crate::config::load_host_registry().all_hosts();
     let remote_url = git::get_github_remote(&github_hosts)
         .await
         .context("Failed to get GitHub remote")?;
