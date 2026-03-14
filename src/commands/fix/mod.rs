@@ -13,7 +13,7 @@ pub use types::FixOptions;
 pub(crate) use types::{IssueContext, WorktreeContext};
 
 use agent::{resume_agent_session, run_agent_session};
-use helpers::try_mark_issue_blocked;
+use helpers::{try_mark_issue_blocked, try_mark_issue_failed};
 use monitor::{monitor_ci_after_fix, monitor_pr_lifecycle};
 use resolve::{check_existing_minions, claim_issue, resolve_issue};
 use types::ExistingMinionCheck;
@@ -244,21 +244,13 @@ async fn run_worker(minion_id: &str, issue: &str, opts: FixOptions) -> Result<i3
         if !result.status.success() {
             update_orchestration_phase(&wt_ctx.minion_id, OrchestrationPhase::Failed).await;
 
-            match crate::github::mark_issue_failed_via_cli(
+            try_mark_issue_failed(
                 &issue_ctx.host,
                 &issue_ctx.owner,
                 &issue_ctx.repo,
                 issue_ctx.issue_num,
             )
-            .await
-            {
-                Ok(()) => {
-                    println!("🏷️  Updated issue label to '{}'", crate::labels::FAILED);
-                }
-                Err(e) => {
-                    log::warn!("⚠️  Failed to update issue label: {}", e);
-                }
-            }
+            .await;
 
             return Ok(result.status.code().unwrap_or(EXIT_CODE_SIGNAL_TERMINATED));
         }

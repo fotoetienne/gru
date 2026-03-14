@@ -34,6 +34,19 @@ pub(super) async fn try_mark_issue_blocked(host: &str, owner: &str, repo: &str, 
     }
 }
 
+/// Attempts to mark an issue as failed via CLI (fire-and-forget).
+/// Logs success/failure but does not propagate errors.
+pub(super) async fn try_mark_issue_failed(host: &str, owner: &str, repo: &str, issue_num: u64) {
+    match crate::github::mark_issue_failed_via_cli(host, owner, repo, issue_num).await {
+        Ok(()) => {
+            println!("🏷️  Updated issue label to '{}'", crate::labels::FAILED);
+        }
+        Err(e) => {
+            log::warn!("⚠️  Failed to update issue label: {}", e);
+        }
+    }
+}
+
 /// Posts a progress comment to the issue via CLI (fire-and-forget).
 pub(super) async fn try_post_progress_comment(
     host: &str,

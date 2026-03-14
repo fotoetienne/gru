@@ -5,7 +5,7 @@ use anyhow::{Context, Result};
 
 /// Resolves an issue argument into validated context.
 ///
-/// Parses the issue string, initializes the GitHub client, and fetches issue details.
+/// Parses the issue string and fetches issue details via gh CLI.
 /// Note: Does NOT claim the issue — that happens after worktree setup to avoid
 /// marking issues as in-progress when setup fails.
 /// Note: Existing minion check is done in `handle_fix` to support resume logic.
