@@ -145,10 +145,10 @@ pub async fn handle_resume(
 
     // Check if attempt_count exceeds max_resume_attempts
     let max_attempts = load_max_resume_attempts();
-    if new_attempt_count >= max_attempts {
+    if new_attempt_count > max_attempts {
         mark_minion_failed(&minion.minion_id).await;
         bail!(
-            "Minion {} has exceeded maximum resume attempts ({} >= {}). Marking as failed.",
+            "Minion {} has exceeded maximum resume attempts ({} > {}). Marking as failed.",
             minion.minion_id,
             new_attempt_count,
             max_attempts
@@ -259,13 +259,14 @@ pub async fn handle_resume(
     update_orchestration_phase(&minion.minion_id, OrchestrationPhase::CreatingPr).await;
 
     let host = crate::github::infer_github_host(&claimed.owner);
-    let github_client = match GitHubClient::from_env_with_host(&claimed.owner, &claimed.repo, &host).await {
-        Ok(client) => Some(client),
-        Err(e) => {
-            log::warn!("⚠️  GitHub client unavailable: {}", e);
-            None
-        }
-    };
+    let github_client =
+        match GitHubClient::from_env_with_host(&claimed.owner, &claimed.repo, &host).await {
+            Ok(client) => Some(client),
+            Err(e) => {
+                log::warn!("⚠️  GitHub client unavailable: {}", e);
+                None
+            }
+        };
     let issue_ctx = IssueContext {
         owner: claimed.owner,
         repo: claimed.repo,
@@ -508,10 +509,12 @@ mod tests {
 
     #[test]
     fn test_load_max_resume_attempts_returns_default_without_config() {
-        // When no config file exists, should return the default value
+        // When no config file exists at a nonexistent path, load falls back to default.
+        // We can't control LabConfig::default_path() here, but we can verify the
+        // constant matches the expected value and that load returns a sane result.
+        assert_eq!(DEFAULT_MAX_RESUME_ATTEMPTS, 3);
         let max = load_max_resume_attempts();
-        // Should return either the configured value or the default (3)
-        assert!(max >= 1);
+        assert!(max >= 1, "load_max_resume_attempts must return at least 1");
     }
 
     #[test]

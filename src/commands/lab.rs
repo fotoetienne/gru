@@ -338,22 +338,17 @@ async fn resume_interrupted_minions(
         }
 
         // Skip minions that have exceeded max attempts
-        if candidate.info.attempt_count >= max_attempts {
+        if candidate.info.attempt_count > max_attempts {
             println!(
-                "⏭️  Skipping {} (issue #{}, {}): attempt_count {} >= max {}",
+                "⏭️  Skipping {} (issue #{}, {}): attempt_count {} > max {}",
                 candidate.minion_id,
                 candidate.info.issue,
                 candidate.info.repo,
                 candidate.info.attempt_count,
                 max_attempts,
             );
-            mark_exhausted_minion(
-                &candidate.minion_id,
-                &candidate.info,
-                &host,
-                &format!("exceeded maximum resume attempts ({})", max_attempts),
-            )
-            .await;
+            let reason = format!("exceeded maximum resume attempts ({})", max_attempts);
+            mark_exhausted_minion(&candidate.minion_id, &candidate.info, &host, &reason).await;
             continue;
         }
 
