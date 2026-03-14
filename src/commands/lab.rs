@@ -508,6 +508,28 @@ async fn poll_and_spawn(
                             {
                                 log::warn!("⚠️  Failed to remove in-progress label: {}", e);
                             }
+                            // Restore the ready label so the issue remains visible for retry
+                            match client
+                                .add_label(&owner, &repo, issue_number, &config.daemon.label)
+                                .await
+                            {
+                                Ok(_) => {
+                                    log::info!(
+                                        "Restored label '{}' on issue #{} after spawn failure",
+                                        config.daemon.label,
+                                        issue_number
+                                    );
+                                }
+                                Err(e) => {
+                                    log::warn!(
+                                        "⚠️  Failed to restore ready label '{}' on issue #{}: {} \
+                                         — issue may need manual label fix",
+                                        config.daemon.label,
+                                        issue_number,
+                                        e
+                                    );
+                                }
+                            }
                         }
                     }
                 }
