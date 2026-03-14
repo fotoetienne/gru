@@ -13,6 +13,8 @@ pub struct Worktree {
     pub branch: String,
     /// Repository identifier (e.g., "owner/repo")
     pub repo: String,
+    /// GitHub hostname (e.g., "github.com" or "ghe.example.com")
+    pub host: String,
     /// Path to the bare repository
     pub bare_repo_path: PathBuf,
 }
@@ -76,8 +78,7 @@ impl Worktree {
             None => return Ok(None),
         };
 
-        let gh_cmd = github::gh_command_for_repo(&self.repo);
-        let output = Command::new(gh_cmd)
+        let output = github::gh_cli_command(&self.host)
             .args([
                 "issue",
                 "view",
@@ -147,12 +148,11 @@ impl Worktree {
     /// Runs `gh pr list --state <state> --head <branch> --json number --jq length`.
     ///
     /// # Error behavior
-    /// - Failure to spawn the `gh`/`ghe` process propagates as `Err`.
+    /// - Failure to spawn the `gh` process propagates as `Err`.
     /// - Non-zero CLI exit (e.g., auth failure, network error) propagates as `Err`.
     ///   Callers decide the conservative default for their use case.
     async fn count_prs_in_state(&self, state: &str) -> Result<u64> {
-        let gh_cmd = github::gh_command_for_repo(&self.repo);
-        let output = Command::new(gh_cmd)
+        let output = github::gh_cli_command(&self.host)
             .args([
                 "pr",
                 "list",
@@ -169,13 +169,12 @@ impl Worktree {
             ])
             .output()
             .await
-            .with_context(|| format!("Failed to run `{} pr list --state {}`", gh_cmd, state))?;
+            .with_context(|| format!("Failed to run `gh pr list --state {}`", state))?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
             anyhow::bail!(
-                "`{} pr list --state {}` exited with {}: {}",
-                gh_cmd,
+                "`gh pr list --state {}` exited with {}: {}",
                 state,
                 output.status,
                 stderr
@@ -189,8 +188,7 @@ impl Worktree {
 
         Ok(count_str.parse().unwrap_or_else(|_| {
             log::warn!(
-                "Unexpected output from '{} pr list --jq length': {:?}",
-                gh_cmd,
+                "Unexpected output from 'gh pr list --jq length': {:?}",
                 count_str
             );
             0
@@ -290,18 +288,19 @@ pub async fn discover_worktrees(repos_dir: &Path) -> Result<Vec<Worktree>> {
     let bare_repos = find_bare_repos(repos_dir).await?;
 
     for bare_repo_path in bare_repos {
-        // Extract repo name from git config
-        let repo_name = match extract_repo_from_git_config(&bare_repo_path, &github_hosts).await {
-            Ok(name) => name,
-            Err(e) => {
-                log::warn!(
-                    "Warning: Failed to extract repo name from {}: {}",
-                    bare_repo_path.display(),
-                    e
-                );
-                continue;
-            }
-        };
+        // Extract repo name and host from git config
+        let (host, repo_name) =
+            match extract_repo_from_git_config(&bare_repo_path, &github_hosts).await {
+                Ok(result) => result,
+                Err(e) => {
+                    log::warn!(
+                        "Warning: Failed to extract repo name from {}: {}",
+                        bare_repo_path.display(),
+                        e
+                    );
+                    continue;
+                }
+            };
 
         // List worktrees for this bare repo
         let output = Command::new("git")
@@ -333,7 +332,7 @@ pub async fn discover_worktrees(repos_dir: &Path) -> Result<Vec<Worktree>> {
 
         // Parse worktree list output
         let stdout = String::from_utf8_lossy(&output.stdout);
-        let discovered = parse_worktree_list(&stdout, &repo_name, &bare_repo_path);
+        let discovered = parse_worktree_list(&stdout, &repo_name, &host, &bare_repo_path);
         worktrees.extend(discovered);
     }
 
@@ -400,12 +399,18 @@ async fn find_bare_repos(dir: &Path) -> Result<Vec<PathBuf>> {
     Ok(bare_repos)
 }
 
-/// Extract repository identifier from git config
+/// Extract repository identifier and host from git config.
+///
 /// Uses `git config remote.origin.url` to get the actual repo URL and parses it
 /// via `git::parse_github_remote` to avoid duplicating URL parsing logic.
-/// Example: https://github.com/owner/repo.git -> "owner/repo"
-///          git@github.com:owner/repo.git -> "owner/repo"
-async fn extract_repo_from_git_config(path: &Path, github_hosts: &[String]) -> Result<String> {
+///
+/// Example: `https://github.com/owner/repo.git` -> `("github.com", "owner/repo")`
+///
+/// Returns `(host, "owner/repo")`.
+async fn extract_repo_from_git_config(
+    path: &Path,
+    github_hosts: &[String],
+) -> Result<(String, String)> {
     // Get remote.origin.url from git config
     let output = Command::new("git")
         .args(["-C", &path.to_string_lossy(), "config", "remote.origin.url"])
@@ -422,16 +427,21 @@ async fn extract_repo_from_git_config(path: &Path, github_hosts: &[String]) -> R
 
     let url = String::from_utf8_lossy(&output.stdout).trim().to_string();
 
-    let (_host, owner, repo) = git::parse_github_remote(&url, github_hosts)
+    let (host, owner, repo) = git::parse_github_remote(&url, github_hosts)
         .context("Failed to parse repo from remote URL")?;
-    Ok(format!("{}/{}", owner, repo))
+    Ok((host, format!("{}/{}", owner, repo)))
 }
 
 /// Parse git worktree list --porcelain output.
 ///
 /// Delegates to `git::parse_porcelain_worktrees` for the actual parsing,
 /// then enriches entries with repo metadata and filters out the bare repo itself.
-fn parse_worktree_list(output: &str, repo: &str, bare_repo_path: &Path) -> Vec<Worktree> {
+fn parse_worktree_list(
+    output: &str,
+    repo: &str,
+    host: &str,
+    bare_repo_path: &Path,
+) -> Vec<Worktree> {
     git::parse_porcelain_worktrees(output)
         .into_iter()
         .filter_map(|entry| {
@@ -444,6 +454,7 @@ fn parse_worktree_list(output: &str, repo: &str, bare_repo_path: &Path) -> Vec<W
                 path: entry.path,
                 branch,
                 repo: repo.to_string(),
+                host: host.to_string(),
                 bare_repo_path: bare_repo_path.to_path_buf(),
             })
         })
@@ -460,6 +471,7 @@ mod tests {
             path: PathBuf::from("/tmp/work"),
             branch: "issue-36".to_string(),
             repo: "owner/repo".to_string(),
+            host: "github.com".to_string(),
             bare_repo_path: PathBuf::from("/tmp/repo.git"),
         };
         assert_eq!(wt.extract_issue_number(), Some(36));
@@ -468,6 +480,7 @@ mod tests {
             path: PathBuf::from("/tmp/work"),
             branch: "gru/issue-42".to_string(),
             repo: "owner/repo".to_string(),
+            host: "github.com".to_string(),
             bare_repo_path: PathBuf::from("/tmp/repo.git"),
         };
         assert_eq!(wt.extract_issue_number(), Some(42));
@@ -476,6 +489,7 @@ mod tests {
             path: PathBuf::from("/tmp/work"),
             branch: "fix/issue-123".to_string(),
             repo: "owner/repo".to_string(),
+            host: "github.com".to_string(),
             bare_repo_path: PathBuf::from("/tmp/repo.git"),
         };
         assert_eq!(wt.extract_issue_number(), Some(123));
@@ -484,6 +498,7 @@ mod tests {
             path: PathBuf::from("/tmp/work"),
             branch: "feature-branch".to_string(),
             repo: "owner/repo".to_string(),
+            host: "github.com".to_string(),
             bare_repo_path: PathBuf::from("/tmp/repo.git"),
         };
         assert_eq!(wt.extract_issue_number(), None);
@@ -493,6 +508,7 @@ mod tests {
             path: PathBuf::from("/tmp/work"),
             branch: "minion/issue-42-M001".to_string(),
             repo: "owner/repo".to_string(),
+            host: "github.com".to_string(),
             bare_repo_path: PathBuf::from("/tmp/repo.git"),
         };
         assert_eq!(wt.extract_issue_number(), Some(42));
@@ -502,6 +518,7 @@ mod tests {
             path: PathBuf::from("/tmp/work"),
             branch: "issue-fix-42".to_string(),
             repo: "owner/repo".to_string(),
+            host: "github.com".to_string(),
             bare_repo_path: PathBuf::from("/tmp/repo.git"),
         };
         assert_eq!(wt.extract_issue_number(), None);
@@ -511,11 +528,12 @@ mod tests {
     fn test_parse_worktree_list() {
         let output = "worktree /Users/test/.gru/repos/owner_repo.git\nHEAD 1234567890abcdef\nbare\n\nworktree /Users/test/.gru/work/owner/repo/issue-36\nHEAD abcdef1234567890\nbranch refs/heads/issue-36\n\n";
         let bare_path = PathBuf::from("/Users/test/.gru/repos/owner_repo.git");
-        let worktrees = parse_worktree_list(output, "owner/repo", &bare_path);
+        let worktrees = parse_worktree_list(output, "owner/repo", "github.com", &bare_path);
 
         assert_eq!(worktrees.len(), 1);
         assert_eq!(worktrees[0].branch, "issue-36");
         assert_eq!(worktrees[0].repo, "owner/repo");
+        assert_eq!(worktrees[0].host, "github.com");
         assert_eq!(
             worktrees[0].path,
             PathBuf::from("/Users/test/.gru/work/owner/repo/issue-36")

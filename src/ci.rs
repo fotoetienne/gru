@@ -256,11 +256,15 @@ pub fn build_ci_fix_prompt(failed_checks: &[CheckRun], attempt: u32) -> String {
 
 /// Fetches check runs for a given PR ref using the gh CLI.
 /// Returns a list of CheckRun structs parsed from the gh CLI output.
-pub async fn fetch_check_runs(owner: &str, repo: &str, git_ref: &str) -> Result<Vec<CheckRun>> {
+pub async fn fetch_check_runs(
+    host: &str,
+    owner: &str,
+    repo: &str,
+    git_ref: &str,
+) -> Result<Vec<CheckRun>> {
     let repo_full = format!("{}/{}", owner, repo);
-    let gh_cmd = github::gh_command_for_repo(&repo_full);
 
-    let output = Command::new(gh_cmd)
+    let output = github::gh_cli_command(host)
         .args([
             "api",
             &format!("repos/{}/commits/{}/check-runs", repo_full, git_ref),
@@ -350,6 +354,7 @@ pub async fn fetch_check_runs(owner: &str, repo: &str, git_ref: &str) -> Result<
 /// Fetches the workflow run logs for a failed check to get more detailed output.
 /// Falls back gracefully if logs aren't available.
 pub async fn fetch_check_logs(
+    host: &str,
     owner: &str,
     repo: &str,
     check_name: &str,
@@ -358,9 +363,8 @@ pub async fn fetch_check_logs(
 ) -> Result<Option<String>> {
     // Use gh to get the workflow run associated with this PR
     let repo_full = format!("{}/{}", owner, repo);
-    let gh_cmd = github::gh_command_for_repo(&repo_full);
 
-    let output = Command::new(gh_cmd)
+    let output = github::gh_cli_command(host)
         .args([
             "run",
             "list",
@@ -394,7 +398,7 @@ pub async fn fetch_check_logs(
         if name.to_lowercase().contains(&check_name.to_lowercase()) && conclusion == "failure" {
             if let Some(run_id) = run["databaseId"].as_u64() {
                 // Try to get the logs for this run
-                let log_output = Command::new(gh_cmd)
+                let log_output = github::gh_cli_command(host)
                     .args([
                         "run",
                         "view",
@@ -421,7 +425,7 @@ pub async fn fetch_check_logs(
     }
 
     // Also try using gh pr checks to get status info
-    let pr_output = Command::new(gh_cmd)
+    let pr_output = github::gh_cli_command(host)
         .args(["pr", "checks", &pr_number.to_string(), "--repo", &repo_full])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -442,7 +446,7 @@ pub async fn fetch_check_logs(
 
 /// Waits for CI checks to complete on a PR, polling at regular intervals.
 /// Returns the overall CI result.
-pub async fn wait_for_ci(owner: &str, repo: &str, head_sha: &str) -> Result<CiResult> {
+pub async fn wait_for_ci(host: &str, owner: &str, repo: &str, head_sha: &str) -> Result<CiResult> {
     let start = std::time::Instant::now();
     let wait_timeout = Duration::from_secs(CI_WAIT_TIMEOUT_SECS);
     let completion_timeout = Duration::from_secs(CI_COMPLETION_TIMEOUT_SECS);
@@ -469,7 +473,7 @@ pub async fn wait_for_ci(owner: &str, repo: &str, head_sha: &str) -> Result<CiRe
             return Ok(CiResult::Timeout);
         }
 
-        let checks = fetch_check_runs(owner, repo, head_sha).await?;
+        let checks = fetch_check_runs(host, owner, repo, head_sha).await?;
 
         if checks.is_empty() {
             sleep(poll_interval).await;
@@ -533,11 +537,15 @@ pub async fn get_head_sha(worktree_path: &Path) -> Result<String> {
 }
 
 /// Gets the PR number associated with the current branch
-pub async fn get_pr_number(owner: &str, repo: &str, branch: &str) -> Result<Option<u64>> {
+pub async fn get_pr_number(
+    host: &str,
+    owner: &str,
+    repo: &str,
+    branch: &str,
+) -> Result<Option<u64>> {
     let repo_full = format!("{}/{}", owner, repo);
-    let gh_cmd = github::gh_command_for_repo(&repo_full);
 
-    let output = Command::new(gh_cmd)
+    let output = github::gh_cli_command(host)
         .args([
             "pr", "list", "--repo", &repo_full, "--head", branch, "--json", "number", "--limit",
             "1",
@@ -598,6 +606,7 @@ pub async fn invoke_ci_fix(
 
 /// Posts an escalation comment on the PR when CI fixes are exhausted
 pub async fn post_escalation_comment(
+    host: &str,
     owner: &str,
     repo: &str,
     pr_number: u64,
@@ -632,11 +641,12 @@ pub async fn post_escalation_comment(
 
     body.push_str(&format!("\n**Labels:** `{}`\n", labels::BLOCKED));
 
-    post_escalation_comment_body(owner, repo, pr_number, &body).await
+    post_escalation_comment_body(host, owner, repo, pr_number, &body).await
 }
 
 /// Post an escalation comment when CI exhaustion occurs due to timeout or no-commits.
 pub async fn post_exhaustion_escalation_comment(
+    host: &str,
     owner: &str,
     repo: &str,
     pr_number: u64,
@@ -655,20 +665,20 @@ pub async fn post_exhaustion_escalation_comment(
         labels::BLOCKED
     );
 
-    post_escalation_comment_body(owner, repo, pr_number, &body).await
+    post_escalation_comment_body(host, owner, repo, pr_number, &body).await
 }
 
 /// Posts an escalation comment body to a PR and adds the blocked label.
 async fn post_escalation_comment_body(
+    host: &str,
     owner: &str,
     repo: &str,
     pr_number: u64,
     body: &str,
 ) -> Result<()> {
     let repo_full = format!("{}/{}", owner, repo);
-    let gh_cmd = github::gh_command_for_repo(&repo_full);
 
-    let output = Command::new(gh_cmd)
+    let output = github::gh_cli_command(host)
         .args([
             "pr",
             "comment",
@@ -690,7 +700,7 @@ async fn post_escalation_comment_body(
     }
 
     // Add the blocked label
-    let _ = Command::new(gh_cmd)
+    let _ = github::gh_cli_command(host)
         .args([
             "pr",
             "edit",
@@ -718,6 +728,7 @@ async fn post_escalation_comment_body(
 ///
 /// Returns Ok(true) if CI passed (possibly after fixes), Ok(false) if escalated.
 pub async fn monitor_and_fix_ci(
+    host: &str,
     owner: &str,
     repo: &str,
     pr_number: u64,
@@ -736,7 +747,7 @@ pub async fn monitor_and_fix_ci(
         );
 
         // Wait for CI to complete
-        let ci_result = wait_for_ci(owner, repo, &head_sha).await?;
+        let ci_result = wait_for_ci(host, owner, repo, &head_sha).await?;
 
         match ci_result {
             CiResult::AllPassed => {
@@ -755,6 +766,7 @@ pub async fn monitor_and_fix_ci(
                         MAX_CI_FIX_ATTEMPTS
                     );
                     post_exhaustion_escalation_comment(
+                        host,
                         owner,
                         repo,
                         pr_number,
@@ -776,7 +788,8 @@ pub async fn monitor_and_fix_ci(
                 for check in &mut failed_checks {
                     if check.output.is_none() || check.output.as_deref() == Some("") {
                         if let Ok(Some(logs)) =
-                            fetch_check_logs(owner, repo, &check.name, pr_number, branch).await
+                            fetch_check_logs(host, owner, repo, &check.name, pr_number, branch)
+                                .await
                         {
                             check.output = Some(logs);
                         }
@@ -789,7 +802,7 @@ pub async fn monitor_and_fix_ci(
                         "🚨 Max fix attempts ({}) reached, escalating to human",
                         MAX_CI_FIX_ATTEMPTS
                     );
-                    post_escalation_comment(owner, repo, pr_number, &failed_checks, attempt)
+                    post_escalation_comment(host, owner, repo, pr_number, &failed_checks, attempt)
                         .await
                         .unwrap_or_else(|e| eprintln!("⚠️  Failed to post escalation: {}", e));
                     return Ok(false);
@@ -820,7 +833,7 @@ pub async fn monitor_and_fix_ci(
                         "🚨 Max fix attempts ({}) reached with no commits, escalating to human",
                         MAX_CI_FIX_ATTEMPTS
                     );
-                    post_escalation_comment(owner, repo, pr_number, &failed_checks, attempt)
+                    post_escalation_comment(host, owner, repo, pr_number, &failed_checks, attempt)
                         .await
                         .unwrap_or_else(|e| eprintln!("⚠️  Failed to post escalation: {}", e));
                     return Ok(false);

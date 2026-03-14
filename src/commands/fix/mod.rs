@@ -281,12 +281,22 @@ async fn run_worker(minion_id: &str, issue: &str, opts: FixOptions) -> Result<i3
     // Add gru:auto-merge label if --auto-merge flag was set
     if auto_merge {
         if let Some(ref pr_num) = pr_number {
-            if let Err(e) =
-                pr_monitor::ensure_auto_merge_label(&issue_ctx.owner, &issue_ctx.repo).await
+            if let Err(e) = pr_monitor::ensure_auto_merge_label(
+                &issue_ctx.host,
+                &issue_ctx.owner,
+                &issue_ctx.repo,
+            )
+            .await
             {
                 log::warn!("⚠️  Failed to ensure gru:auto-merge label: {}", e);
             }
-            match pr_monitor::add_auto_merge_label(&issue_ctx.owner, &issue_ctx.repo, pr_num).await
+            match pr_monitor::add_auto_merge_label(
+                &issue_ctx.host,
+                &issue_ctx.owner,
+                &issue_ctx.repo,
+                pr_num,
+            )
+            .await
             {
                 Ok(()) => println!("🏷️  Added gru:auto-merge label to PR #{}", pr_num),
                 Err(e) => log::warn!("⚠️  Failed to add gru:auto-merge label: {}", e),
@@ -329,6 +339,7 @@ async fn run_worker(minion_id: &str, issue: &str, opts: FixOptions) -> Result<i3
 
     // CI monitoring
     let ci_passed = monitor_ci_after_fix(
+        &issue_ctx.host,
         &issue_ctx.owner,
         &issue_ctx.repo,
         &wt_ctx.branch_name,

@@ -192,7 +192,9 @@ pub(super) async fn monitor_pr_lifecycle(
     monitor_timeout: Duration,
 ) {
     // Ensure the gru:ready-to-merge label exists in the repo
-    if let Err(e) = pr_monitor::ensure_ready_to_merge_label(&issue_ctx.owner, &issue_ctx.repo).await
+    if let Err(e) =
+        pr_monitor::ensure_ready_to_merge_label(&issue_ctx.host, &issue_ctx.owner, &issue_ctx.repo)
+            .await
     {
         log::warn!(
             "⚠️  Failed to ensure {} label: {}",
@@ -273,6 +275,7 @@ pub(super) async fn monitor_pr_lifecycle(
         }
 
         match pr_monitor::monitor_pr(
+            &issue_ctx.host,
             &issue_ctx.owner,
             &issue_ctx.repo,
             pr_number,
@@ -297,6 +300,7 @@ pub(super) async fn monitor_pr_lifecycle(
                 // first ReadyToMerge, rather than unconditionally at startup.
                 if !judge_label_ensured {
                     if let Err(e) = merge_judge::ensure_needs_human_review_label(
+                        &issue_ctx.host,
                         &issue_ctx.owner,
                         &issue_ctx.repo,
                     )
@@ -311,6 +315,7 @@ pub(super) async fn monitor_pr_lifecycle(
                 // not yet cleared — skip judge until human removes it.
                 // On API failure, be conservative and skip (don't proceed).
                 match merge_judge::has_needs_human_review_label(
+                    &issue_ctx.host,
                     &issue_ctx.owner,
                     &issue_ctx.repo,
                     pr_number,
@@ -343,6 +348,7 @@ pub(super) async fn monitor_pr_lifecycle(
 
                 // Invoke the merge-readiness judge.
                 match merge_judge::evaluate(
+                    &issue_ctx.host,
                     &issue_ctx.owner,
                     &issue_ctx.repo,
                     pr_number,
@@ -402,6 +408,7 @@ pub(super) async fn monitor_pr_lifecycle(
                             );
                             // Apply label and post comment.
                             match merge_judge::add_needs_human_review_label(
+                                &issue_ctx.host,
                                 &issue_ctx.owner,
                                 &issue_ctx.repo,
                                 pr_number,
@@ -414,6 +421,7 @@ pub(super) async fn monitor_pr_lifecycle(
                                 }
                             }
                             merge_judge::post_judge_escalation_comment(
+                                &issue_ctx.host,
                                 &issue_ctx.owner,
                                 &issue_ctx.repo,
                                 pr_number,
@@ -512,6 +520,7 @@ pub(super) async fn monitor_pr_lifecycle(
                 };
 
                 match ci::monitor_and_fix_ci(
+                    &issue_ctx.host,
                     &issue_ctx.owner,
                     &issue_ctx.repo,
                     pr_num_u64,
@@ -651,12 +660,13 @@ pub(super) async fn monitor_pr_lifecycle(
 /// Monitors CI after the initial fix and attempts auto-fixes if checks fail.
 /// Returns Ok(true) if CI passed, Ok(false) if escalated/failed.
 pub(super) async fn monitor_ci_after_fix(
+    host: &str,
     owner: &str,
     repo: &str,
     branch: &str,
     worktree_path: &Path,
 ) -> Result<bool> {
-    let pr_number = match ci::get_pr_number(owner, repo, branch).await? {
+    let pr_number = match ci::get_pr_number(host, owner, repo, branch).await? {
         Some(num) => num,
         None => {
             eprintln!(
@@ -668,5 +678,5 @@ pub(super) async fn monitor_ci_after_fix(
     };
 
     eprintln!("🔍 Monitoring CI for PR #{}", pr_number);
-    ci::monitor_and_fix_ci(owner, repo, pr_number, branch, worktree_path).await
+    ci::monitor_and_fix_ci(host, owner, repo, pr_number, branch, worktree_path).await
 }
