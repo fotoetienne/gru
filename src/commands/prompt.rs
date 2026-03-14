@@ -642,7 +642,7 @@ async fn setup_prompt_workspace(
             })
         }
     } else if opts.no_worktree && has_context {
-        println!("ℹ️  Running without worktree - Claude will work in the current directory");
+        println!("ℹ️  Running without worktree - agent will work in the current directory");
         let run_dir = std::env::current_dir().context("Failed to get current working directory")?;
         let wt_path = run_dir.clone();
         fetched.context.worktree_path = Some(wt_path.clone());
@@ -821,19 +821,39 @@ async fn register_and_run_agent(
     }
 }
 
-/// Handles the prompt command by launching Claude with an ad-hoc prompt.
+/// Renders the prompt template with context variables and saves it to the workspace.
+async fn render_and_save_prompt(
+    resolved_prompt: &str,
+    fetched: &mut FetchedContext,
+    ws: &WorkspaceSetup,
+) -> Result<String> {
+    fetched.context.cwd = Some(ws.run_dir.clone());
+    let variables = fetched.context.to_variables();
+    let rendered = render_template(resolved_prompt, &variables);
+
+    let prompt_file = ws.workspace_path.join("prompt.txt");
+    tokio::fs::write(&prompt_file, &rendered)
+        .await
+        .context("Failed to save prompt to workspace")?;
+    println!("📂 Workspace: {}", ws.workspace_path.display());
+
+    Ok(rendered)
+}
+
+/// Handles the prompt command by launching an agent with an ad-hoc prompt.
 /// Returns the exit code from the agent process.
 ///
 /// Phases:
-///   1. Validate input
+///   1. Validate input and agent backend
 ///   2. Resolve prompt text (file-based or ad-hoc)
 ///   3. Build context from --issue / --pr flags
 ///   4. Set up workspace / worktree
 ///   5. Render prompt template
 ///   6. Register minion, run agent, clean up
 pub async fn handle_prompt(prompt: &str, opts: PromptOptions) -> Result<i32> {
-    // Phase 1: Validate input
+    // Phase 1: Validate input and agent backend
     validate_prompt_input(prompt, &opts.worktree)?;
+    agent_registry::resolve_backend(&opts.agent_name)?;
 
     // Phase 2: Resolve prompt text
     let custom_params = parse_params(&opts.params)?;
@@ -855,16 +875,8 @@ pub async fn handle_prompt(prompt: &str, opts: PromptOptions) -> Result<i32> {
     let workspace = workspace::Workspace::new().context("Failed to initialize Gru workspace")?;
     let ws = setup_prompt_workspace(&mut fetched, &opts, &minion_id, &workspace).await?;
 
-    // Phase 5: Render prompt
-    fetched.context.cwd = Some(ws.run_dir.clone());
-    let variables = fetched.context.to_variables();
-    let rendered_prompt = render_template(&resolved_prompt, &variables);
-
-    let prompt_file = ws.workspace_path.join("prompt.txt");
-    tokio::fs::write(&prompt_file, &rendered_prompt)
-        .await
-        .context("Failed to save prompt to workspace")?;
-    println!("📂 Workspace: {}", ws.workspace_path.display());
+    // Phase 5: Render prompt template
+    let rendered_prompt = render_and_save_prompt(&resolved_prompt, &mut fetched, &ws).await?;
 
     // Phase 6: Register minion, run agent, clean up
     let run_cfg = AgentRunConfig {
