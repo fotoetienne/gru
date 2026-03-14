@@ -115,15 +115,6 @@ pub fn build_issue_url_with_host(repo: &str, host: &str, issue_number: u64) -> O
 /// Determine the correct `gh` CLI command for a repository.
 ///
 /// Returns `"ghe"` for non-`github.com` hosts, `"gh"` otherwise.
-///
-/// # Arguments
-/// * `repo` - Repository identifier in "owner/repo" format
-pub fn gh_command_for_repo(repo: &str) -> &'static str {
-    let owner = repo.split('/').next().unwrap_or("");
-    let host = infer_github_host(owner);
-    gh_command_for_host(&host)
-}
-
 /// Get GitHub token with automatic fallback logic
 ///
 /// Priority order:
@@ -1240,29 +1231,6 @@ mod tests {
     #[test]
     fn test_infer_github_host_empty() {
         assert_eq!(infer_github_host(""), "github.com");
-    }
-
-    // --- gh_command_for_repo tests ---
-
-    #[test]
-    fn test_gh_command_for_repo_netflix() {
-        assert_eq!(gh_command_for_repo("netflix/some-repo"), "ghe");
-    }
-
-    #[test]
-    fn test_gh_command_for_repo_public() {
-        assert_eq!(gh_command_for_repo("octocat/hello-world"), "gh");
-    }
-
-    #[test]
-    fn test_gh_command_for_repo_no_slash() {
-        // Edge case: no owner/repo separator
-        assert_eq!(gh_command_for_repo("just-a-string"), "gh");
-    }
-
-    #[test]
-    fn test_gh_command_for_repo_empty() {
-        assert_eq!(gh_command_for_repo(""), "gh");
     }
 
     // --- gh_command_for_host tests ---

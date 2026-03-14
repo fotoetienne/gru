@@ -71,30 +71,28 @@ fn calculate_retry_delay(attempt: u32) -> u64 {
 /// Execute a gh API command with retry logic and exponential backoff.
 ///
 /// # Arguments
-/// * `repo` - Repository identifier in "owner/repo" format (used to select `gh` or `ghe`)
+/// * `host` - GitHub hostname (e.g., "github.com" or "ghe.example.com")
 /// * `args` - The arguments to pass to the gh command
 /// * `max_retries` - Maximum number of retry attempts (default: 5)
 ///
 /// # Returns
 /// The command output on success, or an error after all retries are exhausted.
-async fn gh_api_with_retry(repo: &str, args: &[&str], max_retries: u32) -> Result<Output> {
-    let gh_cmd = github::gh_command_for_repo(repo);
+async fn gh_api_with_retry(host: &str, args: &[&str], max_retries: u32) -> Result<Output> {
     let mut attempts = 0;
     let args_str = args.join(" ");
 
     loop {
-        let output = tokio::process::Command::new(gh_cmd)
+        let output = github::gh_cli_command(host)
             .args(args)
             .output()
             .await
-            .with_context(|| format!("Failed to execute: {} {}", gh_cmd, args_str))?;
+            .with_context(|| format!("Failed to execute: gh {}", args_str))?;
 
         if output.status.success() {
             if attempts > 0 {
                 log::info!(
-                    "GitHub API call succeeded after {} retries: {} {}",
+                    "GitHub API call succeeded after {} retries: gh {}",
                     attempts,
-                    gh_cmd,
                     args_str
                 );
             }
@@ -179,7 +177,7 @@ const READY_TO_MERGE_LABEL: &str = labels::READY_TO_MERGE;
 const AUTO_MERGE_LABEL: &str = labels::AUTO_MERGE;
 
 /// Ensure the `gru:ready-to-merge` label exists in the repository, creating it if needed.
-pub async fn ensure_ready_to_merge_label(owner: &str, repo: &str) -> Result<()> {
+pub async fn ensure_ready_to_merge_label(host: &str, owner: &str, repo: &str) -> Result<()> {
     let (color, description) =
         labels::get_label_info(READY_TO_MERGE_LABEL).expect("READY_TO_MERGE must be in ALL_LABELS");
     let repo_full = format!("{owner}/{repo}");
@@ -189,7 +187,7 @@ pub async fn ensure_ready_to_merge_label(owner: &str, repo: &str) -> Result<()> 
     let desc_field = format!("description={description}");
 
     let output = gh_api_with_retry(
-        &repo_full,
+        host,
         &[
             "api",
             &endpoint,
@@ -222,10 +220,16 @@ pub async fn ensure_ready_to_merge_label(owner: &str, repo: &str) -> Result<()> 
 }
 
 /// Check if a PR currently has a specific label.
-async fn has_label(owner: &str, repo: &str, pr_number: &str, label_name: &str) -> Result<bool> {
+async fn has_label(
+    host: &str,
+    owner: &str,
+    repo: &str,
+    pr_number: &str,
+    label_name: &str,
+) -> Result<bool> {
     let repo_full = format!("{owner}/{repo}");
     let endpoint = format!("repos/{repo_full}/issues/{pr_number}/labels");
-    let output = gh_api_with_retry(&repo_full, &["api", &endpoint], DEFAULT_MAX_RETRIES).await?;
+    let output = gh_api_with_retry(host, &["api", &endpoint], DEFAULT_MAX_RETRIES).await?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -243,17 +247,27 @@ async fn has_label(owner: &str, repo: &str, pr_number: &str, label_name: &str) -
 }
 
 /// Check if a PR currently has the `ready-to-merge` label.
-async fn has_ready_to_merge_label(owner: &str, repo: &str, pr_number: &str) -> Result<bool> {
-    has_label(owner, repo, pr_number, READY_TO_MERGE_LABEL).await
+async fn has_ready_to_merge_label(
+    host: &str,
+    owner: &str,
+    repo: &str,
+    pr_number: &str,
+) -> Result<bool> {
+    has_label(host, owner, repo, pr_number, READY_TO_MERGE_LABEL).await
 }
 
 /// Check if a PR currently has the `gru:auto-merge` label.
-async fn has_auto_merge_label(owner: &str, repo: &str, pr_number: &str) -> Result<bool> {
-    has_label(owner, repo, pr_number, AUTO_MERGE_LABEL).await
+async fn has_auto_merge_label(
+    host: &str,
+    owner: &str,
+    repo: &str,
+    pr_number: &str,
+) -> Result<bool> {
+    has_label(host, owner, repo, pr_number, AUTO_MERGE_LABEL).await
 }
 
 /// Ensure the `gru:auto-merge` label exists in the repository, creating it if needed.
-pub async fn ensure_auto_merge_label(owner: &str, repo: &str) -> Result<()> {
+pub async fn ensure_auto_merge_label(host: &str, owner: &str, repo: &str) -> Result<()> {
     let (color, description) =
         labels::get_label_info(AUTO_MERGE_LABEL).expect("AUTO_MERGE must be in ALL_LABELS");
     let repo_full = format!("{owner}/{repo}");
@@ -263,7 +277,7 @@ pub async fn ensure_auto_merge_label(owner: &str, repo: &str) -> Result<()> {
     let desc_field = format!("description={description}");
 
     let output = gh_api_with_retry(
-        &repo_full,
+        host,
         &[
             "api",
             &endpoint,
@@ -296,10 +310,14 @@ pub async fn ensure_auto_merge_label(owner: &str, repo: &str) -> Result<()> {
 }
 
 /// Add the `gru:auto-merge` label to a PR.
-pub async fn add_auto_merge_label(owner: &str, repo: &str, pr_number: &str) -> Result<()> {
+pub async fn add_auto_merge_label(
+    host: &str,
+    owner: &str,
+    repo: &str,
+    pr_number: &str,
+) -> Result<()> {
     let repo_full = format!("{owner}/{repo}");
-    let gh_cmd = github::gh_command_for_repo(&repo_full);
-    let output = tokio::process::Command::new(gh_cmd)
+    let output = github::gh_cli_command(host)
         .args([
             "pr",
             "edit",
@@ -326,11 +344,16 @@ pub async fn add_auto_merge_label(owner: &str, repo: &str, pr_number: &str) -> R
 }
 
 /// Add the `gru:ready-to-merge` label to a PR.
-async fn add_ready_to_merge_label(owner: &str, repo: &str, pr_number: &str) -> Result<()> {
+async fn add_ready_to_merge_label(
+    host: &str,
+    owner: &str,
+    repo: &str,
+    pr_number: &str,
+) -> Result<()> {
     let repo_full = format!("{owner}/{repo}");
     let endpoint = format!("repos/{repo_full}/issues/{pr_number}/labels");
     let output = gh_api_with_retry(
-        &repo_full,
+        host,
         &[
             "api",
             &endpoint,
@@ -356,13 +379,18 @@ async fn add_ready_to_merge_label(owner: &str, repo: &str, pr_number: &str) -> R
 }
 
 /// Remove the `gru:ready-to-merge` label from a PR.
-async fn remove_ready_to_merge_label(owner: &str, repo: &str, pr_number: &str) -> Result<()> {
+async fn remove_ready_to_merge_label(
+    host: &str,
+    owner: &str,
+    repo: &str,
+    pr_number: &str,
+) -> Result<()> {
     let repo_full = format!("{owner}/{repo}");
 
     let label_encoded = READY_TO_MERGE_LABEL.replace(':', "%3A");
     let endpoint = format!("repos/{repo_full}/issues/{pr_number}/labels/{label_encoded}");
     let output = gh_api_with_retry(
-        &repo_full,
+        host,
         &["api", &endpoint, "-X", "DELETE"],
         DEFAULT_MAX_RETRIES,
     )
@@ -389,32 +417,34 @@ async fn remove_ready_to_merge_label(owner: &str, repo: &str, pr_number: &str) -
 /// Returns `Some(readiness)` if all readiness checks pass, or `None` if not ready
 /// or if the readiness check failed. The `was_ready` bool is updated in place.
 async fn update_readiness_label(
+    host: &str,
     owner: &str,
     repo: &str,
     pr_number: &str,
     pr_number_u64: u64,
     was_ready: &mut bool,
 ) -> Option<merge_readiness::MergeReadiness> {
-    let readiness = match merge_readiness::check_merge_readiness(owner, repo, pr_number_u64).await {
-        Ok(r) => r,
-        Err(e) => {
-            log::warn!("Failed to check merge readiness: {}", e);
-            return None;
-        }
-    };
+    let readiness =
+        match merge_readiness::check_merge_readiness(host, owner, repo, pr_number_u64).await {
+            Ok(r) => r,
+            Err(e) => {
+                log::warn!("Failed to check merge readiness: {}", e);
+                return None;
+            }
+        };
 
     let is_ready = readiness.is_ready();
 
     if is_ready && !*was_ready {
         // Transition: not ready → ready
-        match add_ready_to_merge_label(owner, repo, pr_number).await {
+        match add_ready_to_merge_label(host, owner, repo, pr_number).await {
             Ok(()) => println!("✅ PR #{} is ready to merge", pr_number),
             Err(e) => log::warn!("Failed to add ready-to-merge label: {}", e),
         }
     } else if !is_ready && *was_ready {
         // Transition: ready → not ready
         let reason = readiness.failure_reasons().join(", ");
-        match remove_ready_to_merge_label(owner, repo, pr_number).await {
+        match remove_ready_to_merge_label(host, owner, repo, pr_number).await {
             Ok(()) => println!(
                 "⚠️  PR #{} is no longer ready to merge ({})",
                 pr_number, reason
@@ -451,6 +481,7 @@ struct CheckRunsResponse {
 /// - Already-handled reviews are not re-fetched.
 /// - Reviews posted during event handling (rebase, review response) are caught.
 pub async fn monitor_pr(
+    host: &str,
     owner: &str,
     repo: &str,
     pr_number: &str,
@@ -464,7 +495,7 @@ pub async fn monitor_pr(
 
     // Track merge-readiness state across polls to detect transitions.
     // Seed from the current label state so we don't add/remove on first poll.
-    let mut was_ready = has_ready_to_merge_label(owner, repo, pr_number)
+    let mut was_ready = has_ready_to_merge_label(host, owner, repo, pr_number)
         .await
         .unwrap_or(false);
 
@@ -483,7 +514,7 @@ pub async fn monitor_pr(
 
         // Race the polling iteration against Ctrl+C
         tokio::select! {
-            result = poll_once(owner, repo, pr_number, &mut last_check_time, &mut was_ready) => {
+            result = poll_once(host, owner, repo, pr_number, &mut last_check_time, &mut was_ready) => {
                 if let Some(monitor_result) = result? {
                     return Ok((monitor_result, last_check_time));
                 }
@@ -508,6 +539,7 @@ pub async fn monitor_pr(
 /// Returns `Ok(Some(result))` if an actionable event was detected,
 /// or `Ok(None)` if nothing happened and the caller should sleep and retry.
 async fn poll_once(
+    host: &str,
     owner: &str,
     repo: &str,
     pr_number: &str,
@@ -515,7 +547,7 @@ async fn poll_once(
     was_ready: &mut bool,
 ) -> Result<Option<MonitorResult>> {
     // Fetch PR state
-    let pr = get_pr(owner, repo, pr_number).await?;
+    let pr = get_pr(host, owner, repo, pr_number).await?;
 
     // Check terminal states - merged PRs are also in "closed" state
     // Must check merged flag first to distinguish merged from just closed
@@ -531,7 +563,7 @@ async fn poll_once(
     // The full list is reused below for merge-readiness evaluation.
     // Check for new reviews BEFORE merge conflicts so that reviewer feedback
     // is never silently dropped when conflicts and reviews overlap.
-    let all_reviews = get_all_reviews(owner, repo, pr_number).await?;
+    let all_reviews = get_all_reviews(host, owner, repo, pr_number).await?;
     let has_new_reviews = all_reviews
         .iter()
         .any(|r| r.submitted_at >= *last_check_time);
@@ -541,7 +573,7 @@ async fn poll_once(
             .into_iter()
             .filter(|r| r.submitted_at >= *last_check_time)
             .collect();
-        let comments = get_review_comments(owner, repo, pr_number, &new_reviews).await?;
+        let comments = get_review_comments(host, owner, repo, pr_number, &new_reviews).await?;
         // Advance past these reviews so they are not re-fetched if the caller
         // passes the returned last_check_time back as the next baseline.
         *last_check_time = Utc::now();
@@ -556,7 +588,7 @@ async fn poll_once(
     }
 
     // Check for failed CI runs - include all error states
-    let check_runs = get_check_runs(owner, repo, &pr.head.sha).await?;
+    let check_runs = get_check_runs(host, owner, repo, &pr.head.sha).await?;
     let failed_checks = check_runs.iter().filter(|c| is_failed_check(c)).count();
 
     if failed_checks > 0 {
@@ -575,12 +607,12 @@ async fn poll_once(
             return Ok(None);
         }
     };
-    if update_readiness_label(owner, repo, pr_number, pr_number_u64, was_ready)
+    if update_readiness_label(host, owner, repo, pr_number, pr_number_u64, was_ready)
         .await
         .is_some()
     {
         // PR is ready — check if gru:auto-merge label is present
-        match has_auto_merge_label(owner, repo, pr_number).await {
+        match has_auto_merge_label(host, owner, repo, pr_number).await {
             Ok(true) => {
                 *last_check_time = Utc::now();
                 return Ok(Some(MonitorResult::ReadyToMerge));
@@ -623,10 +655,10 @@ pub enum MonitorResult {
 }
 
 /// Fetch PR details using gh CLI with retry logic for transient failures
-async fn get_pr(owner: &str, repo: &str, pr_number: &str) -> Result<PullRequest> {
+async fn get_pr(host: &str, owner: &str, repo: &str, pr_number: &str) -> Result<PullRequest> {
     let repo_full = format!("{owner}/{repo}");
     let endpoint = format!("repos/{repo_full}/pulls/{pr_number}");
-    let output = gh_api_with_retry(&repo_full, &["api", &endpoint], DEFAULT_MAX_RETRIES).await?;
+    let output = gh_api_with_retry(host, &["api", &endpoint], DEFAULT_MAX_RETRIES).await?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -640,10 +672,15 @@ async fn get_pr(owner: &str, repo: &str, pr_number: &str) -> Result<PullRequest>
 }
 
 /// Fetch all reviews for a PR with retry logic for transient failures
-async fn get_all_reviews(owner: &str, repo: &str, pr_number: &str) -> Result<Vec<Review>> {
+async fn get_all_reviews(
+    host: &str,
+    owner: &str,
+    repo: &str,
+    pr_number: &str,
+) -> Result<Vec<Review>> {
     let repo_full = format!("{owner}/{repo}");
     let endpoint = format!("repos/{repo_full}/pulls/{pr_number}/reviews");
-    let output = gh_api_with_retry(&repo_full, &["api", &endpoint], DEFAULT_MAX_RETRIES).await?;
+    let output = gh_api_with_retry(host, &["api", &endpoint], DEFAULT_MAX_RETRIES).await?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -658,6 +695,7 @@ async fn get_all_reviews(owner: &str, repo: &str, pr_number: &str) -> Result<Vec
 
 /// Fetch review comments for specific reviews with retry logic for transient failures
 async fn get_review_comments(
+    host: &str,
     owner: &str,
     repo: &str,
     pr_number: &str,
@@ -673,8 +711,7 @@ async fn get_review_comments(
             "repos/{repo_full}/pulls/{pr_number}/reviews/{}/comments",
             review.id
         );
-        let output =
-            gh_api_with_retry(&repo_full, &["api", &endpoint], DEFAULT_MAX_RETRIES).await?;
+        let output = gh_api_with_retry(host, &["api", &endpoint], DEFAULT_MAX_RETRIES).await?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -739,10 +776,10 @@ pub fn format_review_prompt(issue_num: u64, pr_number: &str, comments: &[ReviewC
 }
 
 /// Fetch check runs for a given commit SHA with retry logic for transient failures
-async fn get_check_runs(owner: &str, repo: &str, sha: &str) -> Result<Vec<CheckRun>> {
+async fn get_check_runs(host: &str, owner: &str, repo: &str, sha: &str) -> Result<Vec<CheckRun>> {
     let repo_full = format!("{owner}/{repo}");
     let endpoint = format!("repos/{repo_full}/commits/{sha}/check-runs");
-    let output = gh_api_with_retry(&repo_full, &["api", &endpoint], DEFAULT_MAX_RETRIES).await?;
+    let output = gh_api_with_retry(host, &["api", &endpoint], DEFAULT_MAX_RETRIES).await?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
