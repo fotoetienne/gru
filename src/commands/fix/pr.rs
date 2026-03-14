@@ -243,8 +243,8 @@ pub(crate) async fn handle_pr_creation(
 
             println!("✅ Draft PR created: #{}", pr_number);
             println!(
-                "🔗 View PR at: https://github.com/{}/{}/pull/{}",
-                issue_ctx.owner, issue_ctx.repo, pr_number
+                "🔗 View PR at: https://{}/{}/{}/pull/{}",
+                issue_ctx.host, issue_ctx.owner, issue_ctx.repo, pr_number
             );
 
             // Mark issue as done (fire-and-forget)
@@ -274,7 +274,8 @@ pub(crate) async fn handle_pr_creation(
                     wt_ctx.branch_name
                 );
                 log::info!(
-                    "   Check: https://github.com/{}/{}/pulls",
+                    "   Check: https://{}/{}/{}/pulls",
+                    issue_ctx.host,
                     issue_ctx.owner,
                     issue_ctx.repo
                 );

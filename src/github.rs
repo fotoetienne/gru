@@ -397,7 +397,7 @@ impl GitHubClient {
     /// * `owner` - Repository owner
     /// * `repo` - Repository name
     /// * `issue` - Issue number
-    #[allow(dead_code)] // Used by lab.rs (future migration)
+    #[allow(dead_code)] // Currently unused — retained for future lab.rs migration
     pub async fn mark_issue_done(&self, owner: &str, repo: &str, issue: u64) -> Result<()> {
         // Remove in-progress label (ignore errors - may not exist)
         let _ = self
@@ -438,7 +438,7 @@ impl GitHubClient {
     /// * `owner` - Repository owner
     /// * `repo` - Repository name
     /// * `issue` - Issue number
-    #[allow(dead_code)] // Used by lab.rs (future migration)
+    #[allow(dead_code)] // Currently unused — retained for future lab.rs migration
     pub async fn mark_issue_blocked(&self, owner: &str, repo: &str, issue: u64) -> Result<()> {
         // Remove any existing state labels (ignore errors)
         let _ = self
@@ -727,7 +727,7 @@ pub async fn get_issue_via_cli(
 /// Simple struct to hold issue information from gh CLI
 #[derive(Debug, serde::Deserialize)]
 pub struct IssueInfo {
-    #[allow(dead_code)] // Included for serde completeness; callers use .title and .body
+    #[allow(dead_code)] // Included for serde completeness; callers use .title, .body, and .labels
     pub number: u64,
     pub title: String,
     pub body: Option<String>,
