@@ -14,7 +14,8 @@ pub(crate) use types::{IssueContext, WorktreeContext};
 
 use agent::{resume_agent_session, run_agent_session};
 use helpers::{try_mark_issue_blocked, try_mark_issue_failed};
-use monitor::{monitor_ci_after_fix, monitor_pr_lifecycle};
+pub(crate) use monitor::monitor_ci_after_fix;
+pub(crate) use monitor::monitor_pr_lifecycle;
 use resolve::{check_existing_minions, claim_issue, resolve_issue};
 use types::ExistingMinionCheck;
 use worktree::setup_worktree;

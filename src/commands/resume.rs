@@ -4,7 +4,8 @@ use crate::agent_runner::{
     is_stuck_or_timeout_error, run_agent_with_stream_monitoring, EXIT_CODE_SIGNAL_TERMINATED,
 };
 use crate::commands::fix::{
-    handle_pr_creation, update_orchestration_phase, IssueContext, WorktreeContext,
+    handle_pr_creation, monitor_ci_after_fix, monitor_pr_lifecycle, update_orchestration_phase,
+    IssueContext, WorktreeContext,
 };
 use crate::config::{LabConfig, DEFAULT_MAX_RESUME_ATTEMPTS};
 use crate::minion_registry::{
@@ -16,6 +17,7 @@ use crate::progress::{ProgressConfig, ProgressDisplay};
 use crate::session_claim;
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
+use tokio::time::Duration;
 use uuid::Uuid;
 
 /// Load the `max_resume_attempts` setting from config, falling back to the default.
@@ -247,20 +249,73 @@ pub async fn handle_resume(
         details: None,
     };
 
-    match handle_pr_creation(&issue_ctx, &wt_ctx).await {
-        Ok(Some(_)) => {}
-        Ok(None) => {}
+    let pr_number = match handle_pr_creation(&issue_ctx, &wt_ctx).await {
+        Ok(pr) => pr,
         Err(e) => {
             log::warn!("⚠️  PR creation failed: {}", e);
+            None
         }
-    }
+    };
+
+    // If handle_pr_creation didn't return a PR number, check the registry
+    // (the PR may have been created in a previous session)
+    let pr_number = match pr_number {
+        Some(pr) => Some(pr),
+        None => {
+            let mid = minion.minion_id.clone();
+            with_registry(move |registry| Ok(registry.get(&mid).and_then(|info| info.pr.clone())))
+                .await
+                .unwrap_or_else(|e| {
+                    log::warn!("Failed to look up PR number from registry: {}", e);
+                    None
+                })
+        }
+    };
 
     // Respect no_watch: skip lifecycle monitoring for fire-and-forget minions
     if no_watch {
-        println!("🏁 PR created. Skipping lifecycle monitoring (no_watch).");
+        if let Some(ref pr_num) = pr_number {
+            println!(
+                "PR #{} created. Skipping lifecycle monitoring (--no-watch).",
+                pr_num
+            );
+        }
         update_orchestration_phase(&minion.minion_id, OrchestrationPhase::Completed).await;
         println!("✅ Resume completed for Minion {}", minion.minion_id);
         return Ok(0);
+    }
+
+    // Phase: Monitor PR lifecycle (reviews, CI, merge)
+    if let Some(ref pr_num) = pr_number {
+        update_orchestration_phase(&minion.minion_id, OrchestrationPhase::MonitoringPr).await;
+        let monitor_timeout = Duration::from_secs(24 * 3600);
+        monitor_pr_lifecycle(
+            &*backend,
+            &issue_ctx,
+            &wt_ctx,
+            pr_num,
+            effective_timeout.as_deref(),
+            None, // review_timeout: use default
+            monitor_timeout,
+        )
+        .await;
+    }
+
+    // CI monitoring (only if a PR exists)
+    if pr_number.is_some() {
+        let ci_passed = monitor_ci_after_fix(
+            &issue_ctx.host,
+            &issue_ctx.owner,
+            &issue_ctx.repo,
+            &wt_ctx.branch_name,
+            &wt_ctx.checkout_path,
+        )
+        .await;
+        match ci_passed {
+            Ok(true) => log::info!("✅ CI checks passed"),
+            Ok(false) => log::warn!("⚠️  CI checks failed or were escalated"),
+            Err(e) => log::warn!("⚠️  CI monitoring error (non-fatal): {}", e),
+        }
     }
 
     update_orchestration_phase(&minion.minion_id, OrchestrationPhase::Completed).await;
