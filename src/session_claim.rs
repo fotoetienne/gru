@@ -76,6 +76,8 @@ pub async fn check_and_claim_session(
                     // conservative and treat any recorded PID as alive.
                     let is_running = cfg!(not(unix)) || is_process_alive(pid_val);
                     if is_running {
+                        // Do not wrap with .context() — the caller uses
+                        // downcast_ref to distinguish this from IO errors.
                         return Err(SessionClaimError::AlreadyRunning {
                             minion_id: id,
                             mode: info.mode.clone(),
@@ -91,6 +93,7 @@ pub async fn check_and_claim_session(
                     })?;
                 }
                 None => {
+                    // Do not wrap with .context() — see AlreadyRunning above.
                     return Err(SessionClaimError::InconsistentState {
                         minion_id: id,
                         mode: info.mode.clone(),
