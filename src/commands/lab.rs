@@ -1,5 +1,5 @@
 use crate::config::{parse_repo_entry_with_hosts, LabConfig};
-use crate::github::{list_ready_issues_via_cli, GitHubClient};
+use crate::github::{self, list_ready_issues_via_cli};
 use crate::labels;
 use crate::minion_registry::{
     is_process_alive, with_registry, MinionInfo, MinionMode, OrchestrationPhase,
@@ -270,18 +270,14 @@ async fn mark_exhausted_minion(minion_id: &str, info: &MinionInfo, host: &str, r
         Some(parts) => parts,
         None => return,
     };
-    if let Ok(client) = GitHubClient::from_env_with_host(owner, repo_name, host).await {
-        let comment = format!(
-            "⚠️ **Minion {} failed: {}.**\n\n\
-             Phase at failure: `{:?}`\n\n\
-             This issue needs human attention.",
-            minion_id, reason, info.orchestration_phase,
-        );
-        let _ = client
-            .post_comment(owner, repo_name, info.issue, &comment)
-            .await;
-        let _ = client.mark_issue_failed(owner, repo_name, info.issue).await;
-    }
+    let comment = format!(
+        "⚠️ **Minion {} failed: {}.**\n\n\
+         Phase at failure: `{:?}`\n\n\
+         This issue needs human attention.",
+        minion_id, reason, info.orchestration_phase,
+    );
+    let _ = github::post_comment_via_cli(host, owner, repo_name, info.issue, &comment).await;
+    let _ = github::mark_issue_failed_via_cli(host, owner, repo_name, info.issue).await;
 }
 
 /// Resume interrupted minions, filling available slots before new issue claims.
@@ -436,39 +432,26 @@ async fn poll_and_spawn(
         let repo_full = format!("{}/{}", owner, repo);
 
         // Fetch ready issues, excluding blocked ones (both GitHub-blocked and gru:blocked).
-        // Try CLI first (supports -is:blocked qualifier), fall back to octocrab with
-        // client-side filtering if CLI is unavailable.
+        // Try CLI first (supports -is:blocked qualifier), fall back to simpler CLI query
+        // with client-side filtering.
         let issue_numbers =
             match list_ready_issues_via_cli(&owner, &repo, &host, &config.daemon.label).await {
                 Ok(numbers) => numbers,
                 Err(cli_err) => {
                     log::warn!(
-                        "⚠️  CLI issue fetch failed for {}: {}, trying API fallback",
+                        "⚠️  CLI issue fetch failed for {}: {}, trying basic CLI fallback",
                         repo_spec,
                         cli_err
                     );
                     match fallback_list_issues(&owner, &repo, &host, &config.daemon.label).await {
                         Ok(numbers) => numbers,
                         Err(e) => {
-                            log::warn!("⚠️  API fallback also failed for {}: {}", repo_spec, e);
+                            log::warn!("⚠️  Fallback also failed for {}: {}", repo_spec, e);
                             continue;
                         }
                     }
                 }
             };
-
-        // Create GitHub client for claiming issues
-        let client = match GitHubClient::from_env_with_host(&owner, &repo, &host).await {
-            Ok(client) => client,
-            Err(e) => {
-                log::warn!(
-                    "⚠️  Failed to create GitHub client for {}: {}",
-                    repo_spec,
-                    e
-                );
-                continue;
-            }
-        };
 
         // Try to spawn a Minion for each ready issue
         for issue_number in issue_numbers {
@@ -481,9 +464,17 @@ async fn poll_and_spawn(
                 continue;
             }
 
-            // Try to claim the issue
-            match client.claim_issue(&owner, &repo, issue_number).await {
-                Ok(true) => {
+            // Try to claim the issue via CLI
+            match github::claim_issue_via_cli(
+                &host,
+                &owner,
+                &repo,
+                issue_number,
+                &config.daemon.label,
+            )
+            .await
+            {
+                Ok(()) => {
                     // Successfully claimed, spawn Minion
                     match spawn_minion(&repo_full, &host, issue_number).await {
                         Ok(child) => {
@@ -502,41 +493,26 @@ async fn poll_and_spawn(
                                 issue_number,
                                 e
                             );
-                            // Unclaim the issue since we failed to spawn
-                            if let Err(e) = client
-                                .remove_label(&owner, &repo, issue_number, labels::IN_PROGRESS)
-                                .await
+                            // Unclaim the issue since we failed to spawn: remove in-progress, restore ready label
+                            if let Err(e) = github::edit_labels_via_cli(
+                                &host,
+                                &owner,
+                                &repo,
+                                issue_number,
+                                &[&config.daemon.label],
+                                &[labels::IN_PROGRESS],
+                            )
+                            .await
                             {
-                                log::warn!("⚠️  Failed to remove in-progress label: {}", e);
-                            }
-                            // Restore the ready label so the issue remains visible for retry
-                            match client
-                                .add_label(&owner, &repo, issue_number, &config.daemon.label)
-                                .await
-                            {
-                                Ok(_) => {
-                                    log::info!(
-                                        "Restored label '{}' on issue #{} after spawn failure",
-                                        config.daemon.label,
-                                        issue_number
-                                    );
-                                }
-                                Err(e) => {
-                                    log::warn!(
-                                        "⚠️  Failed to restore ready label '{}' on issue #{}: {} \
-                                         — issue may need manual label fix",
-                                        config.daemon.label,
-                                        issue_number,
-                                        e
-                                    );
-                                }
+                                log::warn!(
+                                    "⚠️  Failed to restore labels on issue #{}: {} \
+                                     — issue may need manual label fix",
+                                    issue_number,
+                                    e
+                                );
                             }
                         }
                     }
-                }
-                Ok(false) => {
-                    // Race condition: another Minion claimed it first
-                    continue;
                 }
                 Err(e) => {
                     log::warn!(
@@ -688,27 +664,59 @@ async fn spawn_minion(repo: &str, host: &str, issue_number: u64) -> Result<Child
     Ok(child)
 }
 
-/// Fallback issue listing using octocrab API with client-side filtering.
-/// Used when the gh CLI is unavailable. Cannot filter GitHub-native blocked state
-/// (no API equivalent of `-is:blocked`), but does filter out `gru:blocked` and
-/// `gru:in-progress` labels.
+/// Fallback issue listing using gh CLI with basic label filter.
+/// Used when the primary `list_ready_issues_via_cli` call fails.
+/// Uses a simpler gh CLI invocation with just the label filter.
 async fn fallback_list_issues(
     owner: &str,
     repo: &str,
     host: &str,
     label: &str,
 ) -> Result<Vec<u64>> {
-    let client = GitHubClient::from_env_with_host(owner, repo, host).await?;
-    let issues = client.list_issues_with_label(owner, repo, label).await?;
+    let repo_full = format!("{}/{}", owner, repo);
+    let output = github::gh_cli_command(host)
+        .args([
+            "issue",
+            "list",
+            "--repo",
+            &repo_full,
+            "--label",
+            label,
+            "--state",
+            "open",
+            "--json",
+            "number,labels",
+            "--limit",
+            "100",
+        ])
+        .output()
+        .await
+        .context("Failed to execute gh issue list command")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("gh issue list failed for {}: {}", repo_full, stderr);
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let issues: Vec<serde_json::Value> =
+        serde_json::from_str(&stdout).context("Failed to parse gh issue list output")?;
 
     let filtered: Vec<u64> = issues
         .into_iter()
         .filter(|issue| {
-            let label_names: Vec<String> = issue.labels.iter().map(|l| l.name.clone()).collect();
+            let label_names: Vec<String> = issue["labels"]
+                .as_array()
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|l| l["name"].as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default();
             !labels::has_label(&label_names, labels::BLOCKED)
                 && !labels::has_label(&label_names, labels::IN_PROGRESS)
         })
-        .map(|issue| issue.number)
+        .filter_map(|issue| issue["number"].as_u64())
         .collect();
 
     Ok(filtered)

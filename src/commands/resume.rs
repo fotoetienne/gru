@@ -237,11 +237,12 @@ pub async fn handle_resume(
     // Phase: Create PR (handle_pr_creation checks if branch was pushed internally)
     update_orchestration_phase(&minion.minion_id, OrchestrationPhase::CreatingPr).await;
 
-    let host = crate::github::infer_github_host(&owner);
+    // Resolve host from worktree git remote, falling back to config-based inference
+    let host = resolve_host_from_worktree(&wt_ctx.checkout_path, &owner).await;
     let issue_ctx = IssueContext {
         owner,
         repo: repo_name,
-        host: host.to_string(),
+        host,
         issue_num,
         details: None,
     };
@@ -265,6 +266,31 @@ pub async fn handle_resume(
     update_orchestration_phase(&minion.minion_id, OrchestrationPhase::Completed).await;
     println!("✅ Resume completed for Minion {}", minion.minion_id);
     Ok(0)
+}
+
+/// Resolve the GitHub host for a worktree by inspecting its git remote.
+/// Falls back to config-based `infer_github_host` if the remote can't be parsed.
+async fn resolve_host_from_worktree(checkout_path: &std::path::Path, owner: &str) -> String {
+    let github_hosts = crate::config::load_host_registry().all_hosts();
+
+    // Try to get the host from the worktree's git remote
+    let output = tokio::process::Command::new("git")
+        .args(["remote", "get-url", "origin"])
+        .current_dir(checkout_path)
+        .output()
+        .await;
+
+    if let Ok(output) = output {
+        if output.status.success() {
+            let remote_url = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if let Ok((host, _, _)) = crate::git::parse_github_remote(&remote_url, &github_hosts) {
+                return host;
+            }
+        }
+    }
+
+    // Fallback to config-based heuristic
+    crate::github::infer_github_host(owner)
 }
 
 /// Runs the agent in autonomous mode with stream monitoring.

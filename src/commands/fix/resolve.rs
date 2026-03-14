@@ -163,7 +163,9 @@ pub(super) async fn claim_issue(host: &str, owner: &str, repo: &str, issue_num: 
         }
     }
 
-    match crate::github::claim_issue_via_cli(host, owner, repo, issue_num).await {
+    match crate::github::claim_issue_via_cli(host, owner, repo, issue_num, crate::labels::TODO)
+        .await
+    {
         Ok(()) => {
             println!(
                 "🏷️  Added '{}' label to issue #{}",
