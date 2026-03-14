@@ -89,8 +89,7 @@ pub fn gh_command_for_host(host: &str) -> &'static str {
 /// Selects the right binary (`gh` vs `ghe`) and sets `GH_HOST` for
 /// non-`github.com` hosts so authentication targets the correct server.
 pub fn gh_cli_command(host: &str) -> Command {
-    let gh_cmd = gh_command_for_host(host);
-    let mut cmd = Command::new(gh_cmd);
+    let mut cmd = Command::new("gh");
     if host != "github.com" {
         cmd.env("GH_HOST", host);
     }
@@ -866,6 +865,279 @@ pub async fn create_draft_pr_via_cli(
     Ok(pr_number.to_string())
 }
 
+/// Post a comment on an issue or PR using gh CLI
+///
+/// # Arguments
+/// * `host` - GitHub hostname
+/// * `owner` - Repository owner
+/// * `repo` - Repository name
+/// * `number` - Issue or PR number
+/// * `body` - Comment body (markdown supported)
+#[allow(dead_code)]
+pub async fn post_comment_via_cli(
+    host: &str,
+    owner: &str,
+    repo: &str,
+    number: u64,
+    body: &str,
+) -> Result<()> {
+    let repo_full = format!("{}/{}", owner, repo);
+    let output = gh_cli_command(host)
+        .args([
+            "issue",
+            "comment",
+            &number.to_string(),
+            "--repo",
+            &repo_full,
+            "--body",
+            body,
+        ])
+        .output()
+        .await
+        .context("Failed to execute gh issue comment command")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow!(
+            "Failed to post comment on #{} in {}: {}",
+            number,
+            repo_full,
+            stderr
+        ));
+    }
+
+    Ok(())
+}
+
+/// Edit labels on an issue using gh CLI (add and/or remove in a single call)
+///
+/// # Arguments
+/// * `host` - GitHub hostname
+/// * `owner` - Repository owner
+/// * `repo` - Repository name
+/// * `number` - Issue number
+/// * `add` - Labels to add
+/// * `remove` - Labels to remove
+#[allow(dead_code)]
+pub async fn edit_labels_via_cli(
+    host: &str,
+    owner: &str,
+    repo: &str,
+    number: u64,
+    add: &[&str],
+    remove: &[&str],
+) -> Result<()> {
+    let repo_full = format!("{}/{}", owner, repo);
+    let mut args = vec![
+        "issue".to_string(),
+        "edit".to_string(),
+        number.to_string(),
+        "--repo".to_string(),
+        repo_full.clone(),
+    ];
+
+    for label in add {
+        args.push("--add-label".to_string());
+        args.push(label.to_string());
+    }
+    for label in remove {
+        args.push("--remove-label".to_string());
+        args.push(label.to_string());
+    }
+
+    let output = gh_cli_command(host)
+        .args(&args)
+        .output()
+        .await
+        .context("Failed to execute gh issue edit command")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow!(
+            "Failed to edit labels on #{} in {}: {}",
+            number,
+            repo_full,
+            stderr
+        ));
+    }
+
+    Ok(())
+}
+
+/// Create a label in a repository using gh CLI
+///
+/// Uses `--force` for idempotent behavior (updates if exists).
+///
+/// # Arguments
+/// * `host` - GitHub hostname
+/// * `owner` - Repository owner
+/// * `repo` - Repository name
+/// * `name` - Label name
+/// * `color` - Hex color code (without # prefix)
+/// * `description` - Label description
+#[allow(dead_code)]
+pub async fn create_label_via_cli(
+    host: &str,
+    owner: &str,
+    repo: &str,
+    name: &str,
+    color: &str,
+    description: &str,
+) -> Result<()> {
+    let repo_full = format!("{}/{}", owner, repo);
+    let output = gh_cli_command(host)
+        .args([
+            "label",
+            "create",
+            name,
+            "--repo",
+            &repo_full,
+            "--color",
+            color,
+            "-d",
+            description,
+            "--force",
+        ])
+        .output()
+        .await
+        .context("Failed to execute gh label create command")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow!(
+            "Failed to create label '{}' in {}: {}",
+            name,
+            repo_full,
+            stderr
+        ));
+    }
+
+    Ok(())
+}
+
+/// Check gh CLI authentication status for a host
+///
+/// # Arguments
+/// * `host` - GitHub hostname to check auth for
+///
+/// # Returns
+/// * `Ok(())` if authenticated
+/// * `Err(_)` if not authenticated or check failed
+#[allow(dead_code)]
+pub async fn check_auth_via_cli(host: &str) -> Result<()> {
+    let output = gh_cli_command(host)
+        .args(["auth", "status", "--hostname", host])
+        .output()
+        .await
+        .context("Failed to execute gh auth status command")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow!(
+            "Not authenticated with gh CLI for host {}: {}",
+            host,
+            stderr
+        ));
+    }
+
+    Ok(())
+}
+
+/// Claim an issue by transitioning labels: remove gru:todo, add gru:in-progress.
+///
+/// # Arguments
+/// * `host` - GitHub hostname
+/// * `owner` - Repository owner
+/// * `repo` - Repository name
+/// * `number` - Issue number
+#[allow(dead_code)]
+pub async fn claim_issue_via_cli(host: &str, owner: &str, repo: &str, number: u64) -> Result<()> {
+    edit_labels_via_cli(
+        host,
+        owner,
+        repo,
+        number,
+        &[labels::IN_PROGRESS],
+        &[labels::TODO],
+    )
+    .await
+}
+
+/// Mark an issue as done: remove gru:in-progress, add gru:done.
+///
+/// # Arguments
+/// * `host` - GitHub hostname
+/// * `owner` - Repository owner
+/// * `repo` - Repository name
+/// * `number` - Issue number
+#[allow(dead_code)]
+pub async fn mark_issue_done_via_cli(
+    host: &str,
+    owner: &str,
+    repo: &str,
+    number: u64,
+) -> Result<()> {
+    edit_labels_via_cli(
+        host,
+        owner,
+        repo,
+        number,
+        &[labels::DONE],
+        &[labels::IN_PROGRESS],
+    )
+    .await
+}
+
+/// Mark an issue as failed: remove gru:in-progress, add gru:failed.
+///
+/// # Arguments
+/// * `host` - GitHub hostname
+/// * `owner` - Repository owner
+/// * `repo` - Repository name
+/// * `number` - Issue number
+#[allow(dead_code)]
+pub async fn mark_issue_failed_via_cli(
+    host: &str,
+    owner: &str,
+    repo: &str,
+    number: u64,
+) -> Result<()> {
+    edit_labels_via_cli(
+        host,
+        owner,
+        repo,
+        number,
+        &[labels::FAILED],
+        &[labels::IN_PROGRESS],
+    )
+    .await
+}
+
+/// Mark an issue as blocked: remove gru:in-progress, add gru:blocked.
+///
+/// # Arguments
+/// * `host` - GitHub hostname
+/// * `owner` - Repository owner
+/// * `repo` - Repository name
+/// * `number` - Issue number
+#[allow(dead_code)]
+pub async fn mark_issue_blocked_via_cli(
+    host: &str,
+    owner: &str,
+    repo: &str,
+    number: u64,
+) -> Result<()> {
+    edit_labels_via_cli(
+        host,
+        owner,
+        repo,
+        number,
+        &[labels::BLOCKED],
+        &[labels::IN_PROGRESS],
+    )
+    .await
+}
+
 // ============================================================================
 // Tests
 // ============================================================================
@@ -1167,5 +1439,102 @@ mod tests {
         let query = build_ready_issues_search_query(r"back\slash");
         // Input backslash is escaped: back\slash → back\\slash
         assert!(query.starts_with(r#"label:"back\\slash""#));
+    }
+
+    // --- gh_cli_command tests ---
+
+    #[test]
+    fn test_gh_cli_command_github_com() {
+        let cmd = gh_cli_command("github.com");
+        // Should use "gh" binary
+        assert_eq!(cmd.as_std().get_program(), "gh");
+        // Should not set GH_HOST for github.com
+        let has_gh_host = cmd.as_std().get_envs().any(|(k, _)| k == "GH_HOST");
+        assert!(!has_gh_host);
+    }
+
+    #[test]
+    fn test_gh_cli_command_ghe_host() {
+        let cmd = gh_cli_command("git.example.com");
+        // Should still use "gh" binary (not "ghe")
+        assert_eq!(cmd.as_std().get_program(), "gh");
+        // Should set GH_HOST for non-github.com hosts
+        let gh_host = cmd
+            .as_std()
+            .get_envs()
+            .find(|(k, _)| *k == "GH_HOST")
+            .and_then(|(_, v)| v)
+            .map(|v| v.to_str().unwrap().to_string());
+        assert_eq!(gh_host.as_deref(), Some("git.example.com"));
+    }
+
+    // --- CLI function integration tests ---
+    // These require real gh CLI auth. Run with: cargo test cli_via -- --ignored
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_check_auth_via_cli_github_com() {
+        let result = check_auth_via_cli("github.com").await;
+        // Will pass if gh is authenticated for github.com
+        assert!(result.is_ok(), "gh auth status failed: {:?}", result.err());
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_post_comment_via_cli() {
+        // Requires write access to a test repo
+        let result = post_comment_via_cli(
+            "github.com",
+            "your-username",
+            "your-test-repo",
+            1,
+            "Test comment from CLI",
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "post_comment_via_cli failed: {:?}",
+            result.err()
+        );
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_edit_labels_via_cli() {
+        // Requires write access to a test repo
+        let result = edit_labels_via_cli(
+            "github.com",
+            "your-username",
+            "your-test-repo",
+            1,
+            &["test-label"],
+            &[],
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "edit_labels_via_cli failed: {:?}",
+            result.err()
+        );
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_create_label_via_cli() {
+        // Requires write access to a test repo
+        let result = create_label_via_cli(
+            "github.com",
+            "your-username",
+            "your-test-repo",
+            "test-cli-label",
+            "0E8A16",
+            "Test label created via CLI",
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "create_label_via_cli failed: {:?}",
+            result.err()
+        );
     }
 }
