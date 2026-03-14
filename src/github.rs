@@ -113,7 +113,7 @@ pub fn build_issue_url_with_host(repo: &str, host: &str, issue_number: u64) -> O
 
 /// Determine the correct `gh` CLI command for a repository.
 ///
-/// Returns `"ghe"` for Netflix repos, `"gh"` otherwise.
+/// Returns `"ghe"` for non-`github.com` hosts, `"gh"` otherwise.
 ///
 /// # Arguments
 /// * `repo` - Repository identifier in "owner/repo" format
