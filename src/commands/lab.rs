@@ -21,6 +21,7 @@ pub async fn handle_lab(
     repos: Option<Vec<String>>,
     poll_interval: Option<u64>,
     max_slots: Option<usize>,
+    no_resume: bool,
 ) -> Result<i32> {
     // Load configuration
     let config = if let Some(path) = config_path {
@@ -69,8 +70,13 @@ pub async fn handle_lab(
     // Track child processes for graceful shutdown
     let mut children: Vec<Child> = Vec::new();
 
+    if no_resume {
+        println!("⏭️  Auto-resume disabled (--no-resume)");
+        println!();
+    }
+
     // Perform initial poll immediately for faster feedback
-    if let Err(e) = poll_and_spawn(&config, &mut children).await {
+    if let Err(e) = poll_and_spawn(&config, &mut children, no_resume).await {
         log::warn!("⚠️  Initial polling error: {}", e);
         log::warn!("   Continuing to poll...");
     }
@@ -87,7 +93,7 @@ pub async fn handle_lab(
                 // Clean up finished child processes
                 reap_children(&mut children);
 
-                if let Err(e) = poll_and_spawn(&config, &mut children).await {
+                if let Err(e) = poll_and_spawn(&config, &mut children, no_resume).await {
                     log::warn!("⚠️  Polling error: {}", e);
                     log::warn!("   Continuing to poll...");
                 }
@@ -361,7 +367,11 @@ async fn resume_interrupted_minions(
 }
 
 /// Poll GitHub for ready issues and spawn Minions if slots are available
-async fn poll_and_spawn(config: &LabConfig, children: &mut Vec<Child>) -> Result<()> {
+async fn poll_and_spawn(
+    config: &LabConfig,
+    children: &mut Vec<Child>,
+    no_resume: bool,
+) -> Result<()> {
     // Prune stale registry entries (worktrees that no longer exist)
     prune_stale_entries().await?;
 
@@ -374,7 +384,11 @@ async fn poll_and_spawn(config: &LabConfig, children: &mut Vec<Child>) -> Result
     }
 
     // Resume interrupted minions first, before claiming new issues
-    let resumed = resume_interrupted_minions(config, children, &mut available).await?;
+    let resumed = if no_resume {
+        0
+    } else {
+        resume_interrupted_minions(config, children, &mut available).await?
+    };
     let mut spawned = resumed;
 
     if available == 0 {

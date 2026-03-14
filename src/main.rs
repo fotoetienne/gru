@@ -334,6 +334,9 @@ enum Commands {
 
         #[arg(long, help = "Maximum concurrent Minion slots (overrides config)")]
         slots: Option<usize>,
+
+        #[arg(long, help = "Disable auto-resuming interrupted Minions")]
+        no_resume: bool,
     },
 }
 
@@ -447,7 +450,8 @@ async fn main() {
             repos,
             poll_interval,
             slots,
-        } => lab::handle_lab(config, repos, poll_interval, slots).await,
+            no_resume,
+        } => lab::handle_lab(config, repos, poll_interval, slots, no_resume).await,
     };
 
     // Handle any errors that occurred
