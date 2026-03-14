@@ -439,14 +439,14 @@ async fn poll_and_spawn(
                 Ok(numbers) => numbers,
                 Err(cli_err) => {
                     log::warn!(
-                        "⚠️  CLI issue fetch failed for {}: {}, trying API fallback",
+                        "⚠️  CLI issue fetch failed for {}: {}, trying basic CLI fallback",
                         repo_spec,
                         cli_err
                     );
                     match fallback_list_issues(&owner, &repo, &host, &config.daemon.label).await {
                         Ok(numbers) => numbers,
                         Err(e) => {
-                            log::warn!("⚠️  API fallback also failed for {}: {}", repo_spec, e);
+                            log::warn!("⚠️  Fallback also failed for {}: {}", repo_spec, e);
                             continue;
                         }
                     }
@@ -679,7 +679,7 @@ async fn fallback_list_issues(
             "--json",
             "number,labels",
             "--limit",
-            "50",
+            "100",
         ])
         .output()
         .await

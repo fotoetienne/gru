@@ -993,7 +993,6 @@ pub async fn edit_labels_via_cli(
 /// * `name` - Label name
 /// * `color` - Hex color code (without # prefix)
 /// * `description` - Label description
-#[allow(dead_code)]
 pub async fn create_label_via_cli(
     host: &str,
     owner: &str,
@@ -1041,7 +1040,6 @@ pub async fn create_label_via_cli(
 /// # Returns
 /// * `Ok(())` if authenticated
 /// * `Err(_)` if not authenticated or check failed
-#[allow(dead_code)]
 pub async fn check_auth_via_cli(host: &str) -> Result<()> {
     let output = gh_cli_command(host)
         .args(["auth", "status", "--hostname", host])
