@@ -927,6 +927,10 @@ pub async fn edit_labels_via_cli(
     add: &[&str],
     remove: &[&str],
 ) -> Result<()> {
+    if add.is_empty() && remove.is_empty() {
+        return Ok(());
+    }
+
     let repo_full = format!("{}/{}", owner, repo);
     let mut args = vec![
         "issue".to_string(),
@@ -1044,6 +1048,10 @@ pub async fn check_auth_via_cli(host: &str) -> Result<()> {
 }
 
 /// Claim an issue by transitioning labels: remove gru:todo, add gru:in-progress.
+///
+/// Note: Unlike `GitHubClient::claim_issue`, this does not check whether the
+/// issue is already in-progress (race condition guard). Callers should add that
+/// check if needed.
 ///
 /// # Arguments
 /// * `host` - GitHub hostname
