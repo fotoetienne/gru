@@ -9,8 +9,8 @@ use crate::commands::fix::{
 use crate::config::{LabConfig, DEFAULT_MAX_RESUME_ATTEMPTS};
 use crate::github::GitHubClient;
 use crate::minion_registry::{
-    is_process_alive, revert_to_stopped, with_registry, MinionMode, MinionRegistry,
-    OrchestrationPhase,
+    is_process_alive, mark_minion_failed, revert_to_stopped, with_registry, MinionMode,
+    MinionRegistry, OrchestrationPhase,
 };
 use crate::minion_resolver;
 use crate::progress::{ProgressConfig, ProgressDisplay};
@@ -122,8 +122,7 @@ pub async fn handle_resume(
     // Check if timeout_deadline has passed — fail instead of resuming
     if let Some(deadline) = claimed.timeout_deadline {
         if Utc::now() >= deadline {
-            revert_to_stopped(&minion.minion_id).await;
-            update_orchestration_phase(&minion.minion_id, OrchestrationPhase::Failed).await;
+            mark_minion_failed(&minion.minion_id).await;
             bail!(
                 "Minion {} has passed its timeout deadline ({}). Marking as failed.",
                 minion.minion_id,
@@ -147,8 +146,7 @@ pub async fn handle_resume(
     // Check if attempt_count exceeds max_resume_attempts
     let max_attempts = load_max_resume_attempts();
     if new_attempt_count >= max_attempts {
-        revert_to_stopped(&minion.minion_id).await;
-        update_orchestration_phase(&minion.minion_id, OrchestrationPhase::Failed).await;
+        mark_minion_failed(&minion.minion_id).await;
         bail!(
             "Minion {} has exceeded maximum resume attempts ({} >= {}). Marking as failed.",
             minion.minion_id,
@@ -217,8 +215,7 @@ pub async fn handle_resume(
             Some(format!("{}s", remaining.num_seconds()))
         } else {
             // Deadline just passed between the check above and here — treat as expired
-            revert_to_stopped(&minion.minion_id).await;
-            update_orchestration_phase(&minion.minion_id, OrchestrationPhase::Failed).await;
+            mark_minion_failed(&minion.minion_id).await;
             bail!(
                 "Minion {} has passed its timeout deadline ({}). Marking as failed.",
                 minion.minion_id,

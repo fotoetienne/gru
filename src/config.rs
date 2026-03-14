@@ -143,12 +143,12 @@ fn default_label() -> String {
     crate::labels::TODO.to_string()
 }
 
-fn default_max_resume_attempts() -> u32 {
-    3
-}
-
 /// Default maximum resume attempts (exposed for use in resume.rs when no config is available)
 pub const DEFAULT_MAX_RESUME_ATTEMPTS: u32 = 3;
+
+fn default_max_resume_attempts() -> u32 {
+    DEFAULT_MAX_RESUME_ATTEMPTS
+}
 
 /// Parse a repo entry from the config into `(host, owner, repo)`.
 ///
@@ -322,6 +322,10 @@ impl LabConfig {
             anyhow::bail!("poll_interval_secs must be at least 1");
         }
 
+        if self.daemon.max_resume_attempts == 0 {
+            anyhow::bail!("max_resume_attempts must be at least 1");
+        }
+
         // Validate repo format: "owner/repo" or "host/owner/repo"
         for repo in &self.daemon.repos {
             if parse_repo_entry(repo).is_none() {
@@ -428,6 +432,15 @@ max_resume_attempts = 5
     #[test]
     fn test_default_max_resume_attempts_constant() {
         assert_eq!(DEFAULT_MAX_RESUME_ATTEMPTS, 3);
+    }
+
+    #[test]
+    fn test_validate_zero_max_resume_attempts() {
+        let mut config = LabConfig::default();
+        config.daemon.repos = vec!["owner/repo".to_string()];
+        config.daemon.max_resume_attempts = 0;
+
+        assert!(config.validate().is_err());
     }
 
     #[test]
