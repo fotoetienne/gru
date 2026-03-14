@@ -1,5 +1,5 @@
 use crate::config::{parse_repo_entry_with_hosts, LabConfig};
-use crate::github::{list_ready_issues_via_cli, GitHubClient};
+use crate::github::{self, list_ready_issues_via_cli};
 use crate::labels;
 use crate::minion_registry::{
     is_process_alive, with_registry, MinionInfo, MinionMode, OrchestrationPhase,
@@ -265,23 +265,19 @@ async fn mark_exhausted_minion(minion_id: &str, info: &MinionInfo, host: &str, r
         );
     }
 
-    // Post escalation comment and mark failed on GitHub
+    // Post escalation comment and mark failed on GitHub via CLI
     let (owner, repo_name) = match info.repo.split_once('/') {
         Some(parts) => parts,
         None => return,
     };
-    if let Ok(client) = GitHubClient::from_env_with_host(owner, repo_name, host).await {
-        let comment = format!(
-            "⚠️ **Minion {} failed: {}.**\n\n\
-             Phase at failure: `{:?}`\n\n\
-             This issue needs human attention.",
-            minion_id, reason, info.orchestration_phase,
-        );
-        let _ = client
-            .post_comment(owner, repo_name, info.issue, &comment)
-            .await;
-        let _ = client.mark_issue_failed(owner, repo_name, info.issue).await;
-    }
+    let comment = format!(
+        "⚠️ **Minion {} failed: {}.**\n\n\
+         Phase at failure: `{:?}`\n\n\
+         This issue needs human attention.",
+        minion_id, reason, info.orchestration_phase,
+    );
+    let _ = github::post_comment_via_cli(host, owner, repo_name, info.issue, &comment).await;
+    let _ = github::mark_issue_failed_via_cli(host, owner, repo_name, info.issue).await;
 }
 
 /// Resume interrupted minions, filling available slots before new issue claims.
@@ -457,19 +453,6 @@ async fn poll_and_spawn(
                 }
             };
 
-        // Create GitHub client for claiming issues
-        let client = match GitHubClient::from_env_with_host(&owner, &repo, &host).await {
-            Ok(client) => client,
-            Err(e) => {
-                log::warn!(
-                    "⚠️  Failed to create GitHub client for {}: {}",
-                    repo_spec,
-                    e
-                );
-                continue;
-            }
-        };
-
         // Try to spawn a Minion for each ready issue
         for issue_number in issue_numbers {
             if available == 0 {
@@ -481,9 +464,9 @@ async fn poll_and_spawn(
                 continue;
             }
 
-            // Try to claim the issue
-            match client.claim_issue(&owner, &repo, issue_number).await {
-                Ok(true) => {
+            // Try to claim the issue via CLI
+            match github::claim_issue_via_cli(&host, &owner, &repo, issue_number).await {
+                Ok(()) => {
                     // Successfully claimed, spawn Minion
                     match spawn_minion(&repo_full, &host, issue_number).await {
                         Ok(child) => {
@@ -502,41 +485,33 @@ async fn poll_and_spawn(
                                 issue_number,
                                 e
                             );
-                            // Unclaim the issue since we failed to spawn
-                            if let Err(e) = client
-                                .remove_label(&owner, &repo, issue_number, labels::IN_PROGRESS)
-                                .await
+                            // Unclaim the issue since we failed to spawn:
+                            // remove in-progress and restore the ready label
+                            if let Err(e) = github::edit_labels_via_cli(
+                                &host,
+                                &owner,
+                                &repo,
+                                issue_number,
+                                &[&config.daemon.label],
+                                &[labels::IN_PROGRESS],
+                            )
+                            .await
                             {
-                                log::warn!("⚠️  Failed to remove in-progress label: {}", e);
-                            }
-                            // Restore the ready label so the issue remains visible for retry
-                            match client
-                                .add_label(&owner, &repo, issue_number, &config.daemon.label)
-                                .await
-                            {
-                                Ok(_) => {
-                                    log::info!(
-                                        "Restored label '{}' on issue #{} after spawn failure",
-                                        config.daemon.label,
-                                        issue_number
-                                    );
-                                }
-                                Err(e) => {
-                                    log::warn!(
-                                        "⚠️  Failed to restore ready label '{}' on issue #{}: {} \
-                                         — issue may need manual label fix",
-                                        config.daemon.label,
-                                        issue_number,
-                                        e
-                                    );
-                                }
+                                log::warn!(
+                                    "⚠️  Failed to restore labels on issue #{}: {} \
+                                     — issue may need manual label fix",
+                                    issue_number,
+                                    e
+                                );
+                            } else {
+                                log::info!(
+                                    "Restored label '{}' on issue #{} after spawn failure",
+                                    config.daemon.label,
+                                    issue_number
+                                );
                             }
                         }
                     }
-                }
-                Ok(false) => {
-                    // Race condition: another Minion claimed it first
-                    continue;
                 }
                 Err(e) => {
                     log::warn!(
@@ -611,8 +586,16 @@ async fn is_issue_claimed(repo: &str, issue_number: u64) -> Result<bool> {
 /// Spawn a Minion to work on an issue using the `gru do` command.
 /// Returns the child process handle for lifecycle tracking.
 async fn spawn_minion(repo: &str, host: &str, issue_number: u64) -> Result<Child> {
-    let issue_ref = crate::github::build_issue_url_with_host(repo, host, issue_number)
+    let (owner, repo_name) = repo
+        .split_once('/')
+        .filter(|(o, r)| !o.is_empty() && !r.is_empty())
         .with_context(|| format!("Invalid repo format: '{}'", repo))?;
+    let registry = crate::config::load_host_registry();
+    let web_base = registry.web_url_for(host);
+    let issue_ref = format!(
+        "{}/{}/{}/issues/{}",
+        web_base, owner, repo_name, issue_number
+    );
 
     // Get the current executable path
     let exe = std::env::current_exe().context("Failed to get current executable path")?;
@@ -688,28 +671,67 @@ async fn spawn_minion(repo: &str, host: &str, issue_number: u64) -> Result<Child
     Ok(child)
 }
 
-/// Fallback issue listing using octocrab API with client-side filtering.
-/// Used when the gh CLI is unavailable. Cannot filter GitHub-native blocked state
-/// (no API equivalent of `-is:blocked`), but does filter out `gru:blocked` and
-/// `gru:in-progress` labels.
+/// Fallback issue listing using gh API endpoint.
+/// Used when the primary `list_ready_issues_via_cli` fails.
+/// Uses `gh api` to list issues with the given label, then filters out
+/// `gru:blocked` and `gru:in-progress` labels client-side.
 async fn fallback_list_issues(
     owner: &str,
     repo: &str,
     host: &str,
     label: &str,
 ) -> Result<Vec<u64>> {
-    let client = GitHubClient::from_env_with_host(owner, repo, host).await?;
-    let issues = client.list_issues_with_label(owner, repo, label).await?;
+    let repo_full = format!("{}/{}", owner, repo);
+    let output = github::gh_cli_command(host)
+        .args([
+            "api",
+            &format!("repos/{}/issues", repo_full),
+            "--paginate",
+            "-q",
+            ".[] | select(.pull_request == null) | {number, labels: [.labels[].name]}",
+            "-f",
+            &format!("labels={}", label),
+            "-f",
+            "state=open",
+        ])
+        .output()
+        .await
+        .context("Failed to execute gh api for issue listing")?;
 
-    let filtered: Vec<u64> = issues
-        .into_iter()
-        .filter(|issue| {
-            let label_names: Vec<String> = issue.labels.iter().map(|l| l.name.clone()).collect();
-            !labels::has_label(&label_names, labels::BLOCKED)
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("gh api issue listing failed for {}: {}", repo_full, stderr);
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // Parse each JSON object from the jq output (one per line)
+    let mut filtered = Vec::new();
+    for line in stdout.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Ok(obj) = serde_json::from_str::<serde_json::Value>(line) {
+            let number = obj["number"].as_u64().unwrap_or(0);
+            if number == 0 {
+                continue;
+            }
+            let label_names: Vec<String> = obj["labels"]
+                .as_array()
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default();
+            if !labels::has_label(&label_names, labels::BLOCKED)
                 && !labels::has_label(&label_names, labels::IN_PROGRESS)
-        })
-        .map(|issue| issue.number)
-        .collect();
+            {
+                filtered.push(number);
+            }
+        }
+    }
 
     Ok(filtered)
 }

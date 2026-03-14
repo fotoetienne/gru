@@ -7,6 +7,7 @@ use crate::commands::fix::{
     handle_pr_creation, update_orchestration_phase, IssueContext, WorktreeContext,
 };
 use crate::config::{LabConfig, DEFAULT_MAX_RESUME_ATTEMPTS};
+use crate::git;
 use crate::github::GitHubClient;
 use crate::minion_registry::{
     mark_minion_failed, revert_to_stopped, with_registry, MinionMode, MinionRegistry,
@@ -238,7 +239,12 @@ pub async fn handle_resume(
     // Phase: Create PR (handle_pr_creation checks if branch was pushed internally)
     update_orchestration_phase(&minion.minion_id, OrchestrationPhase::CreatingPr).await;
 
-    let host = crate::github::infer_github_host(&owner);
+    // Detect host from the worktree's git remote
+    let checkout = wt_ctx.checkout_path.clone();
+    let github_hosts = crate::config::load_host_registry().all_hosts();
+    let host = detect_host_from_worktree(&checkout, &github_hosts)
+        .await
+        .unwrap_or_else(|_| "github.com".to_string());
     let github_client = match GitHubClient::from_env_with_host(&owner, &repo_name, &host).await {
         Ok(client) => Some(client),
         Err(e) => {
@@ -249,7 +255,7 @@ pub async fn handle_resume(
     let issue_ctx = IssueContext {
         owner,
         repo: repo_name,
-        host: host.to_string(),
+        host: host.clone(),
         issue_num,
         details: None,
         github_client,
@@ -333,6 +339,33 @@ async fn run_autonomous_agent(
 
     let agent_run = run_result?;
     Ok(agent_run.status)
+}
+
+/// Detect the GitHub host from a worktree's git remote.
+async fn detect_host_from_worktree(
+    worktree_path: &std::path::Path,
+    github_hosts: &[String],
+) -> Result<String> {
+    let output = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(worktree_path)
+        .args(["remote", "get-url", "origin"])
+        .output()
+        .await
+        .context("Failed to execute git remote get-url")?;
+
+    if !output.status.success() {
+        anyhow::bail!("Failed to get remote URL from worktree");
+    }
+
+    let remote_url = String::from_utf8(output.stdout)
+        .context("Remote URL is not valid UTF-8")?
+        .trim()
+        .to_string();
+
+    let (host, _, _) = git::parse_github_remote(&remote_url, github_hosts)
+        .context("Failed to parse GitHub remote URL")?;
+    Ok(host)
 }
 
 #[cfg(test)]

@@ -101,6 +101,7 @@ pub fn gh_cli_command(host: &str) -> Command {
 /// Build a full GitHub issue URL for a repo in "owner/repo" format, with an explicit host.
 ///
 /// Returns `Some(url)` when `repo` is a valid `owner/repo` string, otherwise `None`.
+#[cfg(test)]
 pub fn build_issue_url_with_host(repo: &str, host: &str, issue_number: u64) -> Option<String> {
     let (owner, repo_name) = repo.split_once('/')?;
     if owner.is_empty() || repo_name.is_empty() || repo_name.contains('/') {
@@ -260,6 +261,7 @@ impl GitHubClient {
     /// * `owner` - Repository owner (user or organization)
     /// * `repo` - Repository name
     /// * `number` - PR number
+    #[allow(dead_code)]
     pub async fn get_pr(
         &self,
         owner: &str,
@@ -456,6 +458,7 @@ impl GitHubClient {
     ///
     /// # Returns
     /// The authenticated user's information
+    #[allow(dead_code)]
     pub async fn get_authenticated_user(&self) -> Result<models::Author> {
         self.client
             .current()
@@ -477,6 +480,7 @@ impl GitHubClient {
     /// * `Ok(true)` - Label was created
     /// * `Ok(false)` - Label already exists (idempotent)
     /// * `Err(_)` - Failed to create label
+    #[allow(dead_code)]
     pub async fn create_label(
         &self,
         owner: &str,
@@ -520,6 +524,7 @@ impl GitHubClient {
     ///
     /// # Returns
     /// List of issues with the specified label
+    #[allow(dead_code)]
     pub async fn list_issues_with_label(
         &self,
         owner: &str,

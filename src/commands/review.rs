@@ -2,7 +2,7 @@ use crate::agent::AgentEvent;
 use crate::agent_registry;
 use crate::agent_runner::{run_agent_with_stream_monitoring, EXIT_CODE_SIGNAL_TERMINATED};
 use crate::git;
-use crate::github::{self, GitHubClient};
+use crate::github;
 use crate::minion;
 use crate::minion_registry::{
     with_registry, MinionInfo as RegistryMinionInfo, MinionMode, MinionRegistry, OrchestrationPhase,
@@ -471,23 +471,8 @@ struct PrDetails {
     body: String,
 }
 
-/// Fetches PR title and body from GitHub for prompt rendering.
-/// Uses the API client if available, falls back to gh CLI.
+/// Fetches PR title and body from GitHub for prompt rendering via gh CLI.
 async fn fetch_pr_details(owner: &str, repo: &str, host: &str, pr_num: u64) -> Result<PrDetails> {
-    if let Some(client) = GitHubClient::try_from_env_with_host(host).await {
-        match client.get_pr(owner, repo, pr_num).await {
-            Ok(pr) => {
-                return Ok(PrDetails {
-                    title: pr.title.unwrap_or_default(),
-                    body: pr.body.unwrap_or_default(),
-                });
-            }
-            Err(e) => {
-                log::warn!("Failed to fetch PR via API: {e}. Falling back to gh CLI...");
-            }
-        }
-    }
-
     let info = github::get_pr_via_cli(owner, repo, host, pr_num)
         .await
         .context("Failed to fetch PR details via gh CLI")?;
