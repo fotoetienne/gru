@@ -42,19 +42,34 @@ async fn try_get_token_from_cli_for_host(host: &str) -> Option<String> {
 /// Infer GitHub hostname from repository owner.
 ///
 /// This is a fallback heuristic used when the host isn't known from a URL.
-/// Prefer using the host from `parse_github_remote` or `parse_github_url` when available.
+/// Prefer using the host from `parse_github_remote` or `parse_github_url` when available,
+/// or passing the host explicitly via `from_env_with_host` / `try_from_env_with_host`.
+///
+/// Checks `daemon.repos` config entries for an owner match with an explicit GHE host.
+/// Falls back to a substring heuristic for "netflix" owners.
 ///
 /// # Arguments
 /// * `owner` - Repository owner (user or organization)
 ///
-/// Returns the appropriate GitHub hostname (github.com or ghe.netflix.net)
-pub(crate) fn infer_github_host(owner: &str) -> &'static str {
-    // Future enhancement: Parse from git remote URL
-    // For now, use simple heuristic
+/// Returns the appropriate GitHub hostname
+pub(crate) fn infer_github_host(owner: &str) -> String {
+    // Check daemon.repos config for an explicit host for this owner
+    let cfg = crate::config::try_load_config();
+    if let Some(cfg) = cfg {
+        for repo_spec in &cfg.daemon.repos {
+            if let Some((host, repo_owner, _repo)) = crate::config::parse_repo_entry(repo_spec) {
+                if repo_owner == owner && host != "github.com" {
+                    return host;
+                }
+            }
+        }
+    }
+
+    // Fallback: substring heuristic
     if owner == "netflix" || owner.contains("netflix") {
-        "ghe.netflix.net"
+        "git.netflix.net".to_string()
     } else {
-        "github.com"
+        "github.com".to_string()
     }
 }
 
@@ -98,18 +113,14 @@ pub fn build_issue_url_with_host(repo: &str, host: &str, issue_number: u64) -> O
 
 /// Determine the correct `gh` CLI command for a repository.
 ///
-/// Returns `"ghe"` for Netflix repos, `"gh"` otherwise.
+/// Returns `"ghe"` for non-`github.com` hosts, `"gh"` otherwise.
 ///
 /// # Arguments
 /// * `repo` - Repository identifier in "owner/repo" format
 pub fn gh_command_for_repo(repo: &str) -> &'static str {
     let owner = repo.split('/').next().unwrap_or("");
     let host = infer_github_host(owner);
-    if host.contains("ghe.") {
-        "ghe"
-    } else {
-        "gh"
-    }
+    gh_command_for_host(&host)
 }
 
 /// Get GitHub token with automatic fallback logic
@@ -202,9 +213,10 @@ impl GitHubClient {
     /// This is a convenience wrapper around `from_env_with_host` for callers
     /// that don't have an explicit host (e.g., ad-hoc commands working from
     /// a local git checkout). Prefer `from_env_with_host` when the host is known.
+    #[cfg(test)]
     pub async fn from_env(owner: &str, repo: &str) -> Result<Self> {
         let host = infer_github_host(owner);
-        Self::from_env_with_host(owner, repo, host).await
+        Self::from_env_with_host(owner, repo, &host).await
     }
 
     /// Try to initialize a new GitHub client with token from environment or gh/ghe CLI
@@ -213,9 +225,8 @@ impl GitHubClient {
     /// This allows graceful fallback to CLI methods.
     ///
     /// # Arguments
-    /// * `owner` - Repository owner (used to infer hostname)
-    pub async fn try_from_env(owner: &str, _repo: &str) -> Option<Self> {
-        let host = infer_github_host(owner);
+    /// * `host` - GitHub hostname (e.g., "github.com" or "git.netflix.net")
+    pub async fn try_from_env_with_host(host: &str) -> Option<Self> {
         let token = get_github_token_for_host(host).await.ok()?;
         Self::new_with_host(token, host).ok()
     }
@@ -915,12 +926,20 @@ mod tests {
 
     #[test]
     fn test_infer_github_host_netflix_org() {
-        assert_eq!(infer_github_host("netflix"), "ghe.netflix.net");
+        let host = infer_github_host("netflix");
+        assert_ne!(
+            host, "github.com",
+            "netflix owner should resolve to a GHE host"
+        );
     }
 
     #[test]
     fn test_infer_github_host_netflix_substring() {
-        assert_eq!(infer_github_host("netflix-oss"), "ghe.netflix.net");
+        let host = infer_github_host("netflix-oss");
+        assert_ne!(
+            host, "github.com",
+            "netflix-oss owner should resolve to a GHE host"
+        );
     }
 
     #[test]

@@ -187,15 +187,14 @@ pub async fn handle_resume(
     // Phase: Create PR (handle_pr_creation checks if branch was pushed internally)
     update_orchestration_phase(&minion.minion_id, OrchestrationPhase::CreatingPr).await;
 
-    let github_client = match GitHubClient::from_env(&owner, &repo).await {
+    let host = crate::github::infer_github_host(&owner);
+    let github_client = match GitHubClient::from_env_with_host(&owner, &repo, &host).await {
         Ok(client) => Some(client),
         Err(e) => {
             log::warn!("⚠️  GitHub client unavailable: {}", e);
             None
         }
     };
-
-    let host = crate::github::infer_github_host(&owner);
     let issue_ctx = IssueContext {
         owner,
         repo,

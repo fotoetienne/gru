@@ -191,7 +191,7 @@ async fn create_pr_for_issue(
     // Get issue title - use provided title if available, otherwise fetch
     let issue_title = if let Some(title) = issue_title_opt {
         title.to_string()
-    } else if let Some(github_client) = GitHubClient::try_from_env(owner, repo).await {
+    } else if let Some(github_client) = GitHubClient::try_from_env_with_host(host).await {
         match github_client.get_issue(owner, repo, issue_num).await {
             Ok(issue) => issue.title,
             Err(_) => "Fix issue".to_string(),
@@ -567,7 +567,7 @@ async fn resolve_issue(issue: &str, github_hosts: &[String]) -> Result<IssueCont
         .context("Failed to parse issue number")?;
 
     // Initialize GitHub client (optional - only if token is available)
-    let github_client = match GitHubClient::from_env(&owner, &repo).await {
+    let github_client = match GitHubClient::from_env_with_host(&owner, &repo, &host).await {
         Ok(client) => Some(client),
         Err(err) => {
             eprintln!(
