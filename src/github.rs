@@ -84,10 +84,10 @@ pub fn gh_command_for_host(host: &str) -> &'static str {
     }
 }
 
-/// Creates a pre-configured `tokio::process::Command` for the `gh`/`ghe` CLI.
+/// Creates a pre-configured `tokio::process::Command` for the `gh` CLI.
 ///
-/// Selects the right binary (`gh` vs `ghe`) and sets `GH_HOST` for
-/// non-`github.com` hosts so authentication targets the correct server.
+/// Always uses the `gh` binary and sets `GH_HOST` for non-`github.com`
+/// hosts so authentication targets the correct server.
 pub fn gh_cli_command(host: &str) -> Command {
     let mut cmd = Command::new("gh");
     if host != "github.com" {
@@ -1113,7 +1113,10 @@ pub async fn mark_issue_failed_via_cli(
     .await
 }
 
-/// Mark an issue as blocked: remove gru:in-progress, add gru:blocked.
+/// Mark an issue as blocked: add gru:blocked, remove in-progress/done/failed.
+///
+/// Removes all state labels to ensure a clean transition regardless of
+/// which phase triggered the block (matches octocrab `mark_issue_blocked`).
 ///
 /// # Arguments
 /// * `host` - GitHub hostname
@@ -1133,7 +1136,7 @@ pub async fn mark_issue_blocked_via_cli(
         repo,
         number,
         &[labels::BLOCKED],
-        &[labels::IN_PROGRESS],
+        &[labels::IN_PROGRESS, labels::DONE, labels::FAILED],
     )
     .await
 }
