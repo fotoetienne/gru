@@ -448,6 +448,7 @@ impl LabConfig {
         }
 
         // Validate github_hosts entries
+        let mut seen_hosts: HashMap<&str, &str> = HashMap::new();
         for (name, gh_host) in &self.github_hosts {
             if gh_host.host.is_empty() {
                 anyhow::bail!("[github_hosts.{}]: 'host' must not be empty", name);
@@ -459,6 +460,15 @@ impl LabConfig {
                     gh_host.host
                 );
             }
+            if let Some(existing_name) = seen_hosts.get(gh_host.host.as_str()) {
+                anyhow::bail!(
+                    "[github_hosts.{}]: duplicate host '{}' (already defined by [github_hosts.{}])",
+                    name,
+                    gh_host.host,
+                    existing_name
+                );
+            }
+            seen_hosts.insert(&gh_host.host, name);
         }
 
         // Validate repo format and host name references
@@ -1150,6 +1160,28 @@ repos = ["owner/repo1", "ghe.example.com/org/svc1", "ghe.example.com/org/svc2"]
         config.daemon.repos = vec!["owner/repo".to_string()];
         let err = config.validate().unwrap_err();
         assert!(err.to_string().contains("does not look like a hostname"));
+    }
+
+    #[test]
+    fn test_validate_github_host_duplicate_host() {
+        let mut config = LabConfig::default();
+        config.github_hosts.insert(
+            "alpha".to_string(),
+            GhHostConfig {
+                host: "ghe.example.com".to_string(),
+                web_url: None,
+            },
+        );
+        config.github_hosts.insert(
+            "beta".to_string(),
+            GhHostConfig {
+                host: "ghe.example.com".to_string(),
+                web_url: Some("https://ghe.example.com".to_string()),
+            },
+        );
+        config.daemon.repos = vec!["owner/repo".to_string()];
+        let err = config.validate().unwrap_err();
+        assert!(err.to_string().contains("duplicate host 'ghe.example.com'"));
     }
 
     // --- Config parsing with github_hosts ---
