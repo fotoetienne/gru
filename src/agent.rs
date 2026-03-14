@@ -6,7 +6,7 @@
 //! These types are consumed by `agent_runner.rs`, `progress.rs`, and the
 //! command modules (`fix.rs`, `review.rs`, `prompt.rs`, `resume.rs`).
 
-use chrono::Local;
+use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use tokio::process::Command as TokioCommand;
@@ -98,10 +98,10 @@ pub struct TimestampedEvent {
 }
 
 impl TimestampedEvent {
-    /// Wraps an `AgentEvent` with the current local time.
+    /// Wraps an `AgentEvent` with the current UTC time.
     pub fn now(event: AgentEvent) -> Self {
         Self {
-            ts: Some(Local::now().to_rfc3339()),
+            ts: Some(Utc::now().to_rfc3339()),
             event,
         }
     }

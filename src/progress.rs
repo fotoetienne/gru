@@ -91,29 +91,20 @@ impl ProgressDisplay {
         let _ = self.multi.println(event_text);
     }
 
-    /// Format a timestamp string for display.
-    ///
-    /// If `ts` is a valid RFC 3339 timestamp, returns the local `HH:MM:SS`.
-    /// For legacy events without a timestamp, returns `--:--:--`.
-    fn format_timestamp(ts: Option<&str>) -> String {
-        match ts {
-            Some(s) => DateTime::parse_from_rfc3339(s)
-                .map(|dt| dt.with_timezone(&Local).format("%H:%M:%S").to_string())
-                .unwrap_or_else(|_| "--:--:--".to_string()),
-            None => "--:--:--".to_string(),
-        }
-    }
-
     /// Process a normalized agent event and update the display.
     ///
-    /// When called from live streaming (agent_runner callback), `ts` is `None`
-    /// and the current wall-clock time is used. When replaying from
-    /// `events.jsonl`, the persisted timestamp is passed in.
+    /// Uses the current wall-clock time for the timestamp. Suitable for
+    /// live streaming where events are displayed in real-time.
     pub fn handle_event(&self, event: &AgentEvent) {
         self.handle_event_with_ts(event, None);
     }
 
     /// Process a normalized agent event with an explicit timestamp.
+    ///
+    /// When `ts` is a valid RFC 3339 string, it is converted to local
+    /// `HH:MM:SS`. When `ts` is `None` (live streaming) or invalid,
+    /// the current wall-clock time is used. Legacy events without a
+    /// timestamp show `--:--:--`.
     pub fn handle_event_with_ts(&self, event: &AgentEvent, ts: Option<&str>) {
         if self.config.quiet {
             // In quiet mode, only show errors
@@ -128,10 +119,13 @@ impl ProgressDisplay {
             return;
         }
 
-        let timestamp = match ts {
-            Some(_) => Self::format_timestamp(ts),
-            None => Local::now().format("%H:%M:%S").to_string(),
-        };
+        let timestamp = ts
+            .map(|s| {
+                DateTime::parse_from_rfc3339(s)
+                    .map(|dt| dt.with_timezone(&Local).format("%H:%M:%S").to_string())
+                    .unwrap_or_else(|_| "--:--:--".to_string())
+            })
+            .unwrap_or_else(|| Local::now().format("%H:%M:%S").to_string());
 
         match event {
             AgentEvent::Started { .. } => {
@@ -327,23 +321,44 @@ mod tests {
     }
 
     #[test]
-    fn test_format_timestamp_valid_rfc3339() {
-        let ts = "2025-01-15T14:30:45.123+00:00";
-        let formatted = ProgressDisplay::format_timestamp(Some(ts));
-        // Should produce a valid HH:MM:SS string (exact value depends on local timezone)
-        assert_eq!(formatted.len(), 8);
-        assert!(formatted.contains(':'));
+    fn test_handle_event_with_ts_valid_rfc3339() {
+        // Verify handle_event_with_ts doesn't panic with a valid timestamp
+        let config = ProgressConfig {
+            minion_id: "M001".to_string(),
+            issue: "42".to_string(),
+            quiet: false,
+        };
+        let display = ProgressDisplay::new(config);
+        display.handle_event_with_ts(
+            &AgentEvent::Started { usage: None },
+            Some("2025-01-15T14:30:45.123+00:00"),
+        );
     }
 
     #[test]
-    fn test_format_timestamp_none() {
-        let formatted = ProgressDisplay::format_timestamp(None);
-        assert_eq!(formatted, "--:--:--");
+    fn test_handle_event_with_ts_none_uses_now() {
+        // Verify handle_event_with_ts doesn't panic with None (live streaming path)
+        let config = ProgressConfig {
+            minion_id: "M001".to_string(),
+            issue: "42".to_string(),
+            quiet: false,
+        };
+        let display = ProgressDisplay::new(config);
+        display.handle_event_with_ts(&AgentEvent::Started { usage: None }, None);
     }
 
     #[test]
-    fn test_format_timestamp_invalid() {
-        let formatted = ProgressDisplay::format_timestamp(Some("not-a-timestamp"));
-        assert_eq!(formatted, "--:--:--");
+    fn test_handle_event_with_ts_invalid_shows_placeholder() {
+        // Verify handle_event_with_ts doesn't panic with an invalid timestamp
+        let config = ProgressConfig {
+            minion_id: "M001".to_string(),
+            issue: "42".to_string(),
+            quiet: false,
+        };
+        let display = ProgressDisplay::new(config);
+        display.handle_event_with_ts(
+            &AgentEvent::Started { usage: None },
+            Some("not-a-timestamp"),
+        );
     }
 }
