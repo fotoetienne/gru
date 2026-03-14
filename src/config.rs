@@ -259,6 +259,8 @@ pub fn parse_repo_entry_with_hosts(
 pub struct HostRegistry {
     /// Map from hostname to optional web_url override
     hosts: HashMap<String, Option<String>>,
+    /// Map from config name to hostname (e.g., "netflix" → "git.netflix.net")
+    names: HashMap<String, String>,
 }
 
 impl HostRegistry {
@@ -268,14 +270,17 @@ impl HostRegistry {
     /// `host/owner/repo` entries in `daemon.repos`.
     pub fn from_config(config: &LabConfig) -> Self {
         let mut hosts: HashMap<String, Option<String>> = HashMap::new();
+        let mut names: HashMap<String, String> = HashMap::new();
+
         // Always include github.com
         hosts.insert("github.com".to_string(), None);
 
         // Add hosts from [github_hosts.*] sections
-        for gh_host in config.github_hosts.values() {
+        for (name, gh_host) in &config.github_hosts {
             hosts
                 .entry(gh_host.host.clone())
                 .or_insert_with(|| gh_host.web_url.clone());
+            names.insert(name.clone(), gh_host.host.clone());
         }
 
         // Add hosts from legacy daemon.repos entries (host/owner/repo format)
@@ -285,12 +290,19 @@ impl HostRegistry {
             }
         }
 
-        Self { hosts }
+        Self { hosts, names }
     }
 
     /// All known hostnames (always includes `github.com`).
     pub fn all_hosts(&self) -> Vec<String> {
         self.hosts.keys().cloned().collect()
+    }
+
+    /// Resolve a config name (e.g., `"netflix"`) to its hostname (e.g., `"git.netflix.net"`).
+    /// Used by later phases (Phase 2+) for resolving named host references.
+    #[allow(dead_code)]
+    pub fn host_for_name(&self, name: &str) -> Option<&str> {
+        self.names.get(name).map(|s| s.as_str())
     }
 
     /// Web URL for a given host. Returns the configured `web_url` if set,
@@ -451,7 +463,9 @@ impl LabConfig {
 
         // Validate repo format and host name references
         for repo in &self.daemon.repos {
-            // Check for "name:owner/repo" format — validate that the name exists in github_hosts
+            // Check for "name:owner/repo" format — validate that the name exists in github_hosts.
+            // Only treat as a named reference if the prefix looks like an identifier (no dots/slashes),
+            // matching the logic in parse_repo_entry_with_hosts() to avoid rejecting SSH-style URLs.
             if let Some((name, _)) = repo.split_once(':') {
                 if name.is_empty() {
                     anyhow::bail!(
@@ -459,7 +473,10 @@ impl LabConfig {
                         repo
                     );
                 }
-                if !self.github_hosts.contains_key(name) {
+                if !name.contains('.')
+                    && !name.contains('/')
+                    && !self.github_hosts.contains_key(name)
+                {
                     anyhow::bail!(
                         "Unknown host name '{}' in repo '{}'. Add a [github_hosts.{}] section to config.toml",
                         name,
@@ -806,7 +823,8 @@ confidence_threshold = 6
     fn test_github_hosts_default() {
         let config = LabConfig::default();
         let registry = HostRegistry::from_config(&config);
-        let hosts = registry.all_hosts();
+        let mut hosts = registry.all_hosts();
+        hosts.sort();
         assert_eq!(hosts, vec!["github.com"]);
     }
 
@@ -962,7 +980,8 @@ repos = ["owner/repo1", "ghe.example.com/org/svc1", "ghe.example.com/org/svc2"]
     fn test_host_registry_default_config() {
         let config = LabConfig::default();
         let registry = HostRegistry::from_config(&config);
-        let hosts = registry.all_hosts();
+        let mut hosts = registry.all_hosts();
+        hosts.sort();
         assert_eq!(hosts, vec!["github.com"]);
     }
 
@@ -1046,6 +1065,29 @@ repos = ["owner/repo1", "ghe.example.com/org/svc1", "ghe.example.com/org/svc2"]
         );
         let registry = HostRegistry::from_config(&config);
         assert_eq!(registry.web_url_for("ghe.corp.com"), "https://ghe.corp.com");
+    }
+
+    // --- host_for_name tests ---
+
+    #[test]
+    fn test_host_for_name_found() {
+        let mut config = LabConfig::default();
+        config.github_hosts.insert(
+            "netflix".to_string(),
+            GhHostConfig {
+                host: "git.netflix.net".to_string(),
+                web_url: None,
+            },
+        );
+        let registry = HostRegistry::from_config(&config);
+        assert_eq!(registry.host_for_name("netflix"), Some("git.netflix.net"));
+    }
+
+    #[test]
+    fn test_host_for_name_not_found() {
+        let config = LabConfig::default();
+        let registry = HostRegistry::from_config(&config);
+        assert_eq!(registry.host_for_name("netflix"), None);
     }
 
     // --- Validation tests for named host references ---
