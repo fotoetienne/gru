@@ -591,7 +591,7 @@ pub async fn handle_clean(dry_run: bool, force: bool, base_branch: &str) -> Resu
                 }
             }
             // Also record the pre-canonicalized path for fallback matching
-            if let Some(canonical) = canonical_path_for_fallback.clone() {
+            if let Some(canonical) = canonical_path_for_fallback {
                 registry_paths_to_remove.push(canonical);
             }
         } else {
@@ -680,10 +680,13 @@ pub async fn handle_clean(dry_run: bool, force: bool, base_branch: &str) -> Resu
                     .iter()
                     .filter(|(_id, info)| {
                         let checkout = info.checkout_path();
-                        checkout
-                            .canonicalize()
-                            .map(|c| path_set.contains(&c))
-                            .unwrap_or(false)
+                        // Try direct path match first (worktree dirs are already removed
+                        // so canonicalize() would fail on them), then canonicalize as fallback
+                        path_set.contains(&checkout)
+                            || checkout
+                                .canonicalize()
+                                .map(|c| path_set.contains(&c))
+                                .unwrap_or(false)
                     })
                     .map(|(id, _)| id.clone())
                     .collect();
