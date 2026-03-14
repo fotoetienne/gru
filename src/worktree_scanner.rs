@@ -148,7 +148,7 @@ impl Worktree {
     /// Runs `gh pr list --state <state> --head <branch> --json number --jq length`.
     ///
     /// # Error behavior
-    /// - Failure to spawn the `gh`/`ghe` process propagates as `Err`.
+    /// - Failure to spawn the `gh` process propagates as `Err`.
     /// - Non-zero CLI exit (e.g., auth failure, network error) propagates as `Err`.
     ///   Callers decide the conservative default for their use case.
     async fn count_prs_in_state(&self, state: &str) -> Result<u64> {
@@ -399,13 +399,14 @@ async fn find_bare_repos(dir: &Path) -> Result<Vec<PathBuf>> {
     Ok(bare_repos)
 }
 
-/// Extract repository identifier from git config
+/// Extract repository identifier and host from git config.
+///
 /// Uses `git config remote.origin.url` to get the actual repo URL and parses it
 /// via `git::parse_github_remote` to avoid duplicating URL parsing logic.
-/// Example: https://github.com/owner/repo.git -> "owner/repo"
-///          git@github.com:owner/repo.git -> "owner/repo"
-/// Extract repository identifier and host from git config.
-/// Returns (host, "owner/repo").
+///
+/// Example: `https://github.com/owner/repo.git` -> `("github.com", "owner/repo")`
+///
+/// Returns `(host, "owner/repo")`.
 async fn extract_repo_from_git_config(
     path: &Path,
     github_hosts: &[String],
@@ -532,6 +533,7 @@ mod tests {
         assert_eq!(worktrees.len(), 1);
         assert_eq!(worktrees[0].branch, "issue-36");
         assert_eq!(worktrees[0].repo, "owner/repo");
+        assert_eq!(worktrees[0].host, "github.com");
         assert_eq!(
             worktrees[0].path,
             PathBuf::from("/Users/test/.gru/work/owner/repo/issue-36")
