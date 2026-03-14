@@ -651,11 +651,13 @@ async fn spawn_minion(repo: &str, host: &str, issue_number: u64) -> Result<Child
         .append(true)
         .open(&log_path)
         .await
-        .with_context(|| format!("Failed to open log file: {}", log_path.display()))?;
-    let stdout_file = log_file.into_std().await;
-    let stderr_file = stdout_file
+        .with_context(|| format!("Failed to open log file: {}", log_path.display()))?
+        .try_into_std()
+        .expect("no in-flight I/O immediately after open");
+    let stdout_file = log_file
         .try_clone()
         .context("Failed to clone log file handle")?;
+    let stderr_file = log_file;
 
     // Spawn `gru do <issue>` as a background process with output captured to log file
     let mut child = tokio::process::Command::new(exe)
