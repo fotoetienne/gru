@@ -460,12 +460,16 @@ pub async fn handle_clean(dry_run: bool, force: bool, base_branch: &str) -> Resu
     let mut failed = 0;
     // Collect minion IDs to remove from registry in a single batch
     let mut registry_ids_to_remove: Vec<String> = Vec::new();
-    // Collect worktree paths for fallback registry matching (in case ID extraction fails)
+    // Collect canonical worktree paths for fallback registry matching.
+    // Paths must be canonicalized before removal since the directories won't exist after.
     let mut registry_paths_to_remove: Vec<std::path::PathBuf> = Vec::new();
 
     for (wt, _) in cleanable {
         print!("Removing {}... ", wt.path.display());
         std::io::stdout().flush()?;
+
+        // Capture canonical path before removal for fallback registry matching
+        let canonical_path_for_fallback = wt.path.canonicalize().ok();
 
         // Check if worktree has modified/untracked files
         let (has_modified, only_ephemeral) = match check_worktree_files(&wt.path).await {
@@ -586,8 +590,10 @@ pub async fn handle_clean(dry_run: bool, force: bool, base_branch: &str) -> Resu
                     registry_ids_to_remove.push(minion_id.to_string());
                 }
             }
-            // Also record the worktree path for fallback matching
-            registry_paths_to_remove.push(wt.path.clone());
+            // Also record the pre-canonicalized path for fallback matching
+            if let Some(canonical) = canonical_path_for_fallback.clone() {
+                registry_paths_to_remove.push(canonical);
+            }
         } else {
             println!("✗");
             let stderr = String::from_utf8_lossy(&status.stderr);
@@ -665,12 +671,10 @@ pub async fn handle_clean(dry_run: bool, force: bool, base_branch: &str) -> Resu
         if let Err(e) = with_registry(move |registry| {
             registry.remove_batch(&registry_ids_to_remove)?;
 
-            // Fallback: find registry entries whose checkout_path matches a removed worktree
+            // Fallback: find registry entries whose checkout_path matches a removed worktree.
+            // Paths were canonicalized before worktree removal since dirs no longer exist.
             if !registry_paths_to_remove.is_empty() {
-                let path_set: HashSet<_> = registry_paths_to_remove
-                    .iter()
-                    .filter_map(|p| p.canonicalize().ok())
-                    .collect();
+                let path_set: HashSet<_> = registry_paths_to_remove.into_iter().collect();
                 let ids_by_path: Vec<String> = registry
                     .list()
                     .iter()
@@ -828,6 +832,13 @@ mod tests {
     fn test_extract_minion_id_bare_id() {
         // If the dir name is already just a minion ID, return it as-is
         assert_eq!(extract_minion_id_from_dir("M0pf"), "M0pf");
+    }
+
+    #[test]
+    fn test_extract_minion_id_legacy_uppercase() {
+        // Legacy IDs used uppercase letters for base36 digits 10-35
+        assert_eq!(extract_minion_id_from_dir("issue-42-M00A"), "M00A");
+        assert_eq!(extract_minion_id_from_dir("issue-100-MABC"), "MABC");
     }
 
     #[test]
