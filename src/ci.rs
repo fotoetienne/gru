@@ -28,7 +28,7 @@ const CI_FIX_TIMEOUT_SECS: u64 = 1200;
 
 /// The status of a CI check run
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 pub enum CheckStatus {
     #[default]
     Queued,
@@ -48,6 +48,9 @@ pub enum CheckConclusion {
     Neutral,
     Skipped,
     Stale,
+    /// Catch-all for unknown or future conclusion values from the GitHub API.
+    #[serde(other)]
+    Unknown,
 }
 
 impl CheckConclusion {
@@ -74,6 +77,7 @@ impl fmt::Display for CheckConclusion {
             CheckConclusion::Neutral => write!(f, "neutral"),
             CheckConclusion::Skipped => write!(f, "skipped"),
             CheckConclusion::Stale => write!(f, "stale"),
+            CheckConclusion::Unknown => write!(f, "unknown"),
         }
     }
 }

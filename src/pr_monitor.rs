@@ -1085,6 +1085,24 @@ mod tests {
     }
 
     #[test]
+    fn test_check_run_deserialize_in_progress_status() {
+        use crate::ci::CheckStatus;
+        let json = r#"{"status": "in_progress", "conclusion": null}"#;
+        let check: CheckRun = serde_json::from_str(json).unwrap();
+        assert_eq!(check.status, CheckStatus::InProgress);
+        assert!(check.conclusion.is_none());
+    }
+
+    #[test]
+    fn test_check_run_deserialize_unknown_conclusion() {
+        use crate::ci::CheckConclusion;
+        let json = r#"{"conclusion": "some_future_value"}"#;
+        let check: CheckRun = serde_json::from_str(json).unwrap();
+        assert_eq!(check.conclusion, Some(CheckConclusion::Unknown));
+        assert!(!is_failed_check(&check));
+    }
+
+    #[test]
     fn test_check_runs_response_deserialize() {
         use crate::ci::CheckConclusion;
         let json = r#"{
