@@ -1,7 +1,7 @@
 //! Claude Code stream parsing module.
 //!
 //! Contains Claude-specific event types and stream parsing logic.
-//! The public API is consumed exclusively by `ClaudeBackend::parse_event()`.
+//! The public API is consumed exclusively by `ClaudeBackend::parse_events()`.
 //! Types like `EventStream`, `TokenUsage`, and `StreamOutput::RawLine` are
 //! retained for test coverage but are not called from production code paths
 //! (the generic `agent_runner` reads lines directly and delegates to the backend).
@@ -205,11 +205,11 @@ pub enum StreamOutput {
 /// Parse a trimmed line of Claude Code output into a structured `StreamOutput`.
 ///
 /// Returns `None` if the line is empty or doesn't match any recognized format.
-/// This is the shared parsing logic used by both `EventStream::next_line()` and
-/// `ClaudeBackend::parse_event()`.
-pub(crate) fn parse_line(trimmed: &str) -> Option<StreamOutput> {
+/// This is the shared parsing logic used by both `EventStream::next_outputs()` and
+/// `ClaudeBackend::parse_events()`.
+pub(crate) fn parse_line(trimmed: &str) -> Vec<StreamOutput> {
     if trimmed.is_empty() {
-        return None;
+        return Vec::new();
     }
 
     // Try stream_event wrapper from Claude Code
@@ -217,7 +217,7 @@ pub(crate) fn parse_line(trimmed: &str) -> Option<StreamOutput> {
         if wrapper.get("type").and_then(|t| t.as_str()) == Some("stream_event") {
             if let Some(event_value) = wrapper.get("event") {
                 if let Ok(event) = serde_json::from_value::<ClaudeEvent>(event_value.clone()) {
-                    return Some(StreamOutput::Event(event));
+                    return vec![StreamOutput::Event(event)];
                 }
             }
         }
@@ -226,13 +226,16 @@ pub(crate) fn parse_line(trimmed: &str) -> Option<StreamOutput> {
     // Try conversation message (verbose output with tool results)
     if let Ok(conv_msg) = serde_json::from_str::<ConversationMessage>(trimmed) {
         if conv_msg.message_type == "user" && !conv_msg.message.content.is_empty() {
-            return Some(StreamOutput::ToolResult(
-                conv_msg.message.content[0].clone(),
-            ));
+            return conv_msg
+                .message
+                .content
+                .into_iter()
+                .map(StreamOutput::ToolResult)
+                .collect();
         }
     }
 
-    None
+    Vec::new()
 }
 
 /// Accumulated token usage across a session.
@@ -318,9 +321,10 @@ impl<R: tokio::io::AsyncRead + Unpin> EventStream<R> {
         }
     }
 
-    /// Reads the next line from the stream and attempts to parse it as a ClaudeEvent
-    /// Returns None when the stream ends
-    pub async fn next_line(&mut self) -> anyhow::Result<Option<StreamOutput>> {
+    /// Reads the next line from the stream and attempts to parse it.
+    /// Returns an empty Vec when the stream ends, or one or more outputs per line.
+    /// A single line may yield multiple outputs (e.g., multi-tool-result messages).
+    pub async fn next_outputs(&mut self) -> anyhow::Result<Option<Vec<StreamOutput>>> {
         let mut line = String::new();
         let bytes_read = self
             .reader
@@ -335,24 +339,25 @@ impl<R: tokio::io::AsyncRead + Unpin> EventStream<R> {
         let trimmed = line.trim();
         if trimmed.is_empty() {
             // Return empty string for truly empty lines to avoid unnecessary whitespace
-            return Ok(Some(StreamOutput::RawLine(String::new())));
+            return Ok(Some(vec![StreamOutput::RawLine(String::new())]));
         }
 
         // Delegate to shared parsing logic
-        if let Some(output) = parse_line(trimmed) {
-            return Ok(Some(output));
+        let outputs = parse_line(trimmed);
+        if !outputs.is_empty() {
+            return Ok(Some(outputs));
         }
 
         // Not a recognized format, treat as raw line
-        Ok(Some(StreamOutput::RawLine(line)))
+        Ok(Some(vec![StreamOutput::RawLine(line)]))
     }
 
     /// Read all lines from the stream
     #[cfg(test)]
     pub async fn read_all(&mut self) -> anyhow::Result<Vec<StreamOutput>> {
         let mut outputs = Vec::new();
-        while let Some(output) = self.next_line().await? {
-            outputs.push(output);
+        while let Some(batch) = self.next_outputs().await? {
+            outputs.extend(batch);
         }
         Ok(outputs)
     }
@@ -573,6 +578,68 @@ mod tests {
             }
             _ => panic!("Expected ToolResult with error"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_stream_reader_with_multiple_tool_results() {
+        // Test parsing a message with multiple tool results (batch tool calls)
+        let input = r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"file A contents","is_error":false},{"type":"tool_result","tool_use_id":"toolu_2","content":"file B contents","is_error":false},{"type":"tool_result","tool_use_id":"toolu_3","content":"command failed","is_error":true}]}}
+"#;
+        let mut stream = EventStream::new(input.as_bytes());
+
+        let outputs = stream.read_all().await.unwrap();
+        assert_eq!(outputs.len(), 3);
+
+        match &outputs[0] {
+            StreamOutput::ToolResult(tr) => {
+                assert_eq!(tr.tool_use_id, "toolu_1");
+                assert!(!tr.is_error);
+            }
+            _ => panic!("Expected ToolResult for toolu_1"),
+        }
+
+        match &outputs[1] {
+            StreamOutput::ToolResult(tr) => {
+                assert_eq!(tr.tool_use_id, "toolu_2");
+                assert!(!tr.is_error);
+            }
+            _ => panic!("Expected ToolResult for toolu_2"),
+        }
+
+        match &outputs[2] {
+            StreamOutput::ToolResult(tr) => {
+                assert_eq!(tr.tool_use_id, "toolu_3");
+                assert!(tr.is_error);
+            }
+            _ => panic!("Expected ToolResult for toolu_3"),
+        }
+    }
+
+    #[test]
+    fn test_parse_line_multiple_tool_results() {
+        let line = r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_a","content":"output 1","is_error":false},{"type":"tool_result","tool_use_id":"toolu_b","content":"output 2","is_error":false}]}}"#;
+        let outputs = parse_line(line);
+        assert_eq!(outputs.len(), 2);
+        match &outputs[0] {
+            StreamOutput::ToolResult(tr) => assert_eq!(tr.tool_use_id, "toolu_a"),
+            _ => panic!("Expected ToolResult"),
+        }
+        match &outputs[1] {
+            StreamOutput::ToolResult(tr) => assert_eq!(tr.tool_use_id, "toolu_b"),
+            _ => panic!("Expected ToolResult"),
+        }
+    }
+
+    #[test]
+    fn test_parse_line_single_tool_result() {
+        let line = r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_x","content":"data","is_error":false}]}}"#;
+        let outputs = parse_line(line);
+        assert_eq!(outputs.len(), 1);
+    }
+
+    #[test]
+    fn test_parse_line_empty() {
+        assert!(parse_line("").is_empty());
     }
 
     #[test]

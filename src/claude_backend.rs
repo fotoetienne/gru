@@ -137,23 +137,26 @@ impl AgentBackend for ClaudeBackend {
         claude_runner::build_claude_command(worktree_path, session_id, prompt)
     }
 
-    fn parse_event(&self, line: &str) -> Option<AgentEvent> {
-        let stream_output = stream::parse_line(line.trim())?;
-        match stream_output {
-            StreamOutput::Event(ref claude_event) => self.map_event(claude_event),
-            StreamOutput::ToolResult(ref tool_result) => {
-                let content = match &tool_result.content {
-                    serde_json::Value::String(s) => s.clone(),
-                    other => other.to_string(),
-                };
-                Some(AgentEvent::ToolResult {
-                    tool_use_id: tool_result.tool_use_id.clone(),
-                    content,
-                    is_error: tool_result.is_error,
-                })
-            }
-            StreamOutput::RawLine(_) => None,
-        }
+    fn parse_events(&self, line: &str) -> Vec<AgentEvent> {
+        let stream_outputs = stream::parse_line(line.trim());
+        stream_outputs
+            .into_iter()
+            .filter_map(|output| match output {
+                StreamOutput::Event(ref claude_event) => self.map_event(claude_event),
+                StreamOutput::ToolResult(ref tool_result) => {
+                    let content = match &tool_result.content {
+                        serde_json::Value::String(s) => s.clone(),
+                        other => other.to_string(),
+                    };
+                    Some(AgentEvent::ToolResult {
+                        tool_use_id: tool_result.tool_use_id.clone(),
+                        content,
+                        is_error: tool_result.is_error,
+                    })
+                }
+                StreamOutput::RawLine(_) => None,
+            })
+            .collect()
     }
 
     fn build_resume_command(
@@ -369,7 +372,7 @@ mod tests {
     fn test_parse_event_message_start() {
         let b = backend();
         let line = r#"{"type":"stream_event","event":{"type":"message_start","message":{"id":"msg_1","role":"assistant"}}}"#;
-        let event = b.parse_event(line).unwrap();
+        let event = b.parse_events(line).into_iter().next().unwrap();
         assert!(matches!(event, AgentEvent::Started { usage: None }));
     }
 
@@ -379,16 +382,16 @@ mod tests {
 
         // ContentBlockStart(ToolUse) should NOT emit — it buffers
         let start_line = r#"{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","name":"Bash","id":"toolu_1"}}}"#;
-        assert!(b.parse_event(start_line).is_none());
+        assert!(b.parse_events(start_line).is_empty());
 
         // InputJsonDelta should accumulate
         let delta_line = r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"command\":\"git status\"}"}}}"#;
-        assert!(b.parse_event(delta_line).is_none());
+        assert!(b.parse_events(delta_line).is_empty());
 
         // ContentBlockStop should emit ToolUse with summary
         let stop_line =
             r#"{"type":"stream_event","event":{"type":"content_block_stop","index":0}}"#;
-        let event = b.parse_event(stop_line).unwrap();
+        let event = b.parse_events(stop_line).into_iter().next().unwrap();
         match event {
             AgentEvent::ToolUse {
                 tool_name,
@@ -408,17 +411,17 @@ mod tests {
         let b = backend();
 
         let start = r#"{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","name":"Read","id":"toolu_2"}}}"#;
-        assert!(b.parse_event(start).is_none());
+        assert!(b.parse_events(start).is_empty());
 
         // Two partial JSON deltas
         let delta1 = r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"file_path\":\""}}}"#;
-        assert!(b.parse_event(delta1).is_none());
+        assert!(b.parse_events(delta1).is_empty());
 
         let delta2 = r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"src/main.rs\"}"}}}"#;
-        assert!(b.parse_event(delta2).is_none());
+        assert!(b.parse_events(delta2).is_empty());
 
         let stop = r#"{"type":"stream_event","event":{"type":"content_block_stop","index":0}}"#;
-        let event = b.parse_event(stop).unwrap();
+        let event = b.parse_events(stop).into_iter().next().unwrap();
         match event {
             AgentEvent::ToolUse { input_summary, .. } => {
                 assert_eq!(input_summary, Some("Read: src/main.rs".to_string()));
@@ -431,7 +434,7 @@ mod tests {
     fn test_parse_event_text_delta() {
         let b = backend();
         let line = r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hello world"}}}"#;
-        let event = b.parse_event(line).unwrap();
+        let event = b.parse_events(line).into_iter().next().unwrap();
         assert_eq!(
             event,
             AgentEvent::TextDelta {
@@ -445,14 +448,14 @@ mod tests {
         let b = backend();
         // ContentBlockStop with no buffered tool = text block end = None
         let line = r#"{"type":"stream_event","event":{"type":"content_block_stop","index":0}}"#;
-        assert!(b.parse_event(line).is_none());
+        assert!(b.parse_events(line).is_empty());
     }
 
     #[test]
     fn test_parse_event_message_delta() {
         let b = backend();
         let line = r#"{"type":"stream_event","event":{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":42}}}"#;
-        let event = b.parse_event(line).unwrap();
+        let event = b.parse_events(line).into_iter().next().unwrap();
         match event {
             AgentEvent::MessageComplete { stop_reason, usage } => {
                 assert_eq!(stop_reason.as_deref(), Some("end_turn"));
@@ -466,7 +469,7 @@ mod tests {
     fn test_parse_event_message_delta_no_usage() {
         let b = backend();
         let line = r#"{"type":"stream_event","event":{"type":"message_delta","delta":{"stop_reason":"end_turn"}}}"#;
-        let event = b.parse_event(line).unwrap();
+        let event = b.parse_events(line).into_iter().next().unwrap();
         assert_eq!(
             event,
             AgentEvent::MessageComplete {
@@ -480,7 +483,7 @@ mod tests {
     fn test_parse_event_error() {
         let b = backend();
         let line = r#"{"type":"stream_event","event":{"type":"error","error":{"type":"api_error","message":"rate limited"}}}"#;
-        let event = b.parse_event(line).unwrap();
+        let event = b.parse_events(line).into_iter().next().unwrap();
         assert_eq!(
             event,
             AgentEvent::Error {
@@ -493,7 +496,7 @@ mod tests {
     fn test_parse_event_ping() {
         let b = backend();
         let line = r#"{"type":"stream_event","event":{"type":"ping"}}"#;
-        let event = b.parse_event(line).unwrap();
+        let event = b.parse_events(line).into_iter().next().unwrap();
         assert_eq!(event, AgentEvent::Ping);
     }
 
@@ -501,7 +504,7 @@ mod tests {
     fn test_parse_event_tool_result_from_verbose() {
         let b = backend();
         let line = r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_123","content":"file contents","is_error":false}]}}"#;
-        let event = b.parse_event(line).unwrap();
+        let event = b.parse_events(line).into_iter().next().unwrap();
         assert_eq!(
             event,
             AgentEvent::ToolResult {
@@ -516,7 +519,7 @@ mod tests {
     fn test_parse_event_tool_result_error() {
         let b = backend();
         let line = r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_456","content":"command not found","is_error":true}]}}"#;
-        let event = b.parse_event(line).unwrap();
+        let event = b.parse_events(line).into_iter().next().unwrap();
         assert_eq!(
             event,
             AgentEvent::ToolResult {
@@ -528,23 +531,47 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_events_multiple_tool_results() {
+        let b = backend();
+        let line = r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"output A","is_error":false},{"type":"tool_result","tool_use_id":"toolu_2","content":"output B","is_error":true}]}}"#;
+        let events = b.parse_events(line);
+        assert_eq!(events.len(), 2);
+        assert_eq!(
+            events[0],
+            AgentEvent::ToolResult {
+                tool_use_id: "toolu_1".to_string(),
+                content: "output A".to_string(),
+                is_error: false,
+            }
+        );
+        assert_eq!(
+            events[1],
+            AgentEvent::ToolResult {
+                tool_use_id: "toolu_2".to_string(),
+                content: "output B".to_string(),
+                is_error: true,
+            }
+        );
+    }
+
+    #[test]
     fn test_parse_event_raw_line_returns_none() {
         let b = backend();
-        assert!(b.parse_event("some random output").is_none());
+        assert!(b.parse_events("some random output").is_empty());
     }
 
     #[test]
     fn test_parse_event_empty_line_returns_none() {
         let b = backend();
-        assert!(b.parse_event("").is_none());
-        assert!(b.parse_event("   ").is_none());
+        assert!(b.parse_events("").is_empty());
+        assert!(b.parse_events("   ").is_empty());
     }
 
     #[test]
     fn test_parse_event_message_stop_produces_completion() {
         let b = backend();
         let line = r#"{"type":"stream_event","event":{"type":"message_stop"}}"#;
-        let event = b.parse_event(line).unwrap();
+        let event = b.parse_events(line).into_iter().next().unwrap();
         assert_eq!(
             event,
             AgentEvent::MessageComplete {
@@ -558,7 +585,7 @@ mod tests {
     fn test_parse_event_text_content_block_start_returns_none() {
         let b = backend();
         let line = r#"{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}}"#;
-        assert!(b.parse_event(line).is_none());
+        assert!(b.parse_events(line).is_empty());
     }
 
     #[test]
@@ -570,11 +597,11 @@ mod tests {
                 r#"{{"type":"stream_event","event":{{"type":"content_block_start","index":0,"content_block":{{"type":"tool_use","name":"{}","id":"t1"}}}}}}"#,
                 tool
             );
-            assert!(b.parse_event(&start).is_none()); // buffered
+            assert!(b.parse_events(&start).is_empty()); // buffered
 
             // Stop block — emits ToolUse
             let stop = r#"{"type":"stream_event","event":{"type":"content_block_stop","index":0}}"#;
-            let event = b.parse_event(stop).unwrap();
+            let event = b.parse_events(stop).into_iter().next().unwrap();
             match event {
                 AgentEvent::ToolUse { tool_name, .. } => {
                     assert_eq!(tool_name, *tool);
