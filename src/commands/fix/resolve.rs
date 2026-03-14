@@ -5,7 +5,7 @@ use crate::url_utils::parse_issue_info;
 use anyhow::{Context, Result};
 
 /// Handles GitHub CLI fetch result with fallback
-async fn handle_cli_fetch_result(result: Result<crate::github::IssueInfo>) -> Option<IssueDetails> {
+fn handle_cli_fetch_result(result: Result<crate::github::IssueInfo>) -> Option<IssueDetails> {
     match result {
         Ok(info) => Some(IssueDetails {
             title: info.title,
@@ -216,7 +216,7 @@ async fn fetch_issue_details(
                 eprintln!("   Falling back to gh CLI...");
                 let cli_result =
                     crate::github::get_issue_via_cli(owner, repo, host, issue_num).await;
-                let result = handle_cli_fetch_result(cli_result).await;
+                let result = handle_cli_fetch_result(cli_result);
                 if result.is_none() {
                     eprintln!("   Fix authentication with: gh auth login");
                 }
@@ -225,7 +225,7 @@ async fn fetch_issue_details(
         }
     } else {
         let cli_result = crate::github::get_issue_via_cli(owner, repo, host, issue_num).await;
-        let result = handle_cli_fetch_result(cli_result).await;
+        let result = handle_cli_fetch_result(cli_result);
         if result.is_none() {
             eprintln!("   Fix authentication with: gh auth login");
         }
