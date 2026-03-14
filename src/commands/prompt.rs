@@ -54,7 +54,7 @@ async fn fetch_issue_context(
     context.repo_name = Some(repo.clone());
 
     // Try API first, fall back to CLI
-    if let Some(github_client) = GitHubClient::try_from_env(&owner, &repo).await {
+    if let Some(github_client) = GitHubClient::try_from_env_with_host(&host).await {
         match github_client.get_issue(&owner, &repo, issue_number).await {
             Ok(issue) => {
                 context.issue_title = Some(issue.title.clone());
@@ -148,7 +148,7 @@ async fn fetch_pr_context(pr_str: &str) -> Result<(PromptContext, String, String
     let branch_name;
 
     // Try API first, fall back to CLI
-    if let Some(github_client) = GitHubClient::try_from_env(&owner, &repo).await {
+    if let Some(github_client) = GitHubClient::try_from_env_with_host(&host).await {
         match github_client.get_pr(&owner, &repo, pr_number).await {
             Ok(pr) => {
                 context.pr_title = Some(pr.title.clone().unwrap_or_default());

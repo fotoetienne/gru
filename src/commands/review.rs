@@ -114,7 +114,7 @@ pub async fn handle_review(pr_arg: Option<String>, agent_name: &str) -> Result<i
     let pr_num_u64: u64 = pr_num
         .parse()
         .with_context(|| format!("Invalid PR number: '{}'", pr_num))?;
-    let pr_details = match fetch_pr_details(&owner, &repo, pr_num_u64).await {
+    let pr_details = match fetch_pr_details(&owner, &repo, &host, pr_num_u64).await {
         Ok(details) => Some(details),
         Err(e) => {
             log::warn!("Failed to fetch PR details: {e}. Using fallback prompt.");
@@ -123,7 +123,7 @@ pub async fn handle_review(pr_arg: Option<String>, agent_name: &str) -> Result<i
     };
 
     // Fetch the issue number linked to this PR (if any)
-    let linked_issue = find_issue_for_pr(&owner, &repo, &pr_num)
+    let linked_issue = find_issue_for_pr(&owner, &repo, &host, &pr_num)
         .await
         .unwrap_or_else(|e| {
             log::warn!(
@@ -425,9 +425,8 @@ async fn find_pr_for_issue(issue_num: u64) -> Result<String> {
 /// Finds issue numbers linked to a PR
 /// Uses gh CLI to fetch issues that this PR closes/fixes
 /// Returns the first linked issue number, or 0 if no issues are linked
-async fn find_issue_for_pr(owner: &str, repo: &str, pr_num: &str) -> Result<u64> {
+async fn find_issue_for_pr(owner: &str, repo: &str, host: &str, pr_num: &str) -> Result<u64> {
     let repo_full = format!("{}/{}", owner, repo);
-    let host = crate::github::infer_github_host(owner);
     // Safe: pr_num is already validated as a number earlier in the call chain
     let output = github::gh_cli_command(host)
         .args([
@@ -481,8 +480,8 @@ struct PrDetails {
 
 /// Fetches PR title and body from GitHub for prompt rendering.
 /// Uses the API client if available, falls back to gh CLI.
-async fn fetch_pr_details(owner: &str, repo: &str, pr_num: u64) -> Result<PrDetails> {
-    if let Some(client) = GitHubClient::try_from_env(owner, repo).await {
+async fn fetch_pr_details(owner: &str, repo: &str, host: &str, pr_num: u64) -> Result<PrDetails> {
+    if let Some(client) = GitHubClient::try_from_env_with_host(host).await {
         match client.get_pr(owner, repo, pr_num).await {
             Ok(pr) => {
                 return Ok(PrDetails {
@@ -496,7 +495,6 @@ async fn fetch_pr_details(owner: &str, repo: &str, pr_num: u64) -> Result<PrDeta
         }
     }
 
-    let host = crate::github::infer_github_host(owner);
     let info = github::get_pr_via_cli(owner, repo, host, pr_num)
         .await
         .context("Failed to fetch PR details via gh CLI")?;

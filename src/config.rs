@@ -102,6 +102,15 @@ impl Default for DaemonConfig {
     }
 }
 
+/// Try to load the config file, returning `None` on any error.
+///
+/// This is a convenience for callers that want to inspect config
+/// but can gracefully handle its absence.
+pub fn try_load_config() -> Option<LabConfig> {
+    let path = LabConfig::default_path().ok()?;
+    LabConfig::load_partial(&path).ok()
+}
+
 /// Load just the `github_hosts` from config, returning `["github.com"]` on any error.
 ///
 /// This is a convenience for callers that need host info but don't require
