@@ -26,6 +26,13 @@ pub fn lock_with_timeout(file: &File) -> io::Result<()> {
 }
 
 fn lock_with_attempts(file: &File, max_attempts: u32) -> io::Result<()> {
+    if max_attempts == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "max_attempts must be at least 1",
+        ));
+    }
+
     let mut backoff = INITIAL_BACKOFF;
 
     for attempt in 0..max_attempts {
@@ -159,6 +166,24 @@ mod tests {
             let err = io::Error::new(io::ErrorKind::PermissionDenied, "denied");
             assert!(!is_lock_contention(&err));
         }
+    }
+
+    #[test]
+    fn test_lock_with_zero_attempts_returns_error() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let lock_path = temp_dir.path().join("test.lock");
+
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .unwrap();
+
+        let result = lock_with_attempts(&file, 0);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidInput);
     }
 
     #[test]

@@ -437,17 +437,19 @@ impl MinionRegistry {
         mode: Option<MinionMode>,
     ) -> Box<dyn FnOnce(u32) + Send> {
         Box::new(move |pid: u32| {
-            std::thread::spawn(move || {
-                if let Ok(mut registry) = MinionRegistry::load(None) {
-                    let _ = registry.update(&minion_id, |info| {
-                        info.pid = Some(pid);
-                        if let Some(m) = mode {
-                            info.mode = m;
-                        }
-                        info.last_activity = Utc::now();
-                    });
-                }
-            });
+            let _ = std::thread::Builder::new()
+                .name("pid-callback".into())
+                .spawn(move || {
+                    if let Ok(mut registry) = MinionRegistry::load(None) {
+                        let _ = registry.update(&minion_id, |info| {
+                            info.pid = Some(pid);
+                            if let Some(m) = mode {
+                                info.mode = m;
+                            }
+                            info.last_activity = Utc::now();
+                        });
+                    }
+                });
         })
     }
 
