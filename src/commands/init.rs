@@ -62,7 +62,7 @@ pub async fn handle_init(repo_arg: String) -> Result<i32> {
         RepoSource::GitHub(github_repo) => {
             let parts: Vec<&str> = github_repo.split('/').collect();
             let owner = parts[0].to_string();
-            let host = github::infer_github_host(&owner).to_string();
+            let host = github::infer_github_host(&owner);
             (owner, parts[1].to_string(), host)
         }
         RepoSource::CurrentDir => {

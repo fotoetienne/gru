@@ -1059,25 +1059,32 @@ pub async fn check_auth_via_cli(host: &str) -> Result<()> {
     Ok(())
 }
 
-/// Claim an issue by transitioning labels: remove gru:todo, add gru:in-progress.
+/// Claim an issue by transitioning labels: remove the ready label, add gru:in-progress.
 ///
-/// Note: Unlike `GitHubClient::claim_issue`, this does not check whether the
+/// Note: Unlike the old `GitHubClient::claim_issue`, this does not check whether the
 /// issue is already in-progress (race condition guard). Callers should add that
-/// check if needed.
+/// check if needed for multi-instance deployments.
 ///
 /// # Arguments
 /// * `host` - GitHub hostname
 /// * `owner` - Repository owner
 /// * `repo` - Repository name
 /// * `number` - Issue number
-pub async fn claim_issue_via_cli(host: &str, owner: &str, repo: &str, number: u64) -> Result<()> {
+/// * `ready_label` - The label to remove when claiming (e.g., `labels::TODO` or a custom daemon label)
+pub async fn claim_issue_via_cli(
+    host: &str,
+    owner: &str,
+    repo: &str,
+    number: u64,
+    ready_label: &str,
+) -> Result<()> {
     edit_labels_via_cli(
         host,
         owner,
         repo,
         number,
         &[labels::IN_PROGRESS],
-        &[labels::TODO],
+        &[ready_label],
     )
     .await
 }

@@ -432,8 +432,8 @@ async fn poll_and_spawn(
         let repo_full = format!("{}/{}", owner, repo);
 
         // Fetch ready issues, excluding blocked ones (both GitHub-blocked and gru:blocked).
-        // Try CLI first (supports -is:blocked qualifier), fall back to octocrab with
-        // client-side filtering if CLI is unavailable.
+        // Try CLI first (supports -is:blocked qualifier), fall back to simpler CLI query
+        // with client-side filtering.
         let issue_numbers =
             match list_ready_issues_via_cli(&owner, &repo, &host, &config.daemon.label).await {
                 Ok(numbers) => numbers,
@@ -465,7 +465,15 @@ async fn poll_and_spawn(
             }
 
             // Try to claim the issue via CLI
-            match github::claim_issue_via_cli(&host, &owner, &repo, issue_number).await {
+            match github::claim_issue_via_cli(
+                &host,
+                &owner,
+                &repo,
+                issue_number,
+                &config.daemon.label,
+            )
+            .await
+            {
                 Ok(()) => {
                     // Successfully claimed, spawn Minion
                     match spawn_minion(&repo_full, &host, issue_number).await {
