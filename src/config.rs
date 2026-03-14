@@ -89,6 +89,10 @@ pub struct DaemonConfig {
     /// Label to watch for issues (default: "gru:todo")
     #[serde(default = "default_label")]
     pub label: String,
+
+    /// Maximum resume attempts before marking a Minion as failed (default: 3)
+    #[serde(default = "default_max_resume_attempts")]
+    pub max_resume_attempts: u32,
 }
 
 impl Default for DaemonConfig {
@@ -98,6 +102,7 @@ impl Default for DaemonConfig {
             poll_interval_secs: default_poll_interval(),
             max_slots: default_max_slots(),
             label: default_label(),
+            max_resume_attempts: default_max_resume_attempts(),
         }
     }
 }
@@ -136,6 +141,13 @@ fn default_max_slots() -> usize {
 
 fn default_label() -> String {
     crate::labels::TODO.to_string()
+}
+
+/// Default maximum resume attempts (exposed for use in resume.rs when no config is available)
+pub const DEFAULT_MAX_RESUME_ATTEMPTS: u32 = 3;
+
+fn default_max_resume_attempts() -> u32 {
+    DEFAULT_MAX_RESUME_ATTEMPTS
 }
 
 /// Parse a repo entry from the config into `(host, owner, repo)`.
@@ -215,6 +227,9 @@ impl LabConfig {
 #
 # # Label to watch for issues (default: "gru:todo")
 # label = "gru:todo"
+#
+# # Maximum resume attempts before marking a Minion as failed (default: 3)
+# max_resume_attempts = 3
 
 # [agent]
 # # Which agent backend to use (default: "claude")
@@ -307,6 +322,10 @@ impl LabConfig {
             anyhow::bail!("poll_interval_secs must be at least 1");
         }
 
+        if self.daemon.max_resume_attempts == 0 {
+            anyhow::bail!("max_resume_attempts must be at least 1");
+        }
+
         // Validate repo format: "owner/repo" or "host/owner/repo"
         for repo in &self.daemon.repos {
             if parse_repo_entry(repo).is_none() {
@@ -392,6 +411,36 @@ repos = ["owner/repo"]
         assert_eq!(config.daemon.poll_interval_secs, 30);
         assert_eq!(config.daemon.max_slots, 2);
         assert_eq!(config.daemon.label, "gru:todo");
+        assert_eq!(config.daemon.max_resume_attempts, 3);
+    }
+
+    #[test]
+    fn test_max_resume_attempts_custom() {
+        let config_toml = r#"
+[daemon]
+repos = ["owner/repo"]
+max_resume_attempts = 5
+"#;
+        let mut temp_file = NamedTempFile::new().unwrap();
+        temp_file.write_all(config_toml.as_bytes()).unwrap();
+        temp_file.flush().unwrap();
+
+        let config = LabConfig::load(temp_file.path()).unwrap();
+        assert_eq!(config.daemon.max_resume_attempts, 5);
+    }
+
+    #[test]
+    fn test_default_max_resume_attempts_constant() {
+        assert_eq!(DEFAULT_MAX_RESUME_ATTEMPTS, 3);
+    }
+
+    #[test]
+    fn test_validate_zero_max_resume_attempts() {
+        let mut config = LabConfig::default();
+        config.daemon.repos = vec!["owner/repo".to_string()];
+        config.daemon.max_resume_attempts = 0;
+
+        assert!(config.validate().is_err());
     }
 
     #[test]

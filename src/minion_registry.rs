@@ -55,6 +55,21 @@ pub async fn revert_to_stopped(minion_id: &str) {
     .await;
 }
 
+/// Atomically mark a minion as failed: clear the process claim and set the
+/// orchestration phase to [`OrchestrationPhase::Failed`] in a single registry write.
+pub async fn mark_minion_failed(minion_id: &str) {
+    let mid = minion_id.to_string();
+    let _ = with_registry(move |reg| {
+        reg.update(&mid, |info| {
+            info.mode = MinionMode::Stopped;
+            info.pid = None;
+            info.orchestration_phase = OrchestrationPhase::Failed;
+            info.last_activity = Utc::now();
+        })
+    })
+    .await;
+}
+
 /// The execution mode of a Minion session
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
