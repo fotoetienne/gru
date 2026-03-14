@@ -475,6 +475,17 @@ async fn poll_and_spawn(config: &LabConfig, children: &mut Vec<Child>) -> Result
                             {
                                 log::warn!("⚠️  Failed to remove in-progress label: {}", e);
                             }
+                            // Restore the ready label so the issue remains visible for retry
+                            if let Err(e) = client
+                                .add_label(&owner, &repo, issue_number, &config.daemon.label)
+                                .await
+                            {
+                                log::warn!(
+                                    "⚠️  Failed to restore ready label '{}': {}",
+                                    config.daemon.label,
+                                    e
+                                );
+                            }
                         }
                     }
                 }
