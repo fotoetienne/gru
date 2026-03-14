@@ -744,21 +744,19 @@ pub async fn handle_prompt(prompt: &str, opts: PromptOptions) -> Result<i32> {
     )
     .await;
 
-    // Remove minion from registry (best effort - don't fail if this errors).
-    // No need to update PID/mode first since the entry is being deleted.
-    let remove_id = minion_id.clone();
-    if let Err(e) = with_registry(move |registry| {
-        registry.remove(&remove_id)?;
-        Ok(())
+    // Best-effort cleanup: clear PID, set mode to Stopped, and save token usage.
+    let token_usage = run_result.as_ref().ok().map(|r| r.token_usage.clone());
+    let cleanup_id = minion_id.clone();
+    let _ = with_registry(move |registry| {
+        registry.update(&cleanup_id, |info| {
+            info.pid = None;
+            info.mode = MinionMode::Stopped;
+            if let Some(usage) = token_usage {
+                info.token_usage = Some(usage);
+            }
+        })
     })
-    .await
-    {
-        log::info!(
-            "Warning: Failed to remove minion {} from registry: {}",
-            minion_id,
-            e
-        );
-    }
+    .await;
 
     // Now check if there was a stream error (after cleanup)
     let agent_run = run_result?;
