@@ -667,7 +667,7 @@ pub async fn handle_prompt(prompt: &str, opts: PromptOptions) -> Result<i32> {
         repo: repo_display,
         issue: issue_number_val.unwrap_or(0),
         command: "prompt".to_string(),
-        prompt: rendered_prompt.clone(),
+        prompt: rendered_prompt.chars().take(200).collect(),
         started_at: now,
         branch: branch_name,
         worktree: workspace_path.clone(),
