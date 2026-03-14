@@ -1,6 +1,5 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
@@ -303,9 +302,8 @@ impl MinionRegistry {
             .open(&lock_path)
             .with_context(|| format!("Failed to open lock file: {:?}", lock_path))?;
 
-        // Acquire exclusive lock - this will block if another process holds the lock
-        lock_file
-            .lock_exclusive()
+        // Acquire exclusive lock with timeout to avoid deadlock from hung processes
+        crate::file_lock::lock_with_timeout(&lock_file)
             .with_context(|| format!("Failed to acquire exclusive lock on {:?}", lock_path))?;
 
         // Load existing registry or create new one
