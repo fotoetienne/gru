@@ -1,6 +1,6 @@
 use crate::minion_registry::{is_process_alive, with_registry, MinionMode};
 use crate::minion_resolver;
-use anyhow::{Context, Result};
+use anyhow::Result;
 use std::path::Path;
 use tokio::process::Command;
 
@@ -8,7 +8,10 @@ use tokio::process::Command;
 /// Returns true if the signal was delivered successfully.
 #[cfg(unix)]
 fn send_signal(pid: u32, signal: i32) -> bool {
-    unsafe { libc::kill(pid as i32, signal) == 0 }
+    let Ok(pid_i32) = i32::try_from(pid) else {
+        return false;
+    };
+    unsafe { libc::kill(pid_i32, signal) == 0 }
 }
 
 #[cfg(not(unix))]
@@ -16,12 +19,27 @@ fn send_signal(_pid: u32, _signal: i32) -> bool {
     false
 }
 
+/// Escapes POSIX extended regex metacharacters in a string for use with `pgrep -f`.
+fn escape_regex(s: &str) -> String {
+    let mut escaped = String::with_capacity(s.len() + 16);
+    for c in s.chars() {
+        if matches!(
+            c,
+            '.' | '[' | ']' | '{' | '}' | '(' | ')' | '*' | '+' | '?' | '^' | '$' | '|' | '\\'
+        ) {
+            escaped.push('\\');
+        }
+        escaped.push(c);
+    }
+    escaped
+}
+
 /// Handles the stop command to terminate a running Minion.
 /// Returns 0 on success, 1 on error.
 ///
 /// Termination strategy:
 /// 1. Look up PID from the minion registry (primary path for background workers)
-/// 2. Fall back to ps/lsof scanning for legacy minions without PID in registry
+/// 2. Fall back to pgrep scanning for legacy minions without PID in registry
 /// 3. Update registry to mark minion as stopped
 ///
 /// The ID argument supports smart resolution:
@@ -66,11 +84,15 @@ pub async fn handle_stop(id: String, force: bool) -> Result<i32> {
             if force { " (forced)" } else { "" }
         );
     } else {
-        // Fall back to ps/lsof scanning for legacy minions or if PID wasn't in registry
-        let terminated = terminate_claude_in_worktree(&checkout_path).await?;
+        // Fall back to pgrep scanning for legacy minions or if PID wasn't in registry
+        let terminated = terminate_claude_in_worktree(&checkout_path, force).await?;
 
         if terminated > 0 {
-            println!("🔪 Terminated {} process(es) in worktree", terminated);
+            println!(
+                "🔪 Terminated {} process(es) in worktree{}",
+                terminated,
+                if force { " (forced)" } else { "" }
+            );
         } else {
             println!("ℹ️  No active processes found for minion");
         }
@@ -115,86 +137,97 @@ async fn terminate_via_registry_pid(minion_id: &str, force: bool) -> bool {
         return false;
     }
 
-    let signal = if force { libc::SIGKILL } else { libc::SIGTERM };
+    #[cfg(unix)]
+    {
+        let signal = if force { libc::SIGKILL } else { libc::SIGTERM };
 
-    if send_signal(pid, signal) {
-        log::info!(
-            "Sent {} to worker process (PID: {})",
-            if force { "SIGKILL" } else { "SIGTERM" },
-            pid
-        );
-        true
-    } else {
+        if send_signal(pid, signal) {
+            log::info!(
+                "Sent {} to worker process (PID: {})",
+                if force { "SIGKILL" } else { "SIGTERM" },
+                pid
+            );
+            return true;
+        }
         log::warn!("Failed to send signal to PID {}", pid);
-        false
     }
+
+    #[cfg(not(unix))]
+    {
+        let _ = (pid, force);
+        log::warn!("Process termination not supported on this platform");
+    }
+
+    false
 }
 
-/// Terminates Claude processes running in the specified worktree (legacy fallback).
+/// Terminates Claude/Gru processes running in the specified worktree (legacy fallback).
+///
+/// Uses `pgrep -f` with a pattern that matches only `claude` or `gru` processes
+/// whose command line references the worktree path. The path is regex-escaped to
+/// prevent metacharacters (e.g., `.`, `[`, `]`) from causing false matches.
+///
+/// Note: `pgrep -f` interprets the pattern as a POSIX extended regex. Paths containing
+/// unusual characters beyond what `escape_regex` handles may still produce unexpected
+/// matches, though this is unlikely with standard gru worktree paths.
+///
 /// Returns the number of processes terminated.
-async fn terminate_claude_in_worktree(worktree_path: &Path) -> Result<usize> {
-    let output = Command::new("ps")
-        .args(["-eo", "pid,command"])
-        .output()
-        .await
-        .context("Failed to run ps command")?;
+async fn terminate_claude_in_worktree(worktree_path: &Path, force: bool) -> Result<usize> {
+    let escaped_path = escape_regex(&worktree_path.to_string_lossy());
+    // Match only claude or gru processes referencing this worktree (either order)
+    let pattern = format!(
+        "(claude|gru).*{path}|{path}.*(claude|gru)",
+        path = escaped_path
+    );
 
-    if !output.status.success() {
-        log::warn!("ps command failed, cannot check for running processes");
+    let output = match Command::new("pgrep").args(["-f", &pattern]).output().await {
+        Ok(o) => o,
+        Err(e) => {
+            log::warn!("pgrep not available, cannot scan for processes: {}", e);
+            return Ok(0);
+        }
+    };
+
+    // pgrep exits 1 when no processes match, 2+ on error
+    let exit_code = output.status.code().unwrap_or(-1);
+    if exit_code == 1 {
+        return Ok(0);
+    } else if exit_code != 0 {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        log::warn!("pgrep exited with code {}: {}", exit_code, stderr.trim());
         return Ok(0);
     }
 
-    let ps_output = String::from_utf8_lossy(&output.stdout);
-    let worktree_str = worktree_path.to_string_lossy();
+    #[cfg(unix)]
+    {
+        let signal = if force { libc::SIGKILL } else { libc::SIGTERM };
+        let signal_name = if force { "SIGKILL" } else { "SIGTERM" };
+        let pgrep_output = String::from_utf8_lossy(&output.stdout);
+        let mut terminated = 0;
 
-    let mut terminated = 0;
+        for line in pgrep_output.lines() {
+            let pid: u32 = match line.trim().parse() {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
 
-    for line in ps_output.lines() {
-        let line = line.trim();
-
-        if line.starts_with("PID") || line.is_empty() {
-            continue;
-        }
-
-        if !line.contains("claude") && !line.contains("gru") {
-            continue;
-        }
-
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.is_empty() {
-            continue;
-        }
-
-        let pid: u32 = match parts[0].parse() {
-            Ok(p) => p,
-            Err(_) => continue,
-        };
-
-        // Check if this process is associated with our worktree
-        let cwd_check = Command::new("lsof")
-            .args(["-p", &pid.to_string(), "-Fn"])
-            .output()
-            .await;
-
-        let is_in_worktree = match cwd_check {
-            Ok(output) => {
-                let lsof_output = String::from_utf8_lossy(&output.stdout);
-                lsof_output.contains(&*worktree_str)
-            }
-            Err(_) => line.contains(&*worktree_str),
-        };
-
-        if is_in_worktree {
-            if send_signal(pid, libc::SIGTERM) {
-                log::info!("Sent SIGTERM to process (PID: {})", pid);
+            if send_signal(pid, signal) {
+                log::info!("Sent {} to process (PID: {})", signal_name, pid);
                 terminated += 1;
             } else {
-                log::warn!("Failed to terminate process {}", pid);
+                log::warn!("Failed to send {} to process {}", signal_name, pid);
             }
         }
+
+        Ok(terminated)
     }
 
-    Ok(terminated)
+    #[cfg(not(unix))]
+    {
+        let _ = force;
+        log::warn!("Process termination not supported on this platform");
+        Ok(0)
+    }
 }
 
 #[cfg(test)]
@@ -213,10 +246,31 @@ mod tests {
 
     #[tokio::test]
     async fn test_terminate_claude_in_worktree_nonexistent() {
-        let temp_path = std::env::temp_dir().join("gru-test-nonexistent-worktree");
-        let result = terminate_claude_in_worktree(&temp_path).await;
+        let temp_path = std::env::temp_dir().join("gru-stop-test-sigterm-no-match");
+        let result = terminate_claude_in_worktree(&temp_path, false).await;
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_terminate_claude_in_worktree_force() {
+        let temp_path = std::env::temp_dir().join("gru-stop-test-sigkill-no-match");
+        let result = terminate_claude_in_worktree(&temp_path, true).await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), 0);
+    }
+
+    #[test]
+    fn test_escape_regex_metacharacters() {
+        assert_eq!(escape_regex("/tmp/foo.bar"), "/tmp/foo\\.bar");
+        assert_eq!(escape_regex("path[0]"), "path\\[0\\]");
+        assert_eq!(escape_regex("a(b)c"), "a\\(b\\)c");
+        assert_eq!(escape_regex("no+meta*chars?"), "no\\+meta\\*chars\\?");
+        // Normal worktree path should only escape dots
+        assert_eq!(
+            escape_regex("/Users/me/.gru/work/owner/repo/minion/issue-42-M001/checkout"),
+            "/Users/me/\\.gru/work/owner/repo/minion/issue-42-M001/checkout"
+        );
     }
 
     #[cfg(unix)]
