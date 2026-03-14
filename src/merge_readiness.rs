@@ -79,6 +79,7 @@ impl fmt::Display for MergeReadiness {
 /// This is a pure query function — it reads GitHub state and returns a
 /// deterministic result. Same API state always produces the same output.
 pub async fn check_merge_readiness(
+    host: &str,
     owner: &str,
     repo: &str,
     pr_number: u64,
@@ -87,8 +88,8 @@ pub async fn check_merge_readiness(
 
     // Fetch PR details (for draft, mergeable, head SHA) and reviews concurrently
     let (pr, reviews) = tokio::try_join!(
-        get_pr_details(owner, repo, &pr_str),
-        get_reviews(owner, repo, &pr_str),
+        get_pr_details(host, owner, repo, &pr_str),
+        get_reviews(host, owner, repo, &pr_str),
     )?;
 
     // Fast bail-out: draft PRs are never ready
@@ -103,8 +104,8 @@ pub async fn check_merge_readiness(
 
     // Sequential: needs head SHA from get_pr_details above
     let (check_runs, combined_status) = tokio::try_join!(
-        get_check_runs(owner, repo, &pr.head_sha),
-        get_combined_status(owner, repo, &pr.head_sha),
+        get_check_runs(host, owner, repo, &pr.head_sha),
+        get_combined_status(host, owner, repo, &pr.head_sha),
     )?;
 
     let ci_passing = evaluate_ci(&check_runs) && evaluate_combined_status(&combined_status);
@@ -169,17 +170,16 @@ struct CombinedStatus {
 
 // --- API helpers ---
 
-async fn gh_api_with_retry(repo: &str, args: &[&str], max_retries: u32) -> Result<Output> {
-    let gh_cmd = github::gh_command_for_repo(repo);
+async fn gh_api_with_retry(host: &str, args: &[&str], max_retries: u32) -> Result<Output> {
     let mut attempts = 0;
     let args_str = args.join(" ");
 
     loop {
-        let output = tokio::process::Command::new(gh_cmd)
+        let output = github::gh_cli_command(host)
             .args(args)
             .output()
             .await
-            .with_context(|| format!("Failed to execute: {} {}", gh_cmd, args_str))?;
+            .with_context(|| format!("Failed to execute: gh {}", args_str))?;
 
         if output.status.success() {
             return Ok(output);
@@ -189,9 +189,8 @@ async fn gh_api_with_retry(repo: &str, args: &[&str], max_retries: u32) -> Resul
 
         if attempts >= max_retries || !is_retryable_error(&stderr) {
             anyhow::bail!(
-                "GitHub API call failed after {} attempt(s): {} {} — {}",
+                "GitHub API call failed after {} attempt(s): gh {} — {}",
                 attempts + 1,
-                gh_cmd,
                 args_str,
                 stderr.trim()
             );
@@ -200,11 +199,10 @@ async fn gh_api_with_retry(repo: &str, args: &[&str], max_retries: u32) -> Resul
         attempts += 1;
         let delay = std::cmp::min(BASE_DELAY_SECS.pow(attempts), MAX_DELAY_SECS);
         log::warn!(
-            "Retrying ({}/{}) after {}s: {} {}",
+            "Retrying ({}/{}) after {}s: gh {}",
             attempts,
             max_retries,
             delay,
-            gh_cmd,
             args_str,
         );
         tokio::time::sleep(tokio::time::Duration::from_secs(delay)).await;
@@ -238,10 +236,10 @@ fn is_retryable_error(stderr: &str) -> bool {
 
 // --- Data fetching ---
 
-async fn get_pr_details(owner: &str, repo: &str, pr_number: &str) -> Result<PrDetails> {
+async fn get_pr_details(host: &str, owner: &str, repo: &str, pr_number: &str) -> Result<PrDetails> {
     let repo_full = format!("{owner}/{repo}");
     let endpoint = format!("repos/{repo_full}/pulls/{pr_number}");
-    let output = gh_api_with_retry(&repo_full, &["api", &endpoint], DEFAULT_MAX_RETRIES).await?;
+    let output = gh_api_with_retry(host, &["api", &endpoint], DEFAULT_MAX_RETRIES).await?;
 
     let pr: PrApiResponse =
         serde_json::from_slice(&output.stdout).context("Failed to parse PR JSON")?;
@@ -253,12 +251,17 @@ async fn get_pr_details(owner: &str, repo: &str, pr_number: &str) -> Result<PrDe
     })
 }
 
-async fn get_reviews(owner: &str, repo: &str, pr_number: &str) -> Result<Vec<ReviewApiResponse>> {
+async fn get_reviews(
+    host: &str,
+    owner: &str,
+    repo: &str,
+    pr_number: &str,
+) -> Result<Vec<ReviewApiResponse>> {
     let repo_full = format!("{owner}/{repo}");
     let endpoint = format!("repos/{repo_full}/pulls/{pr_number}/reviews");
     // --paginate with --jq '.[]' streams one JSON object per line across pages
     let output = gh_api_with_retry(
-        &repo_full,
+        host,
         &["api", "--paginate", &endpoint, "--jq", ".[]"],
         DEFAULT_MAX_RETRIES,
     )
@@ -281,12 +284,12 @@ async fn get_reviews(owner: &str, repo: &str, pr_number: &str) -> Result<Vec<Rev
     Ok(reviews)
 }
 
-async fn get_check_runs(owner: &str, repo: &str, sha: &str) -> Result<Vec<CheckRun>> {
+async fn get_check_runs(host: &str, owner: &str, repo: &str, sha: &str) -> Result<Vec<CheckRun>> {
     let repo_full = format!("{owner}/{repo}");
     let endpoint = format!("repos/{repo_full}/commits/{sha}/check-runs");
     // --paginate with --jq streams individual check run objects, one per line
     let output = gh_api_with_retry(
-        &repo_full,
+        host,
         &["api", "--paginate", &endpoint, "--jq", ".check_runs[]"],
         DEFAULT_MAX_RETRIES,
     )
@@ -310,10 +313,15 @@ async fn get_check_runs(owner: &str, repo: &str, sha: &str) -> Result<Vec<CheckR
 }
 
 /// Fetch the combined commit status (legacy Statuses API) for a given SHA.
-async fn get_combined_status(owner: &str, repo: &str, sha: &str) -> Result<CombinedStatus> {
+async fn get_combined_status(
+    host: &str,
+    owner: &str,
+    repo: &str,
+    sha: &str,
+) -> Result<CombinedStatus> {
     let repo_full = format!("{owner}/{repo}");
     let endpoint = format!("repos/{repo_full}/commits/{sha}/status");
-    let output = gh_api_with_retry(&repo_full, &["api", &endpoint], DEFAULT_MAX_RETRIES).await?;
+    let output = gh_api_with_retry(host, &["api", &endpoint], DEFAULT_MAX_RETRIES).await?;
 
     let status: CombinedStatus =
         serde_json::from_slice(&output.stdout).context("Failed to parse combined status JSON")?;

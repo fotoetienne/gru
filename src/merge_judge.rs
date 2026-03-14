@@ -16,7 +16,7 @@ use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command as TokioCommand;
 
-use crate::github::gh_command_for_repo;
+use crate::github;
 use crate::labels;
 
 /// Default confidence threshold (1-10). Only merge when confidence >= this.
@@ -167,18 +167,18 @@ impl JudgeState {
 /// Lightweight fingerprint fetch — only head SHA + comment counts.
 /// Used to check `should_invoke` before fetching full context.
 pub async fn get_pr_fingerprint(
+    host: &str,
     owner: &str,
     repo: &str,
     pr_number: &str,
 ) -> Result<PrStateFingerprint> {
     let repo_full = format!("{owner}/{repo}");
-    let gh_cmd = gh_command_for_repo(&repo_full);
 
     let pr_fut = {
-        let gh = gh_cmd.to_string();
+        let host = host.to_string();
         let ep = format!("repos/{repo_full}/pulls/{pr_number}");
         async move {
-            let output = TokioCommand::new(&gh)
+            let output = github::gh_cli_command(&host)
                 .args(["api", &ep])
                 .output()
                 .await
@@ -202,10 +202,10 @@ pub async fn get_pr_fingerprint(
     };
 
     let ic_fut = {
-        let gh = gh_cmd.to_string();
+        let host = host.to_string();
         let ep = format!("repos/{repo_full}/issues/{pr_number}/comments");
         async move {
-            let output = TokioCommand::new(&gh)
+            let output = github::gh_cli_command(&host)
                 .args(["api", &ep, "--paginate", "--jq", "length"])
                 .output()
                 .await?;
@@ -214,10 +214,10 @@ pub async fn get_pr_fingerprint(
     };
 
     let rv_fut = {
-        let gh = gh_cmd.to_string();
+        let host = host.to_string();
         let ep = format!("repos/{repo_full}/pulls/{pr_number}/reviews");
         async move {
-            let output = TokioCommand::new(&gh)
+            let output = github::gh_cli_command(&host)
                 .args(["api", &ep, "--paginate", "--jq", "length"])
                 .output()
                 .await?;
@@ -226,10 +226,10 @@ pub async fn get_pr_fingerprint(
     };
 
     let rc_fut = {
-        let gh = gh_cmd.to_string();
+        let host = host.to_string();
         let ep = format!("repos/{repo_full}/pulls/{pr_number}/comments");
         async move {
-            let output = TokioCommand::new(&gh)
+            let output = github::gh_cli_command(&host)
                 .args(["api", &ep, "--paginate", "--jq", "length"])
                 .output()
                 .await?;
@@ -255,19 +255,23 @@ fn parse_paginated_lengths(stdout: &[u8]) -> usize {
 }
 
 /// Fetch the full PR context for the judge prompt via `gh`.
-async fn fetch_pr_context(owner: &str, repo: &str, pr_number: &str) -> Result<PrContext> {
+async fn fetch_pr_context(
+    host: &str,
+    owner: &str,
+    repo: &str,
+    pr_number: &str,
+) -> Result<PrContext> {
     let repo_full = format!("{owner}/{repo}");
-    let gh_cmd = gh_command_for_repo(&repo_full);
 
     // Fetch diff, comments, reviews, and review comments in parallel.
     // Use `--paginate --jq '.[]'` to flatten multi-page JSON arrays into
     // a newline-delimited JSON stream, then wrap in `[...]` for valid JSON.
     let diff_fut = {
-        let gh = gh_cmd.to_string();
+        let host = host.to_string();
         let rf = repo_full.clone();
         let pr = pr_number.to_string();
         async move {
-            let output = TokioCommand::new(&gh)
+            let output = github::gh_cli_command(&host)
                 .args(["pr", "diff", &pr, "-R", &rf])
                 .output()
                 .await
@@ -281,12 +285,12 @@ async fn fetch_pr_context(owner: &str, repo: &str, pr_number: &str) -> Result<Pr
     };
 
     let comments_fut = {
-        let gh = gh_cmd.to_string();
+        let host = host.to_string();
         let rf = repo_full.clone();
         let pr = pr_number.to_string();
         async move {
             let endpoint = format!("repos/{rf}/issues/{pr}/comments");
-            let output = TokioCommand::new(&gh)
+            let output = github::gh_cli_command(&host)
                 .args(["api", &endpoint, "--paginate", "--jq", ".[]"])
                 .output()
                 .await
@@ -300,12 +304,12 @@ async fn fetch_pr_context(owner: &str, repo: &str, pr_number: &str) -> Result<Pr
     };
 
     let reviews_fut = {
-        let gh = gh_cmd.to_string();
+        let host = host.to_string();
         let rf = repo_full.clone();
         let pr = pr_number.to_string();
         async move {
             let endpoint = format!("repos/{rf}/pulls/{pr}/reviews");
-            let output = TokioCommand::new(&gh)
+            let output = github::gh_cli_command(&host)
                 .args(["api", &endpoint, "--paginate", "--jq", ".[]"])
                 .output()
                 .await
@@ -319,12 +323,12 @@ async fn fetch_pr_context(owner: &str, repo: &str, pr_number: &str) -> Result<Pr
     };
 
     let review_comments_fut = {
-        let gh = gh_cmd.to_string();
+        let host = host.to_string();
         let rf = repo_full.clone();
         let pr = pr_number.to_string();
         async move {
             let endpoint = format!("repos/{rf}/pulls/{pr}/comments");
-            let output = TokioCommand::new(&gh)
+            let output = github::gh_cli_command(&host)
                 .args(["api", &endpoint, "--paginate", "--jq", ".[]"])
                 .output()
                 .await
@@ -588,6 +592,7 @@ fn extract_json(text: &str) -> Option<&str> {
 /// 4. Enforces max consecutive waits (coerces to escalate)
 /// 5. Returns the response
 pub async fn evaluate(
+    host: &str,
     owner: &str,
     repo: &str,
     pr_number: &str,
@@ -596,7 +601,7 @@ pub async fn evaluate(
     confidence_threshold: u8,
 ) -> Result<Option<JudgeResponse>> {
     // Lightweight fingerprint check first to avoid fetching full context.
-    let fingerprint = get_pr_fingerprint(owner, repo, pr_number).await?;
+    let fingerprint = get_pr_fingerprint(host, owner, repo, pr_number).await?;
 
     if !state.should_invoke(&fingerprint) {
         return Ok(None);
@@ -604,7 +609,7 @@ pub async fn evaluate(
 
     println!("🧑‍⚖️ Invoking merge-readiness judge for PR #{}...", pr_number);
 
-    let context = fetch_pr_context(owner, repo, pr_number).await?;
+    let context = fetch_pr_context(host, owner, repo, pr_number).await?;
 
     let prompt = build_judge_prompt(
         pr_number,
@@ -650,10 +655,14 @@ pub async fn evaluate(
 }
 
 /// Apply the `gru:needs-human-review` label to a PR.
-pub async fn add_needs_human_review_label(owner: &str, repo: &str, pr_number: &str) -> Result<()> {
+pub async fn add_needs_human_review_label(
+    host: &str,
+    owner: &str,
+    repo: &str,
+    pr_number: &str,
+) -> Result<()> {
     let repo_full = format!("{owner}/{repo}");
-    let gh_cmd = gh_command_for_repo(&repo_full);
-    let output = TokioCommand::new(gh_cmd)
+    let output = github::gh_cli_command(host)
         .args([
             "pr",
             "edit",
@@ -680,17 +689,16 @@ pub async fn add_needs_human_review_label(owner: &str, repo: &str, pr_number: &s
 }
 
 /// Ensure the `gru:needs-human-review` label exists in the repository.
-pub async fn ensure_needs_human_review_label(owner: &str, repo: &str) -> Result<()> {
+pub async fn ensure_needs_human_review_label(host: &str, owner: &str, repo: &str) -> Result<()> {
     let (color, description) = labels::get_label_info(NEEDS_HUMAN_REVIEW_LABEL)
         .expect("NEEDS_HUMAN_REVIEW must be in ALL_LABELS");
     let repo_full = format!("{owner}/{repo}");
-    let gh_cmd = gh_command_for_repo(&repo_full);
     let endpoint = format!("repos/{repo_full}/labels");
     let name_field = format!("name={NEEDS_HUMAN_REVIEW_LABEL}");
     let color_field = format!("color={color}");
     let desc_field = format!("description={description}");
 
-    let output = TokioCommand::new(gh_cmd)
+    let output = github::gh_cli_command(host)
         .args([
             "api",
             &endpoint,
@@ -725,15 +733,15 @@ pub async fn ensure_needs_human_review_label(owner: &str, repo: &str) -> Result<
 /// Returns `Err` on API failures — the caller should treat errors
 /// conservatively (do not proceed with merge if the check fails).
 pub async fn has_needs_human_review_label(
+    host: &str,
     owner: &str,
     repo: &str,
     pr_number: &str,
 ) -> Result<bool> {
     let repo_full = format!("{owner}/{repo}");
-    let gh_cmd = gh_command_for_repo(&repo_full);
     let endpoint = format!("repos/{repo_full}/issues/{pr_number}/labels");
 
-    let output = TokioCommand::new(gh_cmd)
+    let output = github::gh_cli_command(host)
         .args(["api", &endpoint])
         .output()
         .await
@@ -760,13 +768,13 @@ pub async fn has_needs_human_review_label(
 
 /// Post an escalation comment explaining why the judge escalated.
 pub async fn post_judge_escalation_comment(
+    host: &str,
     owner: &str,
     repo: &str,
     pr_number: &str,
     response: &JudgeResponse,
 ) {
     let repo_full = format!("{owner}/{repo}");
-    let gh_cmd = gh_command_for_repo(&repo_full);
     let body = format!(
         "🧑‍⚖️ **Merge readiness: {}/10 — needs human review**\n\n{}\n\n\
          _To proceed, remove the `gru:needs-human-review` label. \
@@ -774,7 +782,7 @@ pub async fn post_judge_escalation_comment(
         response.confidence, response.reasoning
     );
 
-    let result = TokioCommand::new(gh_cmd)
+    let result = github::gh_cli_command(host)
         .args([
             "pr", "comment", pr_number, "--repo", &repo_full, "--body", &body,
         ])
