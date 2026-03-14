@@ -2,7 +2,7 @@
 //!
 //! This module provides `run_agent_with_stream_monitoring`, the backend-agnostic
 //! replacement for `run_claude_with_stream_monitoring`. It reads lines from the
-//! agent process's stdout, delegates parsing to `AgentBackend::parse_event()`,
+//! agent process's stdout, delegates parsing to `AgentBackend::parse_events()`,
 //! and passes normalized `AgentEvent` values to the caller's callback.
 
 use crate::agent::{AgentBackend, AgentEvent, TokenUsage};
@@ -147,7 +147,7 @@ async fn log_event(dir: &Path, event: &AgentEvent) -> Result<()> {
 /// Runs an agent with stream monitoring and timeout detection.
 ///
 /// Spawns the pre-built command, reads stdout line by line, and delegates
-/// parsing to `backend.parse_event()`. Normalized `AgentEvent` values are
+/// parsing to `backend.parse_events()`. Normalized `AgentEvent` values are
 /// passed to `output_callback` and logged to `events.jsonl`.
 ///
 /// `events_dir` is the directory where `events.jsonl` will be written.
@@ -276,7 +276,7 @@ where
             inactivity_warning_shown = false;
 
             // Parse the line through the backend
-            if let Some(event) = backend.parse_event(trimmed) {
+            for event in backend.parse_events(trimmed) {
                 // Log the event to events.jsonl
                 log_event(events_dir, &event).await?;
 

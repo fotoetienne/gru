@@ -136,13 +136,14 @@ pub trait AgentBackend: Send + Sync {
     /// Build the command to start a new agent session.
     fn build_command(&self, worktree_path: &Path, session_id: &Uuid, prompt: &str) -> TokioCommand;
 
-    /// Parse a single line of agent output into a normalized event.
+    /// Parse a single line of agent output into normalized events.
     ///
-    /// Returns `None` for lines that don't represent a recognized event
-    /// (e.g., raw log output, blank lines). Backends should silently skip
-    /// unrecognized lines rather than returning errors, since agent output
-    /// commonly includes non-event lines.
-    fn parse_event(&self, line: &str) -> Option<AgentEvent>;
+    /// Returns an empty `Vec` for lines that don't represent recognized events
+    /// (e.g., raw log output, blank lines). May return multiple events when a
+    /// single line contains batch results (e.g., multi-tool-result messages).
+    /// Backends should silently skip unrecognized lines rather than returning
+    /// errors, since agent output commonly includes non-event lines.
+    fn parse_events(&self, line: &str) -> Vec<AgentEvent>;
 
     /// Build the command to resume an existing agent session.
     ///
