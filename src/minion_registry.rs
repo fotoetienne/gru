@@ -422,6 +422,32 @@ impl MinionRegistry {
         Ok(())
     }
 
+    /// Creates a boxed callback that registers a child PID in the minion
+    /// registry when the agent process spawns.
+    ///
+    /// If `mode` is `Some`, the minion's mode is also updated (e.g. to
+    /// `Autonomous`). All callbacks unconditionally set `pid` and
+    /// `last_activity`.
+    ///
+    /// The callback uses synchronous `MinionRegistry::load` because the
+    /// `on_spawn` contract is `FnOnce(u32) + Send` (not async).
+    pub fn pid_callback(
+        minion_id: String,
+        mode: Option<MinionMode>,
+    ) -> Box<dyn FnOnce(u32) + Send> {
+        Box::new(move |pid: u32| {
+            if let Ok(mut registry) = MinionRegistry::load(None) {
+                let _ = registry.update(&minion_id, |info| {
+                    info.pid = Some(pid);
+                    if let Some(m) = mode {
+                        info.mode = m;
+                    }
+                    info.last_activity = Utc::now();
+                });
+            }
+        })
+    }
+
     /// Returns all Minions in the registry
     pub fn list(&self) -> Vec<(String, MinionInfo)> {
         self.data

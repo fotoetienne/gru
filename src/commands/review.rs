@@ -188,15 +188,7 @@ pub async fn handle_review(pr_arg: Option<String>, agent_name: &str) -> Result<i
     let cmd = backend.build_command(&checkout_path, &session_id, &review_prompt);
 
     // Build on_spawn callback to record the child PID in the registry
-    let pid_minion_id = minion_id.clone();
-    let on_spawn: Box<dyn FnOnce(u32) + Send> = Box::new(move |pid: u32| {
-        if let Ok(mut registry) = MinionRegistry::load(None) {
-            let _ = registry.update(&pid_minion_id, |info| {
-                info.pid = Some(pid);
-                info.last_activity = Utc::now();
-            });
-        }
-    });
+    let on_spawn = MinionRegistry::pid_callback(minion_id.clone(), None);
 
     // Run agent with stream monitoring (no timeout for reviews)
     let progress_cb = std::sync::Arc::clone(&progress);

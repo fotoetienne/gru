@@ -718,15 +718,7 @@ pub async fn handle_prompt(prompt: &str, opts: PromptOptions) -> Result<i32> {
     cmd.env("GRU_WORKSPACE", &minion_id);
 
     // Build on_spawn callback to record the child PID in the registry
-    let pid_minion_id = minion_id.clone();
-    let on_spawn: Box<dyn FnOnce(u32) + Send> = Box::new(move |pid: u32| {
-        if let Ok(mut registry) = MinionRegistry::load(None) {
-            let _ = registry.update(&pid_minion_id, |info| {
-                info.pid = Some(pid);
-                info.last_activity = Utc::now();
-            });
-        }
-    });
+    let on_spawn = MinionRegistry::pid_callback(minion_id.clone(), None);
 
     // Run agent with stream monitoring
     let progress_cb = std::sync::Arc::clone(&progress);

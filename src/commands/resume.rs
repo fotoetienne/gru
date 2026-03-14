@@ -304,19 +304,8 @@ async fn run_autonomous_agent(
         progress.handle_event(event);
     };
 
-    // Register PID on spawn. Uses MinionRegistry::load directly instead of
-    // with_registry because the on_spawn callback is synchronous (FnOnce, not async).
-    // This is consistent with the same pattern in fix.rs::run_agent_session_inner.
-    let pid_minion_id = wt_ctx.minion_id.clone();
-    let on_spawn: Box<dyn FnOnce(u32) + Send> = Box::new(move |pid: u32| {
-        if let Ok(mut registry) = MinionRegistry::load(None) {
-            let _ = registry.update(&pid_minion_id, |info| {
-                info.pid = Some(pid);
-                info.mode = MinionMode::Autonomous;
-                info.last_activity = Utc::now();
-            });
-        }
-    });
+    let on_spawn =
+        MinionRegistry::pid_callback(wt_ctx.minion_id.clone(), Some(MinionMode::Autonomous));
 
     let run_result = run_agent_with_stream_monitoring(
         cmd,
