@@ -428,9 +428,10 @@ pub struct PromptOptions {
 struct FetchedContext {
     context: PromptContext,
     issue_number: Option<u64>,
-    /// Owner/repo/host from --issue (or --pr if no --issue)
+    /// Owner/repo from --issue, or from --pr when no --issue is given.
     owner: Option<String>,
     repo: Option<String>,
+    /// Host from --issue only; used exclusively for issue worktree creation.
     host: Option<String>,
     /// PR-specific owner/repo/host (may differ from issue)
     pr_owner: Option<String>,
@@ -771,9 +772,8 @@ async fn register_and_run_agent(
     .await;
 
     // Best-effort cleanup: clear PID, set mode to Stopped, and save token usage.
-    // Token usage is persisted regardless of exit status (Ok with non-zero exit) because
-    // cost data is valuable even for failed tasks. Only stream-level errors (timeout, stuck)
-    // result in Err, in which case partial usage is not saved.
+    // Token usage is persisted regardless of exit status because cost data is
+    // valuable even for failed tasks.
     let token_usage = run_result.as_ref().ok().map(|r| r.token_usage.clone());
     let cleanup_id = minion_id.clone();
     let _ = with_registry(move |registry| {
@@ -787,6 +787,7 @@ async fn register_and_run_agent(
     })
     .await;
 
+    // Now check if there was a stream error (after cleanup)
     let agent_run = run_result?;
     let status = agent_run.status;
 
