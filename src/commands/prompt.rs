@@ -717,7 +717,7 @@ pub async fn handle_prompt(prompt: &str, opts: PromptOptions) -> Result<i32> {
     let mut cmd = backend.build_command(&run_dir, &session_id, &rendered_prompt);
     cmd.env("GRU_WORKSPACE", &minion_id);
 
-    // Build on_spawn callback to record the child PID in the registry
+    // Record child PID on spawn; mode is already set to Autonomous at registration.
     let on_spawn = MinionRegistry::pid_callback(minion_id.clone(), None);
 
     // Run agent with stream monitoring
