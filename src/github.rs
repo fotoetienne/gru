@@ -36,13 +36,12 @@ pub(crate) fn infer_github_host(owner: &str) -> String {
 
 /// Creates a pre-configured `tokio::process::Command` for the `gh` CLI.
 ///
-/// Always uses the `gh` binary and sets `GH_HOST` for non-`github.com`
-/// hosts so authentication targets the correct server.
+/// Always uses the `gh` binary and sets `GH_HOST` to the provided host
+/// so authentication targets the correct server. This ensures deterministic
+/// host selection even when the parent process has `GH_HOST` set.
 pub fn gh_cli_command(host: &str) -> Command {
     let mut cmd = Command::new("gh");
-    if host != "github.com" {
-        cmd.env("GH_HOST", host);
-    }
+    cmd.env("GH_HOST", host);
     cmd
 }
 
@@ -791,9 +790,14 @@ mod tests {
         let cmd = gh_cli_command("github.com");
         // Should use "gh" binary
         assert_eq!(cmd.as_std().get_program(), "gh");
-        // Should not set GH_HOST for github.com
-        let has_gh_host = cmd.as_std().get_envs().any(|(k, _)| k == "GH_HOST");
-        assert!(!has_gh_host);
+        // Should always set GH_HOST for deterministic host selection
+        let gh_host = cmd
+            .as_std()
+            .get_envs()
+            .find(|(k, _)| *k == "GH_HOST")
+            .and_then(|(_, v)| v)
+            .map(|v| v.to_str().unwrap().to_string());
+        assert_eq!(gh_host.as_deref(), Some("github.com"));
     }
 
     #[test]
