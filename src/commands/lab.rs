@@ -9,9 +9,32 @@ use chrono::Utc;
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::process::Stdio;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::process::Child;
 use tokio::time::sleep;
+
+/// Maximum age of a spawn to be considered an "early exit" eligible for label restoration.
+/// Processes that fail within this window likely never started meaningful work, so the
+/// issue label should be restored to the ready state rather than left as in-progress.
+const EARLY_EXIT_THRESHOLD_SECS: u64 = 30;
+
+/// A child process tracked by the lab, with optional metadata for label restoration.
+struct SpawnedChild {
+    child: Child,
+    /// Set for newly claimed issues so we can restore labels on early exit.
+    /// None for resumed minions (they were already in-progress).
+    spawn_meta: Option<SpawnMeta>,
+}
+
+/// Metadata needed to restore labels when a spawned process exits early.
+struct SpawnMeta {
+    host: String,
+    owner: String,
+    repo: String,
+    issue_number: u64,
+    ready_label: String,
+    spawned_at: Instant,
+}
 
 /// Handles the lab daemon command
 pub async fn handle_lab(
@@ -66,7 +89,7 @@ pub async fn handle_lab(
     println!();
 
     // Track child processes for graceful shutdown
-    let mut children: Vec<Child> = Vec::new();
+    let mut children: Vec<SpawnedChild> = Vec::new();
 
     // Safety net: track Minion IDs we've already attempted to resume this session
     // to prevent resume loops even if phase updates are missed.
@@ -95,7 +118,7 @@ pub async fn handle_lab(
             }
             _ = sleep(config.poll_interval()) => {
                 // Clean up finished child processes
-                reap_children(&mut children);
+                reap_children(&mut children).await;
 
                 if let Err(e) = poll_and_spawn(&config, &mut children, no_resume, &mut resumed_this_session).await {
                     log::warn!("⚠️  Polling error: {}", e);
@@ -108,13 +131,56 @@ pub async fn handle_lab(
     Ok(0)
 }
 
-/// Remove finished child processes from the tracking vec
-fn reap_children(children: &mut Vec<Child>) {
+/// Remove finished child processes from the tracking vec.
+/// For early exits (non-zero within threshold), restore labels to prevent orphaning.
+async fn reap_children(children: &mut Vec<SpawnedChild>) {
     let mut i = 0;
     while i < children.len() {
-        match children[i].try_wait() {
+        match children[i].child.try_wait() {
             Ok(Some(status)) => {
                 log::info!("Minion process exited with status: {}", status);
+
+                // If the process failed quickly, restore the issue label
+                if !status.success() {
+                    if let Some(meta) = &children[i].spawn_meta {
+                        let elapsed = meta.spawned_at.elapsed().as_secs();
+                        if elapsed < EARLY_EXIT_THRESHOLD_SECS {
+                            log::warn!(
+                                "⚠️  Spawned gru do for issue #{} exited early with {} (after {}s) — restoring label",
+                                meta.issue_number,
+                                status,
+                                elapsed
+                            );
+                            if let Err(e) = github::edit_labels_via_cli(
+                                &meta.host,
+                                &meta.owner,
+                                &meta.repo,
+                                meta.issue_number,
+                                &[&meta.ready_label],
+                                &[labels::IN_PROGRESS],
+                            )
+                            .await
+                            {
+                                log::warn!(
+                                    "⚠️  Failed to restore labels on issue #{}: {} \
+                                     — issue may need manual label fix",
+                                    meta.issue_number,
+                                    e
+                                );
+                            }
+                        } else {
+                            log::warn!(
+                                "⚠️  Spawned gru do for issue #{} exited with {} (after {}s) — \
+                                 not restoring label (exceeded early-exit threshold of {}s)",
+                                meta.issue_number,
+                                status,
+                                elapsed,
+                                EARLY_EXIT_THRESHOLD_SECS
+                            );
+                        }
+                    }
+                }
+
                 children.swap_remove(i);
             }
             Ok(None) => {
@@ -129,20 +195,20 @@ fn reap_children(children: &mut Vec<Child>) {
 }
 
 /// Signal all child processes to shut down gracefully on Ctrl-C
-async fn shutdown_children(children: &mut [Child]) {
+async fn shutdown_children(children: &mut [SpawnedChild]) {
     if children.is_empty() {
         return;
     }
 
     // Reap already-exited children first for an accurate running count
     let mut running_pids = Vec::new();
-    for child in children.iter_mut() {
-        match child.try_wait() {
+    for sc in children.iter_mut() {
+        match sc.child.try_wait() {
             Ok(Some(status)) => {
                 log::info!("Minion process already exited with status: {}", status);
             }
             Ok(None) => {
-                if let Some(pid) = child.id() {
+                if let Some(pid) = sc.child.id() {
                     running_pids.push(pid);
                 }
             }
@@ -179,14 +245,14 @@ async fn shutdown_children(children: &mut [Child]) {
     sleep(Duration::from_secs(5)).await;
 
     // Force-kill any remaining processes and reap to avoid zombies
-    for child in children.iter_mut() {
-        match child.try_wait() {
+    for sc in children.iter_mut() {
+        match sc.child.try_wait() {
             Ok(Some(_)) => {} // Already exited
             _ => {
                 log::warn!("Force-killing Minion process that didn't exit gracefully");
-                let _ = child.kill().await;
+                let _ = sc.child.kill().await;
                 // Reap the child process to avoid leaving a zombie
-                let _ = child.wait().await;
+                let _ = sc.child.wait().await;
             }
         }
     }
@@ -291,7 +357,7 @@ async fn mark_exhausted_minion(minion_id: &str, info: &MinionInfo, host: &str, r
 /// Returns the number of minions successfully resumed.
 async fn resume_interrupted_minions(
     config: &LabConfig,
-    children: &mut Vec<Child>,
+    children: &mut Vec<SpawnedChild>,
     available: &mut usize,
     max_attempts: u32,
     resumed_this_session: &mut HashSet<String>,
@@ -399,7 +465,10 @@ async fn resume_interrupted_minions(
                         );
                     }
                 }
-                children.push(child);
+                children.push(SpawnedChild {
+                    child,
+                    spawn_meta: None, // Resumed minions don't need label restoration
+                });
                 resumed += 1;
                 *available -= 1;
             }
@@ -424,7 +493,7 @@ async fn resume_interrupted_minions(
 /// Poll GitHub for ready issues and spawn Minions if slots are available
 async fn poll_and_spawn(
     config: &LabConfig,
-    children: &mut Vec<Child>,
+    children: &mut Vec<SpawnedChild>,
     no_resume: bool,
     resumed_this_session: &mut HashSet<String>,
 ) -> Result<()> {
@@ -557,7 +626,17 @@ async fn poll_and_spawn(
                                     );
                                 }
                             }
-                            children.push(child);
+                            children.push(SpawnedChild {
+                                child,
+                                spawn_meta: Some(SpawnMeta {
+                                    host: host.clone(),
+                                    owner: owner.clone(),
+                                    repo: repo.clone(),
+                                    issue_number,
+                                    ready_label: config.daemon.label.clone(),
+                                    spawned_at: Instant::now(),
+                                }),
+                            });
                             println!(
                                 "✨ Spawned Minion for {}/issues/{}",
                                 repo_spec, issue_number
@@ -805,10 +884,10 @@ async fn fallback_list_issues(
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_reap_children_empty() {
-        let mut children: Vec<Child> = Vec::new();
-        reap_children(&mut children);
+    #[tokio::test]
+    async fn test_reap_children_empty() {
+        let mut children: Vec<SpawnedChild> = Vec::new();
+        reap_children(&mut children).await;
         assert!(children.is_empty());
     }
 
@@ -942,5 +1021,65 @@ mod tests {
     fn test_max_resume_attempts_default() {
         let config = LabConfig::default();
         assert_eq!(config.daemon.max_resume_attempts, 3);
+    }
+
+    #[tokio::test]
+    async fn test_reap_children_removes_exited_process() {
+        // Spawn a process that exits immediately with code 1
+        let child = tokio::process::Command::new("false")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+
+        let mut children = vec![SpawnedChild {
+            child,
+            spawn_meta: None,
+        }];
+
+        // Wait for process to exit
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        reap_children(&mut children).await;
+        assert!(children.is_empty(), "Exited child should be reaped");
+    }
+
+    #[tokio::test]
+    async fn test_reap_children_keeps_running_process() {
+        // Spawn a process that sleeps for a while
+        let child = tokio::process::Command::new("sleep")
+            .arg("60")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+
+        let mut children = vec![SpawnedChild {
+            child,
+            spawn_meta: None,
+        }];
+
+        reap_children(&mut children).await;
+        assert_eq!(children.len(), 1, "Running child should not be reaped");
+
+        // Clean up
+        children[0].child.kill().await.ok();
+        children[0].child.wait().await.ok();
+    }
+
+    #[test]
+    fn test_spawn_meta_tracks_issue_metadata() {
+        let meta = SpawnMeta {
+            host: "github.com".to_string(),
+            owner: "test-owner".to_string(),
+            repo: "test-repo".to_string(),
+            issue_number: 42,
+            ready_label: "gru:todo".to_string(),
+            spawned_at: Instant::now(),
+        };
+        assert_eq!(meta.issue_number, 42);
+        assert!(meta.spawned_at.elapsed().as_secs() < EARLY_EXIT_THRESHOLD_SECS);
     }
 }
