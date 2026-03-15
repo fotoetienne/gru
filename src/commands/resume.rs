@@ -4,8 +4,8 @@ use crate::agent_runner::{
     is_stuck_or_timeout_error, run_agent_with_stream_monitoring, EXIT_CODE_SIGNAL_TERMINATED,
 };
 use crate::commands::fix::{
-    handle_pr_creation, monitor_ci_after_fix, monitor_pr_lifecycle, update_orchestration_phase,
-    IssueContext, WorktreeContext,
+    handle_pr_creation, monitor_ci_after_fix, monitor_pr_lifecycle, try_mark_issue_blocked,
+    try_mark_issue_failed, update_orchestration_phase, IssueContext, WorktreeContext,
 };
 use crate::config::{LabConfig, DEFAULT_MAX_RESUME_ATTEMPTS};
 use crate::minion_registry::{
@@ -207,6 +207,16 @@ pub async fn handle_resume(
         None
     };
 
+    // Resolve host from worktree git remote, falling back to config-based inference
+    let host = resolve_host_from_worktree(&wt_ctx.checkout_path, &owner).await;
+    let issue_ctx = IssueContext {
+        owner,
+        repo: repo_name,
+        host,
+        issue_num,
+        details: None,
+    };
+
     update_orchestration_phase(&minion.minion_id, OrchestrationPhase::RunningAgent).await;
 
     // Run agent in autonomous mode with stream monitoring
@@ -224,12 +234,26 @@ pub async fn handle_resume(
         Ok(status) => {
             if !status.success() {
                 update_orchestration_phase(&minion.minion_id, OrchestrationPhase::Failed).await;
+                try_mark_issue_failed(
+                    &issue_ctx.host,
+                    &issue_ctx.owner,
+                    &issue_ctx.repo,
+                    issue_ctx.issue_num,
+                )
+                .await;
                 println!("❌ Claude session exited with non-zero status");
                 return Ok(status.code().unwrap_or(EXIT_CODE_SIGNAL_TERMINATED));
             }
         }
         Err(e) if is_stuck_or_timeout_error(&e) => {
             update_orchestration_phase(&minion.minion_id, OrchestrationPhase::Failed).await;
+            try_mark_issue_blocked(
+                &issue_ctx.host,
+                &issue_ctx.owner,
+                &issue_ctx.repo,
+                issue_ctx.issue_num,
+            )
+            .await;
             log::error!("🚨 {:#}", e);
             return Ok(1);
         }
@@ -238,16 +262,6 @@ pub async fn handle_resume(
 
     // Phase: Create PR (handle_pr_creation checks if branch was pushed internally)
     update_orchestration_phase(&minion.minion_id, OrchestrationPhase::CreatingPr).await;
-
-    // Resolve host from worktree git remote, falling back to config-based inference
-    let host = resolve_host_from_worktree(&wt_ctx.checkout_path, &owner).await;
-    let issue_ctx = IssueContext {
-        owner,
-        repo: repo_name,
-        host,
-        issue_num,
-        details: None,
-    };
 
     let pr_number = match handle_pr_creation(&issue_ctx, &wt_ctx).await {
         Ok(pr) => pr,
@@ -272,11 +286,36 @@ pub async fn handle_resume(
         }
     };
 
+    // Last resort: discover PR by head branch (handles manual PR creation or missing registry state)
+    let pr_number = match pr_number {
+        Some(pr) => Some(pr),
+        None => {
+            match crate::ci::get_pr_number(
+                &issue_ctx.host,
+                &issue_ctx.owner,
+                &issue_ctx.repo,
+                &wt_ctx.branch_name,
+            )
+            .await
+            {
+                Ok(Some(num)) => {
+                    log::info!("Discovered PR #{} by branch name", num);
+                    Some(num.to_string())
+                }
+                Ok(None) => None,
+                Err(e) => {
+                    log::warn!("Failed to discover PR by branch: {}", e);
+                    None
+                }
+            }
+        }
+    };
+
     // Respect no_watch: skip lifecycle monitoring for fire-and-forget minions
     if no_watch {
         if let Some(ref pr_num) = pr_number {
             println!(
-                "PR #{} created. Skipping lifecycle monitoring (--no-watch).",
+                "PR #{}. Skipping lifecycle monitoring (--no-watch).",
                 pr_num
             );
         }
@@ -313,7 +352,17 @@ pub async fn handle_resume(
         .await;
         match ci_passed {
             Ok(true) => log::info!("✅ CI checks passed"),
-            Ok(false) => log::warn!("⚠️  CI checks failed or were escalated"),
+            Ok(false) => {
+                log::warn!("⚠️  CI checks failed or were escalated");
+                try_mark_issue_blocked(
+                    &issue_ctx.host,
+                    &issue_ctx.owner,
+                    &issue_ctx.repo,
+                    issue_ctx.issue_num,
+                )
+                .await;
+                return Ok(1);
+            }
             Err(e) => log::warn!("⚠️  CI monitoring error (non-fatal): {}", e),
         }
     }

@@ -23,7 +23,7 @@ pub(crate) async fn update_orchestration_phase(minion_id: &str, phase: Orchestra
 
 /// Attempts to mark an issue as blocked via CLI (fire-and-forget).
 /// Logs success/failure but does not propagate errors.
-pub(super) async fn try_mark_issue_blocked(host: &str, owner: &str, repo: &str, issue_num: u64) {
+pub(crate) async fn try_mark_issue_blocked(host: &str, owner: &str, repo: &str, issue_num: u64) {
     match crate::github::mark_issue_blocked_via_cli(host, owner, repo, issue_num).await {
         Ok(()) => {
             println!("🏷️  Updated issue label to '{}'", crate::labels::BLOCKED);
@@ -36,7 +36,7 @@ pub(super) async fn try_mark_issue_blocked(host: &str, owner: &str, repo: &str, 
 
 /// Attempts to mark an issue as failed via CLI (fire-and-forget).
 /// Logs success/failure but does not propagate errors.
-pub(super) async fn try_mark_issue_failed(host: &str, owner: &str, repo: &str, issue_num: u64) {
+pub(crate) async fn try_mark_issue_failed(host: &str, owner: &str, repo: &str, issue_num: u64) {
     match crate::github::mark_issue_failed_via_cli(host, owner, repo, issue_num).await {
         Ok(()) => {
             println!("🏷️  Updated issue label to '{}'", crate::labels::FAILED);
