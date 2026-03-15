@@ -306,11 +306,29 @@ pub(crate) async fn handle_pr_creation(
                             log::warn!("⚠️  Failed to update registry with PR number: {}", e);
                         }
 
+                        // Mark issue as done (fire-and-forget), same as success path
+                        match crate::github::mark_issue_done_via_cli(
+                            &issue_ctx.host,
+                            &issue_ctx.owner,
+                            &issue_ctx.repo,
+                            issue_ctx.issue_num,
+                        )
+                        .await
+                        {
+                            Ok(()) => {
+                                println!("🏷️  Updated issue label to '{}'", crate::labels::DONE);
+                            }
+                            Err(e) => {
+                                log::warn!("⚠️  Failed to update issue label: {}", e);
+                            }
+                        }
+
                         Ok(Some(pr_number))
                     }
                     Ok(None) => {
                         log::warn!(
-                            "⚠️  PR exists for branch '{}' but could not be found via API",
+                            "⚠️  PR exists for branch '{}' but could not be found via API. \
+                             This may be a transient GitHub API failure; retry with 'gru resume'.",
                             wt_ctx.branch_name
                         );
                         Ok(None)
