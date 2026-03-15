@@ -377,7 +377,10 @@ Ctrl+D or type 'detach'
 Press Ctrl+D to detach (Minion continues running)
 ```
 
-**Implementation: tmux vs Custom**
+**Implementation: tmux vs Custom (HISTORICAL — superseded by CLI + stream-json)**
+
+> **Note:** This entire section is historical. The tmux approach was evaluated but never shipped.
+> V1 uses CLI + stream-json parsing instead. Kept for decision context only.
 
 **Option A: Use tmux**
 
@@ -580,18 +583,15 @@ impl AttachManager {
 }
 ```
 
-**When to build custom:**
+**When to build custom (historical — no longer applicable):**
 - Multiple users request Windows support (tmux unavailable)
 - Need fine-grained I/O interception for features
 - Want to eliminate external dependencies
 - Performance issues with tmux overhead
 
-**Hybrid approach (future):**
-- Use tmux for session persistence and multiplexing
-- Add custom layer on top for status parsing and event extraction
-- Best of both worlds: tmux reliability + custom semantics
+> **Note:** The CLI + stream-json approach eliminated the need for both tmux and custom I/O multiplexing.
 
-**Alternative: Zellij**
+**Alternative: Zellij (historical)**
 
 [Zellij](https://zellij.dev/) is a modern Rust-based terminal multiplexer gaining popularity:
 
@@ -650,35 +650,7 @@ Command::new("zellij")
     .spawn()?;
 ```
 
-**Why tmux still wins for V1:**
-- **Universal availability** - tmux pre-installed on most systems, Zellij requires separate install
-- **Proven stability** - 15+ years of production use
-- **Known edge cases** - Community has documented all quirks
-- **Easy to swap** - Can switch to Zellij later without changing Gru's API
-- **No real API advantage** - Both require shelling out to CLI
-
-**When Zellij becomes compelling:**
-- Zellij gains true embeddable library API (not just CLI wrapper)
-- Plugin system enables Lab-specific features (status parsing, event hooks)
-- Need better default UX for users attaching to Minions
-- Zellij adoption reaches critical mass (pre-installed by default)
-- Want to build Gru UI as Zellij plugin
-
-**Alternative: GNU Screen**
-
-Older than tmux (1987), but still viable:
-
-**Pros:**
-- ✅ **Even more universal** - Installed everywhere
-- ✅ **Simpler** - Fewer features = less complexity
-- ✅ **Rock solid** - Decades of production testing
-
-**Cons:**
-- ⚠️ **Less actively maintained** - Development slowed
-- ⚠️ **Fewer features** - No panes, limited scripting
-- ⚠️ **Worse performance** - Older codebase
-
-**Verdict: tmux is the sweet spot for V1**
+**Historical verdict:** tmux was initially favored for V1, but CLI + stream-json parsing proved superior and was selected instead. Neither tmux, Zellij, nor GNU Screen are used in the shipped implementation.
 
 ---
 
@@ -687,7 +659,7 @@ Older than tmux (1987), but still viable:
 ### Context
 
 Gru is a CLI tool that:
-- Manages processes (Claude Code sessions in tmux)
+- Manages processes (Claude Code CLI sessions)
 - Makes HTTP calls (GitHub API)
 - Does file I/O (git worktrees, logs)
 - Provides CLI interface
@@ -1306,11 +1278,11 @@ After exhausting retries:
 **No SQLite database:**
 - In-memory state for active Minions
 - Simple JSON file for timeline cursors (`~/.gru/state/cursors.json`)
-- Recovery on restart: enumerate tmux sessions, fetch issue state from GitHub
+- Recovery on restart: check Minion registry, fetch issue state from GitHub
 - Archive logs to disk for completed/failed Minions
 
 **Labels (simplified to 3 states):**
-- `ready-for-minion` → `in-progress` → `minion:done` / `minion:failed`
+- `gru:todo` → `gru:in-progress` → `gru:done` / `gru:failed`
 - No `claimed` intermediate state (goes directly to `in-progress`)
 - Detailed state (review, blocked, testing) in YAML comment events
 

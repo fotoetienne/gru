@@ -15,18 +15,23 @@ Gru uses git worktrees to isolate work for each Minion. The structure is:
 ├── repos/                           # Bare repository mirrors
 │   └── owner/
 │       └── repo.git/                # Bare clone (shared)
-├── work/                            # Active worktrees
+├── work/                            # Active Minion workspaces
 │   └── owner/
 │       └── repo/
-│           ├── M42/                 # Minion M42's worktree
-│           │   ├── .git             # Worktree metadata
-│           │   └── <repo files>
-│           └── M43/                 # Minion M43's worktree
+│           └── minion/
+│               ├── issue-42-M042/           # Minion M042's workspace
+│               │   ├── events.jsonl         # Stream events log
+│               │   └── checkout/            # Git worktree (repo files)
+│               │       ├── .git
+│               │       └── <repo files>
+│               └── issue-43-M043/           # Minion M043's workspace
 ```
 
 **Key concepts:**
 - **Bare repo**: Shared git repository at `~/.gru/repos/owner/repo.git/`
-- **Worktrees**: Individual working directories at `~/.gru/work/owner/repo/M{id}/`
+- **Minion dir**: Metadata directory at `~/.gru/work/owner/repo/minion/issue-<number>-<minion-id>/`
+- **Checkout path**: Actual git worktree at `minion_dir/checkout/`
+- **Branch naming**: `minion/issue-<number>-<minion-id>` (e.g., `minion/issue-42-M042`)
 - **One worktree per Minion**: Each Minion gets its own isolated workspace
 - **Shared object store**: All worktrees share the same git objects (efficient!)
 
@@ -55,13 +60,13 @@ When creating a new Minion workspace:
 # From the bare repo
 cd ~/.gru/repos/owner/repo.git
 
-# Create worktree for Minion M42 on branch 'gru/M42'
-git worktree add ~/.gru/work/owner/repo/M42 -b gru/M42
+# Create worktree for Minion M042 working on issue 42
+git worktree add ~/.gru/work/owner/repo/minion/issue-42-M042/checkout -b minion/issue-42-M042
 ```
 
 **Important:**
-- Worktree path: `~/.gru/work/owner/repo/{minion-id}/`
-- Branch naming: `gru/{minion-id}` or `gru/issue-{number}`
+- Worktree path: `~/.gru/work/owner/repo/minion/issue-<number>-<minion-id>/checkout/`
+- Branch naming: `minion/issue-<number>-<minion-id>`
 - Create from the bare repo directory
 
 ### 3. Remove a Worktree (Minion Cleanup)
@@ -71,11 +76,11 @@ When a Minion completes or is abandoned:
 ```bash
 # Option 1: Remove worktree (keeps branch)
 cd ~/.gru/repos/owner/repo.git
-git worktree remove ~/.gru/work/owner/repo/M42
+git worktree remove ~/.gru/work/owner/repo/minion/issue-42-M042/checkout
 
 # Option 2: Remove both worktree and branch
-git worktree remove ~/.gru/work/owner/repo/M42
-git branch -D gru/M42
+git worktree remove ~/.gru/work/owner/repo/minion/issue-42-M042/checkout
+git branch -D minion/issue-42-M042
 ```
 
 ### 4. Prune Stale Worktrees
@@ -95,10 +100,10 @@ To prevent accidental removal:
 
 ```bash
 # Lock (useful for active Minions)
-git worktree lock ~/.gru/work/owner/repo/M42
+git worktree lock ~/.gru/work/owner/repo/minion/issue-42-M042/checkout
 
 # Unlock
-git worktree unlock ~/.gru/work/owner/repo/M42
+git worktree unlock ~/.gru/work/owner/repo/minion/issue-42-M042/checkout
 ```
 
 ### 6. Repair Worktrees
@@ -106,7 +111,7 @@ git worktree unlock ~/.gru/work/owner/repo/M42
 If worktrees are moved or git metadata is corrupted:
 
 ```bash
-cd ~/.gru/work/owner/repo/M42
+cd ~/.gru/work/owner/repo/minion/issue-42-M042/checkout
 git worktree repair
 ```
 
@@ -123,7 +128,7 @@ git worktree repair
 2. Create worktree for Minion:
    ```bash
    cd ~/.gru/repos/owner/repo.git
-   git worktree add ~/.gru/work/owner/repo/{minion-id} -b gru/{minion-id}
+   git worktree add ~/.gru/work/owner/repo/minion/issue-{number}-{minion-id}/checkout -b minion/issue-{number}-{minion-id}
    ```
 
 ### When Minion Completes
@@ -131,13 +136,13 @@ git worktree repair
 1. Merge/push the branch from the worktree
 2. Remove the worktree:
    ```bash
-   git worktree remove ~/.gru/work/owner/repo/{minion-id}
+   git worktree remove ~/.gru/work/owner/repo/minion/issue-{number}-{minion-id}/checkout
    ```
 3. Optionally delete the branch after merging
 
 ### When Lab Restarts (Recovery)
 
-1. Enumerate tmux sessions to find active Minions
+1. Check Minion registry (`~/.gru/state/minions.json`) for active Minions
 2. Check which worktrees exist:
    ```bash
    git worktree list
@@ -156,11 +161,11 @@ The directory exists but isn't tracked by git:
 
 ```bash
 # Remove the directory
-rm -rf ~/.gru/work/owner/repo/M42
+rm -rf ~/.gru/work/owner/repo/minion/issue-42-M042/checkout
 
 # Recreate the worktree
 cd ~/.gru/repos/owner/repo.git
-git worktree add ~/.gru/work/owner/repo/M42 -b gru/M42
+git worktree add ~/.gru/work/owner/repo/minion/issue-42-M042/checkout -b minion/issue-42-M042
 ```
 
 ### "branch already exists"
@@ -169,10 +174,10 @@ Branch exists from a previous Minion:
 
 ```bash
 # Use existing branch
-git worktree add ~/.gru/work/owner/repo/M42 gru/M42
+git worktree add ~/.gru/work/owner/repo/minion/issue-42-M042/checkout minion/issue-42-M042
 
 # Or force create new branch
-git worktree add ~/.gru/work/owner/repo/M42 -B gru/M42
+git worktree add ~/.gru/work/owner/repo/minion/issue-42-M042/checkout -B minion/issue-42-M042
 ```
 
 ### "fatal: not a git repository"
@@ -196,7 +201,7 @@ git worktree list
 git worktree prune
 
 # Manually clean up orphaned directories
-rm -rf ~/.gru/work/owner/repo/M42
+rm -rf ~/.gru/work/owner/repo/minion/issue-42-M042
 ```
 
 ## Best Practices
@@ -205,7 +210,7 @@ rm -rf ~/.gru/work/owner/repo/M42
    - `cd ~/.gru/repos/owner/repo.git` first
 
 2. **Use consistent branch naming**
-   - `gru/{minion-id}` or `gru/issue-{number}`
+   - `minion/issue-<number>-<minion-id>` (e.g., `minion/issue-42-M042`)
 
 3. **Clean up completed worktrees promptly**
    - Prevents disk space waste

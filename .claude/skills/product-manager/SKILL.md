@@ -207,7 +207,7 @@ Users run agents on their machines, not in the cloud. This means:
 ### **GitHub as Database**
 Instead of adding PostgreSQL or Redis:
 - **Issues** are the task queue
-- **Labels** track state (`ready-for-minion`, `in-progress:M42`)
+- **Labels** track state (`gru:todo`, `gru:in-progress`)
 - **PRs** are results
 - **Comments** are logs and handoffs
 
