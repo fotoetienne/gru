@@ -396,7 +396,9 @@ pub async fn handle_clean(dry_run: bool, force: bool, base_branch: &str) -> Resu
                 // Git refuses to fetch into a ref checked out in a worktree, producing
                 // "fatal: refusing to fetch into branch '...' checked out at '...'".
                 // This is expected for active worktrees and not an error.
-                if !stderr.contains("refusing to fetch into branch '") {
+                if !(stderr.contains("refusing to fetch into branch")
+                    && stderr.contains("checked out at"))
+                {
                     log::warn!(
                         "Failed to fetch for {}: {}",
                         bare_repo.display(),

@@ -122,6 +122,11 @@ impl Worktree {
             .await
             .context("Failed to check remote branch")?;
 
+        if !output.status.success() {
+            // Be conservative on failure — assume branch still exists
+            return Ok(false);
+        }
+
         // If ls-remote returns empty, the branch doesn't exist on remote
         Ok(output.stdout.is_empty())
     }
