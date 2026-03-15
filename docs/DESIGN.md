@@ -787,11 +787,11 @@ Starting work on this issue. I'll create a draft PR shortly.
 ```rust
 // Add label
 // PUT /repos/{owner}/{repo}/issues/{issue_number}/labels
-// Body: ["claimed"]
+// Body: ["gru:in-progress"]
 
 // Replace all labels
 // PUT /repos/{owner}/{repo}/issues/{issue_number}/labels
-// Body: ["in-progress", "minion:M42"]
+// Body: ["gru:in-progress"]
 
 // Remove label
 // DELETE /repos/{owner}/{repo}/issues/{issue_number}/labels/{label}
@@ -893,7 +893,7 @@ headers.insert("If-Modified-Since", last_modified);
 ```rust
 async fn claim(&mut self, issue: Issue) -> Result<(), MinionError> {
     // 1. Add 'claimed' label
-    self.github.add_label(&issue, "claimed").await?;
+    self.github.add_label(&issue, "gru:in-progress").await?;
 
     // 2. Post claim comment
     let comment = format_claim_comment(&self.id, &self.lab_id);
@@ -917,7 +917,7 @@ async fn claim(&mut self, issue: Issue) -> Result<(), MinionError> {
     }
 
     // 5. Update label: claimed -> in-progress
-    self.github.replace_labels(&issue, &["in-progress"]).await?;
+    self.github.replace_labels(&issue, &["gru:in-progress"]).await?;
 
     Ok(())
 }
@@ -1049,7 +1049,7 @@ async fn handle_review(&mut self) -> Result<(), MinionError> {
 ```rust
 async fn complete(&mut self) -> Result<(), MinionError> {
     // Add done label
-    self.github.add_label(&self.issue, "minion:done").await?;
+    self.github.add_label(&self.issue, "gru:done").await?;
 
     // Post completion comment with metrics
     self.post_completion_comment().await?;
@@ -1140,7 +1140,7 @@ async fn reconcile_state(&self) -> Result<(), LabError> {
 
         // Resume or abandon based on state
         match actual_state.as_str() {
-            "in-progress" => {
+            "gru:in-progress" => {
                 let minion_clone = minion.clone();
                 tokio::spawn(async move {
                     minion_clone.resume().await;
@@ -1152,7 +1152,7 @@ async fn reconcile_state(&self) -> Result<(), LabError> {
                     minion_clone.monitor_review().await;
                 });
             }
-            "minion:done" | "minion:failed" => {
+            "gru:done" | "gru:failed" => {
                 minion.cleanup().await?;
             }
             _ => {}
@@ -1408,7 +1408,7 @@ async fn recover(&self) -> Result<(), LabError> {
             let issue = self.github.get_issue(minion.issue_number).await?;
             let labels = &issue.labels;
 
-            if has_label(labels, "in-progress") {
+            if has_label(labels, "gru:in-progress") {
                 // Still marked as in-progress on GitHub
                 // Try to resume or fail gracefully
                 if minion.can_resume() {

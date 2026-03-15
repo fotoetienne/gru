@@ -84,7 +84,7 @@ anyhow = "1"
 ### Core Principles
 
 1. **Single Lab assumption** - No distributed coordination needed initially
-2. **Simple labels for state** - `ready-for-minion`, `claimed`, `in-progress`, `minion:done`, `minion:failed`
+2. **Simple labels for state** - `gru:todo`, `gru:in-progress`, `gru:done`, `gru:failed`
 3. **Comments as event log** - GitHub timeline API provides complete audit trail
 4. **Early draft PR** - Create as soon as branch exists, provides natural lock mechanism
 5. **GitHub Actions for CI** - Delegate test execution to existing infrastructure
@@ -905,13 +905,16 @@ impl Agent for ClaudeCodeAdapter {
 ### Labels
 
 **Issue States:**
-- `ready-for-minion` - Issue is ready to be claimed
-- `claimed` - Lab has claimed but hasn't started work yet
-- `in-progress` - Minion actively working
-- `minion:done` - Completed successfully
-- `minion:failed` - Failed after retries
+- `gru:todo` - Issue is ready to be claimed
+- `gru:in-progress` - Minion actively working
+- `gru:done` - Completed successfully
+- `gru:failed` - Failed after retries
+- `gru:blocked` - Minion needs human help
+- `gru:ready-to-merge` - PR passes checks and is ready
+- `gru:auto-merge` - Auto-merge enabled on PR
+- `gru:needs-human-review` - PR requires human review before merge
 
-**Rationale:** Simple, visible in UI, easy to filter. Single-select enforcement not needed for single Lab.
+**Rationale:** Simple, visible in UI, easy to filter. The `gru:` prefix namespaces labels to avoid collisions with user labels.
 
 ### Event Log via Comments
 
@@ -1118,13 +1121,12 @@ When multi-Lab or advanced tracking needed:
 ## Simplified Lifecycle (V1)
 
 ### Issue Claim
-1. Poll GitHub for issues with `ready-for-minion` label
+1. Poll GitHub for issues with `gru:todo` label
 2. Select highest priority (manual priority label or oldest)
-3. Add `claimed` label
+3. Add `gru:in-progress` label, remove `gru:todo`
 4. Post structured claim comment with Minion ID, timestamp
 5. Create branch `minion/issue-123-M42`
 6. Create draft PR immediately
-7. Remove `ready-for-minion`, add `in-progress` label
 
 ### Minion Work Loop
 1. Read issue description and comments
@@ -1136,7 +1138,7 @@ When multi-Lab or advanced tracking needed:
 7. Wait for CI results
 8. **If CI passes** → continue or mark ready for review
 9. **If CI fails** → analyze logs, attempt fix, goto step 4
-10. **Max retries exceeded** → add `minion:failed` label, request human help
+10. **Max retries exceeded** → add `gru:failed` label, request human help
 
 ### PR Submission
 1. Convert draft PR to ready for review
@@ -1155,7 +1157,7 @@ When multi-Lab or advanced tracking needed:
    - **Unclear requests** → ask clarifying questions
    - **Complex refactors** → create handoff for human
 3. Monitor check runs for failures
-4. On merge → add `minion:done`, archive logs, cleanup worktree
+4. On merge → add `gru:done`, archive logs, cleanup worktree
 
 ---
 
@@ -1169,7 +1171,7 @@ When multi-Lab or advanced tracking needed:
 
 ### Escalation
 After exhausting retries:
-1. Add `minion:failed` label
+1. Add `gru:failed` label
 2. Post detailed failure report comment
 3. Tag human for assistance
 4. Park Minion in paused state (don't cleanup)
@@ -1327,35 +1329,15 @@ After exhausting retries:
 - Monotonic counter stored in `~/.gru/state/next_id.txt`
 
 **Branch management:**
-- Format: `<type>/issue<number>-<slug>-<minion-id>`
-- Examples: `feat/issue123-add-user-auth-M007`, `fix/issue456-memory-leak-M00a`
-- Type prefix derived from issue labels (bug→fix, enhancement→feat, documentation→docs, etc.)
-- Slug: first 4 words of issue title, lowercased, hyphenated
+- Format: `minion/issue-<number>-<minion-id>`
+- Examples: `minion/issue-123-M007`, `minion/issue-456-M00a`
 - Branches from repository default branch (main/master/develop, detected via API)
 - On PR merge: delete both local and remote branch
 
 **Branch naming logic:**
 ```rust
-fn generate_branch_name(issue: &Issue, minion_id: &str) -> String {
-    let type_prefix = match issue.labels.as_slice() {
-        labels if labels.contains(&"bug") => "fix",
-        labels if labels.contains(&"enhancement") => "feat",
-        labels if labels.contains(&"documentation") => "docs",
-        labels if labels.contains(&"refactor") => "refactor",
-        _ => "feat", // default
-    };
-    
-    let slug = issue.title
-        .to_lowercase()
-        .split_whitespace()
-        .take(4)
-        .collect::<Vec<_>>()
-        .join("-")
-        .chars()
-        .filter(|c| c.is_alphanumeric() || *c == '-')
-        .collect::<String>();
-    
-    format!("{}/issue{}-{}-{}", type_prefix, issue.number, slug, minion_id)
+fn generate_branch_name(issue_number: i32, minion_id: &str) -> String {
+    format!("minion/issue-{}-{}", issue_number, minion_id)
 }
 ```
 

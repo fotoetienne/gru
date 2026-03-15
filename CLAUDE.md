@@ -117,7 +117,7 @@ git commit --no-verify
 - `src/minion_resolver.rs` - Resolve Minion by ID, issue number, or PR number
 - `src/workspace.rs` - Manages `~/.gru/` directory structure (repos, work, archive, state)
 - `src/git.rs` - Git operations (bare repos, worktrees, branch management)
-- `src/claude_runner.rs` - Claude CLI subprocess spawning, stream monitoring, timeout/stuck detection
+- `src/claude_runner.rs` - Claude CLI command builders (constructs TokioCommand values for ClaudeBackend)
 - `src/stream.rs` - Claude Code JSON stream parser (events: message_start, content_block_delta, etc.)
 - `src/progress.rs` - Terminal progress display (spinner, tool status)
 - `src/ci.rs` - CI monitoring, failure analysis, and auto-fix via Claude
@@ -188,7 +188,7 @@ claude --print \
 - Built-in backends: Claude Code CLI (`claude_backend.rs`), OpenAI Codex CLI (`codex_backend.rs`)
 - `AgentRunner` provides backend-agnostic execution and monitoring
 
-**Timeout & Stuck Detection** (constants in `claude_runner.rs`):
+**Timeout & Stuck Detection** (constants in `agent_runner.rs`):
 - Stream timeout: 5 minutes per line (`STREAM_TIMEOUT_SECS = 300`)
 - Inactivity warning: 5 minutes (`INACTIVITY_WARNING_SECS = 300`)
 - Stuck threshold: 15 minutes (`INACTIVITY_STUCK_SECS = 900`)
