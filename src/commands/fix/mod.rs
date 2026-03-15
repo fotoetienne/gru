@@ -233,7 +233,10 @@ async fn run_worker(minion_id: &str, issue: &str, opts: FixOptions) -> Result<i3
                 .await;
                 return Ok(1);
             }
-            Err(e) => return Err(e),
+            Err(e) => {
+                update_orchestration_phase(&wt_ctx.minion_id, OrchestrationPhase::Failed).await;
+                return Err(e);
+            }
         }
     } else {
         println!("⏭️  Skipping agent session (already completed)");
@@ -260,22 +263,41 @@ async fn run_worker(minion_id: &str, issue: &str, opts: FixOptions) -> Result<i3
     // Phase 4: Create PR
     let pr_number = if start_phase <= OrchestrationPhase::CreatingPr {
         update_orchestration_phase(&wt_ctx.minion_id, OrchestrationPhase::CreatingPr).await;
-        handle_pr_creation(&issue_ctx, &wt_ctx).await?
+        match handle_pr_creation(&issue_ctx, &wt_ctx).await {
+            Ok(pr) => pr,
+            Err(e) => {
+                update_orchestration_phase(&wt_ctx.minion_id, OrchestrationPhase::Failed).await;
+                return Err(e);
+            }
+        }
     } else {
         println!("⏭️  Skipping PR creation (already completed)");
         let minion_id_owned = wt_ctx.minion_id.clone();
-        let existing_pr = with_registry(move |registry| {
+        let existing_pr = match with_registry(move |registry| {
             Ok(registry
                 .get(&minion_id_owned)
                 .and_then(|info| info.pr.clone()))
         })
-        .await?;
+        .await
+        {
+            Ok(pr) => pr,
+            Err(e) => {
+                update_orchestration_phase(&wt_ctx.minion_id, OrchestrationPhase::Failed).await;
+                return Err(e);
+            }
+        };
 
         if existing_pr.is_some() {
             existing_pr
         } else {
             log::info!("ℹ️  PR not found in registry, retrying PR creation");
-            handle_pr_creation(&issue_ctx, &wt_ctx).await?
+            match handle_pr_creation(&issue_ctx, &wt_ctx).await {
+                Ok(pr) => pr,
+                Err(e) => {
+                    update_orchestration_phase(&wt_ctx.minion_id, OrchestrationPhase::Failed).await;
+                    return Err(e);
+                }
+            }
         }
     };
 
@@ -351,6 +373,7 @@ async fn run_worker(minion_id: &str, issue: &str, opts: FixOptions) -> Result<i3
         Ok(true) => log::info!("✅ CI checks passed"),
         Ok(false) => {
             log::warn!("⚠️  CI checks failed or were escalated");
+            update_orchestration_phase(&wt_ctx.minion_id, OrchestrationPhase::Failed).await;
             try_mark_issue_blocked(
                 &issue_ctx.host,
                 &issue_ctx.owner,

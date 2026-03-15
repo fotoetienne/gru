@@ -258,7 +258,10 @@ pub async fn handle_resume(
             log::error!("🚨 {:#}", e);
             return Ok(1);
         }
-        Err(e) => return Err(e),
+        Err(e) => {
+            update_orchestration_phase(&minion.minion_id, OrchestrationPhase::Failed).await;
+            return Err(e);
+        }
     }
 
     // Phase: Create PR (handle_pr_creation checks if branch was pushed internally)
@@ -355,6 +358,7 @@ pub async fn handle_resume(
             Ok(true) => log::info!("✅ CI checks passed"),
             Ok(false) => {
                 log::warn!("⚠️  CI checks failed or were escalated");
+                update_orchestration_phase(&minion.minion_id, OrchestrationPhase::Failed).await;
                 try_mark_issue_blocked(
                     &issue_ctx.host,
                     &issue_ctx.owner,
