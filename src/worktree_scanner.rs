@@ -44,7 +44,7 @@ impl Worktree {
     /// and parses the number immediately after the prefix. This correctly handles
     /// branches like `minion/issue-42-M001` and avoids false positives on
     /// branches like `issue-fix-42`.
-    fn extract_issue_number(&self) -> Option<u32> {
+    pub(crate) fn extract_issue_number(&self) -> Option<u32> {
         self.branch.split('/').find_map(|segment| {
             segment
                 .strip_prefix("issue-")

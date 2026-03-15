@@ -71,9 +71,92 @@ fn extract_minion_id_from_dir(dir_name: &str) -> &str {
     }
 }
 
+/// Get the directory name that contains the minion ID, accounting for
+/// new-style layouts where the checkout is at `minion_dir/checkout/`.
+fn minion_dir_name(path: &Path) -> Option<&std::ffi::OsStr> {
+    if path.file_name().map(|n| n == "checkout").unwrap_or(false) {
+        path.parent().and_then(|p| p.file_name())
+    } else {
+        path.file_name()
+    }
+}
+
+/// Build a human-readable label like "M0pp (issue #393)" from a worktree.
+fn worktree_label(wt: &worktree_scanner::Worktree) -> String {
+    let lossy_name = minion_dir_name(&wt.path)
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "unknown".to_string());
+    let minion_id = extract_minion_id_from_dir(&lossy_name);
+    match wt.extract_issue_number() {
+        Some(num) => format!("{} (issue #{})", minion_id, num),
+        None => minion_id.to_string(),
+    }
+}
+
+/// Shorten a path by replacing the home directory prefix with `~`.
+fn shorten_path(path: &Path) -> String {
+    if let Some(home) = dirs::home_dir() {
+        if let Ok(suffix) = path.strip_prefix(&home) {
+            return format!("~/{}", suffix.display());
+        }
+    }
+    path.display().to_string()
+}
+
+/// File-change summary from `git status --porcelain` output.
+struct DirtySummary {
+    modified: usize,
+    untracked: usize,
+}
+
+impl std::fmt::Display for DirtySummary {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut parts = Vec::new();
+        if self.modified > 0 {
+            parts.push(format!("{} modified", self.modified));
+        }
+        if self.untracked > 0 {
+            parts.push(format!("{} untracked", self.untracked));
+        }
+        if parts.is_empty() {
+            write!(f, "no changes")
+        } else {
+            write!(f, "{}", parts.join(", "))
+        }
+    }
+}
+
+/// Count modified and untracked files from `git status --porcelain` output.
+fn count_dirty_files(porcelain_output: &str) -> DirtySummary {
+    let mut modified = 0usize;
+    let mut untracked = 0usize;
+    for line in porcelain_output.lines() {
+        if line.len() < 2 {
+            continue;
+        }
+        let status = &line[..2];
+        if status == "??" {
+            untracked += 1;
+        } else {
+            modified += 1;
+        }
+    }
+    DirtySummary {
+        modified,
+        untracked,
+    }
+}
+
+/// Result of checking worktree file status.
+struct WorktreeFileStatus {
+    has_modified: bool,
+    only_ephemeral: bool,
+    /// Raw `git status --porcelain` output for file counting.
+    porcelain: String,
+}
+
 /// Check if worktree contains only ephemeral files
-/// Returns (has_modified_files, only_ephemeral)
-async fn check_worktree_files(worktree_path: &Path) -> Result<(bool, bool)> {
+async fn check_worktree_files(worktree_path: &Path) -> Result<WorktreeFileStatus> {
     let output = Command::new("git")
         .arg("-C")
         .arg(worktree_path)
@@ -90,12 +173,15 @@ async fn check_worktree_files(worktree_path: &Path) -> Result<(bool, bool)> {
         );
     }
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
     let lines: Vec<&str> = stdout.lines().collect();
 
     if lines.is_empty() {
-        // No modified or untracked files
-        return Ok((false, true));
+        return Ok(WorktreeFileStatus {
+            has_modified: false,
+            only_ephemeral: true,
+            porcelain: stdout,
+        });
     }
 
     // Check if all modified/untracked files are ephemeral
@@ -139,7 +225,11 @@ async fn check_worktree_files(worktree_path: &Path) -> Result<(bool, bool)> {
         }
     }
 
-    Ok((true, !has_important_files))
+    Ok(WorktreeFileStatus {
+        has_modified: true,
+        only_ephemeral: !has_important_files,
+        porcelain: stdout,
+    })
 }
 
 /// Handles the clean command to remove merged/closed worktrees
@@ -349,7 +439,7 @@ pub async fn handle_clean(dry_run: bool, force: bool, base_branch: &str) -> Resu
             skipped_active_minions.len()
         );
         for wt in &skipped_active_minions {
-            println!("  {} (active minion)", wt.path.display());
+            println!("  {} (active minion)", worktree_label(wt));
             println!("    Branch: {}", wt.branch);
             println!("    Repo: {}", wt.repo);
             println!();
@@ -363,7 +453,7 @@ pub async fn handle_clean(dry_run: bool, force: bool, base_branch: &str) -> Resu
             skipped_open_prs.len()
         );
         for wt in &skipped_open_prs {
-            println!("  {} (open PR)", wt.path.display());
+            println!("  {} (open PR)", worktree_label(wt));
             println!("    Branch: {}", wt.branch);
             println!("    Repo: {}", wt.repo);
             println!();
@@ -396,19 +486,20 @@ pub async fn handle_clean(dry_run: bool, force: bool, base_branch: &str) -> Resu
                     unreachable!("Active worktree should not be in cleanable list")
                 }
             };
-            println!("  {} ({})", wt.path.display(), reason);
+            println!("  {} ({})", worktree_label(wt), reason);
             println!("    Branch: {}", wt.branch);
             println!("    Repo: {}", wt.repo);
 
             // Check worktree dirty status to inform user what will happen
             match check_worktree_files(&wt.path).await {
-                Ok((has_modified, only_ephemeral)) => {
-                    if !has_modified {
+                Ok(file_status) => {
+                    if !file_status.has_modified {
                         println!("    Status: clean");
-                    } else if only_ephemeral {
+                    } else if file_status.only_ephemeral {
                         println!("    Status: dirty (ephemeral files only - will auto-force)");
                     } else {
-                        println!("    Status: dirty (important files - requires --force)");
+                        let summary = count_dirty_files(&file_status.porcelain);
+                        println!("    Status: dirty ({} - requires --force)", summary);
                     }
                 }
                 Err(_) => {
@@ -457,6 +548,7 @@ pub async fn handle_clean(dry_run: bool, force: bool, base_branch: &str) -> Resu
     println!("\nRemoving worktrees...");
     let mut removed = 0;
     let mut failed = 0;
+    let mut skipped = 0;
     // Collect minion IDs to remove from registry in a single batch
     let mut registry_ids_to_remove: Vec<String> = Vec::new();
     // Collect worktree paths for fallback registry matching.
@@ -465,7 +557,8 @@ pub async fn handle_clean(dry_run: bool, force: bool, base_branch: &str) -> Resu
     let mut registry_paths_to_remove: HashSet<PathBuf> = HashSet::new();
 
     for (wt, _) in cleanable {
-        print!("Removing {}... ", wt.path.display());
+        let label = worktree_label(&wt);
+        print!("Removing {}... ", label);
         std::io::stdout().flush()?;
 
         // Capture paths before removal for fallback registry matching.
@@ -493,7 +586,7 @@ pub async fn handle_clean(dry_run: bool, force: bool, base_branch: &str) -> Resu
         };
 
         // Check if worktree has modified/untracked files
-        let (has_modified, only_ephemeral) = match check_worktree_files(&wt.path).await {
+        let file_status = match check_worktree_files(&wt.path).await {
             Ok(result) => result,
             Err(e) => {
                 println!("✗");
@@ -502,6 +595,8 @@ pub async fn handle_clean(dry_run: bool, force: bool, base_branch: &str) -> Resu
                 continue;
             }
         };
+        let has_modified = file_status.has_modified;
+        let only_ephemeral = file_status.only_ephemeral;
 
         // Decide whether to use --force flag
         // If user specified --force, use it; otherwise auto-force if only ephemeral files
@@ -594,18 +689,7 @@ pub async fn handle_clean(dry_run: bool, force: bool, base_branch: &str) -> Resu
             // Queue minion ID for batch registry removal.
             // Directory names follow the branch convention: "issue-<number>-<minion_id>"
             // (e.g., "issue-387-M0pf"), but registry keys are just the minion ID ("M0pf").
-            // Extract the minion ID suffix from the directory name.
-            let dir_for_id = if wt
-                .path
-                .file_name()
-                .map(|n| n == "checkout")
-                .unwrap_or(false)
-            {
-                wt.path.parent().and_then(|p| p.file_name())
-            } else {
-                wt.path.file_name()
-            };
-            if let Some(dir_name) = dir_for_id {
+            if let Some(dir_name) = minion_dir_name(&wt.path) {
                 if let Some(dir_str) = dir_name.to_str() {
                     let minion_id = extract_minion_id_from_dir(dir_str);
                     registry_ids_to_remove.push(minion_id.to_string());
@@ -614,20 +698,27 @@ pub async fn handle_clean(dry_run: bool, force: bool, base_branch: &str) -> Resu
             // Also record paths for fallback matching
             registry_paths_to_remove.extend(paths_for_fallback);
         } else {
-            println!("✗");
             let stderr = String::from_utf8_lossy(&status.stderr);
-            log::error!("  Error: {}", stderr);
 
-            // If removal failed due to important files, provide helpful message
+            // Dirty worktree: show user-friendly "skipped" instead of raw git error
             if has_modified
                 && !only_ephemeral
                 && stderr.contains("contains modified or untracked files")
             {
-                log::warn!("  Worktree contains important uncommitted changes.");
-                log::warn!("  Run 'gru clean --force' or manually clean the worktree first.");
-            }
+                let summary = count_dirty_files(&file_status.porcelain);
+                println!("skipped");
 
-            failed += 1;
+                let cd_path = shorten_path(&wt.path);
+                println!("  ⚠ Worktree has uncommitted changes ({})", summary);
+                println!("    Use 'gru clean --force' to remove anyway, or inspect with:");
+                println!("    cd {}", cd_path);
+                skipped += 1;
+            } else {
+                // Actual error (not a dirty-worktree skip)
+                println!("✗");
+                log::error!("  Error: {}", stderr.trim());
+                failed += 1;
+            }
         }
     }
 
@@ -716,7 +807,14 @@ pub async fn handle_clean(dry_run: bool, force: bool, base_branch: &str) -> Resu
         }
     }
 
-    println!("\nSummary: {} removed, {} failed", removed, failed);
+    print!("\nSummary: {} removed", removed);
+    if skipped > 0 {
+        print!(", {} skipped (dirty)", skipped);
+    }
+    if failed > 0 {
+        print!(", {} failed", failed);
+    }
+    println!();
 
     Ok(if failed > 0 { 1 } else { 0 })
 }
@@ -865,5 +963,49 @@ mod tests {
             extract_minion_id_from_dir("some-other-dir"),
             "some-other-dir"
         );
+    }
+
+    // --- count_dirty_files tests ---
+
+    #[test]
+    fn test_count_dirty_files_mixed() {
+        let porcelain = " M src/main.rs\n?? new_file.txt\n M src/lib.rs\n";
+        let summary = count_dirty_files(porcelain);
+        assert_eq!(summary.modified, 2);
+        assert_eq!(summary.untracked, 1);
+        assert_eq!(format!("{}", summary), "2 modified, 1 untracked");
+    }
+
+    #[test]
+    fn test_count_dirty_files_only_untracked() {
+        let porcelain = "?? file1.txt\n?? file2.txt\n";
+        let summary = count_dirty_files(porcelain);
+        assert_eq!(summary.modified, 0);
+        assert_eq!(summary.untracked, 2);
+        assert_eq!(format!("{}", summary), "2 untracked");
+    }
+
+    #[test]
+    fn test_count_dirty_files_empty() {
+        let summary = count_dirty_files("");
+        assert_eq!(summary.modified, 0);
+        assert_eq!(summary.untracked, 0);
+        assert_eq!(format!("{}", summary), "no changes");
+    }
+
+    // --- shorten_path tests ---
+
+    #[test]
+    fn test_shorten_path_with_home() {
+        if let Some(home) = dirs::home_dir() {
+            let full = home.join("some/path");
+            assert_eq!(shorten_path(&full), "~/some/path");
+        }
+    }
+
+    #[test]
+    fn test_shorten_path_no_home_prefix() {
+        let path = Path::new("/tmp/some/path");
+        assert_eq!(shorten_path(path), "/tmp/some/path");
     }
 }
