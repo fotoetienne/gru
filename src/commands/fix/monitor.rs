@@ -182,7 +182,7 @@ async fn trigger_pr_review(
 
 /// Monitors a PR for reviews, CI failures, and merge/close events.
 /// Handles automatic review rounds up to MAX_REVIEW_ROUNDS.
-pub(super) async fn monitor_pr_lifecycle(
+pub(crate) async fn monitor_pr_lifecycle(
     backend: &dyn AgentBackend,
     issue_ctx: &IssueContext,
     wt_ctx: &WorktreeContext,
@@ -659,7 +659,7 @@ pub(super) async fn monitor_pr_lifecycle(
 
 /// Monitors CI after the initial fix and attempts auto-fixes if checks fail.
 /// Returns Ok(true) if CI passed, Ok(false) if escalated/failed.
-pub(super) async fn monitor_ci_after_fix(
+pub(crate) async fn monitor_ci_after_fix(
     host: &str,
     owner: &str,
     repo: &str,
