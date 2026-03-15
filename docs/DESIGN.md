@@ -892,7 +892,7 @@ headers.insert("If-Modified-Since", last_modified);
 
 ```rust
 async fn claim(&mut self, issue: Issue) -> Result<(), MinionError> {
-    // 1. Add 'claimed' label
+    // 1. Add 'gru:in-progress' label
     self.github.add_label(&issue, "gru:in-progress").await?;
 
     // 2. Post claim comment
@@ -916,8 +916,8 @@ async fn claim(&mut self, issue: Issue) -> Result<(), MinionError> {
         Err(e) => return Err(e.into()),
     }
 
-    // 5. Update label: claimed -> in-progress
-    self.github.replace_labels(&issue, &["gru:in-progress"]).await?;
+    // 5. Remove 'gru:todo' label
+    self.github.remove_label(&issue, "gru:todo").await?;
 
     Ok(())
 }
@@ -1349,7 +1349,7 @@ async fn escalate(&mut self, reason: &str) -> Result<(), MinionError> {
     self.db.update_minion(self).await?;
 
     // Add label
-    self.github.add_label(&self.issue, "minion:blocked").await?;
+    self.github.add_label(&self.issue, "gru:blocked").await?;
 
     // Post escalation comment
     let comment = format!(
