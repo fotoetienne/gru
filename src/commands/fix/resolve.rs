@@ -1,5 +1,5 @@
 use super::types::{ExistingMinionCheck, IssueContext, IssueDetails};
-use crate::minion_registry::{is_process_alive, with_registry, MinionMode, OrchestrationPhase};
+use crate::minion_registry::{is_process_alive, with_registry, MinionMode};
 use crate::url_utils::parse_issue_info;
 use anyhow::{Context, Result};
 
@@ -94,13 +94,10 @@ pub(super) async fn check_existing_minions(
     }
 
     // All minions are stopped - find the best candidate for resume.
-    // Look for one that hasn't completed/failed and whose worktree still exists.
-    let resumable = existing.iter().find(|(_, info)| {
-        !matches!(
-            info.orchestration_phase,
-            OrchestrationPhase::Completed | OrchestrationPhase::Failed
-        ) && info.worktree.exists()
-    });
+    // Look for one that isn't in a terminal state and whose worktree still exists.
+    let resumable = existing
+        .iter()
+        .find(|(_, info)| !info.orchestration_phase.is_terminal() && info.worktree.exists());
 
     if let Some((minion_id, info)) = resumable {
         return Ok(ExistingMinionCheck::Resumable(
@@ -109,28 +106,9 @@ pub(super) async fn check_existing_minions(
         ));
     }
 
-    // Check if any minion failed — require --force-new to prevent silent retry
-    let has_failed = existing
-        .iter()
-        .any(|(_, info)| matches!(info.orchestration_phase, OrchestrationPhase::Failed));
-
-    if has_failed {
-        let (failed_id, _) = existing
-            .iter()
-            .find(|(_, info)| matches!(info.orchestration_phase, OrchestrationPhase::Failed))
-            .unwrap();
-        eprintln!(
-            "Error: Minion {} previously failed for issue {}.",
-            failed_id, issue_num
-        );
-        eprintln!("\nOptions:");
-        eprintln!(
-            "  - Create new session:   gru do https://github.com/{}/{}/issues/{} --force-new",
-            owner, repo, issue_num
-        );
-        return Ok(ExistingMinionCheck::AlreadyRunning);
-    }
-
+    // All existing minions are in terminal states (Failed/Completed) — allow a
+    // fresh attempt. This lets Lab automatically retry failed issues without
+    // requiring --force-new, while still blocking when a non-terminal minion exists.
     Ok(ExistingMinionCheck::None)
 }
 

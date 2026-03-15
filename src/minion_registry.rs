@@ -130,6 +130,15 @@ impl OrchestrationPhase {
                 | OrchestrationPhase::MonitoringPr
         )
     }
+
+    /// Returns true if this phase is a terminal state (Completed or Failed).
+    /// Minions in terminal states do not block new attempts for the same issue.
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self,
+            OrchestrationPhase::Completed | OrchestrationPhase::Failed
+        )
+    }
 }
 
 /// Generates a default session ID for backwards compatibility
@@ -1024,6 +1033,16 @@ mod tests {
         assert!(OrchestrationPhase::MonitoringPr.is_active());
         assert!(!OrchestrationPhase::Completed.is_active());
         assert!(!OrchestrationPhase::Failed.is_active());
+    }
+
+    #[test]
+    fn test_orchestration_phase_is_terminal() {
+        assert!(!OrchestrationPhase::Setup.is_terminal());
+        assert!(!OrchestrationPhase::RunningAgent.is_terminal());
+        assert!(!OrchestrationPhase::CreatingPr.is_terminal());
+        assert!(!OrchestrationPhase::MonitoringPr.is_terminal());
+        assert!(OrchestrationPhase::Completed.is_terminal());
+        assert!(OrchestrationPhase::Failed.is_terminal());
     }
 
     #[test]
