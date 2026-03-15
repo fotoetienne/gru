@@ -375,8 +375,11 @@ pub async fn handle_clean(dry_run: bool, force: bool, base_branch: &str) -> Resu
         .map(|wt| wt.path.canonicalize().unwrap_or_else(|_| wt.path.clone()))
         .collect();
 
-    // Fetch once per bare repo so that check_merged() has up-to-date refs.
-    // This replaces the per-worktree fetch that was previously in check_remote_deleted().
+    // Fetch once per bare repo to update remote-tracking refs for check_merged().
+    // check_remote_deleted() uses git ls-remote (a live query) so doesn't need this,
+    // but check_merged() compares against local refs which must be up-to-date.
+    // If fetch fails, subsequent checks proceed with potentially stale refs — this is
+    // intentionally conservative (no worktrees are incorrectly cleaned).
     let bare_repos: HashSet<_> = worktrees
         .iter()
         .map(|wt| wt.bare_repo_path.clone())
@@ -390,9 +393,10 @@ pub async fn handle_clean(dry_run: bool, force: bool, base_branch: &str) -> Resu
         match fetch_output {
             Ok(result) if !result.status.success() => {
                 let stderr = String::from_utf8_lossy(&result.stderr);
-                // Suppress "refusing to fetch into branch" warnings for checked-out branches.
+                // Git refuses to fetch into a ref checked out in a worktree, producing
+                // "fatal: refusing to fetch into branch '...' checked out at '...'".
                 // This is expected for active worktrees and not an error.
-                if !stderr.contains("refusing to fetch into branch") {
+                if !stderr.contains("refusing to fetch into branch '") {
                     log::warn!(
                         "Failed to fetch for {}: {}",
                         bare_repo.display(),
