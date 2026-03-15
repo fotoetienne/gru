@@ -697,7 +697,17 @@ async fn register_and_run_agent(
     };
     let progress = std::sync::Arc::new(ProgressDisplay::new(config));
 
-    let mut cmd = backend.build_command(&ws.run_dir, cfg.session_id, cfg.rendered_prompt);
+    let github_host = fetched
+        .host
+        .as_deref()
+        .or(fetched.pr_host.as_deref())
+        .unwrap_or("github.com");
+    let mut cmd = backend.build_command(
+        &ws.run_dir,
+        cfg.session_id,
+        cfg.rendered_prompt,
+        github_host,
+    );
     cmd.env("GRU_WORKSPACE", cfg.minion_id);
 
     // Record child PID on spawn; mode is already set to Autonomous at registration.

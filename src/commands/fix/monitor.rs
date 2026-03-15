@@ -474,6 +474,7 @@ pub(crate) async fn monitor_pr_lifecycle(
                     &wt_ctx.session_id,
                     &review_prompt,
                     timeout_opt,
+                    &issue_ctx.host,
                 )
                 .await
                 {

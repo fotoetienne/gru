@@ -133,8 +133,14 @@ impl AgentBackend for ClaudeBackend {
         "claude-code"
     }
 
-    fn build_command(&self, worktree_path: &Path, session_id: &Uuid, prompt: &str) -> TokioCommand {
-        claude_runner::build_claude_command(worktree_path, session_id, prompt)
+    fn build_command(
+        &self,
+        worktree_path: &Path,
+        session_id: &Uuid,
+        prompt: &str,
+        github_host: &str,
+    ) -> TokioCommand {
+        claude_runner::build_claude_command(worktree_path, session_id, prompt, github_host)
     }
 
     fn parse_events(&self, line: &str) -> Vec<AgentEvent> {
@@ -164,11 +170,13 @@ impl AgentBackend for ClaudeBackend {
         worktree_path: &Path,
         session_id: &Uuid,
         prompt: &str,
+        github_host: &str,
     ) -> Option<TokioCommand> {
         Some(claude_runner::build_claude_resume_command(
             worktree_path,
             session_id,
             prompt,
+            github_host,
         ))
     }
 
@@ -176,6 +184,7 @@ impl AgentBackend for ClaudeBackend {
         &self,
         worktree_path: &Path,
         session_id: &Uuid,
+        github_host: &str,
     ) -> Option<TokioCommand> {
         let mut cmd = TokioCommand::new("claude");
         cmd.arg("--resume")
@@ -183,7 +192,8 @@ impl AgentBackend for ClaudeBackend {
             .current_dir(worktree_path)
             .stdin(std::process::Stdio::inherit())
             .stdout(std::process::Stdio::inherit())
-            .stderr(std::process::Stdio::inherit());
+            .stderr(std::process::Stdio::inherit())
+            .env("GH_HOST", github_host);
         Some(cmd)
     }
 }
@@ -317,7 +327,7 @@ mod tests {
         let b = backend();
         let path = std::path::PathBuf::from("/tmp/worktree");
         let session_id = Uuid::nil();
-        let cmd = b.build_command(&path, &session_id, "fix the bug");
+        let cmd = b.build_command(&path, &session_id, "fix the bug", "github.com");
         let inner = cmd.as_std();
 
         assert_eq!(inner.get_program(), "claude");
@@ -332,6 +342,30 @@ mod tests {
         assert!(args.contains(&"fix the bug".as_ref()));
         assert_eq!(*args.last().unwrap(), std::ffi::OsStr::new("fix the bug"));
         assert!(!args.contains(&"--resume".as_ref()));
+
+        // Verify GH_HOST is set
+        let envs: Vec<_> = inner.get_envs().collect();
+        assert!(
+            envs.iter()
+                .any(|(k, v)| *k == "GH_HOST" && *v == Some("github.com".as_ref())),
+            "GH_HOST should be set on the command"
+        );
+    }
+
+    #[test]
+    fn test_build_command_sets_ghe_host() {
+        let b = backend();
+        let path = std::path::PathBuf::from("/tmp/worktree");
+        let session_id = Uuid::nil();
+        let cmd = b.build_command(&path, &session_id, "fix the bug", "github.example.com");
+        let inner = cmd.as_std();
+
+        let envs: Vec<_> = inner.get_envs().collect();
+        assert!(
+            envs.iter()
+                .any(|(k, v)| *k == "GH_HOST" && *v == Some("github.example.com".as_ref())),
+            "GH_HOST should be set to the GHE host"
+        );
     }
 
     #[test]
@@ -340,7 +374,7 @@ mod tests {
         let path = std::path::PathBuf::from("/tmp/worktree");
         let session_id = Uuid::nil();
         let cmd = b
-            .build_resume_command(&path, &session_id, "continue")
+            .build_resume_command(&path, &session_id, "continue", "github.com")
             .expect("resume should be supported");
         let inner = cmd.as_std();
 
@@ -354,7 +388,9 @@ mod tests {
         let b = backend();
         let path = std::path::PathBuf::from("/tmp");
         let id = Uuid::nil();
-        assert!(b.build_resume_command(&path, &id, "p").is_some());
+        assert!(b
+            .build_resume_command(&path, &id, "p", "github.com")
+            .is_some());
     }
 
     #[test]
@@ -363,7 +399,7 @@ mod tests {
         let path = std::path::PathBuf::from("/tmp/worktree");
         let session_id = Uuid::nil();
         let cmd = b
-            .build_interactive_resume_command(&path, &session_id)
+            .build_interactive_resume_command(&path, &session_id, "github.com")
             .expect("interactive resume should be supported");
         let inner = cmd.as_std();
 

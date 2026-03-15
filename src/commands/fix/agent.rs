@@ -81,7 +81,12 @@ pub(super) async fn run_agent_session(
 ) -> Result<AgentResult> {
     println!("🤖 Launching {}...\n", backend.name());
     let prompt = build_fix_prompt(issue_ctx, wt_ctx);
-    let mut cmd = backend.build_command(&wt_ctx.checkout_path, &wt_ctx.session_id, &prompt);
+    let mut cmd = backend.build_command(
+        &wt_ctx.checkout_path,
+        &wt_ctx.session_id,
+        &prompt,
+        &issue_ctx.host,
+    );
     cmd.env("GRU_WORKSPACE", &wt_ctx.minion_id);
     run_agent_session_inner(backend, issue_ctx, wt_ctx, cmd, quiet, timeout_opt).await
 }
@@ -103,7 +108,12 @@ pub(super) async fn resume_agent_session(
         issue_ctx.issue_num
     );
     let mut cmd = backend
-        .build_resume_command(&wt_ctx.checkout_path, &wt_ctx.session_id, &prompt)
+        .build_resume_command(
+            &wt_ctx.checkout_path,
+            &wt_ctx.session_id,
+            &prompt,
+            &issue_ctx.host,
+        )
         .context("Agent backend does not support resume")?;
     cmd.env("GRU_WORKSPACE", &wt_ctx.minion_id);
     run_agent_session_inner(backend, issue_ctx, wt_ctx, cmd, quiet, timeout_opt).await
@@ -273,9 +283,10 @@ pub(super) async fn invoke_agent_for_reviews(
     session_id: &Uuid,
     prompt: &str,
     timeout_opt: Option<&str>,
+    github_host: &str,
 ) -> Result<()> {
     let cmd = backend
-        .build_resume_command(checkout_path, session_id, prompt)
+        .build_resume_command(checkout_path, session_id, prompt, github_host)
         .context("Agent backend does not support resume")?;
 
     let result = run_agent_with_stream_monitoring(

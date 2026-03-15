@@ -227,6 +227,7 @@ pub async fn handle_resume(
         quiet,
         effective_timeout.as_deref(),
         issue_num,
+        &issue_ctx.host,
     )
     .await;
 
@@ -374,7 +375,10 @@ pub async fn handle_resume(
 
 /// Resolve the GitHub host for a worktree by inspecting its git remote.
 /// Falls back to config-based `infer_github_host` if the remote can't be parsed.
-async fn resolve_host_from_worktree(checkout_path: &std::path::Path, owner: &str) -> String {
+pub(crate) async fn resolve_host_from_worktree(
+    checkout_path: &std::path::Path,
+    owner: &str,
+) -> String {
     let github_hosts = crate::config::load_host_registry().all_hosts();
 
     // Try to get the host from the worktree's git remote
@@ -408,9 +412,15 @@ async fn run_autonomous_agent(
     quiet: bool,
     timeout_opt: Option<&str>,
     issue_num: u64,
+    github_host: &str,
 ) -> Result<std::process::ExitStatus> {
     let mut cmd = backend
-        .build_resume_command(&wt_ctx.checkout_path, &wt_ctx.session_id, prompt)
+        .build_resume_command(
+            &wt_ctx.checkout_path,
+            &wt_ctx.session_id,
+            prompt,
+            github_host,
+        )
         .context("Agent backend does not support resume")?;
     cmd.env("GRU_WORKSPACE", &wt_ctx.minion_id);
 
