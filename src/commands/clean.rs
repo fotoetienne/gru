@@ -83,10 +83,10 @@ fn minion_dir_name(path: &Path) -> Option<&std::ffi::OsStr> {
 
 /// Build a human-readable label like "M0pp (issue #393)" from a worktree.
 fn worktree_label(wt: &worktree_scanner::Worktree) -> String {
-    let minion_id = minion_dir_name(&wt.path)
-        .and_then(|n| n.to_str())
-        .map(extract_minion_id_from_dir)
-        .unwrap_or("unknown");
+    let lossy_name = minion_dir_name(&wt.path)
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "unknown".to_string());
+    let minion_id = extract_minion_id_from_dir(&lossy_name);
     match wt.extract_issue_number() {
         Some(num) => format!("{} (issue #{})", minion_id, num),
         None => minion_id.to_string(),
@@ -548,6 +548,7 @@ pub async fn handle_clean(dry_run: bool, force: bool, base_branch: &str) -> Resu
     println!("\nRemoving worktrees...");
     let mut removed = 0;
     let mut failed = 0;
+    let mut skipped = 0;
     // Collect minion IDs to remove from registry in a single batch
     let mut registry_ids_to_remove: Vec<String> = Vec::new();
     // Collect worktree paths for fallback registry matching.
@@ -711,13 +712,13 @@ pub async fn handle_clean(dry_run: bool, force: bool, base_branch: &str) -> Resu
                 println!("  ⚠ Worktree has uncommitted changes ({})", summary);
                 println!("    Use 'gru clean --force' to remove anyway, or inspect with:");
                 println!("    cd {}", cd_path);
+                skipped += 1;
             } else {
                 // Actual error (not a dirty-worktree skip)
                 println!("✗");
                 log::error!("  Error: {}", stderr.trim());
+                failed += 1;
             }
-
-            failed += 1;
         }
     }
 
@@ -806,7 +807,14 @@ pub async fn handle_clean(dry_run: bool, force: bool, base_branch: &str) -> Resu
         }
     }
 
-    println!("\nSummary: {} removed, {} failed", removed, failed);
+    print!("\nSummary: {} removed", removed);
+    if skipped > 0 {
+        print!(", {} skipped (dirty)", skipped);
+    }
+    if failed > 0 {
+        print!(", {} failed", failed);
+    }
+    println!();
 
     Ok(if failed > 0 { 1 } else { 0 })
 }
