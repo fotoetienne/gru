@@ -68,13 +68,19 @@ pub async fn handle_lab(
     // Track child processes for graceful shutdown
     let mut children: Vec<Child> = Vec::new();
 
+    // Safety net: track Minion IDs we've already attempted to resume this session
+    // to prevent resume loops even if phase updates are missed.
+    let mut resumed_this_session: HashSet<String> = HashSet::new();
+
     if no_resume {
         println!("⏭️  Auto-resume disabled (--no-resume)");
         println!();
     }
 
     // Perform initial poll immediately for faster feedback
-    if let Err(e) = poll_and_spawn(&config, &mut children, no_resume).await {
+    if let Err(e) =
+        poll_and_spawn(&config, &mut children, no_resume, &mut resumed_this_session).await
+    {
         log::warn!("⚠️  Initial polling error: {}", e);
         log::warn!("   Continuing to poll...");
     }
@@ -91,7 +97,7 @@ pub async fn handle_lab(
                 // Clean up finished child processes
                 reap_children(&mut children);
 
-                if let Err(e) = poll_and_spawn(&config, &mut children, no_resume).await {
+                if let Err(e) = poll_and_spawn(&config, &mut children, no_resume, &mut resumed_this_session).await {
                     log::warn!("⚠️  Polling error: {}", e);
                     log::warn!("   Continuing to poll...");
                 }
@@ -288,6 +294,7 @@ async fn resume_interrupted_minions(
     children: &mut Vec<Child>,
     available: &mut usize,
     max_attempts: u32,
+    resumed_this_session: &mut HashSet<String>,
 ) -> Result<usize> {
     if *available == 0 {
         return Ok(0);
@@ -308,6 +315,17 @@ async fn resume_interrupted_minions(
     for candidate in resumable {
         if *available == 0 {
             break;
+        }
+
+        // Skip minions already attempted this session (defense-in-depth against resume loops)
+        if resumed_this_session.contains(&candidate.minion_id) {
+            log::warn!(
+                "⏭️  Skipping {} (issue #{}, {}): already resumed this session",
+                candidate.minion_id,
+                candidate.info.issue,
+                candidate.info.repo,
+            );
+            continue;
         }
 
         let host = match host_for_repo(config, &candidate.info.repo) {
@@ -355,6 +373,9 @@ async fn resume_interrupted_minions(
             candidate.info.repo,
             candidate.info.orchestration_phase,
         );
+
+        // Record this minion as attempted regardless of outcome
+        resumed_this_session.insert(candidate.minion_id.clone());
 
         match spawn_minion(&candidate.info.repo, &host, candidate.info.issue).await {
             Ok(child) => {
@@ -405,6 +426,7 @@ async fn poll_and_spawn(
     config: &LabConfig,
     children: &mut Vec<Child>,
     no_resume: bool,
+    resumed_this_session: &mut HashSet<String>,
 ) -> Result<()> {
     // Prune stale registry entries (worktrees that no longer exist)
     prune_stale_entries().await?;
@@ -422,7 +444,14 @@ async fn poll_and_spawn(
     let resumed = if no_resume {
         0
     } else {
-        resume_interrupted_minions(config, children, &mut available, max_attempts).await?
+        resume_interrupted_minions(
+            config,
+            children,
+            &mut available,
+            max_attempts,
+            resumed_this_session,
+        )
+        .await?
     };
     let mut spawned = resumed;
 
