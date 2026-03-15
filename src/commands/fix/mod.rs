@@ -24,6 +24,7 @@ use crate::agent_registry;
 use crate::agent_runner::{is_stuck_or_timeout_error, parse_timeout, EXIT_CODE_SIGNAL_TERMINATED};
 use crate::minion_registry::{with_registry, MinionMode, OrchestrationPhase};
 use crate::pr_monitor;
+use crate::tmux::TmuxGuard;
 use anyhow::{Context, Result};
 use chrono::Utc;
 use std::path::Path;
@@ -477,6 +478,12 @@ pub async fn handle_fix(issue: &str, opts: FixOptions) -> Result<i32> {
             ExistingMinionCheck::AlreadyRunning => return Ok(1),
         }
     };
+
+    // Rename tmux window now that we know we're proceeding and have the Minion ID
+    let _tmux_guard = TmuxGuard::new(&format!(
+        "gru:{}:#{}",
+        wt_ctx.minion_id, issue_ctx.issue_num
+    ));
 
     // Claim the issue on fresh starts (skip on resume — already claimed)
     if is_fresh {

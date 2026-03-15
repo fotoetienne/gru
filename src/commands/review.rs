@@ -12,6 +12,7 @@ use crate::pr_state::PrState;
 use crate::progress::{ProgressConfig, ProgressDisplay};
 use crate::prompt_loader;
 use crate::prompt_renderer::{render_template, PromptContext};
+use crate::tmux::TmuxGuard;
 use crate::url_utils::parse_pr_info;
 use crate::workspace;
 use anyhow::{Context, Result};
@@ -31,6 +32,9 @@ pub async fn handle_review(pr_arg: Option<String>, agent_name: &str) -> Result<i
         None => resolve_pr_from_current_worktree().await?,
         Some(arg) => resolve_pr_from_arg(&arg).await?,
     };
+
+    // Rename tmux window for the review
+    let _tmux_guard = TmuxGuard::new(&format!("gru:review:#{}", pr_num));
 
     println!(
         "🔍 Setting up workspace for {}/{}#{} (branch: {})",

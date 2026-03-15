@@ -2,6 +2,7 @@ use crate::agent_registry;
 use crate::minion_registry::{revert_to_stopped, with_registry, MinionMode};
 use crate::minion_resolver;
 use crate::session_claim;
+use crate::tmux::TmuxGuard;
 use anyhow::{Context, Result};
 use chrono::Utc;
 use std::process::Stdio;
@@ -81,6 +82,9 @@ pub async fn handle_attach(
             ));
         }
     };
+
+    // Rename tmux window for the attach session
+    let _tmux_guard = TmuxGuard::new(&format!("gru:{}", minion.minion_id));
 
     println!("🔌 Attaching to Minion {}...", minion.minion_id);
     if yolo {
