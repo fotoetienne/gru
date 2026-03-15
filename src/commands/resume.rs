@@ -270,8 +270,8 @@ pub async fn handle_resume(
     let pr_number = match handle_pr_creation(&issue_ctx, &wt_ctx).await {
         Ok(pr) => pr,
         Err(e) => {
-            log::warn!("⚠️  PR creation failed: {}", e);
-            None
+            update_orchestration_phase(&minion.minion_id, OrchestrationPhase::Failed).await;
+            return Err(e);
         }
     };
 
