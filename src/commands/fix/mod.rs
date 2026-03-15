@@ -358,6 +358,11 @@ async fn run_worker(minion_id: &str, issue: &str, opts: FixOptions) -> Result<i3
             monitor_timeout,
         )
         .await;
+    } else {
+        log::warn!(
+            "⚠️  No PR number available — skipping PR lifecycle monitoring. \
+             Branch may not have been pushed, or PR lookup failed."
+        );
     }
 
     // CI monitoring

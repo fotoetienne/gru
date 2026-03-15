@@ -270,23 +270,64 @@ pub(crate) async fn handle_pr_creation(
             let err_msg = e.to_string();
             if err_msg.contains("already exists") || err_msg.contains("A pull request for branch") {
                 log::info!(
-                    "ℹ️  A PR already exists for branch '{}'",
+                    "ℹ️  A PR already exists for branch '{}', recovering PR number...",
                     wt_ctx.branch_name
                 );
-                log::info!(
-                    "   Check: https://{}/{}/{}/pulls",
-                    issue_ctx.host,
-                    issue_ctx.owner,
-                    issue_ctx.repo
-                );
+                // Recover the existing PR number
+                match crate::ci::get_pr_number(
+                    &issue_ctx.host,
+                    &issue_ctx.owner,
+                    &issue_ctx.repo,
+                    &wt_ctx.branch_name,
+                )
+                .await
+                {
+                    Ok(Some(pr_num)) => {
+                        let pr_number = pr_num.to_string();
+                        println!("✅ Recovered existing PR #{}", pr_number);
+
+                        // Save PR state and update registry, same as successful creation
+                        let pr_state =
+                            PrState::new(pr_number.clone(), issue_ctx.issue_num.to_string());
+                        if let Err(e) = pr_state.save(&wt_ctx.minion_dir) {
+                            log::warn!("⚠️  Failed to save PR state: {}", e);
+                        }
+
+                        let minion_id_clone = wt_ctx.minion_id.clone();
+                        let pr_number_clone = pr_number.clone();
+                        if let Err(e) = with_registry(move |registry| {
+                            registry.update(&minion_id_clone, |info| {
+                                info.pr = Some(pr_number_clone);
+                                info.status = "idle".to_string();
+                            })
+                        })
+                        .await
+                        {
+                            log::warn!("⚠️  Failed to update registry with PR number: {}", e);
+                        }
+
+                        Ok(Some(pr_number))
+                    }
+                    Ok(None) => {
+                        log::warn!(
+                            "⚠️  PR exists for branch '{}' but could not be found via API",
+                            wt_ctx.branch_name
+                        );
+                        Ok(None)
+                    }
+                    Err(lookup_err) => {
+                        log::warn!("⚠️  Failed to look up existing PR: {}", lookup_err);
+                        Ok(None)
+                    }
+                }
             } else if err_msg.contains("branch not found") || err_msg.contains("does not exist") {
                 log::warn!("⚠️  Branch was pushed but is no longer available.");
                 log::warn!("   It may have been deleted or force-pushed.");
+                Ok(None)
             } else {
                 log::warn!("⚠️  Failed to create PR: {}", e);
+                Ok(None)
             }
-            log::warn!("   You can create the PR manually if needed.");
-            Ok(None)
         }
     }
 }
