@@ -358,6 +358,26 @@ async fn resume_interrupted_minions(
 
         match spawn_minion(&candidate.info.repo, &host, candidate.info.issue).await {
             Ok(child) => {
+                // Write the outer `gru do` PID to registry immediately to prevent
+                // duplicate spawns. The worker subprocess will later overwrite
+                // this with the inner worker PID.
+                if let Some(pid) = child.id() {
+                    let mid = candidate.minion_id.clone();
+                    if let Err(e) = with_registry(move |registry| {
+                        registry.update(&mid, |info| {
+                            info.pid = Some(pid);
+                            info.mode = MinionMode::Autonomous;
+                        })
+                    })
+                    .await
+                    {
+                        log::warn!(
+                            "⚠️  Failed to write PID for resumed {}: {}",
+                            candidate.minion_id,
+                            e
+                        );
+                    }
+                }
                 children.push(child);
                 resumed += 1;
                 *available -= 1;
@@ -478,6 +498,36 @@ async fn poll_and_spawn(
                     // Successfully claimed, spawn Minion
                     match spawn_minion(&repo_full, &host, issue_number).await {
                         Ok(child) => {
+                            // Write PID to registry immediately (if the subprocess has
+                            // already created the entry) to prevent duplicate spawns.
+                            if let Some(pid) = child.id() {
+                                let repo_cl = repo_full.clone();
+                                if let Err(e) = with_registry(move |registry| {
+                                    let entries = registry.find_by_issue(&repo_cl, issue_number);
+                                    if entries.is_empty() {
+                                        log::debug!(
+                                            "No registry entry yet for issue #{} — \
+                                             subprocess will register its own PID",
+                                            issue_number
+                                        );
+                                    }
+                                    for (mid, _) in entries {
+                                        registry.update(&mid, |info| {
+                                            info.pid = Some(pid);
+                                            info.mode = MinionMode::Autonomous;
+                                        })?;
+                                    }
+                                    Ok(())
+                                })
+                                .await
+                                {
+                                    log::warn!(
+                                        "⚠️  Failed to write PID for new spawn on issue #{}: {}",
+                                        issue_number,
+                                        e
+                                    );
+                                }
+                            }
                             children.push(child);
                             println!(
                                 "✨ Spawned Minion for {}/issues/{}",
