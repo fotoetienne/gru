@@ -411,6 +411,30 @@ mod tests {
         assert!(args.contains(&"--full-auto".as_ref()));
         assert!(args.contains(&"fix the bug".as_ref()));
         assert_eq!(*args.last().unwrap(), std::ffi::OsStr::new("fix the bug"));
+
+        // Verify GH_HOST is set
+        let envs: Vec<_> = inner.get_envs().collect();
+        assert!(
+            envs.iter()
+                .any(|(k, v)| *k == "GH_HOST" && *v == Some("github.com".as_ref())),
+            "GH_HOST should be set on the command"
+        );
+    }
+
+    #[test]
+    fn test_build_command_sets_ghe_host() {
+        let b = backend();
+        let path = std::path::PathBuf::from("/tmp/worktree");
+        let session_id = Uuid::nil();
+        let cmd = b.build_command(&path, &session_id, "fix the bug", "github.example.com");
+        let inner = cmd.as_std();
+
+        let envs: Vec<_> = inner.get_envs().collect();
+        assert!(
+            envs.iter()
+                .any(|(k, v)| *k == "GH_HOST" && *v == Some("github.example.com".as_ref())),
+            "GH_HOST should be set to the GHE host"
+        );
     }
 
     #[test]
@@ -428,6 +452,14 @@ mod tests {
         assert!(args.contains(&"--last".as_ref()));
         assert!(args.contains(&"--json".as_ref()));
         assert!(args.contains(&"--full-auto".as_ref()));
+
+        // Verify GH_HOST is set
+        let envs: Vec<_> = inner.get_envs().collect();
+        assert!(
+            envs.iter()
+                .any(|(k, v)| *k == "GH_HOST" && *v == Some("github.com".as_ref())),
+            "GH_HOST should be set on resume command"
+        );
     }
 
     #[test]
