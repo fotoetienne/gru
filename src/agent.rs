@@ -170,7 +170,16 @@ pub trait AgentBackend: Send + Sync {
     fn name(&self) -> &str;
 
     /// Build the command to start a new agent session.
-    fn build_command(&self, worktree_path: &Path, session_id: &Uuid, prompt: &str) -> TokioCommand;
+    ///
+    /// `github_host` is set as `GH_HOST` on the spawned process so that
+    /// `gh` CLI commands target the correct GitHub instance without discovery.
+    fn build_command(
+        &self,
+        worktree_path: &Path,
+        session_id: &Uuid,
+        prompt: &str,
+        github_host: &str,
+    ) -> TokioCommand;
 
     /// Parse a single line of agent output into normalized events.
     ///
@@ -190,6 +199,7 @@ pub trait AgentBackend: Send + Sync {
         worktree_path: &Path,
         session_id: &Uuid,
         prompt: &str,
+        github_host: &str,
     ) -> Option<TokioCommand>;
 
     /// Build the command to interactively resume an existing agent session.
@@ -203,6 +213,7 @@ pub trait AgentBackend: Send + Sync {
         &self,
         worktree_path: &Path,
         session_id: &Uuid,
+        github_host: &str,
     ) -> Option<TokioCommand>;
 }
 

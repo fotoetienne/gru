@@ -697,7 +697,21 @@ async fn register_and_run_agent(
     };
     let progress = std::sync::Arc::new(ProgressDisplay::new(config));
 
-    let mut cmd = backend.build_command(&ws.run_dir, cfg.session_id, cfg.rendered_prompt);
+    let github_host_owned;
+    let github_host = if let Some(h) = fetched.host.as_deref().or(fetched.pr_host.as_deref()) {
+        h
+    } else {
+        // Ad-hoc prompt without --issue or --pr: resolve from worktree git remote
+        // so GHE repos are handled correctly.
+        github_host_owned = super::resume::resolve_host_from_worktree(&ws.run_dir, "").await;
+        &github_host_owned
+    };
+    let mut cmd = backend.build_command(
+        &ws.run_dir,
+        cfg.session_id,
+        cfg.rendered_prompt,
+        github_host,
+    );
     cmd.env("GRU_WORKSPACE", cfg.minion_id);
 
     // Record child PID on spawn; mode is already set to Autonomous at registration.

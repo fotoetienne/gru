@@ -12,7 +12,12 @@ use uuid::Uuid;
 /// Builds a standard Claude command with common flags.
 ///
 /// Creates a TokioCommand configured for non-interactive stream-json output.
-pub fn build_claude_command(worktree_path: &Path, session_id: &Uuid, prompt: &str) -> TokioCommand {
+pub fn build_claude_command(
+    worktree_path: &Path,
+    session_id: &Uuid,
+    prompt: &str,
+    github_host: &str,
+) -> TokioCommand {
     let mut cmd = TokioCommand::new("claude");
     cmd.arg("--print")
         .arg("--verbose")
@@ -26,7 +31,8 @@ pub fn build_claude_command(worktree_path: &Path, session_id: &Uuid, prompt: &st
         .stdin(std::process::Stdio::inherit())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::inherit())
-        .current_dir(worktree_path);
+        .current_dir(worktree_path)
+        .env("GH_HOST", github_host);
     cmd
 }
 
@@ -37,6 +43,7 @@ pub fn build_claude_resume_command(
     worktree_path: &Path,
     session_id: &Uuid,
     prompt: &str,
+    github_host: &str,
 ) -> TokioCommand {
     let mut cmd = TokioCommand::new("claude");
     cmd.arg("--print")
@@ -51,6 +58,7 @@ pub fn build_claude_resume_command(
         .stdin(std::process::Stdio::inherit())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::inherit())
-        .current_dir(worktree_path);
+        .current_dir(worktree_path)
+        .env("GH_HOST", github_host);
     cmd
 }

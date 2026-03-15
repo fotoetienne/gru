@@ -398,7 +398,8 @@ pub(crate) async fn force_push(worktree_path: &Path) -> Result<()> {
 pub(crate) async fn run_agent_rebase(worktree_path: &Path) -> Result<i32> {
     let backend = agent_registry::resolve_backend(agent_registry::DEFAULT_AGENT)?;
     let session_id = Uuid::new_v4();
-    let cmd = backend.build_command(worktree_path, &session_id, "/rebase");
+    let github_host = super::resume::resolve_host_from_worktree(worktree_path, "").await;
+    let cmd = backend.build_command(worktree_path, &session_id, "/rebase", &github_host);
 
     let result = run_agent_with_stream_monitoring(
         cmd,

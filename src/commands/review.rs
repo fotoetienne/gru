@@ -185,7 +185,7 @@ pub async fn handle_review(pr_arg: Option<String>, agent_name: &str) -> Result<i
     let progress = std::sync::Arc::new(ProgressDisplay::new(config));
 
     // Build the command with flags for autonomous stream-json output
-    let cmd = backend.build_command(&checkout_path, &session_id, &review_prompt);
+    let cmd = backend.build_command(&checkout_path, &session_id, &review_prompt, &host);
 
     // Record child PID on spawn; mode is already set to Autonomous at registration.
     let on_spawn = MinionRegistry::pid_callback(minion_id.clone(), None);

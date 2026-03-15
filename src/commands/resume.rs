@@ -227,6 +227,7 @@ pub async fn handle_resume(
         quiet,
         effective_timeout.as_deref(),
         issue_num,
+        &issue_ctx.host,
     )
     .await;
 
@@ -373,8 +374,12 @@ pub async fn handle_resume(
 }
 
 /// Resolve the GitHub host for a worktree by inspecting its git remote.
-/// Falls back to config-based `infer_github_host` if the remote can't be parsed.
-async fn resolve_host_from_worktree(checkout_path: &std::path::Path, owner: &str) -> String {
+/// Falls back to extracting the host directly from the remote URL, then to
+/// config-based `infer_github_host` if neither approach succeeds.
+pub(crate) async fn resolve_host_from_worktree(
+    checkout_path: &std::path::Path,
+    owner: &str,
+) -> String {
     let github_hosts = crate::config::load_host_registry().all_hosts();
 
     // Try to get the host from the worktree's git remote
@@ -387,7 +392,13 @@ async fn resolve_host_from_worktree(checkout_path: &std::path::Path, owner: &str
     if let Ok(output) = output {
         if output.status.success() {
             let remote_url = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            // First try the full parser (validates against known hosts)
             if let Ok((host, _, _)) = crate::git::parse_github_remote(&remote_url, &github_hosts) {
+                return host;
+            }
+            // If the remote URL is valid but the host isn't in the registry,
+            // extract the host directly so we don't wrongly default to github.com.
+            if let Some(host) = extract_host_from_remote_url(&remote_url) {
                 return host;
             }
         }
@@ -395,6 +406,29 @@ async fn resolve_host_from_worktree(checkout_path: &std::path::Path, owner: &str
 
     // Fallback to config-based heuristic
     crate::github::infer_github_host(owner)
+}
+
+/// Extract the hostname from a git remote URL without requiring it to be in the
+/// known hosts registry. Supports HTTPS (`https://host/...`) and SSH (`git@host:...`).
+fn extract_host_from_remote_url(url: &str) -> Option<String> {
+    if let Some(rest) = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+    {
+        // https://host/owner/repo.git -> host
+        rest.split('/')
+            .next()
+            .map(|h| h.to_string())
+            .filter(|h| !h.is_empty())
+    } else if let Some(rest) = url.strip_prefix("git@") {
+        // git@host:owner/repo.git -> host
+        rest.split(':')
+            .next()
+            .map(|h| h.to_string())
+            .filter(|h| !h.is_empty())
+    } else {
+        None
+    }
 }
 
 /// Runs the agent in autonomous mode with stream monitoring.
@@ -408,9 +442,15 @@ async fn run_autonomous_agent(
     quiet: bool,
     timeout_opt: Option<&str>,
     issue_num: u64,
+    github_host: &str,
 ) -> Result<std::process::ExitStatus> {
     let mut cmd = backend
-        .build_resume_command(&wt_ctx.checkout_path, &wt_ctx.session_id, prompt)
+        .build_resume_command(
+            &wt_ctx.checkout_path,
+            &wt_ctx.session_id,
+            prompt,
+            github_host,
+        )
         .context("Agent backend does not support resume")?;
     cmd.env("GRU_WORKSPACE", &wt_ctx.minion_id);
 
@@ -490,5 +530,35 @@ mod tests {
         assert_eq!(DEFAULT_MAX_RESUME_ATTEMPTS, 3);
         let max = load_max_resume_attempts();
         assert!(max >= 1, "load_max_resume_attempts must return at least 1");
+    }
+
+    #[test]
+    fn test_extract_host_from_remote_url_https() {
+        assert_eq!(
+            extract_host_from_remote_url("https://github.example.com/owner/repo.git"),
+            Some("github.example.com".to_string())
+        );
+        assert_eq!(
+            extract_host_from_remote_url("https://github.com/owner/repo.git"),
+            Some("github.com".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_host_from_remote_url_ssh() {
+        assert_eq!(
+            extract_host_from_remote_url("git@github.example.com:owner/repo.git"),
+            Some("github.example.com".to_string())
+        );
+        assert_eq!(
+            extract_host_from_remote_url("git@github.com:owner/repo.git"),
+            Some("github.com".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_host_from_remote_url_invalid() {
+        assert_eq!(extract_host_from_remote_url("not-a-url"), None);
+        assert_eq!(extract_host_from_remote_url(""), None);
     }
 }

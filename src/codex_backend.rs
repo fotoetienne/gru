@@ -40,8 +40,11 @@ impl AgentBackend for CodexBackend {
         worktree_path: &Path,
         _session_id: &Uuid,
         prompt: &str,
+        github_host: &str,
     ) -> TokioCommand {
-        build_codex_command(worktree_path, prompt)
+        let mut cmd = build_codex_command(worktree_path, prompt);
+        cmd.env("GH_HOST", github_host);
+        cmd
     }
 
     fn parse_events(&self, line: &str) -> Vec<AgentEvent> {
@@ -53,16 +56,20 @@ impl AgentBackend for CodexBackend {
         worktree_path: &Path,
         _session_id: &Uuid,
         prompt: &str,
+        github_host: &str,
     ) -> Option<TokioCommand> {
         // Codex supports resume via `codex exec resume --last "prompt"`
         // but it relies on its own session persistence, not Gru's session ID.
-        Some(build_codex_resume_command(worktree_path, prompt))
+        let mut cmd = build_codex_resume_command(worktree_path, prompt);
+        cmd.env("GH_HOST", github_host);
+        Some(cmd)
     }
 
     fn build_interactive_resume_command(
         &self,
         _worktree_path: &Path,
         _session_id: &Uuid,
+        _github_host: &str,
     ) -> Option<TokioCommand> {
         // Codex CLI does not support interactive resume mode
         None
@@ -394,7 +401,7 @@ mod tests {
         let b = backend();
         let path = std::path::PathBuf::from("/tmp/worktree");
         let session_id = Uuid::nil();
-        let cmd = b.build_command(&path, &session_id, "fix the bug");
+        let cmd = b.build_command(&path, &session_id, "fix the bug", "github.com");
         let inner = cmd.as_std();
 
         assert_eq!(inner.get_program(), "codex");
@@ -404,6 +411,30 @@ mod tests {
         assert!(args.contains(&"--full-auto".as_ref()));
         assert!(args.contains(&"fix the bug".as_ref()));
         assert_eq!(*args.last().unwrap(), std::ffi::OsStr::new("fix the bug"));
+
+        // Verify GH_HOST is set
+        let envs: Vec<_> = inner.get_envs().collect();
+        assert!(
+            envs.iter()
+                .any(|(k, v)| *k == "GH_HOST" && *v == Some("github.com".as_ref())),
+            "GH_HOST should be set on the command"
+        );
+    }
+
+    #[test]
+    fn test_build_command_sets_ghe_host() {
+        let b = backend();
+        let path = std::path::PathBuf::from("/tmp/worktree");
+        let session_id = Uuid::nil();
+        let cmd = b.build_command(&path, &session_id, "fix the bug", "github.example.com");
+        let inner = cmd.as_std();
+
+        let envs: Vec<_> = inner.get_envs().collect();
+        assert!(
+            envs.iter()
+                .any(|(k, v)| *k == "GH_HOST" && *v == Some("github.example.com".as_ref())),
+            "GH_HOST should be set to the GHE host"
+        );
     }
 
     #[test]
@@ -412,7 +443,7 @@ mod tests {
         let path = std::path::PathBuf::from("/tmp/worktree");
         let session_id = Uuid::nil();
         let cmd = b
-            .build_resume_command(&path, &session_id, "continue")
+            .build_resume_command(&path, &session_id, "continue", "github.com")
             .expect("resume should be supported");
         let inner = cmd.as_std();
 
@@ -421,6 +452,14 @@ mod tests {
         assert!(args.contains(&"--last".as_ref()));
         assert!(args.contains(&"--json".as_ref()));
         assert!(args.contains(&"--full-auto".as_ref()));
+
+        // Verify GH_HOST is set
+        let envs: Vec<_> = inner.get_envs().collect();
+        assert!(
+            envs.iter()
+                .any(|(k, v)| *k == "GH_HOST" && *v == Some("github.com".as_ref())),
+            "GH_HOST should be set on resume command"
+        );
     }
 
     #[test]
@@ -428,7 +467,9 @@ mod tests {
         let b = backend();
         let path = std::path::PathBuf::from("/tmp");
         let id = Uuid::nil();
-        assert!(b.build_resume_command(&path, &id, "p").is_some());
+        assert!(b
+            .build_resume_command(&path, &id, "p", "github.com")
+            .is_some());
     }
 
     #[test]
@@ -436,7 +477,9 @@ mod tests {
         let b = backend();
         let path = std::path::PathBuf::from("/tmp");
         let id = Uuid::nil();
-        assert!(b.build_interactive_resume_command(&path, &id).is_none());
+        assert!(b
+            .build_interactive_resume_command(&path, &id, "github.com")
+            .is_none());
     }
 
     // ---- parse_event tests ----

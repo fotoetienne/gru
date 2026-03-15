@@ -64,10 +64,10 @@ pub async fn handle_attach(
     )
     .await?;
 
-    // Extract session_id and agent_name; default to "claude" when not in registry
-    let (session_id, agent_name) = match registry_data {
-        Some(info) => (Some(info.session_id), info.agent_name),
-        None => (None, agent_registry::DEFAULT_AGENT.to_string()),
+    // Extract session_id, agent_name, and repo; default to "claude" when not in registry
+    let (session_id, agent_name, repo_str) = match registry_data {
+        Some(info) => (Some(info.session_id), info.agent_name, Some(info.repo)),
+        None => (None, agent_registry::DEFAULT_AGENT.to_string(), None),
     };
 
     // Resolve the agent backend from the stored agent name
@@ -88,6 +88,14 @@ pub async fn handle_attach(
     }
     println!("📂 Workspace: {}", checkout_path.display());
 
+    // Resolve the GitHub host from the worktree's git remote so spawned
+    // processes can target the correct GHE instance without discovery.
+    let owner_hint = repo_str
+        .as_deref()
+        .and_then(|r| r.split('/').next())
+        .unwrap_or("");
+    let github_host = super::resume::resolve_host_from_worktree(&checkout_path, owner_hint).await;
+
     // Build command for interactive mode via the resolved backend
     let mut cmd = match &session_id {
         Some(sid) => {
@@ -100,7 +108,11 @@ pub async fn handle_attach(
                     );
                 }
             };
-            match backend.build_interactive_resume_command(&checkout_path, &session_uuid) {
+            match backend.build_interactive_resume_command(
+                &checkout_path,
+                &session_uuid,
+                &github_host,
+            ) {
                 Some(c) => c,
                 None => {
                     revert_to_stopped(&minion.minion_id).await;
@@ -127,7 +139,8 @@ pub async fn handle_attach(
                 .current_dir(&checkout_path)
                 .stdin(Stdio::inherit())
                 .stdout(Stdio::inherit())
-                .stderr(Stdio::inherit());
+                .stderr(Stdio::inherit())
+                .env("GH_HOST", &github_host);
             c
         }
     };
