@@ -375,6 +375,38 @@ pub async fn handle_clean(dry_run: bool, force: bool, base_branch: &str) -> Resu
         .map(|wt| wt.path.canonicalize().unwrap_or_else(|_| wt.path.clone()))
         .collect();
 
+    // Fetch once per bare repo so that check_merged() has up-to-date refs.
+    // This replaces the per-worktree fetch that was previously in check_remote_deleted().
+    let bare_repos: HashSet<_> = worktrees
+        .iter()
+        .map(|wt| wt.bare_repo_path.clone())
+        .collect();
+    for bare_repo in &bare_repos {
+        let fetch_output = Command::new("git")
+            .args(["-C", &bare_repo.to_string_lossy(), "fetch", "--prune"])
+            .output()
+            .await;
+
+        match fetch_output {
+            Ok(result) if !result.status.success() => {
+                let stderr = String::from_utf8_lossy(&result.stderr);
+                // Suppress "refusing to fetch into branch" warnings for checked-out branches.
+                // This is expected for active worktrees and not an error.
+                if !stderr.contains("refusing to fetch into branch") {
+                    log::warn!(
+                        "Failed to fetch for {}: {}",
+                        bare_repo.display(),
+                        stderr.trim()
+                    );
+                }
+            }
+            Err(e) => {
+                log::warn!("Failed to run git fetch for {}: {}", bare_repo.display(), e);
+            }
+            _ => {}
+        }
+    }
+
     // Check status of each worktree
     let mut cleanable = Vec::new();
     let mut skipped_active_minions = Vec::new();
