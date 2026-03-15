@@ -71,33 +71,23 @@ fn extract_minion_id_from_dir(dir_name: &str) -> &str {
     }
 }
 
-/// Extract issue number from a branch name like `minion/issue-42-M001`.
-fn extract_issue_from_branch(branch: &str) -> Option<u32> {
-    branch.split('/').find_map(|segment| {
-        segment
-            .strip_prefix("issue-")
-            .and_then(|rest| rest.split('-').next())
-            .and_then(|num_str| num_str.parse().ok())
-    })
+/// Get the directory name that contains the minion ID, accounting for
+/// new-style layouts where the checkout is at `minion_dir/checkout/`.
+fn minion_dir_name(path: &Path) -> Option<&std::ffi::OsStr> {
+    if path.file_name().map(|n| n == "checkout").unwrap_or(false) {
+        path.parent().and_then(|p| p.file_name())
+    } else {
+        path.file_name()
+    }
 }
 
-/// Build a human-readable label like "M0pp (issue #393)" from a worktree's branch.
+/// Build a human-readable label like "M0pp (issue #393)" from a worktree.
 fn worktree_label(wt: &worktree_scanner::Worktree) -> String {
-    let dir_for_id = if wt
-        .path
-        .file_name()
-        .map(|n| n == "checkout")
-        .unwrap_or(false)
-    {
-        wt.path.parent().and_then(|p| p.file_name())
-    } else {
-        wt.path.file_name()
-    };
-    let minion_id = dir_for_id
+    let minion_id = minion_dir_name(&wt.path)
         .and_then(|n| n.to_str())
         .map(extract_minion_id_from_dir)
         .unwrap_or("unknown");
-    match extract_issue_from_branch(&wt.branch) {
+    match wt.extract_issue_number() {
         Some(num) => format!("{} (issue #{})", minion_id, num),
         None => minion_id.to_string(),
     }
@@ -449,7 +439,7 @@ pub async fn handle_clean(dry_run: bool, force: bool, base_branch: &str) -> Resu
             skipped_active_minions.len()
         );
         for wt in &skipped_active_minions {
-            println!("  {} (active minion)", wt.path.display());
+            println!("  {} (active minion)", worktree_label(wt));
             println!("    Branch: {}", wt.branch);
             println!("    Repo: {}", wt.repo);
             println!();
@@ -463,7 +453,7 @@ pub async fn handle_clean(dry_run: bool, force: bool, base_branch: &str) -> Resu
             skipped_open_prs.len()
         );
         for wt in &skipped_open_prs {
-            println!("  {} (open PR)", wt.path.display());
+            println!("  {} (open PR)", worktree_label(wt));
             println!("    Branch: {}", wt.branch);
             println!("    Repo: {}", wt.repo);
             println!();
@@ -698,18 +688,7 @@ pub async fn handle_clean(dry_run: bool, force: bool, base_branch: &str) -> Resu
             // Queue minion ID for batch registry removal.
             // Directory names follow the branch convention: "issue-<number>-<minion_id>"
             // (e.g., "issue-387-M0pf"), but registry keys are just the minion ID ("M0pf").
-            // Extract the minion ID suffix from the directory name.
-            let dir_for_id = if wt
-                .path
-                .file_name()
-                .map(|n| n == "checkout")
-                .unwrap_or(false)
-            {
-                wt.path.parent().and_then(|p| p.file_name())
-            } else {
-                wt.path.file_name()
-            };
-            if let Some(dir_name) = dir_for_id {
+            if let Some(dir_name) = minion_dir_name(&wt.path) {
                 if let Some(dir_str) = dir_name.to_str() {
                     let minion_id = extract_minion_id_from_dir(dir_str);
                     registry_ids_to_remove.push(minion_id.to_string());
@@ -728,10 +707,8 @@ pub async fn handle_clean(dry_run: bool, force: bool, base_branch: &str) -> Resu
                 let summary = count_dirty_files(&file_status.porcelain);
                 println!("skipped");
 
-                // Resolve the cd path, preferring the minion_dir parent for
-                // new-style layouts so users land in the checkout directory.
                 let cd_path = shorten_path(&wt.path);
-                println!("  \u{26a0} Worktree has uncommitted changes ({})", summary);
+                println!("  ⚠ Worktree has uncommitted changes ({})", summary);
                 println!("    Use 'gru clean --force' to remove anyway, or inspect with:");
                 println!("    cd {}", cd_path);
             } else {
@@ -978,22 +955,6 @@ mod tests {
             extract_minion_id_from_dir("some-other-dir"),
             "some-other-dir"
         );
-    }
-
-    // --- extract_issue_from_branch tests ---
-
-    #[test]
-    fn test_extract_issue_from_branch() {
-        assert_eq!(extract_issue_from_branch("minion/issue-42-M001"), Some(42));
-        assert_eq!(
-            extract_issue_from_branch("minion/issue-393-M0pp"),
-            Some(393)
-        );
-    }
-
-    #[test]
-    fn test_extract_issue_from_branch_no_issue() {
-        assert_eq!(extract_issue_from_branch("feature/add-logging"), None);
     }
 
     // --- count_dirty_files tests ---
