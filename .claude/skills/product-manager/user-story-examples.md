@@ -173,7 +173,7 @@ Multiple Labs may poll the same repo. Claiming issues via labels prevents collis
 ## Acceptance Criteria
 - [ ] Given an issue has label "gru:todo", when Lab claims it, then Lab adds "gru:in-progress" label
 - [ ] Given an issue has "gru:in-progress", when another Lab polls, then it skips that issue
-- [ ] Given a Minion fails, when Lab archives it, then Lab replaces "gru:in-progress" with "gru:todo"
+- [ ] Given a Minion fails, when Lab archives it, then Lab replaces "gru:in-progress" with "gru:failed"
 - [ ] Given a Minion completes, when PR merges, then Lab replaces "gru:in-progress" with "gru:done"
 
 ## Technical Notes

@@ -702,7 +702,7 @@ async fn stream_input(&self, mut input: mpsc::Receiver<Vec<u8>>, minion: Arc<Min
      │               │ Max retries exceeded
      │               ▼
      │         ┌──────────────┐
-     │         │ gru:failed   │  (paused, needs human help)
+     │         │ gru:failed   │  (agent encountered failure)
      │         └──────────────┘
      │
      │ PR merged or issue closed
@@ -784,17 +784,12 @@ Starting work on this issue. I'll create a draft PR shortly.
 ### API Usage Patterns
 
 **Label Operations:**
-```rust
-// Add label
-// PUT /repos/{owner}/{repo}/issues/{issue_number}/labels
-// Body: ["gru:in-progress"]
+```bash
+# Add label
+gh issue edit {issue_number} --repo {owner}/{repo} --add-label "gru:in-progress"
 
-// Replace all labels
-// PUT /repos/{owner}/{repo}/issues/{issue_number}/labels
-// Body: ["gru:in-progress"]
-
-// Remove label
-// DELETE /repos/{owner}/{repo}/issues/{issue_number}/labels/{label}
+# Remove label
+gh issue edit {issue_number} --repo {owner}/{repo} --remove-label "gru:todo"
 ```
 
 **Comment Posting:**
