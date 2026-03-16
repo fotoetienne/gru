@@ -93,7 +93,7 @@ binary = "/usr/local/bin/claude"   # Optional: override binary path
 
 ```
 ID       AGENT    REPO                 ISSUE  TASK       PR       BRANCH                         MODE                   UPTIME   TOKENS
-M001     claude   owner/repo           #42    do         #43      minion/issue-42-M001           monitoring (PR ready)  5m       1.2M
+M001     claude-code owner/repo           #42    do         #43      minion/issue-42-M001           monitoring (PR ready)  5m       1.2M
 M002     codex    owner/repo           #44    do         -        minion/issue-44-M002           working                2m       -
 ```
 

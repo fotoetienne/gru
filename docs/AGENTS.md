@@ -40,7 +40,7 @@ binary = "/usr/local/bin/claude"
 Gru spawns Claude Code in non-interactive mode with stream JSON output:
 
 ```bash
-claude --print --verbose --output-format stream-json --dangerously-skip-permissions "<prompt>"
+claude --print --verbose --output-format stream-json --dangerously-skip-permissions --include-partial-messages "<prompt>"
 ```
 
 Key flags:
@@ -86,7 +86,7 @@ codex exec --json --full-auto "<prompt>"
 Resume support uses:
 
 ```bash
-codex exec resume --last "<prompt>"
+codex exec resume --last --json --full-auto "<prompt>"
 ```
 
 Note: Codex does not support interactive resume (`gru attach` will not work with Codex minions).
@@ -139,3 +139,4 @@ The `AgentBackend` trait requires:
 - `build_command()` — construct the CLI command for a new session
 - `parse_events()` — convert stdout lines to normalized `AgentEvent`s
 - `build_resume_command()` — (optional) construct command to resume a session
+- `build_interactive_resume_command()` — (optional) construct command for `gru attach`; return `None` to disable attach support
