@@ -1,13 +1,17 @@
 # Gru: Local-First LLM Agent Orchestrator
 
-Gru is a local-first LLM agent orchestrator that autonomously works on GitHub issues using Claude Code. It manages "Minions" (agent sessions) that claim issues, implement fixes, create PRs, monitor CI, and respond to reviews.
+Gru is a local-first LLM agent orchestrator that autonomously works on GitHub issues. It manages "Minions" (agent sessions) that claim issues, implement fixes, create PRs, monitor CI, and respond to reviews.
+
+Gru supports multiple agent backends — currently [Claude Code](https://github.com/anthropics/claude-code) and [OpenAI Codex](https://github.com/openai/codex) — with a pluggable architecture for adding more.
 
 ## Installation
 
 ### Prerequisites
 
 - [Rust](https://rustup.rs/) (1.73 or later)
-- [Claude CLI](https://github.com/anthropics/claude-code) installed and configured
+- At least one agent backend:
+  - [Claude Code CLI](https://github.com/anthropics/claude-code) (default)
+  - [OpenAI Codex CLI](https://github.com/openai/codex) (optional)
 - Git and GitHub CLI (`gh`) recommended
 
 ### Install from Source
@@ -37,9 +41,12 @@ gru do https://github.com/owner/repo/issues/42
 
 # With timeout
 gru do 42 --timeout 30m
+
+# Use a specific agent backend
+gru do 42 --agent codex
 ```
 
-**`gru review <pr>`** - Review a GitHub pull request using Claude CLI
+**`gru review <pr>`** - Review a GitHub pull request using the configured agent backend
 
 ```bash
 gru review 42
@@ -55,6 +62,42 @@ gru prompt my-prompt --issue 42
 # List available prompts
 gru prompts
 ```
+
+### Agent Backends
+
+Gru supports multiple agent backends via the `--agent` flag. The default is `claude`.
+
+```bash
+# Use Claude Code (default)
+gru do 42
+
+# Use OpenAI Codex
+gru do 42 --agent codex
+
+# Agent flag works with review and prompt commands too
+gru review 42 --agent codex
+gru prompt my-prompt --agent codex
+```
+
+Set a default backend in `~/.gru/config.toml`:
+
+```toml
+[agent]
+default = "codex"
+
+[agent.claude]
+binary = "/usr/local/bin/claude"   # Optional: override binary path
+```
+
+`gru status` shows which agent each Minion is using:
+
+```
+MINION   AGENT    REPO                 ISSUE  TASK       PR       BRANCH                         MODE                   UPTIME   TOKENS
+M001     claude   owner/repo           #42    do         #43      minion/issue-42-M001           monitoring (PR ready)  5m       1.2M
+M002     codex    owner/repo           #44    do         -        minion/issue-44-M002           working                2m       -
+```
+
+See [docs/AGENTS.md](docs/AGENTS.md) for setup instructions for each backend.
 
 ### Minion Management
 
