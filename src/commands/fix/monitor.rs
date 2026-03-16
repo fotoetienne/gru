@@ -666,6 +666,7 @@ pub(crate) async fn monitor_ci_after_fix(
     repo: &str,
     branch: &str,
     worktree_path: &Path,
+    minion_id: &str,
 ) -> Result<bool> {
     let pr_number = match ci::get_pr_number(host, owner, repo, branch).await? {
         Some(num) => num,
@@ -677,6 +678,35 @@ pub(crate) async fn monitor_ci_after_fix(
             return Ok(true);
         }
     };
+
+    // Backfill the minion registry if it has pr: null but we discovered a PR.
+    // Read first to avoid an unnecessary save when pr is already set.
+    let mid = minion_id.to_string();
+    let needs_backfill = crate::minion_registry::with_registry({
+        let mid = mid.clone();
+        move |registry| Ok(registry.get(&mid).is_some_and(|info| info.pr.is_none()))
+    })
+    .await
+    .unwrap_or(false);
+
+    if needs_backfill {
+        let pr_num_for_backfill = pr_number;
+        if let Err(e) = crate::minion_registry::with_registry(move |registry| {
+            registry.update(&mid, |info| {
+                if info.pr.is_none() {
+                    log::info!(
+                        "📝 Backfilling registry: minion now linked to PR #{}",
+                        pr_num_for_backfill
+                    );
+                    info.pr = Some(pr_num_for_backfill.to_string());
+                }
+            })
+        })
+        .await
+        {
+            log::warn!("⚠️  Failed to backfill PR in registry: {}", e);
+        }
+    }
 
     eprintln!("🔍 Monitoring CI for PR #{}", pr_number);
     ci::monitor_and_fix_ci(host, owner, repo, pr_number, branch, worktree_path).await

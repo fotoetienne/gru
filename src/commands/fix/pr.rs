@@ -336,14 +336,55 @@ pub(crate) async fn handle_pr_creation(
                 Ok(None)
             } else {
                 log::warn!("⚠️  Failed to create PR: {}", e);
-                log::warn!(
-                    "   You can create the PR manually at: https://{}/{}/{}/compare/{}",
-                    issue_ctx.host,
-                    issue_ctx.owner,
-                    issue_ctx.repo,
-                    wt_ctx.branch_name
-                );
-                Ok(None)
+
+                // Fallback: a PR may already exist from a previous attempt or
+                // manual creation.  Try to recover it the same way the
+                // "already exists" path does.
+                match crate::ci::get_pr_number(
+                    &issue_ctx.host,
+                    &issue_ctx.owner,
+                    &issue_ctx.repo,
+                    &wt_ctx.branch_name,
+                )
+                .await
+                {
+                    Ok(Some(pr_num)) => {
+                        let pr_number = pr_num.to_string();
+                        println!(
+                            "✅ Recovered existing PR #{} after creation failure",
+                            pr_number
+                        );
+
+                        if let Err(e) = finalize_pr(issue_ctx, wt_ctx, &pr_number).await {
+                            log::warn!("⚠️  Failed to finalize recovered PR state: {}", e);
+                        }
+
+                        Ok(Some(pr_number))
+                    }
+                    Ok(None) => {
+                        log::warn!(
+                            "   No existing PR found for branch '{}'. \
+                             You can create the PR manually at: https://{}/{}/{}/compare/{}",
+                            wt_ctx.branch_name,
+                            issue_ctx.host,
+                            issue_ctx.owner,
+                            issue_ctx.repo,
+                            wt_ctx.branch_name
+                        );
+                        Ok(None)
+                    }
+                    Err(lookup_err) => {
+                        log::warn!("⚠️  Failed to look up existing PR: {}", lookup_err);
+                        log::warn!(
+                            "   You can create the PR manually at: https://{}/{}/{}/compare/{}",
+                            issue_ctx.host,
+                            issue_ctx.owner,
+                            issue_ctx.repo,
+                            wt_ctx.branch_name
+                        );
+                        Ok(None)
+                    }
+                }
             }
         }
     }
