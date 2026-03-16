@@ -373,6 +373,7 @@ async fn run_worker(minion_id: &str, issue: &str, opts: FixOptions) -> Result<i3
         &issue_ctx.repo,
         &wt_ctx.branch_name,
         &wt_ctx.checkout_path,
+        &wt_ctx.minion_id,
     )
     .await;
     match ci_passed {
