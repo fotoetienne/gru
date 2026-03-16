@@ -16,7 +16,7 @@ use tokio::time::sleep;
 /// Maximum age of a spawn to be considered an "early exit" eligible for label restoration.
 /// Processes that fail within this window likely never started meaningful work, so the
 /// issue label should be restored to the ready state rather than left as in-progress.
-const EARLY_EXIT_THRESHOLD_SECS: u64 = 30;
+const EARLY_EXIT_THRESHOLD: Duration = Duration::from_secs(30);
 
 /// A child process tracked by the lab, with optional metadata for label restoration.
 struct SpawnedChild {
@@ -34,6 +34,13 @@ struct SpawnMeta {
     issue_number: u64,
     ready_label: String,
     spawned_at: Instant,
+}
+
+/// Determines whether a failed spawn qualifies for label restoration.
+/// Returns true if the process exited within the early-exit threshold, meaning it
+/// likely never started meaningful work and the issue should be returned to the ready state.
+fn should_restore_label(spawned_at: Instant) -> bool {
+    spawned_at.elapsed() <= EARLY_EXIT_THRESHOLD
 }
 
 /// Handles the lab daemon command
@@ -133,6 +140,11 @@ pub async fn handle_lab(
 
 /// Remove finished child processes from the tracking vec.
 /// For early exits (non-zero within threshold), restore labels to prevent orphaning.
+///
+/// Note: This is called once per poll interval, so the effective early-exit window
+/// is `EARLY_EXIT_THRESHOLD` minus any delay before the next reap cycle. With typical
+/// poll intervals (≤30s) this is fine, but very long poll intervals could cause
+/// early exits to be detected after the threshold has passed.
 async fn reap_children(children: &mut Vec<SpawnedChild>) {
     let mut i = 0;
     while i < children.len() {
@@ -143,13 +155,13 @@ async fn reap_children(children: &mut Vec<SpawnedChild>) {
                 // If the process failed quickly, restore the issue label
                 if !status.success() {
                     if let Some(meta) = &children[i].spawn_meta {
-                        let elapsed = meta.spawned_at.elapsed().as_secs();
-                        if elapsed < EARLY_EXIT_THRESHOLD_SECS {
+                        let elapsed = meta.spawned_at.elapsed();
+                        if should_restore_label(meta.spawned_at) {
                             log::warn!(
-                                "⚠️  Spawned gru do for issue #{} exited early with {} (after {}s) — restoring label",
+                                "⚠️  Spawned gru do for issue #{} exited early with {} (after {:.1}s) — restoring label",
                                 meta.issue_number,
                                 status,
-                                elapsed
+                                elapsed.as_secs_f64()
                             );
                             if let Err(e) = github::edit_labels_via_cli(
                                 &meta.host,
@@ -170,12 +182,12 @@ async fn reap_children(children: &mut Vec<SpawnedChild>) {
                             }
                         } else {
                             log::warn!(
-                                "⚠️  Spawned gru do for issue #{} exited with {} (after {}s) — \
+                                "⚠️  Spawned gru do for issue #{} exited with {} (after {:.1}s) — \
                                  not restoring label (exceeded early-exit threshold of {}s)",
                                 meta.issue_number,
                                 status,
-                                elapsed,
-                                EARLY_EXIT_THRESHOLD_SECS
+                                elapsed.as_secs_f64(),
+                                EARLY_EXIT_THRESHOLD.as_secs()
                             );
                         }
                     }
@@ -1080,6 +1092,36 @@ mod tests {
             spawned_at: Instant::now(),
         };
         assert_eq!(meta.issue_number, 42);
-        assert!(meta.spawned_at.elapsed().as_secs() < EARLY_EXIT_THRESHOLD_SECS);
+        assert!(meta.spawned_at.elapsed() <= EARLY_EXIT_THRESHOLD);
+    }
+
+    #[test]
+    fn test_should_restore_label_within_threshold() {
+        // A just-spawned process should qualify for label restoration
+        let spawned_at = Instant::now();
+        assert!(
+            should_restore_label(spawned_at),
+            "Process that just spawned should qualify for label restoration"
+        );
+    }
+
+    #[test]
+    fn test_should_restore_label_beyond_threshold() {
+        // A process spawned well before the threshold should not qualify
+        let spawned_at = Instant::now() - Duration::from_secs(60);
+        assert!(
+            !should_restore_label(spawned_at),
+            "Process spawned 60s ago should not qualify for label restoration"
+        );
+    }
+
+    #[test]
+    fn test_should_restore_label_just_under_threshold() {
+        // A process spawned just under the threshold should still qualify
+        let spawned_at = Instant::now() - EARLY_EXIT_THRESHOLD + Duration::from_secs(1);
+        assert!(
+            should_restore_label(spawned_at),
+            "Process at 1s under threshold should still qualify for label restoration"
+        );
     }
 }
