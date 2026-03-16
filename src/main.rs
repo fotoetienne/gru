@@ -27,6 +27,7 @@ mod reserved_commands;
 mod session_claim;
 mod stream;
 mod text_buffer;
+mod tmux;
 mod url_utils;
 mod workspace;
 mod worktree_scanner;

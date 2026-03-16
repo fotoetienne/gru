@@ -4,6 +4,7 @@ use crate::labels;
 use crate::minion_registry::{
     is_process_alive, with_registry, MinionInfo, MinionMode, OrchestrationPhase,
 };
+use crate::tmux::TmuxGuard;
 use anyhow::{Context, Result};
 use chrono::Utc;
 use std::collections::HashSet;
@@ -76,6 +77,9 @@ pub async fn handle_lab(
 
     // Validate final configuration
     config.validate()?;
+
+    // Rename tmux window for the lab daemon
+    let _tmux_guard = TmuxGuard::new("gru:lab");
 
     println!("🚀 Starting Gru Lab daemon");
     println!(

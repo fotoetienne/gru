@@ -15,6 +15,7 @@ use crate::minion_registry::{
 use crate::minion_resolver;
 use crate::progress::{ProgressConfig, ProgressDisplay};
 use crate::session_claim;
+use crate::tmux::TmuxGuard;
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
 use tokio::time::Duration;
@@ -158,6 +159,9 @@ pub async fn handle_resume(
             issue_num
         )
     };
+
+    // Rename tmux window for the resume session
+    let _tmux_guard = TmuxGuard::new(&format!("gru:{}", minion.minion_id));
 
     println!(
         "🔄 Resuming Minion {} in autonomous mode...",

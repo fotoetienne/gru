@@ -24,6 +24,7 @@ use crate::agent_registry;
 use crate::agent_runner::{is_stuck_or_timeout_error, parse_timeout, EXIT_CODE_SIGNAL_TERMINATED};
 use crate::minion_registry::{with_registry, MinionMode, OrchestrationPhase};
 use crate::pr_monitor;
+use crate::tmux::TmuxGuard;
 use anyhow::{Context, Result};
 use chrono::Utc;
 use std::path::Path;
@@ -441,6 +442,9 @@ pub async fn handle_fix(issue: &str, opts: FixOptions) -> Result<i32> {
     let github_hosts = crate::config::load_host_registry().all_hosts();
     let issue_ctx = resolve_issue(issue, &github_hosts).await?;
 
+    // Rename tmux window early with the initial `gru:do:#N` name
+    let tmux_guard = TmuxGuard::new(&format!("gru:do:#{}", issue_ctx.issue_num));
+
     // Phase 2: Determine whether to resume or start fresh
     let (wt_ctx, is_fresh) = if force_new {
         (setup_worktree(&issue_ctx, agent_name, &opts).await?, true)
@@ -482,6 +486,12 @@ pub async fn handle_fix(issue: &str, opts: FixOptions) -> Result<i32> {
             ExistingMinionCheck::AlreadyRunning => return Ok(1),
         }
     };
+
+    // Update tmux window name now that we have the Minion ID (gru:do:#N → gru:M042:#N)
+    tmux_guard.rename(&format!(
+        "gru:{}:#{}",
+        wt_ctx.minion_id, issue_ctx.issue_num
+    ));
 
     // Claim the issue on fresh starts (skip on resume — already claimed)
     if is_fresh {
