@@ -95,9 +95,9 @@ pub(super) async fn check_existing_minions(
 
     // All minions are stopped - find the best candidate for resume.
     // Look for one that isn't in a terminal state and whose worktree still exists.
-    // Note: Setup-phase minions without a live process are not resumable
-    // (is_active() excludes Setup) and not terminal — they fall through to
-    // None below. Lab's prune_stale_entries handles cleanup of stale Setup entries.
+    // Note: Setup-phase minions without a live process may match here if their
+    // worktree exists (since Setup is not terminal). In practice, stale Setup
+    // entries rarely have worktrees — Lab's prune_stale_entries cleans them up.
     let resumable = existing
         .iter()
         .find(|(_, info)| !info.orchestration_phase.is_terminal() && info.worktree.exists());
@@ -109,9 +109,9 @@ pub(super) async fn check_existing_minions(
         ));
     }
 
-    // All existing minions are in terminal states (Failed/Completed) — allow a
-    // fresh attempt. This lets Lab automatically retry failed issues without
-    // requiring --force-new, while still blocking when a non-terminal minion exists.
+    // No running and no resumable minions — allow a fresh attempt. This covers
+    // both all-terminal minions (Failed/Completed) and non-terminal ones whose
+    // worktrees no longer exist. Lab can automatically retry without --force-new.
     Ok(ExistingMinionCheck::None)
 }
 
