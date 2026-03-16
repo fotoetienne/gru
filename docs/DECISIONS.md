@@ -84,7 +84,7 @@ anyhow = "1"
 ### Core Principles
 
 1. **Single Lab assumption** - No distributed coordination needed initially
-2. **Simple labels for state** - `ready-for-minion`, `claimed`, `in-progress`, `minion:done`, `minion:failed`
+2. **Simple labels for state** - `gru:todo`, `gru:in-progress`, `gru:done`, `gru:failed`
 3. **Comments as event log** - GitHub timeline API provides complete audit trail
 4. **Early draft PR** - Create as soon as branch exists, provides natural lock mechanism
 5. **GitHub Actions for CI** - Delegate test execution to existing infrastructure
@@ -377,7 +377,10 @@ Ctrl+D or type 'detach'
 Press Ctrl+D to detach (Minion continues running)
 ```
 
-**Implementation: tmux vs Custom**
+**Implementation: tmux vs Custom (HISTORICAL — superseded by CLI + stream-json)**
+
+> **Note:** This entire section is historical. The tmux approach was evaluated but never shipped.
+> V1 uses CLI + stream-json parsing instead. Kept for decision context only.
 
 **Option A: Use tmux**
 
@@ -580,18 +583,15 @@ impl AttachManager {
 }
 ```
 
-**When to build custom:**
+**When to build custom (historical — no longer applicable):**
 - Multiple users request Windows support (tmux unavailable)
 - Need fine-grained I/O interception for features
 - Want to eliminate external dependencies
 - Performance issues with tmux overhead
 
-**Hybrid approach (future):**
-- Use tmux for session persistence and multiplexing
-- Add custom layer on top for status parsing and event extraction
-- Best of both worlds: tmux reliability + custom semantics
+> **Note:** The CLI + stream-json approach eliminated the need for both tmux and custom I/O multiplexing.
 
-**Alternative: Zellij**
+**Alternative: Zellij (historical)**
 
 [Zellij](https://zellij.dev/) is a modern Rust-based terminal multiplexer gaining popularity:
 
@@ -650,35 +650,7 @@ Command::new("zellij")
     .spawn()?;
 ```
 
-**Why tmux still wins for V1:**
-- **Universal availability** - tmux pre-installed on most systems, Zellij requires separate install
-- **Proven stability** - 15+ years of production use
-- **Known edge cases** - Community has documented all quirks
-- **Easy to swap** - Can switch to Zellij later without changing Gru's API
-- **No real API advantage** - Both require shelling out to CLI
-
-**When Zellij becomes compelling:**
-- Zellij gains true embeddable library API (not just CLI wrapper)
-- Plugin system enables Lab-specific features (status parsing, event hooks)
-- Need better default UX for users attaching to Minions
-- Zellij adoption reaches critical mass (pre-installed by default)
-- Want to build Gru UI as Zellij plugin
-
-**Alternative: GNU Screen**
-
-Older than tmux (1987), but still viable:
-
-**Pros:**
-- ✅ **Even more universal** - Installed everywhere
-- ✅ **Simpler** - Fewer features = less complexity
-- ✅ **Rock solid** - Decades of production testing
-
-**Cons:**
-- ⚠️ **Less actively maintained** - Development slowed
-- ⚠️ **Fewer features** - No panes, limited scripting
-- ⚠️ **Worse performance** - Older codebase
-
-**Verdict: tmux is the sweet spot for V1**
+**Historical verdict:** tmux was initially favored for V1, but CLI + stream-json parsing proved superior and was selected instead. Neither tmux, Zellij, nor GNU Screen are used in the shipped implementation.
 
 ---
 
@@ -687,7 +659,7 @@ Older than tmux (1987), but still viable:
 ### Context
 
 Gru is a CLI tool that:
-- Manages processes (Claude Code sessions in tmux)
+- Manages processes (Claude Code CLI sessions)
 - Makes HTTP calls (GitHub API)
 - Does file I/O (git worktrees, logs)
 - Provides CLI interface
@@ -933,13 +905,16 @@ impl Agent for ClaudeCodeAdapter {
 ### Labels
 
 **Issue States:**
-- `ready-for-minion` - Issue is ready to be claimed
-- `claimed` - Lab has claimed but hasn't started work yet
-- `in-progress` - Minion actively working
-- `minion:done` - Completed successfully
-- `minion:failed` - Failed after retries
+- `gru:todo` - Issue is ready to be claimed
+- `gru:in-progress` - Minion actively working
+- `gru:done` - Completed successfully
+- `gru:failed` - Failed after retries
+- `gru:blocked` - Minion needs human help
+- `gru:ready-to-merge` - PR passes checks and is ready
+- `gru:auto-merge` - Auto-merge enabled on PR
+- `gru:needs-human-review` - PR requires human review before merge
 
-**Rationale:** Simple, visible in UI, easy to filter. Single-select enforcement not needed for single Lab.
+**Rationale:** Simple, visible in UI, easy to filter. The `gru:` prefix namespaces labels to avoid collisions with user labels.
 
 ### Event Log via Comments
 
@@ -1146,13 +1121,12 @@ When multi-Lab or advanced tracking needed:
 ## Simplified Lifecycle (V1)
 
 ### Issue Claim
-1. Poll GitHub for issues with `ready-for-minion` label
+1. Poll GitHub for issues with `gru:todo` label
 2. Select highest priority (manual priority label or oldest)
-3. Add `claimed` label
+3. Add `gru:in-progress` label, remove `gru:todo`
 4. Post structured claim comment with Minion ID, timestamp
 5. Create branch `minion/issue-123-M42`
 6. Create draft PR immediately
-7. Remove `ready-for-minion`, add `in-progress` label
 
 ### Minion Work Loop
 1. Read issue description and comments
@@ -1164,7 +1138,7 @@ When multi-Lab or advanced tracking needed:
 7. Wait for CI results
 8. **If CI passes** → continue or mark ready for review
 9. **If CI fails** → analyze logs, attempt fix, goto step 4
-10. **Max retries exceeded** → add `minion:failed` label, request human help
+10. **Max retries exceeded** → add `gru:failed` label, request human help
 
 ### PR Submission
 1. Convert draft PR to ready for review
@@ -1183,7 +1157,7 @@ When multi-Lab or advanced tracking needed:
    - **Unclear requests** → ask clarifying questions
    - **Complex refactors** → create handoff for human
 3. Monitor check runs for failures
-4. On merge → add `minion:done`, archive logs, cleanup worktree
+4. On merge → add `gru:done`, archive logs, cleanup worktree
 
 ---
 
@@ -1197,7 +1171,7 @@ When multi-Lab or advanced tracking needed:
 
 ### Escalation
 After exhausting retries:
-1. Add `minion:failed` label
+1. Add `gru:failed` label
 2. Post detailed failure report comment
 3. Tag human for assistance
 4. Park Minion in paused state (don't cleanup)
@@ -1306,11 +1280,11 @@ After exhausting retries:
 **No SQLite database:**
 - In-memory state for active Minions
 - Simple JSON file for timeline cursors (`~/.gru/state/cursors.json`)
-- Recovery on restart: enumerate tmux sessions, fetch issue state from GitHub
+- Recovery on restart: check Minion registry, fetch issue state from GitHub
 - Archive logs to disk for completed/failed Minions
 
 **Labels (simplified to 3 states):**
-- `ready-for-minion` → `in-progress` → `minion:done` / `minion:failed`
+- `gru:todo` → `gru:in-progress` → `gru:done` / `gru:failed`
 - No `claimed` intermediate state (goes directly to `in-progress`)
 - Detailed state (review, blocked, testing) in YAML comment events
 
@@ -1355,35 +1329,15 @@ After exhausting retries:
 - Monotonic counter stored in `~/.gru/state/next_id.txt`
 
 **Branch management:**
-- Format: `<type>/issue<number>-<slug>-<minion-id>`
-- Examples: `feat/issue123-add-user-auth-M007`, `fix/issue456-memory-leak-M00a`
-- Type prefix derived from issue labels (bug→fix, enhancement→feat, documentation→docs, etc.)
-- Slug: first 4 words of issue title, lowercased, hyphenated
+- Format: `minion/issue-<number>-<minion-id>`
+- Examples: `minion/issue-123-M007`, `minion/issue-456-M00a`
 - Branches from repository default branch (main/master/develop, detected via API)
 - On PR merge: delete both local and remote branch
 
 **Branch naming logic:**
 ```rust
-fn generate_branch_name(issue: &Issue, minion_id: &str) -> String {
-    let type_prefix = match issue.labels.as_slice() {
-        labels if labels.contains(&"bug") => "fix",
-        labels if labels.contains(&"enhancement") => "feat",
-        labels if labels.contains(&"documentation") => "docs",
-        labels if labels.contains(&"refactor") => "refactor",
-        _ => "feat", // default
-    };
-    
-    let slug = issue.title
-        .to_lowercase()
-        .split_whitespace()
-        .take(4)
-        .collect::<Vec<_>>()
-        .join("-")
-        .chars()
-        .filter(|c| c.is_alphanumeric() || *c == '-')
-        .collect::<String>();
-    
-    format!("{}/issue{}-{}-{}", type_prefix, issue.number, slug, minion_id)
+fn generate_branch_name(issue_number: i32, minion_id: &str) -> String {
+    format!("minion/issue-{}-{}", issue_number, minion_id)
 }
 ```
 

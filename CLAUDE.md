@@ -88,9 +88,9 @@ git commit --no-verify
 
 ### Module Structure
 
-- `src/main.rs` - CLI entry point using Clap, defines commands: init, do, review, rebase, path, attach, resume, clean, status, stop, prompt, prompts, lab
+- `src/main.rs` - CLI entry point using Clap, defines commands: init, do, review, rebase, path, attach, resume, clean, status, stop, prompt, prompts, lab, chat, logs, tail
 - `src/commands/` - Command handlers
-  - `fix.rs` - Handles `gru do`: creates worktrees, spawns Claude CLI with stream-json output, monitors progress
+  - `fix/` - Handles `gru do`: directory module with submodules for worktree setup, agent execution, monitoring, PR creation, and resolution
   - `review.rs` - Delegates PR review to Claude CLI
   - `prompt.rs` - Ad-hoc prompt execution (literal or from prompt files)
   - `prompts.rs` - Lists available prompt files
@@ -103,12 +103,21 @@ git commit --no-verify
   - `rebase.rs` - Rebase a Minion branch onto base
   - `lab.rs` - Daemon mode (polls for issues, spawns Minions)
   - `init.rs` - Initialize workspace for a repo
+  - `chat.rs` - Interactive chat with a Minion
+  - `logs.rs` - View Minion log files
+  - `tail.rs` - Tail Minion event streams
+  - `child_process.rs` - Child process management utilities
+- `src/agent.rs` - AgentBackend trait and AgentEvent model for multi-agent support
+- `src/agent_registry.rs` - Backend registration and resolution (maps agent names to backends)
+- `src/agent_runner.rs` - Generic agent execution and monitoring (backend-agnostic)
+- `src/claude_backend.rs` - Claude Code CLI backend implementation (implements AgentBackend)
+- `src/codex_backend.rs` - OpenAI Codex CLI backend implementation (implements AgentBackend)
 - `src/minion.rs` - Minion ID generation (monotonic counter, base36 format: M000, M001, etc.)
 - `src/minion_registry.rs` - Persistent Minion tracking (`~/.gru/state/minions.json` with file locking)
 - `src/minion_resolver.rs` - Resolve Minion by ID, issue number, or PR number
 - `src/workspace.rs` - Manages `~/.gru/` directory structure (repos, work, archive, state)
 - `src/git.rs` - Git operations (bare repos, worktrees, branch management)
-- `src/claude_runner.rs` - Claude CLI subprocess spawning, stream monitoring, timeout/stuck detection
+- `src/claude_runner.rs` - Claude CLI command builders (constructs TokioCommand values for ClaudeBackend)
 - `src/stream.rs` - Claude Code JSON stream parser (events: message_start, content_block_delta, etc.)
 - `src/progress.rs` - Terminal progress display (spinner, tool status)
 - `src/ci.rs` - CI monitoring, failure analysis, and auto-fix via Claude
@@ -123,6 +132,12 @@ git commit --no-verify
 - `src/text_buffer.rs` - Streaming text buffer with flush intervals
 - `src/reserved_commands.rs` - Reserved command name validation
 - `src/progress_comments.rs` - GitHub PR progress comment formatting
+- `src/labels.rs` - GitHub label constants and helpers (`gru:todo`, `gru:in-progress`, etc.)
+- `src/file_lock.rs` - Atomic file locking utilities
+- `src/log_viewer.rs` - Log viewing and streaming
+- `src/merge_judge.rs` - Merge readiness evaluation
+- `src/merge_readiness.rs` - PR merge readiness assessment
+- `src/session_claim.rs` - Session/workspace claiming logic
 
 ### Key Architectural Decisions
 
@@ -167,7 +182,13 @@ claude --print \
 - Worktrees are created from bare repos to avoid conflicts
 - Stale worktrees are automatically force-removed if they exist
 
-**Timeout & Stuck Detection** (constants in `claude_runner.rs`):
+**Multi-Agent Architecture:**
+- Pluggable agent backends via the `AgentBackend` trait (`src/agent.rs`)
+- `AgentRegistry` resolves agent names to backend implementations
+- Built-in backends: Claude Code CLI (`claude_backend.rs`), OpenAI Codex CLI (`codex_backend.rs`)
+- `AgentRunner` provides backend-agnostic execution and monitoring
+
+**Timeout & Stuck Detection** (constants in `agent_runner.rs`):
 - Stream timeout: 5 minutes per line (`STREAM_TIMEOUT_SECS = 300`)
 - Inactivity warning: 5 minutes (`INACTIVITY_WARNING_SECS = 300`)
 - Stuck threshold: 15 minutes (`INACTIVITY_STUCK_SECS = 900`)

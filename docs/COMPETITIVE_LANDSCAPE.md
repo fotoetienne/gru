@@ -154,7 +154,7 @@ Mobile client for remotely controlling Claude Code instances running on your com
 | **Multi-provider** | Claude focused (P1), pluggable later (P3+) | Claude only | ✅ 15+ providers | Claude only |
 | **Remote UI** | Tower (Phase 3+) | Desktop only | Desktop only | ✅ Mobile |
 | **Server Deployment** | ✅ Headless Labs | ❌ Desktop app | ❌ Desktop app | N/A |
-| **Maturity** | Phase 1 (early) | Shipped | Shipped | Shipped |
+| **Maturity** | V1 (feature-complete) | Shipped | Shipped | Shipped |
 
 ---
 
@@ -323,7 +323,7 @@ Mobile client for remotely controlling Claude Code instances running on your com
 **Goal**: Match Conductor's core orchestration by Q1 2025
 
 **Priorities**:
-1. Issue claiming via labels (`ready-for-minion`)
+1. Issue claiming via labels (`gru:todo`)
 2. Git worktree management
 3. Parallel Minion execution
 4. PR creation workflow

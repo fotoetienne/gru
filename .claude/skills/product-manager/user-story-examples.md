@@ -171,13 +171,13 @@ As a developer, I want my Lab to claim issues optimistically so that other Labs 
 Multiple Labs may poll the same repo. Claiming issues via labels prevents collisions and makes work visible in GitHub.
 
 ## Acceptance Criteria
-- [ ] Given an issue has label "ready-for-minion", when Lab claims it, then Lab adds "in-progress:M42" label
-- [ ] Given an issue has "in-progress:M42", when another Lab polls, then it skips that issue
-- [ ] Given a Minion fails, when Lab archives it, then Lab replaces "in-progress:M42" with "ready-for-minion"
-- [ ] Given a Minion completes, when PR merges, then Lab replaces "in-progress:M42" with "minion:done"
+- [ ] Given an issue has label "gru:todo", when Lab claims it, then Lab adds "gru:in-progress" label
+- [ ] Given an issue has "gru:in-progress", when another Lab polls, then it skips that issue
+- [ ] Given a Minion fails, when Lab archives it, then Lab replaces "gru:in-progress" with "gru:failed"
+- [ ] Given a Minion completes, when PR merges, then Lab replaces "gru:in-progress" with "gru:done"
 
 ## Technical Notes
-- Label format: `in-progress:<MINION_ID>` where MINION_ID is Lab hostname + counter
+- Label format: `gru:in-progress` (Minion ID tracked in comments, not labels)
 - Race condition possible: two Labs claim simultaneously → first PR wins (document in README)
 - Need GitHub token with `repo` scope
 

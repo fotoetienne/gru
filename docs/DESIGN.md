@@ -30,7 +30,7 @@
 
 ### What is Gru?
 
-**Gru** is a local-first orchestrator that runs LLM-powered agents (called **Minions**) to autonomously work on GitHub issues. Each Gru instance (a **Lab**) continuously monitors GitHub repositories for issues labeled `ready-for-minion`, claims them, implements solutions, runs tests via GitHub Actions, opens pull requests, and responds to code review feedback.
+**Gru** is a local-first orchestrator that runs LLM-powered agents (called **Minions**) to autonomously work on GitHub issues. Each Gru instance (a **Lab**) continuously monitors GitHub repositories for issues labeled `gru:todo`, claims them, implements solutions, runs tests via GitHub Actions, opens pull requests, and responds to code review feedback.
 
 ### Design Philosophy
 
@@ -45,7 +45,7 @@
 This design describes the **single-Lab MVP**:
 - ✅ One Lab instance (no multi-Lab coordination)
 - ✅ Multi-repo support (Lab watches multiple repos)
-- ✅ Simple 3-state label machine (`ready-for-minion` → `in-progress` → `done`/`failed`)
+- ✅ Simple label state machine (`gru:todo` → `gru:in-progress` → `gru:done`/`gru:failed`)
 - ✅ Local testing via pre-commit hooks + GitHub Actions for verification
 - ✅ In-memory state (no SQLite), file-based cursors
 - ✅ CLI-only (no web UI/Tower)
@@ -59,7 +59,7 @@ This design describes the **single-Lab MVP**:
 **CLI Framework:** Clap
 **GraphQL:** async-graphql (for Tower in future)
 **Web:** Axum (for Tower in future)
-**GitHub API:** octocrab
+**GitHub API:** gh CLI wrappers
 
 **Rationale:** See `docs/DECISIONS.md` for quantitative DMX analysis. Rust scored 0.890 vs Python 0.110 for this use case.
 
@@ -118,7 +118,7 @@ enum ClaudeEvent {
 - Event-based stuck detection (no activity timeout)
 - Structured logging to `events.jsonl`
 - JSON parsing is stable (no regex fragility)
-- No subprocess complexity (tmux/zellij not needed)
+- No subprocess complexity (no tmux/zellij dependency)
 
 ### Why This Approach
 
@@ -206,7 +206,7 @@ After evaluating 6 approaches via spike testing and DMX analysis:
 The **Lab** is the main process that orchestrates Minions.
 
 **Responsibilities:**
-- Poll GitHub for `ready-for-minion` issues
+- Poll GitHub for `gru:todo` issues
 - Manage Minion slots (max concurrent Minions)
 - Monitor PRs for review feedback and CI failures
 - Persist Minion state to disk
@@ -219,7 +219,7 @@ The **Lab** is the main process that orchestrates Minions.
 repos = ["owner/repo1", "owner/repo2"]
 poll_interval_secs = 30       # How often to check for new issues
 max_slots = 2                 # Max concurrent Minions
-label = "ready-for-minion"    # Label to watch for
+label = "gru:todo"             # Label to watch for
 ```
 
 ### Minion
@@ -257,14 +257,11 @@ struct Minion {
     lab_id: String,          // hostname of Lab
     repo: String,            // "owner/repo"
     issue_number: i32,       // 123
-    branch: String,          // e.g., "feat/issue123-add-user-auth-M007"
+    branch: String,          // e.g., "minion/issue-123-M007"
     state: MinionState,      // InProgress, Failed, Done, Orphaned
 
-    worktree_path: String,   // ~/.gru/work/owner/repo/M042
+    worktree_path: String,   // ~/.gru/work/owner/repo/minion/issue-123-M042/checkout/
     pr_number: Option<i32>,  // None until PR created
-
-    // tmux session (V1 uses tmux, not direct process management)
-    tmux_session: String,    // "gru-minion-M042"
 
     started_at: DateTime<Utc>,
     last_activity: DateTime<Utc>,
@@ -331,7 +328,7 @@ query FindReadyIssues($repo: String!) {
     issues(
       first: 20
       states: OPEN
-      labels: ["ready-for-minion"]
+      labels: ["gru:todo"]
       orderBy: {field: CREATED_AT, direction: ASC}
     ) {
       nodes {
@@ -687,33 +684,39 @@ async fn stream_input(&self, mut input: mpsc::Receiver<Vec<u8>>, minion: Arc<Min
 
 ### Issue States (Labels)
 
-**Simplified 3-state machine:**
+**Label state machine:**
 
 ```
+┌──────────┐
+│ gru:todo │  (user adds this when issue is ready)
+└────┬─────┘
+     │
+     │ Lab claims issue
+     ▼
 ┌─────────────────┐
-│ ready-for-minion│  (user adds this when issue is ready)
+│ gru:in-progress │  (Minion actively working)
 └────────┬────────┘
-         │
-         │ Lab claims issue
-         ▼
-  ┌──────────────┐
-  │ in-progress  │  (Minion actively working)
-  └──────┬───────┘
-         │
-         ├───────────┐
-         │           │
-         │           │ Max retries exceeded (10-15 attempts)
-         │           ▼
-         │     ┌──────────────┐
-         │     │ minion:failed│  (paused, needs human help)
-         │     └──────────────┘
-         │
-         │ PR merged or issue closed
-         ▼
-  ┌──────────────┐
-  │ minion:done  │  (archived, cleaned up)
-  └──────────────┘
+     │
+     ├───────────────┐
+     │               │
+     │               │ Max retries exceeded
+     │               ▼
+     │         ┌──────────────┐
+     │         │ gru:failed   │  (agent encountered failure)
+     │         └──────────────┘
+     │
+     │ PR merged or issue closed
+     ▼
+┌──────────┐
+│ gru:done │  (archived, cleaned up)
+└──────────┘
 ```
+
+**Additional labels:**
+- `gru:blocked` — Minion needs human help
+- `gru:ready-to-merge` — PR passes checks and is ready
+- `gru:auto-merge` — Auto-merge enabled on PR
+- `gru:needs-human-review` — PR requires human review before merge
 
 **Note:** Detailed states (planning, implementing, testing, review, blocked) are tracked in YAML comment events, not labels. Labels only reflect high-level lifecycle.
 
@@ -781,17 +784,12 @@ Starting work on this issue. I'll create a draft PR shortly.
 ### API Usage Patterns
 
 **Label Operations:**
-```rust
-// Add label
-// PUT /repos/{owner}/{repo}/issues/{issue_number}/labels
-// Body: ["claimed"]
+```bash
+# Add label
+gh issue edit {issue_number} --repo {owner}/{repo} --add-label "gru:in-progress"
 
-// Replace all labels
-// PUT /repos/{owner}/{repo}/issues/{issue_number}/labels
-// Body: ["in-progress", "minion:M42"]
-
-// Remove label
-// DELETE /repos/{owner}/{repo}/issues/{issue_number}/labels/{label}
+# Remove label
+gh issue edit {issue_number} --repo {owner}/{repo} --remove-label "gru:todo"
 ```
 
 **Comment Posting:**
@@ -889,8 +887,8 @@ headers.insert("If-Modified-Since", last_modified);
 
 ```rust
 async fn claim(&mut self, issue: Issue) -> Result<(), MinionError> {
-    // 1. Add 'claimed' label
-    self.github.add_label(&issue, "claimed").await?;
+    // 1. Add 'gru:in-progress' label
+    self.github.add_label(&issue, "gru:in-progress").await?;
 
     // 2. Post claim comment
     let comment = format_claim_comment(&self.id, &self.lab_id);
@@ -913,8 +911,8 @@ async fn claim(&mut self, issue: Issue) -> Result<(), MinionError> {
         Err(e) => return Err(e.into()),
     }
 
-    // 5. Update label: claimed -> in-progress
-    self.github.replace_labels(&issue, &["in-progress"]).await?;
+    // 5. Remove 'gru:todo' label
+    self.github.remove_label(&issue, "gru:todo").await?;
 
     Ok(())
 }
@@ -1046,7 +1044,7 @@ async fn handle_review(&mut self) -> Result<(), MinionError> {
 ```rust
 async fn complete(&mut self) -> Result<(), MinionError> {
     // Add done label
-    self.github.add_label(&self.issue, "minion:done").await?;
+    self.github.add_label(&self.issue, "gru:done").await?;
 
     // Post completion comment with metrics
     self.post_completion_comment().await?;
@@ -1137,7 +1135,7 @@ async fn reconcile_state(&self) -> Result<(), LabError> {
 
         // Resume or abandon based on state
         match actual_state.as_str() {
-            "in-progress" => {
+            "gru:in-progress" => {
                 let minion_clone = minion.clone();
                 tokio::spawn(async move {
                     minion_clone.resume().await;
@@ -1149,7 +1147,7 @@ async fn reconcile_state(&self) -> Result<(), LabError> {
                     minion_clone.monitor_review().await;
                 });
             }
-            "minion:done" | "minion:failed" => {
+            "gru:done" | "gru:failed" => {
                 minion.cleanup().await?;
             }
             _ => {}
@@ -1346,7 +1344,7 @@ async fn escalate(&mut self, reason: &str) -> Result<(), MinionError> {
     self.db.update_minion(self).await?;
 
     // Add label
-    self.github.add_label(&self.issue, "minion:blocked").await?;
+    self.github.add_label(&self.issue, "gru:blocked").await?;
 
     // Post escalation comment
     let comment = format!(
@@ -1405,7 +1403,7 @@ async fn recover(&self) -> Result<(), LabError> {
             let issue = self.github.get_issue(minion.issue_number).await?;
             let labels = &issue.labels;
 
-            if has_label(labels, "in-progress") {
+            if has_label(labels, "gru:in-progress") {
                 // Still marked as in-progress on GitHub
                 // Try to resume or fail gracefully
                 if minion.can_resume() {
@@ -1658,8 +1656,8 @@ max_slots = 2
 # Polling interval (seconds)
 poll_interval_secs = 30
 
-# Label to watch for issues (default: "ready-for-minion")
-label = "ready-for-minion"
+# Label to watch for issues (default: "gru:todo")
+label = "gru:todo"
 ```
 
 ---
