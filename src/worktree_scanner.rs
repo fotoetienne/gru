@@ -103,30 +103,12 @@ impl Worktree {
         Ok(Some(state == "CLOSED"))
     }
 
-    /// Check if the branch has been deleted on the remote
+    /// Check if the branch has been deleted on the remote.
+    ///
+    /// Uses `git ls-remote` to query the remote directly, avoiding
+    /// `git fetch --prune` which fails with a scary "fatal: refusing to fetch"
+    /// warning when the branch is checked out in an active worktree.
     pub async fn check_remote_deleted(&self) -> Result<bool> {
-        // First fetch to ensure we have latest remote info
-        let fetch_output = Command::new("git")
-            .args([
-                "-C",
-                &self.bare_repo_path.to_string_lossy(),
-                "fetch",
-                "--prune",
-            ])
-            .output()
-            .await
-            .context("Failed to fetch from remote")?;
-
-        if !fetch_output.status.success() {
-            // If fetch fails, be conservative and assume branch exists
-            log::warn!(
-                "Warning: Failed to fetch from remote: {}",
-                String::from_utf8_lossy(&fetch_output.stderr)
-            );
-            return Ok(false);
-        }
-
-        // Check if remote branch exists
         let output = Command::new("git")
             .args([
                 "-C",
@@ -139,6 +121,17 @@ impl Worktree {
             .output()
             .await
             .context("Failed to check remote branch")?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            log::warn!(
+                "ls-remote failed for branch '{}': {}",
+                self.branch,
+                stderr.trim()
+            );
+            // Be conservative on failure — assume branch still exists
+            return Ok(false);
+        }
 
         // If ls-remote returns empty, the branch doesn't exist on remote
         Ok(output.stdout.is_empty())
