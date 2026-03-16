@@ -1,5 +1,5 @@
 use super::types::{ExistingMinionCheck, IssueContext, IssueDetails};
-use crate::minion_registry::{is_process_alive, with_registry, MinionMode, OrchestrationPhase};
+use crate::minion_registry::{is_process_alive, with_registry, MinionMode};
 use crate::url_utils::parse_issue_info;
 use anyhow::{Context, Result};
 
@@ -94,13 +94,13 @@ pub(super) async fn check_existing_minions(
     }
 
     // All minions are stopped - find the best candidate for resume.
-    // Look for one that hasn't completed/failed and whose worktree still exists.
-    let resumable = existing.iter().find(|(_, info)| {
-        !matches!(
-            info.orchestration_phase,
-            OrchestrationPhase::Completed | OrchestrationPhase::Failed
-        ) && info.worktree.exists()
-    });
+    // Look for one that isn't in a terminal state and whose worktree still exists.
+    // Note: Setup-phase minions without a live process may match here if their
+    // worktree exists (since Setup is not terminal). In practice, stale Setup
+    // entries rarely have worktrees — Lab's prune_stale_entries cleans them up.
+    let resumable = existing
+        .iter()
+        .find(|(_, info)| !info.orchestration_phase.is_terminal() && info.worktree.exists());
 
     if let Some((minion_id, info)) = resumable {
         return Ok(ExistingMinionCheck::Resumable(
@@ -109,28 +109,9 @@ pub(super) async fn check_existing_minions(
         ));
     }
 
-    // Check if any minion failed — require --force-new to prevent silent retry
-    let has_failed = existing
-        .iter()
-        .any(|(_, info)| matches!(info.orchestration_phase, OrchestrationPhase::Failed));
-
-    if has_failed {
-        let (failed_id, _) = existing
-            .iter()
-            .find(|(_, info)| matches!(info.orchestration_phase, OrchestrationPhase::Failed))
-            .unwrap();
-        eprintln!(
-            "Error: Minion {} previously failed for issue {}.",
-            failed_id, issue_num
-        );
-        eprintln!("\nOptions:");
-        eprintln!(
-            "  - Create new session:   gru do https://github.com/{}/{}/issues/{} --force-new",
-            owner, repo, issue_num
-        );
-        return Ok(ExistingMinionCheck::AlreadyRunning);
-    }
-
+    // No running and no resumable minions — allow a fresh attempt. This covers
+    // both all-terminal minions (Failed/Completed) and non-terminal ones whose
+    // worktrees no longer exist. Lab can automatically retry without --force-new.
     Ok(ExistingMinionCheck::None)
 }
 
