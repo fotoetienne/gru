@@ -46,7 +46,7 @@ gru do 42 --timeout 30m
 gru do 42 --agent codex
 ```
 
-**`gru review <pr>`** - Review a GitHub pull request using Claude CLI
+**`gru review <pr>`** - Review a GitHub pull request using the configured agent backend
 
 ```bash
 gru review 42
@@ -92,8 +92,8 @@ binary = "/usr/local/bin/claude"   # Optional: override binary path
 `gru status` shows which agent each Minion is using:
 
 ```
-ID       AGENT    REPO                 ISSUE  TASK       PR       BRANCH                         MODE                   UPTIME   TOKENS
-M001     claude-code owner/repo           #42    do         #43      minion/issue-42-M001           monitoring (PR ready)  5m       1.2M
+MINION   AGENT    REPO                 ISSUE  TASK       PR       BRANCH                         MODE                   UPTIME   TOKENS
+M001     claude   owner/repo           #42    do         #43      minion/issue-42-M001           monitoring (PR ready)  5m       1.2M
 M002     codex    owner/repo           #44    do         -        minion/issue-44-M002           working                2m       -
 ```
 

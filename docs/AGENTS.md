@@ -40,11 +40,11 @@ binary = "/usr/local/bin/claude"
 Gru spawns Claude Code in non-interactive mode with stream JSON output:
 
 ```bash
-claude --print --verbose --output-format stream-json --dangerously-skip-permissions --include-partial-messages "<prompt>"
+claude --print --verbose --session-id <uuid> --output-format stream-json --dangerously-skip-permissions --include-partial-messages "<prompt>"
 ```
 
 Key flags:
-- `--print` — non-interactive (no TTY)
+- `--print` — non-interactive (prints to stdout and exits)
 - `--verbose` — include tool calls in output
 - `--output-format stream-json` — real-time event stream
 - `--dangerously-skip-permissions` — autonomous operation
@@ -89,7 +89,7 @@ Resume support uses:
 codex exec resume --last --json --full-auto "<prompt>"
 ```
 
-Note: Codex does not support interactive resume (`gru attach` will not work with Codex minions).
+Note: Codex does not support interactive resume (`gru attach` will not work with Codex minions). Codex also ignores the `session_id` parameter — it relies on its own session persistence for both new and resumed sessions.
 
 ## Selecting a Backend
 
