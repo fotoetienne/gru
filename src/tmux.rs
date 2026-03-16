@@ -31,6 +31,15 @@ impl TmuxGuard {
             original_name: original,
         }
     }
+
+    /// Update the window name while keeping the same restore-on-drop behavior.
+    ///
+    /// No-op if not inside tmux (i.e., if the guard was created as a no-op).
+    pub fn rename(&self, name: &str) {
+        if self.original_name.is_some() {
+            rename_window(name);
+        }
+    }
 }
 
 impl Drop for TmuxGuard {
@@ -73,7 +82,12 @@ fn save_current_name() -> Option<String> {
 /// window that contains the current pane. This relies on the `$TMUX`
 /// socket path set by tmux on session creation.
 fn rename_window(name: &str) {
-    let _ = Command::new("tmux").args(["rename-window", name]).output();
+    let _ = Command::new("tmux")
+        .args(["rename-window", name])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
 }
 
 #[cfg(test)]
