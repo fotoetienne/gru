@@ -123,6 +123,12 @@ impl Worktree {
             .context("Failed to check remote branch")?;
 
         if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            log::warn!(
+                "ls-remote failed for branch '{}': {}",
+                self.branch,
+                stderr.trim()
+            );
             // Be conservative on failure — assume branch still exists
             return Ok(false);
         }

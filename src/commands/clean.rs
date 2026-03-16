@@ -126,6 +126,12 @@ impl std::fmt::Display for DirtySummary {
     }
 }
 
+/// Returns `true` when `stderr` is the expected git message for fetching
+/// into a branch that is checked out in a worktree (not a real error).
+fn is_expected_fetch_refusal(stderr: &str) -> bool {
+    stderr.contains("refusing to fetch into branch") && stderr.contains("checked out at")
+}
+
 /// Count modified and untracked files from `git status --porcelain` output.
 fn count_dirty_files(porcelain_output: &str) -> DirtySummary {
     let mut modified = 0usize;
@@ -375,9 +381,10 @@ pub async fn handle_clean(dry_run: bool, force: bool, base_branch: &str) -> Resu
         .map(|wt| wt.path.canonicalize().unwrap_or_else(|_| wt.path.clone()))
         .collect();
 
-    // Fetch once per bare repo to update remote-tracking refs for check_merged().
-    // check_remote_deleted() uses git ls-remote (a live query) so doesn't need this,
-    // but check_merged() compares against local refs which must be up-to-date.
+    // Fetch once per bare repo so that local refs (e.g. `main`) are current.
+    // check_merged() runs `git branch --merged <base_branch>` against local refs,
+    // so without a fetch it may miss recently-merged branches.
+    // check_remote_deleted() uses git ls-remote (a live query) so doesn't need this.
     // If fetch fails, subsequent checks proceed with potentially stale refs — this is
     // intentionally conservative (no worktrees are incorrectly cleaned).
     let bare_repos: HashSet<_> = worktrees
@@ -386,7 +393,9 @@ pub async fn handle_clean(dry_run: bool, force: bool, base_branch: &str) -> Resu
         .collect();
     for bare_repo in &bare_repos {
         let fetch_output = Command::new("git")
-            .args(["-C", &bare_repo.to_string_lossy(), "fetch", "--prune"])
+            .arg("-C")
+            .arg(bare_repo)
+            .args(["fetch", "--prune"])
             .output()
             .await;
 
@@ -396,9 +405,7 @@ pub async fn handle_clean(dry_run: bool, force: bool, base_branch: &str) -> Resu
                 // Git refuses to fetch into a ref checked out in a worktree, producing
                 // "fatal: refusing to fetch into branch '...' checked out at '...'".
                 // This is expected for active worktrees and not an error.
-                if !(stderr.contains("refusing to fetch into branch")
-                    && stderr.contains("checked out at"))
-                {
+                if !is_expected_fetch_refusal(&stderr) {
                     log::warn!(
                         "Failed to fetch for {}: {}",
                         bare_repo.display(),
@@ -1001,6 +1008,34 @@ mod tests {
             extract_minion_id_from_dir("some-other-dir"),
             "some-other-dir"
         );
+    }
+
+    // --- is_expected_fetch_refusal tests ---
+
+    #[test]
+    fn test_expected_fetch_refusal_matches() {
+        let stderr = "fatal: refusing to fetch into branch 'refs/heads/minion/issue-42-M001' checked out at '/Users/dev/.gru/work/owner/repo/minion/issue-42-M001/checkout'\n";
+        assert!(is_expected_fetch_refusal(stderr));
+    }
+
+    #[test]
+    fn test_expected_fetch_refusal_partial_match_not_suppressed() {
+        // Only "refusing to fetch" without "checked out at" should not be suppressed
+        assert!(!is_expected_fetch_refusal(
+            "fatal: refusing to fetch into branch 'refs/heads/main'"
+        ));
+    }
+
+    #[test]
+    fn test_expected_fetch_refusal_unrelated_error() {
+        assert!(!is_expected_fetch_refusal(
+            "fatal: could not read from remote repository"
+        ));
+    }
+
+    #[test]
+    fn test_expected_fetch_refusal_empty() {
+        assert!(!is_expected_fetch_refusal(""));
     }
 
     // --- count_dirty_files tests ---
