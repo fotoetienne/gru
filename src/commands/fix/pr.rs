@@ -182,6 +182,53 @@ async fn create_pr_for_issue(
     Ok(pr_number)
 }
 
+/// Saves PR state, updates the minion registry, and marks the issue done.
+/// Used by both the normal PR creation path and the "already exists" recovery path.
+///
+/// Errors are propagated — callers that need best-effort semantics should
+/// handle errors themselves rather than using `?`.
+async fn finalize_pr(
+    issue_ctx: &IssueContext,
+    wt_ctx: &WorktreeContext,
+    pr_number: &str,
+) -> Result<()> {
+    // Save PR state to minion_dir (metadata)
+    let pr_state = PrState::new(pr_number.to_string(), issue_ctx.issue_num.to_string());
+    pr_state
+        .save(&wt_ctx.minion_dir)
+        .context("Failed to save PR state")?;
+
+    // Update registry with PR number
+    let minion_id_clone = wt_ctx.minion_id.clone();
+    let pr_number_clone = pr_number.to_string();
+    with_registry(move |registry| {
+        registry.update(&minion_id_clone, |info| {
+            info.pr = Some(pr_number_clone);
+            info.status = "idle".to_string();
+        })
+    })
+    .await?;
+
+    // Mark issue as done (fire-and-forget)
+    match crate::github::mark_issue_done_via_cli(
+        &issue_ctx.host,
+        &issue_ctx.owner,
+        &issue_ctx.repo,
+        issue_ctx.issue_num,
+    )
+    .await
+    {
+        Ok(()) => {
+            println!("🏷️  Updated issue label to '{}'", crate::labels::DONE);
+        }
+        Err(e) => {
+            log::warn!("⚠️  Failed to update issue label: {}", e);
+        }
+    }
+
+    Ok(())
+}
+
 /// Creates a PR for the branch and updates labels/registry.
 /// Returns the PR number if successful.
 pub(crate) async fn handle_pr_creation(
@@ -224,45 +271,13 @@ pub(crate) async fn handle_pr_creation(
     .await
     {
         Ok(pr_number) => {
-            // Save PR state to minion_dir (metadata)
-            let pr_state = PrState::new(pr_number.clone(), issue_ctx.issue_num.to_string());
-            pr_state
-                .save(&wt_ctx.minion_dir)
-                .context("Failed to save PR state")?;
-
-            // Update registry with PR number
-            let minion_id_clone = wt_ctx.minion_id.clone();
-            let pr_number_clone = pr_number.clone();
-            with_registry(move |registry| {
-                registry.update(&minion_id_clone, |info| {
-                    info.pr = Some(pr_number_clone);
-                    info.status = "idle".to_string();
-                })
-            })
-            .await?;
+            finalize_pr(issue_ctx, wt_ctx, &pr_number).await?;
 
             println!("✅ Draft PR created: #{}", pr_number);
             println!(
                 "🔗 View PR at: https://{}/{}/{}/pull/{}",
                 issue_ctx.host, issue_ctx.owner, issue_ctx.repo, pr_number
             );
-
-            // Mark issue as done (fire-and-forget)
-            match crate::github::mark_issue_done_via_cli(
-                &issue_ctx.host,
-                &issue_ctx.owner,
-                &issue_ctx.repo,
-                issue_ctx.issue_num,
-            )
-            .await
-            {
-                Ok(()) => {
-                    println!("🏷️  Updated issue label to '{}'", crate::labels::DONE);
-                }
-                Err(e) => {
-                    log::warn!("⚠️  Failed to update issue label: {}", e);
-                }
-            }
 
             Ok(Some(pr_number))
         }
@@ -273,7 +288,7 @@ pub(crate) async fn handle_pr_creation(
                     "ℹ️  A PR already exists for branch '{}', recovering PR number...",
                     wt_ctx.branch_name
                 );
-                // Recover the existing PR number
+                // Recover the existing PR number via `gh pr list --head <branch>`
                 match crate::ci::get_pr_number(
                     &issue_ctx.host,
                     &issue_ctx.owner,
@@ -286,49 +301,19 @@ pub(crate) async fn handle_pr_creation(
                         let pr_number = pr_num.to_string();
                         println!("✅ Recovered existing PR #{}", pr_number);
 
-                        // Save PR state and update registry, same as successful creation
-                        let pr_state =
-                            PrState::new(pr_number.clone(), issue_ctx.issue_num.to_string());
-                        if let Err(e) = pr_state.save(&wt_ctx.minion_dir) {
-                            log::warn!("⚠️  Failed to save PR state: {}", e);
-                        }
-
-                        let minion_id_clone = wt_ctx.minion_id.clone();
-                        let pr_number_clone = pr_number.clone();
-                        if let Err(e) = with_registry(move |registry| {
-                            registry.update(&minion_id_clone, |info| {
-                                info.pr = Some(pr_number_clone);
-                                info.status = "idle".to_string();
-                            })
-                        })
-                        .await
-                        {
-                            log::warn!("⚠️  Failed to update registry with PR number: {}", e);
-                        }
-
-                        // Mark issue as done (fire-and-forget), same as success path
-                        match crate::github::mark_issue_done_via_cli(
-                            &issue_ctx.host,
-                            &issue_ctx.owner,
-                            &issue_ctx.repo,
-                            issue_ctx.issue_num,
-                        )
-                        .await
-                        {
-                            Ok(()) => {
-                                println!("🏷️  Updated issue label to '{}'", crate::labels::DONE);
-                            }
-                            Err(e) => {
-                                log::warn!("⚠️  Failed to update issue label: {}", e);
-                            }
+                        // Best-effort: log warnings instead of propagating errors,
+                        // since losing the recovered PR number would be worse than
+                        // missing metadata (which can be recovered on next resume).
+                        if let Err(e) = finalize_pr(issue_ctx, wt_ctx, &pr_number).await {
+                            log::warn!("⚠️  Failed to finalize recovered PR state: {}", e);
                         }
 
                         Ok(Some(pr_number))
                     }
                     Ok(None) => {
                         log::warn!(
-                            "⚠️  PR exists for branch '{}' but could not be found via API. \
-                             This may be a transient GitHub API failure; retry with 'gru resume'.",
+                            "⚠️  PR exists for branch '{}' but `gh pr list --head` returned no results. \
+                             This may be a transient GitHub API issue or auth problem; retry with 'gru resume'.",
                             wt_ctx.branch_name
                         );
                         Ok(None)
@@ -341,9 +326,23 @@ pub(crate) async fn handle_pr_creation(
             } else if err_msg.contains("branch not found") || err_msg.contains("does not exist") {
                 log::warn!("⚠️  Branch was pushed but is no longer available.");
                 log::warn!("   It may have been deleted or force-pushed.");
+                log::warn!(
+                    "   You can create the PR manually at: https://{}/{}/{}/compare/{}",
+                    issue_ctx.host,
+                    issue_ctx.owner,
+                    issue_ctx.repo,
+                    wt_ctx.branch_name
+                );
                 Ok(None)
             } else {
                 log::warn!("⚠️  Failed to create PR: {}", e);
+                log::warn!(
+                    "   You can create the PR manually at: https://{}/{}/{}/compare/{}",
+                    issue_ctx.host,
+                    issue_ctx.owner,
+                    issue_ctx.repo,
+                    wt_ctx.branch_name
+                );
                 Ok(None)
             }
         }
