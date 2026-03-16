@@ -681,15 +681,15 @@ pub(crate) async fn monitor_ci_after_fix(
 
     // Backfill the minion registry if it has pr: null but we discovered a PR
     let mid = minion_id.to_string();
-    let pr_str = pr_number.to_string();
+    let pr_num_for_backfill = pr_number;
     if let Err(e) = crate::minion_registry::with_registry(move |registry| {
         registry.update(&mid, |info| {
             if info.pr.is_none() {
                 log::info!(
                     "📝 Backfilling registry: minion now linked to PR #{}",
-                    pr_str
+                    pr_num_for_backfill
                 );
-                info.pr = Some(pr_str.clone());
+                info.pr = Some(pr_num_for_backfill.to_string());
             }
         })
     })
