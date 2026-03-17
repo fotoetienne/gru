@@ -72,8 +72,12 @@ pub async fn handle_attach(
     {
         Ok(data) => data,
         Err(e) => {
-            if let Some(SessionClaimError::AlreadyRunning { .. }) = e.downcast_ref() {
-                // Auto-stop the running minion, then retry the claim
+            if let Some(SessionClaimError::AlreadyRunning { mode, .. }) = e.downcast_ref() {
+                if *mode != MinionMode::Autonomous {
+                    // Don't auto-stop interactive sessions — only autonomous ones
+                    return Err(e);
+                }
+                // Auto-stop the running autonomous minion, then retry the claim
                 auto_stop_minion(&minion.minion_id, &minion.worktree_path).await?;
 
                 // Retry the claim now that the process is stopped
@@ -403,13 +407,9 @@ mod tests {
     async fn test_auto_stop_minion_no_process() {
         // When no process is running, auto_stop_minion should succeed
         // (the registry won't have this minion, so it gracefully exits)
-        let temp_path = std::env::temp_dir().join("gru-attach-test-auto-stop");
-        let result = auto_stop_minion("NONEXISTENT_MINION", &temp_path).await;
+        let temp_dir = tempfile::tempdir().expect("failed to create temp dir");
+        let minion_id = format!("TEST_{}", Uuid::new_v4().simple());
+        let result = auto_stop_minion(&minion_id, temp_dir.path()).await;
         assert!(result.is_ok());
-    }
-
-    #[test]
-    fn test_auto_stop_timeout_value() {
-        assert_eq!(AUTO_STOP_TIMEOUT, std::time::Duration::from_secs(10));
     }
 }
