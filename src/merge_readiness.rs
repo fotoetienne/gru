@@ -109,7 +109,7 @@ pub async fn check_merge_readiness(
     )?;
 
     let ci_passing = evaluate_ci(&check_runs) && evaluate_combined_status(&combined_status);
-    let review_approved = evaluate_reviews(&reviews);
+    let review_approved = evaluate_reviews(&reviews, &pr.author_login);
     let no_conflicts = pr.mergeable == Some(true);
 
     Ok(MergeReadiness {
@@ -128,6 +128,8 @@ struct PrDetails {
     draft: bool,
     /// `None` means GitHub hasn't computed mergeability yet.
     mergeable: Option<bool>,
+    /// Login of the PR author.
+    author_login: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -136,6 +138,12 @@ struct PrApiResponse {
     mergeable: Option<bool>,
     #[serde(default)]
     draft: bool,
+    user: PrUser,
+}
+
+#[derive(Debug, Deserialize)]
+struct PrUser {
+    login: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -248,6 +256,7 @@ async fn get_pr_details(host: &str, owner: &str, repo: &str, pr_number: &str) ->
         head_sha: pr.head.sha,
         draft: pr.draft,
         mergeable: pr.mergeable,
+        author_login: pr.user.login,
     })
 }
 
@@ -367,11 +376,19 @@ fn evaluate_combined_status(status: &CombinedStatus) -> bool {
 ///
 /// DISMISSED reviews clear the reviewer's prior state entirely, fixing a bug
 /// where a dismissed CHANGES_REQUESTED would still block.
-fn evaluate_reviews(reviews: &[ReviewApiResponse]) -> bool {
+///
+/// **Self-review exception:** GitHub prevents users from approving their own PRs,
+/// so self-reviews can only produce COMMENTED state. When the PR author has left
+/// a COMMENTED review (self-review) and no other reviewer has blocked, the review
+/// gate is satisfied. This allows autonomous minions to pass the merge-readiness
+/// check without requiring an external reviewer.
+fn evaluate_reviews(reviews: &[ReviewApiResponse], pr_author: &str) -> bool {
     use std::collections::HashMap;
 
     // Build per-reviewer last-state map (reviews come chronologically from API)
     let mut reviewer_state: HashMap<&str, &str> = HashMap::new();
+    let mut author_commented = false;
+
     for review in reviews {
         let state = review.state.as_str();
         match state {
@@ -382,8 +399,13 @@ fn evaluate_reviews(reviews: &[ReviewApiResponse]) -> bool {
                 // DISMISSED clears the reviewer's prior state
                 reviewer_state.remove(review.user.login.as_str());
             }
+            "COMMENTED" => {
+                if review.user.login == pr_author {
+                    author_commented = true;
+                }
+            }
             _ => {
-                // COMMENTED, PENDING — don't change approval state
+                // PENDING — don't change approval state
             }
         }
     }
@@ -391,7 +413,18 @@ fn evaluate_reviews(reviews: &[ReviewApiResponse]) -> bool {
     let has_approval = reviewer_state.values().any(|&s| s == "APPROVED");
     let has_blocking = reviewer_state.values().any(|&s| s == "CHANGES_REQUESTED");
 
-    has_approval && !has_blocking
+    if has_blocking {
+        return false;
+    }
+
+    // Standard path: at least one external APPROVED review
+    if has_approval {
+        return true;
+    }
+
+    // Self-review exception: the author left a COMMENTED review (GitHub prevents
+    // self-approval) and no other reviewer has blocked.
+    author_commented
 }
 
 #[cfg(test)]
@@ -577,12 +610,12 @@ mod tests {
                 login: "alice".into(),
             },
         }];
-        assert!(evaluate_reviews(&reviews));
+        assert!(evaluate_reviews(&reviews, "author"));
     }
 
     #[test]
     fn test_reviews_no_reviews() {
-        assert!(!evaluate_reviews(&[]));
+        assert!(!evaluate_reviews(&[], "author"));
     }
 
     #[test]
@@ -593,7 +626,7 @@ mod tests {
                 login: "alice".into(),
             },
         }];
-        assert!(!evaluate_reviews(&reviews));
+        assert!(!evaluate_reviews(&reviews, "author"));
     }
 
     #[test]
@@ -604,7 +637,7 @@ mod tests {
                 login: "alice".into(),
             },
         }];
-        assert!(!evaluate_reviews(&reviews));
+        assert!(!evaluate_reviews(&reviews, "author"));
     }
 
     #[test]
@@ -623,7 +656,7 @@ mod tests {
                 },
             },
         ];
-        assert!(!evaluate_reviews(&reviews));
+        assert!(!evaluate_reviews(&reviews, "author"));
     }
 
     #[test]
@@ -642,7 +675,7 @@ mod tests {
                 },
             },
         ];
-        assert!(evaluate_reviews(&reviews));
+        assert!(evaluate_reviews(&reviews, "author"));
     }
 
     #[test]
@@ -667,7 +700,7 @@ mod tests {
                 },
             },
         ];
-        assert!(evaluate_reviews(&reviews));
+        assert!(evaluate_reviews(&reviews, "author"));
     }
 
     #[test]
@@ -694,7 +727,7 @@ mod tests {
             },
         ];
         // Bob's CHANGES_REQUESTED was dismissed, Alice approved → ready
-        assert!(evaluate_reviews(&reviews));
+        assert!(evaluate_reviews(&reviews, "author"));
     }
 
     #[test]
@@ -706,7 +739,7 @@ mod tests {
                 login: "alice".into(),
             },
         }];
-        assert!(!evaluate_reviews(&reviews));
+        assert!(!evaluate_reviews(&reviews, "author"));
     }
 
     #[test]
@@ -725,7 +758,74 @@ mod tests {
                 },
             },
         ];
-        assert!(evaluate_reviews(&reviews));
+        assert!(evaluate_reviews(&reviews, "author"));
+    }
+
+    // --- Self-review tests ---
+
+    #[test]
+    fn test_reviews_self_review_comment_satisfies_gate() {
+        // PR author left a COMMENTED review (self-review). GitHub prevents
+        // self-approval, so COMMENTED is the best the author can do.
+        let reviews = vec![ReviewApiResponse {
+            state: "COMMENTED".into(),
+            user: ReviewUser {
+                login: "minion-bot".into(),
+            },
+        }];
+        assert!(evaluate_reviews(&reviews, "minion-bot"));
+    }
+
+    #[test]
+    fn test_reviews_self_review_comment_blocked_by_changes_requested() {
+        // Author self-reviewed, but another reviewer requested changes — blocked.
+        let reviews = vec![
+            ReviewApiResponse {
+                state: "COMMENTED".into(),
+                user: ReviewUser {
+                    login: "minion-bot".into(),
+                },
+            },
+            ReviewApiResponse {
+                state: "CHANGES_REQUESTED".into(),
+                user: ReviewUser {
+                    login: "alice".into(),
+                },
+            },
+        ];
+        assert!(!evaluate_reviews(&reviews, "minion-bot"));
+    }
+
+    #[test]
+    fn test_reviews_non_author_comment_does_not_satisfy_gate() {
+        // COMMENTED review from someone other than the author should NOT satisfy gate.
+        let reviews = vec![ReviewApiResponse {
+            state: "COMMENTED".into(),
+            user: ReviewUser {
+                login: "alice".into(),
+            },
+        }];
+        assert!(!evaluate_reviews(&reviews, "minion-bot"));
+    }
+
+    #[test]
+    fn test_reviews_self_review_with_external_approval() {
+        // Both self-review and external approval — should pass.
+        let reviews = vec![
+            ReviewApiResponse {
+                state: "COMMENTED".into(),
+                user: ReviewUser {
+                    login: "minion-bot".into(),
+                },
+            },
+            ReviewApiResponse {
+                state: "APPROVED".into(),
+                user: ReviewUser {
+                    login: "alice".into(),
+                },
+            },
+        ];
+        assert!(evaluate_reviews(&reviews, "minion-bot"));
     }
 
     // --- MergeReadiness tests ---
@@ -849,6 +949,7 @@ mod tests {
             head_sha: "abc123".into(),
             draft: false,
             mergeable: None,
+            author_login: "author".into(),
         };
         assert!(pr.mergeable != Some(true));
     }
@@ -859,6 +960,7 @@ mod tests {
             head_sha: "abc123".into(),
             draft: false,
             mergeable: Some(false),
+            author_login: "author".into(),
         };
         assert!(pr.mergeable != Some(true));
     }
@@ -869,6 +971,7 @@ mod tests {
             head_sha: "abc123".into(),
             draft: false,
             mergeable: Some(true),
+            author_login: "author".into(),
         };
         assert!(pr.mergeable == Some(true));
     }
