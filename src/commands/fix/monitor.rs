@@ -703,6 +703,9 @@ pub(crate) async fn monitor_pr_lifecycle(
                         // detected. Reviews posted during the rebase will have
                         // submitted_at > check_time and be caught on the next poll.
                         review_baseline = Some(check_time);
+                        // Note: save_review_check_time is intentionally not called here.
+                        // check_time marks the start of the conflict window, not a point
+                        // where reviews were processed. The exit-time save will persist it.
                         println!("✅ Rebase succeeded, continuing to monitor PR...\n");
                     }
                     Ok(false) => {
