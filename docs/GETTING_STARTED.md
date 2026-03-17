@@ -57,10 +57,7 @@ Gru picks up issues labeled `gru:todo`. Find a small, well-scoped issue in your 
 gh issue edit 42 --add-label "gru:todo" --repo owner/repo
 ```
 
-If the label doesn't exist yet:
-```bash
-gh label create "gru:todo" --color "#0075ca" --repo owner/repo
-```
+**Note:** `gru init` automatically creates all required `gru:*` labels when you initialize a repo, so you normally don't need to create them manually.
 
 **Tip:** Start with a small bug fix or docs update. A focused issue with clear acceptance criteria gives Gru the best chance of getting it right on the first try.
 
@@ -78,7 +75,7 @@ gru do https://github.com/owner/repo/issues/42
 
 Here's what happens:
 
-1. **Worktree created** — Gru creates an isolated git checkout at `~/.gru/work/owner/repo/minion/issue-42-<ID>/checkout/`. Your working directory is untouched.
+1. **Worktree created** — Gru creates an isolated git checkout at `~/.gru/work/owner/repo/minion/issue-42-M001/checkout/`. Your working directory is untouched.
 2. **Agent spawned** — Claude Code starts in that worktree with the issue as its task. It has full tool access: reading/writing files, running tests, calling the GitHub API.
 3. **PR created** — When the agent is satisfied, it opens a draft PR and continues monitoring.
 4. **CI and reviews handled** — Gru watches for CI failures and review comments, feeding them back to the agent for fixes.
@@ -95,8 +92,8 @@ gru status          # list all active Minions
 
 Output looks like:
 ```
-MINION  AGENT   REPO        ISSUE  PR    BRANCH                MODE                   UPTIME  TOKENS
-M001    claude  owner/repo  #42    #43   minion/issue-42-M001  monitoring (PR ready)  5m      1.2M
+MINION   AGENT    REPO        ISSUE    TASK  PR    BRANCH                MODE                   UPTIME   TOKENS
+M001     claude   owner/repo  #42      -     #43   minion/issue-42-M001  monitoring (PR ready)  5m       1.2M
 ```
 
 Attach to a running Minion to see the live stream:
