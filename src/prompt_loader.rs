@@ -169,7 +169,7 @@ Review this pull request: fetch details, analyze changes, and provide code revie
   - `--request-changes -b "review content"` if changes are required AND it's not your own PR
 - Use a HEREDOC for multi-line review content to preserve formatting
 - **IMPORTANT**: ALWAYS verify the gh command succeeded by checking its exit status and any error output. If the command fails, inform the user of the issue
-- **Attribution**: Always end your review body with this footer on its own line: `\n\n<sub>🤖 {{ minion_id }}</sub>`
+{{ minion_attribution_instruction }}
 "#,
     },
     BuiltInPrompt {
