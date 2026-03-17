@@ -29,7 +29,9 @@ pub struct MergeReadiness {
     pub not_draft: bool,
     /// All CI check runs passed (success, skipped, or neutral), none pending/in-progress.
     pub ci_passing: bool,
-    /// At least one APPROVED review, no outstanding CHANGES_REQUESTED.
+    /// Review gate satisfied: at least one external APPROVED review with no outstanding
+    /// CHANGES_REQUESTED, or the PR author left a self-review comment (GitHub prevents
+    /// self-approval) and no reviewer has blocked.
     pub review_approved: bool,
     /// No merge conflicts. `false` when GitHub's `mergeable` is `Some(false)` or `None`.
     pub no_conflicts: bool,
@@ -398,6 +400,9 @@ fn evaluate_reviews(reviews: &[ReviewApiResponse], pr_author: &str) -> bool {
             "DISMISSED" => {
                 // DISMISSED clears the reviewer's prior state
                 reviewer_state.remove(review.user.login.as_str());
+                if review.user.login == pr_author {
+                    author_commented = false;
+                }
             }
             "COMMENTED" => {
                 if review.user.login == pr_author {
@@ -822,6 +827,58 @@ mod tests {
                 state: "APPROVED".into(),
                 user: ReviewUser {
                     login: "alice".into(),
+                },
+            },
+        ];
+        assert!(evaluate_reviews(&reviews, "minion-bot"));
+    }
+
+    #[test]
+    fn test_reviews_self_review_after_external_approval_dismissed() {
+        // External approval was dismissed; only author self-comment remains.
+        let reviews = vec![
+            ReviewApiResponse {
+                state: "COMMENTED".into(),
+                user: ReviewUser {
+                    login: "minion-bot".into(),
+                },
+            },
+            ReviewApiResponse {
+                state: "APPROVED".into(),
+                user: ReviewUser {
+                    login: "alice".into(),
+                },
+            },
+            ReviewApiResponse {
+                state: "DISMISSED".into(),
+                user: ReviewUser {
+                    login: "alice".into(),
+                },
+            },
+        ];
+        assert!(evaluate_reviews(&reviews, "minion-bot"));
+    }
+
+    #[test]
+    fn test_reviews_self_review_after_blocker_dismissed() {
+        // Blocker dismissed, then author self-reviews — should pass.
+        let reviews = vec![
+            ReviewApiResponse {
+                state: "CHANGES_REQUESTED".into(),
+                user: ReviewUser {
+                    login: "alice".into(),
+                },
+            },
+            ReviewApiResponse {
+                state: "DISMISSED".into(),
+                user: ReviewUser {
+                    login: "alice".into(),
+                },
+            },
+            ReviewApiResponse {
+                state: "COMMENTED".into(),
+                user: ReviewUser {
+                    login: "minion-bot".into(),
                 },
             },
         ];
