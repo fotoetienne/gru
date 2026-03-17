@@ -315,14 +315,18 @@ pub(crate) async fn monitor_pr_lifecycle(
             Ok((MonitorResult::ReadyToMerge, _)) => {
                 // All merge gates pass — remove gru:blocked if it was stale
                 if issue_was_blocked {
-                    super::helpers::try_unblock_issue(
-                        &issue_ctx.host,
-                        &issue_ctx.owner,
-                        &issue_ctx.repo,
-                        issue_ctx.issue_num,
-                    )
-                    .await;
+                    if let Ok(pr_num) = pr_number.parse::<u64>() {
+                        super::helpers::try_remove_blocked_label(
+                            &issue_ctx.host,
+                            &issue_ctx.owner,
+                            &issue_ctx.repo,
+                            pr_num,
+                            issue_ctx.issue_num,
+                        )
+                        .await;
+                    }
                     issue_was_blocked = false;
+                    ci_escalated = false;
                 }
 
                 // Lazily ensure the gru:needs-human-review label exists on
@@ -563,10 +567,11 @@ pub(crate) async fn monitor_pr_lifecycle(
                         println!("✅ CI checks now pass after auto-fix");
                         // Remove gru:blocked label if it was added during escalation
                         if issue_was_blocked {
-                            super::helpers::try_unblock_issue(
+                            super::helpers::try_remove_blocked_label(
                                 &issue_ctx.host,
                                 &issue_ctx.owner,
                                 &issue_ctx.repo,
+                                pr_num_u64,
                                 issue_ctx.issue_num,
                             )
                             .await;
