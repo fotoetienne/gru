@@ -70,9 +70,14 @@ async fn post_escalation_comment(
     host: &str,
     pr_number: &str,
     message: &str,
+    minion_id: &str,
 ) {
     let repo_full = format!("{}/{}", owner, repo);
-    let body = format!("🤖 **Minion Escalation**\n\n{}", message);
+    let body = format!(
+        "🤖 **Minion Escalation**\n\n{}{}",
+        message,
+        crate::progress_comments::minion_signature(minion_id)
+    );
 
     let result = crate::github::gh_cli_command(host)
         .args([
@@ -560,6 +565,7 @@ pub(crate) async fn monitor_pr_lifecycle(
                     pr_num_u64,
                     &wt_ctx.branch_name,
                     &wt_ctx.checkout_path,
+                    &wt_ctx.minion_id,
                 )
                 .await
                 {
@@ -612,6 +618,7 @@ pub(crate) async fn monitor_pr_lifecycle(
                         &issue_ctx.host,
                         pr_number,
                         "Auto-rebase failed after multiple attempts. Manual conflict resolution required.",
+                        &wt_ctx.minion_id,
                     )
                     .await;
                     break;
@@ -645,6 +652,7 @@ pub(crate) async fn monitor_pr_lifecycle(
                             &issue_ctx.host,
                             pr_number,
                             "Auto-rebase failed: could not resolve merge conflicts automatically. Manual intervention required.",
+                            &wt_ctx.minion_id,
                         )
                         .await;
                         break;
@@ -657,6 +665,7 @@ pub(crate) async fn monitor_pr_lifecycle(
                             &issue_ctx.host,
                             pr_number,
                             "Auto-rebase encountered an unexpected error. Check Minion logs for details.",
+                            &wt_ctx.minion_id,
                         )
                         .await;
                         break;
@@ -793,5 +802,14 @@ pub(crate) async fn monitor_ci_after_fix(
     }
 
     eprintln!("🔍 Monitoring CI for PR #{}", pr_number);
-    ci::monitor_and_fix_ci(host, owner, repo, pr_number, branch, worktree_path).await
+    ci::monitor_and_fix_ci(
+        host,
+        owner,
+        repo,
+        pr_number,
+        branch,
+        worktree_path,
+        minion_id,
+    )
+    .await
 }

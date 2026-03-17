@@ -48,8 +48,11 @@ fn create_wip_template(minion_id: &str, issue_num: u64, issue_title: &str) -> (S
     let body = format!(
         "## Summary\nAutomated fix for #{} by Minion {}\n\n\
          ## Status\n- [ ] Implementation\n- [ ] Tests\n- [ ] Review\n\n\
-         Fixes #{}\n",
-        issue_num, minion_id, issue_num,
+         Fixes #{}{}",
+        issue_num,
+        minion_id,
+        issue_num,
+        crate::progress_comments::minion_signature(minion_id),
     );
     (title, body)
 }
@@ -125,6 +128,9 @@ async fn create_pr_for_issue(
                     }
                     pr_body.push('\n');
                     pr_body.push_str(&closing_line);
+                }
+                if !pr_body.contains("<sub>🤖") {
+                    pr_body.push_str(&crate::progress_comments::minion_signature(minion_id));
                 }
                 (pr_title, pr_body)
             }
@@ -479,5 +485,6 @@ mod tests {
         assert!(body.contains("Automated fix for #123 by Minion M042"));
         assert!(body.contains("- [ ] Implementation"));
         assert!(body.contains("Fixes #123"));
+        assert!(body.contains("<sub>🤖 M042</sub>"));
     }
 }

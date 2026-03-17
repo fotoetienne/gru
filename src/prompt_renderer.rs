@@ -88,6 +88,10 @@ pub struct PromptContext {
     /// Current working directory
     pub cwd: Option<PathBuf>,
 
+    // Minion context
+    /// Minion ID (e.g. "M042") for attribution footers
+    pub minion_id: Option<String>,
+
     // Custom params from --param key=value
     /// Custom parameters provided via CLI
     pub params: HashMap<String, String>,
@@ -160,6 +164,18 @@ impl PromptContext {
         // Environment
         if let Some(ref p) = self.cwd {
             vars.insert("cwd".to_string(), p.display().to_string());
+        }
+
+        // Minion context
+        if let Some(ref s) = self.minion_id {
+            vars.insert("minion_id".to_string(), s.clone());
+            vars.insert(
+                "minion_attribution_instruction".to_string(),
+                format!(
+                    "- **Attribution**: Always end your review body with this footer on its own line: `\\n\\n<sub>🤖 {}</sub>`",
+                    s
+                ),
+            );
         }
 
         // Custom params override standard variables
@@ -407,6 +423,7 @@ feature/add-thing"#;
             repo_owner: Some("owner".to_string()),
             repo_name: Some("repo".to_string()),
             cwd: Some(PathBuf::from("/current/dir")),
+            minion_id: Some("M042".to_string()),
             params,
         };
 
@@ -431,7 +448,23 @@ feature/add-thing"#;
         assert_eq!(vars.get("repo_owner"), Some(&"owner".to_string()));
         assert_eq!(vars.get("repo_name"), Some(&"repo".to_string()));
         assert_eq!(vars.get("cwd"), Some(&"/current/dir".to_string()));
+        assert_eq!(vars.get("minion_id"), Some(&"M042".to_string()));
+        assert_eq!(
+            vars.get("minion_attribution_instruction"),
+            Some(
+                &"- **Attribution**: Always end your review body with this footer on its own line: `\\n\\n<sub>🤖 M042</sub>`"
+                    .to_string()
+            )
+        );
         assert_eq!(vars.get("custom_key"), Some(&"custom_value".to_string()));
+    }
+
+    #[test]
+    fn test_minion_attribution_instruction_absent_without_minion_id() {
+        let context = PromptContext::new();
+        let vars = context.to_variables();
+        assert_eq!(vars.get("minion_id"), None);
+        assert_eq!(vars.get("minion_attribution_instruction"), None);
     }
 
     #[test]

@@ -631,6 +631,7 @@ pub async fn post_escalation_comment(
     pr_number: u64,
     failed_checks: &[CheckRun],
     attempts: u32,
+    minion_id: &str,
 ) -> Result<()> {
     let mut body = format!(
         "## 🚨 CI Fix Escalation\n\n\
@@ -660,7 +661,7 @@ pub async fn post_escalation_comment(
 
     body.push_str(&format!("\n**Labels:** `{}`\n", labels::BLOCKED));
 
-    post_escalation_comment_body(host, owner, repo, pr_number, &body).await
+    post_escalation_comment_body(host, owner, repo, pr_number, &body, minion_id).await
 }
 
 /// Post an escalation comment when CI exhaustion occurs due to timeout or no-commits.
@@ -671,6 +672,7 @@ pub async fn post_exhaustion_escalation_comment(
     pr_number: u64,
     reason: &str,
     attempts: u32,
+    minion_id: &str,
 ) -> Result<()> {
     let body = format!(
         "## 🚨 CI Fix Escalation\n\n\
@@ -684,7 +686,7 @@ pub async fn post_exhaustion_escalation_comment(
         labels::BLOCKED
     );
 
-    post_escalation_comment_body(host, owner, repo, pr_number, &body).await
+    post_escalation_comment_body(host, owner, repo, pr_number, &body, minion_id).await
 }
 
 /// Posts an escalation comment body to a PR and adds the blocked label.
@@ -694,8 +696,14 @@ async fn post_escalation_comment_body(
     repo: &str,
     pr_number: u64,
     body: &str,
+    minion_id: &str,
 ) -> Result<()> {
     let repo_full = format!("{}/{}", owner, repo);
+    let body_with_sig = format!(
+        "{}{}",
+        body,
+        crate::progress_comments::minion_signature(minion_id)
+    );
 
     let output = github::gh_cli_command(host)
         .args([
@@ -705,7 +713,7 @@ async fn post_escalation_comment_body(
             "--repo",
             &repo_full,
             "--body",
-            body,
+            &body_with_sig,
         ])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -753,6 +761,7 @@ pub async fn monitor_and_fix_ci(
     pr_number: u64,
     branch: &str,
     worktree_path: &Path,
+    minion_id: &str,
 ) -> Result<bool> {
     for attempt in 1..=MAX_CI_FIX_ATTEMPTS {
         // Get the current HEAD SHA
@@ -791,6 +800,7 @@ pub async fn monitor_and_fix_ci(
                         pr_number,
                         "CI checks timed out on all attempts.",
                         attempt,
+                        minion_id,
                     )
                     .await
                     .unwrap_or_else(|e| eprintln!("⚠️  Failed to post escalation: {}", e));
@@ -821,9 +831,17 @@ pub async fn monitor_and_fix_ci(
                         "🚨 Max fix attempts ({}) reached, escalating to human",
                         MAX_CI_FIX_ATTEMPTS
                     );
-                    post_escalation_comment(host, owner, repo, pr_number, &failed_checks, attempt)
-                        .await
-                        .unwrap_or_else(|e| eprintln!("⚠️  Failed to post escalation: {}", e));
+                    post_escalation_comment(
+                        host,
+                        owner,
+                        repo,
+                        pr_number,
+                        &failed_checks,
+                        attempt,
+                        minion_id,
+                    )
+                    .await
+                    .unwrap_or_else(|e| eprintln!("⚠️  Failed to post escalation: {}", e));
                     return Ok(false);
                 }
 
@@ -852,9 +870,17 @@ pub async fn monitor_and_fix_ci(
                         "🚨 Max fix attempts ({}) reached with no commits, escalating to human",
                         MAX_CI_FIX_ATTEMPTS
                     );
-                    post_escalation_comment(host, owner, repo, pr_number, &failed_checks, attempt)
-                        .await
-                        .unwrap_or_else(|e| eprintln!("⚠️  Failed to post escalation: {}", e));
+                    post_escalation_comment(
+                        host,
+                        owner,
+                        repo,
+                        pr_number,
+                        &failed_checks,
+                        attempt,
+                        minion_id,
+                    )
+                    .await
+                    .unwrap_or_else(|e| eprintln!("⚠️  Failed to post escalation: {}", e));
                     return Ok(false);
                 }
 

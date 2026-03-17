@@ -526,6 +526,7 @@ async fn setup_prompt_workspace(
     minion_id: &str,
     workspace: &workspace::Workspace,
 ) -> Result<WorkspaceSetup> {
+    fetched.context.minion_id = Some(minion_id.to_string());
     let has_context = opts.issue.is_some() || opts.pr.is_some();
     let use_auto_worktree = !opts.no_worktree && opts.worktree.is_none();
 

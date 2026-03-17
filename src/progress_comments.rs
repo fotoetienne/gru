@@ -55,6 +55,14 @@ impl ProgressUpdate {
     }
 }
 
+/// Returns an attribution footer for Minion-generated GitHub posts.
+///
+/// Renders as small subscript text on GitHub. A blank line before prevents
+/// it from blending into the last line of content.
+pub fn minion_signature(id: &str) -> String {
+    format!("\n\n<sub>🤖 {}</sub>", id)
+}
+
 /// Tracks progress and manages comment posting
 pub struct ProgressCommentTracker {
     minion_id: String,
@@ -94,6 +102,12 @@ impl ProgressCommentTracker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_minion_signature() {
+        assert_eq!(minion_signature("M042"), "\n\n<sub>🤖 M042</sub>");
+        assert_eq!(minion_signature("M0ug"), "\n\n<sub>🤖 M0ug</sub>");
+    }
 
     #[test]
     fn test_minion_phase_as_str() {

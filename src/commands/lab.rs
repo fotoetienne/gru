@@ -395,8 +395,11 @@ async fn mark_exhausted_minion(minion_id: &str, info: &MinionInfo, host: &str, r
     let comment = format!(
         "⚠️ **Minion {} failed: {}.**\n\n\
          Phase at failure: `{:?}`\n\n\
-         This issue needs human attention.",
-        minion_id, reason, info.orchestration_phase,
+         This issue needs human attention.{}",
+        minion_id,
+        reason,
+        info.orchestration_phase,
+        crate::progress_comments::minion_signature(minion_id),
     );
     let _ = github::post_comment_via_cli(host, owner, repo_name, info.issue, &comment).await;
     let _ = github::mark_issue_failed_via_cli(host, owner, repo_name, info.issue).await;
