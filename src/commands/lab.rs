@@ -120,11 +120,20 @@ pub async fn handle_lab(
         log::warn!("   Continuing to poll...");
     }
 
+    // Listen for both SIGINT (Ctrl-C) and SIGTERM (kill, systemd, docker)
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .context("Failed to register SIGTERM handler")?;
+
     // Main polling loop
     loop {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {
-                println!("\n🛑 Received shutdown signal, stopping daemon...");
+                println!("\n🛑 Received shutdown signal (SIGINT), stopping daemon...");
+                shutdown_children(&mut children, stop_minions).await;
+                break;
+            }
+            _ = sigterm.recv() => {
+                println!("\n🛑 Received shutdown signal (SIGTERM), stopping daemon...");
                 shutdown_children(&mut children, stop_minions).await;
                 break;
             }
@@ -271,9 +280,22 @@ async fn shutdown_children(children: &mut [SpawnedChild], stop_minions: bool) {
         }
     }
 
-    // Wait briefly for graceful shutdown
+    // Wait up to 5 seconds for graceful shutdown, polling every 100ms
     println!("⏳ Waiting for Minions to exit...");
-    sleep(Duration::from_secs(5)).await;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let all_exited = children
+            .iter_mut()
+            .all(|sc| matches!(sc.child.try_wait(), Ok(Some(_))));
+        if all_exited {
+            println!("All Minions exited gracefully.");
+            return;
+        }
+        if Instant::now() >= deadline {
+            break;
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
 
     // Force-kill any remaining processes and reap to avoid zombies
     for sc in children.iter_mut() {
@@ -1220,11 +1242,9 @@ mod tests {
             "Process should still be running after detach shutdown"
         );
 
-        // Clean up: kill the process ourselves
-        #[cfg(unix)]
-        unsafe {
-            libc::kill(pid as i32, libc::SIGKILL);
-        }
+        // Clean up: kill and reap the process to avoid leaving a zombie
+        children[0].child.kill().await.ok();
+        children[0].child.wait().await.ok();
     }
 
     #[tokio::test]
