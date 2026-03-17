@@ -117,12 +117,16 @@ fn format_mode_display(
 /// Handles the status command by displaying active Minions
 /// Optionally filters by a specific ID (minion ID, issue number, or PR number)
 ///
-/// # Two-Phase Approach
+/// # Approach
 ///
 /// To minimize registry lock hold time and prevent blocking other minions:
 ///
-/// **Phase 1 (with lock):** Load registry, detect stale entries and dead processes,
-/// extract basic minion data, then release lock by dropping the registry.
+/// **Pruning (async):** Remove stale entries (missing worktrees) via
+/// [`crate::minion_registry::prune_stale_entries`], which checks GitHub PR
+/// status before removing entries with open PRs. Non-fatal on error.
+///
+/// **Phase 1 (with lock):** Load registry, detect dead processes, extract basic
+/// minion data, then release lock by dropping the registry.
 ///
 /// **Phase 2 (no lock):** Perform PID-based liveness checks and git branch
 /// detection for each worktree.

@@ -167,7 +167,16 @@ pub async fn prune_stale_entries() -> Result<usize> {
     }
 
     // Phase 3: Remove confirmed stale entries (sync, lock held briefly)
-    let count = with_registry(move |registry| registry.remove_batch(&to_remove)).await?;
+    // Re-verify that worktrees still don't exist — a concurrent `gru do` or
+    // `gru lab` could have recreated a worktree between phase 1 and now.
+    let count = with_registry(move |registry| {
+        let still_stale: Vec<String> = to_remove
+            .into_iter()
+            .filter(|id| !registry.get(id).is_some_and(|info| info.worktree.exists()))
+            .collect();
+        registry.remove_batch(&still_stale)
+    })
+    .await?;
 
     if count > 0 {
         log::info!("🗑️  Pruned {} stale Minion(s) from registry", count);
