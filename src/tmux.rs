@@ -8,12 +8,14 @@
 use std::ffi::OsStr;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(unix)]
 use std::sync::Mutex;
 
 /// Global flag: when true, a signal handler should re-enable automatic-rename.
 static TMUX_GUARD_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 /// Global window ID so the signal handler can target the correct window.
+#[cfg(unix)]
 static TMUX_WINDOW_ID: Mutex<Option<String>> = Mutex::new(None);
 
 /// RAII guard that renames the current tmux window and re-enables
@@ -34,9 +36,8 @@ pub struct TmuxGuard {
 impl TmuxGuard {
     /// Create a new guard that renames the tmux window to `name`.
     ///
-    /// Disables `automatic-rename` so the name sticks, and registers a signal
-    /// hook so SIGTERM/SIGINT can clean up. If not inside tmux, returns a
-    /// no-op guard.
+    /// Disables `automatic-rename` so the name sticks, and registers a SIGTERM
+    /// handler for cleanup. If not inside tmux, returns a no-op guard.
     pub fn new(name: &str) -> Self {
         let window_id = match current_window_id() {
             Some(id) => {
@@ -44,14 +45,16 @@ impl TmuxGuard {
                 // so signals arriving mid-setup can still clean up.
                 install_signal_hook();
 
-                // Store window ID globally for the signal handler.
+                // Store window ID and mark guard active BEFORE modifying
+                // tmux state, so a signal arriving mid-setup can clean up.
+                #[cfg(unix)]
                 if let Ok(mut global_id) = TMUX_WINDOW_ID.lock() {
                     *global_id = Some(id.clone());
                 }
+                TMUX_GUARD_ACTIVE.store(true, Ordering::SeqCst);
 
                 set_automatic_rename(&id, false);
                 rename_window(name);
-                TMUX_GUARD_ACTIVE.store(true, Ordering::SeqCst);
                 Some(id)
             }
             None => None,
@@ -74,6 +77,7 @@ impl Drop for TmuxGuard {
         if let Some(ref id) = self.window_id {
             set_automatic_rename(id, true);
             TMUX_GUARD_ACTIVE.store(false, Ordering::SeqCst);
+            #[cfg(unix)]
             if let Ok(mut global_id) = TMUX_WINDOW_ID.lock() {
                 *global_id = None;
             }
@@ -81,69 +85,57 @@ impl Drop for TmuxGuard {
     }
 }
 
-/// Install a signal handler (once) that re-enables `automatic-rename` on
-/// SIGTERM and SIGINT. Uses the default handler afterward so the process still
-/// exits normally.
+/// Install a SIGTERM handler (once) that re-enables `automatic-rename` before
+/// the process exits.
+///
+/// SIGINT is intentionally NOT handled here — callers (lab.rs, fix/mod.rs, etc.)
+/// already handle it via `tokio::signal::ctrl_c()`, which triggers graceful
+/// shutdown and drops the `TmuxGuard`. Using `libc::signal` would replace
+/// tokio's handlers and break that graceful shutdown path.
+///
+/// SIGTERM is not caught by callers, so we handle it here via tokio's signal
+/// infrastructure (which cooperates with existing handlers).
 fn install_signal_hook() {
     use std::sync::Once;
     static INIT: Once = Once::new();
     INIT.call_once(|| {
         #[cfg(unix)]
         {
-            use std::sync::Barrier;
-            use std::thread;
-
-            let barrier = std::sync::Arc::new(Barrier::new(2));
-            let barrier_clone = barrier.clone();
-            thread::spawn(move || {
-                signal_listener(barrier_clone);
-            });
-            // Wait until the signal handlers are registered.
-            barrier.wait();
+            // Spawn a tokio task for SIGTERM listening. This cooperates with
+            // tokio's signal infrastructure instead of replacing handlers.
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                handle.spawn(async {
+                    sigterm_listener().await;
+                });
+            }
         }
     });
 }
 
 #[cfg(unix)]
-fn signal_listener(ready: std::sync::Arc<std::sync::Barrier>) {
-    use std::sync::atomic::AtomicI32;
+async fn sigterm_listener() {
+    use tokio::signal::unix::{signal, SignalKind};
 
-    static CAUGHT_SIGNAL: AtomicI32 = AtomicI32::new(0);
+    let Ok(mut sigterm) = signal(SignalKind::terminate()) else {
+        return;
+    };
+    sigterm.recv().await;
 
-    extern "C" fn handler(sig: libc::c_int) {
-        CAUGHT_SIGNAL.store(sig, Ordering::SeqCst);
-    }
-
-    // Register signal handlers, then signal readiness.
-    unsafe {
-        libc::signal(libc::SIGTERM, handler as *const () as libc::sighandler_t);
-        libc::signal(libc::SIGINT, handler as *const () as libc::sighandler_t);
-    }
-    ready.wait();
-
-    // Poll for the signal (the handler sets CAUGHT_SIGNAL).
-    loop {
-        std::thread::sleep(std::time::Duration::from_millis(50));
-        let sig = CAUGHT_SIGNAL.load(Ordering::SeqCst);
-        if sig != 0 {
-            // Re-enable automatic-rename if a guard was active.
-            if TMUX_GUARD_ACTIVE.swap(false, Ordering::SeqCst) {
-                // Try to use the stored window ID for precise targeting.
-                let window_id = TMUX_WINDOW_ID.lock().ok().and_then(|guard| guard.clone());
-                if let Some(id) = window_id {
-                    set_automatic_rename(&id, true);
-                } else {
-                    restore_automatic_rename_current_window();
-                }
-            }
-            // Re-raise the signal with default handler so the process exits
-            // with the correct status.
-            unsafe {
-                libc::signal(sig, libc::SIG_DFL);
-                libc::raise(sig);
-            }
-            break;
+    // Re-enable automatic-rename if a guard was active.
+    if TMUX_GUARD_ACTIVE.swap(false, Ordering::SeqCst) {
+        let window_id = TMUX_WINDOW_ID.lock().ok().and_then(|guard| guard.clone());
+        if let Some(id) = window_id {
+            set_automatic_rename(&id, true);
+        } else {
+            restore_automatic_rename_current_window();
         }
+    }
+
+    // Re-raise SIGTERM with default handler so the process exits
+    // with the correct status for the parent.
+    unsafe {
+        libc::signal(libc::SIGTERM, libc::SIG_DFL);
+        libc::raise(libc::SIGTERM);
     }
 }
 
@@ -187,7 +179,14 @@ fn rename_window(name: &str) {
 fn set_automatic_rename(window_id: &str, enable: bool) {
     let value = if enable { "on" } else { "off" };
     let _ = Command::new("tmux")
-        .args(["set-option", "-t", window_id, "automatic-rename", value])
+        .args([
+            "set-option",
+            "-w",
+            "-t",
+            window_id,
+            "automatic-rename",
+            value,
+        ])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
