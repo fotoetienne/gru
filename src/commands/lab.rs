@@ -502,8 +502,8 @@ async fn resume_interrupted_minions(
         match spawn_resume(&candidate.minion_id).await {
             Ok(child) => {
                 // Write the `gru resume` PID to registry immediately to prevent
-                // duplicate spawns. The worker subprocess will later overwrite
-                // this with the inner worker PID.
+                // duplicate spawns. The inner agent subprocess will later
+                // overwrite this with the agent PID via pid_callback.
                 if let Some(pid) = child.id() {
                     let mid = candidate.minion_id.clone();
                     if let Err(e) = with_registry(move |registry| {
