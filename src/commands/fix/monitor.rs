@@ -4,12 +4,29 @@ use crate::agent::AgentBackend;
 use crate::ci;
 use crate::config::LabConfig;
 use crate::merge_judge::{self, JudgeAction, JudgeState};
+use crate::minion_registry;
 use crate::pr_monitor::{self, MonitorResult};
 use crate::pr_state::PrState;
 use anyhow::{Context, Result};
+use chrono::{DateTime, Utc};
 use std::path::Path;
 use tokio::process::Command as TokioCommand;
 use tokio::time::{timeout, Duration};
+
+/// Persists a review-check timestamp to the minion registry (best-effort).
+/// Errors are logged as warnings since this is non-critical metadata.
+async fn save_review_check_time(minion_id: &str, ts: DateTime<Utc>) {
+    let mid = minion_id.to_string();
+    if let Err(e) = minion_registry::with_registry(move |registry| {
+        registry.update(&mid, |info| {
+            info.last_review_check_time = Some(ts);
+        })
+    })
+    .await
+    {
+        log::warn!("⚠️  Failed to save last_review_check_time: {}", e);
+    }
+}
 
 /// Attempts to auto-rebase the worktree branch onto its base branch.
 ///
@@ -212,6 +229,11 @@ pub(crate) async fn monitor_pr_lifecycle(
     // Capture timestamp before self-review so that any reviews submitted
     // during the review are not missed when the monitoring loop starts.
     let pre_review_time = chrono::Utc::now();
+
+    // Persist the pre-review timestamp as the initial review baseline.
+    // Set BEFORE the self-review starts so reviews submitted concurrently
+    // are not missed (per #445 lesson: use pre-review time, not post-review).
+    save_review_check_time(&wt_ctx.minion_id, pre_review_time).await;
 
     // Guard: skip self-review if we already posted one for the current HEAD SHA.
     // This prevents duplicate reviews when monitor_pr_lifecycle is re-entered
@@ -562,6 +584,8 @@ pub(crate) async fn monitor_pr_lifecycle(
                         // those reviews aren't re-fetched while still catching
                         // any new reviews posted during handling.
                         review_baseline = Some(check_time);
+                        // Persist updated baseline after successfully handling reviews.
+                        save_review_check_time(&wt_ctx.minion_id, check_time).await;
                     }
                     Err(e) => {
                         log::warn!("⚠️  Failed to address review comments: {}", e);
@@ -786,6 +810,12 @@ pub(crate) async fn monitor_pr_lifecycle(
                 continue;
             }
         }
+    }
+
+    // Persist the final review baseline on monitor exit so the lab wake-up
+    // scan knows where to resume without re-processing already-seen reviews.
+    if let Some(ts) = review_baseline {
+        save_review_check_time(&wt_ctx.minion_id, ts).await;
     }
 }
 

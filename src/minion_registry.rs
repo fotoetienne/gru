@@ -324,6 +324,11 @@ pub struct MinionInfo {
     /// Whether to skip watching (PR monitoring) after agent completes
     #[serde(default)]
     pub no_watch: bool,
+    /// Timestamp of the last review check, used as baseline for detecting new reviews.
+    /// Set before self-review, after addressing review feedback, and on monitor exit.
+    /// Fallback: if None (e.g., old registry entries), callers should fall back to started_at.
+    #[serde(default)]
+    pub last_review_check_time: Option<DateTime<Utc>>,
 }
 
 /// Default agent name for backwards compatibility with existing registry entries
@@ -867,6 +872,7 @@ mod tests {
             timeout_deadline: None,
             attempt_count: 0,
             no_watch: false,
+            last_review_check_time: None,
         }
     }
 
