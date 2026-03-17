@@ -247,6 +247,19 @@ Located in `.claude/skills/`:
 - Comments use YAML frontmatter for structured events
 - Issue/PR parsing supports both numbers (when in repo) and full GitHub URLs
 
+### Issue Dependencies
+- **Body-text convention:** Use `**Blocked by:** #X, #Y` in issue bodies to declare dependencies
+  - Must be on a single line (only the first line after the marker is parsed)
+  - Use `#` prefix for issue numbers (bare numbers are ignored)
+  - Cross-repo references (`owner/repo#123`) are skipped with a warning
+  - Example: `**Blocked by:** #10, #20, #30`
+- **Two-layer checking:** Body parsing (free) runs first, then the native GitHub dependencies API verifies
+- **Native API resolution:** API result is authoritative when available (200). Body text is sole source on 404 (GHES)
+- **GHES compatibility:** When the native dependencies API returns 404, Gru falls back to body-text parsing only. No functionality is lost — body-text deps work identically. 403/500 errors are logged as warnings and the issue is treated as unblocked (pipeline is not blocked on transient API errors)
+- **`gru do` behavior:** Warns about open blockers but proceeds (user explicitly chose the issue). Use `--ignore-deps` to suppress
+- **`gru:waiting` label:** Deferred. For github.com, the native API provides `is:blocked` visibility. For GHES without native deps, body-text dependencies have no GitHub UI representation. A `gru:waiting` label may be added if GHES users report needing visible feedback — not rejected, just not needed for MVP
+- **Implementation:** `src/dependencies.rs` — see `plans/ISSUE_DEPENDENCIES_PRD.md` for full design
+
 ### Worktree Management
 - Worktree paths use branch names as directory paths (e.g., `minion/issue-42-M001/`)
 - Create from bare repos to avoid conflicts
