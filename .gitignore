@@ -5,3 +5,6 @@ target/
 # Ephemeral Minion files
 events.jsonl
 PR_DESCRIPTION.md
+
+/experiments
+/scripts
