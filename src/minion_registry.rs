@@ -292,9 +292,7 @@ pub fn is_process_alive_with_start_time(pid: u32, recorded_start_time: Option<i6
     if let Some(recorded) = recorded_start_time {
         match get_process_start_time(pid) {
             Some(actual) => {
-                // Allow 2-second tolerance for rounding differences between
-                // the Rust clock and the OS-reported value.
-                if (actual - recorded).abs() > 2 {
+                if actual != recorded {
                     log::debug!(
                         "PID {} recycled: recorded start_time={}, actual={}",
                         pid,
@@ -305,8 +303,10 @@ pub fn is_process_alive_with_start_time(pid: u32, recorded_start_time: Option<i6
                 }
             }
             None => {
-                // Couldn't query start time (process may have just exited).
-                // Fall through to trust the kill() result.
+                // Couldn't query start time (process may have just exited between
+                // the kill() check and this query). Fall through to return true —
+                // callers like gru stop will simply get ESRCH when they try to
+                // signal the PID, which is harmless.
             }
         }
     }
@@ -677,7 +677,7 @@ impl MinionRegistry {
     ///
     /// Returns all matching Minions as (minion_id, MinionInfo) pairs regardless
     /// of mode or PID status (including stopped entries). Callers should check
-    /// `is_process_alive` to determine which Minions are actually running.
+    /// [`MinionInfo::is_running`] to determine which Minions are actually running.
     pub fn find_by_issue(&self, repo: &str, issue: u64) -> Vec<(String, MinionInfo)> {
         self.data
             .minions
