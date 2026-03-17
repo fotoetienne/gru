@@ -5,6 +5,7 @@ use crate::ci;
 use crate::config::LabConfig;
 use crate::merge_judge::{self, JudgeAction, JudgeState};
 use crate::pr_monitor::{self, MonitorResult};
+use crate::pr_state::PrState;
 use anyhow::{Context, Result};
 use std::path::Path;
 use tokio::process::Command as TokioCommand;
@@ -212,22 +213,59 @@ pub(crate) async fn monitor_pr_lifecycle(
     // during the review are not missed when the monitoring loop starts.
     let pre_review_time = chrono::Utc::now();
 
-    // Auto-trigger review for Minion-created PRs
-    println!("\n🔍 Starting automated PR review...");
-    match trigger_pr_review(pr_number, &wt_ctx.checkout_path, review_timeout).await {
-        Ok(review_exit_code) => {
-            if review_exit_code == 0 {
-                println!("✅ PR review completed successfully");
-            } else {
-                log::warn!(
-                    "⚠️  PR review completed with exit code: {}",
-                    review_exit_code
-                );
+    // Guard: skip self-review if we already posted one for the current HEAD SHA.
+    // This prevents duplicate reviews when monitor_pr_lifecycle is re-entered
+    // (e.g., on lab daemon resume or run_worker restart).
+    let head_sha = ci::get_head_sha(&wt_ctx.checkout_path).await.ok();
+    let already_reviewed = head_sha.as_deref().is_some_and(|sha| {
+        PrState::load(&wt_ctx.minion_dir)
+            .ok()
+            .flatten()
+            .and_then(|s| s.self_review_sha)
+            .as_deref()
+            == Some(sha)
+    });
+
+    if already_reviewed {
+        println!(
+            "\n⏭️  Skipping self-review: already posted for current HEAD ({})",
+            head_sha.as_deref().unwrap_or("unknown")
+        );
+    } else {
+        // Auto-trigger review for Minion-created PRs
+        println!("\n🔍 Starting automated PR review...");
+        match trigger_pr_review(pr_number, &wt_ctx.checkout_path, review_timeout).await {
+            Ok(review_exit_code) => {
+                if review_exit_code == 0 {
+                    println!("✅ PR review completed successfully");
+                    // Record the HEAD SHA so we don't re-post on next entry.
+                    if let Some(ref sha) = head_sha {
+                        match PrState::load(&wt_ctx.minion_dir) {
+                            Ok(Some(mut state)) => {
+                                state.self_review_sha = Some(sha.clone());
+                                if let Err(e) = state.save(&wt_ctx.minion_dir) {
+                                    log::warn!("⚠️  Failed to save self_review_sha: {}", e);
+                                }
+                            }
+                            Ok(None) => {
+                                log::warn!("⚠️  No PR state found to record self_review_sha");
+                            }
+                            Err(e) => {
+                                log::warn!("⚠️  Failed to load PR state: {}", e);
+                            }
+                        }
+                    }
+                } else {
+                    log::warn!(
+                        "⚠️  PR review completed with exit code: {}",
+                        review_exit_code
+                    );
+                }
             }
-        }
-        Err(e) => {
-            log::warn!("⚠️  Failed to run PR review: {}", e);
-            log::warn!("   You can review manually with: gru review {}", pr_number);
+            Err(e) => {
+                log::warn!("⚠️  Failed to run PR review: {}", e);
+                log::warn!("   You can review manually with: gru review {}", pr_number);
+            }
         }
     }
 

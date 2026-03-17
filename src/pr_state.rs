@@ -12,6 +12,11 @@ pub struct PrState {
     pub issue_number: String,
     /// Current status of the PR
     pub status: PrStatus,
+    /// HEAD SHA at which the last successful self-review was posted.
+    /// Used to prevent duplicate reviews when monitor_pr_lifecycle is re-entered.
+    /// None means no self-review has been posted yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub self_review_sha: Option<String>,
 }
 
 /// Status of a pull request
@@ -31,6 +36,7 @@ impl PrState {
             pr_number,
             issue_number,
             status: PrStatus::Draft,
+            self_review_sha: None,
         }
     }
 
@@ -170,5 +176,28 @@ mod tests {
         assert_eq!(deserialized.pr_number, "42");
         assert_eq!(deserialized.issue_number, "15");
         assert_eq!(deserialized.status, PrStatus::Draft);
+    }
+
+    #[test]
+    fn test_pr_state_self_review_sha_round_trip() {
+        let temp_dir = tempfile::tempdir().unwrap();
+
+        let mut state = PrState::new("42".to_string(), "15".to_string());
+        assert!(state.self_review_sha.is_none());
+
+        // Set a SHA and round-trip through save/load
+        state.self_review_sha = Some("abc123def456".to_string());
+        state.save(temp_dir.path()).unwrap();
+
+        let loaded = PrState::load(temp_dir.path()).unwrap().unwrap();
+        assert_eq!(loaded.self_review_sha, Some("abc123def456".to_string()));
+    }
+
+    #[test]
+    fn test_pr_state_self_review_sha_absent_in_old_json() {
+        // Existing PR state files without self_review_sha should deserialize fine
+        let json = r#"{"pr_number":"42","issue_number":"15","status":"draft"}"#;
+        let state: PrState = serde_json::from_str(json).unwrap();
+        assert!(state.self_review_sha.is_none());
     }
 }

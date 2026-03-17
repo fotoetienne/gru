@@ -100,6 +100,7 @@ pub async fn handle_resume(
     let timeout_deadline: Option<DateTime<Utc>> = info.timeout_deadline;
     let attempt_count = info.attempt_count;
     let no_watch = info.no_watch;
+    let start_phase = info.orchestration_phase.clone();
 
     // Check if timeout_deadline has passed — fail instead of resuming
     if let Some(deadline) = timeout_deadline {
@@ -221,77 +222,94 @@ pub async fn handle_resume(
         details: None,
     };
 
-    update_orchestration_phase(&minion.minion_id, OrchestrationPhase::RunningAgent).await;
+    // Phase: Run agent (skip if already past this phase)
+    if start_phase <= OrchestrationPhase::RunningAgent {
+        update_orchestration_phase(&minion.minion_id, OrchestrationPhase::RunningAgent).await;
 
-    // Run agent in autonomous mode with stream monitoring
-    let claude_result = run_autonomous_agent(
-        &*backend,
-        &wt_ctx,
-        &prompt,
-        quiet,
-        effective_timeout.as_deref(),
-        issue_num,
-        &issue_ctx.host,
-    )
-    .await;
+        let claude_result = run_autonomous_agent(
+            &*backend,
+            &wt_ctx,
+            &prompt,
+            quiet,
+            effective_timeout.as_deref(),
+            issue_num,
+            &issue_ctx.host,
+        )
+        .await;
 
-    match claude_result {
-        Ok(status) => {
-            if !status.success() {
+        match claude_result {
+            Ok(status) => {
+                if !status.success() {
+                    update_orchestration_phase(&minion.minion_id, OrchestrationPhase::Failed).await;
+                    try_mark_issue_failed(
+                        &issue_ctx.host,
+                        &issue_ctx.owner,
+                        &issue_ctx.repo,
+                        issue_ctx.issue_num,
+                    )
+                    .await;
+                    println!("❌ Claude session exited with non-zero status");
+                    return Ok(status.code().unwrap_or(EXIT_CODE_SIGNAL_TERMINATED));
+                }
+            }
+            Err(e) if is_stuck_or_timeout_error(&e) => {
                 update_orchestration_phase(&minion.minion_id, OrchestrationPhase::Failed).await;
-                try_mark_issue_failed(
+                try_mark_issue_blocked(
                     &issue_ctx.host,
                     &issue_ctx.owner,
                     &issue_ctx.repo,
                     issue_ctx.issue_num,
                 )
                 .await;
-                println!("❌ Claude session exited with non-zero status");
-                return Ok(status.code().unwrap_or(EXIT_CODE_SIGNAL_TERMINATED));
+                log::error!("🚨 {:#}", e);
+                return Ok(1);
+            }
+            Err(e) => {
+                update_orchestration_phase(&minion.minion_id, OrchestrationPhase::Failed).await;
+                return Err(e);
             }
         }
-        Err(e) if is_stuck_or_timeout_error(&e) => {
-            update_orchestration_phase(&minion.minion_id, OrchestrationPhase::Failed).await;
-            try_mark_issue_blocked(
-                &issue_ctx.host,
-                &issue_ctx.owner,
-                &issue_ctx.repo,
-                issue_ctx.issue_num,
-            )
-            .await;
-            log::error!("🚨 {:#}", e);
-            return Ok(1);
-        }
-        Err(e) => {
-            update_orchestration_phase(&minion.minion_id, OrchestrationPhase::Failed).await;
-            return Err(e);
-        }
+    } else {
+        println!("⏭️  Skipping agent session (already completed)");
     }
 
-    // Phase: Create PR (handle_pr_creation checks if branch was pushed internally)
-    update_orchestration_phase(&minion.minion_id, OrchestrationPhase::CreatingPr).await;
+    // Phase: Create PR (skip if already past this phase)
+    let pr_number = if start_phase <= OrchestrationPhase::CreatingPr {
+        update_orchestration_phase(&minion.minion_id, OrchestrationPhase::CreatingPr).await;
 
-    let pr_number = match handle_pr_creation(&issue_ctx, &wt_ctx).await {
-        Ok(pr) => pr,
-        Err(e) => {
-            update_orchestration_phase(&minion.minion_id, OrchestrationPhase::Failed).await;
-            return Err(e);
-        }
-    };
+        let pr_number = match handle_pr_creation(&issue_ctx, &wt_ctx).await {
+            Ok(pr) => pr,
+            Err(e) => {
+                update_orchestration_phase(&minion.minion_id, OrchestrationPhase::Failed).await;
+                return Err(e);
+            }
+        };
 
-    // If handle_pr_creation didn't return a PR number, check the registry
-    // (the PR may have been created in a previous session)
-    let pr_number = match pr_number {
-        Some(pr) => Some(pr),
-        None => {
-            let mid = minion.minion_id.clone();
-            with_registry(move |registry| Ok(registry.get(&mid).and_then(|info| info.pr.clone())))
+        // If handle_pr_creation didn't return a PR number, check the registry
+        // (the PR may have been created in a previous session)
+        match pr_number {
+            Some(pr) => Some(pr),
+            None => {
+                let mid = minion.minion_id.clone();
+                with_registry(move |registry| {
+                    Ok(registry.get(&mid).and_then(|info| info.pr.clone()))
+                })
                 .await
                 .unwrap_or_else(|e| {
                     log::warn!("Failed to look up PR number from registry: {}", e);
                     None
                 })
+            }
         }
+    } else {
+        println!("⏭️  Skipping PR creation (already completed)");
+        let mid = minion.minion_id.clone();
+        with_registry(move |registry| Ok(registry.get(&mid).and_then(|info| info.pr.clone())))
+            .await
+            .unwrap_or_else(|e| {
+                log::warn!("Failed to look up PR number from registry: {}", e);
+                None
+            })
     };
 
     // Last resort: discover PR by head branch (handles manual PR creation or missing registry state)
