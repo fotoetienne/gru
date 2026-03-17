@@ -316,7 +316,7 @@ pub fn is_process_alive_with_start_time(pid: u32, recorded_start_time: Option<i6
 
 /// Returns the start time (seconds since epoch) of a process, or `None` if unavailable.
 ///
-/// On macOS, uses `sysctl` with `KERN_PROC/KERN_PROC_PID`.
+/// On macOS, uses `proc_pidinfo` with `PROC_PIDTBSDINFO`.
 /// On Linux, reads `/proc/<pid>/stat` and combines with boot time from `/proc/stat`.
 #[cfg(unix)]
 pub fn get_process_start_time(pid: u32) -> Option<i64> {
@@ -1272,9 +1272,14 @@ mod tests {
             start_time.is_some(),
             "Should get start time for own process"
         );
-        // The start time should be a reasonable value (after 2020-01-01)
+        // The start time should be positive and not in the future
         if let Some(t) = start_time {
-            assert!(t > 1_577_836_800, "Start time should be after 2020: {}", t);
+            assert!(t > 0, "Start time should be positive: {}", t);
+            assert!(
+                t <= chrono::Utc::now().timestamp() + 60,
+                "Start time should not be in the future: {}",
+                t
+            );
         }
     }
 

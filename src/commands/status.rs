@@ -153,11 +153,12 @@ pub async fn handle_status(id: Option<String>, verbose: bool) -> Result<i32> {
         }
 
         // Detect dead processes and update registry.
-        // Only on Unix where is_process_alive uses kill(pid, 0) for accurate checks.
+        // Only on Unix where process liveness checks are available.
         // On non-Unix, is_process_alive always returns false which would incorrectly
         // mark all minions as dead.
-        // Note: is_process_alive is a microsecond syscall, so running it under the
-        // registry lock is acceptable (unlike git operations in Phase 2).
+        // Note: is_running() calls kill(pid, 0) plus a fast proc_pidinfo/procfs lookup
+        // to detect PID reuse. Both are fast kernel calls (microseconds each), so running
+        // them under the registry lock is acceptable (unlike git operations in Phase 2).
         #[cfg(unix)]
         {
             let registry_minions = registry.list();
