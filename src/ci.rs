@@ -34,6 +34,9 @@ pub enum CheckStatus {
     Queued,
     InProgress,
     Completed,
+    /// Catch-all for unknown statuses (e.g., GitHub's "waiting" for environment approvals)
+    #[serde(other)]
+    Unknown,
 }
 
 /// The conclusion of a completed check run
