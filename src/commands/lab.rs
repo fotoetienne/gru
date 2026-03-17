@@ -551,7 +551,7 @@ async fn poll_and_spawn(
     no_resume: bool,
     resumed_this_session: &mut HashSet<String>,
 ) -> Result<()> {
-    // Prune stale registry entries (worktrees that no longer exist)
+    // Prune stale registry entries (missing worktrees or terminal minions with no live process)
     prune_stale_entries().await?;
 
     // Calculate available slots using PID liveness (not registry status string)
@@ -746,6 +746,17 @@ async fn poll_and_spawn(
     Ok(())
 }
 
+/// Returns true if a registry entry is stale and should be pruned.
+///
+/// An entry is stale if its worktree no longer exists on disk, or if its
+/// orchestration phase is terminal (Completed/Failed) with no live process.
+fn is_stale_entry(info: &MinionInfo) -> bool {
+    if !info.worktree.exists() {
+        return true;
+    }
+    info.orchestration_phase.is_terminal() && !info.pid.is_some_and(is_process_alive)
+}
+
 /// Prune stale registry entries where worktrees no longer exist or minions are
 /// in terminal states (Completed/Failed) with no live process.
 async fn prune_stale_entries() -> Result<()> {
@@ -754,14 +765,7 @@ async fn prune_stale_entries() -> Result<()> {
 
         let stale_ids: Vec<String> = minions
             .iter()
-            .filter(|(_id, info)| {
-                // Worktree gone — always stale
-                if !info.worktree.exists() {
-                    return true;
-                }
-                // Terminal state with no live process — no longer resumable
-                info.orchestration_phase.is_terminal() && !info.pid.is_some_and(is_process_alive)
-            })
+            .filter(|(_id, info)| is_stale_entry(info))
             .map(|(id, _)| id.clone())
             .collect();
 
@@ -1200,14 +1204,6 @@ mod tests {
         }
     }
 
-    /// Helper that applies the same pruning filter as `prune_stale_entries`.
-    fn is_stale(info: &MinionInfo) -> bool {
-        if !info.worktree.exists() {
-            return true;
-        }
-        info.orchestration_phase.is_terminal() && !info.pid.is_some_and(is_process_alive)
-    }
-
     #[test]
     fn test_prune_completed_minion_is_stale() {
         let info = MinionInfo {
@@ -1217,7 +1213,7 @@ mod tests {
             ..test_minion_info()
         };
         assert!(
-            is_stale(&info),
+            is_stale_entry(&info),
             "Completed minion with no live process should be pruned"
         );
     }
@@ -1231,8 +1227,22 @@ mod tests {
             ..test_minion_info()
         };
         assert!(
-            is_stale(&info),
+            is_stale_entry(&info),
             "Failed minion with no live process should be pruned"
+        );
+    }
+
+    #[test]
+    fn test_prune_terminal_with_live_pid_not_stale() {
+        let info = MinionInfo {
+            worktree: PathBuf::from("/tmp"), // exists
+            orchestration_phase: OrchestrationPhase::Completed,
+            pid: Some(std::process::id()), // our own PID — alive
+            ..test_minion_info()
+        };
+        assert!(
+            !is_stale_entry(&info),
+            "Terminal minion with live process should not be pruned"
         );
     }
 
@@ -1244,7 +1254,7 @@ mod tests {
             pid: None,
             ..test_minion_info()
         };
-        assert!(!is_stale(&info), "Active minion should not be pruned");
+        assert!(!is_stale_entry(&info), "Active minion should not be pruned");
     }
 
     #[test]
@@ -1256,7 +1266,7 @@ mod tests {
             ..test_minion_info()
         };
         assert!(
-            is_stale(&info),
+            is_stale_entry(&info),
             "Minion with missing worktree should always be pruned"
         );
     }
