@@ -88,6 +88,10 @@ pub struct PromptContext {
     /// Current working directory
     pub cwd: Option<PathBuf>,
 
+    // Minion context
+    /// Minion ID (e.g. "M042") for attribution footers
+    pub minion_id: Option<String>,
+
     // Custom params from --param key=value
     /// Custom parameters provided via CLI
     pub params: HashMap<String, String>,
@@ -160,6 +164,11 @@ impl PromptContext {
         // Environment
         if let Some(ref p) = self.cwd {
             vars.insert("cwd".to_string(), p.display().to_string());
+        }
+
+        // Minion context
+        if let Some(ref s) = self.minion_id {
+            vars.insert("minion_id".to_string(), s.clone());
         }
 
         // Custom params override standard variables
@@ -407,6 +416,7 @@ feature/add-thing"#;
             repo_owner: Some("owner".to_string()),
             repo_name: Some("repo".to_string()),
             cwd: Some(PathBuf::from("/current/dir")),
+            minion_id: Some("M042".to_string()),
             params,
         };
 
@@ -431,6 +441,7 @@ feature/add-thing"#;
         assert_eq!(vars.get("repo_owner"), Some(&"owner".to_string()));
         assert_eq!(vars.get("repo_name"), Some(&"repo".to_string()));
         assert_eq!(vars.get("cwd"), Some(&"/current/dir".to_string()));
+        assert_eq!(vars.get("minion_id"), Some(&"M042".to_string()));
         assert_eq!(vars.get("custom_key"), Some(&"custom_value".to_string()));
     }
 

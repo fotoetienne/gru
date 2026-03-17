@@ -142,8 +142,14 @@ pub async fn handle_review(pr_arg: Option<String>, agent_name: &str) -> Result<i
     let session_id = Uuid::new_v4();
 
     // Build the review prompt using the template system
-    let review_prompt =
-        build_review_prompt(&owner, &repo, &pr_num, pr_details.as_ref(), &checkout_path);
+    let review_prompt = build_review_prompt(
+        &owner,
+        &repo,
+        &pr_num,
+        pr_details.as_ref(),
+        &checkout_path,
+        &minion_id,
+    );
 
     // Register minion in registry (worktree field stores the minion_dir)
     let now = Utc::now();
@@ -498,6 +504,7 @@ fn build_review_prompt(
     pr_num: &str,
     details: Option<&PrDetails>,
     worktree_path: &Path,
+    minion_id: &str,
 ) -> String {
     let Some(details) = details else {
         return format!("/pr_review {}", pr_num);
@@ -528,6 +535,7 @@ fn build_review_prompt(
     prompt_ctx.repo_owner = Some(owner.to_string());
     prompt_ctx.repo_name = Some(repo.to_string());
     prompt_ctx.worktree_path = Some(worktree_path.to_path_buf());
+    prompt_ctx.minion_id = Some(minion_id.to_string());
 
     let variables = prompt_ctx.to_variables();
     render_template(template_content, &variables)
@@ -563,8 +571,14 @@ mod tests {
             body: "This PR fixes the broken widget".to_string(),
         };
 
-        let prompt =
-            build_review_prompt("octocat", "hello-world", "456", Some(&details), tmp.path());
+        let prompt = build_review_prompt(
+            "octocat",
+            "hello-world",
+            "456",
+            Some(&details),
+            tmp.path(),
+            "M042",
+        );
         assert!(prompt.starts_with("# PR #456: Fix the widget"));
         assert!(prompt.contains("octocat/hello-world/pull/456"));
         assert!(prompt.contains("This PR fixes the broken widget"));
@@ -574,7 +588,7 @@ mod tests {
     #[test]
     fn test_build_review_prompt_without_details() {
         let tmp = tempfile::tempdir().unwrap();
-        let prompt = build_review_prompt("octocat", "hello-world", "456", None, tmp.path());
+        let prompt = build_review_prompt("octocat", "hello-world", "456", None, tmp.path(), "M042");
         assert_eq!(prompt, "/pr_review 456");
     }
 
@@ -586,7 +600,14 @@ mod tests {
             body: "Body content here".to_string(),
         };
 
-        let prompt = build_review_prompt("myorg", "myproject", "99", Some(&details), tmp.path());
+        let prompt = build_review_prompt(
+            "myorg",
+            "myproject",
+            "99",
+            Some(&details),
+            tmp.path(),
+            "M042",
+        );
 
         // Verify template variables were substituted
         assert!(!prompt.contains("{{ pr_number }}"));
@@ -625,7 +646,7 @@ CUSTOM: Review PR #{{ pr_number }} - {{ pr_title }}"#,
             body: "Custom body".to_string(),
         };
 
-        let prompt = build_review_prompt("owner", "repo", "55", Some(&details), tmp.path());
+        let prompt = build_review_prompt("owner", "repo", "55", Some(&details), tmp.path(), "M042");
         assert_eq!(prompt, "CUSTOM: Review PR #55 - Custom test");
     }
 }
