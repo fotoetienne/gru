@@ -236,6 +236,11 @@ pub(crate) async fn monitor_pr_lifecycle(
     let mut rebase_attempts = 0;
     let mut judge_state = JudgeState::new();
     let mut judge_label_ensured = false;
+    let mut consecutive_errors: u32 = 0;
+    // 10 consecutive monitor_pr invocation failures before giving up.
+    // Wall-clock time per failure varies since monitor_pr does its own internal
+    // polling and retries before returning an error.
+    const MAX_CONSECUTIVE_ERRORS: u32 = 10;
     // Load merge confidence threshold from config (falls back to default).
     // Uses load_partial to avoid requiring [daemon].repos for non-daemon commands.
     let confidence_threshold = LabConfig::default_path()
@@ -280,7 +285,7 @@ pub(crate) async fn monitor_pr_lifecycle(
             break;
         }
 
-        match pr_monitor::monitor_pr(
+        let monitor_result = pr_monitor::monitor_pr(
             &issue_ctx.host,
             &issue_ctx.owner,
             &issue_ctx.repo,
@@ -289,8 +294,13 @@ pub(crate) async fn monitor_pr_lifecycle(
             remaining,
             review_baseline,
         )
-        .await
-        {
+        .await;
+
+        if monitor_result.is_ok() {
+            consecutive_errors = 0;
+        }
+
+        match monitor_result {
             Ok((MonitorResult::Merged, _)) => {
                 println!("✅ PR #{} was merged successfully!", pr_number);
                 println!("🎉 Issue {} is complete!", issue_ctx.issue_num);
@@ -651,14 +661,51 @@ pub(crate) async fn monitor_pr_lifecycle(
                 break;
             }
             Err(e) => {
-                log::warn!("⚠️  PR monitoring failed: {}", e);
+                consecutive_errors += 1;
+                if consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
+                    log::warn!(
+                        "⚠️  PR monitoring failed {} consecutive times, giving up: {}",
+                        consecutive_errors,
+                        e
+                    );
+                    log::warn!(
+                        "   You can monitor manually at: https://github.com/{}/{}/pull/{}",
+                        issue_ctx.owner,
+                        issue_ctx.repo,
+                        pr_number
+                    );
+                    break;
+                }
                 log::warn!(
-                    "   You can monitor manually at: https://github.com/{}/{}/pull/{}",
-                    issue_ctx.owner,
-                    issue_ctx.repo,
-                    pr_number
+                    "⚠️  PR monitoring error ({}/{}): {}",
+                    consecutive_errors,
+                    MAX_CONSECUTIVE_ERRORS,
+                    e
                 );
-                break;
+                // Sleep before retrying to avoid hammering the API if monitor_pr
+                // fails before its internal poll sleep. Cap at remaining timeout
+                // so we don't overshoot the configured monitor_timeout.
+                let backoff = Duration::from_secs(30);
+                let remaining = monitor_timeout.checked_sub(monitor_start.elapsed());
+                match remaining {
+                    Some(r) if r > Duration::ZERO => {
+                        tokio::select! {
+                            _ = tokio::time::sleep(backoff.min(r)) => {}
+                            _ = tokio::signal::ctrl_c() => {
+                                println!("\n⚠️  Monitoring interrupted by user");
+                                println!(
+                                    "   PR is still open: https://github.com/{}/{}/pull/{}",
+                                    issue_ctx.owner, issue_ctx.repo, pr_number
+                                );
+                                break;
+                            }
+                        }
+                    }
+                    _ => {
+                        // Timeout already expired, let the loop's timeout check handle it.
+                    }
+                }
+                continue;
             }
         }
     }
