@@ -126,6 +126,7 @@ struct PullRequest {
     state: String,
     merged: bool,
     head: Head,
+    user: User,
     /// GitHub's mergeable field: true, false, or null (still computing).
     mergeable: Option<bool>,
 }
@@ -139,7 +140,6 @@ struct Head {
 struct Review {
     id: u64,
     submitted_at: DateTime<Utc>,
-    #[allow(dead_code)]
     user: User,
 }
 
@@ -564,14 +564,16 @@ async fn poll_once(
     // Check for new reviews BEFORE merge conflicts so that reviewer feedback
     // is never silently dropped when conflicts and reviews overlap.
     let all_reviews = get_all_reviews(host, owner, repo, pr_number).await?;
+    let pr_author = &pr.user.login;
     let has_new_reviews = all_reviews
         .iter()
-        .any(|r| r.submitted_at >= *last_check_time);
+        .any(|r| r.submitted_at >= *last_check_time && r.user.login != *pr_author);
     if has_new_reviews {
-        // Extract only the new reviews for comment fetching
+        // Extract only the new reviews for comment fetching, excluding self-reviews
+        // to prevent the minion from entering a feedback loop with its own reviews.
         let new_reviews: Vec<Review> = all_reviews
             .into_iter()
-            .filter(|r| r.submitted_at >= *last_check_time)
+            .filter(|r| r.submitted_at >= *last_check_time && r.user.login != *pr_author)
             .collect();
         let comments = get_review_comments(host, owner, repo, pr_number, &new_reviews).await?;
         // Advance past these reviews so they are not re-fetched if the caller
@@ -943,7 +945,8 @@ mod tests {
             "merged": true,
             "head": {
                 "sha": "abc123def456"
-            }
+            },
+            "user": {"login": "author"}
         }"#;
 
         let pr: PullRequest = serde_json::from_str(json).unwrap();
@@ -959,7 +962,8 @@ mod tests {
             "merged": false,
             "head": {
                 "sha": "abc123def456"
-            }
+            },
+            "user": {"login": "author"}
         }"#;
 
         let pr: PullRequest = serde_json::from_str(json).unwrap();
@@ -974,7 +978,8 @@ mod tests {
             "merged": false,
             "head": {
                 "sha": "abc123def456"
-            }
+            },
+            "user": {"login": "author"}
         }"#;
 
         let pr: PullRequest = serde_json::from_str(json).unwrap();
@@ -1003,6 +1008,7 @@ mod tests {
         assert_eq!(pr.state, "open");
         assert!(!pr.merged);
         assert_eq!(pr.head.sha, "abc123def456");
+        assert_eq!(pr.user.login, "author");
     }
 
     #[test]
@@ -1597,6 +1603,7 @@ mod tests {
             "state": "open",
             "merged": false,
             "head": {"sha": "abc123"},
+            "user": {"login": "author"},
             "mergeable": true
         }"#;
 
@@ -1610,6 +1617,7 @@ mod tests {
             "state": "open",
             "merged": false,
             "head": {"sha": "abc123"},
+            "user": {"login": "author"},
             "mergeable": false
         }"#;
 
@@ -1624,6 +1632,7 @@ mod tests {
             "state": "open",
             "merged": false,
             "head": {"sha": "abc123"},
+            "user": {"login": "author"},
             "mergeable": null
         }"#;
 
@@ -1637,7 +1646,8 @@ mod tests {
         let json = r#"{
             "state": "open",
             "merged": false,
-            "head": {"sha": "abc123"}
+            "head": {"sha": "abc123"},
+            "user": {"login": "author"}
         }"#;
 
         let pr: PullRequest = serde_json::from_str(json).unwrap();
