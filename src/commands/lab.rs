@@ -1,7 +1,9 @@
 use crate::config::{parse_repo_entry_with_hosts, LabConfig};
 use crate::github::{self, list_ready_issues_via_cli};
 use crate::labels;
-use crate::minion_registry::{with_registry, MinionInfo, MinionMode, OrchestrationPhase};
+use crate::minion_registry::{
+    is_process_alive, with_registry, MinionInfo, MinionMode, OrchestrationPhase,
+};
 use crate::tmux::TmuxGuard;
 use anyhow::{Context, Result};
 use chrono::Utc;
@@ -1256,6 +1258,7 @@ mod tests {
             timeout_deadline: None,
             attempt_count: 0,
             no_watch: false,
+            pid_start_time: None,
         }
     }
 
