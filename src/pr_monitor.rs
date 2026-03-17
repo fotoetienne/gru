@@ -173,6 +173,28 @@ fn is_failed_check(check_run: &CheckRun) -> bool {
     check_run.conclusion.as_ref().is_some_and(|c| c.is_failed())
 }
 
+/// Count failed checks only when all runs have completed.
+///
+/// Returns `Some(count)` if every check has `status == Completed` and at least
+/// one has a failed conclusion. Returns `None` if any check is still running
+/// or if all checks passed.
+///
+/// Note: `Iterator::all` returns `true` for an empty iterator (no checks
+/// registered yet). In that case `failed == 0`, so we return `None` and the
+/// outer monitor loop re-polls on the next cycle.
+fn count_completed_failures(check_runs: &[CheckRun]) -> Option<usize> {
+    let all_completed = check_runs
+        .iter()
+        .all(|c| c.status == crate::ci::CheckStatus::Completed);
+    if all_completed {
+        let failed = check_runs.iter().filter(|c| is_failed_check(c)).count();
+        if failed > 0 {
+            return Some(failed);
+        }
+    }
+    None
+}
+
 const READY_TO_MERGE_LABEL: &str = labels::READY_TO_MERGE;
 const AUTO_MERGE_LABEL: &str = labels::AUTO_MERGE;
 
@@ -589,11 +611,10 @@ async fn poll_once(
         return Ok(Some(MonitorResult::MergeConflict));
     }
 
-    // Check for failed CI runs - include all error states
+    // Check for failed CI runs - only report failures when all checks have completed.
+    // If any checks are still queued or in progress, skip and re-check next cycle.
     let check_runs = get_check_runs(host, owner, repo, &pr.head.sha).await?;
-    let failed_checks = check_runs.iter().filter(|c| is_failed_check(c)).count();
-
-    if failed_checks > 0 {
+    if let Some(failed_checks) = count_completed_failures(&check_runs) {
         return Ok(Some(MonitorResult::FailedChecks(failed_checks)));
     }
 
@@ -1263,11 +1284,25 @@ mod tests {
     // ========================================================================
     // These tests use the shared is_failed_check function from production code
 
-    /// Helper to create a CheckRun with only a conclusion
+    /// Helper to create a CheckRun with only a conclusion (defaults to Queued status)
     fn make_check(conclusion: Option<crate::ci::CheckConclusion>) -> CheckRun {
         CheckRun {
             name: String::new(),
             status: Default::default(),
+            conclusion,
+            duration: None,
+            output: None,
+        }
+    }
+
+    /// Helper to create a CheckRun with explicit status and conclusion
+    fn make_check_with_status(
+        status: crate::ci::CheckStatus,
+        conclusion: Option<crate::ci::CheckConclusion>,
+    ) -> CheckRun {
+        CheckRun {
+            name: String::new(),
+            status,
             conclusion,
             duration: None,
             output: None,
@@ -1704,6 +1739,76 @@ mod tests {
 
         let pr: PullRequest = serde_json::from_str(json).unwrap();
         assert_eq!(pr.mergeable, None);
+    }
+
+    // ========================================================================
+    // CI Failure Reporting: Wait for All Checks to Complete (Issue #461)
+    // ========================================================================
+
+    #[test]
+    fn test_ci_failure_not_reported_while_checks_in_progress() {
+        use crate::ci::{CheckConclusion, CheckStatus};
+        let checks = vec![
+            make_check_with_status(CheckStatus::Completed, Some(CheckConclusion::Failure)),
+            make_check_with_status(CheckStatus::InProgress, None),
+        ];
+        assert_eq!(count_completed_failures(&checks), None);
+    }
+
+    #[test]
+    fn test_ci_failure_not_reported_while_checks_queued() {
+        use crate::ci::{CheckConclusion, CheckStatus};
+        let checks = vec![
+            make_check_with_status(CheckStatus::Completed, Some(CheckConclusion::Failure)),
+            make_check_with_status(CheckStatus::Queued, None),
+        ];
+        assert_eq!(count_completed_failures(&checks), None);
+    }
+
+    #[test]
+    fn test_ci_failure_reported_when_all_completed() {
+        use crate::ci::{CheckConclusion, CheckStatus};
+        let checks = vec![
+            make_check_with_status(CheckStatus::Completed, Some(CheckConclusion::Failure)),
+            make_check_with_status(CheckStatus::Completed, Some(CheckConclusion::Success)),
+        ];
+        assert_eq!(count_completed_failures(&checks), Some(1));
+    }
+
+    #[test]
+    fn test_ci_no_failure_when_all_pass() {
+        use crate::ci::{CheckConclusion, CheckStatus};
+        let checks = vec![
+            make_check_with_status(CheckStatus::Completed, Some(CheckConclusion::Success)),
+            make_check_with_status(CheckStatus::Completed, Some(CheckConclusion::Success)),
+        ];
+        assert_eq!(count_completed_failures(&checks), None);
+    }
+
+    #[test]
+    fn test_ci_empty_checks_no_failure() {
+        let checks: Vec<CheckRun> = vec![];
+        assert_eq!(count_completed_failures(&checks), None);
+    }
+
+    #[test]
+    fn test_ci_all_in_progress_no_failure() {
+        use crate::ci::CheckStatus;
+        let checks = vec![
+            make_check_with_status(CheckStatus::InProgress, None),
+            make_check_with_status(CheckStatus::InProgress, None),
+        ];
+        assert_eq!(count_completed_failures(&checks), None);
+    }
+
+    #[test]
+    fn test_ci_unknown_status_not_treated_as_completed() {
+        use crate::ci::{CheckConclusion, CheckStatus};
+        let checks = vec![
+            make_check_with_status(CheckStatus::Completed, Some(CheckConclusion::Failure)),
+            make_check_with_status(CheckStatus::Unknown, None),
+        ];
+        assert_eq!(count_completed_failures(&checks), None);
     }
 
     // Merge readiness tests are in the unified merge_readiness module.
