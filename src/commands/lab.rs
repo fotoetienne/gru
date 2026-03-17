@@ -647,9 +647,9 @@ async fn poll_and_spawn(
         // Fetch ready issues, excluding blocked ones (both GitHub-blocked and gru:blocked).
         // Try CLI first (supports -is:blocked qualifier), fall back to simpler CLI query
         // with client-side filtering.
-        let issue_numbers =
+        let candidates =
             match list_ready_issues_via_cli(&owner, &repo, &host, &config.daemon.label).await {
-                Ok(numbers) => numbers,
+                Ok(issues) => issues,
                 Err(cli_err) => {
                     log::warn!(
                         "⚠️  CLI issue fetch failed for {}: {}, trying basic CLI fallback",
@@ -657,7 +657,7 @@ async fn poll_and_spawn(
                         cli_err
                     );
                     match fallback_list_issues(&owner, &repo, &host, &config.daemon.label).await {
-                        Ok(numbers) => numbers,
+                        Ok(issues) => issues,
                         Err(e) => {
                             log::warn!("⚠️  Fallback also failed for {}: {}", repo_spec, e);
                             continue;
@@ -666,14 +666,34 @@ async fn poll_and_spawn(
                 }
             };
 
+        let candidate_count = candidates.len();
+        let mut blocked_count = 0usize;
+        let mut spawned_this_repo = 0usize;
+
         // Try to spawn a Minion for each ready issue
-        for issue_number in issue_numbers {
+        for candidate in candidates {
+            let issue_number = candidate.number;
             if available == 0 {
                 break;
             }
 
             // Check if issue is already being worked on (by a live process)
             if is_issue_claimed(&repo_full, issue_number).await? {
+                continue;
+            }
+
+            // Check if issue has unresolved dependencies (body parsing + API verify)
+            let body = candidate.body.as_deref().unwrap_or("");
+            let blockers =
+                crate::dependencies::get_blockers(&host, &owner, &repo, issue_number, body).await;
+            if !blockers.is_empty() {
+                let blocker_list: Vec<String> = blockers.iter().map(|n| format!("#{n}")).collect();
+                log::info!(
+                    "⏭️  Skipping issue #{}: blocked by {}",
+                    issue_number,
+                    blocker_list.join(", ")
+                );
+                blocked_count += 1;
                 continue;
             }
 
@@ -739,6 +759,7 @@ async fn poll_and_spawn(
                                 repo_spec, issue_number
                             );
                             spawned += 1;
+                            spawned_this_repo += 1;
                             available -= 1; // Decrement available slots after successful spawn
                         }
                         Err(e) => {
@@ -779,6 +800,16 @@ async fn poll_and_spawn(
                     continue;
                 }
             }
+        }
+
+        // Log when no candidates were spawned and some were blocked
+        if candidate_count > 0 && spawned_this_repo == 0 && blocked_count > 0 {
+            log::warn!(
+                "🚫 {}/{} candidate issue(s) in {} blocked by dependencies — nothing spawned this cycle",
+                blocked_count,
+                candidate_count,
+                repo_spec
+            );
         }
     }
 
@@ -982,7 +1013,7 @@ async fn fallback_list_issues(
     repo: &str,
     host: &str,
     label: &str,
-) -> Result<Vec<u64>> {
+) -> Result<Vec<github::CandidateIssue>> {
     let repo_full = format!("{}/{}", owner, repo);
     let output = github::gh_cli_command(host)
         .args([
@@ -995,7 +1026,7 @@ async fn fallback_list_issues(
             "--state",
             "open",
             "--json",
-            "number,labels",
+            "number,body,labels",
             "--limit",
             "100",
         ])
@@ -1012,7 +1043,7 @@ async fn fallback_list_issues(
     let issues: Vec<serde_json::Value> =
         serde_json::from_str(&stdout).context("Failed to parse gh issue list output")?;
 
-    let filtered: Vec<u64> = issues
+    let filtered: Vec<github::CandidateIssue> = issues
         .into_iter()
         .filter(|issue| {
             let label_names: Vec<String> = issue["labels"]
@@ -1026,7 +1057,11 @@ async fn fallback_list_issues(
             !labels::has_label(&label_names, labels::BLOCKED)
                 && !labels::has_label(&label_names, labels::IN_PROGRESS)
         })
-        .filter_map(|issue| issue["number"].as_u64())
+        .filter_map(|issue| {
+            let number = issue["number"].as_u64()?;
+            let body = issue["body"].as_str().map(String::from);
+            Some(github::CandidateIssue { number, body })
+        })
         .collect();
 
     Ok(filtered)
