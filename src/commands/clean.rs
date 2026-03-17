@@ -443,24 +443,20 @@ pub async fn handle_clean(dry_run: bool, force: bool, base_branch: &str) -> Resu
 
         if is_active_minion {
             // Active minion worktree — but PID detection is unreliable (PID reuse).
-            // Check GitHub state as a fallback: if the PR is merged or issue is
-            // closed, the worktree is cleanable regardless of process state.
-            let status = match wt.status(base_branch).await {
-                Ok(s) => s,
-                Err(e) => {
-                    // Previously active-minion worktrees were skipped with no I/O.
-                    // Be conservative: if we can't reach GitHub, keep the skip.
-                    log::warn!(
-                        "Failed to check GitHub state for active minion worktree {}: {} — skipping",
-                        wt.path.display(),
-                        e
-                    );
-                    skipped_active_minions.push(wt);
-                    continue;
-                }
+            // Check GitHub-derived terminal states as a fallback. We intentionally
+            // skip the git-level check_merged() here because a newly-created branch
+            // identical to base would be a false positive for an active minion.
+            let github_status = if wt.check_pr_merged_on_github().await.unwrap_or(false) {
+                Some(worktree_scanner::WorktreeStatus::PrMerged)
+            } else if matches!(wt.check_issue_closed().await.unwrap_or(None), Some(true)) {
+                Some(worktree_scanner::WorktreeStatus::IssueClosed)
+            } else if wt.check_remote_deleted().await.unwrap_or(false) {
+                Some(worktree_scanner::WorktreeStatus::RemoteDeleted)
+            } else {
+                None
             };
 
-            if status != worktree_scanner::WorktreeStatus::Active {
+            if let Some(status) = github_status {
                 // GitHub says this work is done — cleanable even with a "live" PID.
                 cleanable.push((wt, status));
             } else {
