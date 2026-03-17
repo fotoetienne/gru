@@ -249,7 +249,7 @@ async fn shutdown_children(children: &mut [SpawnedChild], stop_minions: bool) {
             "👋 {} Minion(s) still running — they will continue independently.",
             running_pids.len()
         );
-        println!("   Use `gru stop --all` to stop them, or `gru status` to check on them.");
+        println!("   Use `gru status` to check on them, or `gru stop <id>` to stop one.");
         return;
     }
 
@@ -877,13 +877,16 @@ async fn spawn_minion(repo: &str, host: &str, issue_number: u64) -> Result<Child
         .stdout(Stdio::from(stdout_file))
         .stderr(Stdio::from(stderr_file));
 
-    // Give the child its own session/process group so it won't receive
-    // SIGINT/SIGHUP when the lab's terminal is interrupted.
+    // Give the child its own session so SIGINT from Ctrl-C (sent to the terminal's
+    // foreground process group) is not delivered to the child. This allows the lab
+    // to shut down without killing running Minions.
     #[cfg(unix)]
     unsafe {
         // SAFETY: setsid() is async-signal-safe.
         cmd.pre_exec(|| {
-            libc::setsid();
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
             Ok(())
         });
     }
