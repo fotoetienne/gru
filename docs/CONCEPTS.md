@@ -1,6 +1,6 @@
 # Gru Concepts
 
-A concise mental model for understanding how Gru works.
+Gru runs AI agents that autonomously fix GitHub issues end-to-end. Here is the mental model.
 
 ---
 
@@ -8,7 +8,7 @@ A concise mental model for understanding how Gru works.
 
 A **Minion** is an agent session with a unique ID (M000, M001, M002…). When you run `gru do 42`, Gru creates a Minion, assigns it issue #42, and lets it run autonomously. Each Minion handles the full lifecycle: claim the issue, implement a fix, open a PR, monitor CI, and respond to review comments — with no further input from you.
 
-Minions are numbered monotonically and never reused. If a Minion fails and you retry, you get a new Minion with a new ID.
+If a Minion fails and you retry, a fresh Minion with a new ID takes over.
 
 ## Worktrees
 
@@ -23,7 +23,9 @@ The worktree's branch is named `minion/issue-42-M001`. When the PR merges, Gru c
 
 ## Labels as State
 
-GitHub labels are Gru's state machine. Gru looks for labels to decide what to do next:
+GitHub labels are Gru's state machine. Gru looks for labels to decide what to do next.
+
+**Issue labels:**
 
 | Label | Meaning |
 |---|---|
@@ -32,6 +34,14 @@ GitHub labels are Gru's state machine. Gru looks for labels to decide what to do
 | `gru:done` | PR merged, issue resolved |
 | `gru:failed` | Minion gave up, needs human review |
 | `gru:blocked` | Minion hit a wall, needs human input |
+
+**PR labels:**
+
+| Label | Meaning |
+|---|---|
+| `gru:ready-to-merge` | All checks passed, awaiting merge |
+| `gru:auto-merge` | Merge will happen automatically when checks pass |
+| `gru:needs-human-review` | Minion escalated; human sign-off required |
 
 Add `gru:todo` to an issue to queue it. Remove it to dequeue.
 
@@ -48,15 +58,17 @@ This means Gru's full state is visible in the GitHub UI, survives restarts, and 
 
 ## Lab Mode
 
-`gru lab` runs Gru as a daemon. It polls your configured repositories every 30 seconds, picks up any issue labeled `gru:todo`, and spawns a Minion for it. Set it and forget it.
+`gru lab` runs Gru as a daemon. It polls your configured repositories every 30 seconds, picks up any issue labeled `gru:todo`, and spawns a Minion for it. Once running, it claims and works any `gru:todo` issue without further input.
 
 ```bash
 gru lab   # watches all repos in ~/.gru/config.toml
 ```
 
+You configure which repositories to watch in `~/.gru/config.toml`. Run `gru init` in a repo directory to register it.
+
 ## Agent Backends
 
-Gru's orchestration is backend-agnostic. The default backend is Claude Code CLI, but you can configure others (e.g., OpenAI Codex). The same lifecycle — claim, implement, PR, monitor, review — runs regardless of which LLM is doing the work.
+Gru's orchestration is backend-agnostic. The default backend is Claude Code CLI, but you can configure others (e.g., OpenAI Codex) in `~/.gru/config.toml`. The same lifecycle — claim, implement, PR, monitor, review — runs regardless of which LLM is doing the work.
 
 ## The Lifecycle
 
@@ -70,15 +82,18 @@ Minion claims issue (gru:in-progress)
 Worktree created, agent implements fix
         │
         ▼
-PR opened, CI monitored
-        │
-        ├─ CI fails ──► auto-fix attempted (up to 2x)
-        │
-        ▼
-Review comments handled
-        │
-        ├─ Blocked ───► gru:blocked label + human escalation
-        │
+    PR opened, CI monitored ◄─────────────────────┐
+        │                                          │
+        ├─ CI fails ──► auto-fix attempted (2x)   │
+        │                                          │
+        ▼                                          │
+    Review comments handled                        │
+        │                                          │
+        ├─ Blocked ──► gru:blocked + escalation    │
+        │                                          │
+        └─ Changes requested ──► push fix ─────────┘
+                                  (re-run CI, re-review)
+        │ (all checks pass, approved)
         ▼
 PR merged, worktree cleaned up (gru:done)
 ```
