@@ -746,14 +746,22 @@ async fn poll_and_spawn(
     Ok(())
 }
 
-/// Prune stale registry entries where worktrees no longer exist
+/// Prune stale registry entries where worktrees no longer exist or minions are
+/// in terminal states (Completed/Failed) with no live process.
 async fn prune_stale_entries() -> Result<()> {
     with_registry(|registry| {
         let minions = registry.list();
 
         let stale_ids: Vec<String> = minions
             .iter()
-            .filter(|(_id, info)| !info.worktree.exists())
+            .filter(|(_id, info)| {
+                // Worktree gone — always stale
+                if !info.worktree.exists() {
+                    return true;
+                }
+                // Terminal state with no live process — no longer resumable
+                info.orchestration_phase.is_terminal() && !info.pid.is_some_and(is_process_alive)
+            })
             .map(|(id, _)| id.clone())
             .collect();
 
@@ -1164,6 +1172,92 @@ mod tests {
         assert!(
             should_restore_label(spawned_at),
             "Process at 1s under threshold should still qualify for label restoration"
+        );
+    }
+
+    fn test_minion_info() -> MinionInfo {
+        let now = Utc::now();
+        MinionInfo {
+            repo: "owner/repo".to_string(),
+            issue: 1,
+            command: "do".to_string(),
+            prompt: "Fix issue".to_string(),
+            started_at: now,
+            branch: "minion/issue-1-M001".to_string(),
+            worktree: PathBuf::from("/tmp"),
+            status: "active".to_string(),
+            pr: None,
+            session_id: uuid::Uuid::new_v4().to_string(),
+            pid: None,
+            mode: MinionMode::Autonomous,
+            last_activity: now,
+            orchestration_phase: OrchestrationPhase::Setup,
+            token_usage: None,
+            agent_name: "claude".to_string(),
+            timeout_deadline: None,
+            attempt_count: 0,
+            no_watch: false,
+        }
+    }
+
+    /// Helper that applies the same pruning filter as `prune_stale_entries`.
+    fn is_stale(info: &MinionInfo) -> bool {
+        if !info.worktree.exists() {
+            return true;
+        }
+        info.orchestration_phase.is_terminal() && !info.pid.is_some_and(is_process_alive)
+    }
+
+    #[test]
+    fn test_prune_completed_minion_is_stale() {
+        let info = MinionInfo {
+            worktree: PathBuf::from("/tmp"), // exists
+            orchestration_phase: OrchestrationPhase::Completed,
+            pid: None,
+            ..test_minion_info()
+        };
+        assert!(
+            is_stale(&info),
+            "Completed minion with no live process should be pruned"
+        );
+    }
+
+    #[test]
+    fn test_prune_failed_minion_is_stale() {
+        let info = MinionInfo {
+            worktree: PathBuf::from("/tmp"), // exists
+            orchestration_phase: OrchestrationPhase::Failed,
+            pid: None,
+            ..test_minion_info()
+        };
+        assert!(
+            is_stale(&info),
+            "Failed minion with no live process should be pruned"
+        );
+    }
+
+    #[test]
+    fn test_prune_active_minion_not_stale() {
+        let info = MinionInfo {
+            worktree: PathBuf::from("/tmp"), // exists
+            orchestration_phase: OrchestrationPhase::RunningAgent,
+            pid: None,
+            ..test_minion_info()
+        };
+        assert!(!is_stale(&info), "Active minion should not be pruned");
+    }
+
+    #[test]
+    fn test_prune_missing_worktree_always_stale() {
+        let info = MinionInfo {
+            worktree: PathBuf::from("/nonexistent/path/that/does/not/exist"),
+            orchestration_phase: OrchestrationPhase::RunningAgent,
+            pid: None,
+            ..test_minion_info()
+        };
+        assert!(
+            is_stale(&info),
+            "Minion with missing worktree should always be pruned"
         );
     }
 }
