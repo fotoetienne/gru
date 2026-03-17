@@ -7,6 +7,7 @@ mod claude_runner;
 mod codex_backend;
 mod commands;
 mod config;
+mod dependencies;
 mod file_lock;
 mod git;
 mod github;
@@ -126,6 +127,9 @@ enum Commands {
             help = "Detach immediately after spawning the background worker (don't follow logs)"
         )]
         detach: bool,
+
+        #[arg(long, help = "Skip dependency checking entirely")]
+        ignore_deps: bool,
 
         #[arg(
             long,
@@ -372,6 +376,7 @@ async fn main() {
             no_watch,
             auto_merge,
             detach,
+            ignore_deps,
             worker,
         } => {
             let agent_name = agent.unwrap_or_else(|| agent_registry::DEFAULT_AGENT.to_string());
@@ -387,6 +392,7 @@ async fn main() {
                     no_watch,
                     auto_merge,
                     detach,
+                    ignore_deps,
                     worker,
                 },
             )

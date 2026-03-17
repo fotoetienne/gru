@@ -80,6 +80,9 @@ async fn spawn_worker(
     if opts.quiet {
         cmd.arg("--quiet");
     }
+    if opts.ignore_deps {
+        cmd.arg("--ignore-deps");
+    }
 
     cmd.stdin(std::process::Stdio::null());
     cmd.stdout(std::process::Stdio::from(log_file));
@@ -444,9 +447,38 @@ pub async fn handle_fix(issue: &str, opts: FixOptions) -> Result<i32> {
     // Validate agent name early (fail fast on unknown agents)
     let _backend = agent_registry::resolve_backend(agent_name)?;
 
+    let ignore_deps = opts.ignore_deps;
+
     // Phase 1: Resolve issue
     let github_hosts = crate::config::load_host_registry().all_hosts();
     let issue_ctx = resolve_issue(issue, &github_hosts).await?;
+
+    // Check for unresolved blockers (unless --ignore-deps)
+    if !ignore_deps {
+        let body = issue_ctx
+            .details
+            .as_ref()
+            .map(|d| d.body.as_str())
+            .unwrap_or("");
+        let blockers = crate::dependencies::get_blockers(
+            &issue_ctx.host,
+            &issue_ctx.owner,
+            &issue_ctx.repo,
+            issue_ctx.issue_num,
+            body,
+        )
+        .await;
+
+        if !blockers.is_empty() {
+            let blocker_list: Vec<String> = blockers.iter().map(|n| format!("#{}", n)).collect();
+            println!(
+                "⚠️  Issue #{} may have unresolved blockers: {}",
+                issue_ctx.issue_num,
+                blocker_list.join(", ")
+            );
+            println!("   Use --ignore-deps to suppress this warning.");
+        }
+    }
 
     // Rename tmux window early with the initial `gru:do:#N` name
     let tmux_guard = TmuxGuard::new(&format!("gru:do:#{}", issue_ctx.issue_num));
@@ -740,6 +772,7 @@ CUSTOM: Fix #{{ issue_number }} - {{ issue_title }}"#,
             no_watch: false,
             auto_merge: false,
             detach: false,
+            ignore_deps: false,
             worker: None,
         };
         assert!(!opts.no_watch);
@@ -757,6 +790,7 @@ CUSTOM: Fix #{{ issue_number }} - {{ issue_title }}"#,
             no_watch: true,
             auto_merge: false,
             detach: false,
+            ignore_deps: false,
             worker: None,
         };
         assert!(opts.no_watch);
@@ -774,6 +808,7 @@ CUSTOM: Fix #{{ issue_number }} - {{ issue_title }}"#,
             no_watch: false,
             auto_merge: true,
             detach: false,
+            ignore_deps: false,
             worker: None,
         };
         assert!(opts.auto_merge);
@@ -792,6 +827,7 @@ CUSTOM: Fix #{{ issue_number }} - {{ issue_title }}"#,
             no_watch: true,
             auto_merge: true,
             detach: true,
+            ignore_deps: false,
             worker: Some("M001".to_string()),
         };
         let FixOptions {

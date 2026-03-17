@@ -14,6 +14,8 @@ pub struct FixOptions {
     pub auto_merge: bool,
     /// Detach immediately after spawning background worker (don't follow logs).
     pub detach: bool,
+    /// Skip dependency checking entirely.
+    pub ignore_deps: bool,
     /// Internal: run as background worker for a previously-registered minion.
     /// Value is the minion ID to look up in the registry.
     pub worker: Option<String>,
