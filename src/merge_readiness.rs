@@ -29,7 +29,7 @@ pub struct MergeReadiness {
     pub not_draft: bool,
     /// All CI check runs passed (success, skipped, or neutral), none pending/in-progress.
     pub ci_passing: bool,
-    /// Review gate satisfied: at least one external APPROVED review with no outstanding
+    /// Review gate satisfied: at least one APPROVED review with no outstanding
     /// CHANGES_REQUESTED, or the PR author left a self-review comment (GitHub prevents
     /// self-approval) and no reviewer has blocked.
     pub review_approved: bool,
