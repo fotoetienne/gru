@@ -415,6 +415,44 @@ async fn resume_interrupted_minions(
             None => continue, // repo no longer in config
         };
 
+        // Skip minions whose issue is already closed (PR merged or issue resolved)
+        let (owner, repo_name) = match candidate.info.repo.split_once('/') {
+            Some(parts) => parts,
+            None => continue,
+        };
+        match github::is_issue_closed_via_cli(owner, repo_name, &host, candidate.info.issue).await {
+            Ok(true) => {
+                println!(
+                    "⏭️  Skipping {} (issue #{}, {}): issue is closed",
+                    candidate.minion_id, candidate.info.issue, candidate.info.repo,
+                );
+                // Mark as Completed in the registry
+                let mid = candidate.minion_id.clone();
+                if let Err(e) = with_registry(move |reg| {
+                    reg.update(&mid, |info| {
+                        info.orchestration_phase = OrchestrationPhase::Completed;
+                    })
+                })
+                .await
+                {
+                    log::warn!("Failed to mark {} as completed: {}", candidate.minion_id, e);
+                }
+                continue;
+            }
+            Ok(false) => {} // Issue is still open, proceed with resume
+            Err(e) => {
+                // Transient failure (network, auth, etc.) — skip this cycle;
+                // the candidate stays active so it will be retried next poll.
+                log::warn!(
+                    "⚠️  Failed to check issue state for {} (issue #{}): {} — will retry next poll",
+                    candidate.minion_id,
+                    candidate.info.issue,
+                    e,
+                );
+                continue;
+            }
+        }
+
         // Skip minions whose timeout_deadline has passed
         if let Some(deadline) = candidate.info.timeout_deadline {
             if Utc::now() >= deadline {
