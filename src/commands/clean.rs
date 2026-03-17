@@ -445,10 +445,20 @@ pub async fn handle_clean(dry_run: bool, force: bool, base_branch: &str) -> Resu
             // Active minion worktree — but PID detection is unreliable (PID reuse).
             // Check GitHub state as a fallback: if the PR is merged or issue is
             // closed, the worktree is cleanable regardless of process state.
-            let status = wt
-                .status(base_branch)
-                .await
-                .with_context(|| format!("Failed to check status of {}", wt.path.display()))?;
+            let status = match wt.status(base_branch).await {
+                Ok(s) => s,
+                Err(e) => {
+                    // Previously active-minion worktrees were skipped with no I/O.
+                    // Be conservative: if we can't reach GitHub, keep the skip.
+                    log::warn!(
+                        "Failed to check GitHub state for active minion worktree {}: {} — skipping",
+                        wt.path.display(),
+                        e
+                    );
+                    skipped_active_minions.push(wt);
+                    continue;
+                }
+            };
 
             if status != worktree_scanner::WorktreeStatus::Active {
                 // GitHub says this work is done — cleanable even with a "live" PID.
