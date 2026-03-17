@@ -721,7 +721,7 @@ pub(crate) async fn monitor_ci_after_fix(
     worktree_path: &Path,
     minion_id: &str,
 ) -> Result<bool> {
-    let pr_number = match ci::get_pr_number(host, owner, repo, branch).await? {
+    let pr_number = match ci::get_pr_number(host, owner, repo, branch, None).await? {
         Some(num) => num,
         None => {
             eprintln!(

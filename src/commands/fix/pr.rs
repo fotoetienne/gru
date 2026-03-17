@@ -253,6 +253,29 @@ pub(crate) async fn handle_pr_creation(
         return Ok(None);
     }
 
+    // Check if a PR (open, closed, or merged) already exists for this branch
+    if let Ok(Some(existing_pr)) = crate::ci::get_pr_number(
+        &issue_ctx.host,
+        &issue_ctx.owner,
+        &issue_ctx.repo,
+        &wt_ctx.branch_name,
+        Some("all"),
+    )
+    .await
+    {
+        let pr_number = existing_pr.to_string();
+        println!(
+            "ℹ️  PR #{} already exists for branch '{}', skipping creation.",
+            pr_number, wt_ctx.branch_name
+        );
+
+        if let Err(e) = finalize_pr(issue_ctx, wt_ctx, &pr_number).await {
+            log::warn!("⚠️  Failed to finalize existing PR state: {}", e);
+        }
+
+        return Ok(Some(pr_number));
+    }
+
     println!("📋 Branch was pushed, creating pull request...");
 
     let issue_title_cached = issue_ctx.details.as_ref().map(|d| d.title.as_str());
@@ -294,6 +317,7 @@ pub(crate) async fn handle_pr_creation(
                     &issue_ctx.owner,
                     &issue_ctx.repo,
                     &wt_ctx.branch_name,
+                    None,
                 )
                 .await
                 {
@@ -345,6 +369,7 @@ pub(crate) async fn handle_pr_creation(
                     &issue_ctx.owner,
                     &issue_ctx.repo,
                     &wt_ctx.branch_name,
+                    None,
                 )
                 .await
                 {
@@ -414,6 +439,32 @@ mod tests {
                 // Acceptable failures: gh not installed, not authenticated
                 assert!(
                     msg.contains("gh api failed") || msg.contains("Failed to run gh api"),
+                    "Unexpected error: {}",
+                    msg
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_pr_number_state_all_nonexistent_branch() {
+        // A branch that has never had a PR should return Ok(None)
+        let result = crate::ci::get_pr_number(
+            "github.com",
+            "fotoetienne",
+            "gru",
+            "nonexistent-branch-xyz-12345",
+            Some("all"),
+        )
+        .await;
+
+        match result {
+            Ok(pr) => assert!(pr.is_none(), "Expected no PR for nonexistent branch"),
+            Err(e) => {
+                let msg = e.to_string();
+                // Acceptable: gh not installed or not authenticated
+                assert!(
+                    msg.contains("Failed to list") || msg.contains("gh pr list"),
                     "Unexpected error: {}",
                     msg
                 );
