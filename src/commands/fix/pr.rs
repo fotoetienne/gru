@@ -3,7 +3,6 @@ use crate::minion_registry::with_registry;
 use crate::pr_state::PrState;
 use anyhow::{Context, Result};
 use std::path::Path;
-use std::process::Stdio;
 use tokio::process::Command as TokioCommand;
 
 /// Checks if a branch has been pushed to the remote by querying GitHub's API.
@@ -41,56 +40,6 @@ pub(crate) async fn is_branch_pushed(
         branch_name,
         stderr.trim()
     ))
-}
-
-/// Checks if an open or merged PR already exists for the given head branch.
-/// Returns the PR number if found, or None if no PR exists.
-async fn find_existing_pr(
-    owner: &str,
-    repo: &str,
-    host: &str,
-    branch_name: &str,
-) -> Result<Option<String>> {
-    let repo_full = format!("{}/{}", owner, repo);
-
-    let output = crate::github::gh_cli_command(host)
-        .args([
-            "pr",
-            "list",
-            "--repo",
-            &repo_full,
-            "--head",
-            branch_name,
-            "--state",
-            "all",
-            "--json",
-            "number",
-            "--limit",
-            "1",
-        ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .await
-        .context("Failed to check for existing PRs")?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        log::warn!(
-            "⚠️  gh pr list --state all failed for branch '{}': {}",
-            branch_name,
-            stderr.trim()
-        );
-        return Ok(None);
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let prs: Vec<serde_json::Value> = serde_json::from_str(&stdout).unwrap_or_default();
-
-    Ok(prs
-        .first()
-        .and_then(|pr| pr["number"].as_u64())
-        .map(|n| n.to_string()))
 }
 
 /// Creates a WIP PR title and body template
@@ -304,15 +253,17 @@ pub(crate) async fn handle_pr_creation(
         return Ok(None);
     }
 
-    // Check if a PR (open or merged) already exists for this branch
-    if let Ok(Some(pr_number)) = find_existing_pr(
+    // Check if a PR (open, closed, or merged) already exists for this branch
+    if let Ok(Some(existing_pr)) = crate::ci::get_pr_number(
+        &issue_ctx.host,
         &issue_ctx.owner,
         &issue_ctx.repo,
-        &issue_ctx.host,
         &wt_ctx.branch_name,
+        Some("all"),
     )
     .await
     {
+        let pr_number = existing_pr.to_string();
         println!(
             "ℹ️  PR #{} already exists for branch '{}', skipping creation.",
             pr_number, wt_ctx.branch_name
@@ -366,6 +317,7 @@ pub(crate) async fn handle_pr_creation(
                     &issue_ctx.owner,
                     &issue_ctx.repo,
                     &wt_ctx.branch_name,
+                    None,
                 )
                 .await
                 {
@@ -417,6 +369,7 @@ pub(crate) async fn handle_pr_creation(
                     &issue_ctx.owner,
                     &issue_ctx.repo,
                     &wt_ctx.branch_name,
+                    None,
                 )
                 .await
                 {
@@ -494,13 +447,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_find_existing_pr_nonexistent_branch() {
+    async fn test_get_pr_number_state_all_nonexistent_branch() {
         // A branch that has never had a PR should return Ok(None)
-        let result = find_existing_pr(
+        let result = crate::ci::get_pr_number(
+            "github.com",
             "fotoetienne",
             "gru",
-            "github.com",
             "nonexistent-branch-xyz-12345",
+            Some("all"),
         )
         .await;
 
@@ -510,7 +464,7 @@ mod tests {
                 let msg = e.to_string();
                 // Acceptable: gh not installed or not authenticated
                 assert!(
-                    msg.contains("Failed to check") || msg.contains("gh pr list"),
+                    msg.contains("Failed to list") || msg.contains("gh pr list"),
                     "Unexpected error: {}",
                     msg
                 );

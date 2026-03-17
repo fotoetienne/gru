@@ -303,6 +303,7 @@ pub async fn handle_resume(
                 &issue_ctx.owner,
                 &issue_ctx.repo,
                 &wt_ctx.branch_name,
+                None,
             )
             .await
             {

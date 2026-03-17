@@ -537,19 +537,29 @@ pub async fn get_head_sha(worktree_path: &Path) -> Result<String> {
 }
 
 /// Gets the PR number associated with the current branch
+/// Looks up a PR number for the given branch.
+///
+/// When `state` is `None`, only open PRs are returned (gh default).
+/// Pass `Some("all")` to include open, closed, and merged PRs.
 pub async fn get_pr_number(
     host: &str,
     owner: &str,
     repo: &str,
     branch: &str,
+    state: Option<&str>,
 ) -> Result<Option<u64>> {
     let repo_full = format!("{}/{}", owner, repo);
 
+    let mut args = vec![
+        "pr", "list", "--repo", &repo_full, "--head", branch, "--json", "number", "--limit", "1",
+    ];
+
+    if let Some(s) = state {
+        args.extend(["--state", s]);
+    }
+
     let output = github::gh_cli_command(host)
-        .args([
-            "pr", "list", "--repo", &repo_full, "--head", branch, "--json", "number", "--limit",
-            "1",
-        ])
+        .args(&args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
@@ -561,7 +571,13 @@ pub async fn get_pr_number(
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let prs: Vec<serde_json::Value> = serde_json::from_str(&stdout).unwrap_or_default();
+    let prs: Vec<serde_json::Value> = match serde_json::from_str(&stdout) {
+        Ok(v) => v,
+        Err(e) => {
+            log::debug!("Failed to parse gh pr list output: {}", e);
+            return Ok(None);
+        }
+    };
 
     Ok(prs.first().and_then(|pr| pr["number"].as_u64()))
 }
