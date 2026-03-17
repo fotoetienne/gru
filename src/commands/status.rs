@@ -19,6 +19,7 @@ struct EnhancedMinionInfo {
     pid: Option<u32>,
     worktree_path: String,
     agent_name: String,
+    is_stale: bool,
 }
 
 /// Intermediate Minion data extracted from registry (without expensive status checks)
@@ -38,6 +39,7 @@ struct BasicMinionData {
     session_id: String,
     token_usage: Option<TokenUsage>,
     agent_name: String,
+    is_stale: bool,
 }
 
 /// Calculates uptime from a timestamp
@@ -119,7 +121,7 @@ fn format_mode_display(
 ///
 /// To minimize registry lock hold time and prevent blocking other minions:
 ///
-/// **Phase 1 (with lock):** Load registry, clean up stale entries,
+/// **Phase 1 (with lock):** Load registry, detect stale entries and dead processes,
 /// extract basic minion data, then release lock by dropping the registry.
 ///
 /// **Phase 2 (no lock):** Perform PID-based liveness checks and git branch
@@ -133,24 +135,12 @@ pub async fn handle_status(id: Option<String>, verbose: bool) -> Result<i32> {
         // Get all minions from registry
         let registry_minions = registry.list();
 
-        // Check for stale entries (worktrees that no longer exist)
-        let mut stale_ids = Vec::new();
-        for (minion_id, info) in &registry_minions {
-            if !info.worktree.exists() {
-                stale_ids.push(minion_id.clone());
-            }
-        }
-
-        // Remove stale entries from registry
-        if !stale_ids.is_empty() {
-            for minion_id in &stale_ids {
-                registry.remove(minion_id)?;
-            }
-            log::warn!(
-                "🗑️  Removed {} stale Minion(s) from registry",
-                stale_ids.len()
-            );
-        }
+        // Track stale entries (worktrees that no longer exist on disk)
+        let stale_ids: std::collections::HashSet<String> = registry_minions
+            .iter()
+            .filter(|(_id, info)| !info.worktree.exists())
+            .map(|(id, _)| id.clone())
+            .collect();
 
         // Detect dead processes and update registry.
         // Only on Unix where process liveness checks are available.
@@ -178,21 +168,25 @@ pub async fn handle_status(id: Option<String>, verbose: bool) -> Result<i32> {
         // Extract basic data without expensive operations
         let basic: Vec<BasicMinionData> = registry_minions
             .into_iter()
-            .map(|(minion_id, info)| BasicMinionData {
-                minion_id,
-                repo: info.repo,
-                issue: info.issue,
-                task: info.command,
-                pr: info.pr,
-                branch: info.branch,
-                started_at: info.started_at,
-                worktree: info.worktree,
-                pid: info.pid,
-                pid_start_time: info.pid_start_time,
-                mode: info.mode,
-                session_id: info.session_id,
-                token_usage: info.token_usage,
-                agent_name: info.agent_name,
+            .map(|(minion_id, info)| {
+                let is_stale = stale_ids.contains(&minion_id);
+                BasicMinionData {
+                    minion_id,
+                    repo: info.repo,
+                    issue: info.issue,
+                    task: info.command,
+                    pr: info.pr,
+                    branch: info.branch,
+                    started_at: info.started_at,
+                    worktree: info.worktree,
+                    pid: info.pid,
+                    pid_start_time: info.pid_start_time,
+                    mode: info.mode,
+                    session_id: info.session_id,
+                    token_usage: info.token_usage,
+                    agent_name: info.agent_name,
+                    is_stale,
+                }
             })
             .collect();
 
@@ -205,32 +199,54 @@ pub async fn handle_status(id: Option<String>, verbose: bool) -> Result<i32> {
     let mut minions = tokio::task::spawn_blocking(move || {
         basic_minions
             .into_iter()
-            // Filter out worktrees that were removed between Phase 1 and Phase 2
-            .filter(|basic| basic.worktree.exists())
             .map(|basic| {
-                let (is_running, mode_display) =
-                    format_mode_display(basic.pid, basic.pid_start_time, &basic.mode);
-                let uptime = calculate_uptime(basic.started_at);
-                // Get current branch from checkout path (checks for detached HEAD, branch changes, etc.)
-                let checkout_path = crate::workspace::resolve_checkout_path(&basic.worktree);
-                let branch = get_current_branch(&checkout_path, &basic.branch);
-                let worktree_path = checkout_path.display().to_string();
+                if basic.is_stale || !basic.worktree.exists() {
+                    // Stale entry: worktree doesn't exist (detected in Phase 1,
+                    // or removed between Phase 1 and Phase 2). Skip git operations.
+                    let uptime = calculate_uptime(basic.started_at);
+                    EnhancedMinionInfo {
+                        minion_id: basic.minion_id,
+                        repo: basic.repo,
+                        issue: basic.issue,
+                        task: basic.task,
+                        pr: basic.pr,
+                        branch: basic.branch,
+                        is_running: false,
+                        mode_display: "stale".to_string(),
+                        uptime,
+                        token_usage: basic.token_usage,
+                        session_id: basic.session_id,
+                        pid: None,
+                        worktree_path: basic.worktree.display().to_string(),
+                        agent_name: basic.agent_name,
+                        is_stale: true,
+                    }
+                } else {
+                    let (is_running, mode_display) =
+                        format_mode_display(basic.pid, basic.pid_start_time, &basic.mode);
+                    let uptime = calculate_uptime(basic.started_at);
+                    // Get current branch from checkout path (checks for detached HEAD, branch changes, etc.)
+                    let checkout_path = crate::workspace::resolve_checkout_path(&basic.worktree);
+                    let branch = get_current_branch(&checkout_path, &basic.branch);
+                    let worktree_path = checkout_path.display().to_string();
 
-                EnhancedMinionInfo {
-                    minion_id: basic.minion_id,
-                    repo: basic.repo,
-                    issue: basic.issue,
-                    task: basic.task,
-                    pr: basic.pr,
-                    branch,
-                    is_running,
-                    mode_display,
-                    uptime,
-                    token_usage: basic.token_usage,
-                    session_id: basic.session_id,
-                    pid: basic.pid,
-                    worktree_path,
-                    agent_name: basic.agent_name,
+                    EnhancedMinionInfo {
+                        minion_id: basic.minion_id,
+                        repo: basic.repo,
+                        issue: basic.issue,
+                        task: basic.task,
+                        pr: basic.pr,
+                        branch,
+                        is_running,
+                        mode_display,
+                        uptime,
+                        token_usage: basic.token_usage,
+                        session_id: basic.session_id,
+                        pid: basic.pid,
+                        worktree_path,
+                        agent_name: basic.agent_name,
+                        is_stale: false,
+                    }
                 }
             })
             .collect::<Vec<EnhancedMinionInfo>>()
@@ -271,11 +287,15 @@ pub async fn handle_status(id: Option<String>, verbose: bool) -> Result<i32> {
         return Ok(0);
     }
 
-    // Sort by: running first, then minion_id
-    minions.sort_by(|a, b| match (a.is_running, b.is_running) {
-        (true, false) => std::cmp::Ordering::Less,
-        (false, true) => std::cmp::Ordering::Greater,
-        _ => a.minion_id.cmp(&b.minion_id),
+    // Sort by: running first, then stopped, then stale last; within each group by minion_id
+    minions.sort_by(|a, b| match (a.is_stale, b.is_stale) {
+        (true, false) => std::cmp::Ordering::Greater,
+        (false, true) => std::cmp::Ordering::Less,
+        _ => match (a.is_running, b.is_running) {
+            (true, false) => std::cmp::Ordering::Less,
+            (false, true) => std::cmp::Ordering::Greater,
+            _ => a.minion_id.cmp(&b.minion_id),
+        },
     });
 
     // Print table header
@@ -340,7 +360,16 @@ pub async fn handle_status(id: Option<String>, verbose: bool) -> Result<i32> {
     }
 
     println!();
-    println!("{} Minion(s) found", minions.len());
+    let stale_count = minions.iter().filter(|m| m.is_stale).count();
+    if stale_count > 0 {
+        println!(
+            "{} Minion(s) found ({} stale - run 'gru clean' to remove)",
+            minions.len(),
+            stale_count
+        );
+    } else {
+        println!("{} Minion(s) found", minions.len());
+    }
 
     Ok(0)
 }
