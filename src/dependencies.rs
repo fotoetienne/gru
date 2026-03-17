@@ -419,11 +419,31 @@ mod tests {
 
     #[test]
     fn test_server_error_falls_back_to_body_parsing() {
-        // On 403/500/502/503, API returns Unavailable (None), so body parsing
-        // is used as fallback — same behavior as GHES 404.
-        // If body has blockers, they ARE respected (not silently ignored).
+        // Exercise parse_api_output for each error code, then verify resolve_blockers
+        // uses body parsing as fallback when the API is unavailable.
         let body = "**Blocked by:** #10";
-        let blockers = resolve_blockers(body, None);
-        assert_eq!(blockers, vec![10]);
+        for (stderr, code) in [
+            ("HTTP 403: Forbidden", 42),
+            ("HTTP 500: Internal Server Error", 42),
+            ("HTTP 502: Bad Gateway", 42),
+            ("HTTP 503: Service Unavailable", 42),
+        ] {
+            let api_result = parse_api_output(false, "", stderr, code);
+            assert_eq!(
+                api_result,
+                ApiResult::Unavailable,
+                "Expected Unavailable for {stderr}"
+            );
+            let api_blockers = match api_result {
+                ApiResult::Supported(v) => Some(v),
+                ApiResult::Unavailable => None,
+            };
+            let blockers = resolve_blockers(body, api_blockers);
+            assert_eq!(
+                blockers,
+                vec![10],
+                "Body blockers should be respected on {stderr}"
+            );
+        }
     }
 }

@@ -253,8 +253,9 @@ Located in `.claude/skills/`:
   - Use `#` prefix for issue numbers (bare numbers are ignored)
   - Cross-repo references (`owner/repo#123`) are skipped with a warning
   - Example: `**Blocked by:** #10, #20, #30`
-- **Two-layer checking:** Body parsing (free) runs first, then the native GitHub dependencies API verifies
+- **Two-layer checking:** The native GitHub dependencies API is called first; body parsing is the fallback when the API is unavailable
 - **Native API resolution:** API result is authoritative when available (200). Body text is sole source on 404 (GHES)
+- **Mutually exclusive:** When the API returns a result (even an empty list), it is the sole source of truth — body-text blockers are not merged in. Body parsing is only used when the API is unavailable
 - **GHES compatibility:** When the native dependencies API returns 404, Gru falls back to body-text parsing only. No functionality is lost — body-text deps work identically
 - **Error handling:** 403/500/502/503 errors are logged as warnings and cause fallback to body parsing (same as 404). If body has blockers, they are respected. If body has no blockers, the issue is treated as unblocked
 - **`gru do` behavior:** Warns about open blockers but proceeds (user explicitly chose the issue). Use `--ignore-deps` to suppress
