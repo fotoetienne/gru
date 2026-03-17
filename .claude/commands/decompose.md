@@ -55,7 +55,7 @@ For each approved sub-issue:
   - Body that includes:
     - **Description**: What this sub-issue addresses
     - **Parent Issue**: "Part of #<original-issue>"
-    - **Blocked by:** #N (links to prerequisite sub-issues if order matters, using the `**Blocked by:** #X, #Y` convention)
+    - **Blocked by:** #X, #Y (links to prerequisite sub-issues if order matters, using the `**Blocked by:** #X, #Y` convention)
     - **Code Areas**: File/module references
   - Labels: Copy from parent + add `subtask` if available
 - Capture the new issue numbers
@@ -74,9 +74,11 @@ For each dependency relationship (where issue B is blocked by issue A):
      -f issue_id="$BLOCKER_ID"
    ```
 
-**Graceful degradation:** If the POST returns a 404 (e.g., on GHES without native dependency support), log a warning but continue — the body-text `**Blocked by:**` convention is the universal fallback.
+**Error handling:** After each `gh api` POST, check the exit status and stderr:
+- **404 / "Not Found"**: GHES without native dependency support — log a warning and continue. The body-text `**Blocked by:**` convention is the universal fallback.
+- **Other errors** (422, 500, etc.): Surface the error to the user so dependency setting doesn't silently fail.
 
-Also set native dependencies between sub-issues and the parent issue's blockers (if any were listed in the parent).
+Also set native dependencies between sub-issues and the parent issue's same-repo blockers (if any were listed in the parent). Skip cross-repo blocker references (e.g., `owner/repo#123`) since the `/issues/{number}` endpoint can only resolve IDs within the current repo.
 
 ## 8. Update Parent Issue
 - Add a comment to the parent issue with:
