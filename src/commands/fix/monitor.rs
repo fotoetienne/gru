@@ -230,11 +230,6 @@ pub(crate) async fn monitor_pr_lifecycle(
     // during the review are not missed when the monitoring loop starts.
     let pre_review_time = chrono::Utc::now();
 
-    // Persist the pre-review timestamp as the initial review baseline.
-    // Set BEFORE the self-review starts so reviews submitted concurrently
-    // are not missed (per #445 lesson: use pre-review time, not post-review).
-    save_review_check_time(&wt_ctx.minion_id, pre_review_time).await;
-
     // Guard: skip self-review if we already posted one for the current HEAD SHA.
     // This prevents duplicate reviews when monitor_pr_lifecycle is re-entered
     // (e.g., on lab daemon resume or run_worker restart).
@@ -256,6 +251,11 @@ pub(crate) async fn monitor_pr_lifecycle(
     } else {
         // Auto-trigger review for Minion-created PRs
         println!("\n🔍 Starting automated PR review...");
+        // Persist the pre-review timestamp as the initial review baseline.
+        // Done here (not before the already_reviewed guard) so that on re-entry
+        // we don't overwrite a stored baseline with the current time, which would
+        // cause reviews posted while the minion was stopped to be skipped.
+        save_review_check_time(&wt_ctx.minion_id, pre_review_time).await;
         match trigger_pr_review(pr_number, &wt_ctx.checkout_path, review_timeout).await {
             Ok(review_exit_code) => {
                 if review_exit_code == 0 {
@@ -323,9 +323,24 @@ pub(crate) async fn monitor_pr_lifecycle(
         .unwrap_or(merge_judge::DEFAULT_CONFIDENCE_THRESHOLD);
     // Track review baseline across monitor_pr re-entries so reviews posted
     // before/during event handling (e.g. rebase) are not silently dropped.
-    // Initialized to pre_review_time so reviews submitted during the
-    // self-review are detected on the first poll.
-    let mut review_baseline: Option<chrono::DateTime<chrono::Utc>> = Some(pre_review_time);
+    // On a fresh run, initialize to pre_review_time so reviews submitted
+    // during the self-review are detected on the first poll.
+    // On re-entry (already_reviewed), load the stored baseline from the
+    // registry so reviews posted while the minion was stopped are not skipped.
+    let initial_baseline = if already_reviewed {
+        let mid = wt_ctx.minion_id.clone();
+        minion_registry::with_registry(move |registry| {
+            Ok(registry
+                .get(&mid)
+                .and_then(|info| info.last_review_check_time))
+        })
+        .await
+        .unwrap_or(None)
+        .unwrap_or(pre_review_time)
+    } else {
+        pre_review_time
+    };
+    let mut review_baseline: Option<chrono::DateTime<chrono::Utc>> = Some(initial_baseline);
     loop {
         // Compute remaining time so the timeout spans the entire lifecycle,
         // not just a single monitor_pr invocation.
