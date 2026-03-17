@@ -73,7 +73,7 @@ pub async fn mark_minion_failed(minion_id: &str) {
 
 /// Prune stale registry entries where worktrees no longer exist.
 ///
-/// Uses a two-phase approach so the registry lock is not held during async
+/// Uses a three-phase approach so the registry lock is not held during async
 /// GitHub API calls:
 ///
 /// 1. **Phase 1 (sync):** Collect candidate entries where `worktree.exists()` is

@@ -132,7 +132,10 @@ fn format_mode_display(
 pub async fn handle_status(id: Option<String>, verbose: bool) -> Result<i32> {
     // Prune stale entries using the shared two-phase approach that checks
     // GitHub PR status before removing entries with open PRs.
-    crate::minion_registry::prune_stale_entries().await?;
+    // Non-fatal: a transient GitHub API error should not prevent status display.
+    if let Err(e) = crate::minion_registry::prune_stale_entries().await {
+        log::warn!("Failed to prune stale registry entries: {:#}", e);
+    }
 
     // Phase 1: Load registry and perform remaining cleanup (with lock held)
     let basic_minions = with_registry(|registry| {

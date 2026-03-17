@@ -592,7 +592,7 @@ async fn poll_and_spawn(
     no_resume: bool,
     resumed_this_session: &mut HashSet<String>,
 ) -> Result<()> {
-    // Prune stale registry entries (missing worktrees or terminal minions with no live process)
+    // Prune stale registry entries (worktrees that no longer exist, checking PR status)
     prune_stale_entries().await?;
 
     // Calculate available slots using PID liveness (not registry status string)
@@ -1328,31 +1328,4 @@ mod tests {
             "Process at 1s under threshold should still qualify for label restoration"
         );
     }
-
-    /// Helper to create a MinionInfo with sensible defaults for testing.
-    fn make_test_info(worktree: PathBuf) -> MinionInfo {
-        MinionInfo {
-            repo: "owner/repo".to_string(),
-            issue: 1,
-            command: "do".to_string(),
-            prompt: String::new(),
-            started_at: Utc::now(),
-            branch: "minion/issue-1-M000".to_string(),
-            worktree,
-            status: "active".to_string(),
-            pr: None,
-            session_id: "test-session".to_string(),
-            pid: None,
-            mode: MinionMode::default(),
-            last_activity: Utc::now(),
-            orchestration_phase: OrchestrationPhase::default(),
-            token_usage: None,
-            agent_name: "claude".to_string(),
-            timeout_deadline: None,
-            attempt_count: 0,
-            no_watch: false,
-            pid_start_time: None,
-        }
-    }
-
 }

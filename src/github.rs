@@ -298,6 +298,14 @@ pub async fn is_pr_open_via_cli(owner: &str, repo: &str, host: &str, number: u64
     }
 
     let state = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if state.is_empty() {
+        return Err(anyhow!(
+            "gh pr view returned empty state for PR #{} in {}/{}",
+            number,
+            owner,
+            repo
+        ));
+    }
     Ok(state == "OPEN")
 }
 
