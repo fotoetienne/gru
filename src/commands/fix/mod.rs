@@ -462,17 +462,16 @@ pub async fn handle_fix(issue: &str, opts: FixOptions) -> Result<i32> {
             issue_ctx.issue_num,
             body,
         )
-        .await
-        .unwrap_or_default();
+        .await;
 
         if !blockers.is_empty() {
             let blocker_list: Vec<String> = blockers.iter().map(|n| format!("#{}", n)).collect();
             println!(
-                "⚠️  Issue #{} has open blockers: {}",
+                "⚠️  Issue #{} may have unresolved blockers: {}",
                 issue_ctx.issue_num,
                 blocker_list.join(", ")
             );
-            println!("   Use --ignore-deps to skip this check.");
+            println!("   Use --ignore-deps to suppress this warning.");
         }
     }
 

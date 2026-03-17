@@ -1,5 +1,3 @@
-use anyhow::Result;
-
 use crate::github::gh_cli_command;
 
 /// Parse blocker issue numbers from an issue body.
@@ -57,54 +55,29 @@ pub fn parse_blockers_from_body(body: &str) -> Vec<u64> {
     blockers
 }
 
-/// Fetch open blockers for an issue via the GitHub native dependencies API.
+/// Result of interpreting the `gh api` output for the dependencies endpoint.
 ///
-/// Calls `GET /repos/{owner}/{repo}/issues/{number}/dependencies/blocked_by`
-/// and filters results to those with `state == "open"`.
+/// Separates "API supported and returned a result" from "API not available or errored".
+#[derive(Debug, PartialEq)]
+pub enum ApiResult {
+    /// API returned 200 — the contained list is the set of open blocker issue numbers.
+    Supported(Vec<u64>),
+    /// API is not available (404/GHES) or returned an error (403/5xx/spawn failure).
+    Unavailable,
+}
+
+/// Parse the raw output of `gh api` for the dependencies endpoint into an [`ApiResult`].
 ///
-/// Returns `Ok(vec![])` on 404 (GHES fallback), 403, or 500 — these are
-/// treated as "no blockers detected" to avoid blocking the pipeline on API errors.
-pub async fn get_blockers_via_api(
-    host: &str,
-    owner: &str,
-    repo: &str,
-    issue_number: u64,
-) -> Result<Vec<u64>> {
-    let endpoint = format!(
-        "repos/{}/{}/issues/{}/dependencies/blocked_by",
-        owner, repo, issue_number
-    );
-
-    let output = gh_cli_command(host)
-        .args([
-            "api",
-            &endpoint,
-            "--jq",
-            "[.[] | select(.state == \"open\") | .number]",
-        ])
-        .output()
-        .await;
-
-    let output = match output {
-        Ok(o) => o,
-        Err(e) => {
-            log::warn!("Failed to call dependencies API: {}", e);
-            return Ok(vec![]);
-        }
-    };
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let code_str = output.status.code().map(|c| c.to_string());
-        let code = code_str.as_deref().unwrap_or("unknown");
-
-        // Check for HTTP error codes in stderr (gh api includes them)
+/// This is a pure function extracted for testability. It interprets the exit status,
+/// stderr, and stdout of the `gh api` call.
+pub fn parse_api_output(success: bool, stdout: &str, stderr: &str, issue_number: u64) -> ApiResult {
+    if !success {
         if stderr.contains("404") || stderr.contains("Not Found") {
             log::debug!(
                 "Dependencies API returned 404 (GHES fallback) for issue #{}",
                 issue_number
             );
-            return Ok(vec![]);
+            return ApiResult::Unavailable;
         }
         if stderr.contains("403")
             || stderr.contains("500")
@@ -112,45 +85,86 @@ pub async fn get_blockers_via_api(
             || stderr.contains("503")
         {
             log::warn!(
-                "Dependencies API returned error for issue #{}: {} (exit code {})",
+                "Dependencies API returned error for issue #{}: {}",
                 issue_number,
                 stderr.trim(),
-                code
             );
-            return Ok(vec![]);
+            return ApiResult::Unavailable;
         }
 
         log::warn!(
-            "Dependencies API failed for issue #{}: {} (exit code {})",
+            "Dependencies API failed for issue #{}: {}",
             issue_number,
             stderr.trim(),
-            code
         );
-        return Ok(vec![]);
+        return ApiResult::Unavailable;
     }
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
     let trimmed = stdout.trim();
 
     if trimmed.is_empty() || trimmed == "[]" || trimmed == "null" {
-        return Ok(vec![]);
+        return ApiResult::Supported(vec![]);
     }
 
     match serde_json::from_str::<Vec<u64>>(trimmed) {
-        Ok(numbers) => Ok(numbers),
+        Ok(numbers) => ApiResult::Supported(numbers),
         Err(e) => {
             log::warn!("Failed to parse dependencies API response: {}", e);
-            Ok(vec![])
+            ApiResult::Unavailable
         }
+    }
+}
+
+/// Fetch open blockers for an issue via the GitHub native dependencies API.
+///
+/// Calls `GET /repos/{owner}/{repo}/issues/{number}/dependencies/blocked_by`
+/// and filters results to those with `state == "open"`.
+///
+/// Returns `Some(blockers)` when the API is supported and returns 200.
+/// Returns `None` on 404 (GHES), 403, 5xx, or any other error — the caller
+/// should fall back to body parsing.
+pub async fn get_blockers_via_api(
+    host: &str,
+    owner: &str,
+    repo: &str,
+    issue_number: u64,
+) -> Option<Vec<u64>> {
+    let endpoint = format!(
+        "repos/{}/{}/issues/{}/dependencies/blocked_by",
+        owner, repo, issue_number
+    );
+
+    let output = match gh_cli_command(host)
+        .args([
+            "api",
+            &endpoint,
+            "--jq",
+            "[.[] | select(.state == \"open\") | .number]",
+        ])
+        .output()
+        .await
+    {
+        Ok(o) => o,
+        Err(e) => {
+            log::warn!("Failed to call dependencies API: {}", e);
+            return None;
+        }
+    };
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    match parse_api_output(output.status.success(), &stdout, &stderr, issue_number) {
+        ApiResult::Supported(blockers) => Some(blockers),
+        ApiResult::Unavailable => None,
     }
 }
 
 /// Get all open blockers for an issue using both body parsing and the native API.
 ///
 /// Resolution policy:
-/// - If the API returns non-empty blockers, those are used (body text ignored)
-/// - If the API returns empty or 404, body-parsed blockers are used as fallback
-/// - On API error, body-parsed blockers are the sole source
+/// - Native API wins when it returns 200 (even if the list is empty)
+/// - Body text is the sole source when the API is unavailable (404/error)
 /// - Results are never combined across sources
 pub async fn get_blockers(
     host: &str,
@@ -158,30 +172,14 @@ pub async fn get_blockers(
     repo: &str,
     issue_number: u64,
     body: &str,
-) -> Result<Vec<u64>> {
+) -> Vec<u64> {
     let body_blockers = parse_blockers_from_body(body);
 
-    // Try the native API
-    let api_result = get_blockers_via_api(host, owner, repo, issue_number).await;
-
-    match api_result {
-        Ok(api_blockers) => {
-            // If the API returned results (even empty), it wins
-            // The only way to distinguish "API returned 200 with empty list" from
-            // "API returned 404" is that our 404 handler returns Ok(vec![]).
-            // Since we can't distinguish, we merge: use API if non-empty, else body.
-            if !api_blockers.is_empty() {
-                Ok(api_blockers)
-            } else if !body_blockers.is_empty() {
-                Ok(body_blockers)
-            } else {
-                Ok(vec![])
-            }
-        }
-        Err(_) => {
-            // API error — fall back to body parsing
-            Ok(body_blockers)
-        }
+    // Try the native API — returns Some when the endpoint is supported,
+    // None when unavailable (404/GHES) or errored (403/5xx).
+    match get_blockers_via_api(host, owner, repo, issue_number).await {
+        Some(api_blockers) => api_blockers,
+        None => body_blockers,
     }
 }
 
@@ -258,5 +256,61 @@ mod tests {
         let body = "**Blocked by:** 42";
         let blockers = parse_blockers_from_body(body);
         assert!(blockers.is_empty());
+    }
+
+    // --- parse_api_output tests ---
+
+    #[test]
+    fn test_api_success_with_blockers() {
+        let result = parse_api_output(true, "[10, 20]", "", 1);
+        assert_eq!(result, ApiResult::Supported(vec![10, 20]));
+    }
+
+    #[test]
+    fn test_api_success_empty_list() {
+        let result = parse_api_output(true, "[]", "", 1);
+        assert_eq!(result, ApiResult::Supported(vec![]));
+    }
+
+    #[test]
+    fn test_api_success_empty_stdout() {
+        let result = parse_api_output(true, "", "", 1);
+        assert_eq!(result, ApiResult::Supported(vec![]));
+    }
+
+    #[test]
+    fn test_api_success_null() {
+        let result = parse_api_output(true, "null", "", 1);
+        assert_eq!(result, ApiResult::Supported(vec![]));
+    }
+
+    #[test]
+    fn test_api_success_invalid_json() {
+        let result = parse_api_output(true, "not json", "", 1);
+        assert_eq!(result, ApiResult::Unavailable);
+    }
+
+    #[test]
+    fn test_api_404_not_found() {
+        let result = parse_api_output(false, "", "HTTP 404: Not Found", 1);
+        assert_eq!(result, ApiResult::Unavailable);
+    }
+
+    #[test]
+    fn test_api_403_forbidden() {
+        let result = parse_api_output(false, "", "HTTP 403: Forbidden", 1);
+        assert_eq!(result, ApiResult::Unavailable);
+    }
+
+    #[test]
+    fn test_api_500_server_error() {
+        let result = parse_api_output(false, "", "HTTP 500: Internal Server Error", 1);
+        assert_eq!(result, ApiResult::Unavailable);
+    }
+
+    #[test]
+    fn test_api_unknown_error() {
+        let result = parse_api_output(false, "", "something unexpected", 1);
+        assert_eq!(result, ApiResult::Unavailable);
     }
 }
