@@ -1452,6 +1452,7 @@ mod tests {
 
     /// Helper that mirrors the production filter in poll_once: excludes reviews
     /// by the PR author AND before the last check time.
+    /// NOTE: keep in sync with the filter predicate in poll_once (around line 570).
     fn filter_new_external_reviews(
         reviews: Vec<Review>,
         since: DateTime<Utc>,
@@ -1496,6 +1497,21 @@ mod tests {
 
         let filtered = filter_new_external_reviews(reviews, since, "pr-author");
         assert!(filtered.is_empty());
+    }
+
+    #[test]
+    fn test_self_review_before_last_check_excluded_by_time_filter() {
+        let since: DateTime<Utc> = "2024-06-15T10:00:00Z".parse().unwrap();
+        let reviews = vec![
+            // Self-review before last_check_time — excluded by time filter alone
+            make_review_by(1, "2024-06-15T09:00:00Z", "pr-author"),
+            // External review after last_check_time — included
+            make_review_by(2, "2024-06-15T11:00:00Z", "external-reviewer"),
+        ];
+
+        let filtered = filter_new_external_reviews(reviews, since, "pr-author");
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].user.login, "external-reviewer");
     }
 
     // ========================================================================
