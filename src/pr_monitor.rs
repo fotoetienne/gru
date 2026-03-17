@@ -564,16 +564,16 @@ async fn poll_once(
     // Check for new reviews BEFORE merge conflicts so that reviewer feedback
     // is never silently dropped when conflicts and reviews overlap.
     let all_reviews = get_all_reviews(host, owner, repo, pr_number).await?;
-    let pr_author = &pr.user.login;
+    let pr_author = pr.user.login.as_str();
     let has_new_reviews = all_reviews
         .iter()
-        .any(|r| r.submitted_at >= *last_check_time && r.user.login != *pr_author);
+        .any(|r| r.submitted_at >= *last_check_time && r.user.login != pr_author);
     if has_new_reviews {
         // Extract only the new reviews for comment fetching, excluding self-reviews
         // to prevent the minion from entering a feedback loop with its own reviews.
         let new_reviews: Vec<Review> = all_reviews
             .into_iter()
-            .filter(|r| r.submitted_at >= *last_check_time && r.user.login != *pr_author)
+            .filter(|r| r.submitted_at >= *last_check_time && r.user.login != pr_author)
             .collect();
         let comments = get_review_comments(host, owner, repo, pr_number, &new_reviews).await?;
         // Advance past these reviews so they are not re-fetched if the caller
