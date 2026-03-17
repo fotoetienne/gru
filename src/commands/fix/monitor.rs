@@ -232,6 +232,8 @@ pub(crate) async fn monitor_pr_lifecycle(
     let mut rebase_attempts = 0;
     let mut judge_state = JudgeState::new();
     let mut judge_label_ensured = false;
+    let mut consecutive_errors: u32 = 0;
+    const MAX_CONSECUTIVE_ERRORS: u32 = 10;
     // Load merge confidence threshold from config (falls back to default).
     // Uses load_partial to avoid requiring [daemon].repos for non-daemon commands.
     let confidence_threshold = LabConfig::default_path()
@@ -274,7 +276,7 @@ pub(crate) async fn monitor_pr_lifecycle(
             break;
         }
 
-        match pr_monitor::monitor_pr(
+        let monitor_result = pr_monitor::monitor_pr(
             &issue_ctx.host,
             &issue_ctx.owner,
             &issue_ctx.repo,
@@ -283,8 +285,13 @@ pub(crate) async fn monitor_pr_lifecycle(
             remaining,
             review_baseline,
         )
-        .await
-        {
+        .await;
+
+        if monitor_result.is_ok() {
+            consecutive_errors = 0;
+        }
+
+        match monitor_result {
             Ok((MonitorResult::Merged, _)) => {
                 println!("✅ PR #{} was merged successfully!", pr_number);
                 println!("🎉 Issue {} is complete!", issue_ctx.issue_num);
@@ -645,14 +652,28 @@ pub(crate) async fn monitor_pr_lifecycle(
                 break;
             }
             Err(e) => {
-                log::warn!("⚠️  PR monitoring failed: {}", e);
+                consecutive_errors += 1;
+                if consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
+                    log::warn!(
+                        "⚠️  PR monitoring failed {} consecutive times, giving up: {}",
+                        consecutive_errors,
+                        e
+                    );
+                    log::warn!(
+                        "   You can monitor manually at: https://github.com/{}/{}/pull/{}",
+                        issue_ctx.owner,
+                        issue_ctx.repo,
+                        pr_number
+                    );
+                    break;
+                }
                 log::warn!(
-                    "   You can monitor manually at: https://github.com/{}/{}/pull/{}",
-                    issue_ctx.owner,
-                    issue_ctx.repo,
-                    pr_number
+                    "⚠️  PR monitoring error ({}/{}): {}",
+                    consecutive_errors,
+                    MAX_CONSECUTIVE_ERRORS,
+                    e
                 );
-                break;
+                continue;
             }
         }
     }
