@@ -1,4 +1,4 @@
-use crate::minion_registry::{is_process_alive, with_registry, MinionMode};
+use crate::minion_registry::{is_process_alive_with_start_time, with_registry, MinionMode};
 use crate::minion_resolver;
 use anyhow::Result;
 use std::path::Path;
@@ -103,7 +103,7 @@ pub async fn handle_stop(id: String, force: bool) -> Result<i32> {
     match with_registry(move |registry| {
         registry.update(&minion_id, |info| {
             info.status = "stopped".to_string();
-            info.pid = None;
+            info.clear_pid();
             info.mode = MinionMode::Stopped;
         })
     })
@@ -128,12 +128,16 @@ pub async fn handle_stop(id: String, force: bool) -> Result<i32> {
 /// Returns true if a process was found and signalled.
 async fn terminate_via_registry_pid(minion_id: &str, force: bool) -> bool {
     let mid = minion_id.to_string();
-    let pid = match with_registry(move |reg| Ok(reg.get(&mid).and_then(|info| info.pid))).await {
-        Ok(Some(pid)) => pid,
+    let (pid, pid_start_time) = match with_registry(move |reg| {
+        Ok(reg.get(&mid).map(|info| (info.pid, info.pid_start_time)))
+    })
+    .await
+    {
+        Ok(Some((Some(pid), start_time))) => (pid, start_time),
         _ => return false,
     };
 
-    if !is_process_alive(pid) {
+    if !is_process_alive_with_start_time(pid, pid_start_time) {
         return false;
     }
 

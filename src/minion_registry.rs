@@ -48,7 +48,7 @@ pub async fn revert_to_stopped(minion_id: &str) {
     let _ = with_registry(move |reg| {
         reg.update(&mid, |info| {
             info.mode = MinionMode::Stopped;
-            info.pid = None;
+            info.clear_pid();
             info.last_activity = Utc::now();
         })
     })
@@ -62,7 +62,7 @@ pub async fn mark_minion_failed(minion_id: &str) {
     let _ = with_registry(move |reg| {
         reg.update(&mid, |info| {
             info.mode = MinionMode::Stopped;
-            info.pid = None;
+            info.clear_pid();
             info.orchestration_phase = OrchestrationPhase::Failed;
             info.last_activity = Utc::now();
         })
@@ -180,6 +180,11 @@ pub struct MinionInfo {
     /// Process ID of the Claude Code process (None when not running)
     #[serde(default)]
     pub pid: Option<u32>,
+    /// Process start time (seconds since epoch) recorded at spawn.
+    /// Used to detect PID reuse: if the OS-reported start time for the PID
+    /// differs from this value, the PID was recycled to a different process.
+    #[serde(default)]
+    pub pid_start_time: Option<i64>,
     /// Current execution mode of the Minion
     #[serde(default)]
     pub mode: MinionMode,
@@ -220,6 +225,27 @@ impl MinionInfo {
     pub fn checkout_path(&self) -> PathBuf {
         crate::workspace::resolve_checkout_path(&self.worktree)
     }
+
+    /// Clears the PID and its associated start time.
+    pub fn clear_pid(&mut self) {
+        self.pid = None;
+        self.pid_start_time = None;
+    }
+
+    /// Checks whether this minion's process is still alive, accounting for PID reuse.
+    ///
+    /// Returns `true` only if:
+    /// 1. A PID is recorded
+    /// 2. The process exists (via `kill(pid, 0)`)
+    /// 3. The process start time matches what was recorded at spawn (if available)
+    ///
+    /// If `pid_start_time` is `None` (legacy entries), falls back to the basic kill check.
+    pub fn is_running(&self) -> bool {
+        match self.pid {
+            Some(pid) => is_process_alive_with_start_time(pid, self.pid_start_time),
+            None => false,
+        }
+    }
 }
 
 /// Checks whether a process with the given PID is still alive.
@@ -228,6 +254,9 @@ impl MinionInfo {
 /// Returns `true` if the process exists and is owned by the current user.
 /// Returns `false` if the process does not exist, or exists but is owned by a different user
 /// (EPERM). Since Gru spawns Claude processes as the same user, EPERM is not expected in practice.
+///
+/// **Warning:** This does NOT detect PID reuse. Prefer [`is_process_alive_with_start_time`]
+/// or [`MinionInfo::is_running`] when a recorded start time is available.
 pub fn is_process_alive(pid: u32) -> bool {
     #[cfg(unix)]
     {
@@ -246,6 +275,158 @@ pub fn is_process_alive(pid: u32) -> bool {
         let _ = pid;
         false
     }
+}
+
+/// Like [`is_process_alive`], but also verifies the process start time to detect PID reuse.
+///
+/// If `recorded_start_time` is `Some`, the OS-reported start time for the PID is compared
+/// against it. If they differ, the PID was recycled to a different process and this returns
+/// `false`. If `recorded_start_time` is `None` (legacy entries), falls back to the basic
+/// kill-signal check.
+pub fn is_process_alive_with_start_time(pid: u32, recorded_start_time: Option<i64>) -> bool {
+    if !is_process_alive(pid) {
+        return false;
+    }
+
+    // If we have a recorded start time, verify the PID still belongs to the same process.
+    if let Some(recorded) = recorded_start_time {
+        match get_process_start_time(pid) {
+            Some(actual) => {
+                // Allow 2-second tolerance for rounding differences between
+                // the Rust clock and the OS-reported value.
+                if (actual - recorded).abs() > 2 {
+                    log::debug!(
+                        "PID {} recycled: recorded start_time={}, actual={}",
+                        pid,
+                        recorded,
+                        actual
+                    );
+                    return false;
+                }
+            }
+            None => {
+                // Couldn't query start time (process may have just exited).
+                // Fall through to trust the kill() result.
+            }
+        }
+    }
+
+    true
+}
+
+/// Returns the start time (seconds since epoch) of a process, or `None` if unavailable.
+///
+/// On macOS, uses `sysctl` with `KERN_PROC/KERN_PROC_PID`.
+/// On Linux, reads `/proc/<pid>/stat` and combines with boot time from `/proc/stat`.
+#[cfg(unix)]
+pub fn get_process_start_time(pid: u32) -> Option<i64> {
+    #[cfg(target_os = "macos")]
+    {
+        get_process_start_time_macos(pid)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        get_process_start_time_linux(pid)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
+#[cfg(not(unix))]
+pub fn get_process_start_time(_pid: u32) -> Option<i64> {
+    None
+}
+
+#[cfg(target_os = "macos")]
+fn get_process_start_time_macos(pid: u32) -> Option<i64> {
+    // Use `proc_pidinfo` with PROC_PIDTBSDINFO to get the process start time.
+    // This avoids needing the kinfo_proc struct from libc (not exposed for macOS).
+    use std::mem;
+
+    // proc_bsdinfo struct layout (from <sys/proc_info.h>)
+    #[repr(C)]
+    struct ProcBsdInfo {
+        pbi_flags: u32,
+        pbi_status: u32,
+        pbi_xstatus: u32,
+        pbi_pid: u32,
+        pbi_ppid: u32,
+        pbi_uid: libc::uid_t,
+        pbi_gid: libc::gid_t,
+        pbi_ruid: libc::uid_t,
+        pbi_rgid: libc::gid_t,
+        pbi_svuid: libc::uid_t,
+        pbi_svgid: libc::gid_t,
+        _rfu_1: u32,
+        pbi_comm: [libc::c_char; 16], // MAXCOMLEN
+        pbi_name: [libc::c_char; 32], // 2 * MAXCOMLEN
+        pbi_nfiles: u32,
+        pbi_pgid: u32,
+        pbi_pjobc: u32,
+        e_tdev: u32,
+        e_tpgid: u32,
+        pbi_nice: i32,
+        pbi_start_tvsec: u64,
+        pbi_start_tvusec: u64,
+    }
+
+    const PROC_PIDTBSDINFO: libc::c_int = 3;
+
+    extern "C" {
+        fn proc_pidinfo(
+            pid: libc::c_int,
+            flavor: libc::c_int,
+            arg: u64,
+            buffer: *mut libc::c_void,
+            buffersize: libc::c_int,
+        ) -> libc::c_int;
+    }
+
+    let mut info: ProcBsdInfo = unsafe { mem::zeroed() };
+    let size = mem::size_of::<ProcBsdInfo>() as libc::c_int;
+
+    let ret = unsafe {
+        proc_pidinfo(
+            pid as libc::c_int,
+            PROC_PIDTBSDINFO,
+            0,
+            &mut info as *mut _ as *mut libc::c_void,
+            size,
+        )
+    };
+
+    if ret <= 0 {
+        return None;
+    }
+
+    Some(info.pbi_start_tvsec as i64)
+}
+
+#[cfg(target_os = "linux")]
+fn get_process_start_time_linux(pid: u32) -> Option<i64> {
+    // Read /proc/<pid>/stat to get start time in clock ticks since boot
+    let stat = std::fs::read_to_string(format!("/proc/{}/stat", pid)).ok()?;
+    // Field 22 (1-indexed) is starttime. The comm field (2) may contain spaces/parens,
+    // so find the last ')' first.
+    let after_comm = stat.rfind(')')? + 2; // skip ") "
+    let fields: Vec<&str> = stat[after_comm..].split_whitespace().collect();
+    // starttime is field 20 after comm (0-indexed from after_comm)
+    let start_ticks: u64 = fields.get(19)?.parse().ok()?;
+
+    // Get system boot time from /proc/stat
+    let proc_stat = std::fs::read_to_string("/proc/stat").ok()?;
+    let btime_line = proc_stat.lines().find(|l| l.starts_with("btime "))?;
+    let boot_time: i64 = btime_line.split_whitespace().nth(1)?.parse().ok()?;
+
+    let ticks_per_sec = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    if ticks_per_sec <= 0 {
+        return None;
+    }
+
+    Some(boot_time + (start_ticks as i64 / ticks_per_sec))
 }
 
 /// Root structure for the minions registry file
@@ -446,12 +627,15 @@ impl MinionRegistry {
         mode: Option<MinionMode>,
     ) -> Box<dyn FnOnce(u32) + Send> {
         Box::new(move |pid: u32| {
+            // Capture the process start time immediately so we can detect PID reuse later.
+            let start_time = get_process_start_time(pid);
             let _ = std::thread::Builder::new()
                 .name("pid-callback".into())
                 .spawn(move || match MinionRegistry::load(None) {
                     Ok(mut registry) => {
                         if let Err(e) = registry.update(&minion_id, |info| {
                             info.pid = Some(pid);
+                            info.pid_start_time = start_time;
                             if let Some(m) = mode {
                                 info.mode = m;
                             }
@@ -559,6 +743,7 @@ mod tests {
             pr: None,
             session_id: uuid::Uuid::new_v4().to_string(),
             pid: None,
+            pid_start_time: None,
             mode: MinionMode::Autonomous,
             last_activity: now,
             orchestration_phase: OrchestrationPhase::Setup,
@@ -785,7 +970,7 @@ mod tests {
         // Simulate process exit: clear PID and set mode to Stopped
         registry
             .update("M001", |info| {
-                info.pid = None;
+                info.clear_pid();
                 info.mode = MinionMode::Stopped;
             })
             .unwrap();
@@ -1075,5 +1260,124 @@ mod tests {
         let registry = MinionRegistry::load(Some(temp_dir.path())).unwrap();
         let info = registry.get("M001").unwrap();
         assert_eq!(info.orchestration_phase, OrchestrationPhase::Setup);
+    }
+
+    #[test]
+    fn test_get_process_start_time_current_process() {
+        let pid = std::process::id();
+        let start_time = get_process_start_time(pid);
+        // On macOS/Linux, we should be able to get our own start time
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        assert!(
+            start_time.is_some(),
+            "Should get start time for own process"
+        );
+        // The start time should be a reasonable value (after 2020-01-01)
+        if let Some(t) = start_time {
+            assert!(t > 1_577_836_800, "Start time should be after 2020: {}", t);
+        }
+    }
+
+    #[test]
+    fn test_get_process_start_time_nonexistent() {
+        // Very high PID that doesn't exist
+        let start_time = get_process_start_time(4_194_304);
+        assert!(start_time.is_none());
+    }
+
+    #[test]
+    fn test_is_process_alive_with_start_time_matching() {
+        let pid = std::process::id();
+        let start_time = get_process_start_time(pid);
+        // With matching start time, should return true
+        assert!(is_process_alive_with_start_time(pid, start_time));
+    }
+
+    #[test]
+    fn test_is_process_alive_with_start_time_mismatched() {
+        let pid = std::process::id();
+        // With a start time from the distant past, should detect as recycled
+        let fake_start_time = Some(1_000_000_000_i64); // ~2001
+        assert!(
+            !is_process_alive_with_start_time(pid, fake_start_time),
+            "Should detect PID reuse when start times differ"
+        );
+    }
+
+    #[test]
+    fn test_is_process_alive_with_start_time_none_fallback() {
+        let pid = std::process::id();
+        // With no recorded start time (legacy), falls back to basic kill check
+        assert!(is_process_alive_with_start_time(pid, None));
+    }
+
+    #[test]
+    fn test_is_process_alive_with_start_time_dead_pid() {
+        // Non-existent PID should return false regardless of start time
+        assert!(!is_process_alive_with_start_time(4_194_304, None));
+        assert!(!is_process_alive_with_start_time(
+            4_194_304,
+            Some(1_000_000)
+        ));
+    }
+
+    #[test]
+    fn test_minion_info_is_running() {
+        let mut info = test_minion_info();
+        // No PID → not running
+        assert!(!info.is_running());
+
+        // Set PID to our own process with correct start time
+        let pid = std::process::id();
+        info.pid = Some(pid);
+        info.pid_start_time = get_process_start_time(pid);
+        assert!(info.is_running());
+
+        // Set a fake start time → PID reuse detected → not running
+        info.pid_start_time = Some(1_000_000_000);
+        assert!(!info.is_running());
+    }
+
+    #[test]
+    fn test_minion_info_clear_pid() {
+        let mut info = test_minion_info();
+        info.pid = Some(12345);
+        info.pid_start_time = Some(1_700_000_000);
+
+        info.clear_pid();
+        assert_eq!(info.pid, None);
+        assert_eq!(info.pid_start_time, None);
+    }
+
+    #[test]
+    fn test_pid_start_time_backwards_compat() {
+        let temp_dir = tempdir().unwrap();
+        let registry_path = temp_dir.path().join("minions.json");
+
+        // Write a registry JSON without pid_start_time (simulating old format)
+        let old_json = r#"{
+            "minions": {
+                "M001": {
+                    "repo": "owner/repo",
+                    "issue": 42,
+                    "command": "do",
+                    "prompt": "Fix issue",
+                    "started_at": "2024-01-01T00:00:00Z",
+                    "branch": "minion/issue-42-M001",
+                    "worktree": "/tmp/test",
+                    "status": "active",
+                    "session_id": "abc-123",
+                    "pid": 12345,
+                    "mode": "autonomous"
+                }
+            }
+        }"#;
+        fs::write(&registry_path, old_json).unwrap();
+
+        let registry = MinionRegistry::load(Some(temp_dir.path())).unwrap();
+        let info = registry.get("M001").unwrap();
+        assert_eq!(info.pid, Some(12345));
+        // pid_start_time should default to None for old entries
+        assert_eq!(info.pid_start_time, None);
     }
 }

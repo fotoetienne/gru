@@ -5,7 +5,7 @@
 //! `gru tail`, and the auto-tail feature of `gru do`.
 
 use crate::agent::TimestampedEvent;
-use crate::minion_registry::{is_process_alive, with_registry};
+use crate::minion_registry::{is_process_alive_with_start_time, with_registry};
 use crate::progress::{ProgressConfig, ProgressDisplay};
 use anyhow::{Context, Result};
 use std::io::{BufRead, Seek, SeekFrom, Write};
@@ -70,9 +70,14 @@ async fn tail_follow(
     output: &TailOutput<'_>,
 ) -> Result<()> {
     let mid = minion_id.to_string();
-    let worker_pid = with_registry(move |reg| Ok(reg.get(&mid).and_then(|info| info.pid)))
-        .await
-        .unwrap_or(None);
+    let (worker_pid, worker_start_time) = with_registry(move |reg| {
+        Ok(reg
+            .get(&mid)
+            .map(|info| (info.pid, info.pid_start_time))
+            .unwrap_or((None, None)))
+    })
+    .await
+    .unwrap_or((None, None));
 
     // Wait for events file to be created (worker may not have written yet)
     let mut waited = Duration::ZERO;
@@ -84,7 +89,7 @@ async fn tail_follow(
                 events_path.display()
             );
         }
-        if !is_pid_alive(worker_pid) {
+        if !is_pid_alive(worker_pid, worker_start_time) {
             anyhow::bail!("Worker exited before creating events file. Check gru.log for details.");
         }
         tokio::time::sleep(TAIL_POLL_INTERVAL).await;
@@ -104,7 +109,7 @@ async fn tail_follow(
             _ = tokio::time::sleep(TAIL_POLL_INTERVAL) => {
                 position = output.read_new(events_path, position)?;
 
-                if !is_pid_alive(worker_pid) {
+                if !is_pid_alive(worker_pid, worker_start_time) {
                     // Read any final events
                     let _ = output.read_new(events_path, position);
                     output.on_finish();
@@ -386,9 +391,12 @@ pub async fn tail_events_last_n(
     tail_follow(&events_path, minion_id, last_n, &output).await
 }
 
-/// Checks if a worker process is alive using a cached PID.
-fn is_pid_alive(pid: Option<u32>) -> bool {
-    pid.map(is_process_alive).unwrap_or(false)
+/// Checks if a worker process is alive using a cached PID and start time.
+fn is_pid_alive(pid: Option<u32>, start_time: Option<i64>) -> bool {
+    match pid {
+        Some(p) => is_process_alive_with_start_time(p, start_time),
+        None => false,
+    }
 }
 
 #[cfg(test)]
@@ -475,11 +483,11 @@ mod tests {
 
     #[test]
     fn test_is_pid_alive_none() {
-        assert!(!is_pid_alive(None));
+        assert!(!is_pid_alive(None, None));
     }
 
     #[test]
     fn test_is_pid_alive_current_process() {
-        assert!(is_pid_alive(Some(std::process::id())));
+        assert!(is_pid_alive(Some(std::process::id()), None));
     }
 }

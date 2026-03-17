@@ -1,4 +1,4 @@
-use crate::minion_registry::{is_process_alive, with_registry, MinionInfo, MinionMode};
+use crate::minion_registry::{with_registry, MinionInfo, MinionMode};
 use anyhow::Result;
 use chrono::Utc;
 
@@ -70,11 +70,11 @@ pub async fn check_and_claim_session(
 
         if info.mode != MinionMode::Stopped {
             match info.pid {
-                Some(pid_val) => {
-                    // On Unix, verify the process is actually alive.
+                Some(_pid_val) => {
+                    // On Unix, verify the process is actually alive (with PID reuse detection).
                     // On non-Unix, is_process_alive always returns false, so be
                     // conservative and treat any recorded PID as alive.
-                    let is_running = cfg!(not(unix)) || is_process_alive(pid_val);
+                    let is_running = cfg!(not(unix)) || info.is_running();
                     if is_running {
                         // Do not wrap with .context() — the caller uses
                         // downcast_ref to distinguish this from IO errors.
@@ -88,7 +88,7 @@ pub async fn check_and_claim_session(
                     // it's running. Reset to Stopped before claiming.
                     reg.update(&id, |i| {
                         i.mode = MinionMode::Stopped;
-                        i.pid = None;
+                        i.clear_pid();
                         i.last_activity = Utc::now();
                     })?;
                 }

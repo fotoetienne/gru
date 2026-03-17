@@ -273,9 +273,8 @@ pub async fn handle_clean(dry_run: bool, force: bool, base_branch: &str) -> Resu
                 let is_alive = match info.pid {
                     // On non-Unix, is_process_alive always returns false, so we conservatively
                     // assume a recorded PID is alive to avoid cleaning active worktrees.
-                    Some(pid) => {
-                        cfg!(not(unix)) || crate::minion_registry::is_process_alive(pid)
-                    }
+                    // On Unix, verify both PID existence and start time to detect reuse.
+                    Some(_) => cfg!(not(unix)) || info.is_running(),
                     // No PID recorded: trust the mode field. Legacy entries (pre-PID) default
                     // to Stopped, so they won't block cleanup. But if mode says the minion is
                     // running, be conservative and protect the worktree.

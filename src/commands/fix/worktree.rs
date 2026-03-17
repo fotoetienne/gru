@@ -88,6 +88,7 @@ pub(super) async fn setup_worktree(
         pr: None,
         session_id: session_id.to_string(),
         pid: None,
+        pid_start_time: None,
         mode: MinionMode::Autonomous,
         last_activity: now,
         orchestration_phase: OrchestrationPhase::Setup,

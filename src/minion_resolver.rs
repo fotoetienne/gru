@@ -168,9 +168,10 @@ fn load_from_registry() -> Vec<MinionInfo> {
                 }
             };
 
-            let status = match info.pid {
-                Some(pid) if crate::minion_registry::is_process_alive(pid) => "Active".to_string(),
-                _ => "Stopped".to_string(),
+            let status = if info.is_running() {
+                "Active".to_string()
+            } else {
+                "Stopped".to_string()
             };
 
             MinionInfo {
