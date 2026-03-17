@@ -106,7 +106,9 @@ python3 .claude/skills/project-manager/pm.py graph
 
 **Blocked Issues**: Issues waiting on other issues to be completed first.
 
-**Dependencies**: Relationships defined as "Blocked by: #X, #Y" in issue bodies.
+**Dependencies**: Relationships tracked in two ways:
+1. **Native GitHub dependencies** (primary) — set via `gh api`, visible in GitHub UI as `is:blocked` state
+2. **Body text convention** (fallback) — `**Blocked by:** #X, #Y` in issue bodies, for GHES compatibility
 
 **Parallel Work**: Multiple issues that can be worked on simultaneously because they don't depend on each other. Examples in Gru:
 - After #4: #5 and #6 can run in parallel
@@ -179,6 +181,46 @@ python3 .claude/skills/project-manager/pm.py graph
    Both paths converge at #15-#16, where you can work together.
    This could save ~3-4 sequential steps!"
 
+## Setting Native GitHub Dependencies on Issues
+
+When creating issues that have blockers, set dependencies **both** ways for belt-and-suspenders coverage:
+
+### 1. Body text (always — works everywhere including GHES)
+Include `**Blocked by:** #X, #Y` in the issue body when creating with `gh issue create`.
+
+### 2. Native GitHub dependencies (when available)
+After creating the issue, set native deps via `gh api`. The native API requires the blocker's internal `id` (not the issue number):
+
+```bash
+# Get the internal id of the blocking issue
+BLOCKER_ID=$(gh api /repos/OWNER/REPO/issues/BLOCKER_NUMBER --jq .id)
+
+# Set the dependency: NEW_ISSUE is blocked by BLOCKER
+gh api /repos/OWNER/REPO/issues/NEW_ISSUE_NUMBER/dependencies/blocked_by \
+  -f issue_id="$BLOCKER_ID"
+```
+
+**Example: creating an issue blocked by #472:**
+```bash
+# Create the issue with body-text deps
+gh issue create --title "Add lab integration for deps" --body "$(cat <<'EOF'
+## User Story
+...
+
+**Blocked by:** #472
+EOF
+)"
+
+# Set native dependency (extract new issue number from output)
+BLOCKER_ID=$(gh api /repos/OWNER/REPO/issues/472 --jq .id)
+gh api /repos/OWNER/REPO/issues/NEW_NUMBER/dependencies/blocked_by \
+  -f issue_id="$BLOCKER_ID"
+```
+
+**GHES note:** The native dependencies API may return 404 on older GitHub Enterprise Server versions. Body-text deps are the fallback. Always include both.
+
+See `plans/ISSUE_DEPENDENCIES_PRD.md` for full design rationale.
+
 ## When to Suggest Actions
 
 ### After showing status
@@ -215,6 +257,7 @@ Your role is **planning and prioritization**, not implementation.
 - ✅ Suggest what to work on next
 - ✅ Explain why issues are prioritized
 - ✅ Help create new issues (guide them to use `gh issue create`)
+- ✅ Set native GitHub dependencies when creating issues with blockers
 - ✅ Celebrate milestones
 
 ### DON'T:

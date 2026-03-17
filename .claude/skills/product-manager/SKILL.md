@@ -416,6 +416,57 @@ EOF
   --label "feature,p1,ui"
 ```
 
+### Setting Native GitHub Issue Dependencies
+
+When creating issues with dependencies, use a belt-and-suspenders approach: set **both** body-text conventions and native GitHub dependencies. Body text ensures human readability and GHES compatibility; native deps enable GitHub's `is:blocked` filter and UI indicators.
+
+**1. Always include body-text dependencies** (the existing Gru convention):
+
+```markdown
+## Dependencies
+**Blocked by:** #40, #41
+```
+
+**2. Resolve the blocking issue's internal `id`** (the native API requires `id`, not `number`):
+
+```bash
+BLOCKER_ID=$(gh api /repos/OWNER/REPO/issues/41 --jq .id)
+```
+
+**3. Set the native blocked-by dependency:**
+
+```bash
+gh api /repos/OWNER/REPO/issues/42/dependencies/blocked_by \
+  -f issue_id="$BLOCKER_ID"
+```
+
+**4. Full example** — create an issue and set its dependencies:
+
+```bash
+# Create the issue with body-text deps
+gh issue create \
+  --title "Integrate dependency check into gru lab" \
+  --body "$(cat <<'EOF'
+## User Story
+As a developer running `gru lab`, I want blocked issues to be skipped automatically.
+
+## Dependencies
+**Blocked by:** #40, #41
+EOF
+)" \
+  --label "feature,priority:medium"
+
+# Then set native deps (requires issue number from create output)
+ISSUE_NUM=42  # from gh issue create output
+for BLOCKER in 40 41; do
+  BLOCKER_ID=$(gh api /repos/OWNER/REPO/issues/$BLOCKER --jq .id)
+  gh api /repos/OWNER/REPO/issues/$ISSUE_NUM/dependencies/blocked_by \
+    -f issue_id="$BLOCKER_ID"
+done
+```
+
+**GHES note:** The native dependencies API may not be available on GitHub Enterprise Server (returns 404). Body-text deps are the fallback — this is why we always include them even when setting native deps.
+
 ## Tips for Success
 
 1. **Read before you write**: Always check existing docs, plans, and issues first
