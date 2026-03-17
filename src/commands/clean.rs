@@ -439,8 +439,23 @@ pub async fn handle_clean(dry_run: bool, force: bool, base_branch: &str) -> Resu
             }
         };
 
-        if active_minion_worktrees.contains(&canonical_wt_path) {
-            skipped_active_minions.push(wt);
+        let is_active_minion = active_minion_worktrees.contains(&canonical_wt_path);
+
+        if is_active_minion {
+            // Active minion worktree — but PID detection is unreliable (PID reuse).
+            // Check GitHub state as a fallback: if the PR is merged or issue is
+            // closed, the worktree is cleanable regardless of process state.
+            let status = wt
+                .status(base_branch)
+                .await
+                .with_context(|| format!("Failed to check status of {}", wt.path.display()))?;
+
+            if status != worktree_scanner::WorktreeStatus::Active {
+                // GitHub says this work is done — cleanable even with a "live" PID.
+                cleanable.push((wt, status));
+            } else {
+                skipped_active_minions.push(wt);
+            }
             continue;
         }
 
