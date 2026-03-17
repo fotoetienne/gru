@@ -332,10 +332,11 @@ pub(crate) async fn monitor_pr_lifecycle(
         minion_registry::with_registry(move |registry| {
             Ok(registry
                 .get(&mid)
-                .and_then(|info| info.last_review_check_time))
+                .map(|info| info.last_review_check_time.unwrap_or(info.started_at)))
         })
         .await
-        .unwrap_or(None)
+        .ok()
+        .flatten()
         .unwrap_or(pre_review_time)
     } else {
         pre_review_time
