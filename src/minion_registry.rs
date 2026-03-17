@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 
 use crate::agent::TokenUsage;
 use crate::file_lock::lock_with_timeout;
+use crate::github::{infer_github_host, is_pr_open_via_cli};
 use crate::workspace::Workspace;
 
 /// Async helper that loads the registry inside `spawn_blocking`, runs the
@@ -68,6 +69,111 @@ pub async fn mark_minion_failed(minion_id: &str) {
         })
     })
     .await;
+}
+
+/// Prune stale registry entries where worktrees no longer exist.
+///
+/// Uses a two-phase approach so the registry lock is not held during async
+/// GitHub API calls:
+///
+/// 1. **Phase 1 (sync):** Collect candidate entries where `worktree.exists()` is
+///    false. Entries without a PR are immediately prunable. Entries with a PR are
+///    held for async verification.
+/// 2. **Phase 2 (async):** For each candidate that has an associated PR, check
+///    whether the PR is still open on GitHub. Only entries whose PR is *not* open
+///    (merged, closed, or not found) are added to the final prune list.
+/// 3. **Phase 3 (sync):** Re-acquire the registry lock and remove confirmed stale
+///    entries.
+///
+/// Returns the number of entries pruned.
+pub async fn prune_stale_entries() -> Result<usize> {
+    // Phase 1: Collect candidates (sync, lock held briefly)
+    let candidates: Vec<(String, Option<String>, String)> = with_registry(|registry| {
+        let minions = registry.list();
+        let candidates = minions
+            .iter()
+            .filter(|(_id, info)| !info.worktree.exists())
+            .map(|(id, info)| (id.clone(), info.pr.clone(), info.repo.clone()))
+            .collect();
+        Ok(candidates)
+    })
+    .await?;
+
+    if candidates.is_empty() {
+        return Ok(0);
+    }
+
+    // Phase 2: Check PR status for candidates that have an open PR (async, no lock)
+    let mut to_remove = Vec::new();
+    for (id, pr, repo) in &candidates {
+        match pr {
+            None => {
+                // No PR associated — safe to prune
+                to_remove.push(id.clone());
+            }
+            Some(pr_number_str) => {
+                let pr_number: u64 = match pr_number_str.parse() {
+                    Ok(n) => n,
+                    Err(_) => {
+                        // Malformed PR number — prune the entry
+                        log::warn!(
+                            "Minion {} has malformed PR number '{}', pruning",
+                            id,
+                            pr_number_str
+                        );
+                        to_remove.push(id.clone());
+                        continue;
+                    }
+                };
+                // Parse owner/repo
+                let parts: Vec<&str> = repo.splitn(2, '/').collect();
+                if parts.len() != 2 {
+                    log::warn!("Minion {} has malformed repo '{}', pruning", id, repo);
+                    to_remove.push(id.clone());
+                    continue;
+                }
+                let (owner, repo_name) = (parts[0], parts[1]);
+                let host = infer_github_host(owner);
+
+                match is_pr_open_via_cli(owner, repo_name, &host, pr_number).await {
+                    Ok(true) => {
+                        // PR is still open — do NOT prune
+                        log::info!(
+                            "Minion {} has open PR #{}, keeping registry entry",
+                            id,
+                            pr_number
+                        );
+                    }
+                    Ok(false) => {
+                        // PR is merged or closed — safe to prune
+                        to_remove.push(id.clone());
+                    }
+                    Err(e) => {
+                        // API error — be conservative, don't prune
+                        log::warn!(
+                            "Failed to check PR #{} status for Minion {}: {}. Keeping entry.",
+                            pr_number,
+                            id,
+                            e
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    if to_remove.is_empty() {
+        return Ok(0);
+    }
+
+    // Phase 3: Remove confirmed stale entries (sync, lock held briefly)
+    let count = with_registry(move |registry| registry.remove_batch(&to_remove)).await?;
+
+    if count > 0 {
+        log::info!("🗑️  Pruned {} stale Minion(s) from registry", count);
+    }
+
+    Ok(count)
 }
 
 /// The execution mode of a Minion session

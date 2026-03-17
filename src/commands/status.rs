@@ -130,18 +130,12 @@ fn format_mode_display(
 /// This ensures the lock is only held for the minimum time needed to read/write
 /// the registry file, not for I/O operations.
 pub async fn handle_status(id: Option<String>, verbose: bool) -> Result<i32> {
-    // Phase 1: Load registry and clean up (with lock held)
+    // Prune stale entries using the shared two-phase approach that checks
+    // GitHub PR status before removing entries with open PRs.
+    crate::minion_registry::prune_stale_entries().await?;
+
+    // Phase 1: Load registry and perform remaining cleanup (with lock held)
     let basic_minions = with_registry(|registry| {
-        // Get all minions from registry
-        let registry_minions = registry.list();
-
-        // Track stale entries (worktrees that no longer exist on disk)
-        let stale_ids: std::collections::HashSet<String> = registry_minions
-            .iter()
-            .filter(|(_id, info)| !info.worktree.exists())
-            .map(|(id, _)| id.clone())
-            .collect();
-
         // Detect dead processes and update registry.
         // Only on Unix where process liveness checks are available.
         // On non-Unix, is_process_alive always returns false which would incorrectly
@@ -169,7 +163,7 @@ pub async fn handle_status(id: Option<String>, verbose: bool) -> Result<i32> {
         let basic: Vec<BasicMinionData> = registry_minions
             .into_iter()
             .map(|(minion_id, info)| {
-                let is_stale = stale_ids.contains(&minion_id);
+                let is_stale = !info.worktree.exists();
                 BasicMinionData {
                     minion_id,
                     repo: info.repo,

@@ -259,6 +259,48 @@ pub async fn is_issue_closed_via_cli(
     Ok(state == "CLOSED")
 }
 
+/// Check whether a PR is still open (i.e., not merged or closed).
+///
+/// Returns `true` if the PR state is "OPEN", `false` otherwise.
+///
+/// # Arguments
+/// * `owner` - Repository owner (user or organization)
+/// * `repo` - Repository name
+/// * `host` - GitHub hostname
+/// * `number` - PR number
+pub async fn is_pr_open_via_cli(owner: &str, repo: &str, host: &str, number: u64) -> Result<bool> {
+    let repo_full = format!("{}/{}", owner, repo);
+    let output = gh_cli_command(host)
+        .args([
+            "pr",
+            "view",
+            &number.to_string(),
+            "--repo",
+            &repo_full,
+            "--json",
+            "state",
+            "--jq",
+            ".state",
+        ])
+        .output()
+        .await
+        .context("Failed to execute gh pr view command")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow!(
+            "Failed to fetch PR #{} state from {}/{}: {}",
+            number,
+            owner,
+            repo,
+            stderr
+        ));
+    }
+
+    let state = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    Ok(state == "OPEN")
+}
+
 /// Simple struct to hold issue information from gh CLI
 #[derive(Debug, serde::Deserialize)]
 pub struct IssueInfo {
