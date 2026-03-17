@@ -367,31 +367,35 @@ async fn run_worker(minion_id: &str, issue: &str, opts: FixOptions) -> Result<i3
         );
     }
 
-    // CI monitoring
-    let ci_passed = monitor_ci_after_fix(
-        &issue_ctx.host,
-        &issue_ctx.owner,
-        &issue_ctx.repo,
-        &wt_ctx.branch_name,
-        &wt_ctx.checkout_path,
-        &wt_ctx.minion_id,
-    )
-    .await;
-    match ci_passed {
-        Ok(true) => log::info!("✅ CI checks passed"),
-        Ok(false) => {
-            log::warn!("⚠️  CI checks failed or were escalated");
-            update_orchestration_phase(&wt_ctx.minion_id, OrchestrationPhase::Failed).await;
-            try_mark_issue_blocked(
-                &issue_ctx.host,
-                &issue_ctx.owner,
-                &issue_ctx.repo,
-                issue_ctx.issue_num,
-            )
-            .await;
-            return Ok(1);
+    // CI monitoring — only when PR creation failed (no PR number), since
+    // monitor_pr_lifecycle handles CI internally when a PR exists.
+    // When no_watch is true, we have already returned early above.
+    if pr_number.is_none() {
+        let ci_passed = monitor_ci_after_fix(
+            &issue_ctx.host,
+            &issue_ctx.owner,
+            &issue_ctx.repo,
+            &wt_ctx.branch_name,
+            &wt_ctx.checkout_path,
+            &wt_ctx.minion_id,
+        )
+        .await;
+        match ci_passed {
+            Ok(true) => log::info!("✅ CI checks passed"),
+            Ok(false) => {
+                log::warn!("⚠️  CI checks failed or were escalated");
+                update_orchestration_phase(&wt_ctx.minion_id, OrchestrationPhase::Failed).await;
+                try_mark_issue_blocked(
+                    &issue_ctx.host,
+                    &issue_ctx.owner,
+                    &issue_ctx.repo,
+                    issue_ctx.issue_num,
+                )
+                .await;
+                return Ok(1);
+            }
+            Err(e) => log::warn!("⚠️  CI monitoring error (non-fatal): {}", e),
         }
-        Err(e) => log::warn!("⚠️  CI monitoring error (non-fatal): {}", e),
     }
 
     update_orchestration_phase(&wt_ctx.minion_id, OrchestrationPhase::Completed).await;
