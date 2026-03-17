@@ -472,7 +472,7 @@ pub async fn handle_fix(issue: &str, opts: FixOptions) -> Result<i32> {
                 issue_ctx.issue_num,
                 blocker_list.join(", ")
             );
-            println!("   Proceeding anyway. Use --ignore-deps to suppress this warning.");
+            println!("   Use --ignore-deps to skip this check.");
         }
     }
 

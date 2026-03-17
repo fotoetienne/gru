@@ -128,7 +128,7 @@ enum Commands {
         )]
         detach: bool,
 
-        #[arg(long, help = "Skip dependency checking (suppress blocker warnings)")]
+        #[arg(long, help = "Skip dependency checking entirely")]
         ignore_deps: bool,
 
         #[arg(
