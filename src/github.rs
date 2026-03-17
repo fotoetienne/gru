@@ -719,6 +719,59 @@ pub async fn mark_issue_failed_via_cli(
     .await
 }
 
+/// Remove `gru:blocked` label from a PR and restore `gru:in-progress` on the issue.
+///
+/// The CI escalation path adds `gru:blocked` to the **PR** via `gh pr edit`,
+/// so removal must also target the PR. The issue gets `gru:in-progress`
+/// restored since `mark_issue_blocked_via_cli` removed it.
+///
+/// Idempotent: silently succeeds if the label is not present.
+pub async fn remove_blocked_label(
+    host: &str,
+    owner: &str,
+    repo: &str,
+    pr_number: u64,
+    issue_number: u64,
+) -> Result<()> {
+    let repo_full = format!("{}/{}", owner, repo);
+
+    // Remove gru:blocked from the PR (where ci.rs adds it)
+    let output = gh_cli_command(host)
+        .args([
+            "pr",
+            "edit",
+            &pr_number.to_string(),
+            "--repo",
+            &repo_full,
+            "--remove-label",
+            labels::BLOCKED,
+        ])
+        .output()
+        .await
+        .context("Failed to remove blocked label from PR")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        // Ignore "not found" errors — label may not be present
+        if !stderr.contains("404") && !stderr.contains("not found") {
+            anyhow::bail!("Failed to remove blocked label from PR: {}", stderr);
+        }
+    }
+
+    // Restore gru:in-progress on the issue (blocking removed it)
+    let _ = edit_labels_via_cli(
+        host,
+        owner,
+        repo,
+        issue_number,
+        &[labels::IN_PROGRESS],
+        &[labels::BLOCKED],
+    )
+    .await;
+
+    Ok(())
+}
+
 /// Mark an issue as blocked: add gru:blocked, remove in-progress/done/failed.
 ///
 /// Removes all state labels to ensure a clean transition regardless of

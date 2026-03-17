@@ -34,6 +34,26 @@ pub(crate) async fn try_mark_issue_blocked(host: &str, owner: &str, repo: &str, 
     }
 }
 
+/// Removes `gru:blocked` from the PR and restores `gru:in-progress` on the issue.
+/// Fire-and-forget: logs on failure but does not propagate errors.
+/// Idempotent: safe to call even if the label is not present.
+pub(crate) async fn try_remove_blocked_label(
+    host: &str,
+    owner: &str,
+    repo: &str,
+    pr_number: u64,
+    issue_num: u64,
+) {
+    match crate::github::remove_blocked_label(host, owner, repo, pr_number, issue_num).await {
+        Ok(()) => {
+            println!("🏷️  Removed '{}' label", crate::labels::BLOCKED);
+        }
+        Err(e) => {
+            log::warn!("⚠️  Failed to remove blocked label: {}", e);
+        }
+    }
+}
+
 /// Attempts to mark an issue as failed via CLI (fire-and-forget).
 /// Logs success/failure but does not propagate errors.
 pub(crate) async fn try_mark_issue_failed(host: &str, owner: &str, repo: &str, issue_num: u64) {
