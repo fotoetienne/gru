@@ -367,8 +367,9 @@ async fn run_worker(minion_id: &str, issue: &str, opts: FixOptions) -> Result<i3
         );
     }
 
-    // CI monitoring — only when monitor_pr_lifecycle was skipped (no PR),
-    // since monitor_pr_lifecycle already handles CI internally.
+    // CI monitoring — only when PR creation failed (no PR number), since
+    // monitor_pr_lifecycle handles CI internally when a PR exists.
+    // When no_watch is true, we have already returned early above.
     if pr_number.is_none() {
         let ci_passed = monitor_ci_after_fix(
             &issue_ctx.host,
