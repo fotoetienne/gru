@@ -972,6 +972,7 @@ async fn fallback_list_issues(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::minion_registry::is_process_alive;
 
     #[tokio::test]
     async fn test_reap_children_empty() {
