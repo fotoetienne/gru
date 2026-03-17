@@ -160,6 +160,22 @@ pub async fn get_blockers_via_api(
     }
 }
 
+/// Resolve blockers from body text and an optional API result.
+///
+/// This is a pure function extracted for testability. It implements the
+/// resolution policy without any I/O.
+///
+/// Resolution policy:
+/// - Native API wins when it returns `Some` (even if the list is empty)
+/// - Body text is the sole source when the API is unavailable (`None`)
+/// - Results are never combined across sources
+pub fn resolve_blockers(body: &str, api_result: Option<Vec<u64>>) -> Vec<u64> {
+    match api_result {
+        Some(api_blockers) => api_blockers,
+        None => parse_blockers_from_body(body),
+    }
+}
+
 /// Get all open blockers for an issue using both body parsing and the native API.
 ///
 /// Resolution policy:
@@ -173,14 +189,8 @@ pub async fn get_blockers(
     issue_number: u64,
     body: &str,
 ) -> Vec<u64> {
-    let body_blockers = parse_blockers_from_body(body);
-
-    // Try the native API — returns Some when the endpoint is supported,
-    // None when unavailable (404/GHES) or errored (403/5xx).
-    match get_blockers_via_api(host, owner, repo, issue_number).await {
-        Some(api_blockers) => api_blockers,
-        None => body_blockers,
-    }
+    let api_result = get_blockers_via_api(host, owner, repo, issue_number).await;
+    resolve_blockers(body, api_result)
 }
 
 #[cfg(test)]
@@ -312,5 +322,128 @@ mod tests {
     fn test_api_unknown_error() {
         let result = parse_api_output(false, "", "something unexpected", 1);
         assert_eq!(result, ApiResult::Unavailable);
+    }
+
+    // --- resolve_blockers tests (GHES fallback / E2E resolution logic) ---
+
+    #[test]
+    fn test_resolve_ghes_404_falls_back_to_body() {
+        // GHES: API unavailable (404), body has blockers → body wins
+        let body = "**Blocked by:** #10, #20";
+        let result = resolve_blockers(body, None);
+        assert_eq!(result, vec![10, 20]);
+    }
+
+    #[test]
+    fn test_resolve_ghes_404_no_body_blockers() {
+        // GHES: API unavailable, body has no blockers → unblocked
+        let body = "Just a regular issue description";
+        let result = resolve_blockers(body, None);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_resolve_api_supported_overrides_body() {
+        // github.com: API returns blockers, body also has blockers → API wins
+        let body = "**Blocked by:** #10, #20";
+        let result = resolve_blockers(body, Some(vec![30, 40]));
+        assert_eq!(result, vec![30, 40]);
+    }
+
+    #[test]
+    fn test_resolve_api_empty_overrides_body() {
+        // github.com: API says unblocked, body says blocked → API wins (authoritative)
+        let body = "**Blocked by:** #10, #20";
+        let result = resolve_blockers(body, Some(vec![]));
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_resolve_api_supported_no_body() {
+        // github.com: API returns blockers, no body text → API result used
+        let body = "";
+        let result = resolve_blockers(body, Some(vec![5]));
+        assert_eq!(result, vec![5]);
+    }
+
+    #[test]
+    fn test_resolve_both_empty() {
+        // No blockers from either source → unblocked
+        let body = "";
+        let result = resolve_blockers(body, Some(vec![]));
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_resolve_sources_never_combined() {
+        // Body says #10, API says #20 → only API result returned, not union
+        let body = "**Blocked by:** #10";
+        let result = resolve_blockers(body, Some(vec![20]));
+        assert_eq!(result, vec![20]);
+        assert!(!result.contains(&10));
+    }
+
+    // --- Additional error code coverage ---
+
+    #[test]
+    fn test_api_502_bad_gateway() {
+        let result = parse_api_output(false, "", "HTTP 502: Bad Gateway", 42);
+        assert_eq!(result, ApiResult::Unavailable);
+    }
+
+    #[test]
+    fn test_api_503_service_unavailable() {
+        let result = parse_api_output(false, "", "HTTP 503: Service Unavailable", 42);
+        assert_eq!(result, ApiResult::Unavailable);
+    }
+
+    // --- GHES end-to-end scenario tests ---
+    // These test the full resolution path: API unavailable (None) → body parsing fallback.
+    // See test_api_404_not_found for the parse_api_output → Unavailable mapping.
+
+    #[test]
+    fn test_ghes_blocked_issue_detected_via_body() {
+        // GHES: API unavailable (404), body has blockers → body wins
+        let body = "## Description\nImplement feature X\n\n**Blocked by:** #100, #200\n\n## Notes\nSome notes";
+        let blockers = resolve_blockers(body, None);
+        assert_eq!(blockers, vec![100, 200]);
+    }
+
+    #[test]
+    fn test_ghes_unblocked_issue_passes() {
+        // GHES: API unavailable, no body deps → unblocked
+        let body = "## Description\nJust a regular issue";
+        let blockers = resolve_blockers(body, None);
+        assert!(blockers.is_empty());
+    }
+
+    #[test]
+    fn test_server_error_falls_back_to_body_parsing() {
+        // Exercise parse_api_output for each error code, then verify resolve_blockers
+        // uses body parsing as fallback when the API is unavailable.
+        let body = "**Blocked by:** #10";
+        for (stderr, code) in [
+            ("HTTP 403: Forbidden", 42),
+            ("HTTP 500: Internal Server Error", 42),
+            ("HTTP 502: Bad Gateway", 42),
+            ("HTTP 503: Service Unavailable", 42),
+        ] {
+            let api_result = parse_api_output(false, "", stderr, code);
+            assert_eq!(
+                api_result,
+                ApiResult::Unavailable,
+                "Expected Unavailable for {stderr}"
+            );
+            let api_blockers = match api_result {
+                ApiResult::Supported(v) => Some(v),
+                ApiResult::Unavailable => None,
+            };
+            let blockers = resolve_blockers(body, api_blockers);
+            assert_eq!(
+                blockers,
+                vec![10],
+                "Body blockers should be respected on {stderr}"
+            );
+        }
     }
 }

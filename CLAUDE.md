@@ -247,6 +247,21 @@ Located in `.claude/skills/`:
 - Comments use YAML frontmatter for structured events
 - Issue/PR parsing supports both numbers (when in repo) and full GitHub URLs
 
+### Issue Dependencies
+- **Body-text convention:** Use `**Blocked by:** #X, #Y` in issue bodies to declare dependencies
+  - Must be on a single line (only the first line after the marker is parsed)
+  - Use `#` prefix for issue numbers (bare numbers are ignored)
+  - Cross-repo references (`owner/repo#123`) are skipped with a warning
+  - Example: `**Blocked by:** #10, #20, #30`
+- **Two-layer checking:** The native GitHub dependencies API is called first; body parsing is the fallback when the API is unavailable
+- **Native API resolution:** API result is authoritative when available (200). Body text is sole source on 404 (GHES)
+- **Mutually exclusive:** When the API returns a result (even an empty list), it is the sole source of truth — body-text blockers are not merged in. Body parsing is only used when the API is unavailable
+- **GHES compatibility:** When the native dependencies API returns 404, Gru falls back to body-text parsing only. No functionality is lost — body-text deps work identically
+- **Error handling:** 403/500/502/503 errors are logged as warnings and cause fallback to body parsing (same as 404). If body has blockers, they are respected. If body has no blockers, the issue is treated as unblocked
+- **`gru do` behavior:** Warns about open blockers but proceeds (user explicitly chose the issue). Use `--ignore-deps` to suppress
+- **`gru:waiting` label:** Deferred. For github.com, the native API provides `is:blocked` visibility. For GHES without native deps, body-text dependencies have no GitHub UI representation. A `gru:waiting` label may be added if GHES users report needing visible feedback — not rejected, just not needed for MVP
+- **Implementation:** `src/dependencies.rs` — see `plans/ISSUE_DEPENDENCIES_PRD.md` for full design
+
 ### Worktree Management
 - Worktree paths use branch names as directory paths (e.g., `minion/issue-42-M001/`)
 - Create from bare repos to avoid conflicts
