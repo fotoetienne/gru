@@ -762,7 +762,7 @@ fn is_stale_entry(info: &MinionInfo) -> bool {
     if !info.worktree.exists() {
         return true;
     }
-    info.orchestration_phase.is_terminal() && !info.pid.is_some_and(is_process_alive)
+    info.orchestration_phase.is_terminal() && !info.is_running()
 }
 
 /// Prune stale registry entries where worktrees no longer exist or minions are
