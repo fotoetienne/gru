@@ -147,10 +147,11 @@ pub async fn get_blockers_via_api(
 
 /// Get all open blockers for an issue using both body parsing and the native API.
 ///
-/// Conflict resolution policy:
-/// - Native API wins when it returns 200 (even if body says unblocked)
-/// - Body text is sole source when API returns 404
-/// - Body text is never combined with API results
+/// Resolution policy:
+/// - If the API returns non-empty blockers, those are used (body text ignored)
+/// - If the API returns empty or 404, body-parsed blockers are used as fallback
+/// - On API error, body-parsed blockers are the sole source
+/// - Results are never combined across sources
 pub async fn get_blockers(
     host: &str,
     owner: &str,
