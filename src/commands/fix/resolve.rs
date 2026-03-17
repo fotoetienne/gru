@@ -1,5 +1,5 @@
 use super::types::{ExistingMinionCheck, IssueContext, IssueDetails};
-use crate::minion_registry::{is_process_alive, with_registry, MinionMode};
+use crate::minion_registry::{with_registry, MinionMode};
 use crate::url_utils::parse_issue_info;
 use anyhow::{Context, Result};
 
@@ -48,17 +48,15 @@ pub(super) async fn check_existing_minions(
 
     // Sort deterministically: running Minions first, then by most recent start time.
     existing.sort_by(|(_, a), (_, b)| {
-        let a_running = a.pid.map(is_process_alive).unwrap_or(false);
-        let b_running = b.pid.map(is_process_alive).unwrap_or(false);
+        let a_running = a.is_running();
+        let b_running = b.is_running();
         b_running
             .cmp(&a_running)
             .then_with(|| b.last_activity.cmp(&a.last_activity))
     });
 
     // Check if any minion is actually running
-    let any_running = existing
-        .iter()
-        .any(|(_, info)| info.pid.map(is_process_alive).unwrap_or(false));
+    let any_running = existing.iter().any(|(_, info)| info.is_running());
 
     if any_running {
         // A minion is actively running - show error with suggestions
@@ -69,7 +67,7 @@ pub(super) async fn check_existing_minions(
         );
 
         for (minion_id, info) in &existing {
-            let actually_running = info.pid.map(is_process_alive).unwrap_or(false);
+            let actually_running = info.is_running();
             let status_msg = if actually_running {
                 match info.mode {
                     MinionMode::Autonomous => "running (autonomous)",

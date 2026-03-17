@@ -222,7 +222,7 @@ async fn run_agent_session_inner(
     let exit_minion_id = wt_ctx.minion_id.clone();
     let _ = with_registry(move |registry| {
         registry.update(&exit_minion_id, |info| {
-            info.pid = None;
+            info.clear_pid();
             info.mode = MinionMode::Stopped;
             if let Some(usage) = token_usage {
                 info.token_usage = Some(usage);

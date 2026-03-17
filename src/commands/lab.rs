@@ -1,9 +1,7 @@
 use crate::config::{parse_repo_entry_with_hosts, LabConfig};
 use crate::github::{self, list_ready_issues_via_cli};
 use crate::labels;
-use crate::minion_registry::{
-    is_process_alive, with_registry, MinionInfo, MinionMode, OrchestrationPhase,
-};
+use crate::minion_registry::{with_registry, MinionInfo, MinionMode, OrchestrationPhase};
 use crate::tmux::TmuxGuard;
 use anyhow::{Context, Result};
 use chrono::Utc;
@@ -321,8 +319,7 @@ async fn find_resumable_minions(config: &LabConfig) -> Result<Vec<ResumableMinio
             .list()
             .into_iter()
             .filter(|(_id, info)| {
-                let process_dead =
-                    info.mode == MinionMode::Stopped || !info.pid.is_some_and(is_process_alive);
+                let process_dead = info.mode == MinionMode::Stopped || !info.is_running();
                 process_dead
                     && info.orchestration_phase.is_active()
                     && info.worktree.exists()
@@ -512,6 +509,8 @@ async fn resume_interrupted_minions(
                     if let Err(e) = with_registry(move |registry| {
                         registry.update(&mid, |info| {
                             info.pid = Some(pid);
+                            info.pid_start_time =
+                                crate::minion_registry::get_process_start_time(pid);
                             info.mode = MinionMode::Autonomous;
                         })
                     })
@@ -671,6 +670,8 @@ async fn poll_and_spawn(
                                     for (mid, _) in entries {
                                         registry.update(&mid, |info| {
                                             info.pid = Some(pid);
+                                            info.pid_start_time =
+                                                crate::minion_registry::get_process_start_time(pid);
                                             info.mode = MinionMode::Autonomous;
                                         })?;
                                     }
@@ -790,7 +791,7 @@ async fn available_slots(max_slots: usize) -> Result<usize> {
         let active = registry
             .list()
             .iter()
-            .filter(|(_id, info)| info.pid.is_some_and(is_process_alive))
+            .filter(|(_id, info)| info.is_running())
             .count();
         Ok(active)
     })
@@ -804,9 +805,7 @@ async fn is_issue_claimed(repo: &str, issue_number: u64) -> Result<bool> {
     let repo = repo.to_string();
     with_registry(move |registry| {
         let claimed = registry.list().iter().any(|(_id, info)| {
-            info.repo == repo
-                && info.issue == issue_number
-                && info.pid.is_some_and(is_process_alive)
+            info.repo == repo && info.issue == issue_number && info.is_running()
         });
         Ok(claimed)
     })

@@ -1,5 +1,5 @@
 use crate::log_viewer;
-use crate::minion_registry::{is_process_alive, with_registry};
+use crate::minion_registry::with_registry;
 use crate::minion_resolver;
 use anyhow::{Context, Result};
 
@@ -123,10 +123,9 @@ pub async fn handle_tail(
 /// Checks if a minion's worker process is currently running.
 async fn is_minion_running(minion_id: &str) -> bool {
     let mid = minion_id.to_string();
-    let pid = with_registry(move |reg| Ok(reg.get(&mid).and_then(|info| info.pid)))
+    with_registry(move |reg| Ok(reg.get(&mid).map(|info| info.is_running()).unwrap_or(false)))
         .await
-        .unwrap_or(None);
-    pid.map(is_process_alive).unwrap_or(false)
+        .unwrap_or(false)
 }
 
 #[cfg(test)]

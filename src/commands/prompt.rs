@@ -655,6 +655,7 @@ async fn register_and_run_agent(
         pr: None,
         session_id: cfg.session_id.to_string(),
         pid: None,
+        pid_start_time: None,
         mode: MinionMode::Autonomous,
         last_activity: now,
         orchestration_phase: OrchestrationPhase::RunningAgent,
@@ -740,7 +741,7 @@ async fn register_and_run_agent(
     let cleanup_id = minion_id.clone();
     let _ = with_registry(move |registry| {
         registry.update(&cleanup_id, |info| {
-            info.pid = None;
+            info.clear_pid();
             info.mode = MinionMode::Stopped;
             if let Some(usage) = token_usage {
                 info.token_usage = Some(usage);

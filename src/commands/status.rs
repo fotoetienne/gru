@@ -1,5 +1,5 @@
 use crate::agent::TokenUsage;
-use crate::minion_registry::{is_process_alive, with_registry, MinionMode};
+use crate::minion_registry::{is_process_alive_with_start_time, with_registry, MinionMode};
 use anyhow::{Context, Result};
 
 /// Combined Minion information from registry and filesystem scanning
@@ -33,6 +33,7 @@ struct BasicMinionData {
     started_at: chrono::DateTime<chrono::Utc>,
     worktree: std::path::PathBuf,
     pid: Option<u32>,
+    pid_start_time: Option<i64>,
     mode: MinionMode,
     session_id: String,
     token_usage: Option<TokenUsage>,
@@ -90,9 +91,13 @@ fn get_current_branch(worktree_path: &std::path::Path, registry_branch: &str) ->
 }
 
 /// Determines whether the process is running and the display mode string
-fn format_mode_display(pid: Option<u32>, mode: &MinionMode) -> (bool, String) {
+fn format_mode_display(
+    pid: Option<u32>,
+    pid_start_time: Option<i64>,
+    mode: &MinionMode,
+) -> (bool, String) {
     match pid {
-        Some(pid) if is_process_alive(pid) => {
+        Some(pid) if is_process_alive_with_start_time(pid, pid_start_time) => {
             let display = match mode {
                 MinionMode::Autonomous => "running (autonomous)".to_string(),
                 MinionMode::Interactive => "running (interactive)".to_string(),
@@ -148,22 +153,21 @@ pub async fn handle_status(id: Option<String>, verbose: bool) -> Result<i32> {
         }
 
         // Detect dead processes and update registry.
-        // Only on Unix where is_process_alive uses kill(pid, 0) for accurate checks.
+        // Only on Unix where process liveness checks are available.
         // On non-Unix, is_process_alive always returns false which would incorrectly
         // mark all minions as dead.
-        // Note: is_process_alive is a microsecond syscall, so running it under the
-        // registry lock is acceptable (unlike git operations in Phase 2).
+        // Note: is_running() calls kill(pid, 0) plus a fast proc_pidinfo/procfs lookup
+        // to detect PID reuse. Both are fast kernel calls (microseconds each), so running
+        // them under the registry lock is acceptable (unlike git operations in Phase 2).
         #[cfg(unix)]
         {
             let registry_minions = registry.list();
             for (minion_id, info) in &registry_minions {
-                if let Some(pid) = info.pid {
-                    if !is_process_alive(pid) {
-                        registry.update(minion_id, |info| {
-                            info.mode = MinionMode::Stopped;
-                            info.pid = None;
-                        })?;
-                    }
+                if info.pid.is_some() && !info.is_running() {
+                    registry.update(minion_id, |info| {
+                        info.mode = MinionMode::Stopped;
+                        info.clear_pid();
+                    })?;
                 }
             }
         }
@@ -184,6 +188,7 @@ pub async fn handle_status(id: Option<String>, verbose: bool) -> Result<i32> {
                 started_at: info.started_at,
                 worktree: info.worktree,
                 pid: info.pid,
+                pid_start_time: info.pid_start_time,
                 mode: info.mode,
                 session_id: info.session_id,
                 token_usage: info.token_usage,
@@ -203,7 +208,8 @@ pub async fn handle_status(id: Option<String>, verbose: bool) -> Result<i32> {
             // Filter out worktrees that were removed between Phase 1 and Phase 2
             .filter(|basic| basic.worktree.exists())
             .map(|basic| {
-                let (is_running, mode_display) = format_mode_display(basic.pid, &basic.mode);
+                let (is_running, mode_display) =
+                    format_mode_display(basic.pid, basic.pid_start_time, &basic.mode);
                 let uptime = calculate_uptime(basic.started_at);
                 // Get current branch from checkout path (checks for detached HEAD, branch changes, etc.)
                 let checkout_path = crate::workspace::resolve_checkout_path(&basic.worktree);
@@ -419,7 +425,7 @@ mod tests {
 
     #[test]
     fn test_format_mode_display_no_pid() {
-        let (is_running, display) = format_mode_display(None, &MinionMode::Autonomous);
+        let (is_running, display) = format_mode_display(None, None, &MinionMode::Autonomous);
         assert!(!is_running);
         assert_eq!(display, "stopped");
     }
@@ -428,7 +434,7 @@ mod tests {
     fn test_format_mode_display_autonomous_alive() {
         // Our own PID should be alive
         let pid = std::process::id();
-        let (is_running, display) = format_mode_display(Some(pid), &MinionMode::Autonomous);
+        let (is_running, display) = format_mode_display(Some(pid), None, &MinionMode::Autonomous);
         assert!(is_running);
         assert_eq!(display, "running (autonomous)");
     }
@@ -436,7 +442,7 @@ mod tests {
     #[test]
     fn test_format_mode_display_interactive_alive() {
         let pid = std::process::id();
-        let (is_running, display) = format_mode_display(Some(pid), &MinionMode::Interactive);
+        let (is_running, display) = format_mode_display(Some(pid), None, &MinionMode::Interactive);
         assert!(is_running);
         assert_eq!(display, "running (interactive)");
     }
@@ -447,7 +453,7 @@ mod tests {
         // doesn't exist. Avoid u32::MAX which wraps to -1 as i32, causing kill(-1,0)
         // to signal all processes.
         let (is_running, display) =
-            format_mode_display(Some(i32::MAX as u32), &MinionMode::Autonomous);
+            format_mode_display(Some(i32::MAX as u32), None, &MinionMode::Autonomous);
         assert!(!is_running);
         assert_eq!(display, "stopped");
     }
@@ -456,7 +462,7 @@ mod tests {
     fn test_format_mode_display_stopped_mode_alive_pid() {
         // Edge case: PID alive but mode is Stopped (shouldn't normally happen)
         let pid = std::process::id();
-        let (is_running, display) = format_mode_display(Some(pid), &MinionMode::Stopped);
+        let (is_running, display) = format_mode_display(Some(pid), None, &MinionMode::Stopped);
         assert!(is_running);
         assert_eq!(display, "running (unknown)");
     }

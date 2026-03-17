@@ -174,6 +174,8 @@ pub async fn handle_attach(
         reg.update(&mid, |info| {
             info.mode = MinionMode::Interactive;
             info.pid = pid_at_spawn;
+            info.pid_start_time =
+                pid_at_spawn.and_then(crate::minion_registry::get_process_start_time);
             info.last_activity = Utc::now();
         })
     })
@@ -190,7 +192,7 @@ pub async fn handle_attach(
     let _ = with_registry(move |reg| {
         reg.update(&mid, |info| {
             info.mode = MinionMode::Stopped;
-            info.pid = None;
+            info.clear_pid();
             info.last_activity = Utc::now();
         })
     })

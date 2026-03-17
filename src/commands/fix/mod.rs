@@ -114,6 +114,7 @@ async fn spawn_worker(
     if let Err(e) = with_registry(move |reg| {
         reg.update(&mid, |info| {
             info.pid = Some(pid);
+            info.pid_start_time = crate::minion_registry::get_process_start_time(pid);
             info.mode = MinionMode::Autonomous;
             info.last_activity = Utc::now();
         })
@@ -399,7 +400,7 @@ async fn run_worker(minion_id: &str, issue: &str, opts: FixOptions) -> Result<i3
     let mid_cleanup = minion_id.to_string();
     let _ = with_registry(move |reg| {
         reg.update(&mid_cleanup, |info| {
-            info.pid = None;
+            info.clear_pid();
             info.mode = MinionMode::Stopped;
         })
     })
