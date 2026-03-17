@@ -340,6 +340,12 @@ enum Commands {
 
         #[arg(long, help = "Disable auto-resuming interrupted Minions")]
         no_resume: bool,
+
+        #[arg(
+            long,
+            help = "Kill running Minions on shutdown (default: detach and let them continue)"
+        )]
+        stop_minions: bool,
     },
 }
 
@@ -454,7 +460,8 @@ async fn main() {
             poll_interval,
             slots,
             no_resume,
-        } => lab::handle_lab(config, repos, poll_interval, slots, no_resume).await,
+            stop_minions,
+        } => lab::handle_lab(config, repos, poll_interval, slots, no_resume, stop_minions).await,
     };
 
     // Handle any errors that occurred

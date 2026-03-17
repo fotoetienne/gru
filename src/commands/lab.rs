@@ -51,6 +51,7 @@ pub async fn handle_lab(
     poll_interval: Option<u64>,
     max_slots: Option<usize>,
     no_resume: bool,
+    stop_minions: bool,
 ) -> Result<i32> {
     // Load configuration
     let config = if let Some(path) = config_path {
@@ -124,7 +125,7 @@ pub async fn handle_lab(
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {
                 println!("\n🛑 Received shutdown signal, stopping daemon...");
-                shutdown_children(&mut children).await;
+                shutdown_children(&mut children, stop_minions).await;
                 break;
             }
             _ = sleep(config.poll_interval()) => {
@@ -210,8 +211,11 @@ async fn reap_children(children: &mut Vec<SpawnedChild>) {
     }
 }
 
-/// Signal all child processes to shut down gracefully on Ctrl-C
-async fn shutdown_children(children: &mut [SpawnedChild]) {
+/// Handle child processes on lab shutdown.
+///
+/// When `stop_minions` is false (default), detaches from running children and lets them
+/// continue independently. When `stop_minions` is true, sends SIGTERM then SIGKILL.
+async fn shutdown_children(children: &mut [SpawnedChild], stop_minions: bool) {
     if children.is_empty() {
         return;
     }
@@ -235,10 +239,21 @@ async fn shutdown_children(children: &mut [SpawnedChild]) {
     }
 
     if running_pids.is_empty() {
-        println!("No running Minion processes to shut down.");
+        println!("No running Minion processes.");
         return;
     }
 
+    if !stop_minions {
+        // Default: detach from children, let them continue running independently
+        println!(
+            "👋 {} Minion(s) still running — they will continue independently.",
+            running_pids.len()
+        );
+        println!("   Use `gru stop --all` to stop them, or `gru status` to check on them.");
+        return;
+    }
+
+    // --stop-minions: kill all children
     println!(
         "🔪 Signaling {} running Minion(s) to shut down...",
         running_pids.len()
@@ -853,15 +868,27 @@ async fn spawn_minion(repo: &str, host: &str, issue_number: u64) -> Result<Child
         .context("Failed to clone log file handle")?;
     let stderr_file = log_file;
 
-    // Spawn `gru do <issue>` as a background process with output captured to log file
-    let mut child = tokio::process::Command::new(exe)
-        .arg("do")
+    // Spawn `gru do <issue>` as a background process with output captured to log file.
+    // Use setsid to give the child its own process group so it survives lab shutdown.
+    let mut cmd = tokio::process::Command::new(exe);
+    cmd.arg("do")
         .arg(&issue_ref)
         .stdin(Stdio::null())
         .stdout(Stdio::from(stdout_file))
-        .stderr(Stdio::from(stderr_file))
-        .spawn()
-        .context("Failed to spawn gru do command")?;
+        .stderr(Stdio::from(stderr_file));
+
+    // Give the child its own session/process group so it won't receive
+    // SIGINT/SIGHUP when the lab's terminal is interrupted.
+    #[cfg(unix)]
+    unsafe {
+        // SAFETY: setsid() is async-signal-safe.
+        cmd.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        });
+    }
+
+    let mut child = cmd.spawn().context("Failed to spawn gru do command")?;
 
     // Give the process a moment to fail if there are startup issues
     // This prevents phantom slot occupancy from processes that immediately fail
@@ -1159,6 +1186,71 @@ mod tests {
         assert!(
             !should_restore_label(spawned_at),
             "Process spawned 60s ago should not qualify for label restoration"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_shutdown_children_detach_leaves_process_running() {
+        // Spawn a process that sleeps
+        let child = tokio::process::Command::new("sleep")
+            .arg("60")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+
+        let pid = child.id().unwrap();
+
+        let mut children = vec![SpawnedChild {
+            child,
+            spawn_meta: None,
+        }];
+
+        // Default shutdown (detach mode) should NOT kill the process
+        shutdown_children(&mut children, false).await;
+
+        // Process should still be alive
+        assert!(
+            is_process_alive(pid),
+            "Process should still be running after detach shutdown"
+        );
+
+        // Clean up: kill the process ourselves
+        #[cfg(unix)]
+        unsafe {
+            libc::kill(pid as i32, libc::SIGKILL);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_shutdown_children_stop_kills_process() {
+        // Spawn a process that sleeps
+        let child = tokio::process::Command::new("sleep")
+            .arg("60")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+
+        let pid = child.id().unwrap();
+
+        let mut children = vec![SpawnedChild {
+            child,
+            spawn_meta: None,
+        }];
+
+        // Stop mode should kill the process
+        shutdown_children(&mut children, true).await;
+
+        // Give a moment for the process to be reaped
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Process should be dead
+        assert!(
+            !is_process_alive(pid),
+            "Process should be dead after stop shutdown"
         );
     }
 
