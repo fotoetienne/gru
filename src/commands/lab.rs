@@ -499,9 +499,9 @@ async fn resume_interrupted_minions(
         // Record this minion as attempted regardless of outcome
         resumed_this_session.insert(candidate.minion_id.clone());
 
-        match spawn_minion(&candidate.info.repo, &host, candidate.info.issue).await {
+        match spawn_resume(&candidate.minion_id).await {
             Ok(child) => {
-                // Write the outer `gru do` PID to registry immediately to prevent
+                // Write the `gru resume` PID to registry immediately to prevent
                 // duplicate spawns. The worker subprocess will later overwrite
                 // this with the inner worker PID.
                 if let Some(pid) = child.id() {
@@ -883,6 +883,57 @@ async fn spawn_minion(repo: &str, host: &str, issue_number: u64) -> Result<Child
         anyhow::bail!(
             "Spawned process for {} exited immediately with status: {:?}",
             issue_ref,
+            status
+        );
+    }
+
+    println!("📝 Log: {}", log_path.display());
+
+    Ok(child)
+}
+
+/// Spawn a resume for an existing Minion using `gru resume <minion_id>`.
+/// Returns the child process handle for lifecycle tracking.
+async fn spawn_resume(minion_id: &str) -> Result<Child> {
+    let exe = std::env::current_exe().context("Failed to get current executable path")?;
+
+    // Create log directory and open log file
+    let home = dirs::home_dir().context("Failed to determine home directory")?;
+    let log_dir = home.join(".gru").join("state").join("logs");
+    tokio::fs::create_dir_all(&log_dir)
+        .await
+        .with_context(|| format!("Failed to create log directory: {}", log_dir.display()))?;
+
+    let log_path = log_dir.join(format!("resume-{}.log", minion_id));
+    let log_file = tokio::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .await
+        .with_context(|| format!("Failed to open log file: {}", log_path.display()))?
+        .try_into_std()
+        .expect("no in-flight I/O immediately after open");
+    let stdout_file = log_file
+        .try_clone()
+        .context("Failed to clone log file handle")?;
+    let stderr_file = log_file;
+
+    let mut child = tokio::process::Command::new(exe)
+        .arg("resume")
+        .arg(minion_id)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(stdout_file))
+        .stderr(Stdio::from(stderr_file))
+        .spawn()
+        .context("Failed to spawn gru resume command")?;
+
+    // Give the process a moment to fail if there are startup issues
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    if let Ok(Some(status)) = child.try_wait() {
+        anyhow::bail!(
+            "Spawned gru resume for {} exited immediately with status: {:?}",
+            minion_id,
             status
         );
     }
