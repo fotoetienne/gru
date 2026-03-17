@@ -19,7 +19,7 @@ Each Minion works in an isolated **git worktree** under `~/.gru/work/`. Your mai
 └── checkout/   ← the actual git worktree
 ```
 
-The worktree's branch is named `minion/issue-42-M001`. When the PR merges, Gru cleans up the worktree automatically.
+The worktree's branch is named `minion/issue-42-M001`. Worktrees persist after the PR merges; run `gru clean` to remove them.
 
 ## Labels as State
 
@@ -31,7 +31,7 @@ GitHub labels are Gru's state machine. Gru looks for labels to decide what to do
 |---|---|
 | `gru:todo` | Ready for a Minion to pick up |
 | `gru:in-progress` | Claimed by a Minion, work underway |
-| `gru:done` | PR merged, issue resolved |
+| `gru:done` | PR opened, agent finished |
 | `gru:failed` | Minion gave up, needs human review |
 | `gru:blocked` | Minion hit a wall, needs human input |
 
@@ -54,11 +54,11 @@ Gru has no external database. Everything lives in GitHub:
 - **PRs** are the output
 - **Comments** are the logs
 
-This means Gru's full state is visible in the GitHub UI, survives restarts, and requires no setup beyond `gh` auth.
+This means Gru's task state is visible in the GitHub UI, survives restarts, and requires no setup beyond `gh` auth. (Some local runtime metadata — Minion IDs, registry — lives under `~/.gru/state/`.)
 
 ## Lab Mode
 
-`gru lab` runs Gru as a daemon. It polls your configured repositories every 30 seconds, picks up any issue labeled `gru:todo`, and spawns a Minion for it. Once running, it claims and works any `gru:todo` issue without further input.
+`gru lab` runs Gru as a daemon. It polls your configured repositories every 30 seconds by default, picks up any issue labeled `gru:todo`, and spawns a Minion for it. Once running, it claims and works any `gru:todo` issue without further input.
 
 ```bash
 gru lab   # watches all repos in ~/.gru/config.toml
@@ -82,20 +82,24 @@ Minion claims issue (gru:in-progress)
 Worktree created, agent implements fix
         │
         ▼
-    PR opened, CI monitored ◄─────────────────────┐
-        │                                          │
-        ├─ CI fails ──► auto-fix attempted (2x)   │
-        │                                          │
-        ▼                                          │
-    Review comments handled                        │
-        │                                          │
-        ├─ Blocked ──► gru:blocked + escalation    │
-        │                                          │
-        └─ Changes requested ──► push fix ─────────┘
-                                  (re-run CI, re-review)
-        │ (all checks pass, approved)
-        ▼
-PR merged, worktree cleaned up (gru:done)
+PR opened (gru:done) ──► CI monitored ◄───────────────────┐
+                                │                          │
+                                ├─ CI fails ──► auto-fix   │
+                                │              attempted   │
+                                │              (2x max)    │
+                                ▼                          │
+                        Review comments handled            │
+                                │                          │
+                                ├─ Blocked ──► gru:blocked │
+                                │              + escalation │
+                                │                          │
+                                └─ Changes requested ──────┘
+                                   push fix, re-run CI
+
+        (all checks pass, approved)
+                │
+                ▼
+            PR merged
 ```
 
-If anything goes unresolvably wrong, the Minion labels the issue `gru:blocked` or `gru:failed` and leaves a comment explaining what it needs.
+If anything goes unresolvably wrong, the Minion labels the issue `gru:blocked` or `gru:failed` and typically leaves a comment explaining what it needs.
