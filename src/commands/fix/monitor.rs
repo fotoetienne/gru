@@ -155,6 +155,10 @@ async fn post_exit_notification_if_needed(
     match result {
         Ok(output) if output.status.success() => {
             log::info!("Posted monitoring-paused notification on PR #{}", pr_number);
+            println!(
+                "⏸️  Monitoring paused. {} review(s) pending. Resume: gru resume {}",
+                count, minion_id
+            );
         }
         Ok(output) => {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -168,11 +172,6 @@ async fn post_exit_notification_if_needed(
             log::warn!("Failed to run gh pr comment for exit notification: {}", e);
         }
     }
-
-    println!(
-        "⏸️  Monitoring paused. {} review(s) pending. Resume: gru resume {}",
-        count, minion_id
-    );
 }
 
 /// Posts an escalation comment on a PR when auto-rebase fails.
@@ -927,13 +926,10 @@ pub(crate) async fn monitor_pr_lifecycle(
 
     // Persist the final review baseline on monitor exit so the lab wake-up
     // scan knows where to resume without re-processing already-seen reviews.
-    if let Some(ts) = review_baseline {
-        save_review_check_time(&wt_ctx.minion_id, ts).await;
-    }
-
-    // If the PR is still open with unaddressed external reviews, post a
-    // notification so the user knows to resume.
+    // Also check if the PR is still open with unaddressed external reviews and
+    // post a notification if so.
     if let Some(baseline) = review_baseline {
+        save_review_check_time(&wt_ctx.minion_id, baseline).await;
         post_exit_notification_if_needed(
             &issue_ctx.owner,
             &issue_ctx.repo,

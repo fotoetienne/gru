@@ -849,7 +849,9 @@ pub(crate) async fn get_pr_info_for_exit_notification(
     pr_number: &str,
 ) -> Result<(bool, String)> {
     let pr = get_pr(host, owner, repo, pr_number).await?;
-    let is_open = pr.state != "closed";
+    // A merged PR has state="closed" AND merged=true. Check both to guard
+    // against the narrow race where state hasn't propagated yet.
+    let is_open = pr.state != "closed" && !pr.merged;
     Ok((is_open, pr.user.login))
 }
 
