@@ -382,7 +382,23 @@ async fn resume_interrupted_minions(
         return Ok(0);
     }
 
-    let resumable = find_resumable_minions(config).await?;
+    let resumable: Vec<_> = find_resumable_minions(config)
+        .await?
+        .into_iter()
+        .filter(|c| {
+            if resumed_this_session.contains(&c.minion_id) {
+                log::debug!(
+                    "Skipping {} (issue #{}, {}): already resumed this session",
+                    c.minion_id,
+                    c.info.issue,
+                    c.info.repo,
+                );
+                false
+            } else {
+                true
+            }
+        })
+        .collect();
     if resumable.is_empty() {
         return Ok(0);
     }
@@ -397,17 +413,6 @@ async fn resume_interrupted_minions(
     for candidate in resumable {
         if *available == 0 {
             break;
-        }
-
-        // Skip minions already attempted this session (defense-in-depth against resume loops)
-        if resumed_this_session.contains(&candidate.minion_id) {
-            log::warn!(
-                "⏭️  Skipping {} (issue #{}, {}): already resumed this session",
-                candidate.minion_id,
-                candidate.info.issue,
-                candidate.info.repo,
-            );
-            continue;
         }
 
         let host = match host_for_repo(config, &candidate.info.repo) {
