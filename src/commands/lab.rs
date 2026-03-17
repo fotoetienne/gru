@@ -751,6 +751,21 @@ async fn poll_and_spawn(
     Ok(())
 }
 
+/// Check whether a registry entry is stale and should be pruned.
+///
+/// An entry is stale if:
+/// 1. Its worktree no longer exists on disk, OR
+/// 2. It reached a terminal phase (Completed/Failed), has no live process,
+///    and has no associated PR (minions with open PRs are retained).
+fn is_stale_entry(info: &MinionInfo) -> bool {
+    if !info.worktree.exists() {
+        return true;
+    }
+    info.orchestration_phase.is_terminal()
+        && !info.pid.is_some_and(is_process_alive)
+        && info.pr.is_none()
+}
+
 /// Prune stale registry entries where worktrees no longer exist
 async fn prune_stale_entries() -> Result<()> {
     with_registry(|registry| {
@@ -758,7 +773,7 @@ async fn prune_stale_entries() -> Result<()> {
 
         let stale_ids: Vec<String> = minions
             .iter()
-            .filter(|(_id, info)| !info.worktree.exists())
+            .filter(|(_id, info)| is_stale_entry(info))
             .map(|(id, _)| id.clone())
             .collect();
 
@@ -1170,5 +1185,84 @@ mod tests {
             should_restore_label(spawned_at),
             "Process at 1s under threshold should still qualify for label restoration"
         );
+    }
+
+    /// Helper to create a MinionInfo with sensible defaults for testing.
+    fn test_minion_info(worktree: PathBuf) -> MinionInfo {
+        MinionInfo {
+            repo: "owner/repo".to_string(),
+            issue: 1,
+            command: "do".to_string(),
+            prompt: String::new(),
+            started_at: Utc::now(),
+            branch: "minion/issue-1-M001".to_string(),
+            worktree,
+            status: "active".to_string(),
+            pr: None,
+            session_id: "test-session".to_string(),
+            pid: None,
+            mode: MinionMode::default(),
+            last_activity: Utc::now(),
+            orchestration_phase: OrchestrationPhase::default(),
+            token_usage: None,
+            agent_name: "claude".to_string(),
+            timeout_deadline: None,
+            attempt_count: 0,
+            no_watch: false,
+        }
+    }
+
+    #[test]
+    fn test_is_stale_entry_missing_worktree() {
+        let info = test_minion_info(PathBuf::from("/nonexistent/path"));
+        assert!(is_stale_entry(&info));
+    }
+
+    #[test]
+    fn test_is_stale_entry_terminal_no_pr() {
+        // Completed minion with no PR and no live process → stale
+        let mut info = test_minion_info(std::env::temp_dir());
+        info.orchestration_phase = OrchestrationPhase::Completed;
+        info.pid = None;
+        info.pr = None;
+        assert!(is_stale_entry(&info));
+    }
+
+    #[test]
+    fn test_is_stale_entry_terminal_with_pr_retained() {
+        // Completed minion with an open PR → not stale
+        let mut info = test_minion_info(std::env::temp_dir());
+        info.orchestration_phase = OrchestrationPhase::Completed;
+        info.pid = None;
+        info.pr = Some("123".to_string());
+        assert!(!is_stale_entry(&info));
+    }
+
+    #[test]
+    fn test_is_stale_entry_active_minion_not_stale() {
+        // Non-terminal minion with existing worktree → not stale
+        let mut info = test_minion_info(std::env::temp_dir());
+        info.orchestration_phase = OrchestrationPhase::RunningAgent;
+        assert!(!is_stale_entry(&info));
+    }
+
+    #[test]
+    fn test_is_stale_entry_failed_no_pr() {
+        // Failed minion with no PR → stale
+        let mut info = test_minion_info(std::env::temp_dir());
+        info.orchestration_phase = OrchestrationPhase::Failed;
+        info.pid = None;
+        info.pr = None;
+        assert!(is_stale_entry(&info));
+    }
+
+    #[test]
+    fn test_is_stale_entry_failed_with_pr_retained() {
+        // Failed minion with a PR → not stale
+        let mut info = test_minion_info(std::env::temp_dir());
+        info.orchestration_phase = OrchestrationPhase::Failed;
+        info.pid = None;
+        info.pr = Some("456".to_string());
+        assert!(!is_stale_entry(&info));
     }
 }
