@@ -275,7 +275,14 @@ async fn auto_stop_minion(minion_id: &str, worktree_path: &std::path::Path) -> R
 
         if tokio::time::Instant::now() >= deadline {
             // Hard-kill after timeout
-            super::stop::terminate_via_registry_pid(minion_id, true).await;
+            println!("Force-killing Minion {} after 10s timeout.", minion_id);
+            let killed = super::stop::terminate_via_registry_pid(minion_id, true).await;
+            if !killed {
+                log::warn!(
+                    "Failed to hard-kill Minion {}; proceeding with attach anyway",
+                    minion_id
+                );
+            }
             // Brief pause for the kill to take effect
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
             break;
@@ -284,16 +291,9 @@ async fn auto_stop_minion(minion_id: &str, worktree_path: &std::path::Path) -> R
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     }
 
-    // Update registry to mark as stopped
-    let mid = minion_id.to_string();
-    let _ = with_registry(move |reg| {
-        reg.update(&mid, |info| {
-            info.mode = MinionMode::Stopped;
-            info.clear_pid();
-            info.last_activity = Utc::now();
-        })
-    })
-    .await;
+    // Don't update the registry here — check_and_claim_session's retry will
+    // atomically detect the dead PID and reset to Stopped before claiming as
+    // Interactive, avoiding a race window between two separate registry writes.
 
     Ok(())
 }
