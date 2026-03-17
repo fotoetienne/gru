@@ -233,6 +233,7 @@ pub(crate) async fn monitor_pr_lifecycle(
     let monitor_start = tokio::time::Instant::now();
     let mut review_round = 0;
     let mut ci_escalated = false;
+    let mut issue_was_blocked = false;
     let mut rebase_attempts = 0;
     let mut judge_state = JudgeState::new();
     let mut judge_label_ensured = false;
@@ -312,6 +313,18 @@ pub(crate) async fn monitor_pr_lifecycle(
                 break;
             }
             Ok((MonitorResult::ReadyToMerge, _)) => {
+                // All merge gates pass — remove gru:blocked if it was stale
+                if issue_was_blocked {
+                    super::helpers::try_unblock_issue(
+                        &issue_ctx.host,
+                        &issue_ctx.owner,
+                        &issue_ctx.repo,
+                        issue_ctx.issue_num,
+                    )
+                    .await;
+                    issue_was_blocked = false;
+                }
+
                 // Lazily ensure the gru:needs-human-review label exists on
                 // first ReadyToMerge, rather than unconditionally at startup.
                 if !judge_label_ensured {
@@ -548,10 +561,23 @@ pub(crate) async fn monitor_pr_lifecycle(
                 {
                     Ok(true) => {
                         println!("✅ CI checks now pass after auto-fix");
+                        // Remove gru:blocked label if it was added during escalation
+                        if issue_was_blocked {
+                            super::helpers::try_unblock_issue(
+                                &issue_ctx.host,
+                                &issue_ctx.owner,
+                                &issue_ctx.repo,
+                                issue_ctx.issue_num,
+                            )
+                            .await;
+                            issue_was_blocked = false;
+                        }
+                        ci_escalated = false;
                         println!("🔄 Continuing to monitor PR...\n");
                     }
                     Ok(false) => {
                         ci_escalated = true;
+                        issue_was_blocked = true;
                         println!("⚠️  CI auto-fix escalated to human after max attempts");
                         println!(
                             "   Review the checks at: https://github.com/{}/{}/pull/{}/checks",

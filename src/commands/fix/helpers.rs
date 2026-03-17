@@ -34,6 +34,19 @@ pub(crate) async fn try_mark_issue_blocked(host: &str, owner: &str, repo: &str, 
     }
 }
 
+/// Attempts to unblock an issue via CLI (fire-and-forget).
+/// Removes gru:blocked and restores gru:in-progress.
+pub(crate) async fn try_unblock_issue(host: &str, owner: &str, repo: &str, issue_num: u64) {
+    match crate::github::unblock_issue_via_cli(host, owner, repo, issue_num).await {
+        Ok(()) => {
+            println!("🏷️  Removed '{}' label from issue", crate::labels::BLOCKED);
+        }
+        Err(e) => {
+            log::warn!("⚠️  Failed to remove blocked label: {}", e);
+        }
+    }
+}
+
 /// Attempts to mark an issue as failed via CLI (fire-and-forget).
 /// Logs success/failure but does not propagate errors.
 pub(crate) async fn try_mark_issue_failed(host: &str, owner: &str, repo: &str, issue_num: u64) {

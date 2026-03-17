@@ -719,6 +719,28 @@ pub async fn mark_issue_failed_via_cli(
     .await
 }
 
+/// Unblock an issue: remove gru:blocked, restore gru:in-progress.
+///
+/// Called after a previously-blocked issue recovers (e.g., CI passes after
+/// auto-fix or external action).
+///
+/// # Arguments
+/// * `host` - GitHub hostname
+/// * `owner` - Repository owner
+/// * `repo` - Repository name
+/// * `number` - Issue number
+pub async fn unblock_issue_via_cli(host: &str, owner: &str, repo: &str, number: u64) -> Result<()> {
+    edit_labels_via_cli(
+        host,
+        owner,
+        repo,
+        number,
+        &[labels::IN_PROGRESS],
+        &[labels::BLOCKED],
+    )
+    .await
+}
+
 /// Mark an issue as blocked: add gru:blocked, remove in-progress/done/failed.
 ///
 /// Removes all state labels to ensure a clean transition regardless of
