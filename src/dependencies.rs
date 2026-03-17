@@ -383,23 +383,7 @@ mod tests {
         assert!(!result.contains(&10));
     }
 
-    // --- Error code differentiation tests ---
-
-    #[test]
-    fn test_api_404_is_debug_not_error() {
-        // 404 = GHES, expected behavior, should use log::debug (not warn)
-        // Verified by the fact that parse_api_output returns Unavailable
-        // and the log message uses "GHES fallback" phrasing
-        let result = parse_api_output(false, "", "HTTP 404: Not Found", 42);
-        assert_eq!(result, ApiResult::Unavailable);
-    }
-
-    #[test]
-    fn test_api_403_is_warning() {
-        // 403 = permissions issue, different from 404 (GHES)
-        let result = parse_api_output(false, "", "HTTP 403: Forbidden", 42);
-        assert_eq!(result, ApiResult::Unavailable);
-    }
+    // --- Additional error code coverage ---
 
     #[test]
     fn test_api_502_bad_gateway() {
@@ -414,52 +398,32 @@ mod tests {
     }
 
     // --- GHES end-to-end scenario tests ---
+    // These test the full resolution path: API unavailable (None) → body parsing fallback.
+    // See test_api_404_not_found for the parse_api_output → Unavailable mapping.
 
     #[test]
-    fn test_ghes_scenario_blocked_issue_detected_via_body() {
-        // Simulate GHES: API returns 404 (None), issue has body deps
-        // This is the primary GHES use case
+    fn test_ghes_blocked_issue_detected_via_body() {
+        // GHES: API unavailable (404), body has blockers → body wins
         let body = "## Description\nImplement feature X\n\n**Blocked by:** #100, #200\n\n## Notes\nSome notes";
-        let api_result = {
-            let parsed = parse_api_output(false, "", "HTTP 404: Not Found", 50);
-            match parsed {
-                ApiResult::Supported(v) => Some(v),
-                ApiResult::Unavailable => None,
-            }
-        };
-        let blockers = resolve_blockers(body, api_result);
+        let blockers = resolve_blockers(body, None);
         assert_eq!(blockers, vec![100, 200]);
     }
 
     #[test]
-    fn test_ghes_scenario_unblocked_issue_passes() {
-        // GHES: API 404, no body deps → issue is unblocked
+    fn test_ghes_unblocked_issue_passes() {
+        // GHES: API unavailable, no body deps → unblocked
         let body = "## Description\nJust a regular issue";
-        let api_result = {
-            let parsed = parse_api_output(false, "", "HTTP 404: Not Found", 50);
-            match parsed {
-                ApiResult::Supported(v) => Some(v),
-                ApiResult::Unavailable => None,
-            }
-        };
-        let blockers = resolve_blockers(body, api_result);
+        let blockers = resolve_blockers(body, None);
         assert!(blockers.is_empty());
     }
 
     #[test]
-    fn test_server_error_treats_as_unblocked() {
-        // 500 error → treated as unblocked (don't block pipeline on API errors)
+    fn test_server_error_falls_back_to_body_parsing() {
+        // On 403/500/502/503, API returns Unavailable (None), so body parsing
+        // is used as fallback — same behavior as GHES 404.
+        // If body has blockers, they ARE respected (not silently ignored).
         let body = "**Blocked by:** #10";
-        let api_result = {
-            let parsed = parse_api_output(false, "", "HTTP 500: Internal Server Error", 50);
-            match parsed {
-                ApiResult::Supported(v) => Some(v),
-                ApiResult::Unavailable => None,
-            }
-        };
-        // Note: on 500, API returns None, so body parsing is used as fallback
-        // This means body blockers ARE respected on server errors (same as GHES 404)
-        let blockers = resolve_blockers(body, api_result);
+        let blockers = resolve_blockers(body, None);
         assert_eq!(blockers, vec![10]);
     }
 }

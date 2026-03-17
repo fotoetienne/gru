@@ -255,7 +255,8 @@ Located in `.claude/skills/`:
   - Example: `**Blocked by:** #10, #20, #30`
 - **Two-layer checking:** Body parsing (free) runs first, then the native GitHub dependencies API verifies
 - **Native API resolution:** API result is authoritative when available (200). Body text is sole source on 404 (GHES)
-- **GHES compatibility:** When the native dependencies API returns 404, Gru falls back to body-text parsing only. No functionality is lost — body-text deps work identically. 403/500 errors are logged as warnings and the issue is treated as unblocked (pipeline is not blocked on transient API errors)
+- **GHES compatibility:** When the native dependencies API returns 404, Gru falls back to body-text parsing only. No functionality is lost — body-text deps work identically
+- **Error handling:** 403/500/502/503 errors are logged as warnings and cause fallback to body parsing (same as 404). If body has blockers, they are respected. If body has no blockers, the issue is treated as unblocked
 - **`gru do` behavior:** Warns about open blockers but proceeds (user explicitly chose the issue). Use `--ignore-deps` to suppress
 - **`gru:waiting` label:** Deferred. For github.com, the native API provides `is:blocked` visibility. For GHES without native deps, body-text dependencies have no GitHub UI representation. A `gru:waiting` label may be added if GHES users report needing visible feedback — not rejected, just not needed for MVP
 - **Implementation:** `src/dependencies.rs` — see `plans/ISSUE_DEPENDENCIES_PRD.md` for full design
