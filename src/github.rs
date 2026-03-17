@@ -128,7 +128,7 @@ pub async fn list_ready_issues_via_cli(
     repo: &str,
     host: &str,
     label: &str,
-) -> Result<Vec<u64>> {
+) -> Result<Vec<CandidateIssue>> {
     let repo_full = format!("{}/{}", owner, repo);
     let search_query = build_ready_issues_search_query(label);
     let output = gh_cli_command(host)
@@ -142,7 +142,7 @@ pub async fn list_ready_issues_via_cli(
             "--state",
             "open",
             "--json",
-            "number",
+            "number,body",
             "--limit",
             "100",
         ])
@@ -160,16 +160,18 @@ pub async fn list_ready_issues_via_cli(
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let items: Vec<IssueNumber> =
+    let items: Vec<CandidateIssue> =
         serde_json::from_str(&stdout).context("Failed to parse gh issue list JSON output")?;
 
-    Ok(items.into_iter().map(|i| i.number).collect())
+    Ok(items)
 }
 
-/// Helper struct for deserializing issue number from gh CLI JSON
-#[derive(Debug, serde::Deserialize)]
-struct IssueNumber {
-    number: u64,
+/// Issue candidate returned by list queries, with optional body for dependency checking
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct CandidateIssue {
+    pub number: u64,
+    #[serde(default)]
+    pub body: Option<String>,
 }
 
 /// Fetch issue details using gh CLI
@@ -810,12 +812,12 @@ mod tests {
         assert!(result.is_err());
     }
 
-    // --- IssueNumber deserialization tests ---
+    // --- CandidateIssue deserialization tests ---
 
     #[test]
     fn test_issue_number_deserialize() {
         let json = r#"[{"number": 1}, {"number": 42}, {"number": 100}]"#;
-        let items: Vec<IssueNumber> = serde_json::from_str(json).unwrap();
+        let items: Vec<CandidateIssue> = serde_json::from_str(json).unwrap();
         assert_eq!(items.len(), 3);
         assert_eq!(items[0].number, 1);
         assert_eq!(items[1].number, 42);
@@ -825,14 +827,14 @@ mod tests {
     #[test]
     fn test_issue_number_deserialize_empty() {
         let json = "[]";
-        let items: Vec<IssueNumber> = serde_json::from_str(json).unwrap();
+        let items: Vec<CandidateIssue> = serde_json::from_str(json).unwrap();
         assert!(items.is_empty());
     }
 
     #[test]
     fn test_issue_number_deserialize_extra_fields() {
         let json = r#"[{"number": 5, "title": "ignored", "url": "https://example.com"}]"#;
-        let items: Vec<IssueNumber> = serde_json::from_str(json).unwrap();
+        let items: Vec<CandidateIssue> = serde_json::from_str(json).unwrap();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].number, 5);
     }
@@ -840,7 +842,7 @@ mod tests {
     #[test]
     fn test_issue_number_deserialize_missing_number() {
         let json = r#"[{"title": "no number"}]"#;
-        let result: Result<Vec<IssueNumber>, _> = serde_json::from_str(json);
+        let result: Result<Vec<CandidateIssue>, _> = serde_json::from_str(json);
         assert!(result.is_err());
     }
 
