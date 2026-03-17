@@ -1,7 +1,9 @@
 use crate::config::{parse_repo_entry_with_hosts, LabConfig};
 use crate::github::{self, list_ready_issues_via_cli};
 use crate::labels;
-use crate::minion_registry::{with_registry, MinionInfo, MinionMode, OrchestrationPhase};
+use crate::minion_registry::{
+    is_process_alive, with_registry, MinionInfo, MinionMode, OrchestrationPhase,
+};
 use crate::tmux::TmuxGuard;
 use anyhow::{Context, Result};
 use chrono::Utc;
@@ -499,11 +501,11 @@ async fn resume_interrupted_minions(
         // Record this minion as attempted regardless of outcome
         resumed_this_session.insert(candidate.minion_id.clone());
 
-        match spawn_minion(&candidate.info.repo, &host, candidate.info.issue).await {
+        match spawn_resume(&candidate.minion_id).await {
             Ok(child) => {
-                // Write the outer `gru do` PID to registry immediately to prevent
-                // duplicate spawns. The worker subprocess will later overwrite
-                // this with the inner worker PID.
+                // Write the `gru resume` PID to registry immediately to prevent
+                // duplicate spawns. The inner agent subprocess will later
+                // overwrite this with the agent PID via pid_callback.
                 if let Some(pid) = child.id() {
                     let mid = candidate.minion_id.clone();
                     if let Err(e) = with_registry(move |registry| {
@@ -892,6 +894,57 @@ async fn spawn_minion(repo: &str, host: &str, issue_number: u64) -> Result<Child
     Ok(child)
 }
 
+/// Spawn a resume for an existing Minion using `gru resume <minion_id>`.
+/// Returns the child process handle for lifecycle tracking.
+async fn spawn_resume(minion_id: &str) -> Result<Child> {
+    let exe = std::env::current_exe().context("Failed to get current executable path")?;
+
+    // Create log directory and open log file
+    let home = dirs::home_dir().context("Failed to determine home directory")?;
+    let log_dir = home.join(".gru").join("state").join("logs");
+    tokio::fs::create_dir_all(&log_dir)
+        .await
+        .with_context(|| format!("Failed to create log directory: {}", log_dir.display()))?;
+
+    let log_path = log_dir.join(format!("resume-{}.log", minion_id));
+    let log_file = tokio::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .await
+        .with_context(|| format!("Failed to open log file: {}", log_path.display()))?
+        .try_into_std()
+        .expect("no in-flight I/O immediately after open");
+    let stdout_file = log_file
+        .try_clone()
+        .context("Failed to clone log file handle")?;
+    let stderr_file = log_file;
+
+    let mut child = tokio::process::Command::new(exe)
+        .arg("resume")
+        .arg(minion_id)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(stdout_file))
+        .stderr(Stdio::from(stderr_file))
+        .spawn()
+        .context("Failed to spawn gru resume command")?;
+
+    // Give the process a moment to fail if there are startup issues
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    if let Ok(Some(status)) = child.try_wait() {
+        anyhow::bail!(
+            "Spawned gru resume for {} exited immediately with status: {:?}",
+            minion_id,
+            status
+        );
+    }
+
+    println!("📝 Log: {}", log_path.display());
+
+    Ok(child)
+}
+
 /// Fallback issue listing using gh CLI with basic label filter.
 /// Used when the primary `list_ready_issues_via_cli` call fails.
 /// Uses a simpler gh CLI invocation with just the label filter.
@@ -1205,6 +1258,7 @@ mod tests {
             timeout_deadline: None,
             attempt_count: 0,
             no_watch: false,
+            pid_start_time: None,
         }
     }
 
