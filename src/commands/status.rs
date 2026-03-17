@@ -200,28 +200,9 @@ pub async fn handle_status(id: Option<String>, verbose: bool) -> Result<i32> {
         basic_minions
             .into_iter()
             .map(|basic| {
-                if basic.is_stale {
-                    // Stale entry: worktree doesn't exist, skip git operations
-                    let uptime = calculate_uptime(basic.started_at);
-                    EnhancedMinionInfo {
-                        minion_id: basic.minion_id,
-                        repo: basic.repo,
-                        issue: basic.issue,
-                        task: basic.task,
-                        pr: basic.pr,
-                        branch: basic.branch,
-                        is_running: false,
-                        mode_display: "stale".to_string(),
-                        uptime,
-                        token_usage: basic.token_usage,
-                        session_id: basic.session_id,
-                        pid: None,
-                        worktree_path: basic.worktree.display().to_string(),
-                        agent_name: basic.agent_name,
-                        is_stale: true,
-                    }
-                } else if !basic.worktree.exists() {
-                    // Worktree removed between Phase 1 and Phase 2 (race condition)
+                if basic.is_stale || !basic.worktree.exists() {
+                    // Stale entry: worktree doesn't exist (detected in Phase 1,
+                    // or removed between Phase 1 and Phase 2). Skip git operations.
                     let uptime = calculate_uptime(basic.started_at);
                     EnhancedMinionInfo {
                         minion_id: basic.minion_id,
