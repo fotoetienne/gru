@@ -203,6 +203,10 @@ pub(crate) async fn monitor_pr_lifecycle(
         );
     }
 
+    // Capture timestamp before self-review so that any reviews submitted
+    // during the review are not missed when the monitoring loop starts.
+    let pre_review_time = chrono::Utc::now();
+
     // Auto-trigger review for Minion-created PRs
     println!("\n🔍 Starting automated PR review...");
     match trigger_pr_review(pr_number, &wt_ctx.checkout_path, review_timeout).await {
@@ -248,7 +252,9 @@ pub(crate) async fn monitor_pr_lifecycle(
         .unwrap_or(merge_judge::DEFAULT_CONFIDENCE_THRESHOLD);
     // Track review baseline across monitor_pr re-entries so reviews posted
     // before/during event handling (e.g. rebase) are not silently dropped.
-    let mut review_baseline: Option<chrono::DateTime<chrono::Utc>> = None;
+    // Initialized to pre_review_time so reviews submitted during the
+    // self-review are detected on the first poll.
+    let mut review_baseline: Option<chrono::DateTime<chrono::Utc>> = Some(pre_review_time);
     loop {
         // Compute remaining time so the timeout spans the entire lifecycle,
         // not just a single monitor_pr invocation.
