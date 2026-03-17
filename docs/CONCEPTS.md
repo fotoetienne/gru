@@ -82,24 +82,28 @@ Minion claims issue (gru:in-progress)
 Worktree created, agent implements fix
         │
         ▼
-PR opened (gru:done) ──► CI monitored ◄───────────────────┐
-                                │                          │
-                                ├─ CI fails ──► auto-fix   │
-                                │              attempted   │
-                                │              (2x max)    │
-                                ▼                          │
-                        Review comments handled            │
-                                │                          │
-                                ├─ Blocked ──► gru:blocked │
-                                │              + escalation │
-                                │                          │
-                                └─ Changes requested ──────┘
-                                   push fix, re-run CI
-
-        (all checks pass, approved)
-                │
-                ▼
-            PR merged
+PR opened (gru:done) ──► CI monitored ◄──────────────────────┐
+                                │                             │
+                                ├─ CI fails ──► auto-fix      │
+                                │              attempted      │
+                                │              (2x max)       │
+                                │              │              │
+                                │              └─ still fails │
+                                │                 ──► gru:blocked
+                                │
+                                ▼
+                        Review comments handled
+                                │
+                                ├─ Blocked ──► gru:blocked + escalation
+                                │
+                                ├─ Changes requested ──► push fix ──────┘
+                                │                        (re-run CI)
+                                │
+                                ▼
+                        All checks pass + approved
+                                │
+                                ▼
+                            PR merged
 ```
 
 If anything goes unresolvably wrong, the Minion labels the issue `gru:blocked` or `gru:failed` and typically leaves a comment explaining what it needs.
