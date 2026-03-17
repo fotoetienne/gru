@@ -54,7 +54,7 @@ impl TmuxGuard {
                 TMUX_GUARD_ACTIVE.store(true, Ordering::SeqCst);
 
                 set_automatic_rename(&id, false);
-                rename_window(name);
+                rename_window(&id, name);
                 Some(id)
             }
             None => None,
@@ -66,8 +66,8 @@ impl TmuxGuard {
     ///
     /// No-op if not inside tmux (i.e., if the guard was created as a no-op).
     pub fn rename(&self, name: &str) {
-        if self.window_id.is_some() {
-            rename_window(name);
+        if let Some(ref id) = self.window_id {
+            rename_window(id, name);
         }
     }
 }
@@ -165,10 +165,10 @@ fn current_window_id() -> Option<String> {
     }
 }
 
-/// Rename the current tmux window. Silently ignores errors.
-fn rename_window(name: &str) {
+/// Rename a specific tmux window. Silently ignores errors.
+fn rename_window(window_id: &str, name: &str) {
     let _ = Command::new("tmux")
-        .args(["rename-window", name])
+        .args(["rename-window", "-t", window_id, name])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
