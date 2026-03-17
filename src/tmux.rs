@@ -193,8 +193,9 @@ fn set_automatic_rename(window_id: &str, enable: bool) {
         .status();
 }
 
-/// Re-enable automatic-rename on the current window (fallback when window ID
-/// is unavailable, e.g. if the mutex is poisoned).
+/// Re-enable automatic-rename on the current window. Best-effort fallback when
+/// the window ID is unavailable (e.g. mutex poisoned); may target the wrong
+/// window if the user has switched focus since the guard was created.
 fn restore_automatic_rename_current_window() {
     let _ = Command::new("tmux")
         .args(["set-option", "-w", "automatic-rename", "on"])
@@ -231,6 +232,20 @@ mod tests {
             window_id: Some("@999".to_string()),
         };
         drop(guard);
+    }
+
+    #[test]
+    fn test_rename_noop_without_window_id() {
+        let guard = TmuxGuard { window_id: None };
+        guard.rename("irrelevant");
+    }
+
+    #[test]
+    fn test_rename_active_guard_does_not_panic() {
+        let guard = TmuxGuard {
+            window_id: Some("@999".to_string()),
+        };
+        guard.rename("new-name");
     }
 
     #[test]
