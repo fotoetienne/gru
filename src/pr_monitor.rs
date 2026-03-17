@@ -1447,6 +1447,58 @@ mod tests {
     }
 
     // ========================================================================
+    // Self-Review Filtering Tests
+    // ========================================================================
+
+    /// Helper that mirrors the production filter in poll_once: excludes reviews
+    /// by the PR author AND before the last check time.
+    fn filter_new_external_reviews(
+        reviews: Vec<Review>,
+        since: DateTime<Utc>,
+        pr_author: &str,
+    ) -> Vec<Review> {
+        reviews
+            .into_iter()
+            .filter(|r| r.submitted_at >= since && r.user.login != pr_author)
+            .collect()
+    }
+
+    fn make_review_by(id: u64, timestamp: &str, login: &str) -> Review {
+        Review {
+            id,
+            submitted_at: timestamp.parse().unwrap(),
+            user: User {
+                login: login.to_string(),
+            },
+        }
+    }
+
+    #[test]
+    fn test_self_review_excluded_from_new_reviews() {
+        let since: DateTime<Utc> = "2024-06-15T10:00:00Z".parse().unwrap();
+        let reviews = vec![
+            make_review_by(1, "2024-06-15T11:00:00Z", "pr-author"),
+            make_review_by(2, "2024-06-15T11:00:00Z", "external-reviewer"),
+        ];
+
+        let filtered = filter_new_external_reviews(reviews, since, "pr-author");
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].user.login, "external-reviewer");
+    }
+
+    #[test]
+    fn test_only_self_reviews_returns_empty() {
+        let since: DateTime<Utc> = "2024-06-15T10:00:00Z".parse().unwrap();
+        let reviews = vec![
+            make_review_by(1, "2024-06-15T11:00:00Z", "pr-author"),
+            make_review_by(2, "2024-06-15T12:00:00Z", "pr-author"),
+        ];
+
+        let filtered = filter_new_external_reviews(reviews, since, "pr-author");
+        assert!(filtered.is_empty());
+    }
+
+    // ========================================================================
     // JSON Parsing Error Tests
     // ========================================================================
 
