@@ -665,6 +665,7 @@ async fn register_and_run_agent(
         timeout_deadline: None,
         attempt_count: 0,
         no_watch: false,
+        last_review_check_time: None,
     };
 
     let minion_id_owned = cfg.minion_id.to_string();

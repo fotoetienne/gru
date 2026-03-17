@@ -4,12 +4,29 @@ use crate::agent::AgentBackend;
 use crate::ci;
 use crate::config::LabConfig;
 use crate::merge_judge::{self, JudgeAction, JudgeState};
+use crate::minion_registry;
 use crate::pr_monitor::{self, MonitorResult};
 use crate::pr_state::PrState;
 use anyhow::{Context, Result};
+use chrono::{DateTime, Utc};
 use std::path::Path;
 use tokio::process::Command as TokioCommand;
 use tokio::time::{timeout, Duration};
+
+/// Persists a review-check timestamp to the minion registry (best-effort).
+/// Errors are logged as warnings since this is non-critical metadata.
+async fn save_review_check_time(minion_id: &str, ts: DateTime<Utc>) {
+    let mid = minion_id.to_string();
+    if let Err(e) = minion_registry::with_registry(move |registry| {
+        registry.update(&mid, |info| {
+            info.last_review_check_time = Some(ts);
+        })
+    })
+    .await
+    {
+        log::warn!("⚠️  Failed to save last_review_check_time: {}", e);
+    }
+}
 
 /// Attempts to auto-rebase the worktree branch onto its base branch.
 ///
@@ -234,6 +251,11 @@ pub(crate) async fn monitor_pr_lifecycle(
     } else {
         // Auto-trigger review for Minion-created PRs
         println!("\n🔍 Starting automated PR review...");
+        // Persist the pre-review timestamp as the initial review baseline.
+        // Done here (not before the already_reviewed guard) so that on re-entry
+        // we don't overwrite a stored baseline with the current time, which would
+        // cause reviews posted while the minion was stopped to be skipped.
+        save_review_check_time(&wt_ctx.minion_id, pre_review_time).await;
         match trigger_pr_review(pr_number, &wt_ctx.checkout_path, review_timeout).await {
             Ok(review_exit_code) => {
                 if review_exit_code == 0 {
@@ -301,9 +323,25 @@ pub(crate) async fn monitor_pr_lifecycle(
         .unwrap_or(merge_judge::DEFAULT_CONFIDENCE_THRESHOLD);
     // Track review baseline across monitor_pr re-entries so reviews posted
     // before/during event handling (e.g. rebase) are not silently dropped.
-    // Initialized to pre_review_time so reviews submitted during the
-    // self-review are detected on the first poll.
-    let mut review_baseline: Option<chrono::DateTime<chrono::Utc>> = Some(pre_review_time);
+    // On a fresh run, initialize to pre_review_time so reviews submitted
+    // during the self-review are detected on the first poll.
+    // On re-entry (already_reviewed), load the stored baseline from the
+    // registry so reviews posted while the minion was stopped are not skipped.
+    let initial_baseline = if already_reviewed {
+        let mid = wt_ctx.minion_id.clone();
+        minion_registry::with_registry(move |registry| {
+            Ok(registry
+                .get(&mid)
+                .map(|info| info.last_review_check_time.unwrap_or(info.started_at)))
+        })
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or(pre_review_time)
+    } else {
+        pre_review_time
+    };
+    let mut review_baseline: Option<chrono::DateTime<chrono::Utc>> = Some(initial_baseline);
     loop {
         // Compute remaining time so the timeout spans the entire lifecycle,
         // not just a single monitor_pr invocation.
@@ -562,6 +600,8 @@ pub(crate) async fn monitor_pr_lifecycle(
                         // those reviews aren't re-fetched while still catching
                         // any new reviews posted during handling.
                         review_baseline = Some(check_time);
+                        // Persist updated baseline after successfully handling reviews.
+                        save_review_check_time(&wt_ctx.minion_id, check_time).await;
                     }
                     Err(e) => {
                         log::warn!("⚠️  Failed to address review comments: {}", e);
@@ -679,6 +719,9 @@ pub(crate) async fn monitor_pr_lifecycle(
                         // detected. Reviews posted during the rebase will have
                         // submitted_at > check_time and be caught on the next poll.
                         review_baseline = Some(check_time);
+                        // Note: save_review_check_time is intentionally not called here.
+                        // check_time marks the start of the conflict window, not a point
+                        // where reviews were processed. The exit-time save will persist it.
                         println!("✅ Rebase succeeded, continuing to monitor PR...\n");
                     }
                     Ok(false) => {
@@ -786,6 +829,12 @@ pub(crate) async fn monitor_pr_lifecycle(
                 continue;
             }
         }
+    }
+
+    // Persist the final review baseline on monitor exit so the lab wake-up
+    // scan knows where to resume without re-processing already-seen reviews.
+    if let Some(ts) = review_baseline {
+        save_review_check_time(&wt_ctx.minion_id, ts).await;
     }
 }
 

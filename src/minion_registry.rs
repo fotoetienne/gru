@@ -324,6 +324,11 @@ pub struct MinionInfo {
     /// Whether to skip watching (PR monitoring) after agent completes
     #[serde(default)]
     pub no_watch: bool,
+    /// Timestamp of the last review check, used as baseline for detecting new reviews.
+    /// Set before self-review, after addressing review feedback, and on monitor exit.
+    /// Fallback: if None (e.g., old registry entries), callers should fall back to started_at.
+    #[serde(default)]
+    pub last_review_check_time: Option<DateTime<Utc>>,
 }
 
 /// Default agent name for backwards compatibility with existing registry entries
@@ -867,6 +872,7 @@ mod tests {
             timeout_deadline: None,
             attempt_count: 0,
             no_watch: false,
+            last_review_check_time: None,
         }
     }
 
@@ -1499,5 +1505,38 @@ mod tests {
         assert_eq!(info.pid, Some(12345));
         // pid_start_time should default to None for old entries
         assert_eq!(info.pid_start_time, None);
+    }
+
+    #[test]
+    fn test_last_review_check_time_defaults_to_none_for_old_entries() {
+        let temp_dir = tempdir().unwrap();
+        let registry_path = temp_dir.path().join("minions.json");
+
+        // Write a registry JSON without last_review_check_time (simulating old format)
+        let old_json = r#"{
+            "minions": {
+                "M001": {
+                    "repo": "owner/repo",
+                    "issue": 42,
+                    "command": "do",
+                    "prompt": "Fix issue",
+                    "started_at": "2024-01-01T00:00:00Z",
+                    "branch": "minion/issue-42-M001",
+                    "worktree": "/tmp/test",
+                    "status": "active",
+                    "session_id": "abc-123",
+                    "mode": "autonomous"
+                }
+            }
+        }"#;
+        fs::write(&registry_path, old_json).unwrap();
+
+        let registry = MinionRegistry::load(Some(temp_dir.path())).unwrap();
+        let info = registry.get("M001").unwrap();
+        // last_review_check_time should default to None for old entries
+        assert_eq!(info.last_review_check_time, None);
+        // Callers should fall back to started_at when this field is None
+        let baseline = info.last_review_check_time.unwrap_or(info.started_at);
+        assert_eq!(baseline, info.started_at);
     }
 }
