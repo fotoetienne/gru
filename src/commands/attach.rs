@@ -1,7 +1,9 @@
 use crate::agent_registry;
-use crate::minion_registry::{revert_to_stopped, with_registry, MinionMode};
+use crate::minion_registry::{
+    is_process_alive_with_start_time, revert_to_stopped, with_registry, MinionMode,
+};
 use crate::minion_resolver;
-use crate::session_claim;
+use crate::session_claim::{self, SessionClaimError};
 use crate::tmux::TmuxGuard;
 use anyhow::{Context, Result};
 use chrono::Utc;
@@ -58,12 +60,34 @@ pub async fn handle_attach(
     // Atomically check registry state, get session_id + agent_name, and claim as Interactive.
     // This prevents TOCTOU races where two `gru attach` calls could both see
     // mode=Stopped and proceed simultaneously.
-    let registry_data = session_claim::check_and_claim_session(
+    //
+    // If the minion is already running autonomously, auto-stop it first so the
+    // user can take over interactively without a separate `gru stop` step.
+    let registry_data = match session_claim::check_and_claim_session(
         &minion.minion_id,
         MinionMode::Interactive,
         true, // graceful: allow attach without registry
     )
-    .await?;
+    .await
+    {
+        Ok(data) => data,
+        Err(e) => {
+            if let Some(SessionClaimError::AlreadyRunning { .. }) = e.downcast_ref() {
+                // Auto-stop the running minion, then retry the claim
+                auto_stop_minion(&minion.minion_id, &minion.worktree_path).await?;
+
+                // Retry the claim now that the process is stopped
+                session_claim::check_and_claim_session(
+                    &minion.minion_id,
+                    MinionMode::Interactive,
+                    true,
+                )
+                .await?
+            } else {
+                return Err(e);
+            }
+        }
+    };
 
     // Extract session_id, agent_name, and repo; default to "claude" when not in registry
     let (session_id, agent_name, repo_str) = match registry_data {
@@ -207,6 +231,73 @@ pub async fn handle_attach(
     Ok(if status.success() { 0 } else { 1 })
 }
 
+/// Graceful stop timeout before escalating to hard kill.
+const AUTO_STOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Auto-stops a running Minion so `attach` can take over interactively.
+///
+/// Strategy: send SIGTERM via the registry PID (or fall back to pgrep), then
+/// wait up to 10 seconds for the process to exit. If it's still alive after
+/// the timeout, hard-kill it.
+async fn auto_stop_minion(minion_id: &str, worktree_path: &std::path::Path) -> Result<()> {
+    println!("Stopping Minion {}... attaching.", minion_id);
+
+    // Try graceful termination first
+    let pid_terminated = super::stop::terminate_via_registry_pid(minion_id, false).await;
+
+    if !pid_terminated {
+        // Legacy fallback: scan for processes via pgrep
+        super::stop::terminate_claude_in_worktree(worktree_path, false).await?;
+    }
+
+    // Wait for the process to actually exit (up to 10s), then hard-kill
+    let mid = minion_id.to_string();
+    let deadline = tokio::time::Instant::now() + AUTO_STOP_TIMEOUT;
+    loop {
+        // Check if process is still alive via registry PID
+        let mid_clone = mid.clone();
+        let still_alive = match with_registry(move |reg| {
+            Ok(reg.get(&mid_clone).map(|info| {
+                info.pid
+                    .map(|pid| is_process_alive_with_start_time(pid, info.pid_start_time))
+                    .unwrap_or(false)
+            }))
+        })
+        .await
+        {
+            Ok(Some(alive)) => alive,
+            _ => false,
+        };
+
+        if !still_alive {
+            break;
+        }
+
+        if tokio::time::Instant::now() >= deadline {
+            // Hard-kill after timeout
+            super::stop::terminate_via_registry_pid(minion_id, true).await;
+            // Brief pause for the kill to take effect
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            break;
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+
+    // Update registry to mark as stopped
+    let mid = minion_id.to_string();
+    let _ = with_registry(move |reg| {
+        reg.update(&mid, |info| {
+            info.mode = MinionMode::Stopped;
+            info.clear_pid();
+            info.last_activity = Utc::now();
+        })
+    })
+    .await;
+
+    Ok(())
+}
+
 /// Prompts the user whether to auto-resume autonomous monitoring.
 ///
 /// Returns `true` if the user confirmed (Enter, "y", or "yes"), `false` otherwise
@@ -306,5 +397,19 @@ mod tests {
         assert!(!is_affirmative("NO\n"));
         assert!(!is_affirmative("nope\n"));
         assert!(!is_affirmative("anything else\n"));
+    }
+
+    #[tokio::test]
+    async fn test_auto_stop_minion_no_process() {
+        // When no process is running, auto_stop_minion should succeed
+        // (the registry won't have this minion, so it gracefully exits)
+        let temp_path = std::env::temp_dir().join("gru-attach-test-auto-stop");
+        let result = auto_stop_minion("NONEXISTENT_MINION", &temp_path).await;
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_auto_stop_timeout_value() {
+        assert_eq!(AUTO_STOP_TIMEOUT, std::time::Duration::from_secs(10));
     }
 }

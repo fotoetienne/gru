@@ -126,7 +126,7 @@ pub async fn handle_stop(id: String, force: bool) -> Result<i32> {
 
 /// Terminates a minion's worker process using the PID stored in the registry.
 /// Returns true if a process was found and signalled.
-async fn terminate_via_registry_pid(minion_id: &str, force: bool) -> bool {
+pub async fn terminate_via_registry_pid(minion_id: &str, force: bool) -> bool {
     let mid = minion_id.to_string();
     let (pid, pid_start_time) = match with_registry(move |reg| {
         Ok(reg.get(&mid).map(|info| (info.pid, info.pid_start_time)))
@@ -176,7 +176,7 @@ async fn terminate_via_registry_pid(minion_id: &str, force: bool) -> bool {
 /// matches, though this is unlikely with standard gru worktree paths.
 ///
 /// Returns the number of processes terminated.
-async fn terminate_claude_in_worktree(worktree_path: &Path, force: bool) -> Result<usize> {
+pub async fn terminate_claude_in_worktree(worktree_path: &Path, force: bool) -> Result<usize> {
     let escaped_path = escape_regex(&worktree_path.to_string_lossy());
     // Match only claude or gru processes referencing this worktree (either order)
     let pattern = format!(
