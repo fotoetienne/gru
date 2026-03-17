@@ -592,7 +592,7 @@ async fn poll_and_spawn(
     no_resume: bool,
     resumed_this_session: &mut HashSet<String>,
 ) -> Result<()> {
-    // Prune stale registry entries (missing worktrees or terminal minions with no live process)
+    // Prune stale registry entries (worktrees that no longer exist, checking PR status)
     prune_stale_entries().await?;
 
     // Calculate available slots using PID liveness (not registry status string)
@@ -789,44 +789,13 @@ async fn poll_and_spawn(
     Ok(())
 }
 
-/// Check whether a registry entry is stale and should be pruned.
+/// Prune stale registry entries where worktrees no longer exist.
 ///
-/// A minion with an associated PR is never pruned (regardless of worktree
-/// state), so it remains visible in `gru status` until the PR is merged/closed.
-///
-/// Otherwise an entry is stale if:
-/// 1. Its worktree no longer exists on disk, OR
-/// 2. It reached a terminal phase (Completed/Failed) with no live process.
-fn is_stale_entry(info: &MinionInfo) -> bool {
-    if info.pr.is_some() {
-        return false;
-    }
-    if !info.worktree.exists() {
-        return true;
-    }
-    info.orchestration_phase.is_terminal() && !info.is_running()
-}
-
-/// Prune stale registry entries where worktrees no longer exist
-/// or the minion has completed without an open PR.
+/// Delegates to the shared two-phase pruning in `minion_registry` which
+/// checks GitHub PR status before removing entries with open PRs.
 async fn prune_stale_entries() -> Result<()> {
-    with_registry(|registry| {
-        let minions = registry.list();
-
-        let stale_ids: Vec<String> = minions
-            .iter()
-            .filter(|(_id, info)| is_stale_entry(info))
-            .map(|(id, _)| id.clone())
-            .collect();
-
-        if !stale_ids.is_empty() {
-            let count = registry.remove_batch(&stale_ids)?;
-            log::info!("🗑️  Pruned {} stale Minion(s) from registry", count);
-        }
-
-        Ok(())
-    })
-    .await
+    crate::minion_registry::prune_stale_entries().await?;
+    Ok(())
 }
 
 /// Calculate available slots based on PID liveness of registered Minions
@@ -1358,93 +1327,5 @@ mod tests {
             should_restore_label(spawned_at),
             "Process at 1s under threshold should still qualify for label restoration"
         );
-    }
-
-    /// Helper to create a MinionInfo with sensible defaults for testing.
-    fn make_test_info(worktree: PathBuf) -> MinionInfo {
-        MinionInfo {
-            repo: "owner/repo".to_string(),
-            issue: 1,
-            command: "do".to_string(),
-            prompt: String::new(),
-            started_at: Utc::now(),
-            branch: "minion/issue-1-M000".to_string(),
-            worktree,
-            status: "active".to_string(),
-            pr: None,
-            session_id: "test-session".to_string(),
-            pid: None,
-            mode: MinionMode::default(),
-            last_activity: Utc::now(),
-            orchestration_phase: OrchestrationPhase::default(),
-            token_usage: None,
-            agent_name: "claude".to_string(),
-            timeout_deadline: None,
-            attempt_count: 0,
-            no_watch: false,
-            pid_start_time: None,
-        }
-    }
-
-    #[test]
-    fn test_is_stale_entry_missing_worktree() {
-        let info = make_test_info(PathBuf::from("/nonexistent/path"));
-        assert!(is_stale_entry(&info));
-    }
-
-    #[test]
-    fn test_is_stale_entry_existing_worktree_not_terminal() {
-        // Active minion with existing worktree should not be stale
-        let info = make_test_info(std::env::temp_dir());
-        assert!(!is_stale_entry(&info));
-    }
-
-    #[test]
-    fn test_is_stale_entry_terminal_no_pr_is_stale() {
-        // Completed minion with no PR and no live process should be stale
-        let mut info = make_test_info(std::env::temp_dir());
-        info.orchestration_phase = OrchestrationPhase::Completed;
-        info.pid = None;
-        info.pr = None;
-        assert!(is_stale_entry(&info));
-    }
-
-    #[test]
-    fn test_is_stale_entry_terminal_with_pr_not_stale() {
-        // Completed minion with an open PR should NOT be stale
-        let mut info = make_test_info(std::env::temp_dir());
-        info.orchestration_phase = OrchestrationPhase::Completed;
-        info.pid = None;
-        info.pr = Some("123".to_string());
-        assert!(!is_stale_entry(&info));
-    }
-
-    #[test]
-    fn test_is_stale_entry_failed_with_pr_not_stale() {
-        // Failed minion with a PR should NOT be stale
-        let mut info = make_test_info(std::env::temp_dir());
-        info.orchestration_phase = OrchestrationPhase::Failed;
-        info.pid = None;
-        info.pr = Some("456".to_string());
-        assert!(!is_stale_entry(&info));
-    }
-
-    #[test]
-    fn test_is_stale_entry_missing_worktree_with_pr_not_stale() {
-        // Minion whose worktree was removed but still has an open PR should NOT be stale
-        let mut info = make_test_info(PathBuf::from("/nonexistent/path"));
-        info.orchestration_phase = OrchestrationPhase::Completed;
-        info.pr = Some("789".to_string());
-        assert!(!is_stale_entry(&info));
-    }
-
-    #[test]
-    fn test_is_stale_entry_terminal_no_pr_with_live_pid_not_stale() {
-        // Terminal minion with a live PID should NOT be stale (shutdown in progress)
-        let mut info = make_test_info(std::env::temp_dir());
-        info.orchestration_phase = OrchestrationPhase::Completed;
-        info.pid = Some(std::process::id()); // our own PID is always alive
-        info.pr = None;
-        assert!(!is_stale_entry(&info));
     }
 }
