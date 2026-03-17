@@ -110,7 +110,7 @@ pub async fn mark_pr_ready_via_cli(
 /// * `label` - Label to search for (e.g., "gru:todo")
 ///
 /// # Returns
-/// List of issue numbers matching the search criteria (capped at 100)
+/// List of `CandidateIssue` values (number + optional body) matching the criteria (capped at 100)
 /// Build a GitHub search query that finds issues with the given label while excluding
 /// blocked and in-progress issues. Escapes special characters in the label.
 fn build_ready_issues_search_query(label: &str) -> String {
