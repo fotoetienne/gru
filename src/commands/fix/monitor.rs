@@ -233,7 +233,9 @@ pub(crate) async fn monitor_pr_lifecycle(
     let mut judge_state = JudgeState::new();
     let mut judge_label_ensured = false;
     let mut consecutive_errors: u32 = 0;
-    // 10 retries at ~30s apart = ~5 minutes tolerance for API outages before giving up.
+    // 10 consecutive monitor_pr invocation failures before giving up.
+    // Wall-clock time per failure varies since monitor_pr does its own internal
+    // polling and retries before returning an error.
     const MAX_CONSECUTIVE_ERRORS: u32 = 10;
     // Load merge confidence threshold from config (falls back to default).
     // Uses load_partial to avoid requiring [daemon].repos for non-daemon commands.
@@ -675,8 +677,28 @@ pub(crate) async fn monitor_pr_lifecycle(
                     e
                 );
                 // Sleep before retrying to avoid hammering the API if monitor_pr
-                // fails before its internal poll sleep.
-                tokio::time::sleep(Duration::from_secs(30)).await;
+                // fails before its internal poll sleep. Cap at remaining timeout
+                // so we don't overshoot the configured monitor_timeout.
+                let backoff = Duration::from_secs(30);
+                let remaining = monitor_timeout.checked_sub(monitor_start.elapsed());
+                match remaining {
+                    Some(r) if r > Duration::ZERO => {
+                        tokio::select! {
+                            _ = tokio::time::sleep(backoff.min(r)) => {}
+                            _ = tokio::signal::ctrl_c() => {
+                                println!("\n⚠️  Monitoring interrupted by user");
+                                println!(
+                                    "   PR is still open: https://github.com/{}/{}/pull/{}",
+                                    issue_ctx.owner, issue_ctx.repo, pr_number
+                                );
+                                break;
+                            }
+                        }
+                    }
+                    _ => {
+                        // Timeout already expired, let the loop's timeout check handle it.
+                    }
+                }
                 continue;
             }
         }
