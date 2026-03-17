@@ -909,10 +909,13 @@ async fn spawn_minion(repo: &str, host: &str, issue_number: u64) -> Result<Child
     let stderr_file = log_file;
 
     // Spawn `gru do <issue>` as a background process with output captured to log file.
-    // Use setsid to give the child its own process group so it survives lab shutdown.
+    // Remove TMUX/TMUX_PANE so the child doesn't inherit the lab's tmux session —
+    // otherwise TmuxGuard renames arbitrary windows in the parent's tmux.
     let mut cmd = tokio::process::Command::new(exe);
     cmd.arg("do")
         .arg(&issue_ref)
+        .env_remove("TMUX")
+        .env_remove("TMUX_PANE")
         .stdin(Stdio::null())
         .stdout(Stdio::from(stdout_file))
         .stderr(Stdio::from(stderr_file));
