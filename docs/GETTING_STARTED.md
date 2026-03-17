@@ -24,7 +24,7 @@ Before you start, you need:
    npm install -g @anthropic-ai/claude-code
    claude --version      # confirm it's installed
    ```
-   Using OpenAI Codex instead? See [docs/AGENTS.md](AGENTS.md).
+   Using OpenAI Codex instead? See [AGENTS.md](AGENTS.md).
 
 ## Install Gru
 
@@ -104,7 +104,7 @@ Attach to a running Minion to see the live stream:
 gru attach M001
 ```
 
-Press `Ctrl-C` to detach — the Minion keeps running.
+Press `Ctrl-C` to exit the interactive session — the Minion is paused. Run `gru resume M001` to let it continue working autonomously.
 
 If you need to pause:
 ```bash
