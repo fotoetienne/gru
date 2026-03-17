@@ -667,7 +667,8 @@ async fn poll_and_spawn(
             };
 
         let candidate_count = candidates.len();
-        let mut blocked_count: usize = 0;
+        let mut blocked_count = 0usize;
+        let mut spawned_this_repo = 0usize;
 
         // Try to spawn a Minion for each ready issue
         for candidate in candidates {
@@ -758,6 +759,7 @@ async fn poll_and_spawn(
                                 repo_spec, issue_number
                             );
                             spawned += 1;
+                            spawned_this_repo += 1;
                             available -= 1; // Decrement available slots after successful spawn
                         }
                         Err(e) => {
@@ -800,10 +802,11 @@ async fn poll_and_spawn(
             }
         }
 
-        // Log when all candidates in a repo are blocked
-        if candidate_count > 0 && blocked_count == candidate_count {
+        // Log when no candidates were spawned and some were blocked
+        if candidate_count > 0 && spawned_this_repo == 0 && blocked_count > 0 {
             log::warn!(
-                "🚫 All {} candidate issue(s) in {} are blocked — nothing to claim this cycle",
+                "🚫 {}/{} candidate issue(s) in {} blocked by dependencies — nothing spawned this cycle",
+                blocked_count,
                 candidate_count,
                 repo_spec
             );

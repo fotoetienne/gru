@@ -815,7 +815,7 @@ mod tests {
     // --- CandidateIssue deserialization tests ---
 
     #[test]
-    fn test_issue_number_deserialize() {
+    fn test_candidate_issue_deserialize() {
         let json = r#"[{"number": 1}, {"number": 42}, {"number": 100}]"#;
         let items: Vec<CandidateIssue> = serde_json::from_str(json).unwrap();
         assert_eq!(items.len(), 3);
@@ -825,14 +825,14 @@ mod tests {
     }
 
     #[test]
-    fn test_issue_number_deserialize_empty() {
+    fn test_candidate_issue_deserialize_empty() {
         let json = "[]";
         let items: Vec<CandidateIssue> = serde_json::from_str(json).unwrap();
         assert!(items.is_empty());
     }
 
     #[test]
-    fn test_issue_number_deserialize_extra_fields() {
+    fn test_candidate_issue_deserialize_extra_fields() {
         let json = r#"[{"number": 5, "title": "ignored", "url": "https://example.com"}]"#;
         let items: Vec<CandidateIssue> = serde_json::from_str(json).unwrap();
         assert_eq!(items.len(), 1);
@@ -840,10 +840,34 @@ mod tests {
     }
 
     #[test]
-    fn test_issue_number_deserialize_missing_number() {
+    fn test_candidate_issue_deserialize_missing_number() {
         let json = r#"[{"title": "no number"}]"#;
         let result: Result<Vec<CandidateIssue>, _> = serde_json::from_str(json);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_candidate_issue_with_body() {
+        let json = r#"[{"number": 7, "body": "**Blocked by:** #3, #5"}]"#;
+        let items: Vec<CandidateIssue> = serde_json::from_str(json).unwrap();
+        assert_eq!(items[0].number, 7);
+        assert_eq!(items[0].body.as_deref(), Some("**Blocked by:** #3, #5"));
+    }
+
+    #[test]
+    fn test_candidate_issue_null_body() {
+        let json = r#"[{"number": 8, "body": null}]"#;
+        let items: Vec<CandidateIssue> = serde_json::from_str(json).unwrap();
+        assert_eq!(items[0].number, 8);
+        assert!(items[0].body.is_none());
+    }
+
+    #[test]
+    fn test_candidate_issue_missing_body() {
+        let json = r#"[{"number": 9}]"#;
+        let items: Vec<CandidateIssue> = serde_json::from_str(json).unwrap();
+        assert_eq!(items[0].number, 9);
+        assert!(items[0].body.is_none());
     }
 
     // --- Search query construction tests ---
