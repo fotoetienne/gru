@@ -55,12 +55,32 @@ For each approved sub-issue:
   - Body that includes:
     - **Description**: What this sub-issue addresses
     - **Parent Issue**: "Part of #<original-issue>"
-    - **Dependencies**: Links to other sub-issues if order matters
+    - **Blocked by:** #X, #Y (links to prerequisite sub-issues if order matters, using the `**Blocked by:** #X, #Y` convention)
     - **Code Areas**: File/module references
   - Labels: Copy from parent + add `subtask` if available
 - Capture the new issue numbers
 
-## 7. Update Parent Issue
+## 7. Set Native GitHub Dependencies
+After all sub-issues are created, set native dependencies via the GitHub API for any sub-issue that depends on another:
+
+For each dependency relationship (where issue B is blocked by issue A):
+1. Resolve the blocker's internal ID:
+   ```bash
+   BLOCKER_ID=$(gh api /repos/OWNER/REPO/issues/A_NUMBER --jq .id)
+   ```
+2. Set the dependency:
+   ```bash
+   gh api /repos/OWNER/REPO/issues/B_NUMBER/dependencies/blocked_by \
+     -f issue_id="$BLOCKER_ID"
+   ```
+
+**Error handling:** After each `gh api` POST, check the exit status and stderr:
+- **404 / "Not Found"**: GHES without native dependency support — log a warning and continue. The body-text `**Blocked by:**` convention is the universal fallback.
+- **Other errors** (422, 500, etc.): Surface the error to the user so dependency setting doesn't silently fail.
+
+Also set native dependencies between sub-issues and the parent issue's same-repo blockers (if any were listed in the parent). Skip cross-repo blocker references (e.g., `owner/repo#123`) since the `/issues/{number}` endpoint can only resolve IDs within the current repo.
+
+## 8. Update Parent Issue
 - Add a comment to the parent issue with:
   - A checklist of the sub-issues created
   - Links to each sub-issue
@@ -76,7 +96,7 @@ For each approved sub-issue:
   Each sub-issue can be worked on independently.
   ```
 
-## 8. Summarize
+## 9. Summarize
 - Report the sub-issues created with their numbers
 - Suggest: "Run `/do <first-sub-issue>` to start implementation"
 - Note: Don't close the parent issue - it will close automatically when all sub-issues are done
