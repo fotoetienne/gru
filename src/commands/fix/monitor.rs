@@ -81,6 +81,100 @@ async fn auto_rebase_pr(worktree_path: &Path) -> Result<bool> {
     }
 }
 
+/// Format the body of a monitoring-paused notification comment.
+///
+/// Includes YAML frontmatter for machine discoverability and a human-readable
+/// section with the minion ID and resume command.
+fn format_exit_notification_comment(minion_id: &str, unaddressed_count: usize) -> String {
+    let review_word = if unaddressed_count == 1 {
+        "review comment"
+    } else {
+        "review comments"
+    };
+    format!(
+        "---\ntype: monitoring-paused\n---\n\n\
+        ⏸️ This PR's automated agent has paused. \
+        There are {} {} that haven't been addressed yet. \
+        Resume automated responses with:\n`gru resume {}`{}",
+        unaddressed_count,
+        review_word,
+        minion_id,
+        crate::progress_comments::minion_signature(minion_id),
+    )
+}
+
+/// Check for unaddressed reviews and post a notification comment if warranted.
+///
+/// Skips silently when the PR is merged/closed or when there are no unaddressed
+/// external reviews (i.e. reviews from someone other than the PR author).
+async fn post_exit_notification_if_needed(
+    owner: &str,
+    repo: &str,
+    host: &str,
+    pr_number: &str,
+    minion_id: &str,
+    review_baseline: DateTime<Utc>,
+) {
+    // Check PR state and author in one API call.
+    let (is_open, pr_author) =
+        match pr_monitor::get_pr_info_for_exit_notification(host, owner, repo, pr_number).await {
+            Ok(info) => info,
+            Err(e) => {
+                log::warn!("⚠️  Could not check PR state for exit notification: {}", e);
+                return;
+            }
+        };
+
+    if !is_open {
+        return;
+    }
+
+    let reviews = match pr_monitor::get_all_reviews(host, owner, repo, pr_number).await {
+        Ok(r) => r,
+        Err(e) => {
+            log::warn!("⚠️  Could not fetch reviews for exit notification: {}", e);
+            return;
+        }
+    };
+
+    let count = pr_monitor::has_unaddressed_reviews(&reviews, &pr_author, review_baseline);
+
+    if !pr_monitor::should_post_exit_notification(is_open, count) {
+        return;
+    }
+
+    let body = format_exit_notification_comment(minion_id, count);
+    let repo_full = format!("{}/{}", owner, repo);
+    let result = crate::github::gh_cli_command(host)
+        .args([
+            "pr", "comment", pr_number, "--repo", &repo_full, "--body", &body,
+        ])
+        .output()
+        .await;
+
+    match result {
+        Ok(output) if output.status.success() => {
+            log::info!("Posted monitoring-paused notification on PR #{}", pr_number);
+        }
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            log::warn!(
+                "Failed to post exit notification on PR #{}: {}",
+                pr_number,
+                stderr.trim()
+            );
+        }
+        Err(e) => {
+            log::warn!("Failed to run gh pr comment for exit notification: {}", e);
+        }
+    }
+
+    println!(
+        "⏸️  Monitoring paused. {} review(s) pending. Resume: gru resume {}",
+        count, minion_id
+    );
+}
+
 /// Posts an escalation comment on a PR when auto-rebase fails.
 async fn post_escalation_comment(
     owner: &str,
@@ -836,6 +930,20 @@ pub(crate) async fn monitor_pr_lifecycle(
     if let Some(ts) = review_baseline {
         save_review_check_time(&wt_ctx.minion_id, ts).await;
     }
+
+    // If the PR is still open with unaddressed external reviews, post a
+    // notification so the user knows to resume.
+    if let Some(baseline) = review_baseline {
+        post_exit_notification_if_needed(
+            &issue_ctx.owner,
+            &issue_ctx.repo,
+            &issue_ctx.host,
+            pr_number,
+            &wt_ctx.minion_id,
+            baseline,
+        )
+        .await;
+    }
 }
 
 /// Monitors CI after the initial fix and attempts auto-fixes if checks fail.
@@ -899,4 +1007,27 @@ pub(crate) async fn monitor_ci_after_fix(
         minion_id,
     )
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_exit_notification_format_contains_minion_id_and_resume_command() {
+        let body = format_exit_notification_comment("M042", 2);
+        assert!(body.contains("M042"), "comment must contain minion ID");
+        assert!(
+            body.contains("gru resume M042"),
+            "comment must contain resume command"
+        );
+        assert!(
+            body.contains("2 review comments"),
+            "comment must mention the count"
+        );
+        assert!(
+            body.contains("type: monitoring-paused"),
+            "comment must include YAML frontmatter type"
+        );
+    }
 }
