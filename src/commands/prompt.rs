@@ -526,6 +526,7 @@ async fn setup_prompt_workspace(
     minion_id: &str,
     workspace: &workspace::Workspace,
 ) -> Result<WorkspaceSetup> {
+    fetched.context.minion_id = Some(minion_id.to_string());
     let has_context = opts.issue.is_some() || opts.pr.is_some();
     let use_auto_worktree = !opts.no_worktree && opts.worktree.is_none();
 
@@ -839,6 +840,7 @@ pub async fn handle_prompt(prompt: &str, opts: PromptOptions) -> Result<i32> {
     let ws = setup_prompt_workspace(&mut fetched, &opts, &minion_id, &workspace).await?;
 
     // Phase 5: Render prompt template
+    fetched.context.minion_id = Some(minion_id.clone());
     let rendered_prompt = render_and_save_prompt(&resolved_prompt, &mut fetched, &ws).await?;
 
     // Phase 6: Register minion, run agent, clean up
