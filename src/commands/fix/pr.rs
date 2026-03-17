@@ -129,7 +129,9 @@ async fn create_pr_for_issue(
                     pr_body.push('\n');
                     pr_body.push_str(&closing_line);
                 }
-                pr_body.push_str(&crate::progress_comments::minion_signature(minion_id));
+                if !pr_body.contains("<sub>🤖") {
+                    pr_body.push_str(&crate::progress_comments::minion_signature(minion_id));
+                }
                 (pr_title, pr_body)
             }
             Ok(_) => {
