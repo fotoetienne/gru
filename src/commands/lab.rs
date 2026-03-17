@@ -791,10 +791,12 @@ async fn poll_and_spawn(
 
 /// Check whether a registry entry is stale and should be pruned.
 ///
-/// An entry is stale if:
+/// A minion with an associated PR is never pruned (regardless of worktree
+/// state), so it remains visible in `gru status` until the PR is merged/closed.
+///
+/// Otherwise an entry is stale if:
 /// 1. Its worktree no longer exists on disk, OR
-/// 2. It reached a terminal phase (Completed/Failed), has no live process,
-///    and has no associated PR (minions with open PRs are retained).
+/// 2. It reached a terminal phase (Completed/Failed) with no live process.
 fn is_stale_entry(info: &MinionInfo) -> bool {
     if info.pr.is_some() {
         return false;
@@ -1421,6 +1423,25 @@ mod tests {
         info.orchestration_phase = OrchestrationPhase::Failed;
         info.pid = None;
         info.pr = Some("456".to_string());
+        assert!(!is_stale_entry(&info));
+    }
+
+    #[test]
+    fn test_is_stale_entry_missing_worktree_with_pr_not_stale() {
+        // Minion whose worktree was removed but still has an open PR should NOT be stale
+        let mut info = make_test_info(PathBuf::from("/nonexistent/path"));
+        info.orchestration_phase = OrchestrationPhase::Completed;
+        info.pr = Some("789".to_string());
+        assert!(!is_stale_entry(&info));
+    }
+
+    #[test]
+    fn test_is_stale_entry_terminal_no_pr_with_live_pid_not_stale() {
+        // Terminal minion with a live PID should NOT be stale (shutdown in progress)
+        let mut info = make_test_info(std::env::temp_dir());
+        info.orchestration_phase = OrchestrationPhase::Completed;
+        info.pid = Some(std::process::id()); // our own PID is always alive
+        info.pr = None;
         assert!(!is_stale_entry(&info));
     }
 }
