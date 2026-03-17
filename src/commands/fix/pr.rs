@@ -3,6 +3,7 @@ use crate::minion_registry::with_registry;
 use crate::pr_state::PrState;
 use anyhow::{Context, Result};
 use std::path::Path;
+use std::process::Stdio;
 use tokio::process::Command as TokioCommand;
 
 /// Checks if a branch has been pushed to the remote by querying GitHub's API.
@@ -40,6 +41,56 @@ pub(crate) async fn is_branch_pushed(
         branch_name,
         stderr.trim()
     ))
+}
+
+/// Checks if an open or merged PR already exists for the given head branch.
+/// Returns the PR number if found, or None if no PR exists.
+async fn find_existing_pr(
+    owner: &str,
+    repo: &str,
+    host: &str,
+    branch_name: &str,
+) -> Result<Option<String>> {
+    let repo_full = format!("{}/{}", owner, repo);
+
+    let output = crate::github::gh_cli_command(host)
+        .args([
+            "pr",
+            "list",
+            "--repo",
+            &repo_full,
+            "--head",
+            branch_name,
+            "--state",
+            "all",
+            "--json",
+            "number",
+            "--limit",
+            "1",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .await
+        .context("Failed to check for existing PRs")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        log::warn!(
+            "⚠️  gh pr list --state all failed for branch '{}': {}",
+            branch_name,
+            stderr.trim()
+        );
+        return Ok(None);
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let prs: Vec<serde_json::Value> = serde_json::from_str(&stdout).unwrap_or_default();
+
+    Ok(prs
+        .first()
+        .and_then(|pr| pr["number"].as_u64())
+        .map(|n| n.to_string()))
 }
 
 /// Creates a WIP PR title and body template
@@ -253,6 +304,27 @@ pub(crate) async fn handle_pr_creation(
         return Ok(None);
     }
 
+    // Check if a PR (open or merged) already exists for this branch
+    if let Ok(Some(pr_number)) = find_existing_pr(
+        &issue_ctx.owner,
+        &issue_ctx.repo,
+        &issue_ctx.host,
+        &wt_ctx.branch_name,
+    )
+    .await
+    {
+        println!(
+            "ℹ️  PR #{} already exists for branch '{}', skipping creation.",
+            pr_number, wt_ctx.branch_name
+        );
+
+        if let Err(e) = finalize_pr(issue_ctx, wt_ctx, &pr_number).await {
+            log::warn!("⚠️  Failed to finalize existing PR state: {}", e);
+        }
+
+        return Ok(Some(pr_number));
+    }
+
     println!("📋 Branch was pushed, creating pull request...");
 
     let issue_title_cached = issue_ctx.details.as_ref().map(|d| d.title.as_str());
@@ -414,6 +486,31 @@ mod tests {
                 // Acceptable failures: gh not installed, not authenticated
                 assert!(
                     msg.contains("gh api failed") || msg.contains("Failed to run gh api"),
+                    "Unexpected error: {}",
+                    msg
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_find_existing_pr_nonexistent_branch() {
+        // A branch that has never had a PR should return Ok(None)
+        let result = find_existing_pr(
+            "fotoetienne",
+            "gru",
+            "github.com",
+            "nonexistent-branch-xyz-12345",
+        )
+        .await;
+
+        match result {
+            Ok(pr) => assert!(pr.is_none(), "Expected no PR for nonexistent branch"),
+            Err(e) => {
+                let msg = e.to_string();
+                // Acceptable: gh not installed or not authenticated
+                assert!(
+                    msg.contains("Failed to check") || msg.contains("gh pr list"),
                     "Unexpected error: {}",
                     msg
                 );
