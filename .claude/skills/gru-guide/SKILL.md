@@ -34,11 +34,11 @@ When a user asks how to get started, set up Gru, or use Gru for the first time:
    rustc --version    # needs 1.73+
    gh auth status     # needs "Logged in"
    claude --version   # or codex --version
-   gru --version      # confirm gru is installed
    ```
 3. Walk through the steps in order:
    - Install prerequisites (Rust, gh, Claude Code)
    - Install Gru from source
+   - Verify: `gru --version`
    - `gru init owner/repo`
    - Label an issue with `gru:todo`
    - Run `gru do <issue>`
@@ -143,7 +143,7 @@ When a user reports an error or something isn't working:
 **Minion gets stuck**
 - Check logs: `gru logs <minion-id>`
 - Attach to see live: `gru attach <minion-id>`
-- Stop and resume: `gru stop M001 && gru resume M001`
+- Stop and resume: `gru stop <minion-id> && gru resume <minion-id>`
 
 **"worktree already exists"**
 - Stale worktree from a previous run
