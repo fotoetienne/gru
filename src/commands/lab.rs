@@ -445,9 +445,15 @@ async fn find_minions_needing_review_wake(
             continue;
         }
 
-        if resumed_this_session.contains(&minion_id) {
-            continue;
-        }
+        // NOTE: we intentionally do NOT check `resumed_this_session` here.
+        // That set guards the resume chain (active-phase minions) from being
+        // resumed twice in one session. Completed minions are never inserted
+        // into it by the resume chain, so the guard would be a no-op for
+        // first-time wake-ups. More critically, a minion that was resumed
+        // earlier in the session, completed its work, and then received new
+        // reviews would be incorrectly blocked from a second wake-up.
+        // The resume chain's own `resumed_this_session.remove()` below handles
+        // clearing the entry after the phase flip.
 
         let last_check = wake_check_times
             .get(&minion_id)
@@ -484,7 +490,11 @@ async fn find_minions_needing_review_wake(
             None => continue,
         };
 
-        // Fetch PR open/author info and all reviews in parallel-ish sequence.
+        // Record the check time immediately so the cooldown applies even when API calls
+        // fail — prevents hammering the GitHub API during transient outages.
+        wake_check_times.insert(minion_id.clone(), Utc::now());
+
+        // Fetch PR open/author info and all reviews.
         let pr_info = match pr_monitor::get_pr_info_for_exit_notification(
             &host, &owner, &repo_name, &pr_number,
         )
@@ -516,9 +526,6 @@ async fn find_minions_needing_review_wake(
                 continue;
             }
         };
-
-        // Record that we performed a check for this minion, regardless of outcome.
-        wake_check_times.insert(minion_id.clone(), Utc::now());
 
         let since = info.last_review_check_time.unwrap_or(info.started_at);
         let unaddressed = pr_monitor::has_unaddressed_reviews(&reviews, &pr_author, since);
@@ -590,6 +597,10 @@ async fn find_resumable_minions(config: &LabConfig) -> Result<Vec<ResumableMinio
             .list()
             .into_iter()
             .filter(|(_id, info)| {
+                // Require pid.is_some() for the non-Stopped path: is_running() returns false
+                // when pid is None, which would incorrectly flag a minion as dead during the
+                // transient startup window where check_and_claim_session has set mode =
+                // Autonomous but the lab hasn't written the PID yet.
                 let process_dead =
                     info.mode == MinionMode::Stopped || (info.pid.is_some() && !info.is_running());
                 process_dead

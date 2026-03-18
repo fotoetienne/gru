@@ -148,6 +148,25 @@ pub async fn handle_resume(
         }
     };
 
+    // Clear wake_reason unconditionally so it never leaks in the registry,
+    // regardless of which prompt branch wins below.
+    if wake_reason.is_some() {
+        let mid = minion.minion_id.clone();
+        if let Err(e) = with_registry(move |reg| {
+            reg.update(&mid, |i| {
+                i.wake_reason = None;
+            })
+        })
+        .await
+        {
+            log::warn!(
+                "Failed to clear wake_reason for {}: {}",
+                minion.minion_id,
+                e
+            );
+        }
+    }
+
     // Build the continuation prompt.
     // Priority: explicit additional_prompt > wake_reason (review-focused) > generic continuation.
     //
@@ -163,21 +182,6 @@ pub async fn handle_resume(
             extra
         )
     } else if let Some(ref reason) = wake_reason {
-        // Clear wake_reason from the registry now that we've consumed it.
-        let mid = minion.minion_id.clone();
-        if let Err(e) = with_registry(move |reg| {
-            reg.update(&mid, |i| {
-                i.wake_reason = None;
-            })
-        })
-        .await
-        {
-            log::warn!(
-                "Failed to clear wake_reason for {}: {}",
-                minion.minion_id,
-                e
-            );
-        }
         reason.clone()
     } else {
         format!(
