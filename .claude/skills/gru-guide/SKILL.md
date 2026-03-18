@@ -117,9 +117,8 @@ default = "claude"   # or "codex"
 binary = "/usr/local/bin/claude"
 
 # Configure repos for lab mode
-[[repos]]
-owner = "myorg"
-repo = "myproject"
+[daemon]
+repos = ["myorg/myproject"]
 ```
 
 ### Troubleshooting
@@ -192,6 +191,8 @@ If docs can't be read via symlinks, try the original paths:
 - `docs/GETTING_STARTED.md`
 - `docs/CONCEPTS.md`
 - `docs/AGENTS.md`
+- `docs/DESIGN.md`
+- `docs/DECISIONS.md`
 - `README.md`
 - `CLAUDE.md`
 
