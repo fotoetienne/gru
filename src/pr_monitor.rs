@@ -138,7 +138,7 @@ struct Head {
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct Review {
-    pub(crate) id: u64,
+    id: u64,
     pub(crate) submitted_at: DateTime<Utc>,
     pub(crate) user: User,
 }

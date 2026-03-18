@@ -87,9 +87,9 @@ async fn auto_rebase_pr(worktree_path: &Path) -> Result<bool> {
 /// section with the minion ID and resume command.
 fn format_exit_notification_comment(minion_id: &str, unaddressed_count: usize) -> String {
     let review_word = if unaddressed_count == 1 {
-        "review comment"
+        "review"
     } else {
-        "review comments"
+        "reviews"
     };
     format!(
         "---\ntype: monitoring-paused\n---\n\n\
@@ -1017,10 +1017,7 @@ mod tests {
             body.contains("gru resume M042"),
             "comment must contain resume command"
         );
-        assert!(
-            body.contains("2 review comments"),
-            "comment must mention the count"
-        );
+        assert!(body.contains("2 reviews"), "comment must mention the count");
         assert!(
             body.contains("type: monitoring-paused"),
             "comment must include YAML frontmatter type"
