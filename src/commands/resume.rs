@@ -150,6 +150,13 @@ pub async fn handle_resume(
 
     // Build the continuation prompt.
     // Priority: explicit additional_prompt > wake_reason (review-focused) > generic continuation.
+    //
+    // Note: when the lab daemon wakes a minion for new reviews it sets start_phase =
+    // MonitoringPr, so the agent-run branch below (`start_phase <= RunningAgent`) is
+    // skipped and `prompt` is never passed to the agent directly.  In that case
+    // `wake_reason` acts as metadata signalling WHY the minion was woken, and the actual
+    // review response is handled by `monitor_pr_lifecycle`'s own review-detection loop
+    // (which uses `last_review_check_time` as a baseline for new reviews).
     let prompt = if let Some(ref extra) = additional_prompt {
         format!(
             "Continue working on this issue. Additional instructions: {}",

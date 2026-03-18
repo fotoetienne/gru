@@ -445,7 +445,7 @@ async fn find_minions_needing_review_wake(
         let last_check = wake_check_times
             .get(&minion_id)
             .copied()
-            .unwrap_or_else(|| DateTime::<Utc>::from_timestamp(0, 0).unwrap_or_default());
+            .unwrap_or(DateTime::UNIX_EPOCH);
 
         // Skip if the cooldown window hasn't elapsed (avoids burning GitHub API quota).
         let elapsed = Utc::now()
@@ -548,7 +548,10 @@ async fn find_minions_needing_review_wake(
             continue;
         }
 
-        // Clear from resumed_this_session so the existing resume chain picks it up.
+        // Remove from resumed_this_session so the resume chain picks up the re-flipped
+        // minion.  In practice a Completed minion should never be in this set (the resume
+        // chain only inserts active-phase minions), but removing defensively ensures the
+        // guard doesn't block a woken minion if that invariant ever breaks.
         resumed_this_session.remove(&minion_id);
     }
 
