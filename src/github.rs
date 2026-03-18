@@ -842,7 +842,10 @@ pub async fn get_authenticated_user(host: &str) -> Result<String> {
     Ok(login)
 }
 
-/// Fetch all reviews for a PR from the GitHub API.
+/// Fetch all reviews for a PR from the GitHub API (paginated).
+///
+/// Uses `--paginate --jq '.[]'` to handle PRs with more than 30 reviews,
+/// producing a newline-delimited JSON stream that is then collected into a Vec.
 pub async fn list_pr_reviews(
     host: &str,
     owner: &str,
@@ -851,7 +854,7 @@ pub async fn list_pr_reviews(
 ) -> Result<Vec<PrReview>> {
     let endpoint = format!("repos/{}/{}/pulls/{}/reviews", owner, repo, pr_number);
     let output = gh_cli_command(host)
-        .args(["api", &endpoint])
+        .args(["api", &endpoint, "--paginate", "--jq", ".[]"])
         .output()
         .await
         .context("Failed to execute gh api reviews command")?;
@@ -867,17 +870,26 @@ pub async fn list_pr_reviews(
         ));
     }
 
+    // --paginate --jq '.[]' outputs one JSON object per line (NDJSON).
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let reviews: Vec<PrReview> =
-        serde_json::from_str(&stdout).context("Failed to parse PR reviews JSON")?;
+    let mut reviews = Vec::new();
+    for line in stdout.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let review: PrReview =
+            serde_json::from_str(line).context("Failed to parse PR review JSON line")?;
+        reviews.push(review);
+    }
     Ok(reviews)
 }
 
-/// Check whether the authenticated gh user has already posted a non-dismissed review
-/// for the given HEAD SHA on the specified PR.
+/// Check whether the authenticated gh user has already posted a non-dismissed,
+/// non-pending review for the given HEAD SHA on the specified PR.
 ///
-/// Returns `Ok(true)` if a review already exists (skip posting another).
-/// Returns `Ok(false)` if no review found or on API error (fail open).
+/// Returns `true` if a review already exists (skip posting another).
+/// Returns `false` if no review found or on API error (fail open).
 ///
 /// # Race condition note
 /// If two minions enter this check simultaneously, both may see `false` and both
@@ -918,13 +930,19 @@ pub async fn has_gru_review_for_sha(
 }
 
 /// Pure helper: given a list of reviews, a user login, and a SHA, determine
-/// whether the user already has a non-dismissed review for that commit.
+/// whether the user already has a submitted, non-dismissed review for that commit.
+///
+/// `PENDING` reviews (drafted but not yet submitted) and `DISMISSED` reviews do not
+/// count — both should allow a new review to be posted.
 ///
 /// Extracted for unit testing without network access.
 pub fn review_exists_for_sha(reviews: &[PrReview], user_login: &str, sha: &str) -> bool {
-    reviews
-        .iter()
-        .any(|r| r.user.login == user_login && r.commit_id == sha && r.state != "DISMISSED")
+    reviews.iter().any(|r| {
+        r.user.login == user_login
+            && r.commit_id == sha
+            && r.state != "DISMISSED"
+            && r.state != "PENDING"
+    })
 }
 
 // ============================================================================
@@ -987,9 +1005,9 @@ mod tests {
     }
 
     #[test]
-    fn test_review_exists_dismissed_then_new_review_allowed() {
-        // First review was dismissed; a new one should be allowed (return false)
-        let reviews = vec![make_review("gru-bot", "abc123", "DISMISSED")];
+    fn test_review_exists_pending_is_ignored() {
+        // A PENDING review was never submitted; should not block re-review
+        let reviews = vec![make_review("gru-bot", "abc123", "PENDING")];
         assert!(!review_exists_for_sha(&reviews, "gru-bot", "abc123"));
     }
 
