@@ -101,6 +101,7 @@ pub async fn handle_resume(
     let attempt_count = info.attempt_count;
     let no_watch = info.no_watch;
     let start_phase = info.orchestration_phase.clone();
+    let wake_reason = info.wake_reason.clone();
 
     // Check if timeout_deadline has passed — fail instead of resuming
     if let Some(deadline) = timeout_deadline {
@@ -147,12 +148,30 @@ pub async fn handle_resume(
         }
     };
 
-    // Build the continuation prompt
+    // Build the continuation prompt.
+    // Priority: explicit additional_prompt > wake_reason (review-focused) > generic continuation.
     let prompt = if let Some(ref extra) = additional_prompt {
         format!(
             "Continue working on this issue. Additional instructions: {}",
             extra
         )
+    } else if let Some(ref reason) = wake_reason {
+        // Clear wake_reason from the registry now that we've consumed it.
+        let mid = minion.minion_id.clone();
+        if let Err(e) = with_registry(move |reg| {
+            reg.update(&mid, |i| {
+                i.wake_reason = None;
+            })
+        })
+        .await
+        {
+            log::warn!(
+                "Failed to clear wake_reason for {}: {}",
+                minion.minion_id,
+                e
+            );
+        }
+        reason.clone()
     } else {
         format!(
             "Continue working on issue #{}. Pick up where you left off. \

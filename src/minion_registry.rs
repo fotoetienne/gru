@@ -329,6 +329,11 @@ pub struct MinionInfo {
     /// Fallback: if None (e.g., old registry entries), callers should fall back to started_at.
     #[serde(default)]
     pub last_review_check_time: Option<DateTime<Utc>>,
+    /// Reason the minion was woken up by the lab daemon (e.g., "Address review comments on PR #42").
+    /// Set when the lab daemon flips a Completed minion to MonitoringPr due to new reviews.
+    /// Cleared by the resume path after it is consumed to build the continuation prompt.
+    #[serde(default)]
+    pub wake_reason: Option<String>,
 }
 
 /// Default agent name for backwards compatibility with existing registry entries
@@ -873,6 +878,7 @@ mod tests {
             attempt_count: 0,
             no_watch: false,
             last_review_check_time: None,
+            wake_reason: None,
         }
     }
 
