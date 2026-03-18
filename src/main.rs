@@ -144,12 +144,31 @@ enum Commands {
         id: String,
 
         #[arg(
+            short = 'f',
+            long = "follow",
+            conflicts_with = "no_follow",
+            help = "Force follow mode (replay + stream live events)"
+        )]
+        follow: bool,
+
+        #[arg(
             long = "no-follow",
+            conflicts_with = "follow",
             help = "Replay history only, don't follow live events"
         )]
         no_follow: bool,
+
+        #[arg(long, help = "Output raw JSONL for piping/scripting")]
+        raw: bool,
+
+        #[arg(
+            short = 'n',
+            long = "lines",
+            help = "Number of events to show (default: all for stopped, 20 before following for running)"
+        )]
+        lines: Option<usize>,
     },
-    #[command(about = "Stream a Minion's event log (follow mode auto-detected)")]
+    #[command(about = "Stream a Minion's event log (alias for 'logs')", hide = true)]
     Tail {
         #[arg(help = "Minion ID, issue number, or PR number (e.g., M0tk, 42)")]
         id: String,
@@ -398,7 +417,13 @@ async fn main() {
             )
             .await
         }
-        Commands::Logs { id, no_follow } => logs::handle_logs(id, !no_follow, cli.quiet).await,
+        Commands::Logs {
+            id,
+            follow,
+            no_follow,
+            raw,
+            lines,
+        } => logs::handle_logs(id, follow, no_follow, raw, lines, cli.quiet).await,
         Commands::Tail {
             id,
             no_follow,
