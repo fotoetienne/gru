@@ -725,6 +725,29 @@ async fn resume_interrupted_minions(
             None => continue, // repo no longer in config
         };
 
+        // Cross-cycle guard: skip if another minion for this issue is already running
+        // (e.g. the most-recent was resumed in the previous cycle and is still alive).
+        match is_issue_claimed(&candidate.info.repo, candidate.info.issue).await {
+            Ok(true) => {
+                log::info!(
+                    "Skipping {} (issue #{}, {}): another minion for this issue is already running",
+                    candidate.minion_id,
+                    candidate.info.issue,
+                    candidate.info.repo,
+                );
+                continue;
+            }
+            Ok(false) => {}
+            Err(e) => {
+                log::warn!(
+                    "⚠️  Failed to check if issue #{} is claimed: {} — skipping to be safe",
+                    candidate.info.issue,
+                    e,
+                );
+                continue;
+            }
+        }
+
         // Skip minions whose issue is already closed (PR merged or issue resolved)
         let (owner, repo_name) = match candidate.info.repo.split_once('/') {
             Some(parts) => parts,
