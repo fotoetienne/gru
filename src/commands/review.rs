@@ -175,6 +175,7 @@ pub async fn handle_review(pr_arg: Option<String>, agent_name: &str) -> Result<i
         attempt_count: 0,
         no_watch: false,
         last_review_check_time: None,
+        wake_reason: None,
     };
 
     // Register the Minion (spawn_blocking to avoid holding lock during review)

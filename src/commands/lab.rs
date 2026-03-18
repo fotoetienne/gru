@@ -2,10 +2,11 @@ use crate::config::{parse_repo_entry_with_hosts, LabConfig};
 use crate::github::{self, list_ready_issues_via_cli};
 use crate::labels;
 use crate::minion_registry::{with_registry, MinionInfo, MinionMode, OrchestrationPhase};
+use crate::pr_monitor;
 use crate::tmux::TmuxGuard;
 use anyhow::{Context, Result};
-use chrono::Utc;
-use std::collections::HashSet;
+use chrono::{DateTime, Utc};
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Duration, Instant};
@@ -105,14 +106,25 @@ pub async fn handle_lab(
     // to prevent resume loops even if phase updates are missed.
     let mut resumed_this_session: HashSet<String> = HashSet::new();
 
+    // Track the last time we polled each Completed minion for new reviews.
+    // Not persisted — resets on daemon restart, which is fine since the cooldown
+    // only serves to rate-limit GitHub API calls within a session.
+    let mut wake_check_times: HashMap<String, DateTime<Utc>> = HashMap::new();
+
     if no_resume {
         println!("⏭️  Auto-resume disabled (--no-resume)");
         println!();
     }
 
     // Perform initial poll immediately for faster feedback
-    if let Err(e) =
-        poll_and_spawn(&config, &mut children, no_resume, &mut resumed_this_session).await
+    if let Err(e) = poll_and_spawn(
+        &config,
+        &mut children,
+        no_resume,
+        &mut resumed_this_session,
+        &mut wake_check_times,
+    )
+    .await
     {
         log::warn!("⚠️  Initial polling error: {}", e);
         log::warn!("   Continuing to poll...");
@@ -139,7 +151,15 @@ pub async fn handle_lab(
                 // Clean up finished child processes
                 reap_children(&mut children).await;
 
-                if let Err(e) = poll_and_spawn(&config, &mut children, no_resume, &mut resumed_this_session).await {
+                if let Err(e) = poll_and_spawn(
+                    &config,
+                    &mut children,
+                    no_resume,
+                    &mut resumed_this_session,
+                    &mut wake_check_times,
+                )
+                .await
+                {
                     log::warn!("⚠️  Polling error: {}", e);
                     log::warn!("   Continuing to poll...");
                 }
@@ -341,6 +361,218 @@ fn host_for_repo(config: &LabConfig, owner_repo: &str) -> Option<String> {
     None
 }
 
+/// Minimum time between GitHub API calls for the review wake-up scan per minion.
+const WAKE_COOLDOWN: Duration = Duration::from_secs(5 * 60);
+
+/// Returns the IDs of Completed minions eligible for a review wake-up check.
+///
+/// A candidate must:
+/// - Be in the `Completed` phase (this also implicitly prevents double-flip: a minion
+///   already flipped to `MonitoringPr` will no longer match `== Completed`)
+/// - Have a PR number (no point polling if there's no PR)
+/// - Not exceed `max_attempts` (bounded autonomy)
+pub(crate) fn find_wake_candidates(
+    minions: &[(String, MinionInfo)],
+    max_attempts: u32,
+) -> Vec<String> {
+    minions
+        .iter()
+        .filter(|(_id, info)| {
+            info.orchestration_phase == OrchestrationPhase::Completed
+                && info.pr.is_some()
+                && info.attempt_count < max_attempts
+        })
+        .map(|(id, _info)| id.clone())
+        .collect()
+}
+
+/// Returns true if a Completed minion should be woken up based on PR and review state.
+///
+/// Conditions:
+/// - `pr_open`: the PR is still open (not merged or closed)
+/// - `unaddressed_reviews > 0`: there are new external reviews to address
+///
+/// Note: cooldown rate-limiting is enforced separately via `within_wake_cooldown` before
+/// any GitHub API calls are made. This function encapsulates only the per-minion wake
+/// decision after reviews are fetched, keeping it a simple testable predicate.
+pub(crate) fn should_wake_minion(pr_open: bool, unaddressed_reviews: usize) -> bool {
+    pr_open && unaddressed_reviews > 0
+}
+
+/// Returns true if a minion is still within the wake cooldown window.
+///
+/// Used to rate-limit GitHub API calls per minion. `last_check` defaults to
+/// `DateTime::UNIX_EPOCH` for minions that have never been checked.
+pub(crate) fn within_wake_cooldown(
+    last_check: DateTime<Utc>,
+    now: DateTime<Utc>,
+    cooldown: Duration,
+) -> bool {
+    let elapsed = now
+        .signed_duration_since(last_check)
+        .to_std()
+        .unwrap_or(Duration::ZERO);
+    elapsed < cooldown
+}
+
+/// Scan Completed minions for open PRs with new external reviews, and flip them back
+/// to `MonitoringPr` so the resume chain picks them up.
+///
+/// `wake_check_times` is an in-memory map of minion_id → last GitHub API poll time,
+/// used to enforce `WAKE_COOLDOWN` across poll cycles without persisting to disk.
+async fn find_minions_needing_review_wake(
+    config: &LabConfig,
+    max_attempts: u32,
+    wake_check_times: &mut HashMap<String, DateTime<Utc>>,
+    resumed_this_session: &mut HashSet<String>,
+) -> Result<()> {
+    let repos = configured_repos(config);
+
+    let all_minions: Vec<(String, MinionInfo)> = with_registry(|reg| Ok(reg.list())).await?;
+
+    let candidate_ids = find_wake_candidates(&all_minions, max_attempts);
+    if candidate_ids.is_empty() {
+        return Ok(());
+    }
+
+    for minion_id in candidate_ids {
+        let info = match all_minions.iter().find(|(id, _)| id == &minion_id) {
+            Some((_, info)) => info.clone(),
+            None => continue,
+        };
+
+        if !repos.contains(&info.repo) {
+            continue;
+        }
+
+        // NOTE: we intentionally do NOT check `resumed_this_session` here.
+        // That set guards the resume chain (active-phase minions) from being
+        // resumed twice in one session. Completed minions are never inserted
+        // into it by the resume chain, so the guard would be a no-op for
+        // first-time wake-ups. More critically, a minion that was resumed
+        // earlier in the session, completed its work, and then received new
+        // reviews would be incorrectly blocked from a second wake-up.
+        // The resume chain's own `resumed_this_session.remove()` below handles
+        // clearing the entry after the phase flip.
+
+        let last_check = wake_check_times
+            .get(&minion_id)
+            .copied()
+            .unwrap_or(DateTime::UNIX_EPOCH);
+
+        // Skip if the cooldown window hasn't elapsed (avoids burning GitHub API quota).
+        let now = Utc::now();
+        if within_wake_cooldown(last_check, now, WAKE_COOLDOWN) {
+            let elapsed = now
+                .signed_duration_since(last_check)
+                .to_std()
+                .unwrap_or(Duration::ZERO);
+            log::debug!(
+                "Skipping wake check for {} (cooldown: {:.0?} remaining)",
+                minion_id,
+                WAKE_COOLDOWN.saturating_sub(elapsed)
+            );
+            continue;
+        }
+
+        let pr_number = match &info.pr {
+            Some(p) => p.clone(),
+            None => continue,
+        };
+
+        let host = match host_for_repo(config, &info.repo) {
+            Some(h) => h,
+            None => continue,
+        };
+
+        let (owner, repo_name) = match info.repo.split_once('/') {
+            Some((o, r)) => (o.to_string(), r.to_string()),
+            None => continue,
+        };
+
+        // Record the check time immediately so the cooldown applies even when API calls
+        // fail — prevents hammering the GitHub API during transient outages.
+        wake_check_times.insert(minion_id.clone(), Utc::now());
+
+        // Fetch PR open/author info and all reviews.
+        let pr_info = match pr_monitor::get_pr_info_for_exit_notification(
+            &host, &owner, &repo_name, &pr_number,
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                log::warn!(
+                    "Failed to get PR info for {} (PR #{}): {}",
+                    minion_id,
+                    pr_number,
+                    e
+                );
+                continue;
+            }
+        };
+        let (pr_open, pr_author) = pr_info;
+
+        let reviews = match pr_monitor::get_all_reviews(&host, &owner, &repo_name, &pr_number).await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                log::warn!(
+                    "Failed to fetch reviews for {} (PR #{}): {}",
+                    minion_id,
+                    pr_number,
+                    e
+                );
+                continue;
+            }
+        };
+
+        let since = info.last_review_check_time.unwrap_or(info.started_at);
+        let unaddressed = pr_monitor::has_unaddressed_reviews(&reviews, &pr_author, since);
+
+        if !should_wake_minion(pr_open, unaddressed) {
+            log::debug!(
+                "No wake needed for {} (pr_open={}, unaddressed={})",
+                minion_id,
+                pr_open,
+                unaddressed
+            );
+            continue;
+        }
+
+        println!(
+            "🔔 Waking up {} (issue #{}, {}): {} new external review(s) on PR #{}",
+            minion_id, info.issue, info.repo, unaddressed, pr_number
+        );
+
+        let wake_reason = format!("Address the review comments on PR #{}", pr_number);
+        let mid = minion_id.clone();
+        if let Err(e) = with_registry(move |reg| {
+            reg.update(&mid, |i| {
+                i.orchestration_phase = OrchestrationPhase::MonitoringPr;
+                i.wake_reason = Some(wake_reason.clone());
+            })
+        })
+        .await
+        {
+            log::warn!(
+                "Failed to update registry for wake-up of {}: {}",
+                minion_id,
+                e
+            );
+            continue;
+        }
+
+        // Remove from resumed_this_session so the resume chain picks up the re-flipped
+        // minion.  In practice a Completed minion should never be in this set (the resume
+        // chain only inserts active-phase minions), but removing defensively ensures the
+        // guard doesn't block a woken minion if that invariant ever breaks.
+        resumed_this_session.remove(&minion_id);
+    }
+
+    Ok(())
+}
+
 /// Scan the registry for minions that can be resumed.
 ///
 /// A minion is resumable if:
@@ -365,6 +597,10 @@ async fn find_resumable_minions(config: &LabConfig) -> Result<Vec<ResumableMinio
             .list()
             .into_iter()
             .filter(|(_id, info)| {
+                // Require pid.is_some() for the non-Stopped path: is_running() returns false
+                // when pid is None, which would incorrectly flag a minion as dead during the
+                // transient startup window where check_and_claim_session has set mode =
+                // Autonomous but the lab hasn't written the PID yet.
                 let process_dead =
                     info.mode == MinionMode::Stopped || (info.pid.is_some() && !info.is_running());
                 process_dead
@@ -604,9 +840,27 @@ async fn poll_and_spawn(
     children: &mut Vec<SpawnedChild>,
     no_resume: bool,
     resumed_this_session: &mut HashSet<String>,
+    wake_check_times: &mut HashMap<String, DateTime<Utc>>,
 ) -> Result<()> {
     // Prune stale registry entries (worktrees that no longer exist, checking PR status)
     prune_stale_entries().await?;
+
+    let max_attempts = config.daemon.max_resume_attempts;
+
+    // Wake up Completed minions with new external reviews so they re-enter MonitoringPr.
+    // Runs after prune_stale_entries so stale entries don't generate spurious wake-ups.
+    if !no_resume {
+        if let Err(e) = find_minions_needing_review_wake(
+            config,
+            max_attempts,
+            wake_check_times,
+            resumed_this_session,
+        )
+        .await
+        {
+            log::warn!("⚠️  Review wake scan error: {}", e);
+        }
+    }
 
     // Calculate available slots using PID liveness (not registry status string)
     let mut available = available_slots(config.daemon.max_slots).await?;
@@ -617,7 +871,6 @@ async fn poll_and_spawn(
     }
 
     // Resume interrupted minions first, before claiming new issues
-    let max_attempts = config.daemon.max_resume_attempts;
     let resumed = if no_resume {
         0
     } else {
@@ -1374,6 +1627,150 @@ mod tests {
         assert!(
             should_restore_label(spawned_at),
             "Process at 1s under threshold should still qualify for label restoration"
+        );
+    }
+
+    // --- find_wake_candidates tests ---
+
+    fn make_completed_minion(pr: Option<&str>, attempt_count: u32) -> MinionInfo {
+        use crate::minion_registry::{MinionMode, OrchestrationPhase};
+        use std::path::PathBuf;
+        MinionInfo {
+            repo: "owner/repo".to_string(),
+            issue: 42,
+            command: "do".to_string(),
+            prompt: "test".to_string(),
+            started_at: chrono::Utc::now(),
+            branch: "minion/issue-42-M001".to_string(),
+            worktree: PathBuf::from("/tmp/test"),
+            status: "active".to_string(),
+            pr: pr.map(String::from),
+            session_id: uuid::Uuid::new_v4().to_string(),
+            pid: None,
+            pid_start_time: None,
+            mode: MinionMode::Stopped,
+            last_activity: chrono::Utc::now(),
+            orchestration_phase: OrchestrationPhase::Completed,
+            token_usage: None,
+            agent_name: "claude".to_string(),
+            timeout_deadline: None,
+            attempt_count,
+            no_watch: false,
+            last_review_check_time: None,
+            wake_reason: None,
+        }
+    }
+
+    #[test]
+    fn test_find_wake_candidates_empty_registry() {
+        let minions: Vec<(String, MinionInfo)> = vec![];
+        let candidates = find_wake_candidates(&minions, 3);
+        assert!(candidates.is_empty(), "Empty registry yields no candidates");
+    }
+
+    #[test]
+    fn test_find_wake_candidates_skips_minions_without_prs() {
+        let info = make_completed_minion(None, 0);
+        let minions = vec![("M001".to_string(), info)];
+        let candidates = find_wake_candidates(&minions, 3);
+        assert!(
+            candidates.is_empty(),
+            "Minion without a PR must not be a candidate"
+        );
+    }
+
+    #[test]
+    fn test_find_wake_candidates_skips_over_max_attempts() {
+        let info = make_completed_minion(Some("10"), 3);
+        let minions = vec![("M001".to_string(), info)];
+        // max_attempts=3 means attempt_count must be < 3; attempt_count=3 is over limit
+        let candidates = find_wake_candidates(&minions, 3);
+        assert!(
+            candidates.is_empty(),
+            "Minion at max_attempts must not be a candidate"
+        );
+    }
+
+    #[test]
+    fn test_find_wake_candidates_requires_completed_phase() {
+        use crate::minion_registry::OrchestrationPhase;
+        let mut info = make_completed_minion(Some("10"), 0);
+        // MonitoringPr is an active phase, not Completed — excluded by the == Completed check
+        info.orchestration_phase = OrchestrationPhase::MonitoringPr;
+        let minions = vec![("M001".to_string(), info)];
+        let candidates = find_wake_candidates(&minions, 3);
+        assert!(
+            candidates.is_empty(),
+            "Only Completed-phase minions are candidates; any other phase is excluded"
+        );
+    }
+
+    #[test]
+    fn test_find_wake_candidates_returns_eligible_minion() {
+        let info = make_completed_minion(Some("10"), 0);
+        let minions = vec![("M001".to_string(), info)];
+        let candidates = find_wake_candidates(&minions, 3);
+        assert_eq!(candidates, vec!["M001"]);
+    }
+
+    // --- within_wake_cooldown tests ---
+
+    #[test]
+    fn test_within_wake_cooldown_true_when_recently_checked() {
+        let now = Utc::now();
+        let last_check = now - chrono::Duration::seconds(60); // 1 minute ago
+        let cooldown = Duration::from_secs(5 * 60); // 5 minute cooldown
+        assert!(
+            within_wake_cooldown(last_check, now, cooldown),
+            "Should be within cooldown when only 1 minute has elapsed of a 5-minute cooldown"
+        );
+    }
+
+    #[test]
+    fn test_within_wake_cooldown_false_when_cooldown_elapsed() {
+        let now = Utc::now();
+        let last_check = now - chrono::Duration::seconds(6 * 60); // 6 minutes ago
+        let cooldown = Duration::from_secs(5 * 60); // 5 minute cooldown
+        assert!(
+            !within_wake_cooldown(last_check, now, cooldown),
+            "Should not be within cooldown when 6 minutes have elapsed of a 5-minute cooldown"
+        );
+    }
+
+    #[test]
+    fn test_within_wake_cooldown_false_for_epoch_default() {
+        // DateTime::UNIX_EPOCH is the default for never-checked minions; cooldown must not block them.
+        let now = Utc::now();
+        let cooldown = Duration::from_secs(5 * 60);
+        assert!(
+            !within_wake_cooldown(DateTime::UNIX_EPOCH, now, cooldown),
+            "Never-checked minion (epoch default) must pass the cooldown check"
+        );
+    }
+
+    // --- should_wake_minion tests ---
+
+    #[test]
+    fn test_should_wake_minion_false_for_closed_pr() {
+        assert!(
+            !should_wake_minion(false, 2),
+            "Closed/merged PR must never trigger wake-up"
+        );
+    }
+
+    #[test]
+    fn test_should_wake_minion_false_for_no_reviews() {
+        assert!(
+            !should_wake_minion(true, 0),
+            "Open PR with zero unaddressed reviews must not trigger wake-up"
+        );
+    }
+
+    #[test]
+    fn test_should_wake_minion_true_when_all_conditions_met() {
+        assert!(
+            should_wake_minion(true, 1),
+            "Wake-up must trigger when PR is open and reviews are pending"
         );
     }
 }

@@ -101,6 +101,7 @@ pub async fn handle_resume(
     let attempt_count = info.attempt_count;
     let no_watch = info.no_watch;
     let start_phase = info.orchestration_phase.clone();
+    let wake_reason = info.wake_reason.clone();
 
     // Check if timeout_deadline has passed — fail instead of resuming
     if let Some(deadline) = timeout_deadline {
@@ -147,12 +148,41 @@ pub async fn handle_resume(
         }
     };
 
-    // Build the continuation prompt
+    // Clear wake_reason unconditionally so it never leaks in the registry,
+    // regardless of which prompt branch wins below.
+    if wake_reason.is_some() {
+        let mid = minion.minion_id.clone();
+        if let Err(e) = with_registry(move |reg| {
+            reg.update(&mid, |i| {
+                i.wake_reason = None;
+            })
+        })
+        .await
+        {
+            log::warn!(
+                "Failed to clear wake_reason for {}: {}",
+                minion.minion_id,
+                e
+            );
+        }
+    }
+
+    // Build the continuation prompt.
+    // Priority: explicit additional_prompt > wake_reason (review-focused) > generic continuation.
+    //
+    // Note: when the lab daemon wakes a minion for new reviews it sets start_phase =
+    // MonitoringPr, so the agent-run branch below (`start_phase <= RunningAgent`) is
+    // skipped and `prompt` is never passed to the agent directly.  In that case
+    // `wake_reason` acts as metadata signalling WHY the minion was woken, and the actual
+    // review response is handled by `monitor_pr_lifecycle`'s own review-detection loop
+    // (which uses `last_review_check_time` as a baseline for new reviews).
     let prompt = if let Some(ref extra) = additional_prompt {
         format!(
             "Continue working on this issue. Additional instructions: {}",
             extra
         )
+    } else if let Some(ref reason) = wake_reason {
+        reason.clone()
     } else {
         format!(
             "Continue working on issue #{}. Pick up where you left off. \

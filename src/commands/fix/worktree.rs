@@ -98,6 +98,7 @@ pub(super) async fn setup_worktree(
         attempt_count: 1,
         no_watch: opts.no_watch,
         last_review_check_time: None,
+        wake_reason: None,
     };
 
     let minion_id_clone = minion_id.clone();

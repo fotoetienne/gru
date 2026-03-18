@@ -28,6 +28,23 @@ async fn save_review_check_time(minion_id: &str, ts: DateTime<Utc>) {
     }
 }
 
+/// Resets `attempt_count` to 0 after a successful review response (best-effort).
+///
+/// The cap should only trigger on *consecutive* failures. Resetting here ensures a
+/// minion that successfully addresses reviews isn't penalised for past resume cycles.
+async fn reset_attempt_count(minion_id: &str) {
+    let mid = minion_id.to_string();
+    if let Err(e) = minion_registry::with_registry(move |registry| {
+        registry.update(&mid, |info| {
+            info.attempt_count = 0;
+        })
+    })
+    .await
+    {
+        log::warn!("⚠️  Failed to reset attempt_count: {}", e);
+    }
+}
+
 /// Attempts to auto-rebase the worktree branch onto its base branch.
 ///
 /// Returns `Ok(true)` if the rebase succeeded (clean or Claude resolved conflicts),
@@ -695,6 +712,9 @@ pub(crate) async fn monitor_pr_lifecycle(
                         review_baseline = Some(check_time);
                         // Persist updated baseline after successfully handling reviews.
                         save_review_check_time(&wt_ctx.minion_id, check_time).await;
+                        // Reset attempt_count so the cap only triggers on consecutive
+                        // failures, not cumulative resume cycles across successful rounds.
+                        reset_attempt_count(&wt_ctx.minion_id).await;
                     }
                     Err(e) => {
                         log::warn!("⚠️  Failed to address review comments: {}", e);
