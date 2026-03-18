@@ -665,7 +665,7 @@ async fn resume_interrupted_minions(
         return Ok(0);
     }
 
-    let resumable: Vec<_> = find_resumable_minions(config)
+    let mut resumable: Vec<_> = find_resumable_minions(config)
         .await?
         .into_iter()
         .filter(|c| {
@@ -686,14 +686,40 @@ async fn resume_interrupted_minions(
         return Ok(0);
     }
 
+    // Sort by minion ID descending so the most recent minion per issue is preferred.
+    // IDs are zero-padded base36 strings, so (length DESC, string DESC) gives the
+    // correct numeric order.
+    resumable.sort_by(|a, b| {
+        b.minion_id
+            .len()
+            .cmp(&a.minion_id.len())
+            .then_with(|| b.minion_id.cmp(&a.minion_id))
+    });
+
     println!(
         "🔄 Found {} resumable Minion(s) from previous session",
         resumable.len()
     );
 
     let mut resumed = 0;
+    // Per-cycle deduplication: track which (repo, issue) pairs have already had a
+    // minion queued for resume in this poll cycle.  Without this guard, when N
+    // stopped minions share the same issue (e.g. after repeated lab restarts), all N
+    // pass the per-session minion-ID filter and are resumed concurrently, causing
+    // duplicate PR reviews and conflicting actions.
+    let mut resumed_issues: HashSet<(String, u64)> = HashSet::new();
 
     for candidate in resumable {
+        let issue_key = (candidate.info.repo.clone(), candidate.info.issue);
+        if resumed_issues.contains(&issue_key) {
+            log::info!(
+                "Skipping {} (issue #{}, {}): another minion for this issue is already resuming this cycle",
+                candidate.minion_id,
+                candidate.info.issue,
+                candidate.info.repo,
+            );
+            continue;
+        }
         if *available == 0 {
             break;
         }
@@ -784,6 +810,9 @@ async fn resume_interrupted_minions(
 
         // Record this minion as attempted regardless of outcome
         resumed_this_session.insert(candidate.minion_id.clone());
+        // Claim the issue slot for this cycle so no other minion for the same
+        // issue is resumed, even if the spawn below fails.
+        resumed_issues.insert(issue_key);
 
         match spawn_resume(&candidate.minion_id).await {
             Ok(child) => {
