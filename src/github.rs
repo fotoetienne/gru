@@ -802,12 +802,272 @@ pub async fn mark_issue_blocked_via_cli(
 }
 
 // ============================================================================
+// PR Review Deduplication
+// ============================================================================
+
+/// A single PR review returned by the GitHub reviews API.
+#[derive(Debug, serde::Deserialize)]
+pub struct PrReview {
+    pub user: ReviewUser,
+    pub commit_id: String,
+    pub state: String,
+}
+
+/// The user portion of a PR review response.
+#[derive(Debug, serde::Deserialize)]
+pub struct ReviewUser {
+    pub login: String,
+}
+
+/// Returns the login of the currently authenticated `gh` CLI user.
+///
+/// Uses `gh api user` to fetch the authenticated account. Returns an error
+/// if `gh` is not authenticated or the API call fails.
+pub async fn get_authenticated_user(host: &str) -> Result<String> {
+    let output = gh_cli_command(host)
+        .args(["api", "user", "--jq", ".login"])
+        .output()
+        .await
+        .context("Failed to execute gh api user command")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow!("Failed to get authenticated user: {}", stderr));
+    }
+
+    let login = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if login.is_empty() {
+        return Err(anyhow!("gh api user returned empty login"));
+    }
+    Ok(login)
+}
+
+/// Fetch all reviews for a PR from the GitHub API (paginated).
+///
+/// Uses `--paginate --jq '.[]'` to handle PRs with more than 30 reviews,
+/// producing a newline-delimited JSON stream that is then collected into a Vec.
+pub async fn list_pr_reviews(
+    host: &str,
+    owner: &str,
+    repo: &str,
+    pr_number: &str,
+) -> Result<Vec<PrReview>> {
+    let endpoint = format!("repos/{}/{}/pulls/{}/reviews", owner, repo, pr_number);
+    let output = gh_cli_command(host)
+        .args(["api", &endpoint, "--paginate", "--jq", ".[]"])
+        .output()
+        .await
+        .context("Failed to execute gh api reviews command")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow!(
+            "Failed to list PR reviews for {}/{} #{}: {}",
+            owner,
+            repo,
+            pr_number,
+            stderr
+        ));
+    }
+
+    // --paginate --jq '.[]' outputs one JSON object per line (NDJSON).
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    parse_pr_reviews_ndjson(&stdout)
+}
+
+/// Parse a newline-delimited JSON stream of PR review objects.
+///
+/// `--paginate --jq '.[]'` emits one JSON object per line; this helper
+/// is extracted for unit testing without network access.
+pub fn parse_pr_reviews_ndjson(ndjson: &str) -> Result<Vec<PrReview>> {
+    let mut reviews = Vec::new();
+    for line in ndjson.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let review: PrReview =
+            serde_json::from_str(line).context("Failed to parse PR review JSON line")?;
+        reviews.push(review);
+    }
+    Ok(reviews)
+}
+
+/// Check whether the authenticated gh user has already posted a non-dismissed,
+/// non-pending review for the given HEAD SHA on the specified PR.
+///
+/// Returns `true` if a review already exists (skip posting another).
+/// Returns `false` if no review found or on API error (fail open).
+///
+/// # Race condition note
+/// If two minions enter this check simultaneously, both may see `false` and both
+/// proceed to post a review. This is a narrow window with low consequence (one
+/// extra review comment) and is not worth a distributed lock for V1.
+pub async fn has_gru_review_for_sha(
+    host: &str,
+    owner: &str,
+    repo: &str,
+    pr_number: &str,
+    head_sha: &str,
+) -> bool {
+    // Get the authenticated user login; fail open on error.
+    // TODO: the authenticated user is stable for the lifetime of a process; a
+    // OnceLock<String> or a caller-supplied parameter could avoid this extra
+    // `gh api user` call on each invocation. Not worth the complexity at V1
+    // call frequency (once per monitor_pr_lifecycle entry), but revisit if
+    // has_gru_review_for_sha ever gets additional hot-path callers.
+    let gh_user = match get_authenticated_user(host).await {
+        Ok(u) => u,
+        Err(e) => {
+            log::warn!(
+                "⚠️  Could not get authenticated user for review dedup check: {}",
+                e
+            );
+            return false;
+        }
+    };
+
+    // Fetch all reviews; fail open on error.
+    let reviews = match list_pr_reviews(host, owner, repo, pr_number).await {
+        Ok(r) => r,
+        Err(e) => {
+            log::warn!(
+                "⚠️  Could not fetch PR reviews for dedup check (proceeding): {}",
+                e
+            );
+            return false;
+        }
+    };
+
+    review_exists_for_sha(&reviews, &gh_user, head_sha)
+}
+
+/// Pure helper: given a list of reviews, a user login, and a SHA, determine
+/// whether the user already has a submitted, non-dismissed review for that commit.
+///
+/// `PENDING` reviews (drafted but not yet submitted) and `DISMISSED` reviews do not
+/// count — both should allow a new review to be posted.
+///
+/// Extracted for unit testing without network access.
+pub fn review_exists_for_sha(reviews: &[PrReview], user_login: &str, sha: &str) -> bool {
+    reviews.iter().any(|r| {
+        r.user.login == user_login
+            && r.commit_id == sha
+            && r.state != "DISMISSED"
+            && r.state != "PENDING"
+    })
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- review_exists_for_sha tests ---
+
+    fn make_review(login: &str, commit_id: &str, state: &str) -> PrReview {
+        PrReview {
+            user: ReviewUser {
+                login: login.to_string(),
+            },
+            commit_id: commit_id.to_string(),
+            state: state.to_string(),
+        }
+    }
+
+    #[test]
+    fn test_review_exists_matching_review() {
+        let reviews = vec![make_review("gru-bot", "abc123", "APPROVED")];
+        assert!(review_exists_for_sha(&reviews, "gru-bot", "abc123"));
+    }
+
+    #[test]
+    fn test_review_exists_dismissed_is_ignored() {
+        let reviews = vec![make_review("gru-bot", "abc123", "DISMISSED")];
+        assert!(!review_exists_for_sha(&reviews, "gru-bot", "abc123"));
+    }
+
+    #[test]
+    fn test_review_exists_different_sha() {
+        let reviews = vec![make_review("gru-bot", "abc123", "APPROVED")];
+        assert!(!review_exists_for_sha(&reviews, "gru-bot", "deadbeef"));
+    }
+
+    #[test]
+    fn test_review_exists_different_user() {
+        let reviews = vec![make_review("other-bot", "abc123", "APPROVED")];
+        assert!(!review_exists_for_sha(&reviews, "gru-bot", "abc123"));
+    }
+
+    #[test]
+    fn test_review_exists_empty_list() {
+        assert!(!review_exists_for_sha(&[], "gru-bot", "abc123"));
+    }
+
+    #[test]
+    fn test_review_exists_multiple_reviews_one_matches() {
+        let reviews = vec![
+            make_review("human-reviewer", "abc123", "APPROVED"),
+            make_review("gru-bot", "abc123", "COMMENTED"),
+            make_review("gru-bot", "oldsha", "APPROVED"),
+        ];
+        assert!(review_exists_for_sha(&reviews, "gru-bot", "abc123"));
+    }
+
+    #[test]
+    fn test_review_exists_pending_is_ignored() {
+        // A PENDING review was never submitted; should not block re-review
+        let reviews = vec![make_review("gru-bot", "abc123", "PENDING")];
+        assert!(!review_exists_for_sha(&reviews, "gru-bot", "abc123"));
+    }
+
+    #[test]
+    fn test_review_exists_commented_state_counts() {
+        let reviews = vec![make_review("gru-bot", "abc123", "COMMENTED")];
+        assert!(review_exists_for_sha(&reviews, "gru-bot", "abc123"));
+    }
+
+    #[test]
+    fn test_review_exists_changes_requested_counts() {
+        let reviews = vec![make_review("gru-bot", "abc123", "CHANGES_REQUESTED")];
+        assert!(review_exists_for_sha(&reviews, "gru-bot", "abc123"));
+    }
+
+    #[test]
+    fn test_pr_review_deserialize() {
+        let json = r#"[
+            {"user": {"login": "gru-bot"}, "commit_id": "abc123", "state": "APPROVED"},
+            {"user": {"login": "human"}, "commit_id": "abc123", "state": "CHANGES_REQUESTED"}
+        ]"#;
+        let reviews: Vec<PrReview> = serde_json::from_str(json).unwrap();
+        assert_eq!(reviews.len(), 2);
+        assert_eq!(reviews[0].user.login, "gru-bot");
+        assert_eq!(reviews[0].commit_id, "abc123");
+        assert_eq!(reviews[0].state, "APPROVED");
+    }
+
+    #[test]
+    fn test_parse_pr_reviews_ndjson() {
+        // Exercises the actual parsing path used by list_pr_reviews
+        let ndjson = concat!(
+            "{\"user\":{\"login\":\"gru-bot\"},\"commit_id\":\"abc123\",\"state\":\"APPROVED\"}\n",
+            "{\"user\":{\"login\":\"human\"},\"commit_id\":\"abc123\",\"state\":\"CHANGES_REQUESTED\"}\n",
+            "\n", // blank line should be skipped
+        );
+        let reviews = parse_pr_reviews_ndjson(ndjson).unwrap();
+        assert_eq!(reviews.len(), 2);
+        assert_eq!(reviews[0].user.login, "gru-bot");
+        assert_eq!(reviews[1].state, "CHANGES_REQUESTED");
+    }
+
+    #[test]
+    fn test_parse_pr_reviews_ndjson_empty() {
+        let reviews = parse_pr_reviews_ndjson("").unwrap();
+        assert!(reviews.is_empty());
+    }
 
     // --- infer_github_host tests ---
 

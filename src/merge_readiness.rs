@@ -10,6 +10,7 @@
 //! 4. No merge conflicts — `mergeable` field from GitHub API
 
 use crate::github;
+use crate::github::ReviewUser;
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::fmt;
@@ -157,11 +158,6 @@ struct HeadRef {
 pub(crate) struct ReviewApiResponse {
     pub(crate) state: String,
     pub(crate) user: ReviewUser,
-}
-
-#[derive(Debug, Deserialize)]
-pub(crate) struct ReviewUser {
-    pub(crate) login: String,
 }
 
 #[derive(Debug, Deserialize)]
