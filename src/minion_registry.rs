@@ -329,14 +329,16 @@ pub struct MinionInfo {
     /// Fallback: if None (e.g., old registry entries), callers should fall back to started_at.
     #[serde(default)]
     pub last_review_check_time: Option<DateTime<Utc>>,
-    /// Observability note set by the lab daemon when waking a Completed minion due to new reviews
+    /// Set by the lab daemon when waking a Completed minion due to new reviews
     /// (e.g., "Address review comments on PR #42"). Cleared by the resume path after it is read.
     ///
-    /// Note: when `orchestration_phase == MonitoringPr`, `run_autonomous_agent` is skipped and
-    /// this value is never passed to Claude as a prompt. The actual review handling is done
-    /// organically by `monitor_pr_lifecycle` via `last_review_check_time`. This field exists
-    /// so operators can see *why* a minion was re-activated (visible in `gru status` and the
-    /// registry JSON).
+    /// This drives prompt selection in the resume path: if set, the resume path uses this
+    /// review-focused string instead of the generic continuation prompt. However, when
+    /// `orchestration_phase == MonitoringPr` (the lab-wake case), `run_autonomous_agent` is
+    /// skipped entirely and the prompt is never forwarded to Claude — review handling is done
+    /// organically by `monitor_pr_lifecycle` via `last_review_check_time`. The field is still
+    /// useful as an observability signal (visible in `gru status` and the registry JSON) and
+    /// would take effect for any non-MonitoringPr resume that happens to have wake_reason set.
     #[serde(default)]
     pub wake_reason: Option<String>,
 }

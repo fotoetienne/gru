@@ -367,10 +367,10 @@ const WAKE_COOLDOWN: Duration = Duration::from_secs(5 * 60);
 /// Returns the IDs of Completed minions eligible for a review wake-up check.
 ///
 /// A candidate must:
-/// - Be in the `Completed` phase
+/// - Be in the `Completed` phase (this also implicitly prevents double-flip: a minion
+///   already flipped to `MonitoringPr` will no longer match `== Completed`)
 /// - Have a PR number (no point polling if there's no PR)
 /// - Not exceed `max_attempts` (bounded autonomy)
-/// - Not already be in `MonitoringPr` (prevents double-flip)
 pub(crate) fn find_wake_candidates(
     minions: &[(String, MinionInfo)],
     max_attempts: u32,
@@ -392,11 +392,27 @@ pub(crate) fn find_wake_candidates(
 /// - `pr_open`: the PR is still open (not merged or closed)
 /// - `unaddressed_reviews > 0`: there are new external reviews to address
 ///
-/// Note: cooldown rate-limiting is enforced by the caller *before* making GitHub API
-/// calls. This function encapsulates only the per-minion wake decision after reviews
-/// are fetched, keeping it a simple testable predicate over the fetched state.
+/// Note: cooldown rate-limiting is enforced separately via `within_wake_cooldown` before
+/// any GitHub API calls are made. This function encapsulates only the per-minion wake
+/// decision after reviews are fetched, keeping it a simple testable predicate.
 pub(crate) fn should_wake_minion(pr_open: bool, unaddressed_reviews: usize) -> bool {
     pr_open && unaddressed_reviews > 0
+}
+
+/// Returns true if a minion is still within the wake cooldown window.
+///
+/// Used to rate-limit GitHub API calls per minion. `last_check` defaults to
+/// `DateTime::UNIX_EPOCH` for minions that have never been checked.
+pub(crate) fn within_wake_cooldown(
+    last_check: DateTime<Utc>,
+    now: DateTime<Utc>,
+    cooldown: Duration,
+) -> bool {
+    let elapsed = now
+        .signed_duration_since(last_check)
+        .to_std()
+        .unwrap_or(Duration::ZERO);
+    elapsed < cooldown
 }
 
 /// Scan Completed minions for open PRs with new external reviews, and flip them back
@@ -439,11 +455,12 @@ async fn find_minions_needing_review_wake(
             .unwrap_or(DateTime::UNIX_EPOCH);
 
         // Skip if the cooldown window hasn't elapsed (avoids burning GitHub API quota).
-        let elapsed = Utc::now()
-            .signed_duration_since(last_check)
-            .to_std()
-            .unwrap_or(Duration::ZERO);
-        if elapsed < WAKE_COOLDOWN {
+        let now = Utc::now();
+        if within_wake_cooldown(last_check, now, WAKE_COOLDOWN) {
+            let elapsed = now
+                .signed_duration_since(last_check)
+                .to_std()
+                .unwrap_or(Duration::ZERO);
             log::debug!(
                 "Skipping wake check for {} (cooldown: {:.0?} remaining)",
                 minion_id,
@@ -1683,6 +1700,41 @@ mod tests {
         let minions = vec![("M001".to_string(), info)];
         let candidates = find_wake_candidates(&minions, 3);
         assert_eq!(candidates, vec!["M001"]);
+    }
+
+    // --- within_wake_cooldown tests ---
+
+    #[test]
+    fn test_within_wake_cooldown_true_when_recently_checked() {
+        let now = Utc::now();
+        let last_check = now - chrono::Duration::seconds(60); // 1 minute ago
+        let cooldown = Duration::from_secs(5 * 60); // 5 minute cooldown
+        assert!(
+            within_wake_cooldown(last_check, now, cooldown),
+            "Should be within cooldown when only 1 minute has elapsed of a 5-minute cooldown"
+        );
+    }
+
+    #[test]
+    fn test_within_wake_cooldown_false_when_cooldown_elapsed() {
+        let now = Utc::now();
+        let last_check = now - chrono::Duration::seconds(6 * 60); // 6 minutes ago
+        let cooldown = Duration::from_secs(5 * 60); // 5 minute cooldown
+        assert!(
+            !within_wake_cooldown(last_check, now, cooldown),
+            "Should not be within cooldown when 6 minutes have elapsed of a 5-minute cooldown"
+        );
+    }
+
+    #[test]
+    fn test_within_wake_cooldown_false_for_epoch_default() {
+        // DateTime::UNIX_EPOCH is the default for never-checked minions; cooldown must not block them.
+        let now = Utc::now();
+        let cooldown = Duration::from_secs(5 * 60);
+        assert!(
+            !within_wake_cooldown(DateTime::UNIX_EPOCH, now, cooldown),
+            "Never-checked minion (epoch default) must pass the cooldown check"
+        );
     }
 
     // --- should_wake_minion tests ---
