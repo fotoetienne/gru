@@ -137,15 +137,15 @@ struct Head {
 }
 
 #[derive(Debug, Deserialize)]
-struct Review {
+pub(crate) struct Review {
     id: u64,
-    submitted_at: DateTime<Utc>,
-    user: User,
+    pub(crate) submitted_at: DateTime<Utc>,
+    pub(crate) user: User,
 }
 
 #[derive(Debug, Deserialize)]
-struct User {
-    login: String,
+pub(crate) struct User {
+    pub(crate) login: String,
 }
 
 /// A review comment with file location and content
@@ -695,7 +695,7 @@ async fn get_pr(host: &str, owner: &str, repo: &str, pr_number: &str) -> Result<
 }
 
 /// Fetch all reviews for a PR with retry logic for transient failures
-async fn get_all_reviews(
+pub(crate) async fn get_all_reviews(
     host: &str,
     owner: &str,
     repo: &str,
@@ -813,6 +813,46 @@ async fn get_check_runs(host: &str, owner: &str, repo: &str, sha: &str) -> Resul
         .context("Failed to parse check runs JSON response")?;
 
     Ok(response.check_runs)
+}
+
+/// Returns the count of external (non-author) reviews submitted after `since`.
+///
+/// "Unaddressed" means: submitted after the baseline and not from the PR author.
+/// Used to decide whether to post a monitoring-paused notification on exit.
+pub(crate) fn has_unaddressed_reviews(
+    reviews: &[Review],
+    pr_author: &str,
+    since: DateTime<Utc>,
+) -> usize {
+    reviews
+        .iter()
+        .filter(|r| r.submitted_at > since && r.user.login != pr_author)
+        .count()
+}
+
+/// Returns true if a monitoring-paused notification should be posted.
+///
+/// Notification is suppressed when the PR is closed/merged (`pr_open == false`)
+/// or when there are no unaddressed external reviews.
+pub(crate) fn should_post_exit_notification(pr_open: bool, unaddressed_count: usize) -> bool {
+    pr_open && unaddressed_count > 0
+}
+
+/// Fetch just the fields needed for exit-notification decisions without
+/// exposing internal types to callers.
+///
+/// Returns `(is_open, pr_author_login)`.
+pub(crate) async fn get_pr_info_for_exit_notification(
+    host: &str,
+    owner: &str,
+    repo: &str,
+    pr_number: &str,
+) -> Result<(bool, String)> {
+    let pr = get_pr(host, owner, repo, pr_number).await?;
+    // A merged PR has state="closed" AND merged=true. Check both to guard
+    // against the narrow race where state hasn't propagated yet.
+    let is_open = pr.state != "closed" && !pr.merged;
+    Ok((is_open, pr.user.login))
 }
 
 #[cfg(test)]
@@ -1812,4 +1852,59 @@ mod tests {
     }
 
     // Merge readiness tests are in the unified merge_readiness module.
+
+    // ========================================================================
+    // Exit Notification Tests
+    // ========================================================================
+
+    fn make_review_with_login(login: &str, submitted_at: &str) -> Review {
+        Review {
+            id: 1,
+            submitted_at: submitted_at.parse().unwrap(),
+            user: User {
+                login: login.to_string(),
+            },
+        }
+    }
+
+    #[test]
+    fn test_has_unaddressed_reviews_filters_pr_author() {
+        let since = "2024-01-01T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        let reviews = vec![
+            make_review_with_login("minion-bot", "2024-01-02T00:00:00Z"), // PR author — excluded
+            make_review_with_login("alice", "2024-01-02T00:00:00Z"),      // external reviewer
+        ];
+        assert_eq!(has_unaddressed_reviews(&reviews, "minion-bot", since), 1);
+    }
+
+    #[test]
+    fn test_has_unaddressed_reviews_returns_zero_before_baseline() {
+        let since = "2024-01-10T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        let reviews = vec![
+            make_review_with_login("alice", "2024-01-05T00:00:00Z"), // before baseline
+            make_review_with_login("alice", "2024-01-10T00:00:00Z"), // equal to baseline — excluded (uses >)
+        ];
+        assert_eq!(has_unaddressed_reviews(&reviews, "bot", since), 0);
+    }
+
+    #[test]
+    fn test_has_unaddressed_reviews_empty_list() {
+        let since = "2024-01-01T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        assert_eq!(has_unaddressed_reviews(&[], "bot", since), 0);
+    }
+
+    #[test]
+    fn test_should_post_exit_notification_false_when_pr_closed() {
+        assert!(!should_post_exit_notification(false, 3));
+    }
+
+    #[test]
+    fn test_should_post_exit_notification_false_when_no_unaddressed() {
+        assert!(!should_post_exit_notification(true, 0));
+    }
+
+    #[test]
+    fn test_should_post_exit_notification_true_when_open_and_unaddressed() {
+        assert!(should_post_exit_notification(true, 2));
+    }
 }
