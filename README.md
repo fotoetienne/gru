@@ -146,8 +146,16 @@ cargo build
 
 ### Running Tests
 
+This project uses [cargo-nextest](https://nexte.st/) as the test runner. Install it first:
+
 ```bash
-cargo test
+cargo install cargo-nextest
+```
+
+Then run tests:
+
+```bash
+cargo nextest run
 ```
 
 ### Running Clippy

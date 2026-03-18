@@ -21,13 +21,13 @@ install:
 update:
     git pull && just install
 
-# Run all tests
+# Run all tests (requires cargo-nextest: cargo install cargo-nextest)
 test:
-    cargo test
+    cargo nextest run
 
 # Run tests with output
 test-verbose:
-    cargo test -- --nocapture
+    cargo nextest run --no-capture
 
 # Run clippy linter with warnings as errors
 lint:
