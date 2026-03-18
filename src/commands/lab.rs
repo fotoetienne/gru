@@ -344,8 +344,17 @@ fn host_for_repo(config: &LabConfig, owner_repo: &str) -> Option<String> {
 /// Scan the registry for minions that can be resumed.
 ///
 /// A minion is resumable if:
-/// - Its process is not running (mode is Stopped, or mode is Autonomous/Interactive
-///   but the PID is dead — e.g. after SIGKILL before cleanup could run)
+/// - Its process is not running. Two cases are distinguished:
+///
+///   1. `mode == Stopped` — the minion was cleanly stopped; no PID is present.
+///   2. Running-mode (`Autonomous`/`Interactive`) with a recorded PID that is now
+///      dead — e.g. after SIGKILL before cleanup could run.
+///
+///   We require a PID to be present for case 2 to avoid a false positive during the
+///   transient startup window: `check_and_claim_session` sets `mode = Autonomous` but
+///   the outer lab hasn't written the PID yet. In that window `is_running()` returns
+///   false (no PID ⟹ false), which would incorrectly flag the minion as dead.
+///   Gating on `pid.is_some()` excludes that window.
 /// - Its orchestration phase is active (RunningAgent, CreatingPr, or MonitoringPr)
 /// - Its worktree still exists on disk
 /// - Its repo is in the Lab config
@@ -356,7 +365,8 @@ async fn find_resumable_minions(config: &LabConfig) -> Result<Vec<ResumableMinio
             .list()
             .into_iter()
             .filter(|(_id, info)| {
-                let process_dead = info.mode == MinionMode::Stopped || !info.is_running();
+                let process_dead =
+                    info.mode == MinionMode::Stopped || (info.pid.is_some() && !info.is_running());
                 process_dead
                     && info.orchestration_phase.is_active()
                     && info.worktree.exists()
