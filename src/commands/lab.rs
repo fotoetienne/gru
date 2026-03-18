@@ -651,6 +651,24 @@ async fn mark_exhausted_minion(minion_id: &str, info: &MinionInfo, host: &str, r
     let _ = github::mark_issue_failed_via_cli(host, owner, repo_name, info.issue).await;
 }
 
+/// Sort candidates by minion ID descending (most recent first) and deduplicate by
+/// `(repo, issue_number)`, keeping only the first (highest-ID) candidate per issue.
+///
+/// IDs are zero-padded base36 strings — `(length DESC, lowercased-string DESC)` gives the
+/// correct numeric order and handles legacy uppercase IDs produced by older gru versions.
+fn sort_and_dedup_resumable(mut candidates: Vec<ResumableMinion>) -> Vec<ResumableMinion> {
+    candidates.sort_by_cached_key(|c| {
+        let key = c.minion_id.to_ascii_lowercase();
+        std::cmp::Reverse((c.minion_id.len(), key))
+    });
+
+    let mut seen: HashSet<(String, u64)> = HashSet::new();
+    candidates
+        .into_iter()
+        .filter(|c| seen.insert((c.info.repo.clone(), c.info.issue)))
+        .collect()
+}
+
 /// Resume interrupted minions, filling available slots before new issue claims.
 ///
 /// Returns the number of minions successfully resumed.
@@ -665,7 +683,7 @@ async fn resume_interrupted_minions(
         return Ok(0);
     }
 
-    let mut resumable: Vec<_> = find_resumable_minions(config)
+    let resumable: Vec<_> = find_resumable_minions(config)
         .await?
         .into_iter()
         .filter(|c| {
@@ -686,17 +704,9 @@ async fn resume_interrupted_minions(
         return Ok(0);
     }
 
-    // Sort by minion ID descending so the most recent minion per issue is preferred.
-    // IDs are zero-padded base36 strings, so (length DESC, string DESC) gives the
-    // correct numeric order.  Normalize to lowercase before comparing so that legacy
-    // uppercase IDs (produced by earlier versions of gru) sort correctly alongside
-    // current lowercase ones.
-    resumable.sort_by(|a, b| {
-        b.minion_id
-            .len()
-            .cmp(&a.minion_id.len())
-            .then_with(|| b.minion_id.to_lowercase().cmp(&a.minion_id.to_lowercase()))
-    });
+    // Sort by recency and deduplicate per (repo, issue): only the most recent minion
+    // per issue is retained, preventing concurrent resumes for the same issue.
+    let resumable = sort_and_dedup_resumable(resumable);
 
     println!(
         "🔄 Found {} resumable Minion(s) from previous session",
@@ -704,27 +714,10 @@ async fn resume_interrupted_minions(
     );
 
     let mut resumed = 0;
-    // Per-cycle deduplication: track which (repo, issue) pairs have already had a
-    // minion queued for resume in this poll cycle.  Without this guard, when N
-    // stopped minions share the same issue (e.g. after repeated lab restarts), all N
-    // pass the per-session minion-ID filter and are resumed concurrently, causing
-    // duplicate PR reviews and conflicting actions.
-    let mut resumed_issues: HashSet<(String, u64)> = HashSet::new();
 
     for candidate in resumable {
         if *available == 0 {
             break;
-        }
-
-        let issue_key = (candidate.info.repo.clone(), candidate.info.issue);
-        if resumed_issues.contains(&issue_key) {
-            log::info!(
-                "Skipping {} (issue #{}, {}): another minion for this issue is already resuming this cycle",
-                candidate.minion_id,
-                candidate.info.issue,
-                candidate.info.repo,
-            );
-            continue;
         }
 
         let host = match host_for_repo(config, &candidate.info.repo) {
@@ -813,9 +806,6 @@ async fn resume_interrupted_minions(
 
         // Record this minion as attempted regardless of outcome
         resumed_this_session.insert(candidate.minion_id.clone());
-        // Claim the issue slot for this cycle so no other minion for the same
-        // issue is resumed, even if the spawn below fails.
-        resumed_issues.insert(issue_key);
 
         match spawn_resume(&candidate.minion_id).await {
             Ok(child) => {
@@ -1804,5 +1794,111 @@ mod tests {
             should_wake_minion(true, 1),
             "Wake-up must trigger when PR is open and reviews are pending"
         );
+    }
+
+    // --- sort_and_dedup_resumable tests ---
+
+    fn make_resumable(minion_id: &str, repo: &str, issue: u64) -> ResumableMinion {
+        use crate::minion_registry::{MinionInfo, MinionMode, OrchestrationPhase};
+        use chrono::Utc;
+        use std::path::PathBuf;
+        let now = Utc::now();
+        ResumableMinion {
+            minion_id: minion_id.to_string(),
+            info: MinionInfo {
+                repo: repo.to_string(),
+                issue,
+                command: "do".to_string(),
+                prompt: String::new(),
+                started_at: now,
+                branch: format!("minion/issue-{}-{}", issue, minion_id),
+                worktree: PathBuf::from("/tmp/test"),
+                status: "active".to_string(),
+                pr: None,
+                session_id: uuid::Uuid::new_v4().to_string(),
+                pid: None,
+                pid_start_time: None,
+                mode: MinionMode::Stopped,
+                last_activity: now,
+                orchestration_phase: OrchestrationPhase::RunningAgent,
+                token_usage: None,
+                agent_name: "claude".to_string(),
+                timeout_deadline: None,
+                attempt_count: 0,
+                no_watch: false,
+                last_review_check_time: None,
+                wake_reason: None,
+            },
+        }
+    }
+
+    #[test]
+    fn test_sort_and_dedup_resumable_picks_most_recent() {
+        // Three minions for the same issue; M003 is the most recent and should win.
+        let candidates = vec![
+            make_resumable("M001", "owner/repo", 42),
+            make_resumable("M003", "owner/repo", 42),
+            make_resumable("M002", "owner/repo", 42),
+        ];
+        let result = sort_and_dedup_resumable(candidates);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].minion_id, "M003");
+    }
+
+    #[test]
+    fn test_sort_and_dedup_resumable_keeps_one_per_issue() {
+        // Two issues, two minions each; only the newer one per issue should survive.
+        let candidates = vec![
+            make_resumable("M001", "owner/repo", 10),
+            make_resumable("M004", "owner/repo", 10),
+            make_resumable("M002", "owner/repo", 20),
+            make_resumable("M003", "owner/repo", 20),
+        ];
+        let result = sort_and_dedup_resumable(candidates);
+        assert_eq!(result.len(), 2);
+        let ids: Vec<&str> = result.iter().map(|r| r.minion_id.as_str()).collect();
+        assert!(
+            ids.contains(&"M004"),
+            "issue 10: expected M004, got {:?}",
+            ids
+        );
+        assert!(
+            ids.contains(&"M003"),
+            "issue 20: expected M003, got {:?}",
+            ids
+        );
+    }
+
+    #[test]
+    fn test_sort_and_dedup_resumable_legacy_uppercase_ids() {
+        // Legacy IDs used uppercase letters for digits 10-35.
+        // M00Z (legacy) and M00a (current) both represent 35; M00a is a current-format
+        // ID while M00Z is legacy.  The sort must not incorrectly rank the legacy
+        // uppercase ID higher than a current ID with the same numeric value.
+        // M010 = 36, which is strictly greater than M00z = 35, so M010 must win.
+        let candidates = vec![
+            make_resumable("M00Z", "owner/repo", 1), // legacy uppercase, value = 35
+            make_resumable("M010", "owner/repo", 1), // current lowercase, value = 36
+        ];
+        let result = sort_and_dedup_resumable(candidates);
+        assert_eq!(result.len(), 1);
+        assert_eq!(
+            result[0].minion_id, "M010",
+            "M010 (36) must rank higher than M00Z (35)"
+        );
+    }
+
+    #[test]
+    fn test_sort_and_dedup_resumable_empty() {
+        let result = sort_and_dedup_resumable(vec![]);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_sort_and_dedup_resumable_single() {
+        let candidates = vec![make_resumable("M001", "owner/repo", 42)];
+        let result = sort_and_dedup_resumable(candidates);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].minion_id, "M001");
     }
 }
