@@ -872,8 +872,16 @@ pub async fn list_pr_reviews(
 
     // --paginate --jq '.[]' outputs one JSON object per line (NDJSON).
     let stdout = String::from_utf8_lossy(&output.stdout);
+    parse_pr_reviews_ndjson(&stdout)
+}
+
+/// Parse a newline-delimited JSON stream of PR review objects.
+///
+/// `--paginate --jq '.[]'` emits one JSON object per line; this helper
+/// is extracted for unit testing without network access.
+pub fn parse_pr_reviews_ndjson(ndjson: &str) -> Result<Vec<PrReview>> {
     let mut reviews = Vec::new();
-    for line in stdout.lines() {
+    for line in ndjson.lines() {
         let line = line.trim();
         if line.is_empty() {
             continue;
@@ -1034,6 +1042,26 @@ mod tests {
         assert_eq!(reviews[0].user.login, "gru-bot");
         assert_eq!(reviews[0].commit_id, "abc123");
         assert_eq!(reviews[0].state, "APPROVED");
+    }
+
+    #[test]
+    fn test_parse_pr_reviews_ndjson() {
+        // Exercises the actual parsing path used by list_pr_reviews
+        let ndjson = concat!(
+            "{\"user\":{\"login\":\"gru-bot\"},\"commit_id\":\"abc123\",\"state\":\"APPROVED\"}\n",
+            "{\"user\":{\"login\":\"human\"},\"commit_id\":\"abc123\",\"state\":\"CHANGES_REQUESTED\"}\n",
+            "\n", // blank line should be skipped
+        );
+        let reviews = parse_pr_reviews_ndjson(ndjson).unwrap();
+        assert_eq!(reviews.len(), 2);
+        assert_eq!(reviews[0].user.login, "gru-bot");
+        assert_eq!(reviews[1].state, "CHANGES_REQUESTED");
+    }
+
+    #[test]
+    fn test_parse_pr_reviews_ndjson_empty() {
+        let reviews = parse_pr_reviews_ndjson("").unwrap();
+        assert!(reviews.is_empty());
     }
 
     // --- infer_github_host tests ---
