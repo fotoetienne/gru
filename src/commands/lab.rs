@@ -388,24 +388,15 @@ pub(crate) fn find_wake_candidates(
 
 /// Returns true if a Completed minion should be woken up based on PR and review state.
 ///
-/// All conditions must hold:
+/// Conditions:
 /// - `pr_open`: the PR is still open (not merged or closed)
 /// - `unaddressed_reviews > 0`: there are new external reviews to address
-/// - cooldown has elapsed since `last_check` (rate-limits GitHub API calls)
-pub(crate) fn should_wake_minion(
-    pr_open: bool,
-    unaddressed_reviews: usize,
-    last_check: DateTime<Utc>,
-    cooldown: Duration,
-) -> bool {
-    if !pr_open || unaddressed_reviews == 0 {
-        return false;
-    }
-    Utc::now()
-        .signed_duration_since(last_check)
-        .to_std()
-        .map(|elapsed| elapsed >= cooldown)
-        .unwrap_or(false)
+///
+/// Note: cooldown rate-limiting is enforced by the caller *before* making GitHub API
+/// calls. This function encapsulates only the per-minion wake decision after reviews
+/// are fetched, keeping it a simple testable predicate over the fetched state.
+pub(crate) fn should_wake_minion(pr_open: bool, unaddressed_reviews: usize) -> bool {
+    pr_open && unaddressed_reviews > 0
 }
 
 /// Scan Completed minions for open PRs with new external reviews, and flip them back
@@ -515,7 +506,7 @@ async fn find_minions_needing_review_wake(
         let since = info.last_review_check_time.unwrap_or(info.started_at);
         let unaddressed = pr_monitor::has_unaddressed_reviews(&reviews, &pr_author, since);
 
-        if !should_wake_minion(pr_open, unaddressed, last_check, WAKE_COOLDOWN) {
+        if !should_wake_minion(pr_open, unaddressed) {
             log::debug!(
                 "No wake needed for {} (pr_open={}, unaddressed={})",
                 minion_id,
@@ -1673,16 +1664,16 @@ mod tests {
     }
 
     #[test]
-    fn test_find_wake_candidates_skips_non_completed_phases() {
+    fn test_find_wake_candidates_requires_completed_phase() {
         use crate::minion_registry::OrchestrationPhase;
         let mut info = make_completed_minion(Some("10"), 0);
-        // MonitoringPr is an active phase, not Completed — must be skipped
+        // MonitoringPr is an active phase, not Completed — excluded by the == Completed check
         info.orchestration_phase = OrchestrationPhase::MonitoringPr;
         let minions = vec![("M001".to_string(), info)];
         let candidates = find_wake_candidates(&minions, 3);
         assert!(
             candidates.is_empty(),
-            "Minion in MonitoringPr phase must not be a candidate (prevents double-flip)"
+            "Only Completed-phase minions are candidates; any other phase is excluded"
         );
     }
 
@@ -1698,39 +1689,25 @@ mod tests {
 
     #[test]
     fn test_should_wake_minion_false_for_closed_pr() {
-        let old_check = chrono::Utc::now() - chrono::Duration::hours(1);
         assert!(
-            !should_wake_minion(false, 2, old_check, Duration::from_secs(300)),
+            !should_wake_minion(false, 2),
             "Closed/merged PR must never trigger wake-up"
         );
     }
 
     #[test]
     fn test_should_wake_minion_false_for_no_reviews() {
-        let old_check = chrono::Utc::now() - chrono::Duration::hours(1);
         assert!(
-            !should_wake_minion(true, 0, old_check, Duration::from_secs(300)),
+            !should_wake_minion(true, 0),
             "Open PR with zero unaddressed reviews must not trigger wake-up"
         );
     }
 
     #[test]
-    fn test_should_wake_minion_respects_cooldown() {
-        // last_check is very recent — cooldown not elapsed
-        let recent_check = chrono::Utc::now() - chrono::Duration::seconds(10);
-        assert!(
-            !should_wake_minion(true, 1, recent_check, Duration::from_secs(300)),
-            "Wake-up must be suppressed when within cooldown window"
-        );
-    }
-
-    #[test]
     fn test_should_wake_minion_true_when_all_conditions_met() {
-        // PR open, reviews pending, cooldown elapsed
-        let old_check = chrono::Utc::now() - chrono::Duration::hours(1);
         assert!(
-            should_wake_minion(true, 1, old_check, Duration::from_secs(300)),
-            "Wake-up must trigger when PR is open, reviews pending, and cooldown elapsed"
+            should_wake_minion(true, 1),
+            "Wake-up must trigger when PR is open and reviews are pending"
         );
     }
 }
