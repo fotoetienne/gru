@@ -688,12 +688,14 @@ async fn resume_interrupted_minions(
 
     // Sort by minion ID descending so the most recent minion per issue is preferred.
     // IDs are zero-padded base36 strings, so (length DESC, string DESC) gives the
-    // correct numeric order.
+    // correct numeric order.  Normalize to lowercase before comparing so that legacy
+    // uppercase IDs (produced by earlier versions of gru) sort correctly alongside
+    // current lowercase ones.
     resumable.sort_by(|a, b| {
         b.minion_id
             .len()
             .cmp(&a.minion_id.len())
-            .then_with(|| b.minion_id.cmp(&a.minion_id))
+            .then_with(|| b.minion_id.to_lowercase().cmp(&a.minion_id.to_lowercase()))
     });
 
     println!(
@@ -710,6 +712,10 @@ async fn resume_interrupted_minions(
     let mut resumed_issues: HashSet<(String, u64)> = HashSet::new();
 
     for candidate in resumable {
+        if *available == 0 {
+            break;
+        }
+
         let issue_key = (candidate.info.repo.clone(), candidate.info.issue);
         if resumed_issues.contains(&issue_key) {
             log::info!(
@@ -719,9 +725,6 @@ async fn resume_interrupted_minions(
                 candidate.info.repo,
             );
             continue;
-        }
-        if *available == 0 {
-            break;
         }
 
         let host = match host_for_repo(config, &candidate.info.repo) {
