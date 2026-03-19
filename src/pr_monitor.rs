@@ -807,29 +807,19 @@ pub fn format_review_prompt(
     prompt.push_str("Please make the requested changes, run tests, and commit.\n\n");
 
     // Instruct the agent to reply to each review comment thread
-    prompt.push_str(
+    prompt.push_str(&format!(
         "After committing your changes, reply to EACH review comment thread to explain what you changed. \
-        For each comment, post an inline reply using the GitHub API:\n\n\
-        ```\n\
-        gh api repos/",
-    );
-    prompt.push_str(owner);
-    prompt.push('/');
-    prompt.push_str(repo);
-    prompt.push_str("/pulls/");
-    prompt.push_str(pr_number);
-    prompt.push_str("/comments -f body=\"<reply text>\n\n<sub>🤖 ");
-    prompt.push_str(minion_id);
-    prompt.push_str(
-        "</sub>\" -F in_reply_to=<comment_id>\n\
-        ```\n\n\
-        Where `<comment_id>` is the Comment ID listed above for each review comment. \
-        Each reply must:\n\
-        - Summarize what was changed to address the feedback\n\
-        - End with the signature: `\\n\\n<sub>🤖 ",
-    );
-    prompt.push_str(minion_id);
-    prompt.push_str("</sub>`\n");
+For each comment, post an inline reply using the GitHub API:\n\n\
+```\n\
+gh api --method POST repos/{owner}/{repo}/pulls/{pr_number}/comments \\\n  \
+-f body=$'<reply text>\\n\\n<sub>🤖 {minion_id}</sub>' \\\n  \
+-F in_reply_to=<comment_id>\n\
+```\n\n\
+Where `<comment_id>` is the Comment ID listed above for each review comment. \
+Each reply must:\n\
+- Summarize what was changed to address the feedback\n\
+- End with the signature: `\\n\\n<sub>🤖 {minion_id}</sub>`\n"
+    ));
 
     prompt
 }
@@ -949,6 +939,8 @@ mod tests {
         assert!(prompt.contains("@bob"));
         assert!(prompt.contains("**Comment ID:** 2001"));
         assert!(prompt.contains("**Comment ID:** 2002"));
+        assert!(prompt.contains("in_reply_to"));
+        assert!(prompt.contains("End with the signature"));
     }
 
     #[test]
