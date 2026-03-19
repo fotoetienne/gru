@@ -40,8 +40,19 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "cargo-deps"
+
+      - name: Install Just
+        uses: extractions/setup-just@v2
+
       - name: Install cargo-audit
         uses: taiki-e/install-action@cargo-audit
 
-      - name: Run cargo audit
-        run: cargo audit
+      - name: Run security audit
+        run: just audit
