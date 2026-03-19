@@ -4,6 +4,13 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.73"
 license = "Apache-2.0"
+description = "A local-first LLM agent orchestrator that autonomously works on GitHub issues"
+authors = ["Stephen Spalding"]
+repository = "https://github.com/fotoetienne/gru"
+homepage = "https://github.com/fotoetienne/gru"
+readme = "README.md"
+keywords = ["ai", "agent", "github", "automation", "llm"]
+categories = ["command-line-utilities", "development-tools"]
 
 [dependencies]
 anyhow = "1.0"
