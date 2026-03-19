@@ -7,7 +7,6 @@ license = "Apache-2.0"
 description = "A local-first LLM agent orchestrator that autonomously works on GitHub issues"
 authors = ["Stephen Spalding"]
 repository = "https://github.com/fotoetienne/gru"
-homepage = "https://github.com/fotoetienne/gru"
 readme = "README.md"
 keywords = ["ai", "agent", "github", "automation", "llm"]
 categories = ["command-line-utilities", "development-tools"]
