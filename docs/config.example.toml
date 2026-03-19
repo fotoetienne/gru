@@ -64,11 +64,13 @@
 # [agent]
 # Which backend to use by default. Options: "claude", "codex"
 # Can be overridden per-run with `gru do 42 --agent codex`.
+# For codex setup details, see docs/AGENTS.md.
 # default = "claude"
 
 # [agent.claude]
 # Override the Claude Code CLI binary path. Useful if claude is
 # installed somewhere other than your $PATH.
+# Can be set without [agent] above if you only need a binary override.
 # binary = "/usr/local/bin/claude"
 
 # ─────────────────────────────────────────────────────────────────────
@@ -77,7 +79,7 @@
 # Controls when Gru considers a PR safe to merge.
 
 # [merge]
-# Confidence threshold (1-10) for the merge-readiness judge.
+# Confidence threshold for the merge-readiness judge (recommended: 1-10).
 # Higher = more conservative. The judge must score >= this value
 # before Gru will merge a PR.
 # confidence_threshold = 8
