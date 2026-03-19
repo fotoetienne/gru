@@ -1,0 +1,110 @@
+# Gru configuration file
+# Location: ~/.gru/config.toml
+#
+# All sections and fields are optional. Defaults are shown in comments.
+# Uncomment and modify the sections you need.
+
+# ─────────────────────────────────────────────────────────────────────
+# GitHub Enterprise Server (GHES) hosts
+# ─────────────────────────────────────────────────────────────────────
+# Define named hosts so you can reference them in daemon.repos as
+# "name:owner/repo" instead of spelling out "ghe.example.com/owner/repo".
+#
+# You can define as many hosts as you need. github.com is always
+# available implicitly — you don't need to define it here.
+
+# [github_hosts.mycompany]
+# host = "ghe.mycompany.com"
+# # web_url is optional — only set it if the web UI lives on a different
+# # domain than the git/API host (uncommon).
+# # web_url = "https://github.mycompany.com"
+
+# Example: a second GHES instance
+# [github_hosts.labs]
+# host = "git.labs.example.com"
+
+# ─────────────────────────────────────────────────────────────────────
+# Daemon settings (used by `gru lab`)
+# ─────────────────────────────────────────────────────────────────────
+# The [daemon] section configures Lab mode, where Gru continuously
+# polls for gru:todo issues and spawns Minions to work on them.
+# This section is required for `gru lab` but optional for `gru do`.
+
+# [daemon]
+# Repositories to monitor. Required for `gru lab`.
+# Three formats are supported:
+#   "owner/repo"              — github.com (most common)
+#   "name:owner/repo"         — uses a named host from [github_hosts]
+#   "ghe.example.com/org/svc" — legacy explicit-host format
+#
+# Multi-repo example:
+# repos = [
+#     "myorg/frontend",
+#     "myorg/backend",
+#     "mycompany:internal/platform",
+# ]
+
+# How often to poll for new issues, in seconds.
+# poll_interval_secs = 30
+
+# Maximum Minions running at the same time.
+# max_slots = 2
+
+# Issue label that triggers Gru to pick up work.
+# label = "gru:todo"
+
+# How many times to resume a stuck Minion before marking it failed.
+# max_resume_attempts = 3
+
+# ─────────────────────────────────────────────────────────────────────
+# Agent backend
+# ─────────────────────────────────────────────────────────────────────
+# Configure which AI agent Gru delegates coding work to.
+
+# [agent]
+# Which backend to use by default. Options: "claude", "codex"
+# Can be overridden per-run with `gru do 42 --agent codex`.
+# default = "claude"
+
+# [agent.claude]
+# Override the Claude Code CLI binary path. Useful if claude is
+# installed somewhere other than your $PATH.
+# binary = "/usr/local/bin/claude"
+
+# ─────────────────────────────────────────────────────────────────────
+# Merge readiness
+# ─────────────────────────────────────────────────────────────────────
+# Controls when Gru considers a PR safe to merge.
+
+# [merge]
+# Confidence threshold (1-10) for the merge-readiness judge.
+# Higher = more conservative. The judge must score >= this value
+# before Gru will merge a PR.
+# confidence_threshold = 8
+
+# ─────────────────────────────────────────────────────────────────────
+# Full GHES example
+# ─────────────────────────────────────────────────────────────────────
+# Here's a complete config for a team using GitHub Enterprise Server
+# with two repos, higher concurrency, and a custom agent binary:
+#
+# [github_hosts.corp]
+# host = "ghe.corp.com"
+#
+# [daemon]
+# repos = [
+#     "corp:platform/api-gateway",
+#     "corp:platform/web-ui",
+# ]
+# poll_interval_secs = 60
+# max_slots = 4
+# max_resume_attempts = 5
+#
+# [agent]
+# default = "claude"
+#
+# [agent.claude]
+# binary = "/opt/tools/claude"
+#
+# [merge]
+# confidence_threshold = 9
