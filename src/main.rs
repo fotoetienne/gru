@@ -39,10 +39,13 @@ use commands::{
     status, stop, tail,
 };
 
+/// Version string including git hash (e.g., "0.1.0 (abc1234)")
+const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (", env!("GRU_GIT_HASH"), ")");
+
 /// CLI structure for the Gru agent orchestrator
 #[derive(Parser)]
 #[command(name = "gru")]
-#[command(version)]
+#[command(version = VERSION)]
 #[command(about = "Local-First LLM Agent Orchestrator", long_about = None)]
 struct Cli {
     #[command(subcommand)]

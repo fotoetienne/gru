@@ -1,0 +1,92 @@
+# git-cliff configuration for Gru
+# https://git-cliff.org/docs/configuration
+
+[changelog]
+header = """# Changelog
+
+All notable changes to this project will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).\n
+"""
+body = """
+{%- macro remote_url() -%}
+  https://github.com/{{ remote.github.owner }}/{{ remote.github.repo }}
+{%- endmacro -%}
+
+{% if version -%}
+    ## [{{ version | trim_start_matches(pat="v") }}] - {{ timestamp | date(format="%Y-%m-%d") }}
+{% else -%}
+    ## [Unreleased]
+{% endif -%}
+
+{% for group, commits in commits | group_by(attribute="group") %}
+    ### {{ group | striptags | trim }}
+    {% for commit in commits %}
+        - {% if commit.scope %}*({{ commit.scope }})* {% endif %}{{ commit.message | upper_first | trim }}\
+            {% if commit.github.username %} by @{{ commit.github.username }}{%- endif -%}
+            {% if commit.github.pr_number %} in [#{{ commit.github.pr_number }}]({{ self::remote_url() }}/pull/{{ commit.github.pr_number }}){%- endif %}
+    {%- endfor %}
+{% endfor %}
+"""
+footer = """
+{%- macro remote_url() -%}
+  https://github.com/{{ remote.github.owner }}/{{ remote.github.repo }}
+{%- endmacro -%}
+
+{% for release in releases -%}
+    {% if release.version -%}
+        {% if release.previous.version -%}
+            [{{ release.version | trim_start_matches(pat="v") }}]: {{ self::remote_url() }}/compare/{{ release.previous.version }}...{{ release.version }}
+        {% else -%}
+            [{{ release.version | trim_start_matches(pat="v") }}]: {{ self::remote_url() }}/releases/tag/{{ release.version }}
+        {% endif -%}
+    {% else -%}
+        {% if release.previous.version -%}
+            [Unreleased]: {{ self::remote_url() }}/compare/{{ release.previous.version }}...HEAD
+        {% endif -%}
+    {% endif -%}
+{% endfor %}
+"""
+trim = true
+
+[git]
+conventional_commits = true
+filter_unconventional = false
+split_commits = false
+commit_parsers = [
+    # GitHub PR labels (matched via --github-repo integration)
+    { field = "github.pr_labels", pattern = "feature", group = "Added" },
+    { field = "github.pr_labels", pattern = "enhancement", group = "Changed" },
+    { field = "github.pr_labels", pattern = "bug", group = "Fixed" },
+    { field = "github.pr_labels", pattern = "documentation", group = "Documentation" },
+    { field = "github.pr_labels", pattern = "security", group = "Security" },
+    { field = "github.pr_labels", pattern = "dependencies", group = "Dependencies" },
+
+    # Conventional commits fallback
+    { message = "^feat", group = "Added" },
+    { message = "^fix", group = "Fixed" },
+    { message = "^doc", group = "Documentation" },
+    { message = "^perf", group = "Changed" },
+    { message = "^refactor", group = "Changed" },
+    { message = "^style", group = "Changed" },
+    { message = "^ci", group = "CI" },
+    { message = "^chore", group = "Miscellaneous" },
+
+    # PR title patterns (Fixes #N, Add X, Fix X, etc.)
+    { message = "^[Aa]dd", group = "Added" },
+    { message = "^[Ff]ix", group = "Fixed" },
+    { message = "^[Uu]pdate", group = "Changed" },
+    { message = "^[Rr]emove", group = "Removed" },
+    { message = "^[Rr]efactor", group = "Changed" },
+
+    # Default: anything unmatched
+    { message = ".*", group = "Other" },
+]
+filter_commits = false
+tag_pattern = "v[0-9].*"
+sort_commits = "newest"
+
+[remote.github]
+owner = "fotoetienne"
+repo = "gru"
