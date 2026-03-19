@@ -1537,8 +1537,14 @@ mod tests {
             spawn_meta: None,
         }];
 
-        // Wait for process to exit
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        // Poll until the process has actually exited instead of a fixed sleep,
+        // which is flaky on loaded CI machines.
+        for _ in 0..100 {
+            if children[0].child.try_wait().unwrap().is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
 
         reap_children(&mut children).await;
         assert!(children.is_empty(), "Exited child should be reaped");
