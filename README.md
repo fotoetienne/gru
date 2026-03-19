@@ -243,7 +243,7 @@ Contributions are welcome! Please feel free to submit issues and pull requests.
 
 ## License
 
-[License information to be added]
+This project is licensed under the [Apache License, Version 2.0](LICENSE).
 
 ## Related Projects
 
