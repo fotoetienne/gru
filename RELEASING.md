@@ -15,6 +15,12 @@ Install git-cliff for changelog generation:
 cargo install git-cliff
 ```
 
+Set a GitHub token for PR metadata lookups (avoids rate limiting):
+
+```bash
+export GITHUB_TOKEN=$(gh auth token)
+```
+
 ## Release Steps
 
 1. **Bump version** in `Cargo.toml`:
@@ -27,9 +33,9 @@ cargo install git-cliff
    cargo check
    ```
 
-3. **Generate the changelog**:
+3. **Generate the changelog** (use `--tag` so git-cliff knows the version before tagging):
    ```bash
-   just changelog
+   git-cliff --github-repo fotoetienne/gru --tag v0.2.0 -o CHANGELOG.md
    ```
    Review the output in `CHANGELOG.md` and edit if needed.
 
