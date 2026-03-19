@@ -1539,12 +1539,20 @@ mod tests {
 
         // Poll until the process has actually exited instead of a fixed sleep,
         // which is flaky on loaded CI machines.
+        let mut exited = false;
         for _ in 0..100 {
-            if children[0].child.try_wait().unwrap().is_some() {
+            if children[0]
+                .child
+                .try_wait()
+                .expect("failed to check child process status")
+                .is_some()
+            {
+                exited = true;
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
+        assert!(exited, "child process did not exit within 1s timeout");
 
         reap_children(&mut children).await;
         assert!(children.is_empty(), "Exited child should be reaped");
