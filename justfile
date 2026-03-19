@@ -45,6 +45,10 @@ fmt:
 fmt-check:
     cargo fmt --all -- --check
 
+# Audit dependencies for known vulnerabilities (requires cargo-audit: cargo install cargo-audit)
+audit:
+    cargo audit
+
 # Run all checks: format, lint, test, and build
 check: fmt-check lint test build
     @echo "✓ All checks passed!"
