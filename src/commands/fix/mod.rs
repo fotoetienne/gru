@@ -4,6 +4,7 @@ mod monitor;
 mod pr;
 mod resolve;
 mod types;
+mod worker;
 mod worktree;
 
 // Re-export public API used by other modules (e.g., resume.rs)
@@ -12,7 +13,6 @@ pub(crate) use pr::handle_pr_creation;
 pub use types::FixOptions;
 pub(crate) use types::{IssueContext, WorktreeContext};
 
-use agent::{resume_agent_session, run_agent_session};
 pub(crate) use helpers::{try_mark_issue_blocked, try_mark_issue_failed};
 pub(crate) use monitor::monitor_ci_after_fix;
 pub(crate) use monitor::monitor_pr_lifecycle;
@@ -23,7 +23,6 @@ use worktree::setup_worktree;
 use crate::agent_registry;
 use crate::agent_runner::{is_stuck_or_timeout_error, parse_timeout, EXIT_CODE_SIGNAL_TERMINATED};
 use crate::minion_registry::{with_registry, MinionMode, OrchestrationPhase};
-use crate::pr_monitor;
 use crate::tmux::TmuxGuard;
 use anyhow::{Context, Result};
 use chrono::Utc;
@@ -198,146 +197,30 @@ async fn run_worker(minion_id: &str, issue: &str, opts: FixOptions) -> Result<i3
     let start_phase = info.orchestration_phase.clone();
 
     // Phase 3: Run agent
-    let agent_result = if start_phase <= OrchestrationPhase::RunningAgent {
-        update_orchestration_phase(&wt_ctx.minion_id, OrchestrationPhase::RunningAgent).await;
-
-        // Use --resume only if the agent has already run (session ID was used).
-        // If interrupted during Setup, the session was never started.
-        let use_resume = start_phase > OrchestrationPhase::Setup;
-        let result = if use_resume {
-            resume_agent_session(
-                &*backend,
-                &issue_ctx,
-                &wt_ctx,
-                quiet,
-                timeout_opt.as_deref(),
-            )
-            .await
-        } else {
-            run_agent_session(
-                &*backend,
-                &issue_ctx,
-                &wt_ctx,
-                quiet,
-                timeout_opt.as_deref(),
-            )
-            .await
-        };
-
-        match result {
-            Ok(result) => Some(result),
-            Err(e) if is_stuck_or_timeout_error(&e) => {
-                update_orchestration_phase(&wt_ctx.minion_id, OrchestrationPhase::Failed).await;
-                log::error!("🚨 {:#}", e);
-                try_mark_issue_blocked(
-                    &issue_ctx.host,
-                    &issue_ctx.owner,
-                    &issue_ctx.repo,
-                    issue_ctx.issue_num,
-                )
-                .await;
-                return Ok(1);
-            }
-            Err(e) => {
-                update_orchestration_phase(&wt_ctx.minion_id, OrchestrationPhase::Failed).await;
-                return Err(e);
-            }
-        }
-    } else {
-        println!("⏭️  Skipping agent session (already completed)");
-        None
+    let agent_result = match worker::run_agent_phase(
+        &*backend,
+        &issue_ctx,
+        &wt_ctx,
+        &start_phase,
+        quiet,
+        timeout_opt.as_deref(),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(e) if is_stuck_or_timeout_error(&e) => return Ok(1),
+        Err(e) => return Err(e),
     };
 
-    // Check agent result
+    // Check agent result — non-zero exit means failure
     if let Some(ref result) = agent_result {
         if !result.status.success() {
-            update_orchestration_phase(&wt_ctx.minion_id, OrchestrationPhase::Failed).await;
-
-            try_mark_issue_failed(
-                &issue_ctx.host,
-                &issue_ctx.owner,
-                &issue_ctx.repo,
-                issue_ctx.issue_num,
-            )
-            .await;
-
             return Ok(result.status.code().unwrap_or(EXIT_CODE_SIGNAL_TERMINATED));
         }
     }
 
     // Phase 4: Create PR
-    let pr_number = if start_phase <= OrchestrationPhase::CreatingPr {
-        update_orchestration_phase(&wt_ctx.minion_id, OrchestrationPhase::CreatingPr).await;
-        match handle_pr_creation(&issue_ctx, &wt_ctx).await {
-            Ok(pr) => pr,
-            Err(e) => {
-                update_orchestration_phase(&wt_ctx.minion_id, OrchestrationPhase::Failed).await;
-                return Err(e);
-            }
-        }
-    } else {
-        println!("⏭️  Skipping PR creation (already completed)");
-        let minion_id_owned = wt_ctx.minion_id.clone();
-        let existing_pr = match with_registry(move |registry| {
-            Ok(registry
-                .get(&minion_id_owned)
-                .and_then(|info| info.pr.clone()))
-        })
-        .await
-        {
-            Ok(pr) => pr,
-            Err(e) => {
-                update_orchestration_phase(&wt_ctx.minion_id, OrchestrationPhase::Failed).await;
-                return Err(e);
-            }
-        };
-
-        if existing_pr.is_some() {
-            existing_pr
-        } else {
-            log::info!("ℹ️  PR not found in registry, retrying PR creation");
-            match handle_pr_creation(&issue_ctx, &wt_ctx).await {
-                Ok(pr) => pr,
-                Err(e) => {
-                    update_orchestration_phase(&wt_ctx.minion_id, OrchestrationPhase::Failed).await;
-                    return Err(e);
-                }
-            }
-        }
-    };
-
-    // Add gru:auto-merge label if --auto-merge flag was set
-    if auto_merge {
-        if let Some(ref pr_num) = pr_number {
-            if let Err(e) = pr_monitor::ensure_auto_merge_label(
-                &issue_ctx.host,
-                &issue_ctx.owner,
-                &issue_ctx.repo,
-            )
-            .await
-            {
-                log::warn!("⚠️  Failed to ensure gru:auto-merge label: {}", e);
-            }
-            match pr_monitor::add_auto_merge_label(
-                &issue_ctx.host,
-                &issue_ctx.owner,
-                &issue_ctx.repo,
-                pr_num,
-            )
-            .await
-            {
-                Ok(()) => println!("🏷️  Added gru:auto-merge label to PR #{}", pr_num),
-                Err(e) => log::warn!("⚠️  Failed to add gru:auto-merge label: {}", e),
-            }
-        }
-    }
-
-    let agent_exit_code = || {
-        agent_result
-            .as_ref()
-            .map(|r| r.status.code().unwrap_or(EXIT_CODE_SIGNAL_TERMINATED))
-            .unwrap_or(0)
-    };
+    let pr_number = worker::create_pr_phase(&issue_ctx, &wt_ctx, &start_phase, auto_merge).await?;
 
     if no_watch {
         if let Some(ref pr_num) = pr_number {
@@ -347,58 +230,23 @@ async fn run_worker(minion_id: &str, issue: &str, opts: FixOptions) -> Result<i3
             );
         }
         update_orchestration_phase(&wt_ctx.minion_id, OrchestrationPhase::Completed).await;
-        return Ok(agent_exit_code());
+        return Ok(worker::agent_exit_code(&agent_result));
     }
 
     // Phase 5: Monitor PR lifecycle
-    if let Some(ref pr_num) = pr_number {
-        update_orchestration_phase(&wt_ctx.minion_id, OrchestrationPhase::MonitoringPr).await;
-        monitor_pr_lifecycle(
-            &*backend,
-            &issue_ctx,
-            &wt_ctx,
-            pr_num,
-            timeout_opt.as_deref(),
-            review_timeout,
-            monitor_timeout,
-        )
-        .await;
-    } else {
-        log::warn!(
-            "⚠️  No PR number available — skipping PR lifecycle monitoring. \
-             Branch may not have been pushed, or PR lookup failed."
-        );
-    }
+    let monitor_result = worker::monitor_pr_phase(
+        &*backend,
+        &issue_ctx,
+        &wt_ctx,
+        &pr_number,
+        timeout_opt.as_deref(),
+        review_timeout,
+        monitor_timeout,
+    )
+    .await;
 
-    // CI monitoring — only when PR creation failed (no PR number), since
-    // monitor_pr_lifecycle handles CI internally when a PR exists.
-    // When no_watch is true, we have already returned early above.
-    if pr_number.is_none() {
-        let ci_passed = monitor_ci_after_fix(
-            &issue_ctx.host,
-            &issue_ctx.owner,
-            &issue_ctx.repo,
-            &wt_ctx.branch_name,
-            &wt_ctx.checkout_path,
-            &wt_ctx.minion_id,
-        )
-        .await;
-        match ci_passed {
-            Ok(true) => log::info!("✅ CI checks passed"),
-            Ok(false) => {
-                log::warn!("⚠️  CI checks failed or were escalated");
-                update_orchestration_phase(&wt_ctx.minion_id, OrchestrationPhase::Failed).await;
-                try_mark_issue_blocked(
-                    &issue_ctx.host,
-                    &issue_ctx.owner,
-                    &issue_ctx.repo,
-                    issue_ctx.issue_num,
-                )
-                .await;
-                return Ok(1);
-            }
-            Err(e) => log::warn!("⚠️  CI monitoring error (non-fatal): {}", e),
-        }
+    if monitor_result.is_err() {
+        return Ok(1);
     }
 
     update_orchestration_phase(&wt_ctx.minion_id, OrchestrationPhase::Completed).await;
@@ -413,7 +261,7 @@ async fn run_worker(minion_id: &str, issue: &str, opts: FixOptions) -> Result<i3
     })
     .await;
 
-    Ok(agent_exit_code())
+    Ok(worker::agent_exit_code(&agent_result))
 }
 
 /// Handles the fix command by delegating to the agent backend.
