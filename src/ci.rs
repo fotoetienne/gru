@@ -930,13 +930,45 @@ pub async fn monitor_and_fix_ci(
                     "🔧 Invoking Claude to fix CI failures (attempt {}/{})...",
                     attempt, MAX_CI_FIX_ATTEMPTS
                 );
-                let exit_code = invoke_ci_fix(worktree_path, &failed_checks, attempt).await?;
+                let fix_result = invoke_ci_fix(worktree_path, &failed_checks, attempt).await;
 
-                if exit_code != 0 {
-                    eprintln!(
-                        "⚠️  Claude fix attempt returned non-zero exit code: {}",
-                        exit_code
-                    );
+                match fix_result {
+                    Ok(exit_code) => {
+                        if exit_code != 0 {
+                            eprintln!(
+                                "⚠️  Claude fix attempt returned non-zero exit code: {}",
+                                exit_code
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("⚠️  Claude CI fix failed: {}", e);
+                        // On timeout or other errors, check if we should escalate
+                        match decide_after_no_commits(attempt, MAX_CI_FIX_ATTEMPTS) {
+                            CiFixAction::RetryNextAttempt => continue,
+                            CiFixAction::Escalate(_) => {
+                                eprintln!(
+                                    "🚨 Max fix attempts ({}) reached with CI fix error, escalating to human",
+                                    MAX_CI_FIX_ATTEMPTS
+                                );
+                                post_exhaustion_escalation_comment(
+                                    host,
+                                    owner,
+                                    repo,
+                                    pr_number,
+                                    &format!("CI fix process failed: {}", e),
+                                    attempt,
+                                    minion_id,
+                                )
+                                .await
+                                .unwrap_or_else(|e| {
+                                    eprintln!("⚠️  Failed to post escalation: {}", e)
+                                });
+                                return Ok(false);
+                            }
+                            _ => unreachable!(),
+                        }
+                    }
                 }
 
                 // Check if Claude actually made new commits
@@ -950,12 +982,12 @@ pub async fn monitor_and_fix_ci(
                                 "🚨 Max fix attempts ({}) reached with no commits, escalating to human",
                                 MAX_CI_FIX_ATTEMPTS
                             );
-                            post_escalation_comment(
+                            post_exhaustion_escalation_comment(
                                 host,
                                 owner,
                                 repo,
                                 pr_number,
-                                &failed_checks,
+                                "CI fix attempt produced no new commits on all attempts.",
                                 attempt,
                                 minion_id,
                             )
