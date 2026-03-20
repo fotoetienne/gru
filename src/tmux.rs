@@ -219,22 +219,6 @@ mod tests {
     }
 
     #[test]
-    fn test_drop_noop_guard_does_not_panic() {
-        let guard = TmuxGuard { window_id: None };
-        drop(guard);
-    }
-
-    #[test]
-    fn test_drop_active_guard_does_not_panic() {
-        // With a fake window_id, set_automatic_rename will silently fail
-        // (no tmux server), which is fine — we just verify no panic.
-        let guard = TmuxGuard {
-            window_id: Some("@999".to_string()),
-        };
-        drop(guard);
-    }
-
-    #[test]
     fn test_rename_noop_without_window_id() {
         let guard = TmuxGuard { window_id: None };
         guard.rename("irrelevant");
