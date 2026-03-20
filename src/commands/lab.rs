@@ -5,13 +5,21 @@ use crate::minion_registry::{with_registry, MinionInfo, MinionMode, Orchestratio
 use crate::pr_monitor;
 use crate::tmux::TmuxGuard;
 use anyhow::{Context, Result};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Local, Utc};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 use tokio::process::Child;
 use tokio::time::sleep;
+
+/// Prints a timestamped message to stdout in `[HH:MM:SS] <message>` format.
+macro_rules! tprintln {
+    () => { println!() };
+    ($($arg:tt)*) => {
+        println!("[{}] {}", Local::now().format("%H:%M:%S"), format_args!($($arg)*))
+    };
+}
 
 /// Maximum age of a spawn to be considered an "early exit" eligible for label restoration.
 /// Processes that fail within this window likely never started meaningful work, so the
@@ -81,23 +89,23 @@ pub async fn handle_lab(
     // Rename tmux window for the lab daemon
     let _tmux_guard = TmuxGuard::new("gru:lab");
 
-    println!("🚀 Starting Gru Lab daemon");
-    println!(
+    tprintln!("🚀 Starting Gru Lab daemon");
+    tprintln!(
         "📋 Monitoring {} repository(ies)",
         config.daemon.repos.len()
     );
-    println!("🔄 Poll interval: {}s", config.daemon.poll_interval_secs);
-    println!("🎰 Max concurrent slots: {}", config.daemon.max_slots);
-    println!("🏷️  Watching for label: {}", config.daemon.label);
-    println!();
+    tprintln!("🔄 Poll interval: {}s", config.daemon.poll_interval_secs);
+    tprintln!("🎰 Max concurrent slots: {}", config.daemon.max_slots);
+    tprintln!("🏷️  Watching for label: {}", config.daemon.label);
+    tprintln!();
 
     for repo in &config.daemon.repos {
-        println!("  • {}", repo);
+        tprintln!("  • {}", repo);
     }
 
-    println!();
-    println!("Press Ctrl-C to stop...");
-    println!();
+    tprintln!();
+    tprintln!("Press Ctrl-C to stop...");
+    tprintln!();
 
     // Track child processes for graceful shutdown
     let mut children: Vec<SpawnedChild> = Vec::new();
@@ -112,8 +120,8 @@ pub async fn handle_lab(
     let mut wake_check_times: HashMap<String, DateTime<Utc>> = HashMap::new();
 
     if no_resume {
-        println!("⏭️  Auto-resume disabled (--no-resume)");
-        println!();
+        tprintln!("⏭️  Auto-resume disabled (--no-resume)");
+        tprintln!();
     }
 
     // Perform initial poll immediately for faster feedback
@@ -138,12 +146,14 @@ pub async fn handle_lab(
     loop {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {
-                println!("\n🛑 Received shutdown signal (SIGINT), stopping daemon...");
+                tprintln!();
+                tprintln!("🛑 Received shutdown signal (SIGINT), stopping daemon...");
                 shutdown_children(&mut children, stop_minions).await;
                 break;
             }
             _ = sigterm.recv() => {
-                println!("\n🛑 Received shutdown signal (SIGTERM), stopping daemon...");
+                tprintln!();
+                tprintln!("🛑 Received shutdown signal (SIGTERM), stopping daemon...");
                 shutdown_children(&mut children, stop_minions).await;
                 break;
             }
@@ -266,22 +276,22 @@ async fn shutdown_children(children: &mut [SpawnedChild], stop_minions: bool) {
     }
 
     if running_pids.is_empty() {
-        println!("No running Minion processes.");
+        tprintln!("No running Minion processes.");
         return;
     }
 
     if !stop_minions {
         // Default: detach from children, let them continue running independently
-        println!(
+        tprintln!(
             "👋 {} Minion(s) still running — they will continue independently.",
             running_pids.len()
         );
-        println!("   Use `gru status` to check on them, or `gru stop <id>` to stop one.");
+        tprintln!("   Use `gru status` to check on them, or `gru stop <id>` to stop one.");
         return;
     }
 
     // --stop-minions: kill all children
-    println!(
+    tprintln!(
         "🔪 Signaling {} running Minion(s) to shut down...",
         running_pids.len()
     );
@@ -299,14 +309,14 @@ async fn shutdown_children(children: &mut [SpawnedChild], stop_minions: bool) {
     }
 
     // Wait up to 5 seconds for graceful shutdown, polling every 100ms
-    println!("⏳ Waiting for Minions to exit...");
+    tprintln!("⏳ Waiting for Minions to exit...");
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         let all_exited = children
             .iter_mut()
             .all(|sc| matches!(sc.child.try_wait(), Ok(Some(_))));
         if all_exited {
-            println!("All Minions exited gracefully.");
+            tprintln!("All Minions exited gracefully.");
             return;
         }
         if Instant::now() >= deadline {
@@ -540,9 +550,13 @@ async fn find_minions_needing_review_wake(
             continue;
         }
 
-        println!(
+        tprintln!(
             "🔔 Waking up {} (issue #{}, {}): {} new external review(s) on PR #{}",
-            minion_id, info.issue, info.repo, unaddressed, pr_number
+            minion_id,
+            info.issue,
+            info.repo,
+            unaddressed,
+            pr_number
         );
 
         let wake_reason = format!("Address the review comments on PR #{}", pr_number);
@@ -708,7 +722,7 @@ async fn resume_interrupted_minions(
     // per issue is retained, preventing concurrent resumes for the same issue.
     let resumable = sort_and_dedup_resumable(resumable);
 
-    println!(
+    tprintln!(
         "🔄 Found {} resumable Minion(s) from previous session",
         resumable.len()
     );
@@ -755,9 +769,11 @@ async fn resume_interrupted_minions(
         };
         match github::is_issue_closed_via_cli(owner, repo_name, &host, candidate.info.issue).await {
             Ok(true) => {
-                println!(
+                tprintln!(
                     "⏭️  Skipping {} (issue #{}, {}): issue is closed",
-                    candidate.minion_id, candidate.info.issue, candidate.info.repo,
+                    candidate.minion_id,
+                    candidate.info.issue,
+                    candidate.info.repo,
                 );
                 // Mark as Completed in the registry
                 let mid = candidate.minion_id.clone();
@@ -789,9 +805,11 @@ async fn resume_interrupted_minions(
         // Skip minions whose timeout_deadline has passed
         if let Some(deadline) = candidate.info.timeout_deadline {
             if Utc::now() >= deadline {
-                println!(
+                tprintln!(
                     "⏭️  Skipping {} (issue #{}, {}): timeout_deadline has passed",
-                    candidate.minion_id, candidate.info.issue, candidate.info.repo,
+                    candidate.minion_id,
+                    candidate.info.issue,
+                    candidate.info.repo,
                 );
                 mark_exhausted_minion(
                     &candidate.minion_id,
@@ -806,7 +824,7 @@ async fn resume_interrupted_minions(
 
         // Skip minions that have exceeded max attempts
         if candidate.info.attempt_count > max_attempts {
-            println!(
+            tprintln!(
                 "⏭️  Skipping {} (issue #{}, {}): attempt_count {} > max {}",
                 candidate.minion_id,
                 candidate.info.issue,
@@ -819,7 +837,7 @@ async fn resume_interrupted_minions(
             continue;
         }
 
-        println!(
+        tprintln!(
             "♻️  Resuming {} (issue #{}, {}, phase: {:?})",
             candidate.minion_id,
             candidate.info.issue,
@@ -873,7 +891,7 @@ async fn resume_interrupted_minions(
     }
 
     if resumed > 0 {
-        println!("✅ Resumed {} Minion(s)", resumed);
+        tprintln!("✅ Resumed {} Minion(s)", resumed);
     }
 
     Ok(resumed)
@@ -932,7 +950,7 @@ async fn poll_and_spawn(
 
     if available == 0 {
         if spawned > 0 {
-            println!();
+            tprintln!();
         }
         return Ok(());
     }
@@ -1065,9 +1083,10 @@ async fn poll_and_spawn(
                                     spawned_at: Instant::now(),
                                 }),
                             });
-                            println!(
+                            tprintln!(
                                 "✨ Spawned Minion for {}/issues/{}",
-                                repo_spec, issue_number
+                                repo_spec,
+                                issue_number
                             );
                             spawned += 1;
                             spawned_this_repo += 1;
@@ -1125,7 +1144,7 @@ async fn poll_and_spawn(
     }
 
     if spawned > 0 {
-        println!();
+        tprintln!();
     }
 
     Ok(())
@@ -1260,7 +1279,7 @@ async fn spawn_minion(repo: &str, host: &str, issue_number: u64) -> Result<Child
         );
     }
 
-    println!("📝 Log: {}", log_path.display());
+    tprintln!("📝 Log: {}", log_path.display());
 
     Ok(child)
 }
@@ -1311,7 +1330,7 @@ async fn spawn_resume(minion_id: &str) -> Result<Child> {
         );
     }
 
-    println!("📝 Log: {}", log_path.display());
+    tprintln!("📝 Log: {}", log_path.display());
 
     Ok(child)
 }
