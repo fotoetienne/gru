@@ -471,8 +471,6 @@ fn scan_prompt_directory(dir: &Path) -> Result<HashMap<String, PathBuf>> {
 /// **Implementation note**: Loads in reverse order (global → built-in → repo)
 /// where later entries override earlier ones in the HashMap. This achieves the
 /// correct priority while being efficient (no need to check existence before insert).
-///
-/// Reserved system commands are validated separately and never loaded.
 pub(crate) fn load_prompts(repo_root: Option<&Path>) -> Result<HashMap<String, Prompt>> {
     load_prompts_internal(repo_root, dirs::home_dir().as_deref())
 }

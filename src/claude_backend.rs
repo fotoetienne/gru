@@ -32,16 +32,9 @@ struct ToolBuffer {
 /// internally, emitting a single `AgentEvent::ToolUse` with a populated
 /// `input_summary` when `ContentBlockStop` arrives. This eliminates the UX
 /// regression of showing "Tool: Bash" instead of "Run: git status".
+#[derive(Default)]
 pub struct ClaudeBackend {
     tool_buffer: Mutex<Option<ToolBuffer>>,
-}
-
-impl Default for ClaudeBackend {
-    fn default() -> Self {
-        Self {
-            tool_buffer: Mutex::new(None),
-        }
-    }
 }
 
 impl ClaudeBackend {
