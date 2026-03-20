@@ -141,6 +141,64 @@ pub enum CiResult {
     Timeout,
 }
 
+/// Action to take after evaluating CI status in the fix loop.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CiFixAction {
+    /// CI passed or no checks configured — done successfully.
+    Done,
+    /// CI failed and we have remaining attempts — try to fix.
+    AttemptFix,
+    /// Skip to next attempt without fixing (e.g., timeout or no commits).
+    RetryNextAttempt,
+    /// Escalate to human — all attempts exhausted.
+    Escalate(EscalationReason),
+}
+
+/// Reason for escalating a CI failure to a human.
+#[derive(Debug, Clone, PartialEq)]
+pub enum EscalationReason {
+    /// CI checks timed out on the final attempt.
+    Timeout,
+    /// CI checks failed on the final attempt.
+    ChecksFailed,
+    /// Fix attempt produced no new commits on the final attempt.
+    NoCommits,
+}
+
+/// Decides what action to take after observing a CI result.
+///
+/// Pure function — no I/O, no side effects.
+pub fn decide_ci_action(ci_result: &CiResult, attempt: u32, max_attempts: u32) -> CiFixAction {
+    match ci_result {
+        CiResult::AllPassed | CiResult::NoChecks => CiFixAction::Done,
+        CiResult::Timeout => {
+            if attempt >= max_attempts {
+                CiFixAction::Escalate(EscalationReason::Timeout)
+            } else {
+                CiFixAction::RetryNextAttempt
+            }
+        }
+        CiResult::Failed(_) => {
+            if attempt >= max_attempts {
+                CiFixAction::Escalate(EscalationReason::ChecksFailed)
+            } else {
+                CiFixAction::AttemptFix
+            }
+        }
+    }
+}
+
+/// Decides what action to take when a fix attempt produced no new commits.
+///
+/// Pure function — no I/O, no side effects.
+pub fn decide_after_no_commits(attempt: u32, max_attempts: u32) -> CiFixAction {
+    if attempt >= max_attempts {
+        CiFixAction::Escalate(EscalationReason::NoCommits)
+    } else {
+        CiFixAction::RetryNextAttempt
+    }
+}
+
 /// Returns the last `max_bytes` of a string, aligned to a UTF-8 char boundary.
 /// Safe for all UTF-8 content (won't panic on multi-byte characters).
 fn safe_tail(s: &str, max_bytes: usize) -> &str {
@@ -777,38 +835,80 @@ pub async fn monitor_and_fix_ci(
         // Wait for CI to complete
         let ci_result = wait_for_ci(host, owner, repo, &head_sha).await?;
 
-        match ci_result {
-            CiResult::AllPassed => {
-                eprintln!("✅ All CI checks passed!");
-                return Ok(true);
-            }
-            CiResult::NoChecks => {
-                eprintln!("ℹ️  No CI checks configured, skipping CI monitoring");
-                return Ok(true);
-            }
-            CiResult::Timeout => {
-                eprintln!("⏱️  CI checks timed out");
-                if attempt == MAX_CI_FIX_ATTEMPTS {
-                    eprintln!(
-                        "🚨 Max fix attempts ({}) reached with CI timeout, escalating to human",
-                        MAX_CI_FIX_ATTEMPTS
-                    );
-                    post_exhaustion_escalation_comment(
-                        host,
-                        owner,
-                        repo,
-                        pr_number,
-                        "CI checks timed out on all attempts.",
-                        attempt,
-                        minion_id,
-                    )
-                    .await
-                    .unwrap_or_else(|e| eprintln!("⚠️  Failed to post escalation: {}", e));
-                    return Ok(false);
+        match decide_ci_action(&ci_result, attempt, MAX_CI_FIX_ATTEMPTS) {
+            CiFixAction::Done => {
+                match ci_result {
+                    CiResult::AllPassed => eprintln!("✅ All CI checks passed!"),
+                    CiResult::NoChecks => {
+                        eprintln!("ℹ️  No CI checks configured, skipping CI monitoring")
+                    }
+                    _ => {}
                 }
+                return Ok(true);
+            }
+            CiFixAction::RetryNextAttempt => {
+                // Only reachable via CiResult::Timeout (non-final attempt)
+                eprintln!("⏱️  CI checks timed out");
                 continue;
             }
-            CiResult::Failed(mut failed_checks) => {
+            CiFixAction::Escalate(EscalationReason::Timeout) => {
+                eprintln!(
+                    "🚨 Max fix attempts ({}) reached with CI timeout, escalating to human",
+                    MAX_CI_FIX_ATTEMPTS
+                );
+                post_exhaustion_escalation_comment(
+                    host,
+                    owner,
+                    repo,
+                    pr_number,
+                    "CI checks timed out on all attempts.",
+                    attempt,
+                    minion_id,
+                )
+                .await
+                .unwrap_or_else(|e| eprintln!("⚠️  Failed to post escalation: {}", e));
+                return Ok(false);
+            }
+            CiFixAction::Escalate(EscalationReason::ChecksFailed) => {
+                let mut failed_checks = match ci_result {
+                    CiResult::Failed(checks) => checks,
+                    _ => unreachable!(),
+                };
+
+                // Enrich with detailed logs before escalating
+                for check in &mut failed_checks {
+                    if check.output.is_none() || check.output.as_deref() == Some("") {
+                        if let Ok(Some(logs)) =
+                            fetch_check_logs(host, owner, repo, &check.name, pr_number, branch)
+                                .await
+                        {
+                            check.output = Some(logs);
+                        }
+                    }
+                }
+
+                eprintln!(
+                    "🚨 Max fix attempts ({}) reached, escalating to human",
+                    MAX_CI_FIX_ATTEMPTS
+                );
+                post_escalation_comment(
+                    host,
+                    owner,
+                    repo,
+                    pr_number,
+                    &failed_checks,
+                    attempt,
+                    minion_id,
+                )
+                .await
+                .unwrap_or_else(|e| eprintln!("⚠️  Failed to post escalation: {}", e));
+                return Ok(false);
+            }
+            CiFixAction::AttemptFix => {
+                let mut failed_checks = match ci_result {
+                    CiResult::Failed(checks) => checks,
+                    _ => unreachable!(),
+                };
                 let check_names: Vec<&str> =
                     failed_checks.iter().map(|c| c.name.as_str()).collect();
                 eprintln!("❌ CI checks failed: {}", check_names.join(", "));
@@ -823,26 +923,6 @@ pub async fn monitor_and_fix_ci(
                             check.output = Some(logs);
                         }
                     }
-                }
-
-                if attempt == MAX_CI_FIX_ATTEMPTS {
-                    // Last attempt failed, escalate
-                    eprintln!(
-                        "🚨 Max fix attempts ({}) reached, escalating to human",
-                        MAX_CI_FIX_ATTEMPTS
-                    );
-                    post_escalation_comment(
-                        host,
-                        owner,
-                        repo,
-                        pr_number,
-                        &failed_checks,
-                        attempt,
-                        minion_id,
-                    )
-                    .await
-                    .unwrap_or_else(|e| eprintln!("⚠️  Failed to post escalation: {}", e));
-                    return Ok(false);
                 }
 
                 // Invoke Claude to fix
@@ -863,25 +943,28 @@ pub async fn monitor_and_fix_ci(
                 let new_sha = get_head_sha(worktree_path).await?;
                 if new_sha == head_sha {
                     eprintln!("⚠️  Claude made no new commits, cannot retry");
-                    if attempt < MAX_CI_FIX_ATTEMPTS {
-                        continue;
+                    match decide_after_no_commits(attempt, MAX_CI_FIX_ATTEMPTS) {
+                        CiFixAction::RetryNextAttempt => continue,
+                        CiFixAction::Escalate(_) => {
+                            eprintln!(
+                                "🚨 Max fix attempts ({}) reached with no commits, escalating to human",
+                                MAX_CI_FIX_ATTEMPTS
+                            );
+                            post_escalation_comment(
+                                host,
+                                owner,
+                                repo,
+                                pr_number,
+                                &failed_checks,
+                                attempt,
+                                minion_id,
+                            )
+                            .await
+                            .unwrap_or_else(|e| eprintln!("⚠️  Failed to post escalation: {}", e));
+                            return Ok(false);
+                        }
+                        _ => unreachable!(),
                     }
-                    eprintln!(
-                        "🚨 Max fix attempts ({}) reached with no commits, escalating to human",
-                        MAX_CI_FIX_ATTEMPTS
-                    );
-                    post_escalation_comment(
-                        host,
-                        owner,
-                        repo,
-                        pr_number,
-                        &failed_checks,
-                        attempt,
-                        minion_id,
-                    )
-                    .await
-                    .unwrap_or_else(|e| eprintln!("⚠️  Failed to post escalation: {}", e));
-                    return Ok(false);
                 }
 
                 // Push the fix
@@ -910,6 +993,8 @@ pub async fn monitor_and_fix_ci(
 
                 // Loop continues to check CI again
             }
+            // NoCommits escalation is only returned by decide_after_no_commits
+            CiFixAction::Escalate(EscalationReason::NoCommits) => unreachable!(),
         }
     }
 
@@ -1193,5 +1278,113 @@ mod tests {
     #[test]
     fn test_safe_tail_empty_string() {
         assert_eq!(safe_tail("", 10), "");
+    }
+
+    // --- decide_ci_action tests ---
+
+    #[test]
+    fn test_decide_ci_action_all_passed() {
+        let result = CiResult::AllPassed;
+        assert_eq!(decide_ci_action(&result, 1, 2), CiFixAction::Done);
+    }
+
+    #[test]
+    fn test_decide_ci_action_no_checks() {
+        let result = CiResult::NoChecks;
+        assert_eq!(decide_ci_action(&result, 1, 2), CiFixAction::Done);
+    }
+
+    #[test]
+    fn test_decide_ci_action_timeout_not_last_attempt() {
+        let result = CiResult::Timeout;
+        assert_eq!(
+            decide_ci_action(&result, 1, 2),
+            CiFixAction::RetryNextAttempt
+        );
+    }
+
+    #[test]
+    fn test_decide_ci_action_timeout_last_attempt() {
+        let result = CiResult::Timeout;
+        assert_eq!(
+            decide_ci_action(&result, 2, 2),
+            CiFixAction::Escalate(EscalationReason::Timeout)
+        );
+    }
+
+    #[test]
+    fn test_decide_ci_action_failed_not_last_attempt() {
+        let result = CiResult::Failed(vec![CheckRun {
+            name: "test".to_string(),
+            status: CheckStatus::Completed,
+            conclusion: Some(CheckConclusion::Failure),
+            duration: None,
+            output: None,
+        }]);
+        assert_eq!(decide_ci_action(&result, 1, 2), CiFixAction::AttemptFix);
+    }
+
+    #[test]
+    fn test_decide_ci_action_failed_last_attempt() {
+        let result = CiResult::Failed(vec![]);
+        assert_eq!(
+            decide_ci_action(&result, 2, 2),
+            CiFixAction::Escalate(EscalationReason::ChecksFailed)
+        );
+    }
+
+    #[test]
+    fn test_decide_ci_action_single_attempt_max() {
+        // With max_attempts=1, first attempt is already the last
+        let result = CiResult::Failed(vec![]);
+        assert_eq!(
+            decide_ci_action(&result, 1, 1),
+            CiFixAction::Escalate(EscalationReason::ChecksFailed)
+        );
+
+        let timeout = CiResult::Timeout;
+        assert_eq!(
+            decide_ci_action(&timeout, 1, 1),
+            CiFixAction::Escalate(EscalationReason::Timeout)
+        );
+    }
+
+    #[test]
+    fn test_decide_ci_action_passed_on_last_attempt() {
+        // CI can pass on any attempt
+        let result = CiResult::AllPassed;
+        assert_eq!(decide_ci_action(&result, 2, 2), CiFixAction::Done);
+    }
+
+    // --- decide_after_no_commits tests ---
+
+    #[test]
+    fn test_decide_after_no_commits_not_last_attempt() {
+        assert_eq!(decide_after_no_commits(1, 2), CiFixAction::RetryNextAttempt);
+    }
+
+    #[test]
+    fn test_decide_after_no_commits_last_attempt() {
+        assert_eq!(
+            decide_after_no_commits(2, 2),
+            CiFixAction::Escalate(EscalationReason::NoCommits)
+        );
+    }
+
+    #[test]
+    fn test_decide_after_no_commits_beyond_max() {
+        // attempt > max should still escalate
+        assert_eq!(
+            decide_after_no_commits(3, 2),
+            CiFixAction::Escalate(EscalationReason::NoCommits)
+        );
+    }
+
+    #[test]
+    fn test_decide_after_no_commits_single_attempt() {
+        assert_eq!(
+            decide_after_no_commits(1, 1),
+            CiFixAction::Escalate(EscalationReason::NoCommits)
+        );
     }
 }
