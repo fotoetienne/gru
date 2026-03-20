@@ -28,7 +28,7 @@ use crate::reserved_commands;
 /// built-in with the same name has non-empty `content`, it is inserted and
 /// will shadow the global prompt. A global prompt therefore only takes effect
 /// when there is no corresponding built-in with content for that name.
-pub const BUILT_IN_PROMPTS: &[BuiltInPrompt] = &[
+pub(crate) const BUILT_IN_PROMPTS: &[BuiltInPrompt] = &[
     BuiltInPrompt {
         name: "do",
         description: "Work on a GitHub issue with tests and PR",
@@ -242,7 +242,7 @@ After resolving each conflict:
 
 /// A built-in prompt definition compiled into the binary
 #[derive(Debug)]
-pub struct BuiltInPrompt {
+pub(crate) struct BuiltInPrompt {
     pub name: &'static str,
     pub description: &'static str,
     pub requires: &'static [&'static str],
@@ -252,7 +252,7 @@ pub struct BuiltInPrompt {
 impl BuiltInPrompt {
     /// Converts this built-in definition into a `Prompt` struct.
     /// Returns `None` if the built-in has no content (placeholder for future implementation).
-    pub fn to_prompt(&self) -> Option<Prompt> {
+    pub(crate) fn to_prompt(&self) -> Option<Prompt> {
         if self.content.trim().is_empty() {
             return None;
         }
@@ -270,7 +270,7 @@ impl BuiltInPrompt {
 }
 
 /// Prompts grouped by their source, for display in `gru prompts`
-pub struct PromptsBySource {
+pub(crate) struct PromptsBySource {
     pub built_in: Vec<(String, String)>,
     pub repo: Vec<Prompt>,
     pub global: Vec<Prompt>,
@@ -278,7 +278,7 @@ pub struct PromptsBySource {
 
 /// Metadata for a prompt file, parsed from YAML frontmatter
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct PromptMetadata {
+pub(crate) struct PromptMetadata {
     /// Short description of what the prompt does
     pub description: Option<String>,
 
@@ -293,7 +293,7 @@ pub struct PromptMetadata {
 
 /// Definition of a prompt parameter
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct PromptParam {
+pub(crate) struct PromptParam {
     /// Parameter name
     pub name: String,
 
@@ -307,7 +307,7 @@ pub struct PromptParam {
 
 /// A loaded prompt with metadata and content
 #[derive(Debug, Clone)]
-pub struct Prompt {
+pub(crate) struct Prompt {
     /// Name of the prompt (filename without .md extension)
     pub name: String,
 
@@ -323,7 +323,7 @@ pub struct Prompt {
 
 /// Location where a prompt was loaded from
 #[derive(Debug, Clone, PartialEq)]
-pub enum PromptSource {
+pub(crate) enum PromptSource {
     /// Repo-specific prompt (.gru/prompts/)
     Repo(PathBuf),
 
@@ -341,7 +341,7 @@ impl PromptSource {
     /// - Repo: `.gru/prompts/<filename>`
     /// - Built-in: `built-in`
     /// - Global: `~/.gru/prompts/<filename>`
-    pub fn display(&self) -> String {
+    pub(crate) fn display(&self) -> String {
         match self {
             PromptSource::Repo(path) => {
                 let filename = path
@@ -475,7 +475,7 @@ fn scan_prompt_directory(dir: &Path) -> Result<HashMap<String, PathBuf>> {
 /// correct priority while being efficient (no need to check existence before insert).
 ///
 /// Reserved system commands are validated separately and never loaded.
-pub fn load_prompts(repo_root: Option<&Path>) -> Result<HashMap<String, Prompt>> {
+pub(crate) fn load_prompts(repo_root: Option<&Path>) -> Result<HashMap<String, Prompt>> {
     load_prompts_internal(repo_root, dirs::home_dir().as_deref())
 }
 
@@ -561,7 +561,7 @@ fn load_prompts_internal(
 /// prompt count grows significantly.
 ///
 /// Returns `None` if no prompt with that name exists (neither built-in nor custom).
-pub fn resolve_prompt(name: &str, repo_root: Option<&Path>) -> Result<Option<Prompt>> {
+pub(crate) fn resolve_prompt(name: &str, repo_root: Option<&Path>) -> Result<Option<Prompt>> {
     let mut prompts = load_prompts(repo_root)?;
 
     let prompt = prompts.remove(name);
@@ -621,7 +621,7 @@ fn collect_missing_params<'a>(
 /// validate_required_params(&metadata, &provided)?;
 /// ```
 #[cfg_attr(not(test), allow(dead_code))]
-pub fn validate_required_params(
+pub(crate) fn validate_required_params(
     metadata: &PromptMetadata,
     provided: &HashMap<String, String>,
 ) -> Result<()> {
@@ -648,7 +648,7 @@ pub fn validate_required_params(
 ///
 /// Unlike `load_prompts()` which merges by priority, this function returns
 /// prompts in separate collections for display in `gru prompts`.
-pub fn list_prompts_by_source(repo_root: Option<&Path>) -> Result<PromptsBySource> {
+pub(crate) fn list_prompts_by_source(repo_root: Option<&Path>) -> Result<PromptsBySource> {
     list_prompts_by_source_internal(repo_root, dirs::home_dir().as_deref())
 }
 
@@ -727,7 +727,7 @@ const KNOWN_REQUIREMENTS: &[&str] = &["issue", "pr"];
 ///
 /// # Returns
 /// A list of (requirement_name, flag_hint) pairs for any missing requirements
-pub fn validate_requires(
+pub(crate) fn validate_requires(
     requires: &[String],
     issue_provided: bool,
     pr_provided: bool,
@@ -769,7 +769,7 @@ pub fn validate_requires(
 /// * `issue_provided` - Whether `--issue` was provided
 /// * `pr_provided` - Whether `--pr` was provided
 /// * `provided_params` - The parameters provided via `--param` flags
-pub fn validate_prompt_requirements(
+pub(crate) fn validate_prompt_requirements(
     prompt_name: &str,
     metadata: &PromptMetadata,
     issue_provided: bool,
@@ -808,7 +808,7 @@ pub fn validate_prompt_requirements(
 /// Currently checks:
 /// - Prompt content is not empty
 /// - Parameter names are valid identifiers
-pub fn validate_prompt(prompt: &Prompt) -> Result<()> {
+pub(crate) fn validate_prompt(prompt: &Prompt) -> Result<()> {
     // Check content is not empty
     if prompt.content.trim().is_empty() {
         bail!("Prompt '{}' has empty content", prompt.name);

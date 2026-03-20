@@ -15,7 +15,7 @@ static ISSUE_LINK_REGEX: Lazy<Regex> = Lazy::new(|| {
 
 /// Information about a resolved Minion worktree
 #[derive(Debug, Clone)]
-pub struct MinionInfo {
+pub(crate) struct MinionInfo {
     pub minion_id: String,
     pub issue_number: Option<u64>,
     #[allow(dead_code)]
@@ -55,7 +55,7 @@ impl MinionInfo {
 /// 2. Try with M prefix (e.g., 12 -> M12)
 /// 3. Parse as number, search local minions by issue number
 /// 4. Fallback to GitHub API for PRs (if online)
-pub async fn resolve_minion(id: &str) -> Result<MinionInfo> {
+pub(crate) async fn resolve_minion(id: &str) -> Result<MinionInfo> {
     // Load minions from registry (primary source, consistent with gru status).
     // Returns empty vec on error — registry is best-effort, errors logged at debug level.
     let registry_minions = tokio::task::spawn_blocking(load_from_registry)
@@ -223,7 +223,7 @@ fn find_by_issue_number_from_list(issue_num: u64, minions: &[MinionInfo]) -> Opt
 }
 
 /// Scans all minion worktrees and returns MinionInfo structs
-pub fn scan_all_minions() -> Result<Vec<MinionInfo>> {
+pub(crate) fn scan_all_minions() -> Result<Vec<MinionInfo>> {
     let workspace = workspace::Workspace::new().context("Failed to initialize workspace")?;
     let work_path = workspace.work();
 

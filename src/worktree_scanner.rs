@@ -6,7 +6,7 @@ use tokio::process::Command;
 
 /// Represents a discovered worktree
 #[derive(Debug, Clone)]
-pub struct Worktree {
+pub(crate) struct Worktree {
     /// Path to the worktree directory
     pub path: PathBuf,
     /// Branch name associated with this worktree
@@ -21,7 +21,7 @@ pub struct Worktree {
 
 /// Status of a worktree indicating whether it can be cleaned
 #[derive(Debug, PartialEq)]
-pub enum WorktreeStatus {
+pub(crate) enum WorktreeStatus {
     /// Branch has no unmerged commits relative to the base branch (either fully
     /// merged or freshly created with no new commits yet)
     Merged,
@@ -268,7 +268,7 @@ impl Worktree {
 }
 
 /// Discover all worktrees in the given repos directory
-pub async fn discover_worktrees(repos_dir: &Path) -> Result<Vec<Worktree>> {
+pub(crate) async fn discover_worktrees(repos_dir: &Path) -> Result<Vec<Worktree>> {
     let mut worktrees = Vec::new();
 
     if !repos_dir.exists() {

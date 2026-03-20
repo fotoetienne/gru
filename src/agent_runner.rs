@@ -16,16 +16,16 @@ use tokio::time::{timeout, Duration};
 
 /// Timeout in seconds for each line read from the agent's output stream.
 /// Set to 5 minutes to accommodate long-running LLM operations.
-pub const STREAM_TIMEOUT_SECS: u64 = 300;
+pub(crate) const STREAM_TIMEOUT_SECS: u64 = 300;
 
 /// Duration of inactivity before warning the user.
-pub const INACTIVITY_WARNING_SECS: u64 = 300; // 5 minutes
+pub(crate) const INACTIVITY_WARNING_SECS: u64 = 300; // 5 minutes
 
 /// Duration of inactivity before considering the task stuck.
-pub const INACTIVITY_STUCK_SECS: u64 = 900; // 15 minutes
+pub(crate) const INACTIVITY_STUCK_SECS: u64 = 900; // 15 minutes
 
 /// Exit code returned when a process is terminated by a signal (shell convention).
-pub const EXIT_CODE_SIGNAL_TERMINATED: i32 = 128;
+pub(crate) const EXIT_CODE_SIGNAL_TERMINATED: i32 = 128;
 
 /// Errors from the agent runner that indicate the task is stuck or timed out.
 ///
@@ -82,7 +82,7 @@ pub struct AgentRunResult {
 
 /// Parses a timeout string into a Duration.
 /// Supports formats like "10s", "5m", "1h", "30".
-pub fn parse_timeout(timeout_str: &str) -> Result<Duration> {
+pub(crate) fn parse_timeout(timeout_str: &str) -> Result<Duration> {
     let timeout_str = timeout_str.trim();
 
     // Try to parse as plain seconds first
