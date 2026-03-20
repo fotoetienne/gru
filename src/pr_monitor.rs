@@ -341,8 +341,9 @@ pub async fn add_auto_merge_label(
     pr_number: &str,
 ) -> Result<()> {
     let repo_full = github::repo_slug(owner, repo);
-    let output = github::gh_cli_command(host)
-        .args([
+    github::run_gh(
+        host,
+        &[
             "pr",
             "edit",
             pr_number,
@@ -350,19 +351,9 @@ pub async fn add_auto_merge_label(
             AUTO_MERGE_LABEL,
             "-R",
             &repo_full,
-        ])
-        .output()
-        .await
-        .context("Failed to add gru:auto-merge label")?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!(
-            "Failed to add gru:auto-merge label to PR #{}: {}",
-            pr_number,
-            stderr
-        );
-    }
+        ],
+    )
+    .await?;
 
     Ok(())
 }
