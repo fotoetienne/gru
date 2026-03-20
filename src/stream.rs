@@ -196,8 +196,7 @@ pub enum StreamOutput {
 /// Parse a trimmed line of Claude Code output into structured `StreamOutput` values.
 ///
 /// Returns an empty `Vec` if the line is empty or doesn't match any recognized format.
-/// This is the shared parsing logic used by both `EventStream::next_outputs()` and
-/// `ClaudeBackend::parse_events()`.
+/// Called exclusively by `ClaudeBackend::parse_events()`.
 pub(crate) fn parse_line(trimmed: &str) -> Vec<StreamOutput> {
     if trimmed.is_empty() {
         return Vec::new();
