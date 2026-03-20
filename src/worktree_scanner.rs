@@ -56,6 +56,9 @@ impl Worktree {
     /// Check if the worktree's branch has been merged into the base branch
     pub async fn check_merged(&self, base_branch: &str) -> Result<bool> {
         let output = Command::new("git")
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
             .args([
                 "-C",
                 &self.bare_repo_path.to_string_lossy(),
@@ -110,6 +113,9 @@ impl Worktree {
     /// warning when the branch is checked out in an active worktree.
     pub async fn check_remote_deleted(&self) -> Result<bool> {
         let output = Command::new("git")
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
             .args([
                 "-C",
                 &self.bare_repo_path.to_string_lossy(),
@@ -224,6 +230,9 @@ impl Worktree {
             })
             .unwrap_or(false)
         {
+            // Treat API errors (Err→None) and branches without issue numbers (Ok(None))
+            // as "still open" — conservative: don't clean unless we have positive
+            // confirmation the issue is done. Only Some(false) means explicitly open.
             let issue_still_open =
                 matches!(self.check_issue_closed().await.unwrap_or(None), Some(false));
             if !issue_still_open {
@@ -535,15 +544,6 @@ mod tests {
         cmd
     }
 
-    /// Clear git environment variables that interfere with tests when run
-    /// from a pre-commit hook. This affects both our helper commands AND the
-    /// production code's `Command::new("git")` calls (e.g., `check_merged()`).
-    fn clear_git_env() {
-        std::env::remove_var("GIT_DIR");
-        std::env::remove_var("GIT_WORK_TREE");
-        std::env::remove_var("GIT_INDEX_FILE");
-    }
-
     /// Set up a bare repo + working clone with an initial commit on main.
     /// Returns (bare_path, work_path).
     async fn setup_test_repo(base: &Path) -> (PathBuf, PathBuf) {
@@ -622,7 +622,6 @@ mod tests {
     /// not be cleaned if the associated issue is still open.
     #[tokio::test]
     async fn test_check_merged_returns_true_for_fresh_branch() {
-        clear_git_env();
         let temp_dir = tempfile::tempdir().unwrap();
         let (bare_path, work_path) = setup_test_repo(temp_dir.path()).await;
 
@@ -669,7 +668,6 @@ mod tests {
     /// Verify that `check_merged()` returns false when the branch has diverging commits.
     #[tokio::test]
     async fn test_check_merged_returns_false_for_diverged_branch() {
-        clear_git_env();
         let temp_dir = tempfile::tempdir().unwrap();
         let (bare_path, work_path) = setup_test_repo(temp_dir.path()).await;
 
