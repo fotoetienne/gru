@@ -19,11 +19,20 @@ pub(crate) fn repo_slug(owner: &str, repo: &str) -> String {
 ///
 /// # Arguments
 /// * `owner` - Repository owner (user or organization)
+/// * `config` - Optional pre-loaded config. When `None`, falls back to
+///   [`crate::config::try_load_config`].
 ///
 /// Returns the appropriate GitHub hostname
-pub(crate) fn infer_github_host(owner: &str) -> String {
+pub(crate) fn infer_github_host(owner: &str, config: Option<&crate::config::LabConfig>) -> String {
     // Check daemon.repos config for an explicit host for this owner
-    let cfg = crate::config::try_load_config();
+    let loaded;
+    let cfg = match config {
+        Some(c) => Some(c),
+        None => {
+            loaded = crate::config::try_load_config();
+            loaded.as_ref()
+        }
+    };
     if let Some(cfg) = cfg {
         for repo_spec in &cfg.daemon.repos {
             if let Some((host, repo_owner, _repo)) =
@@ -955,12 +964,44 @@ mod tests {
 
     #[test]
     fn test_infer_github_host_public_owner() {
-        assert_eq!(infer_github_host("octocat"), "github.com");
+        assert_eq!(infer_github_host("octocat", None), "github.com");
     }
 
     #[test]
     fn test_infer_github_host_empty() {
-        assert_eq!(infer_github_host(""), "github.com");
+        assert_eq!(infer_github_host("", None), "github.com");
+    }
+
+    #[test]
+    fn test_infer_github_host_with_injected_config() {
+        use crate::config::{GhHostConfig, LabConfig};
+        use std::collections::HashMap;
+
+        let mut hosts = HashMap::new();
+        hosts.insert(
+            "corp".to_string(),
+            GhHostConfig {
+                host: "github.corp.example.com".to_string(),
+                web_url: None,
+            },
+        );
+
+        let cfg = LabConfig {
+            github_hosts: hosts,
+            daemon: crate::config::DaemonConfig {
+                repos: vec!["corp:acme/widgets".to_string()],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        // Owner present in config -> returns GHE host
+        assert_eq!(
+            infer_github_host("acme", Some(&cfg)),
+            "github.corp.example.com"
+        );
+        // Owner not in config -> falls back to github.com
+        assert_eq!(infer_github_host("unknown", Some(&cfg)), "github.com");
     }
 
     // --- IssueInfo deserialization tests ---

@@ -133,7 +133,7 @@ pub async fn prune_stale_entries() -> Result<usize> {
                     continue;
                 }
                 let (owner, repo_name) = (parts[0], parts[1]);
-                let host = infer_github_host(owner);
+                let host = infer_github_host(owner, None);
 
                 match is_pr_open_via_cli(owner, repo_name, &host, pr_number).await {
                     Ok(true) => {

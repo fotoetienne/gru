@@ -355,7 +355,7 @@ async fn find_bare_repos(dir: &Path) -> Result<Vec<PathBuf>> {
     let mut dirs_to_scan = vec![dir.to_path_buf()];
 
     while let Some(current_dir) = dirs_to_scan.pop() {
-        let entries = match std::fs::read_dir(&current_dir) {
+        let mut entries = match tokio::fs::read_dir(&current_dir).await {
             Ok(entries) => entries,
             Err(e) => {
                 log::warn!(
@@ -367,15 +367,14 @@ async fn find_bare_repos(dir: &Path) -> Result<Vec<PathBuf>> {
             }
         };
 
-        for entry in entries {
-            let entry = match entry {
-                Ok(e) => e,
-                Err(_) => continue,
-            };
-
+        while let Ok(Some(entry)) = entries.next_entry().await {
             let path = entry.path();
 
-            if !path.is_dir() {
+            let is_dir = tokio::fs::metadata(&path)
+                .await
+                .map(|m| m.is_dir())
+                .unwrap_or(false);
+            if !is_dir {
                 continue;
             }
 

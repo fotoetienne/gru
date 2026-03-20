@@ -469,7 +469,7 @@ pub(crate) async fn resolve_host_from_worktree(
     }
 
     // Fallback to config-based heuristic
-    crate::github::infer_github_host(owner)
+    crate::github::infer_github_host(owner, None)
 }
 
 /// Extract the hostname from a git remote URL without requiring it to be in the
