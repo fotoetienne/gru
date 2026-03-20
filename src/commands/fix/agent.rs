@@ -170,7 +170,8 @@ async fn run_agent_session_inner(
                 }
                 // Bash tool with test-related commands signals the testing phase.
                 // "command" is the Codex backend equivalent of Bash.
-                "Bash" | "command" if previous_phase != MinionPhase::Testing => {
+                // Only transition from Implementing (not Planning) to keep phases sequential.
+                "Bash" | "command" if previous_phase == MinionPhase::Implementing => {
                     if let Some(ref summary) = input_summary {
                         if is_test_command(summary) {
                             callback_state
@@ -263,10 +264,10 @@ async fn run_agent_session_inner(
 /// Checks whether a Bash tool input summary looks like a test command.
 ///
 /// Matches common test runners and invocations (e.g., `cargo test`, `just test`,
-/// `npm test`, `pytest`). The summary is expected to start with "Run: " as
-/// produced by the Claude Code backend.
+/// `npm test`, `pytest`). The summary may start with "Run: " as produced by
+/// the agent backends; this prefix is optional and will be stripped when present.
 fn is_test_command(summary: &str) -> bool {
-    // Strip the "Run: " prefix that Claude Code prepends to Bash summaries
+    // Strip the optional "Run: " prefix that agent backends prepend to Bash summaries
     let cmd = summary.strip_prefix("Run: ").unwrap_or(summary);
     let cmd_lower = cmd.to_lowercase();
 
