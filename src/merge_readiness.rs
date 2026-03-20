@@ -25,7 +25,7 @@ const MAX_DELAY_SECS: u64 = 60;
 /// Each field represents one prerequisite for merging. The PR is ready
 /// to merge only when all fields are `true`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MergeReadiness {
+pub(crate) struct MergeReadiness {
     /// PR is not a draft.
     pub not_draft: bool,
     /// All CI check runs passed (success, skipped, or neutral), none pending/in-progress.
@@ -81,7 +81,7 @@ impl fmt::Display for MergeReadiness {
 ///
 /// This is a pure query function — it reads GitHub state and returns a
 /// deterministic result. Same API state always produces the same output.
-pub async fn check_merge_readiness(
+pub(crate) async fn check_merge_readiness(
     host: &str,
     owner: &str,
     repo: &str,

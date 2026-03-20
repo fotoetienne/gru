@@ -150,7 +150,7 @@ pub(crate) struct User {
 
 /// A review comment with file location and content
 #[derive(Debug, Clone)]
-pub struct ReviewComment {
+pub(crate) struct ReviewComment {
     pub file: String,
     pub line: Option<u64>,
     pub body: String,
@@ -201,7 +201,7 @@ const READY_TO_MERGE_LABEL: &str = labels::READY_TO_MERGE;
 const AUTO_MERGE_LABEL: &str = labels::AUTO_MERGE;
 
 /// Ensure the `gru:ready-to-merge` label exists in the repository, creating it if needed.
-pub async fn ensure_ready_to_merge_label(host: &str, owner: &str, repo: &str) -> Result<()> {
+pub(crate) async fn ensure_ready_to_merge_label(host: &str, owner: &str, repo: &str) -> Result<()> {
     let (color, description) =
         labels::get_label_info(READY_TO_MERGE_LABEL).expect("READY_TO_MERGE must be in ALL_LABELS");
     let repo_full = github::repo_slug(owner, repo);
@@ -291,7 +291,7 @@ async fn has_auto_merge_label(
 }
 
 /// Ensure the `gru:auto-merge` label exists in the repository, creating it if needed.
-pub async fn ensure_auto_merge_label(host: &str, owner: &str, repo: &str) -> Result<()> {
+pub(crate) async fn ensure_auto_merge_label(host: &str, owner: &str, repo: &str) -> Result<()> {
     let (color, description) =
         labels::get_label_info(AUTO_MERGE_LABEL).expect("AUTO_MERGE must be in ALL_LABELS");
     let repo_full = github::repo_slug(owner, repo);
@@ -334,7 +334,7 @@ pub async fn ensure_auto_merge_label(host: &str, owner: &str, repo: &str) -> Res
 }
 
 /// Add the `gru:auto-merge` label to a PR.
-pub async fn add_auto_merge_label(
+pub(crate) async fn add_auto_merge_label(
     host: &str,
     owner: &str,
     repo: &str,
@@ -495,7 +495,7 @@ struct CheckRunsResponse {
 /// should pass this value as `baseline` on the next invocation so that:
 /// - Already-handled reviews are not re-fetched.
 /// - Reviews posted during event handling (rebase, review response) are caught.
-pub async fn monitor_pr(
+pub(crate) async fn monitor_pr(
     host: &str,
     owner: &str,
     repo: &str,
@@ -651,7 +651,7 @@ async fn poll_once(
 
 /// Result of monitoring a PR
 #[derive(Debug)]
-pub enum MonitorResult {
+pub(crate) enum MonitorResult {
     /// PR was successfully merged
     Merged,
     /// PR was closed without merging
@@ -769,7 +769,7 @@ async fn get_review_comments(
 }
 
 /// Format review comments into a prompt for Claude
-pub fn format_review_prompt(
+pub(crate) fn format_review_prompt(
     issue_num: u64,
     pr_number: &str,
     comments: &[ReviewComment],

@@ -9,7 +9,7 @@ use crate::workspace::Workspace;
 
 /// Repository source type for initialization
 #[derive(Debug, Clone)]
-pub enum RepoSource {
+pub(crate) enum RepoSource {
     /// GitHub repository in "owner/repo" format
     GitHub(String),
     /// Local filesystem path (not yet implemented)
@@ -20,7 +20,7 @@ pub enum RepoSource {
 }
 
 /// Parse repository source from command line argument
-pub fn parse_repo_source(arg: &str) -> Result<RepoSource> {
+pub(crate) fn parse_repo_source(arg: &str) -> Result<RepoSource> {
     // Explicit path markers
     if arg.starts_with("./") || arg.starts_with("../") || arg.starts_with('/') {
         return Ok(RepoSource::LocalPath(PathBuf::from(arg)));

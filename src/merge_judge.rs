@@ -20,7 +20,7 @@ use crate::github;
 use crate::labels;
 
 /// Default confidence threshold (1-10). Only merge when confidence >= this.
-pub const DEFAULT_CONFIDENCE_THRESHOLD: u8 = 8;
+pub(crate) const DEFAULT_CONFIDENCE_THRESHOLD: u8 = 8;
 
 /// Maximum consecutive wait responses before the judge must decide merge or escalate.
 const MAX_CONSECUTIVE_WAITS: u32 = 3;
@@ -33,7 +33,7 @@ const NEEDS_HUMAN_REVIEW_LABEL: &str = labels::NEEDS_HUMAN_REVIEW;
 
 /// Action the judge can take.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum JudgeAction {
+pub(crate) enum JudgeAction {
     /// All feedback genuinely addressed — proceed with merge.
     Merge,
     /// Not confident yet — re-evaluate after the given duration.
@@ -54,7 +54,7 @@ struct JudgeResponseRaw {
 
 /// Parsed judge response with typed action.
 #[derive(Debug, Clone)]
-pub struct JudgeResponse {
+pub(crate) struct JudgeResponse {
     pub confidence: u8,
     pub action: JudgeAction,
     pub reasoning: String,
@@ -62,14 +62,14 @@ pub struct JudgeResponse {
 
 /// Fingerprint of PR state used to avoid redundant judge invocations.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PrStateFingerprint {
+pub(crate) struct PrStateFingerprint {
     pub head_sha: String,
     pub comment_count: usize,
 }
 
 /// Tracks the judge's state across poll iterations.
 #[derive(Debug)]
-pub struct JudgeState {
+pub(crate) struct JudgeState {
     /// Last PR state we evaluated.
     last_fingerprint: Option<PrStateFingerprint>,
     /// Number of consecutive "wait" responses with no state change.
@@ -81,7 +81,7 @@ pub struct JudgeState {
 }
 
 impl JudgeState {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             last_fingerprint: None,
             consecutive_waits: 0,
@@ -91,7 +91,7 @@ impl JudgeState {
     }
 
     /// Returns true if the judge should be invoked for the given PR state.
-    pub fn should_invoke(&self, fingerprint: &PrStateFingerprint) -> bool {
+    pub(crate) fn should_invoke(&self, fingerprint: &PrStateFingerprint) -> bool {
         // If PR state changed, always re-invoke.
         if self.last_fingerprint.as_ref() != Some(fingerprint) {
             return true;
@@ -107,7 +107,11 @@ impl JudgeState {
     }
 
     /// Record the judge's response and update internal state.
-    pub fn record_response(&mut self, fingerprint: PrStateFingerprint, response: &JudgeResponse) {
+    pub(crate) fn record_response(
+        &mut self,
+        fingerprint: PrStateFingerprint,
+        response: &JudgeResponse,
+    ) {
         let state_changed = self.last_fingerprint.as_ref() != Some(&fingerprint);
 
         if state_changed {
@@ -139,23 +143,23 @@ impl JudgeState {
     }
 
     /// Returns the number of consecutive waits with no state change.
-    pub fn consecutive_waits(&self) -> u32 {
+    pub(crate) fn consecutive_waits(&self) -> u32 {
         self.consecutive_waits
     }
 
     /// Mark that the escalation label was successfully applied.
-    pub fn mark_label_applied(&mut self) {
+    pub(crate) fn mark_label_applied(&mut self) {
         self.label_applied = true;
     }
 
     /// Returns true if the label was previously applied by the judge.
-    pub fn label_was_applied(&self) -> bool {
+    pub(crate) fn label_was_applied(&self) -> bool {
         self.label_applied
     }
 
     /// Note that `gru:needs-human-review` was cleared by a human.
     /// Only has effect if the label was previously applied.
-    pub fn mark_escalation_cleared(&mut self) {
+    pub(crate) fn mark_escalation_cleared(&mut self) {
         if self.label_applied {
             self.label_applied = false;
             // Reset fingerprint so the judge re-evaluates on next check.
@@ -166,7 +170,7 @@ impl JudgeState {
 
 /// Lightweight fingerprint fetch — only head SHA + comment counts.
 /// Used to check `should_invoke` before fetching full context.
-pub async fn get_pr_fingerprint(
+pub(crate) async fn get_pr_fingerprint(
     host: &str,
     owner: &str,
     repo: &str,
@@ -547,7 +551,7 @@ fn extract_json(text: &str) -> Option<&str> {
 /// 3. Builds the judge prompt and invokes the LLM
 /// 4. Enforces max consecutive waits (coerces to escalate)
 /// 5. Returns the response
-pub async fn evaluate(
+pub(crate) async fn evaluate(
     host: &str,
     owner: &str,
     repo: &str,
@@ -611,7 +615,7 @@ pub async fn evaluate(
 }
 
 /// Apply the `gru:needs-human-review` label to a PR.
-pub async fn add_needs_human_review_label(
+pub(crate) async fn add_needs_human_review_label(
     host: &str,
     owner: &str,
     repo: &str,
@@ -636,7 +640,11 @@ pub async fn add_needs_human_review_label(
 }
 
 /// Ensure the `gru:needs-human-review` label exists in the repository.
-pub async fn ensure_needs_human_review_label(host: &str, owner: &str, repo: &str) -> Result<()> {
+pub(crate) async fn ensure_needs_human_review_label(
+    host: &str,
+    owner: &str,
+    repo: &str,
+) -> Result<()> {
     let (color, description) = labels::get_label_info(NEEDS_HUMAN_REVIEW_LABEL)
         .expect("NEEDS_HUMAN_REVIEW must be in ALL_LABELS");
     let repo_full = github::repo_slug(owner, repo);
@@ -679,7 +687,7 @@ pub async fn ensure_needs_human_review_label(host: &str, owner: &str, repo: &str
 ///
 /// Returns `Err` on API failures — the caller should treat errors
 /// conservatively (do not proceed with merge if the check fails).
-pub async fn has_needs_human_review_label(
+pub(crate) async fn has_needs_human_review_label(
     host: &str,
     owner: &str,
     repo: &str,
@@ -701,7 +709,7 @@ pub async fn has_needs_human_review_label(
 }
 
 /// Post an escalation comment explaining why the judge escalated.
-pub async fn post_judge_escalation_comment(
+pub(crate) async fn post_judge_escalation_comment(
     host: &str,
     owner: &str,
     repo: &str,

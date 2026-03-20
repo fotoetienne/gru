@@ -44,7 +44,7 @@ pub(crate) fn infer_github_host(owner: &str) -> String {
 /// Always uses the `gh` binary and sets `GH_HOST` to the provided host
 /// so authentication targets the correct server. This ensures deterministic
 /// host selection even when the parent process has `GH_HOST` set.
-pub fn gh_cli_command(host: &str) -> Command {
+pub(crate) fn gh_cli_command(host: &str) -> Command {
     let mut cmd = Command::new("gh");
     cmd.env("GH_HOST", host);
     cmd

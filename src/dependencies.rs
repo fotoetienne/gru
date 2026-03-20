@@ -7,7 +7,7 @@ use crate::github::gh_cli_command;
 /// are skipped with a log warning.
 ///
 /// Returns a list of issue numbers found in the body text.
-pub fn parse_blockers_from_body(body: &str) -> Vec<u64> {
+pub(crate) fn parse_blockers_from_body(body: &str) -> Vec<u64> {
     let marker = "**Blocked by:**";
     let start = match body.find(marker) {
         Some(pos) => pos + marker.len(),
@@ -59,7 +59,7 @@ pub fn parse_blockers_from_body(body: &str) -> Vec<u64> {
 ///
 /// Separates "API supported and returned a result" from "API not available or errored".
 #[derive(Debug, PartialEq)]
-pub enum ApiResult {
+pub(crate) enum ApiResult {
     /// API returned 200 — the contained list is the set of open blocker issue numbers.
     Supported(Vec<u64>),
     /// API is not available (404/GHES) or returned an error (403/5xx/spawn failure).
@@ -70,7 +70,12 @@ pub enum ApiResult {
 ///
 /// This is a pure function extracted for testability. It interprets the exit status,
 /// stderr, and stdout of the `gh api` call.
-pub fn parse_api_output(success: bool, stdout: &str, stderr: &str, issue_number: u64) -> ApiResult {
+pub(crate) fn parse_api_output(
+    success: bool,
+    stdout: &str,
+    stderr: &str,
+    issue_number: u64,
+) -> ApiResult {
     if !success {
         if stderr.contains("404") || stderr.contains("Not Found") {
             log::debug!(
@@ -119,7 +124,7 @@ pub fn parse_api_output(success: bool, stdout: &str, stderr: &str, issue_number:
 ///
 /// Extracted for testability — handles both spawn failures (`Err`) and
 /// output parsing (`Ok`). The `Ok` variant carries `(success, stdout, stderr)`.
-pub fn interpret_api_call(
+pub(crate) fn interpret_api_call(
     output: Result<(bool, String, String), String>,
     issue_number: u64,
 ) -> Option<Vec<u64>> {
@@ -145,7 +150,7 @@ pub fn interpret_api_call(
 /// Returns `Some(blockers)` when the API is supported and returns 200.
 /// Returns `None` on 404 (GHES), 403, 5xx, or any other error — the caller
 /// should fall back to body parsing.
-pub async fn get_blockers_via_api(
+pub(crate) async fn get_blockers_via_api(
     host: &str,
     owner: &str,
     repo: &str,
@@ -186,7 +191,7 @@ pub async fn get_blockers_via_api(
 /// - Native API wins when it returns `Some` (even if the list is empty)
 /// - Body text is the sole source when the API is unavailable (`None`)
 /// - Results are never combined across sources
-pub fn resolve_blockers(body: &str, api_result: Option<Vec<u64>>) -> Vec<u64> {
+pub(crate) fn resolve_blockers(body: &str, api_result: Option<Vec<u64>>) -> Vec<u64> {
     match api_result {
         Some(api_blockers) => api_blockers,
         None => parse_blockers_from_body(body),
@@ -199,7 +204,7 @@ pub fn resolve_blockers(body: &str, api_result: Option<Vec<u64>>) -> Vec<u64> {
 /// - Native API wins when it returns 200 (even if the list is empty)
 /// - Body text is the sole source when the API is unavailable (404/error)
 /// - Results are never combined across sources
-pub async fn get_blockers(
+pub(crate) async fn get_blockers(
     host: &str,
     owner: &str,
     repo: &str,
