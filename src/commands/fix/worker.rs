@@ -1,3 +1,4 @@
+use super::agent::{resume_agent_session, run_agent_session};
 use super::helpers::{try_mark_issue_blocked, try_mark_issue_failed, update_orchestration_phase};
 use super::monitor::{monitor_ci_after_fix, monitor_pr_lifecycle};
 use super::pr::handle_pr_creation;
@@ -6,17 +7,15 @@ use crate::agent::AgentBackend;
 use crate::agent_runner::EXIT_CODE_SIGNAL_TERMINATED;
 use crate::minion_registry::OrchestrationPhase;
 use crate::pr_monitor;
-use agent::{resume_agent_session, run_agent_session};
 use anyhow::Result;
 use tokio::time::Duration;
 
-use super::agent;
-
 /// Runs the agent session phase (Phase 3).
 ///
-/// Returns `Some(AgentResult)` on success, or `Ok(None)` if the phase was
-/// already completed (resume skip). Returns an exit code via `Err` on
-/// stuck/timeout or other failures that should stop the pipeline.
+/// Returns `Ok(Some(AgentResult))` when the agent ran (the result may indicate
+/// a non-zero exit — callers must check `result.status.success()`).
+/// Returns `Ok(None)` if the phase was already completed (resume skip).
+/// Returns `Err` on stuck/timeout or other failures that should stop the pipeline.
 pub(super) async fn run_agent_phase(
     backend: &dyn AgentBackend,
     issue_ctx: &IssueContext,
@@ -183,11 +182,9 @@ pub(super) async fn monitor_pr_phase(
             "⚠️  No PR number available — skipping PR lifecycle monitoring. \
              Branch may not have been pushed, or PR lookup failed."
         );
-    }
 
-    // CI monitoring — only when PR creation failed (no PR number), since
-    // monitor_pr_lifecycle handles CI internally when a PR exists.
-    if pr_number.is_none() {
+        // CI monitoring fallback — only when no PR exists, since
+        // monitor_pr_lifecycle handles CI internally when a PR is present.
         let ci_passed = monitor_ci_after_fix(
             &issue_ctx.host,
             &issue_ctx.owner,
