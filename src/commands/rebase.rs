@@ -16,9 +16,6 @@ use uuid::Uuid;
 /// intelligent resolution.
 ///
 /// Returns the process exit code (0 = success).
-/// Default timeout for Claude conflict resolution (30 minutes).
-const DEFAULT_CONFLICT_TIMEOUT: &str = "30m";
-
 pub async fn handle_rebase(
     target: Option<String>,
     push: bool,
@@ -74,11 +71,8 @@ pub async fn handle_rebase(
             // (the /rebase command will re-initiate the rebase itself)
             abort_rebase(&worktree_path).await?;
 
-            // Use provided timeout or default to 30 minutes
-            let conflict_timeout = timeout.unwrap_or(DEFAULT_CONFLICT_TIMEOUT);
-
             // Spawn Claude Code with /rebase command
-            let exit_code = run_agent_rebase(&worktree_path, Some(conflict_timeout)).await?;
+            let exit_code = run_agent_rebase(&worktree_path, timeout).await?;
 
             if exit_code == 0 {
                 if push {
@@ -408,8 +402,12 @@ pub(crate) async fn force_push(worktree_path: &Path) -> Result<()> {
     );
 }
 
+/// Default timeout for agent conflict resolution (30 minutes).
+const DEFAULT_CONFLICT_TIMEOUT: &str = "30m";
+
 /// Spawns the agent with the `/rebase` command to resolve conflicts.
 ///
+/// Uses a 30-minute default timeout if none is provided.
 /// Returns the agent's exit code.
 pub(crate) async fn run_agent_rebase(worktree_path: &Path, timeout: Option<&str>) -> Result<i32> {
     let backend = agent_registry::resolve_backend(agent_registry::DEFAULT_AGENT)?;
@@ -417,11 +415,12 @@ pub(crate) async fn run_agent_rebase(worktree_path: &Path, timeout: Option<&str>
     let github_host = super::resume::resolve_host_from_worktree(worktree_path, "").await;
     let cmd = backend.build_command(worktree_path, &session_id, "/rebase", &github_host);
 
+    let effective_timeout = Some(timeout.unwrap_or(DEFAULT_CONFLICT_TIMEOUT));
     let result = run_agent_with_stream_monitoring(
         cmd,
         &*backend,
         worktree_path,
-        timeout,
+        effective_timeout,
         None::<fn(&AgentEvent)>, // no output callback
         None,                    // no on_spawn callback
     )
