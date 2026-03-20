@@ -167,7 +167,7 @@ pub(super) async fn monitor_pr_phase(
 ) -> Result<()> {
     if let Some(ref pr_num) = pr_number {
         update_orchestration_phase(&wt_ctx.minion_id, OrchestrationPhase::MonitoringPr).await;
-        monitor_pr_lifecycle(
+        let _ = monitor_pr_lifecycle(
             backend,
             issue_ctx,
             wt_ctx,
