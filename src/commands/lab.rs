@@ -1186,25 +1186,12 @@ async fn is_issue_claimed(repo: &str, issue_number: u64) -> Result<bool> {
     .await
 }
 
-/// Spawn a Minion to work on an issue using the `gru do` command.
-/// Returns the child process handle for lifecycle tracking.
-async fn spawn_minion(repo: &str, host: &str, issue_number: u64) -> Result<Child> {
-    let issue_ref = crate::github::build_issue_url_with_host(repo, host, issue_number)
-        .with_context(|| format!("Invalid repo format: '{}'", repo))?;
-
-    // Get the current executable path
-    let exe = std::env::current_exe().context("Failed to get current executable path")?;
-
-    // Create log directory and open log file for this minion's output
-    let home = dirs::home_dir().context("Failed to determine home directory")?;
-    let log_dir = home.join(".gru").join("state").join("logs");
-    tokio::fs::create_dir_all(&log_dir)
-        .await
-        .with_context(|| format!("Failed to create log directory: {}", log_dir.display()))?;
-
-    // Include host in log filename to avoid collisions when the same owner/repo
-    // exists on different hosts (e.g., github.com/org/svc vs ghe.corp.com/org/svc).
-    // Sanitize by replacing any non-alphanumeric characters with hyphens.
+/// Build a log filename for a minion working on an issue.
+///
+/// For `github.com` hosts the prefix is omitted; for other hosts (GHE) the
+/// hostname is sanitized and prepended to avoid collisions when the same
+/// owner/repo exists on multiple hosts.
+fn format_log_name(host: &str, repo: &str, issue_number: u64) -> String {
     let safe_host = if host == "github.com" {
         String::new()
     } else {
@@ -1221,10 +1208,27 @@ async fn spawn_minion(repo: &str, host: &str, issue_number: u64) -> Result<Child
         format!("{}-", sanitized)
     };
     let safe_repo = repo.replace('/', "-");
-    let log_path = log_dir.join(format!(
-        "{}{}-issue-{}.log",
-        safe_host, safe_repo, issue_number
-    ));
+    format!("{}{}-issue-{}.log", safe_host, safe_repo, issue_number)
+}
+
+/// Spawn a Minion to work on an issue using the `gru do` command.
+///
+/// Returns the child process handle for lifecycle tracking.
+async fn spawn_minion(repo: &str, host: &str, issue_number: u64) -> Result<Child> {
+    let issue_ref = crate::github::build_issue_url_with_host(repo, host, issue_number)
+        .with_context(|| format!("Invalid repo format: '{}'", repo))?;
+
+    // Get the current executable path
+    let exe = std::env::current_exe().context("Failed to get current executable path")?;
+
+    // Create log directory and open log file for this minion's output
+    let home = dirs::home_dir().context("Failed to determine home directory")?;
+    let log_dir = home.join(".gru").join("state").join("logs");
+    tokio::fs::create_dir_all(&log_dir)
+        .await
+        .with_context(|| format!("Failed to create log directory: {}", log_dir.display()))?;
+
+    let log_path = log_dir.join(format_log_name(host, repo, issue_number));
     let log_file = tokio::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -1411,44 +1415,26 @@ mod tests {
 
     #[test]
     fn test_log_path_github_com() {
-        let safe_repo = "owner/repo".replace('/', "-");
-        let log_name = format!("{}-issue-{}.log", safe_repo, 42);
-        assert_eq!(log_name, "owner-repo-issue-42.log");
+        assert_eq!(
+            format_log_name("github.com", "owner/repo", 42),
+            "owner-repo-issue-42.log"
+        );
     }
 
     #[test]
     fn test_log_path_ghe_includes_host() {
-        let host = "ghe.netflix.net";
-        let sanitized: String = host
-            .chars()
-            .map(|c| {
-                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                    c
-                } else {
-                    '-'
-                }
-            })
-            .collect();
-        let safe_host = format!("{}-", sanitized);
-        let safe_repo = "corp/service".replace('/', "-");
-        let log_name = format!("{}{}-issue-{}.log", safe_host, safe_repo, 42);
-        assert_eq!(log_name, "ghe-netflix-net-corp-service-issue-42.log");
+        assert_eq!(
+            format_log_name("ghe.netflix.net", "corp/service", 42),
+            "ghe-netflix-net-corp-service-issue-42.log"
+        );
     }
 
     #[test]
     fn test_log_path_host_with_port_is_sanitized() {
-        let host = "ghe.example.com:8443";
-        let sanitized: String = host
-            .chars()
-            .map(|c| {
-                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                    c
-                } else {
-                    '-'
-                }
-            })
-            .collect();
-        assert_eq!(sanitized, "ghe-example-com-8443");
+        assert_eq!(
+            format_log_name("ghe.example.com:8443", "org/app", 7),
+            "ghe-example-com-8443-org-app-issue-7.log"
+        );
     }
 
     // --- issue URL construction tests ---
