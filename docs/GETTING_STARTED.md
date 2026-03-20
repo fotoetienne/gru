@@ -126,7 +126,7 @@ gru clean   # removes worktrees for merged/closed PRs
 
 ## Next Steps
 
-- **Configure defaults** — `~/.gru/config.toml` lets you set a default agent backend, token limits, and more. See the [README](../README.md) for config reference.
+- **Configure defaults** — `~/.gru/config.toml` lets you set a default agent backend, polling intervals, merge thresholds, and more. Copy [docs/config.example.toml](config.example.toml) to `~/.gru/config.toml` and uncomment the sections you need. The example file includes annotated explanations of every option, including GitHub Enterprise Server setup.
 - **Lab mode** — Run `gru lab` to let Gru continuously pick up `gru:todo` issues and work on them unattended. Useful for letting it run overnight.
 - **Multiple backends** — Use `gru do 42 --agent codex` to use OpenAI Codex instead of Claude. See [docs/AGENTS.md](AGENTS.md) for setup.
 - **Architecture** — Curious how it all fits together? [docs/DESIGN.md](DESIGN.md) covers the full system design.
