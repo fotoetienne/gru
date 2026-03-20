@@ -219,16 +219,22 @@ pub async fn handle_review(pr_arg: Option<String>, agent_name: &str) -> Result<i
     )
     .await;
 
-    // Best-effort cleanup: clear PID, set mode to Stopped, and save token usage.
-    // Token usage is persisted regardless of exit status (Ok with non-zero exit) because
-    // cost data is valuable even for failed tasks. Only stream-level errors (timeout, stuck)
-    // result in Err, in which case partial usage is not saved.
+    // Best-effort cleanup: clear PID, set mode to Stopped, save token usage, and
+    // mark orchestration phase as terminal. Review is ephemeral (does not support
+    // resume), so we always move to Completed/Failed to prevent the lab daemon from
+    // attempting to resume a finished review.
+    let exit_ok = run_result.as_ref().is_ok_and(|r| r.status.success());
     let token_usage = run_result.as_ref().ok().map(|r| r.token_usage.clone());
     let cleanup_id = minion_id.clone();
     let _ = with_registry(move |registry| {
         registry.update(&cleanup_id, |info| {
             info.clear_pid();
             info.mode = MinionMode::Stopped;
+            info.orchestration_phase = if exit_ok {
+                OrchestrationPhase::Completed
+            } else {
+                OrchestrationPhase::Failed
+            };
             if let Some(usage) = token_usage {
                 info.token_usage = Some(usage);
             }
