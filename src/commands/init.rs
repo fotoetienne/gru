@@ -42,8 +42,61 @@ pub(crate) fn parse_repo_source(arg: &str) -> Result<RepoSource> {
     );
 }
 
+/// Check if a binary is available on PATH.
+fn check_binary(name: &str) -> bool {
+    which::which(name).is_ok()
+}
+
+/// Run prerequisite checks before initialization.
+/// Returns Ok(()) if all critical prerequisites are met, Err with exit code 1 otherwise.
+fn check_prerequisites() -> Result<i32> {
+    println!("Checking prerequisites...\n");
+    let mut has_errors = false;
+
+    // 1. Check for gh CLI
+    if check_binary("gh") {
+        println!("  ✓ gh (GitHub CLI)");
+    } else {
+        println!("  ✗ gh (GitHub CLI) — not found");
+        println!("    Install: https://cli.github.com/");
+        has_errors = true;
+    }
+
+    // 2. Check for at least one agent backend
+    let has_claude = check_binary("claude");
+    let has_codex = check_binary("codex");
+
+    if has_claude {
+        println!("  ✓ claude (Claude Code CLI)");
+    }
+    if has_codex {
+        println!("  ✓ codex (OpenAI Codex CLI)");
+    }
+    if !has_claude && !has_codex {
+        println!("  ⚠ No agent backend found (claude or codex)");
+        println!(
+            "    Install Claude Code: https://docs.anthropic.com/en/docs/claude-code/overview"
+        );
+        println!("    Install Codex: https://github.com/openai/codex");
+    }
+
+    if has_errors {
+        println!("\n❌ Missing required tools. Install them and try again.");
+        return Ok(1);
+    }
+
+    println!();
+    Ok(0)
+}
+
 /// Initialize a repository for use with Gru
-pub async fn handle_init(repo_arg: String) -> Result<i32> {
+pub async fn handle_init(repo_arg: String, host_override: Option<String>) -> Result<i32> {
+    // Run prerequisite checks
+    let prereq_result = check_prerequisites()?;
+    if prereq_result != 0 {
+        return Ok(prereq_result);
+    }
+
     // Parse repository source
     let repo_source = parse_repo_source(&repo_arg)?;
 
@@ -52,12 +105,18 @@ pub async fn handle_init(repo_arg: String) -> Result<i32> {
         RepoSource::GitHub(github_repo) => {
             let parts: Vec<&str> = github_repo.split('/').collect();
             let owner = parts[0].to_string();
-            let host = github::infer_github_host(&owner);
+            let host = if let Some(ref h) = host_override {
+                h.clone()
+            } else {
+                github::infer_github_host(&owner)
+            };
             (owner, parts[1].to_string(), host)
         }
         RepoSource::CurrentDir => {
             println!("🔍 Detecting repository from current directory...");
-            detect_current_repo().await?
+            let (owner, repo, detected_host) = detect_current_repo().await?;
+            let host = host_override.unwrap_or(detected_host);
+            (owner, repo, host)
         }
     };
 
@@ -69,10 +128,15 @@ pub async fn handle_init(repo_arg: String) -> Result<i32> {
         Ok(()) => {
             println!("✓ Authenticated via gh CLI");
         }
-        Err(e) => {
-            log::error!("\n❌ GitHub authentication failed: {}", e);
-            log::warn!("Ensure the GitHub CLI (gh) is installed and authenticated:");
-            log::error!("  gh auth login --hostname {}\n", host);
+        Err(_) => {
+            println!("\n❌ GitHub authentication failed for host: {}", host);
+            println!("\nTo authenticate, run:\n");
+            if host == "github.com" {
+                println!("  gh auth login");
+            } else {
+                println!("  gh auth login --hostname {}", host);
+            }
+            println!();
             return Ok(1);
         }
     }
@@ -87,6 +151,7 @@ pub async fn handle_init(repo_arg: String) -> Result<i32> {
     match LabConfig::write_default_config(&config_path) {
         Ok(true) => {
             println!("✓ Created default config: {}", config_path.display());
+            println!("  Edit it to customize Gru's behavior.");
         }
         Ok(false) => {
             println!("  • Config exists: {}", config_path.display());
@@ -115,7 +180,7 @@ pub async fn handle_init(repo_arg: String) -> Result<i32> {
         }
     }
 
-    // 4. Create all required labels (idempotent via --force)
+    // 5. Create all required labels (idempotent via --force)
     println!("\n🏷️  Configuring labels...");
     let mut labels_failed = Vec::new();
 
@@ -138,7 +203,7 @@ pub async fn handle_init(repo_arg: String) -> Result<i32> {
         );
     }
 
-    // 5. Check for ready issues
+    // 6. Check for ready issues
     println!("\n🔍 Checking for ready issues...");
     match github::list_ready_issues_via_cli(&owner, &repo, &host, labels::TODO).await {
         Ok(issues) => {
@@ -161,11 +226,13 @@ pub async fn handle_init(repo_arg: String) -> Result<i32> {
     println!("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     println!("✓ Repository is ready!\n");
     println!("Next steps:");
-    println!("  1. Mark an issue as ready:");
-    println!("     gh issue edit 42 --add-label {}", labels::TODO);
+    println!("  1. Label an issue for Gru to work on:");
+    println!("     gh issue edit <number> --add-label {}", labels::TODO);
     println!("  2. Start a Minion:");
-    println!("     gru do {}/{}#42", owner, repo);
-    println!("  3. Check status:");
+    println!("     gru do {}/{}#<number>", owner, repo);
+    println!("  3. Or run in daemon mode:");
+    println!("     gru lab");
+    println!("  4. Check status:");
     println!("     gru status");
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
 
@@ -247,5 +314,13 @@ mod tests {
 
         let result = parse_repo_source("owner/");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_check_binary_finds_common_tools() {
+        // 'sh' should exist on any Unix system
+        assert!(check_binary("sh"));
+        // Random non-existent binary
+        assert!(!check_binary("definitely-not-a-real-binary-xyz123"));
     }
 }
