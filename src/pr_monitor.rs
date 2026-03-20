@@ -176,6 +176,12 @@ pub(crate) struct ReviewFeedback {
     pub bodies: Vec<ReviewBody>,
 }
 
+impl ReviewFeedback {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.comments.is_empty() && self.bodies.is_empty()
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct ApiReviewComment {
     id: u64,
@@ -634,7 +640,12 @@ async fn poll_once(
         // Advance past these reviews so they are not re-fetched if the caller
         // passes the returned last_check_time back as the next baseline.
         *last_check_time = Utc::now();
-        return Ok(Some(MonitorResult::NewReviews(feedback)));
+        // Only emit NewReviews if there is actual feedback to act on.
+        // DISMISSED reviews or reviews with empty bodies and no inline
+        // comments can produce an empty ReviewFeedback.
+        if !feedback.is_empty() {
+            return Ok(Some(MonitorResult::NewReviews(feedback)));
+        }
     }
 
     // Check merge conflict status.
@@ -766,18 +777,20 @@ async fn get_review_comments(
     let mut failed_reviews = 0;
 
     for review in reviews {
-        // Collect review body text (non-empty bodies that aren't just whitespace)
-        if let Some(ref body) = review.body {
-            let trimmed = body.trim();
-            if !trimmed.is_empty() {
-                all_bodies.push(ReviewBody {
-                    body: trimmed.to_string(),
-                    reviewer: review.user.login.clone(),
-                    state: review
-                        .state
-                        .clone()
-                        .unwrap_or_else(|| "COMMENTED".to_string()),
-                });
+        // Collect review body text (non-empty bodies that aren't just whitespace).
+        // Skip DISMISSED reviews — their body is the dismissal reason, not
+        // actionable feedback for the implementer.
+        let state = review.state.as_deref().unwrap_or("COMMENTED");
+        if state != "DISMISSED" {
+            if let Some(ref body) = review.body {
+                let trimmed = body.trim();
+                if !trimmed.is_empty() {
+                    all_bodies.push(ReviewBody {
+                        body: trimmed.to_string(),
+                        reviewer: review.user.login.clone(),
+                        state: state.to_string(),
+                    });
+                }
             }
         }
 
