@@ -136,14 +136,14 @@ struct Head {
     sha: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub(crate) struct Review {
     id: u64,
     pub(crate) submitted_at: DateTime<Utc>,
     pub(crate) user: User,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub(crate) struct User {
     pub(crate) login: String,
 }
@@ -549,6 +549,39 @@ pub async fn monitor_pr(
     }
 }
 
+/// Check if a PR has reached a terminal state (merged or closed).
+///
+/// Returns `Some(MonitorResult::Merged)` for merged PRs, `Some(MonitorResult::Closed)`
+/// for closed-but-not-merged PRs, or `None` if the PR is still open.
+pub(crate) fn determine_pr_terminal_state(state: &str, merged: bool) -> Option<MonitorResult> {
+    if state == "closed" {
+        if merged {
+            Some(MonitorResult::Merged)
+        } else {
+            Some(MonitorResult::Closed)
+        }
+    } else {
+        None
+    }
+}
+
+/// Filter reviews to only include those submitted at or after `since` by users
+/// other than the PR author.
+///
+/// This excludes self-reviews (to prevent feedback loops) and old reviews
+/// (already processed in a previous poll cycle).
+pub(crate) fn filter_new_external_reviews(
+    reviews: &[Review],
+    since: DateTime<Utc>,
+    pr_author: &str,
+) -> Vec<Review> {
+    reviews
+        .iter()
+        .filter(|r| r.submitted_at >= since && r.user.login != pr_author)
+        .cloned()
+        .collect()
+}
+
 /// Perform a single polling iteration: check PR state, reviews, CI, and merge readiness.
 ///
 /// Returns `Ok(Some(result))` if an actionable event was detected,
@@ -566,12 +599,8 @@ async fn poll_once(
 
     // Check terminal states - merged PRs are also in "closed" state
     // Must check merged flag first to distinguish merged from just closed
-    if pr.state == "closed" {
-        if pr.merged {
-            return Ok(Some(MonitorResult::Merged));
-        } else {
-            return Ok(Some(MonitorResult::Closed));
-        }
+    if let Some(result) = determine_pr_terminal_state(&pr.state, pr.merged) {
+        return Ok(Some(result));
     }
 
     // Fetch all reviews once, then filter for new ones to avoid a double API call.
@@ -580,16 +609,8 @@ async fn poll_once(
     // is never silently dropped when conflicts and reviews overlap.
     let all_reviews = get_all_reviews(host, owner, repo, pr_number).await?;
     let pr_author = pr.user.login.as_str();
-    let has_new_reviews = all_reviews
-        .iter()
-        .any(|r| r.submitted_at >= *last_check_time && r.user.login != pr_author);
-    if has_new_reviews {
-        // Extract only the new reviews for comment fetching, excluding self-reviews
-        // to prevent the minion from entering a feedback loop with its own reviews.
-        let new_reviews: Vec<Review> = all_reviews
-            .into_iter()
-            .filter(|r| r.submitted_at >= *last_check_time && r.user.login != pr_author)
-            .collect();
+    let new_reviews = filter_new_external_reviews(&all_reviews, *last_check_time, pr_author);
+    if !new_reviews.is_empty() {
         let comments = get_review_comments(host, owner, repo, pr_number, &new_reviews).await?;
         // Advance past these reviews so they are not re-fetched if the caller
         // passes the returned last_check_time back as the next baseline.
@@ -1308,19 +1329,6 @@ mod tests {
     // PR State Detection Tests
     // ========================================================================
 
-    /// Helper to simulate PR state checking logic
-    fn determine_pr_terminal_state(state: &str, merged: bool) -> Option<MonitorResult> {
-        if state == "closed" {
-            if merged {
-                Some(MonitorResult::Merged)
-            } else {
-                Some(MonitorResult::Closed)
-            }
-        } else {
-            None
-        }
-    }
-
     #[test]
     fn test_merged_pr_returns_merged_result() {
         let result = determine_pr_terminal_state("closed", true);
@@ -1475,14 +1483,9 @@ mod tests {
     // ========================================================================
     // Review Timestamp Filtering Tests
     // ========================================================================
-
-    /// Helper to filter reviews by timestamp
-    fn filter_reviews_since(reviews: Vec<Review>, since: DateTime<Utc>) -> Vec<Review> {
-        reviews
-            .into_iter()
-            .filter(|r| r.submitted_at >= since)
-            .collect()
-    }
+    // These tests exercise the production filter_new_external_reviews function.
+    // Tests that focus on timestamp logic use pr_author="not-reviewer" so the
+    // author filter is a no-op and the timestamp behavior is isolated.
 
     fn make_review(id: u64, timestamp: &str) -> Review {
         Review {
@@ -1502,7 +1505,7 @@ mod tests {
             make_review(2, "2024-06-15T11:00:00Z"), // After - included
         ];
 
-        let filtered = filter_reviews_since(reviews, since);
+        let filtered = filter_new_external_reviews(&reviews, since, "not-reviewer");
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].id, 2);
     }
@@ -1513,7 +1516,7 @@ mod tests {
         let since: DateTime<Utc> = "2024-06-15T10:00:00Z".parse().unwrap();
         let reviews = vec![make_review(1, "2024-06-15T10:00:00Z")];
 
-        let filtered = filter_reviews_since(reviews, since);
+        let filtered = filter_new_external_reviews(&reviews, since, "not-reviewer");
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].id, 1);
     }
@@ -1526,7 +1529,7 @@ mod tests {
             make_review(2, "2024-06-15T09:59:59Z"),
         ];
 
-        let filtered = filter_reviews_since(reviews, since);
+        let filtered = filter_new_external_reviews(&reviews, since, "not-reviewer");
         assert!(filtered.is_empty());
     }
 
@@ -1535,7 +1538,7 @@ mod tests {
         let since: DateTime<Utc> = "2024-06-15T10:00:00Z".parse().unwrap();
         let reviews: Vec<Review> = vec![];
 
-        let filtered = filter_reviews_since(reviews, since);
+        let filtered = filter_new_external_reviews(&reviews, since, "not-reviewer");
         assert!(filtered.is_empty());
     }
 
@@ -1548,26 +1551,13 @@ mod tests {
             make_review(3, "2024-06-16T10:00:00Z"),
         ];
 
-        let filtered = filter_reviews_since(reviews, since);
+        let filtered = filter_new_external_reviews(&reviews, since, "not-reviewer");
         assert_eq!(filtered.len(), 3);
     }
 
     // ========================================================================
     // Self-Review Filtering Tests
     // ========================================================================
-
-    /// Helper that mirrors the production filter in poll_once: excludes reviews
-    /// by the PR author AND before the last check time.
-    fn filter_new_external_reviews(
-        reviews: Vec<Review>,
-        since: DateTime<Utc>,
-        pr_author: &str,
-    ) -> Vec<Review> {
-        reviews
-            .into_iter()
-            .filter(|r| r.submitted_at >= since && r.user.login != pr_author)
-            .collect()
-    }
 
     fn make_review_by(id: u64, timestamp: &str, login: &str) -> Review {
         Review {
@@ -1587,7 +1577,7 @@ mod tests {
             make_review_by(2, "2024-06-15T11:00:00Z", "external-reviewer"),
         ];
 
-        let filtered = filter_new_external_reviews(reviews, since, "pr-author");
+        let filtered = filter_new_external_reviews(&reviews, since, "pr-author");
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].user.login, "external-reviewer");
     }
@@ -1600,7 +1590,7 @@ mod tests {
             make_review_by(2, "2024-06-15T12:00:00Z", "pr-author"),
         ];
 
-        let filtered = filter_new_external_reviews(reviews, since, "pr-author");
+        let filtered = filter_new_external_reviews(&reviews, since, "pr-author");
         assert!(filtered.is_empty());
     }
 
