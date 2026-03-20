@@ -115,6 +115,28 @@ pub fn parse_api_output(success: bool, stdout: &str, stderr: &str, issue_number:
     }
 }
 
+/// Process the result of running the `gh api` dependencies command.
+///
+/// Extracted for testability — handles both spawn failures (`Err`) and
+/// output parsing (`Ok`). The `Ok` variant carries `(success, stdout, stderr)`.
+pub fn interpret_api_call(
+    output: Result<(bool, String, String), String>,
+    issue_number: u64,
+) -> Option<Vec<u64>> {
+    match output {
+        Err(e) => {
+            log::warn!("Failed to call dependencies API: {}", e);
+            None
+        }
+        Ok((success, stdout, stderr)) => {
+            match parse_api_output(success, &stdout, &stderr, issue_number) {
+                ApiResult::Supported(blockers) => Some(blockers),
+                ApiResult::Unavailable => None,
+            }
+        }
+    }
+}
+
 /// Fetch open blockers for an issue via the GitHub native dependencies API.
 ///
 /// Calls `GET /repos/{owner}/{repo}/issues/{number}/dependencies/blocked_by`
@@ -134,7 +156,7 @@ pub async fn get_blockers_via_api(
         owner, repo, issue_number
     );
 
-    let output = match gh_cli_command(host)
+    let result = match gh_cli_command(host)
         .args([
             "api",
             &endpoint,
@@ -144,20 +166,15 @@ pub async fn get_blockers_via_api(
         .output()
         .await
     {
-        Ok(o) => o,
-        Err(e) => {
-            log::warn!("Failed to call dependencies API: {}", e);
-            return None;
-        }
+        Ok(o) => Ok((
+            o.status.success(),
+            String::from_utf8_lossy(&o.stdout).into_owned(),
+            String::from_utf8_lossy(&o.stderr).into_owned(),
+        )),
+        Err(e) => Err(e.to_string()),
     };
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-
-    match parse_api_output(output.status.success(), &stdout, &stderr, issue_number) {
-        ApiResult::Supported(blockers) => Some(blockers),
-        ApiResult::Unavailable => None,
-    }
+    interpret_api_call(result, issue_number)
 }
 
 /// Resolve blockers from body text and an optional API result.
@@ -381,6 +398,112 @@ mod tests {
         let result = resolve_blockers(body, Some(vec![20]));
         assert_eq!(result, vec![20]);
         assert!(!result.contains(&10));
+    }
+
+    // --- interpret_api_call tests ---
+
+    #[test]
+    fn test_interpret_spawn_failure_returns_none() {
+        let result = interpret_api_call(Err("connection refused".to_string()), 42);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_interpret_success_with_blockers() {
+        let result = interpret_api_call(Ok((true, "[10, 20, 30]".to_string(), String::new())), 1);
+        assert_eq!(result, Some(vec![10, 20, 30]));
+    }
+
+    #[test]
+    fn test_interpret_success_empty_list() {
+        let result = interpret_api_call(Ok((true, "[]".to_string(), String::new())), 1);
+        assert_eq!(result, Some(vec![]));
+    }
+
+    #[test]
+    fn test_interpret_success_empty_stdout() {
+        let result = interpret_api_call(Ok((true, String::new(), String::new())), 1);
+        assert_eq!(result, Some(vec![]));
+    }
+
+    #[test]
+    fn test_interpret_404_returns_none() {
+        let result = interpret_api_call(
+            Ok((false, String::new(), "HTTP 404: Not Found".to_string())),
+            1,
+        );
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_interpret_403_returns_none() {
+        let result = interpret_api_call(
+            Ok((false, String::new(), "HTTP 403: Forbidden".to_string())),
+            1,
+        );
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_interpret_server_errors_return_none() {
+        for stderr in [
+            "HTTP 500: Internal Server Error",
+            "HTTP 502: Bad Gateway",
+            "HTTP 503: Service Unavailable",
+        ] {
+            let result = interpret_api_call(Ok((false, String::new(), stderr.to_string())), 42);
+            assert!(result.is_none(), "Expected None for {stderr}");
+        }
+    }
+
+    #[test]
+    fn test_interpret_invalid_json_returns_none() {
+        let result = interpret_api_call(Ok((true, "not valid json".to_string(), String::new())), 1);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_interpret_null_stdout() {
+        let result = interpret_api_call(Ok((true, "null".to_string(), String::new())), 1);
+        assert_eq!(result, Some(vec![]));
+    }
+
+    // --- get_blockers end-to-end resolution via interpret_api_call + resolve_blockers ---
+
+    #[test]
+    fn test_end_to_end_api_supported_overrides_body() {
+        let api_output = Ok((true, "[30]".to_string(), String::new()));
+        let api_result = interpret_api_call(api_output, 1);
+        let body = "**Blocked by:** #10, #20";
+        let blockers = resolve_blockers(body, api_result);
+        assert_eq!(blockers, vec![30]);
+    }
+
+    #[test]
+    fn test_end_to_end_api_failure_falls_back_to_body() {
+        let api_output = Ok((false, String::new(), "HTTP 404: Not Found".to_string()));
+        let api_result = interpret_api_call(api_output, 1);
+        let body = "**Blocked by:** #10, #20";
+        let blockers = resolve_blockers(body, api_result);
+        assert_eq!(blockers, vec![10, 20]);
+    }
+
+    #[test]
+    fn test_end_to_end_spawn_failure_falls_back_to_body() {
+        let api_output = Err("gh not found".to_string());
+        let api_result = interpret_api_call(api_output, 1);
+        let body = "**Blocked by:** #5";
+        let blockers = resolve_blockers(body, api_result);
+        assert_eq!(blockers, vec![5]);
+    }
+
+    #[test]
+    fn test_end_to_end_api_empty_overrides_body() {
+        let api_output = Ok((true, "[]".to_string(), String::new()));
+        let api_result = interpret_api_call(api_output, 1);
+        let body = "**Blocked by:** #10";
+        let blockers = resolve_blockers(body, api_result);
+        assert!(blockers.is_empty());
     }
 
     // --- Additional error code coverage ---
