@@ -1025,6 +1025,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_format_duration_seconds() {
+        assert_eq!(format_duration(0), "0s");
+        assert_eq!(format_duration(45), "45s");
+        assert_eq!(format_duration(59), "59s");
+    }
+
+    #[test]
+    fn test_format_duration_minutes() {
+        assert_eq!(format_duration(60), "1m");
+        assert_eq!(format_duration(90), "1m"); // seconds truncated
+        assert_eq!(format_duration(3599), "59m");
+    }
+
+    #[test]
+    fn test_format_duration_hours() {
+        assert_eq!(format_duration(3600), "1h0m");
+        assert_eq!(format_duration(5 * 3600 + 15 * 60 + 30), "5h15m"); // seconds truncated
+    }
+
+    #[test]
     fn test_exit_notification_format_contains_minion_id_and_resume_command() {
         let body = format_exit_notification_comment("M042", 2);
         assert!(body.contains("M042"), "comment must contain minion ID");
