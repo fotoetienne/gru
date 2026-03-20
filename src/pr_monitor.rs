@@ -569,7 +569,9 @@ pub(crate) fn determine_pr_terminal_state(state: &str, merged: bool) -> Option<M
 /// other than the PR author.
 ///
 /// This excludes self-reviews (to prevent feedback loops) and old reviews
-/// (already processed in a previous poll cycle).
+/// (already processed in a previous poll cycle). Uses inclusive `>=` so that
+/// a review landing exactly at `since` is captured; contrast with
+/// `count_unaddressed_reviews` which uses exclusive `>` for a different purpose.
 pub(crate) fn filter_new_external_reviews(
     reviews: &[Review],
     since: DateTime<Utc>,
@@ -1492,6 +1494,9 @@ mod tests {
             id,
             submitted_at: timestamp.parse().unwrap(),
             user: User {
+                // Timestamp-only tests pass pr_author="not-reviewer" so this
+                // login must differ from that sentinel to keep the author
+                // filter a no-op.
                 login: "reviewer".to_string(),
             },
         }
