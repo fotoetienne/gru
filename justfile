@@ -57,6 +57,14 @@ check: fmt-check lint test build
 clean:
     cargo clean
 
+# Generate CHANGELOG.md from merged PRs between tags (requires: cargo install git-cliff)
+changelog:
+    git-cliff --github-repo fotoetienne/gru -o CHANGELOG.md
+
+# Preview changelog without writing (requires: cargo install git-cliff)
+changelog-preview:
+    git-cliff --github-repo fotoetienne/gru
+
 # Show project information
 info:
     @echo "Gru - Local-First LLM Agent Orchestrator"
