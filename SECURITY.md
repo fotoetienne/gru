@@ -24,9 +24,9 @@ Each Minion runs with `--dangerously-skip-permissions`, which means it can:
 
 Each Minion works in a dedicated git worktree under `~/.gru/work/`. Worktrees are created from bare repository mirrors, so Minions cannot interfere with your main checkout or each other's working directories.
 
-- Path traversal is validated — `..` and backslash sequences are rejected
+- Worktree creation validates paths — `..` and backslash sequences are rejected, and paths are verified to stay within `~/.gru/work/`
 - Branch names are validated against git's rules (no `..`, `@{`, null bytes, etc.)
-- Worktree paths are verified to stay within the `~/.gru/work/` directory
+- **Note:** These checks prevent worktree creation at bad paths. Once a Minion is running, it has full filesystem access as described above
 
 ### Ephemeral Processes
 
@@ -35,7 +35,7 @@ Minions are short-lived processes, not persistent daemons. Each Minion:
 - Runs as a child process of the Gru CLI
 - Exits when the task completes, times out, or is stopped
 - Has no background persistence after termination
-- Can be resumed (max 3 attempts) if interrupted, then marked as failed
+- Can be resumed up to `max_resume_attempts` times (default: 3, configurable) if interrupted, then marked as failed
 
 ### Timeout and Stuck Detection
 
@@ -59,7 +59,9 @@ Minions can attempt to fix CI failures automatically, but this is bounded:
 
 ### Merge Controls
 
-PRs created by Minions are **not merged automatically** unless you explicitly configure auto-merge. The default flow requires human review:
+PRs created by Minions are **not merged automatically** unless you explicitly configure auto-merge. The default flow requires human review.
+
+In lab (daemon) mode, additional merge controls apply:
 
 1. **Deterministic checks** run first: CI status, review approvals, no merge conflicts, not a draft
 2. **Confidence threshold**: An LLM judge evaluates merge readiness (default threshold: 8/10)
@@ -71,9 +73,9 @@ Gru uses GitHub labels (`gru:todo`, `gru:in-progress`, `gru:done`, `gru:failed`,
 
 ### Credential Handling
 
-- GitHub tokens are passed via `GIT_ASKPASS` scripts with `0700` permissions, never in command arguments
-- Credentials are redacted from log output
-- Token environment variables are only visible to the same OS user
+- GitHub tokens are passed via a `GRU_ASKPASS_TOKEN` environment variable to a temporary `GIT_ASKPASS` script (permissions `0700`), keeping them out of command arguments and log output
+- Credentials are redacted from stderr before logging
+- Environment variables are visible to other processes running as the same OS user
 
 ## Known Risks
 
@@ -120,7 +122,7 @@ If secrets are present in environment variables or accessible files (`.env`, cre
 If you discover a security vulnerability in Gru, please report it responsibly:
 
 1. **Do not open a public GitHub issue** for security vulnerabilities
-2. Email the maintainers at the address listed in the repository's contact information
+2. Use [GitHub's private security advisory feature](https://github.com/fotoetienne/gru/security/advisories/new) to report the issue
 3. Include a description of the vulnerability, steps to reproduce, and potential impact
 4. We will acknowledge receipt within 48 hours and provide a timeline for a fix
 
