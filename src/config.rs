@@ -1237,4 +1237,74 @@ repos = ["corp:team/app"]
         assert!(template.contains("host ="));
         assert!(template.contains("web_url ="));
     }
+
+    #[test]
+    fn config_example_parses() {
+        let content = include_str!("../docs/config.example.toml");
+        // Stop before the "Full GHES example" section to avoid duplicate table headers
+        assert!(
+            content.contains("Full GHES example"),
+            "docs/config.example.toml must contain a 'Full GHES example' section; \
+             update the sentinel if the heading changed"
+        );
+        let content = content.split("Full GHES example").next().unwrap();
+        // Uncomment lines (strip repeated "# " prefixes to handle double-commented
+        // lines like `# # web_url = ...`), then keep only TOML-meaningful lines.
+        // This filters out descriptive prose while preserving section headers,
+        // key = value pairs, array elements, and comments.
+        let uncommented: String = content
+            .lines()
+            .map(|l| {
+                let mut s = l;
+                while let Some(stripped) = s.strip_prefix("# ") {
+                    s = stripped;
+                }
+                s
+            })
+            .filter(|l| {
+                let t = l.trim();
+                if t.is_empty() || t.starts_with('#') || t.starts_with('[') || t == "]" {
+                    return true;
+                }
+                // key = value: key must be a bare TOML key, value must start
+                // with a TOML value token
+                if let Some(eq_pos) = t.find(" = ") {
+                    let key = t[..eq_pos].trim();
+                    let val = t[eq_pos + 3..].trim();
+                    return !key.is_empty()
+                        && key
+                            .chars()
+                            .all(|c| c.is_alphanumeric() || c == '_' || c == '-')
+                        && (val.starts_with('"')
+                            || val.starts_with('\'')
+                            || val.starts_with('[')
+                            || val.starts_with('{')
+                            || val == "true"
+                            || val == "false"
+                            || val.starts_with(|c: char| c.is_ascii_digit()));
+                }
+                // Array string element: indented "value", or "value"
+                if l.starts_with(' ') && t.starts_with('"') {
+                    return t.ends_with("\",") || t.ends_with('"');
+                }
+                false
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        // Use serde_ignored to detect fields in the example that don't exist
+        // in LabConfig (e.g., renamed or stale fields). Plain toml::from_str
+        // silently ignores unknown fields since the structs don't use
+        // #[serde(deny_unknown_fields)].
+        let mut ignored = Vec::new();
+        let deserializer = toml::Deserializer::new(&uncommented);
+        let _config: LabConfig = serde_ignored::deserialize(deserializer, |path| {
+            ignored.push(path.to_string());
+        })
+        .expect("docs/config.example.toml should parse against LabConfig");
+        assert!(
+            ignored.is_empty(),
+            "docs/config.example.toml contains fields not recognized by LabConfig: {:?}",
+            ignored
+        );
+    }
 }

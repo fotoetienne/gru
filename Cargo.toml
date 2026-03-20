@@ -30,5 +30,8 @@ uuid = { version = "1.21", features = ["v4"] }
 fs2 = "0.4"
 tempfile = "3.26"
 
+[dev-dependencies]
+serde_ignored = "0.1"
+
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
