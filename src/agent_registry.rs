@@ -11,12 +11,12 @@ use crate::codex_backend::CodexBackend;
 const AVAILABLE_AGENTS: &[&str] = &["claude", "codex"];
 
 /// Default agent name when none is specified.
-pub const DEFAULT_AGENT: &str = "claude";
+pub(crate) const DEFAULT_AGENT: &str = "claude";
 
 /// Resolves an agent name to a concrete `AgentBackend` implementation.
 ///
 /// Returns an error with available agents listed if the name is unknown.
-pub fn resolve_backend(agent_name: &str) -> anyhow::Result<Box<dyn AgentBackend>> {
+pub(crate) fn resolve_backend(agent_name: &str) -> anyhow::Result<Box<dyn AgentBackend>> {
     match agent_name {
         "claude" => Ok(Box::new(ClaudeBackend::default())),
         "codex" => Ok(Box::new(CodexBackend)),

@@ -17,7 +17,7 @@ use uuid::Uuid;
 /// intelligent resolution.
 ///
 /// Returns the process exit code (0 = success).
-pub async fn handle_rebase(
+pub(crate) async fn handle_rebase(
     target: Option<String>,
     push: bool,
     yes: bool,

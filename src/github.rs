@@ -96,7 +96,11 @@ pub(crate) async fn run_gh(host: &str, args: &[&str]) -> Result<String> {
 /// Build a full GitHub issue URL for a repo in "owner/repo" format, with an explicit host.
 ///
 /// Returns `Some(url)` when `repo` is a valid `owner/repo` string, otherwise `None`.
-pub fn build_issue_url_with_host(repo: &str, host: &str, issue_number: u64) -> Option<String> {
+pub(crate) fn build_issue_url_with_host(
+    repo: &str,
+    host: &str,
+    issue_number: u64,
+) -> Option<String> {
     let (owner, repo_name) = repo.split_once('/')?;
     if owner.is_empty() || repo_name.is_empty() || repo_name.contains('/') {
         return None;
@@ -118,7 +122,7 @@ pub fn build_issue_url_with_host(repo: &str, host: &str, issue_number: u64) -> O
 /// * `owner` - Repository owner
 /// * `repo` - Repository name
 /// * `pr_number` - PR number
-pub async fn mark_pr_ready_via_cli(
+pub(crate) async fn mark_pr_ready_via_cli(
     owner: &str,
     repo: &str,
     host: &str,
@@ -155,7 +159,7 @@ fn build_ready_issues_search_query(label: &str) -> String {
     )
 }
 
-pub async fn list_ready_issues_via_cli(
+pub(crate) async fn list_ready_issues_via_cli(
     owner: &str,
     repo: &str,
     host: &str,
@@ -190,10 +194,10 @@ pub async fn list_ready_issues_via_cli(
 
 /// Issue candidate returned by list queries, with optional body for dependency checking
 #[derive(Debug, Clone, serde::Deserialize)]
-pub struct CandidateIssue {
-    pub number: u64,
+pub(crate) struct CandidateIssue {
+    pub(crate) number: u64,
     #[serde(default)]
-    pub body: Option<String>,
+    pub(crate) body: Option<String>,
 }
 
 /// Fetch issue details using gh CLI
@@ -202,7 +206,7 @@ pub struct CandidateIssue {
 /// * `owner` - Repository owner (user or organization)
 /// * `repo` - Repository name
 /// * `number` - Issue number
-pub async fn get_issue_via_cli(
+pub(crate) async fn get_issue_via_cli(
     owner: &str,
     repo: &str,
     host: &str,
@@ -328,7 +332,7 @@ fn check_issue_eligibility(state: &str, labels: &[IssueLabel]) -> (bool, Option<
 ///
 /// Returns `true` if the issue state is `CLOSED` (the GraphQL enum value
 /// returned by `gh issue view --json state`).
-pub async fn is_issue_closed_via_cli(
+pub(crate) async fn is_issue_closed_via_cli(
     owner: &str,
     repo: &str,
     host: &str,
@@ -365,7 +369,12 @@ pub async fn is_issue_closed_via_cli(
 /// * `repo` - Repository name
 /// * `host` - GitHub hostname
 /// * `number` - PR number
-pub async fn is_pr_open_via_cli(owner: &str, repo: &str, host: &str, number: u64) -> Result<bool> {
+pub(crate) async fn is_pr_open_via_cli(
+    owner: &str,
+    repo: &str,
+    host: &str,
+    number: u64,
+) -> Result<bool> {
     let repo_full = repo_slug(owner, repo);
     let number_str = number.to_string();
     let stdout = run_gh(
@@ -398,27 +407,27 @@ pub async fn is_pr_open_via_cli(owner: &str, repo: &str, host: &str, number: u64
 
 /// Simple struct to hold issue information from gh CLI
 #[derive(Debug, serde::Deserialize)]
-pub struct IssueInfo {
-    pub title: String,
-    pub body: Option<String>,
+pub(crate) struct IssueInfo {
+    pub(crate) title: String,
+    pub(crate) body: Option<String>,
     /// Labels attached to the issue (from `gh issue view --json labels`)
     #[serde(default)]
-    pub labels: Vec<IssueLabel>,
+    pub(crate) labels: Vec<IssueLabel>,
 }
 
 /// Label info returned by `gh issue view --json labels`
 #[derive(Debug, serde::Deserialize)]
-pub struct IssueLabel {
-    pub name: String,
+pub(crate) struct IssueLabel {
+    pub(crate) name: String,
 }
 
 /// Simple struct to hold PR information from gh CLI
 #[derive(Debug, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct PrInfo {
-    pub title: String,
-    pub body: Option<String>,
-    pub head_ref_name: String,
+pub(crate) struct PrInfo {
+    pub(crate) title: String,
+    pub(crate) body: Option<String>,
+    pub(crate) head_ref_name: String,
 }
 
 /// Fetch PR details using gh CLI
@@ -427,7 +436,12 @@ pub struct PrInfo {
 /// * `owner` - Repository owner (user or organization)
 /// * `repo` - Repository name
 /// * `number` - PR number
-pub async fn get_pr_via_cli(owner: &str, repo: &str, host: &str, number: u64) -> Result<PrInfo> {
+pub(crate) async fn get_pr_via_cli(
+    owner: &str,
+    repo: &str,
+    host: &str,
+    number: u64,
+) -> Result<PrInfo> {
     let repo_full = repo_slug(owner, repo);
     let number_str = number.to_string();
     let stdout = run_gh(
@@ -461,7 +475,7 @@ pub async fn get_pr_via_cli(owner: &str, repo: &str, host: &str, number: u64) ->
 /// * `body` - PR description body (markdown supported)
 ///
 /// Returns the PR number as a string
-pub async fn create_draft_pr_via_cli(
+pub(crate) async fn create_draft_pr_via_cli(
     owner: &str,
     repo: &str,
     host: &str,
@@ -533,7 +547,7 @@ pub async fn create_draft_pr_via_cli(
 /// * `repo` - Repository name
 /// * `number` - Issue or PR number
 /// * `body` - Comment body (markdown supported)
-pub async fn post_comment_via_cli(
+pub(crate) async fn post_comment_via_cli(
     host: &str,
     owner: &str,
     repo: &str,
@@ -568,7 +582,7 @@ pub async fn post_comment_via_cli(
 /// * `number` - Issue number
 /// * `add` - Labels to add
 /// * `remove` - Labels to remove
-pub async fn edit_labels_via_cli(
+pub(crate) async fn edit_labels_via_cli(
     host: &str,
     owner: &str,
     repo: &str,
@@ -609,7 +623,7 @@ pub async fn edit_labels_via_cli(
 /// * `name` - Label name
 /// * `color` - Hex color code (without # prefix)
 /// * `description` - Label description
-pub async fn create_label_via_cli(
+pub(crate) async fn create_label_via_cli(
     host: &str,
     owner: &str,
     repo: &str,
@@ -646,7 +660,7 @@ pub async fn create_label_via_cli(
 /// # Returns
 /// * `Ok(())` if authenticated
 /// * `Err(_)` if not authenticated or check failed
-pub async fn check_auth_via_cli(host: &str) -> Result<()> {
+pub(crate) async fn check_auth_via_cli(host: &str) -> Result<()> {
     run_gh(host, &["auth", "status", "--hostname", host]).await?;
     Ok(())
 }
@@ -663,7 +677,7 @@ pub async fn check_auth_via_cli(host: &str) -> Result<()> {
 /// * `repo` - Repository name
 /// * `number` - Issue number
 /// * `ready_label` - The label to remove when claiming (e.g., `labels::TODO` or a custom daemon label)
-pub async fn claim_issue_via_cli(
+pub(crate) async fn claim_issue_via_cli(
     host: &str,
     owner: &str,
     repo: &str,
@@ -688,7 +702,7 @@ pub async fn claim_issue_via_cli(
 /// * `owner` - Repository owner
 /// * `repo` - Repository name
 /// * `number` - Issue number
-pub async fn mark_issue_done_via_cli(
+pub(crate) async fn mark_issue_done_via_cli(
     host: &str,
     owner: &str,
     repo: &str,
@@ -712,7 +726,7 @@ pub async fn mark_issue_done_via_cli(
 /// * `owner` - Repository owner
 /// * `repo` - Repository name
 /// * `number` - Issue number
-pub async fn mark_issue_failed_via_cli(
+pub(crate) async fn mark_issue_failed_via_cli(
     host: &str,
     owner: &str,
     repo: &str,
@@ -736,7 +750,7 @@ pub async fn mark_issue_failed_via_cli(
 /// restored since `mark_issue_blocked_via_cli` removed it.
 ///
 /// Idempotent: silently succeeds if the label is not present.
-pub async fn remove_blocked_label(
+pub(crate) async fn remove_blocked_label(
     host: &str,
     owner: &str,
     repo: &str,
@@ -792,7 +806,7 @@ pub async fn remove_blocked_label(
 /// * `owner` - Repository owner
 /// * `repo` - Repository name
 /// * `number` - Issue number
-pub async fn mark_issue_blocked_via_cli(
+pub(crate) async fn mark_issue_blocked_via_cli(
     host: &str,
     owner: &str,
     repo: &str,
@@ -815,23 +829,23 @@ pub async fn mark_issue_blocked_via_cli(
 
 /// A single PR review returned by the GitHub reviews API.
 #[derive(Debug, serde::Deserialize)]
-pub struct PrReview {
-    pub user: ReviewUser,
-    pub commit_id: String,
-    pub state: String,
+pub(crate) struct PrReview {
+    pub(crate) user: ReviewUser,
+    pub(crate) commit_id: String,
+    pub(crate) state: String,
 }
 
 /// The user portion of a PR review response.
 #[derive(Debug, serde::Deserialize)]
-pub struct ReviewUser {
-    pub login: String,
+pub(crate) struct ReviewUser {
+    pub(crate) login: String,
 }
 
 /// Returns the login of the currently authenticated `gh` CLI user.
 ///
 /// Uses `gh api user` to fetch the authenticated account. Returns an error
 /// if `gh` is not authenticated or the API call fails.
-pub async fn get_authenticated_user(host: &str) -> Result<String> {
+pub(crate) async fn get_authenticated_user(host: &str) -> Result<String> {
     let stdout = run_gh(host, &["api", "user", "--jq", ".login"]).await?;
 
     let login = stdout.trim().to_string();
@@ -845,7 +859,7 @@ pub async fn get_authenticated_user(host: &str) -> Result<String> {
 ///
 /// Uses `--paginate --jq '.[]'` to handle PRs with more than 30 reviews,
 /// producing a newline-delimited JSON stream that is then collected into a Vec.
-pub async fn list_pr_reviews(
+pub(crate) async fn list_pr_reviews(
     host: &str,
     owner: &str,
     repo: &str,
@@ -862,7 +876,7 @@ pub async fn list_pr_reviews(
 ///
 /// `--paginate --jq '.[]'` emits one JSON object per line; this helper
 /// is extracted for unit testing without network access.
-pub fn parse_pr_reviews_ndjson(ndjson: &str) -> Result<Vec<PrReview>> {
+pub(crate) fn parse_pr_reviews_ndjson(ndjson: &str) -> Result<Vec<PrReview>> {
     let mut reviews = Vec::new();
     for line in ndjson.lines() {
         let line = line.trim();
@@ -886,7 +900,7 @@ pub fn parse_pr_reviews_ndjson(ndjson: &str) -> Result<Vec<PrReview>> {
 /// If two minions enter this check simultaneously, both may see `false` and both
 /// proceed to post a review. This is a narrow window with low consequence (one
 /// extra review comment) and is not worth a distributed lock for V1.
-pub async fn has_gru_review_for_sha(
+pub(crate) async fn has_gru_review_for_sha(
     host: &str,
     owner: &str,
     repo: &str,
@@ -932,7 +946,7 @@ pub async fn has_gru_review_for_sha(
 /// count — both should allow a new review to be posted.
 ///
 /// Extracted for unit testing without network access.
-pub fn review_exists_for_sha(reviews: &[PrReview], user_login: &str, sha: &str) -> bool {
+pub(crate) fn review_exists_for_sha(reviews: &[PrReview], user_login: &str, sha: &str) -> bool {
     reviews.iter().any(|r| {
         r.user.login == user_login
             && r.commit_id == sha

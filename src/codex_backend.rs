@@ -23,7 +23,7 @@ use uuid::Uuid;
 /// Implements `AgentBackend` by spawning `codex exec --json --full-auto`
 /// and parsing the resulting JSONL event stream.
 #[derive(Default)]
-pub struct CodexBackend;
+pub(crate) struct CodexBackend;
 
 impl AgentBackend for CodexBackend {
     fn name(&self) -> &str {

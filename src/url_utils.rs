@@ -4,20 +4,20 @@ use anyhow::{Context, Result};
 
 /// The type of resource referenced in a GitHub URL
 #[derive(Debug, Clone, PartialEq)]
-pub enum GitHubResourceType {
+pub(crate) enum GitHubResourceType {
     Issue,
     Pull,
 }
 
 /// Parsed components of a GitHub URL
 #[derive(Debug, Clone)]
-pub struct GitHubUrl {
+pub(crate) struct GitHubUrl {
     /// GitHub hostname (e.g., "github.com" or "ghe.example.com")
-    pub host: String,
-    pub owner: String,
-    pub repo: String,
-    pub resource_type: GitHubResourceType,
-    pub number: u32,
+    pub(crate) host: String,
+    pub(crate) owner: String,
+    pub(crate) repo: String,
+    pub(crate) resource_type: GitHubResourceType,
+    pub(crate) number: u32,
 }
 
 /// Cleans a URL by stripping query parameters, fragments, and trailing slashes.
@@ -42,7 +42,7 @@ fn clean_url(url: &str) -> &str {
 /// - URLs with query params, fragments, and trailing slashes
 ///
 /// Returns `None` if the URL is not a valid GitHub issue/PR URL.
-pub fn parse_github_url(url: &str, github_hosts: &[String]) -> Option<GitHubUrl> {
+pub(crate) fn parse_github_url(url: &str, github_hosts: &[String]) -> Option<GitHubUrl> {
     let cleaned = clean_url(url);
 
     for host in github_hosts {
@@ -92,7 +92,7 @@ pub fn parse_github_url(url: &str, github_hosts: &[String]) -> Option<GitHubUrl>
 /// Supports both plain issue numbers (auto-detects from current directory) and GitHub URLs.
 /// `github_hosts` should contain all recognized hosts (e.g., `["github.com", "ghe.example.com"]`).
 /// Returns `(owner, repo, issue_number, host)`.
-pub async fn parse_issue_info(
+pub(crate) async fn parse_issue_info(
     issue: &str,
     github_hosts: &[String],
 ) -> Result<(String, String, String, String)> {
@@ -163,7 +163,7 @@ fn build_pr_view_args(pr_num: &str, repo: Option<&str>) -> Vec<String> {
 /// `github_hosts` should contain all recognized hosts (e.g., `["github.com", "ghe.example.com"]`).
 /// For plain numbers, fetches metadata from GitHub to get branch info.
 /// Returns `(owner, repo, pr_number, branch, host)`.
-pub async fn parse_pr_info(
+pub(crate) async fn parse_pr_info(
     pr: &str,
     github_hosts: &[String],
 ) -> Result<(String, String, String, String, String)> {

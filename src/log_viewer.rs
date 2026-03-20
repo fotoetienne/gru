@@ -124,7 +124,7 @@ async fn tail_follow(
 
 /// Replays all existing events from an events.jsonl file through a ProgressDisplay.
 /// Returns the byte position after replay (for subsequent tailing).
-pub fn replay_events(events_path: &Path, progress: &ProgressDisplay) -> Result<u64> {
+pub(crate) fn replay_events(events_path: &Path, progress: &ProgressDisplay) -> Result<u64> {
     let file = std::fs::File::open(events_path)
         .with_context(|| format!("Failed to open {}", events_path.display()))?;
     let mut reader = std::io::BufReader::new(file);
@@ -161,7 +161,7 @@ pub fn replay_events(events_path: &Path, progress: &ProgressDisplay) -> Result<u
 /// - The minion process is no longer alive (checked via PID in registry)
 /// - Ctrl+C is pressed (clean exit, does not affect the worker)
 /// - The events file is fully consumed and the minion is done
-pub async fn tail_events(
+pub(crate) async fn tail_events(
     events_path: PathBuf,
     minion_id: &str,
     issue_num: &str,
@@ -223,7 +223,7 @@ fn read_new_events(events_path: &Path, position: u64, progress: &ProgressDisplay
 
 /// Replays the last `n` events from an events.jsonl file through a ProgressDisplay.
 /// Returns the byte position after replay (for subsequent tailing).
-pub fn replay_last_n_events(
+pub(crate) fn replay_last_n_events(
     events_path: &Path,
     n: usize,
     progress: &ProgressDisplay,
@@ -267,7 +267,7 @@ pub fn replay_last_n_events(
 
 /// Replays all events from an events.jsonl file as raw JSONL to stdout.
 /// Returns the byte position after replay.
-pub fn replay_events_raw(events_path: &Path) -> Result<u64> {
+pub(crate) fn replay_events_raw(events_path: &Path) -> Result<u64> {
     let file = std::fs::File::open(events_path)
         .with_context(|| format!("Failed to open {}", events_path.display()))?;
     let mut reader = std::io::BufReader::new(file);
@@ -294,7 +294,7 @@ pub fn replay_events_raw(events_path: &Path) -> Result<u64> {
 
 /// Replays the last N lines from an events.jsonl file as raw JSONL to stdout.
 /// Returns the byte position after replay.
-pub fn replay_last_n_events_raw(events_path: &Path, n: usize) -> Result<u64> {
+pub(crate) fn replay_last_n_events_raw(events_path: &Path, n: usize) -> Result<u64> {
     let file = std::fs::File::open(events_path)
         .with_context(|| format!("Failed to open {}", events_path.display()))?;
     let mut reader = std::io::BufReader::new(file);
@@ -327,7 +327,7 @@ pub fn replay_last_n_events_raw(events_path: &Path, n: usize) -> Result<u64> {
 
 /// Tails an events.jsonl file in raw JSONL mode.
 /// Replays history (optionally last N lines) then follows live events.
-pub async fn tail_events_raw(
+pub(crate) async fn tail_events_raw(
     events_path: PathBuf,
     minion_id: &str,
     last_n: Option<usize>,
@@ -372,7 +372,7 @@ fn read_new_events_raw(events_path: &Path, position: u64) -> Result<u64> {
 }
 
 /// Tails events with last-N support (formatted mode).
-pub async fn tail_events_last_n(
+pub(crate) async fn tail_events_last_n(
     events_path: PathBuf,
     minion_id: &str,
     issue_num: &str,

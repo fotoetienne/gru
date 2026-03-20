@@ -8,7 +8,7 @@ const CTRL_C_GRACE_SECS: u64 = 5;
 /// Send a termination signal to the child process.
 /// On Unix, sends SIGTERM for graceful shutdown.
 /// On other platforms, attempts kill (there is no graceful signal equivalent).
-pub fn signal_child(child: &mut tokio::process::Child) {
+pub(crate) fn signal_child(child: &mut tokio::process::Child) {
     #[cfg(unix)]
     {
         if let Some(pid) = child.id() {
@@ -30,7 +30,9 @@ pub fn signal_child(child: &mut tokio::process::Child) {
 ///
 /// On Ctrl-C: sends SIGTERM, waits up to `CTRL_C_GRACE_SECS`, then force-kills.
 /// Used by both `gru chat` and `gru attach` to ensure clean shutdown.
-pub async fn wait_with_ctrlc_handling(child: &mut tokio::process::Child) -> Result<ExitStatus> {
+pub(crate) async fn wait_with_ctrlc_handling(
+    child: &mut tokio::process::Child,
+) -> Result<ExitStatus> {
     tokio::select! {
         result = child.wait() => result.context("Failed to wait for child process"),
         _ = tokio::signal::ctrl_c() => {

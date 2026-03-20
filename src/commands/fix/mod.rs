@@ -277,7 +277,7 @@ async fn run_worker(minion_id: &str, issue: &str, opts: FixOptions) -> Result<i3
 ///
 /// If a previous session for the same issue was interrupted, it will
 /// automatically resume from the last completed phase.
-pub async fn handle_fix(issue: &str, opts: FixOptions) -> Result<i32> {
+pub(crate) async fn handle_fix(issue: &str, opts: FixOptions) -> Result<i32> {
     // Worker mode: run phases 3-5 directly (background process)
     if let Some(ref minion_id) = opts.worker {
         let mid = minion_id.clone();

@@ -26,7 +26,7 @@ thread_local! {
 /// - `archive`: Completed or archived minion workspaces
 /// - `state`: State files (e.g., minion ID counter)
 #[derive(Clone)]
-pub struct Workspace {
+pub(crate) struct Workspace {
     #[allow(dead_code)] // Accessed via root() in tests
     root: PathBuf,
     repos: PathBuf,
@@ -41,7 +41,7 @@ pub struct Workspace {
 ///
 /// Dereferences to `&Workspace`, so callers can use it identically regardless
 /// of which variant is active. In production builds only `Static` is used.
-pub enum WorkspaceRef {
+pub(crate) enum WorkspaceRef {
     /// Reference to the process-wide singleton (production path).
     Static(&'static Workspace),
     /// Owned clone from a thread-local test override.
@@ -70,7 +70,7 @@ impl Workspace {
     /// In test builds, checks for a thread-local override set via
     /// [`set_test_workspace`] before falling back to the process-wide singleton.
     /// Returns a [`WorkspaceRef`] that dereferences to `&Workspace`.
-    pub fn global() -> io::Result<WorkspaceRef> {
+    pub(crate) fn global() -> io::Result<WorkspaceRef> {
         #[cfg(test)]
         {
             let maybe = TEST_WORKSPACE_OVERRIDE.with(|cell| cell.borrow().clone());
@@ -104,7 +104,7 @@ impl Workspace {
 
     /// Test helper: creates a Workspace rooted at the given path.
     #[cfg(test)]
-    pub fn new_with_root(root: PathBuf) -> io::Result<Self> {
+    pub(crate) fn new_with_root(root: PathBuf) -> io::Result<Self> {
         Self::init(root)
     }
 
@@ -139,7 +139,7 @@ impl Workspace {
     /// - The home directory cannot be determined
     /// - Directory creation fails due to permissions or I/O errors
     /// - Setting directory permissions fails (Unix only)
-    pub fn new() -> io::Result<Self> {
+    pub(crate) fn new() -> io::Result<Self> {
         let home = dirs::home_dir()
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Home directory not found"))?;
         Self::init(home.join(".gru"))
@@ -147,28 +147,28 @@ impl Workspace {
 
     /// Returns a reference to the workspace root directory path (`~/.gru`).
     #[cfg(test)]
-    pub fn root(&self) -> &Path {
+    pub(crate) fn root(&self) -> &Path {
         &self.root
     }
 
     /// Returns a reference to the repos directory path (`~/.gru/repos`).
-    pub fn repos(&self) -> &Path {
+    pub(crate) fn repos(&self) -> &Path {
         &self.repos
     }
 
     /// Returns a reference to the work directory path (`~/.gru/work`).
-    pub fn work(&self) -> &Path {
+    pub(crate) fn work(&self) -> &Path {
         &self.work
     }
 
     /// Returns a reference to the archive directory path (`~/.gru/archive`).
     #[cfg(test)]
-    pub fn archive(&self) -> &Path {
+    pub(crate) fn archive(&self) -> &Path {
         &self.archive
     }
 
     /// Returns a reference to the state directory path (`~/.gru/state`).
-    pub fn state(&self) -> &Path {
+    pub(crate) fn state(&self) -> &Path {
         &self.state
     }
 
@@ -206,7 +206,7 @@ impl Workspace {
     /// This method validates inputs and computes the path, but does not create the directory.
     /// Forward slashes in repo names and branch names are allowed and will create nested directories.
     /// Remote prefixes (like "origin/") are automatically stripped from branch names.
-    pub fn work_dir(&self, repo: &str, branch_name: &str) -> io::Result<PathBuf> {
+    pub(crate) fn work_dir(&self, repo: &str, branch_name: &str) -> io::Result<PathBuf> {
         if repo.contains('\\') || repo.contains("..") {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -255,7 +255,7 @@ impl Workspace {
     ///
     /// This method validates inputs and computes the path, but does not create the directory.
     #[cfg(test)]
-    pub fn archive_dir(&self, minion_id: &str) -> io::Result<PathBuf> {
+    pub(crate) fn archive_dir(&self, minion_id: &str) -> io::Result<PathBuf> {
         if minion_id.contains('/') || minion_id.contains('\\') || minion_id.contains("..") {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -292,7 +292,7 @@ impl Workspace {
 /// assert!(ws.state().starts_with(tmp.path()));
 /// ```
 #[cfg(test)]
-pub fn set_test_workspace(root: PathBuf) -> io::Result<TestWorkspaceGuard> {
+pub(crate) fn set_test_workspace(root: PathBuf) -> io::Result<TestWorkspaceGuard> {
     let ws = Workspace::init(root)?;
     TEST_WORKSPACE_OVERRIDE.with(|cell| {
         *cell.borrow_mut() = Some(ws);
@@ -302,7 +302,7 @@ pub fn set_test_workspace(root: PathBuf) -> io::Result<TestWorkspaceGuard> {
 
 /// RAII guard that clears the thread-local workspace override on drop.
 #[cfg(test)]
-pub struct TestWorkspaceGuard {
+pub(crate) struct TestWorkspaceGuard {
     _private: (),
 }
 
@@ -320,7 +320,7 @@ impl Drop for TestWorkspaceGuard {
 /// Prefers `minion_dir/checkout` only if it looks like a Git worktree
 /// (i.e., contains a `.git` marker). Otherwise falls back to `minion_dir`
 /// itself (supporting legacy layouts and avoiding stale/empty `checkout/`).
-pub fn resolve_checkout_path(minion_dir: &Path) -> PathBuf {
+pub(crate) fn resolve_checkout_path(minion_dir: &Path) -> PathBuf {
     let checkout = minion_dir.join("checkout");
     if checkout.join(".git").exists() {
         return checkout;

@@ -5,19 +5,19 @@ use std::path::Path;
 
 /// Represents the state of a pull request being worked on by a Minion
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PrState {
+pub(crate) struct PrState {
     /// PR number (as string to match GitHub API)
-    pub pr_number: String,
+    pub(crate) pr_number: String,
     /// Issue number this PR is fixing
-    pub issue_number: String,
+    pub(crate) issue_number: String,
     /// Current status of the PR
-    pub status: PrStatus,
+    pub(crate) status: PrStatus,
 }
 
 /// Status of a pull request
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
-pub enum PrStatus {
+pub(crate) enum PrStatus {
     /// PR has been created as a draft
     Draft,
     /// PR is ready for review
@@ -26,7 +26,7 @@ pub enum PrStatus {
 
 impl PrState {
     /// Create a new PR state
-    pub fn new(pr_number: String, issue_number: String) -> Self {
+    pub(crate) fn new(pr_number: String, issue_number: String) -> Self {
         Self {
             pr_number,
             issue_number,
@@ -44,7 +44,7 @@ impl PrState {
     ///   - Checkout subdir: caller passes `checkout/`, state is in parent `minion_dir/`
     ///
     /// Returns None if the file doesn't exist in either location
-    pub fn load(dir: &Path) -> Result<Option<Self>> {
+    pub(crate) fn load(dir: &Path) -> Result<Option<Self>> {
         let pr_state_path = dir.join(".gru_pr_state.json");
 
         if pr_state_path.exists() {
@@ -81,7 +81,7 @@ impl PrState {
     /// * `worktree_path` - Path to the worktree directory
     ///
     /// Note: Uses hidden file (.gru_pr_state.json) to avoid git status pollution
-    pub fn save(&self, worktree_path: &Path) -> Result<()> {
+    pub(crate) fn save(&self, worktree_path: &Path) -> Result<()> {
         let pr_state_path = worktree_path.join(".gru_pr_state.json");
 
         let contents =

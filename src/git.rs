@@ -105,7 +105,7 @@ fn redact_credentials(stderr: &str) -> String {
 
 /// Detects if the current directory is within a git repository
 /// Returns the root path of the git repository
-pub async fn detect_git_repo() -> Result<PathBuf> {
+pub(crate) async fn detect_git_repo() -> Result<PathBuf> {
     let output = Command::new("git")
         .arg("rev-parse")
         .arg("--show-toplevel")
@@ -131,7 +131,7 @@ pub async fn detect_git_repo() -> Result<PathBuf> {
 
 /// Gets the GitHub remote URL from the current git repository
 /// Tries "origin" first, then falls back to the first GitHub remote found
-pub async fn get_github_remote(github_hosts: &[String]) -> Result<String> {
+pub(crate) async fn get_github_remote(github_hosts: &[String]) -> Result<String> {
     // Use `git remote -v` to get all remotes and their URLs in one call
     let output = Command::new("git")
         .arg("remote")
@@ -200,7 +200,10 @@ fn is_github_url(url: &str, github_hosts: &[String]) -> bool {
 /// - `git@<host>:owner/repo.git`
 ///
 /// `github_hosts` should contain all recognized hosts (e.g., `["github.com", "ghe.example.com"]`).
-pub fn parse_github_remote(url: &str, github_hosts: &[String]) -> Result<(String, String, String)> {
+pub(crate) fn parse_github_remote(
+    url: &str,
+    github_hosts: &[String],
+) -> Result<(String, String, String)> {
     if !is_github_url(url, github_hosts) {
         anyhow::bail!("Not a GitHub URL: {}", url);
     }
@@ -243,11 +246,11 @@ pub fn parse_github_remote(url: &str, github_hosts: &[String]) -> Result<(String
 
 /// Represents a single entry from `git worktree list --porcelain` output.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct WorktreeEntry {
+pub(crate) struct WorktreeEntry {
     /// Filesystem path to the worktree
-    pub path: PathBuf,
+    pub(crate) path: PathBuf,
     /// Branch name (without refs/heads/ prefix), None for detached HEAD or bare entries
-    pub branch: Option<String>,
+    pub(crate) branch: Option<String>,
 }
 
 /// Parses `git worktree list --porcelain` output into structured entries.
@@ -259,7 +262,7 @@ pub struct WorktreeEntry {
 /// blank line. If a `worktree` line appears without a preceding blank line,
 /// the in-progress entry is silently discarded (consistent with git's guarantee
 /// for `--porcelain` output).
-pub fn parse_porcelain_worktrees(output: &str) -> Vec<WorktreeEntry> {
+pub(crate) fn parse_porcelain_worktrees(output: &str) -> Vec<WorktreeEntry> {
     let mut entries = Vec::new();
     let mut current_path: Option<PathBuf> = None;
     let mut current_branch: Option<String> = None;
@@ -391,7 +394,7 @@ async fn configure_hooks(worktree_path: &Path) -> Result<()> {
 }
 
 /// Represents a Git repository with owner and repo name
-pub struct GitRepo {
+pub(crate) struct GitRepo {
     owner: String,
     repo: String,
     /// GitHub hostname (e.g., "github.com" or "ghe.example.com")
@@ -401,7 +404,7 @@ pub struct GitRepo {
 
 impl GitRepo {
     /// Create a new GitRepo instance
-    pub fn new(
+    pub(crate) fn new(
         owner: impl Into<String>,
         repo: impl Into<String>,
         host: impl Into<String>,
@@ -428,7 +431,7 @@ impl GitRepo {
     /// Returns an error if:
     /// - The git clone or fetch command fails (network issues, authentication, etc.)
     /// - Unable to create parent directories
-    pub async fn ensure_bare_clone(&self) -> Result<()> {
+    pub(crate) async fn ensure_bare_clone(&self) -> Result<()> {
         let token = std::env::var("GRU_GITHUB_TOKEN")
             .ok()
             .filter(|t| !t.is_empty());
@@ -671,7 +674,11 @@ impl GitRepo {
     /// - The branch name is invalid
     /// - The branch is already checked out in another worktree
     /// - Git worktree creation fails
-    pub async fn create_worktree(&self, branch_name: &str, worktree_path: &Path) -> Result<()> {
+    pub(crate) async fn create_worktree(
+        &self,
+        branch_name: &str,
+        worktree_path: &Path,
+    ) -> Result<()> {
         // Validate branch name
         validate_branch_name(branch_name)?;
 
@@ -761,7 +768,11 @@ impl GitRepo {
     /// - The branch name is invalid or doesn't exist
     /// - The worktree path already exists
     /// - Git worktree creation fails
-    pub async fn checkout_worktree(&self, branch_name: &str, worktree_path: &Path) -> Result<()> {
+    pub(crate) async fn checkout_worktree(
+        &self,
+        branch_name: &str,
+        worktree_path: &Path,
+    ) -> Result<()> {
         // Validate branch name
         validate_branch_name(branch_name)?;
 
@@ -848,7 +859,10 @@ impl GitRepo {
     /// - The branch name is invalid
     /// - The bare repository doesn't exist
     /// - The git worktree list command fails
-    pub async fn find_worktree_for_branch(&self, branch_name: &str) -> Result<Option<PathBuf>> {
+    pub(crate) async fn find_worktree_for_branch(
+        &self,
+        branch_name: &str,
+    ) -> Result<Option<PathBuf>> {
         // Validate branch name
         validate_branch_name(branch_name)?;
 
@@ -899,7 +913,7 @@ impl GitRepo {
     /// - The bare repository doesn't exist
     /// - The branch name is invalid
     /// - The git fetch command fails
-    pub async fn fetch_branch(&self, branch_name: &str) -> Result<()> {
+    pub(crate) async fn fetch_branch(&self, branch_name: &str) -> Result<()> {
         // Validate branch name using existing validation
         validate_branch_name(branch_name)?;
 

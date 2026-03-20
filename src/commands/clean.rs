@@ -932,7 +932,7 @@ async fn remove_worktrees(
 }
 
 /// Handles the clean command to remove merged/closed worktrees
-pub async fn handle_clean(dry_run: bool, force: bool, base_branch: &str) -> Result<i32> {
+pub(crate) async fn handle_clean(dry_run: bool, force: bool, base_branch: &str) -> Result<i32> {
     let ws = workspace::Workspace::new().context("Failed to initialize workspace")?;
 
     let scan = match scan_worktrees(&ws, base_branch).await? {

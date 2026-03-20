@@ -4,7 +4,7 @@ use anyhow::Result;
 /// Handles the `gru tail` command (hidden alias for `gru logs`).
 ///
 /// Delegates to `handle_logs` with `--no-follow` mapped from the tail flag.
-pub async fn handle_tail(
+pub(crate) async fn handle_tail(
     id: String,
     no_follow: bool,
     raw: bool,

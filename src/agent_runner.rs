@@ -32,7 +32,7 @@ pub(crate) const EXIT_CODE_SIGNAL_TERMINATED: i32 = 128;
 /// These are typed errors so callers can reliably detect blocked states via
 /// `downcast_ref::<AgentRunnerError>()` rather than fragile string matching.
 #[derive(Debug)]
-pub enum AgentRunnerError {
+pub(crate) enum AgentRunnerError {
     /// The task exceeded its configured maximum timeout (--timeout flag).
     MaxTimeout(Duration),
     /// No activity (no stream events) for INACTIVITY_STUCK_SECS.
@@ -69,15 +69,15 @@ impl std::error::Error for AgentRunnerError {}
 
 /// Returns true if the error indicates the task is stuck or timed out,
 /// meaning it should be labeled `gru:blocked` instead of `gru:failed`.
-pub fn is_stuck_or_timeout_error(err: &anyhow::Error) -> bool {
+pub(crate) fn is_stuck_or_timeout_error(err: &anyhow::Error) -> bool {
     err.downcast_ref::<AgentRunnerError>().is_some()
 }
 
 /// Result of running an agent session, including exit status and token usage.
 #[derive(Debug)]
-pub struct AgentRunResult {
-    pub status: std::process::ExitStatus,
-    pub token_usage: TokenUsage,
+pub(crate) struct AgentRunResult {
+    pub(crate) status: std::process::ExitStatus,
+    pub(crate) token_usage: TokenUsage,
 }
 
 /// Parses a timeout string into a Duration.
@@ -162,7 +162,7 @@ async fn log_event(dir: &Path, event: &AgentEvent) -> Result<()> {
 /// `on_spawn` is called synchronously with the child PID immediately after the
 /// process is spawned, before stream processing begins. This ensures the PID
 /// is recorded before the process can exit.
-pub async fn run_agent_with_stream_monitoring<F>(
+pub(crate) async fn run_agent_with_stream_monitoring<F>(
     mut cmd: TokioCommand,
     backend: &dyn AgentBackend,
     events_dir: &Path,

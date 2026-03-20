@@ -20,7 +20,7 @@ use crate::workspace::Workspace;
 ///
 /// * `state_dir` - Optional custom state directory path. If None, uses `~/.gru/state/`.
 ///   This parameter is primarily for testing with isolated temp directories.
-pub fn generate_minion_id_with_state(state_dir: Option<&Path>) -> io::Result<String> {
+pub(crate) fn generate_minion_id_with_state(state_dir: Option<&Path>) -> io::Result<String> {
     let state_path = if let Some(custom_dir) = state_dir {
         // Test path: use provided directory and ensure it exists
         fs::create_dir_all(custom_dir)?;
@@ -81,7 +81,7 @@ pub fn generate_minion_id_with_state(state_dir: Option<&Path>) -> io::Result<Str
 /// Generates a unique Minion ID using the default production state directory.
 ///
 /// This is a convenience wrapper around `generate_minion_id_with_state(None)`.
-pub fn generate_minion_id() -> io::Result<String> {
+pub(crate) fn generate_minion_id() -> io::Result<String> {
     generate_minion_id_with_state(None)
 }
 

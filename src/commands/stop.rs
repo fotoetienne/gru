@@ -47,7 +47,7 @@ fn escape_regex(s: &str) -> String {
 /// - With M prefix (e.g., 12 -> M12)
 /// - Issue number (finds minion working on that issue)
 /// - PR number (finds minion via linked issue)
-pub async fn handle_stop(id: String, force: bool) -> Result<i32> {
+pub(crate) async fn handle_stop(id: String, force: bool) -> Result<i32> {
     // Resolve the minion ID to get the worktree path
     let minion = minion_resolver::resolve_minion(&id).await?;
 

@@ -3,22 +3,22 @@ use std::process::ExitStatus;
 use uuid::Uuid;
 
 /// Options for the `gru do` (fix) command.
-pub struct FixOptions {
-    pub timeout: Option<String>,
-    pub review_timeout: Option<String>,
-    pub monitor_timeout: Option<String>,
-    pub quiet: bool,
-    pub force_new: bool,
-    pub agent_name: String,
-    pub no_watch: bool,
-    pub auto_merge: bool,
+pub(crate) struct FixOptions {
+    pub(crate) timeout: Option<String>,
+    pub(crate) review_timeout: Option<String>,
+    pub(crate) monitor_timeout: Option<String>,
+    pub(crate) quiet: bool,
+    pub(crate) force_new: bool,
+    pub(crate) agent_name: String,
+    pub(crate) no_watch: bool,
+    pub(crate) auto_merge: bool,
     /// Detach immediately after spawning background worker (don't follow logs).
-    pub detach: bool,
+    pub(crate) detach: bool,
     /// Skip dependency checking entirely.
-    pub ignore_deps: bool,
+    pub(crate) ignore_deps: bool,
     /// Internal: run as background worker for a previously-registered minion.
     /// Value is the minion ID to look up in the registry.
-    pub worker: Option<String>,
+    pub(crate) worker: Option<String>,
 }
 
 /// Maximum number of review rounds to handle automatically
@@ -32,36 +32,36 @@ pub(crate) const MAX_REBASE_ATTEMPTS: usize = 2;
 /// Result of resolving an issue argument into validated context.
 /// Contains the parsed issue number as `u64`, eliminating repeated string parsing.
 pub(crate) struct IssueContext {
-    pub owner: String,
-    pub repo: String,
+    pub(crate) owner: String,
+    pub(crate) repo: String,
     /// GitHub hostname (e.g., "github.com" or "ghe.example.com")
-    pub host: String,
-    pub issue_num: u64,
+    pub(crate) host: String,
+    pub(crate) issue_num: u64,
     /// Fetched issue details: (title, body, labels). None if fetch failed.
-    pub details: Option<IssueDetails>,
+    pub(crate) details: Option<IssueDetails>,
 }
 
 /// Fetched issue metadata from GitHub.
 pub(crate) struct IssueDetails {
-    pub title: String,
-    pub body: String,
-    pub labels: String,
+    pub(crate) title: String,
+    pub(crate) body: String,
+    pub(crate) labels: String,
 }
 
 /// Result of setting up a worktree for a minion.
 pub(crate) struct WorktreeContext {
-    pub minion_id: String,
-    pub branch_name: String,
+    pub(crate) minion_id: String,
+    pub(crate) branch_name: String,
     /// Top-level minion directory where metadata lives (events.jsonl, PR_DESCRIPTION.md, etc.)
-    pub minion_dir: PathBuf,
+    pub(crate) minion_dir: PathBuf,
     /// Git worktree checkout path (minion_dir/checkout for new layout, minion_dir for legacy)
-    pub checkout_path: PathBuf,
-    pub session_id: Uuid,
+    pub(crate) checkout_path: PathBuf,
+    pub(crate) session_id: Uuid,
 }
 
 /// Result of running an agent session.
 pub(crate) struct AgentResult {
-    pub status: ExitStatus,
+    pub(crate) status: ExitStatus,
 }
 
 /// Result of checking for existing minions on an issue.

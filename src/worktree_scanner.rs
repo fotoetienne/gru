@@ -8,15 +8,15 @@ use tokio::process::Command;
 #[derive(Debug, Clone)]
 pub(crate) struct Worktree {
     /// Path to the worktree directory
-    pub path: PathBuf,
+    pub(crate) path: PathBuf,
     /// Branch name associated with this worktree
-    pub branch: String,
+    pub(crate) branch: String,
     /// Repository identifier (e.g., "owner/repo")
-    pub repo: String,
+    pub(crate) repo: String,
     /// GitHub hostname (e.g., "github.com" or "ghe.example.com")
-    pub host: String,
+    pub(crate) host: String,
     /// Path to the bare repository
-    pub bare_repo_path: PathBuf,
+    pub(crate) bare_repo_path: PathBuf,
 }
 
 /// Status of a worktree indicating whether it can be cleaned
@@ -54,7 +54,7 @@ impl Worktree {
     }
 
     /// Check if the worktree's branch has been merged into the base branch
-    pub async fn check_merged(&self, base_branch: &str) -> Result<bool> {
+    pub(crate) async fn check_merged(&self, base_branch: &str) -> Result<bool> {
         let output = Command::new("git")
             .env_remove("GIT_DIR")
             .env_remove("GIT_WORK_TREE")
@@ -76,7 +76,7 @@ impl Worktree {
     }
 
     /// Check if the associated GitHub issue is closed
-    pub async fn check_issue_closed(&self) -> Result<Option<bool>> {
+    pub(crate) async fn check_issue_closed(&self) -> Result<Option<bool>> {
         let issue_num = match self.extract_issue_number() {
             Some(num) => num,
             None => return Ok(None),
@@ -111,7 +111,7 @@ impl Worktree {
     /// Uses `git ls-remote` to query the remote directly, avoiding
     /// `git fetch --prune` which fails with a scary "fatal: refusing to fetch"
     /// warning when the branch is checked out in an active worktree.
-    pub async fn check_remote_deleted(&self) -> Result<bool> {
+    pub(crate) async fn check_remote_deleted(&self) -> Result<bool> {
         let output = Command::new("git")
             .env_remove("GIT_DIR")
             .env_remove("GIT_WORK_TREE")
@@ -201,7 +201,7 @@ impl Worktree {
     /// This method uses `gh pr list --state merged --head <branch>` to check GitHub directly.
     /// Callers should treat errors conservatively (i.e., assume the PR may not have been
     /// confirmed as merged).
-    pub async fn check_pr_merged_on_github(&self) -> Result<bool> {
+    pub(crate) async fn check_pr_merged_on_github(&self) -> Result<bool> {
         Ok(self.count_prs_in_state("merged").await? > 0)
     }
 
@@ -209,12 +209,12 @@ impl Worktree {
     ///
     /// Used to prevent cleaning worktrees that have PRs under review.
     /// Callers should treat errors conservatively (i.e., assume an open PR may exist).
-    pub async fn check_has_open_pr(&self) -> Result<bool> {
+    pub(crate) async fn check_has_open_pr(&self) -> Result<bool> {
         Ok(self.count_prs_in_state("open").await? > 0)
     }
 
     /// Determine the overall status of this worktree
-    pub async fn status(&self, base_branch: &str) -> Result<WorktreeStatus> {
+    pub(crate) async fn status(&self, base_branch: &str) -> Result<WorktreeStatus> {
         // Check in order of priority
 
         // 1. Check if merged (git-level)

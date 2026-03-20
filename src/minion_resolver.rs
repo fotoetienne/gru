@@ -16,14 +16,14 @@ static ISSUE_LINK_REGEX: Lazy<Regex> = Lazy::new(|| {
 /// Information about a resolved Minion worktree
 #[derive(Debug, Clone)]
 pub(crate) struct MinionInfo {
-    pub minion_id: String,
-    pub issue_number: Option<u64>,
+    pub(crate) minion_id: String,
+    pub(crate) issue_number: Option<u64>,
     /// The top-level minion directory (metadata lives here).
     /// Use `checkout_path()` to get the git worktree location.
-    pub worktree_path: PathBuf,
+    pub(crate) worktree_path: PathBuf,
     /// Used by find_by_issue_number_from_list to rank candidates.
     /// Values: "Active", "Stopped" (from registry), "Idle" (from filesystem scan).
-    pub status: String,
+    pub(crate) status: String,
 }
 
 impl MinionInfo {
@@ -31,7 +31,7 @@ impl MinionInfo {
     ///
     /// New-style minions store the git worktree in `worktree_path/checkout/`.
     /// Legacy minions have the git worktree directly in `worktree_path/`.
-    pub fn checkout_path(&self) -> PathBuf {
+    pub(crate) fn checkout_path(&self) -> PathBuf {
         crate::workspace::resolve_checkout_path(&self.worktree_path)
     }
 }
