@@ -13,6 +13,7 @@ Gru is **agent-agnostic**. It ships with backends for [Claude Code](https://gith
 
 ```bash
 # Install
+git clone https://github.com/fotoetienne/gru.git && cd gru
 cargo install --path .
 
 # Initialize a repo
@@ -22,7 +23,7 @@ gru init owner/repo
 gru do 42
 ```
 
-That's it. Gru creates a worktree, spawns the agent, opens a PR, and monitors CI and reviews autonomously.
+Gru creates an isolated worktree, spawns the agent, opens a PR, and monitors CI and reviews autonomously.
 
 ## Installation
 
@@ -96,7 +97,7 @@ gru status              # List all active Minions
 gru status M001         # Details for a specific Minion
 gru logs M001           # View event stream
 gru attach M001         # Attach terminal to a running Minion
-gru stop M001           # Pause a Minion
+gru stop M001           # Stop a running Minion
 gru resume M001         # Resume a stopped Minion
 gru rebase M001         # Rebase a Minion's branch onto latest base
 gru path M001           # Print the Minion's worktree path
@@ -144,8 +145,7 @@ Or configure repos in `~/.gru/config.toml` and run `gru lab` with no arguments:
 ```toml
 [daemon]
 repos = ["owner/frontend", "owner/backend"]
-max_slots = 4
-poll_interval_secs = 30
+max_slots = 4            # default is 2
 ```
 
 ## Configuration
@@ -165,9 +165,9 @@ Key options: default agent backend, polling intervals, concurrency slots, merge 
 1. `gru init owner/repo` creates a bare git mirror at `~/.gru/repos/`
 2. `gru do 42` creates an isolated worktree under `~/.gru/work/`, spawns the agent, and monitors its progress via streaming JSON
 3. The agent reads the issue, explores the code, makes changes, and runs tests
-4. Gru opens a PR, watches CI, and feeds failures back to the agent for auto-fix
+4. Gru opens a PR, watches CI, and feeds failures back to the agent for auto-fix (up to 2 attempts before escalating)
 5. Review comments are forwarded to the agent for responses
-6. Labels (`gru:todo` → `gru:in-progress` → `gru:done`) track state on GitHub
+6. Labels (`gru:todo` → `gru:in-progress` → `gru:done` / `gru:failed`) track state on GitHub
 
 ## Roadmap
 
