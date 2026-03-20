@@ -742,12 +742,16 @@ fn sort_and_dedup_resumable(mut candidates: Vec<ResumableMinion>) -> Vec<Resumab
 /// Determine whether a resume candidate should be skipped, and handle side-effects
 /// (marking closed issues as completed, marking exhausted minions as failed).
 ///
-/// Returns `Ok(true)` if the candidate should be resumed, `Ok(false)` to skip.
+/// Returns `true` if the candidate should be resumed, `false` to skip.
+///
+/// All errors (registry access, GitHub API) are handled internally by logging
+/// and returning `false` — a single candidate failure should never abort the
+/// entire resume loop.
 async fn should_resume_candidate(
     candidate: &ResumableMinion,
     host: &str,
     max_attempts: u32,
-) -> Result<bool> {
+) -> bool {
     // Cross-cycle guard: skip if another minion for this issue is already running
     match is_issue_claimed(&candidate.info.repo, candidate.info.issue).await {
         Ok(true) => {
@@ -757,7 +761,7 @@ async fn should_resume_candidate(
                 candidate.info.issue,
                 candidate.info.repo,
             );
-            return Ok(false);
+            return false;
         }
         Ok(false) => {}
         Err(e) => {
@@ -766,14 +770,14 @@ async fn should_resume_candidate(
                 candidate.info.issue,
                 e,
             );
-            return Ok(false);
+            return false;
         }
     }
 
     // Skip minions whose issue is already closed (PR merged or issue resolved)
     let (owner, repo_name) = match candidate.info.repo.split_once('/') {
         Some(parts) => parts,
-        None => return Ok(false),
+        None => return false,
     };
     match github::is_issue_closed_via_cli(owner, repo_name, host, candidate.info.issue).await {
         Ok(true) => {
@@ -784,7 +788,7 @@ async fn should_resume_candidate(
                 candidate.info.repo,
             );
             mark_minion_completed(&candidate.minion_id).await;
-            return Ok(false);
+            return false;
         }
         Ok(false) => {
             // Issue is still open — but the PR may already be merged
@@ -807,7 +811,7 @@ async fn should_resume_candidate(
                         pr_num,
                     );
                     mark_minion_completed(&candidate.minion_id).await;
-                    return Ok(false);
+                    return false;
                 }
                 PrResumeDecision::RetryNextPoll { pr_num, error } => {
                     log::warn!(
@@ -817,7 +821,7 @@ async fn should_resume_candidate(
                         candidate.info.issue,
                         error,
                     );
-                    return Ok(false);
+                    return false;
                 }
             }
         }
@@ -828,7 +832,7 @@ async fn should_resume_candidate(
                 candidate.info.issue,
                 e,
             );
-            return Ok(false);
+            return false;
         }
     }
 
@@ -848,7 +852,7 @@ async fn should_resume_candidate(
                 "timeout deadline has passed",
             )
             .await;
-            return Ok(false);
+            return false;
         }
     }
 
@@ -864,10 +868,10 @@ async fn should_resume_candidate(
         );
         let reason = format!("exceeded maximum resume attempts ({})", max_attempts);
         mark_exhausted_minion(&candidate.minion_id, &candidate.info, host, &reason).await;
-        return Ok(false);
+        return false;
     }
 
-    Ok(true)
+    true
 }
 
 /// Spawn a resume process for a candidate and write its PID to the registry.
@@ -974,7 +978,7 @@ async fn resume_interrupted_minions(
             None => continue,
         };
 
-        if !should_resume_candidate(candidate, &host, max_attempts).await? {
+        if !should_resume_candidate(candidate, &host, max_attempts).await {
             continue;
         }
 
@@ -1488,8 +1492,13 @@ async fn spawn_resume(minion_id: &str) -> Result<Child> {
     let log_name = format!("resume-{}.log", minion_id);
     let (stdout_file, stderr_file, log_path) = setup_log_file(&log_name).await?;
 
+    // Remove TMUX/TMUX_PANE so the child doesn't inherit the lab's tmux session —
+    // otherwise TmuxGuard renames arbitrary windows in the parent's tmux.
     let mut cmd = tokio::process::Command::new(exe);
-    cmd.arg("resume").arg(minion_id);
+    cmd.arg("resume")
+        .arg(minion_id)
+        .env_remove("TMUX")
+        .env_remove("TMUX_PANE");
 
     let child = spawn_background_cmd(
         cmd,
