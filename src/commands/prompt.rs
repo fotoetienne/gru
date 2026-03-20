@@ -190,7 +190,7 @@ async fn setup_issue_worktree(
     let branch_name = format!("minion/issue-{}-{}", issue_number, minion_id);
     println!("🌿 Creating worktree with branch: {}", branch_name);
 
-    let repo_name = format!("{}/{}", owner, repo);
+    let repo_name = github::repo_slug(owner, repo);
     let worktree_path = workspace
         .work_dir(&repo_name, &branch_name)
         .context("Failed to compute worktree path")?;
@@ -637,7 +637,7 @@ fn build_minion_registry_info(
     ws: &WorkspaceSetup,
 ) -> RegistryMinionInfo {
     let repo_display = if let (Some(ref owner), Some(ref repo)) = (&fetched.owner, &fetched.repo) {
-        format!("{}/{}", owner, repo)
+        github::repo_slug(owner, repo)
     } else {
         "ad-hoc".to_string()
     };

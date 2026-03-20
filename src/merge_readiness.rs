@@ -243,7 +243,7 @@ fn is_retryable_error(stderr: &str) -> bool {
 // --- Data fetching ---
 
 async fn get_pr_details(host: &str, owner: &str, repo: &str, pr_number: &str) -> Result<PrDetails> {
-    let repo_full = format!("{owner}/{repo}");
+    let repo_full = github::repo_slug(owner, repo);
     let endpoint = format!("repos/{repo_full}/pulls/{pr_number}");
     let output = gh_api_with_retry(host, &["api", &endpoint], DEFAULT_MAX_RETRIES).await?;
 
@@ -264,7 +264,7 @@ async fn get_reviews(
     repo: &str,
     pr_number: &str,
 ) -> Result<Vec<ReviewApiResponse>> {
-    let repo_full = format!("{owner}/{repo}");
+    let repo_full = github::repo_slug(owner, repo);
     let endpoint = format!("repos/{repo_full}/pulls/{pr_number}/reviews");
     // --paginate with --jq '.[]' streams one JSON object per line across pages
     let output = gh_api_with_retry(
@@ -292,7 +292,7 @@ async fn get_reviews(
 }
 
 async fn get_check_runs(host: &str, owner: &str, repo: &str, sha: &str) -> Result<Vec<CheckRun>> {
-    let repo_full = format!("{owner}/{repo}");
+    let repo_full = github::repo_slug(owner, repo);
     let endpoint = format!("repos/{repo_full}/commits/{sha}/check-runs");
     // --paginate with --jq streams individual check run objects, one per line
     let output = gh_api_with_retry(
@@ -326,7 +326,7 @@ async fn get_combined_status(
     repo: &str,
     sha: &str,
 ) -> Result<CombinedStatus> {
-    let repo_full = format!("{owner}/{repo}");
+    let repo_full = github::repo_slug(owner, repo);
     let endpoint = format!("repos/{repo_full}/commits/{sha}/status");
     let output = gh_api_with_retry(host, &["api", &endpoint], DEFAULT_MAX_RETRIES).await?;
 

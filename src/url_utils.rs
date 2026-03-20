@@ -187,7 +187,7 @@ pub async fn parse_pr_info(
                  Did you mean to use `gru do` instead?"
             );
         }
-        let repo_full = format!("{}/{}", parsed.owner, parsed.repo);
+        let repo_full = github::repo_slug(&parsed.owner, &parsed.repo);
         (parsed.number.to_string(), parsed.host, Some(repo_full))
     } else {
         anyhow::bail!(

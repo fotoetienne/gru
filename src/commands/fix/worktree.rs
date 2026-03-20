@@ -40,7 +40,7 @@ pub(super) async fn setup_worktree(
     let branch_name = format!("minion/issue-{}-{}", ctx.issue_num, minion_id);
     println!("🌿 Creating worktree with branch: {}", branch_name);
 
-    let repo_name = format!("{}/{}", ctx.owner, ctx.repo);
+    let repo_name = crate::github::repo_slug(&ctx.owner, &ctx.repo);
     let minion_dir = workspace
         .work_dir(&repo_name, &branch_name)
         .context("Failed to compute minion directory path")?;

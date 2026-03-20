@@ -311,7 +311,7 @@ pub fn scan_all_minions() -> Result<Vec<MinionInfo>> {
                 // Build repo name from path components
                 let owner = owner_entry.file_name().to_string_lossy().to_string();
                 let repo = repo_entry.file_name().to_string_lossy().to_string();
-                let repo_name = format!("{}/{}", owner, repo);
+                let repo_name = github::repo_slug(&owner, &repo);
 
                 minions.push(MinionInfo {
                     minion_id,
@@ -424,7 +424,7 @@ async fn resolve_issue_from_pr(pr_num: u64) -> Result<u64> {
         .context("Failed to get GitHub remote")?;
     let (host, det_owner, det_repo) = git::parse_github_remote(&remote_url, &github_hosts)
         .context("Failed to parse GitHub remote URL")?;
-    let repo_full = format!("{}/{}", det_owner, det_repo);
+    let repo_full = github::repo_slug(&det_owner, &det_repo);
     // Use gh CLI to get linked issue from PR body
     let output = github::gh_cli_command(&host)
         .args([

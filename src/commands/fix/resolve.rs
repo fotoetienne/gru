@@ -37,7 +37,7 @@ pub(super) async fn check_existing_minions(
     repo: &str,
     issue_num: u64,
 ) -> Result<ExistingMinionCheck> {
-    let repo_for_check = format!("{}/{}", owner, repo);
+    let repo_for_check = crate::github::repo_slug(owner, repo);
     let mut existing =
         with_registry(move |registry| Ok(registry.find_by_issue(&repo_for_check, issue_num)))
             .await?;

@@ -423,7 +423,7 @@ async fn extract_repo_from_git_config(
 
     let (host, owner, repo) = git::parse_github_remote(&url, github_hosts)
         .context("Failed to parse repo from remote URL")?;
-    Ok((host, format!("{}/{}", owner, repo)))
+    Ok((host, github::repo_slug(&owner, &repo)))
 }
 
 /// Parse git worktree list --porcelain output.

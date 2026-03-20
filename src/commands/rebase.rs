@@ -259,7 +259,7 @@ async fn get_pr_base_branch(worktree_path: &Path, branch: &str) -> Result<Option
     let github_hosts = crate::config::load_host_registry().all_hosts();
     let remote_url = get_remote_url(worktree_path).await?;
     let (host, owner, repo) = git::parse_github_remote(&remote_url, &github_hosts)?;
-    let repo_full = format!("{}/{}", owner, repo);
+    let repo_full = github::repo_slug(&owner, &repo);
 
     let output = github::gh_cli_command(&host)
         .args([

@@ -172,7 +172,7 @@ pub async fn get_pr_fingerprint(
     repo: &str,
     pr_number: &str,
 ) -> Result<PrStateFingerprint> {
-    let repo_full = format!("{owner}/{repo}");
+    let repo_full = github::repo_slug(owner, repo);
 
     let pr_fut = {
         let host = host.to_string();
@@ -261,7 +261,7 @@ async fn fetch_pr_context(
     repo: &str,
     pr_number: &str,
 ) -> Result<PrContext> {
-    let repo_full = format!("{owner}/{repo}");
+    let repo_full = github::repo_slug(owner, repo);
 
     // Fetch diff, comments, reviews, and review comments in parallel.
     // Use `--paginate --jq '.[]'` to flatten multi-page JSON arrays into
@@ -661,7 +661,7 @@ pub async fn add_needs_human_review_label(
     repo: &str,
     pr_number: &str,
 ) -> Result<()> {
-    let repo_full = format!("{owner}/{repo}");
+    let repo_full = github::repo_slug(owner, repo);
     let output = github::gh_cli_command(host)
         .args([
             "pr",
@@ -692,7 +692,7 @@ pub async fn add_needs_human_review_label(
 pub async fn ensure_needs_human_review_label(host: &str, owner: &str, repo: &str) -> Result<()> {
     let (color, description) = labels::get_label_info(NEEDS_HUMAN_REVIEW_LABEL)
         .expect("NEEDS_HUMAN_REVIEW must be in ALL_LABELS");
-    let repo_full = format!("{owner}/{repo}");
+    let repo_full = github::repo_slug(owner, repo);
     let endpoint = format!("repos/{repo_full}/labels");
     let name_field = format!("name={NEEDS_HUMAN_REVIEW_LABEL}");
     let color_field = format!("color={color}");
@@ -738,7 +738,7 @@ pub async fn has_needs_human_review_label(
     repo: &str,
     pr_number: &str,
 ) -> Result<bool> {
-    let repo_full = format!("{owner}/{repo}");
+    let repo_full = github::repo_slug(owner, repo);
     let endpoint = format!("repos/{repo_full}/issues/{pr_number}/labels");
 
     let output = github::gh_cli_command(host)
@@ -774,7 +774,7 @@ pub async fn post_judge_escalation_comment(
     pr_number: &str,
     response: &JudgeResponse,
 ) {
-    let repo_full = format!("{owner}/{repo}");
+    let repo_full = github::repo_slug(owner, repo);
     let body = format!(
         "🧑‍⚖️ **Merge readiness: {}/10 — needs human review**\n\n{}\n\n\
          _To proceed, remove the `gru:needs-human-review` label. \

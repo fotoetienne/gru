@@ -93,7 +93,7 @@ pub async fn handle_review(pr_arg: Option<String>, agent_name: &str) -> Result<i
             .await
             .with_context(|| format!("Failed to fetch PR branch '{}'", branch))?;
 
-        let repo_name = format!("{}/{}", owner, repo);
+        let repo_name = github::repo_slug(&owner, &repo);
         let minion_dir = workspace
             .work_dir(&repo_name, &minion_id)
             .context("Failed to compute minion directory path")?;
@@ -154,7 +154,7 @@ pub async fn handle_review(pr_arg: Option<String>, agent_name: &str) -> Result<i
     // Register minion in registry (worktree field stores the minion_dir)
     let now = Utc::now();
     let registry_info = RegistryMinionInfo {
-        repo: format!("{}/{}", owner, repo),
+        repo: github::repo_slug(&owner, &repo),
         issue: linked_issue,
         command: "review".to_string(),
         prompt: review_prompt.chars().take(200).collect(),
@@ -387,7 +387,7 @@ async fn find_pr_for_issue(issue_num: u64) -> Result<String> {
         .context("Failed to get GitHub remote")?;
     let (host, det_owner, det_repo) = git::parse_github_remote(&remote_url, &github_hosts)
         .context("Failed to parse GitHub remote URL")?;
-    let repo_full = format!("{}/{}", det_owner, det_repo);
+    let repo_full = github::repo_slug(&det_owner, &det_repo);
     // Safe: issue_num is validated as u64 by the type system, which can only contain digits.
     // This prevents command injection as the format string will never contain shell metacharacters.
     let output = github::gh_cli_command(&host)
@@ -438,7 +438,7 @@ async fn find_pr_for_issue(issue_num: u64) -> Result<String> {
 /// Uses gh CLI to fetch issues that this PR closes/fixes
 /// Returns the first linked issue number, or 0 if no issues are linked
 async fn find_issue_for_pr(owner: &str, repo: &str, host: &str, pr_num: &str) -> Result<u64> {
-    let repo_full = format!("{}/{}", owner, repo);
+    let repo_full = github::repo_slug(owner, repo);
     // Safe: pr_num is already validated as a number earlier in the call chain
     let output = github::gh_cli_command(host)
         .args([

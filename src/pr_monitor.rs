@@ -204,7 +204,7 @@ const AUTO_MERGE_LABEL: &str = labels::AUTO_MERGE;
 pub async fn ensure_ready_to_merge_label(host: &str, owner: &str, repo: &str) -> Result<()> {
     let (color, description) =
         labels::get_label_info(READY_TO_MERGE_LABEL).expect("READY_TO_MERGE must be in ALL_LABELS");
-    let repo_full = format!("{owner}/{repo}");
+    let repo_full = github::repo_slug(owner, repo);
     let endpoint = format!("repos/{repo_full}/labels");
     let name_field = format!("name={READY_TO_MERGE_LABEL}");
     let color_field = format!("color={color}");
@@ -251,7 +251,7 @@ async fn has_label(
     pr_number: &str,
     label_name: &str,
 ) -> Result<bool> {
-    let repo_full = format!("{owner}/{repo}");
+    let repo_full = github::repo_slug(owner, repo);
     let endpoint = format!("repos/{repo_full}/issues/{pr_number}/labels");
     let output = gh_api_with_retry(host, &["api", &endpoint], DEFAULT_MAX_RETRIES).await?;
 
@@ -294,7 +294,7 @@ async fn has_auto_merge_label(
 pub async fn ensure_auto_merge_label(host: &str, owner: &str, repo: &str) -> Result<()> {
     let (color, description) =
         labels::get_label_info(AUTO_MERGE_LABEL).expect("AUTO_MERGE must be in ALL_LABELS");
-    let repo_full = format!("{owner}/{repo}");
+    let repo_full = github::repo_slug(owner, repo);
     let endpoint = format!("repos/{repo_full}/labels");
     let name_field = format!("name={AUTO_MERGE_LABEL}");
     let color_field = format!("color={color}");
@@ -340,7 +340,7 @@ pub async fn add_auto_merge_label(
     repo: &str,
     pr_number: &str,
 ) -> Result<()> {
-    let repo_full = format!("{owner}/{repo}");
+    let repo_full = github::repo_slug(owner, repo);
     let output = github::gh_cli_command(host)
         .args([
             "pr",
@@ -374,7 +374,7 @@ async fn add_ready_to_merge_label(
     repo: &str,
     pr_number: &str,
 ) -> Result<()> {
-    let repo_full = format!("{owner}/{repo}");
+    let repo_full = github::repo_slug(owner, repo);
     let endpoint = format!("repos/{repo_full}/issues/{pr_number}/labels");
     let output = gh_api_with_retry(
         host,
@@ -409,7 +409,7 @@ async fn remove_ready_to_merge_label(
     repo: &str,
     pr_number: &str,
 ) -> Result<()> {
-    let repo_full = format!("{owner}/{repo}");
+    let repo_full = github::repo_slug(owner, repo);
 
     let label_encoded = READY_TO_MERGE_LABEL.replace(':', "%3A");
     let endpoint = format!("repos/{repo_full}/issues/{pr_number}/labels/{label_encoded}");
@@ -681,7 +681,7 @@ pub enum MonitorResult {
 
 /// Fetch PR details using gh CLI with retry logic for transient failures
 async fn get_pr(host: &str, owner: &str, repo: &str, pr_number: &str) -> Result<PullRequest> {
-    let repo_full = format!("{owner}/{repo}");
+    let repo_full = github::repo_slug(owner, repo);
     let endpoint = format!("repos/{repo_full}/pulls/{pr_number}");
     let output = gh_api_with_retry(host, &["api", &endpoint], DEFAULT_MAX_RETRIES).await?;
 
@@ -703,7 +703,7 @@ pub(crate) async fn get_all_reviews(
     repo: &str,
     pr_number: &str,
 ) -> Result<Vec<Review>> {
-    let repo_full = format!("{owner}/{repo}");
+    let repo_full = github::repo_slug(owner, repo);
     let endpoint = format!("repos/{repo_full}/pulls/{pr_number}/reviews");
     let output = gh_api_with_retry(host, &["api", &endpoint], DEFAULT_MAX_RETRIES).await?;
 
@@ -726,7 +726,7 @@ async fn get_review_comments(
     pr_number: &str,
     reviews: &[Review],
 ) -> Result<Vec<ReviewComment>> {
-    let repo_full = format!("{owner}/{repo}");
+    let repo_full = github::repo_slug(owner, repo);
     let mut all_comments = Vec::new();
     let mut failed_reviews = 0;
 
@@ -826,7 +826,7 @@ Each reply must:\n\
 
 /// Fetch check runs for a given commit SHA with retry logic for transient failures
 async fn get_check_runs(host: &str, owner: &str, repo: &str, sha: &str) -> Result<Vec<CheckRun>> {
-    let repo_full = format!("{owner}/{repo}");
+    let repo_full = github::repo_slug(owner, repo);
     let endpoint = format!("repos/{repo_full}/commits/{sha}/check-runs");
     let output = gh_api_with_retry(host, &["api", &endpoint], DEFAULT_MAX_RETRIES).await?;
 
