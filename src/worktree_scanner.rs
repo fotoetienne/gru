@@ -212,6 +212,9 @@ impl Worktree {
         // Check in order of priority
 
         // 1. Check if merged (git-level)
+        // Note: check_merged() returns true for branches with no diverging commits,
+        // including freshly created branches where the minion hasn't done any work yet.
+        // Cross-check with issue state to avoid cleaning active worktrees.
         if self
             .check_merged(base_branch)
             .await
@@ -221,7 +224,11 @@ impl Worktree {
             })
             .unwrap_or(false)
         {
-            return Ok(WorktreeStatus::Merged);
+            let issue_still_open =
+                matches!(self.check_issue_closed().await.unwrap_or(None), Some(false));
+            if !issue_still_open {
+                return Ok(WorktreeStatus::Merged);
+            }
         }
 
         // 2. Check if PR was merged on GitHub (handles squash merges)
@@ -516,6 +523,210 @@ mod tests {
             bare_repo_path: PathBuf::from("/tmp/repo.git"),
         };
         assert_eq!(wt.extract_issue_number(), None);
+    }
+
+    /// Creates a git Command with GIT_DIR/GIT_WORK_TREE/GIT_INDEX_FILE cleared
+    /// so tests work correctly even when run from a pre-commit hook.
+    fn clean_git_cmd() -> Command {
+        let mut cmd = Command::new("git");
+        cmd.env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE");
+        cmd
+    }
+
+    /// Clear git environment variables that interfere with tests when run
+    /// from a pre-commit hook. This affects both our helper commands AND the
+    /// production code's `Command::new("git")` calls (e.g., `check_merged()`).
+    fn clear_git_env() {
+        std::env::remove_var("GIT_DIR");
+        std::env::remove_var("GIT_WORK_TREE");
+        std::env::remove_var("GIT_INDEX_FILE");
+    }
+
+    /// Set up a bare repo + working clone with an initial commit on main.
+    /// Returns (bare_path, work_path).
+    async fn setup_test_repo(base: &Path) -> (PathBuf, PathBuf) {
+        let bare_path = base.join("test.git");
+        std::fs::create_dir_all(&bare_path).unwrap();
+        clean_git_cmd()
+            .args(["init", "--bare"])
+            .current_dir(&bare_path)
+            .output()
+            .await
+            .unwrap();
+
+        let work_path = base.join("work");
+        clean_git_cmd()
+            .args([
+                "clone",
+                &bare_path.to_string_lossy(),
+                &work_path.to_string_lossy(),
+            ])
+            .output()
+            .await
+            .unwrap();
+
+        clean_git_cmd()
+            .args([
+                "-C",
+                &work_path.to_string_lossy(),
+                "config",
+                "user.email",
+                "test@test.com",
+            ])
+            .output()
+            .await
+            .unwrap();
+        clean_git_cmd()
+            .args([
+                "-C",
+                &work_path.to_string_lossy(),
+                "config",
+                "user.name",
+                "Test",
+            ])
+            .output()
+            .await
+            .unwrap();
+
+        std::fs::write(work_path.join("file.txt"), "hello").unwrap();
+        clean_git_cmd()
+            .args(["-C", &work_path.to_string_lossy(), "add", "file.txt"])
+            .output()
+            .await
+            .unwrap();
+        clean_git_cmd()
+            .args([
+                "-C",
+                &work_path.to_string_lossy(),
+                "commit",
+                "-m",
+                "initial",
+            ])
+            .output()
+            .await
+            .unwrap();
+        clean_git_cmd()
+            .args(["-C", &work_path.to_string_lossy(), "push", "origin", "main"])
+            .output()
+            .await
+            .unwrap();
+
+        (bare_path, work_path)
+    }
+
+    /// Verify that `check_merged()` returns true for a freshly created branch
+    /// that has no diverging commits. This is the root cause of #591: branches
+    /// with no new work are technically "merged" by git's definition, but should
+    /// not be cleaned if the associated issue is still open.
+    #[tokio::test]
+    async fn test_check_merged_returns_true_for_fresh_branch() {
+        clear_git_env();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let (bare_path, work_path) = setup_test_repo(temp_dir.path()).await;
+
+        // Create a new branch (no new commits) and push it
+        clean_git_cmd()
+            .args([
+                "-C",
+                &work_path.to_string_lossy(),
+                "checkout",
+                "-b",
+                "minion/issue-42-M001",
+            ])
+            .output()
+            .await
+            .unwrap();
+        clean_git_cmd()
+            .args([
+                "-C",
+                &work_path.to_string_lossy(),
+                "push",
+                "origin",
+                "minion/issue-42-M001",
+            ])
+            .output()
+            .await
+            .unwrap();
+
+        let wt = Worktree {
+            path: work_path,
+            branch: "minion/issue-42-M001".to_string(),
+            repo: "owner/repo".to_string(),
+            host: "github.com".to_string(),
+            bare_repo_path: bare_path,
+        };
+
+        // A fresh branch with no diverging commits IS "merged" by git's definition
+        let merged = wt.check_merged("main").await.unwrap();
+        assert!(
+            merged,
+            "Fresh branch with no new commits should be reported as merged by git"
+        );
+    }
+
+    /// Verify that `check_merged()` returns false when the branch has diverging commits.
+    #[tokio::test]
+    async fn test_check_merged_returns_false_for_diverged_branch() {
+        clear_git_env();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let (bare_path, work_path) = setup_test_repo(temp_dir.path()).await;
+
+        // Create branch with a new commit
+        clean_git_cmd()
+            .args([
+                "-C",
+                &work_path.to_string_lossy(),
+                "checkout",
+                "-b",
+                "minion/issue-99-M002",
+            ])
+            .output()
+            .await
+            .unwrap();
+        std::fs::write(work_path.join("new_file.txt"), "new work").unwrap();
+        clean_git_cmd()
+            .args(["-C", &work_path.to_string_lossy(), "add", "new_file.txt"])
+            .output()
+            .await
+            .unwrap();
+        clean_git_cmd()
+            .args([
+                "-C",
+                &work_path.to_string_lossy(),
+                "commit",
+                "-m",
+                "new work",
+            ])
+            .output()
+            .await
+            .unwrap();
+        clean_git_cmd()
+            .args([
+                "-C",
+                &work_path.to_string_lossy(),
+                "push",
+                "origin",
+                "minion/issue-99-M002",
+            ])
+            .output()
+            .await
+            .unwrap();
+
+        let wt = Worktree {
+            path: work_path,
+            branch: "minion/issue-99-M002".to_string(),
+            repo: "owner/repo".to_string(),
+            host: "github.com".to_string(),
+            bare_repo_path: bare_path,
+        };
+
+        let merged = wt.check_merged("main").await.unwrap();
+        assert!(
+            !merged,
+            "Branch with unmerged commits should not be reported as merged"
+        );
     }
 
     #[test]
