@@ -211,6 +211,19 @@ enum Commands {
             help = "Issue number, PR number, Minion ID, or URL. Auto-detects from current worktree if omitted."
         )]
         target: Option<String>,
+
+        #[arg(
+            long,
+            help = "Force-push the rebased branch to origin after a successful rebase"
+        )]
+        push: bool,
+
+        #[arg(
+            short,
+            long,
+            help = "Maximum duration for Claude conflict resolution (e.g., '10m', '30m', '1h'). Defaults to 30 minutes."
+        )]
+        timeout: Option<String>,
     },
     #[command(about = "Get the filesystem path to a Minion's worktree")]
     Path {
@@ -437,7 +450,11 @@ async fn main() {
             let agent_name = agent.unwrap_or_else(|| agent_registry::DEFAULT_AGENT.to_string());
             review::handle_review(pr, &agent_name).await
         }
-        Commands::Rebase { target } => rebase::handle_rebase(target).await,
+        Commands::Rebase {
+            target,
+            push,
+            timeout,
+        } => rebase::handle_rebase(target, push, timeout.as_deref()).await,
         Commands::Path { id, issue, pr } => path::handle_path(id, issue, pr).await,
         Commands::Attach {
             id,
