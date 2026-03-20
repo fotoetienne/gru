@@ -223,6 +223,78 @@ pub async fn get_issue_via_cli(
     Ok(issue)
 }
 
+/// Quick revalidation check for an issue before dispatch.
+///
+/// Fetches the issue's current state and labels in a single API call to detect
+/// TOCTOU races (issue closed or claimed between poll and dispatch).
+///
+/// Returns `true` if the issue is still eligible (open and not in-progress).
+/// Returns `true` (fail-open) if the API call fails, so that transient errors
+/// don't block dispatch.
+pub async fn is_issue_still_eligible(owner: &str, repo: &str, host: &str, number: u64) -> bool {
+    #[derive(serde::Deserialize)]
+    struct RevalidationInfo {
+        state: String,
+        #[serde(default)]
+        labels: Vec<IssueLabel>,
+    }
+
+    let repo_full = repo_slug(owner, repo);
+    let number_str = number.to_string();
+    let result = run_gh(
+        host,
+        &[
+            "issue",
+            "view",
+            &number_str,
+            "--repo",
+            &repo_full,
+            "--json",
+            "state,labels",
+        ],
+    )
+    .await;
+
+    match result {
+        Ok(stdout) => match serde_json::from_str::<RevalidationInfo>(&stdout) {
+            Ok(info) => {
+                if info.state == "CLOSED" {
+                    log::info!("⏭️  Issue #{} was closed since last poll, skipping", number);
+                    return false;
+                }
+                if info
+                    .labels
+                    .iter()
+                    .any(|l| l.name == crate::labels::IN_PROGRESS)
+                {
+                    log::info!(
+                        "⏭️  Issue #{} was claimed (gru:in-progress) since last poll, skipping",
+                        number
+                    );
+                    return false;
+                }
+                true
+            }
+            Err(e) => {
+                log::warn!(
+                    "⚠️  Failed to parse revalidation response for issue #{}: {} — proceeding anyway",
+                    number,
+                    e
+                );
+                true // fail-open
+            }
+        },
+        Err(e) => {
+            log::warn!(
+                "⚠️  Revalidation API call failed for issue #{}: {} — proceeding anyway",
+                number,
+                e
+            );
+            true // fail-open
+        }
+    }
+}
+
 /// Check if a GitHub issue is closed (or has a merged/closed PR).
 ///
 /// Returns `true` if the issue state is `CLOSED` (the GraphQL enum value
