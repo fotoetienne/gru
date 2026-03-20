@@ -367,7 +367,19 @@ async fn find_bare_repos(dir: &Path) -> Result<Vec<PathBuf>> {
             }
         };
 
-        while let Ok(Some(entry)) = entries.next_entry().await {
+        loop {
+            let entry = match entries.next_entry().await {
+                Ok(Some(entry)) => entry,
+                Ok(None) => break,
+                Err(e) => {
+                    log::warn!(
+                        "Warning: Failed to read entry in {}: {}",
+                        current_dir.display(),
+                        e
+                    );
+                    continue;
+                }
+            };
             let path = entry.path();
 
             let is_dir = tokio::fs::metadata(&path)
