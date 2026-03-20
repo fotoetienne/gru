@@ -90,6 +90,7 @@ async fn auto_rebase_pr(worktree_path: &Path) -> Result<bool> {
                 commit_count,
                 if commit_count == 1 { "" } else { "s" }
             );
+            log::info!("Auto force-pushing rebased branch (autonomous mode, --force-with-lease)");
             force_push(worktree_path).await?;
             println!("🚀 Force-pushed rebased branch");
             Ok(true)
@@ -102,6 +103,7 @@ async fn auto_rebase_pr(worktree_path: &Path) -> Result<bool> {
             let exit_code = run_agent_rebase(worktree_path, None).await?;
             if exit_code == 0 {
                 // Defensively force push in case the /rebase skill didn't push
+                log::info!("Auto force-pushing after conflict resolution (autonomous mode, --force-with-lease)");
                 force_push(worktree_path).await?;
                 println!("🚀 Force-pushed rebased branch");
                 Ok(true)

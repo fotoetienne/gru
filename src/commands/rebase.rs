@@ -19,6 +19,7 @@ use uuid::Uuid;
 pub async fn handle_rebase(
     target: Option<String>,
     push: bool,
+    yes: bool,
     timeout: Option<&str>,
 ) -> Result<i32> {
     let worktree_path = match target {
@@ -57,8 +58,7 @@ pub async fn handle_rebase(
             );
 
             if push {
-                force_push(&worktree_path).await?;
-                println!("🚀 Force-pushed rebased branch");
+                maybe_force_push(&worktree_path, yes).await?;
             } else {
                 println!("ℹ️  Use --push to force-push the rebased branch to origin");
             }
@@ -77,8 +77,7 @@ pub async fn handle_rebase(
             if exit_code == 0 {
                 if push {
                     // Defensively force push in case the /rebase skill didn't push
-                    force_push(&worktree_path).await?;
-                    println!("🚀 Force-pushed rebased branch");
+                    maybe_force_push(&worktree_path, yes).await?;
                 } else {
                     println!("ℹ️  Use --push to force-push the rebased branch to origin");
                 }
@@ -374,6 +373,56 @@ pub(crate) async fn abort_rebase(worktree_path: &Path) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Confirms with the user, then force-pushes. Skips the prompt when `yes` is true.
+async fn maybe_force_push(worktree_path: &Path, yes: bool) -> Result<()> {
+    let branch = get_current_branch(worktree_path).await.unwrap_or_default();
+    println!(
+        "⚠️  About to force-push branch '{}' to origin (using --force-with-lease)",
+        branch
+    );
+
+    if !yes && !confirm_force_push().await {
+        println!("Force-push cancelled.");
+        println!("ℹ️  Run again with --yes to skip this prompt, or push manually:");
+        println!("    git push --force-with-lease origin HEAD");
+        return Ok(());
+    }
+
+    force_push(worktree_path).await?;
+    println!("🚀 Force-pushed rebased branch");
+    Ok(())
+}
+
+/// Prompts the user to confirm a force-push.
+///
+/// Returns `true` if confirmed (y/yes/Enter), `false` otherwise.
+async fn confirm_force_push() -> bool {
+    use std::io::Write;
+    use tokio::io::AsyncBufReadExt;
+
+    print!("Proceed? [Y/n] ");
+    if std::io::stdout().flush().is_err() {
+        return false;
+    }
+
+    let mut input = String::new();
+    let stdin = tokio::io::stdin();
+    let mut reader = tokio::io::BufReader::new(stdin);
+
+    tokio::select! {
+        result = reader.read_line(&mut input) => {
+            match result {
+                Ok(0) | Err(_) => false,
+                Ok(_) => {
+                    let answer = input.trim().to_lowercase();
+                    answer.is_empty() || answer == "y" || answer == "yes"
+                }
+            }
+        }
+        _ = tokio::signal::ctrl_c() => false,
+    }
 }
 
 /// Force-pushes the current branch using --force-with-lease.

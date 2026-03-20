@@ -224,6 +224,9 @@ enum Commands {
         )]
         push: bool,
 
+        #[arg(short, long, help = "Skip confirmation prompt before force-pushing")]
+        yes: bool,
+
         #[arg(
             short,
             long,
@@ -455,8 +458,9 @@ async fn main() {
         Commands::Rebase {
             target,
             push,
+            yes,
             timeout,
-        } => rebase::handle_rebase(target, push, timeout.as_deref()).await,
+        } => rebase::handle_rebase(target, push, yes, timeout.as_deref()).await,
         Commands::Path { id } => path::handle_path(id).await,
         Commands::Attach {
             id,
