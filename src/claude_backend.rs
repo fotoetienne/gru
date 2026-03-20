@@ -9,6 +9,7 @@
 
 use crate::agent::{AgentBackend, AgentEvent, TokenUsage as AgentTokenUsage};
 use crate::claude_runner;
+use crate::display_utils::{shorten_path, truncate_string};
 use crate::stream::{self, ClaudeEvent, ContentBlock, ContentDelta, StreamOutput};
 use std::path::Path;
 use std::sync::Mutex;
@@ -266,35 +267,6 @@ fn format_tool_summary(tool_name: &str, input_json: &str) -> String {
         "TodoWrite" => "Update todos".to_string(),
         "AskUserQuestion" => "Asking question...".to_string(),
         _ => format!("Tool: {}", tool_name),
-    }
-}
-
-/// Truncate a string to a maximum number of characters (not bytes).
-fn truncate_string(s: &str, max_chars: usize) -> String {
-    let chars: Vec<char> = s.chars().take(max_chars + 1).collect();
-    if chars.len() > max_chars {
-        format!("{}...", chars[..max_chars].iter().collect::<String>())
-    } else {
-        s.to_string()
-    }
-}
-
-/// Shorten a file path for display, showing the last 3 components.
-fn shorten_path(path: &str) -> String {
-    let path_obj = std::path::Path::new(path);
-    let components: Vec<_> = path_obj.components().collect();
-
-    if components.len() <= 3 {
-        path.to_string()
-    } else {
-        let last_parts: Vec<_> = components
-            .iter()
-            .rev()
-            .take(3)
-            .rev()
-            .map(|c| c.as_os_str().to_string_lossy())
-            .collect();
-        format!(".../{}", last_parts.join("/"))
     }
 }
 
@@ -707,18 +679,5 @@ mod tests {
     fn test_format_tool_summary_invalid_json() {
         let result = format_tool_summary("Bash", "not valid json");
         assert_eq!(result, "Tool: Bash");
-    }
-
-    #[test]
-    fn test_shorten_path_short() {
-        assert_eq!(shorten_path("src/main.rs"), "src/main.rs");
-    }
-
-    #[test]
-    fn test_shorten_path_long() {
-        assert_eq!(
-            shorten_path("/Users/test/projects/gru/src/commands/fix.rs"),
-            ".../src/commands/fix.rs"
-        );
     }
 }

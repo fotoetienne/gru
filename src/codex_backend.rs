@@ -12,6 +12,7 @@
 //! - `error` → `AgentEvent::Error`
 
 use crate::agent::{AgentBackend, AgentEvent, TokenUsage};
+use crate::display_utils::{shorten_path, truncate_string};
 use serde::Deserialize;
 use std::path::Path;
 use tokio::process::Command as TokioCommand;
@@ -340,35 +341,6 @@ fn extract_message_text(content: &Option<serde_json::Value>) -> Option<String> {
             }
         }
         _ => None,
-    }
-}
-
-/// Truncate a string to a maximum number of characters.
-fn truncate_string(s: &str, max_chars: usize) -> String {
-    let chars: Vec<char> = s.chars().take(max_chars + 1).collect();
-    if chars.len() > max_chars {
-        format!("{}...", chars[..max_chars].iter().collect::<String>())
-    } else {
-        s.to_string()
-    }
-}
-
-/// Shorten a file path for display, showing the last 3 components.
-fn shorten_path(path: &str) -> String {
-    let path_obj = std::path::Path::new(path);
-    let components: Vec<_> = path_obj.components().collect();
-
-    if components.len() <= 3 {
-        path.to_string()
-    } else {
-        let last_parts: Vec<_> = components
-            .iter()
-            .rev()
-            .take(3)
-            .rev()
-            .map(|c| c.as_os_str().to_string_lossy())
-            .collect();
-        format!(".../{}", last_parts.join("/"))
     }
 }
 
@@ -764,19 +736,6 @@ mod tests {
         let result = format_codex_command_summary(&long_cmd);
         assert!(result.ends_with("..."));
         assert!(result.starts_with("Run: "));
-    }
-
-    #[test]
-    fn test_shorten_path_short() {
-        assert_eq!(shorten_path("src/main.rs"), "src/main.rs");
-    }
-
-    #[test]
-    fn test_shorten_path_long() {
-        assert_eq!(
-            shorten_path("/Users/test/projects/gru/src/commands/fix.rs"),
-            ".../src/commands/fix.rs"
-        );
     }
 
     #[test]
