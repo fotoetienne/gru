@@ -25,6 +25,7 @@ mod progress;
 mod progress_comments;
 mod prompt_loader;
 mod prompt_renderer;
+mod prompt_utils;
 mod session_claim;
 mod stream;
 mod text_buffer;
@@ -224,7 +225,12 @@ enum Commands {
         )]
         push: bool,
 
-        #[arg(short, long, help = "Skip confirmation prompt before force-pushing")]
+        #[arg(
+            short,
+            long,
+            requires = "push",
+            help = "Skip confirmation prompt before force-pushing (requires --push)"
+        )]
         yes: bool,
 
         #[arg(

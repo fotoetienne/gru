@@ -5,6 +5,7 @@ use crate::git;
 use crate::github;
 use crate::minion_resolver;
 use anyhow::{Context, Result};
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use tokio::process::Command;
 use uuid::Uuid;
@@ -383,17 +384,27 @@ pub(crate) async fn abort_rebase(worktree_path: &Path) -> Result<()> {
 ///
 /// Returns `true` if the push happened, `false` if the user cancelled.
 async fn maybe_force_push(worktree_path: &Path, yes: bool) -> Result<bool> {
-    let branch = get_current_branch(worktree_path).await.unwrap_or_default();
-    println!(
-        "⚠️  About to force-push branch '{}' to origin (using --force-with-lease)",
-        branch
-    );
+    let branch = get_current_branch(worktree_path).await?;
 
-    if !yes && !confirm_force_push().await {
-        println!("Force-push cancelled.");
-        println!("ℹ️  Run again with --yes to skip this prompt, or push manually:");
-        println!("    git push --force-with-lease origin HEAD");
-        return Ok(false);
+    if !yes {
+        println!(
+            "⚠️  About to force-push branch '{}' to origin (using --force-with-lease)",
+            branch
+        );
+
+        if !std::io::stdin().is_terminal() {
+            anyhow::bail!(
+                "Non-interactive terminal detected. Use --yes to skip the confirmation prompt, \
+                 or push manually:\n    git push --force-with-lease origin HEAD"
+            );
+        }
+
+        if !confirm_force_push().await {
+            println!("Force-push cancelled.");
+            println!("ℹ️  Run again with --yes to skip this prompt, or push manually:");
+            println!("    git push --force-with-lease origin HEAD");
+            return Ok(false);
+        }
     }
 
     force_push(worktree_path).await?;
@@ -421,10 +432,7 @@ async fn confirm_force_push() -> bool {
         result = reader.read_line(&mut input) => {
             match result {
                 Ok(0) | Err(_) => false,
-                Ok(_) => {
-                    let answer = input.trim().to_lowercase();
-                    answer.is_empty() || answer == "y" || answer == "yes"
-                }
+                Ok(_) => crate::prompt_utils::is_affirmative(&input),
             }
         }
         _ = tokio::signal::ctrl_c() => false,

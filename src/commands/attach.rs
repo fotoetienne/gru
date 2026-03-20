@@ -325,17 +325,11 @@ async fn prompt_auto_resume() -> bool {
         result = reader.read_line(&mut input) => {
             match result {
                 Ok(0) | Err(_) => false, // EOF (Ctrl+D) or error
-                Ok(_) => is_affirmative(&input),
+                Ok(_) => crate::prompt_utils::is_affirmative(&input),
             }
         }
         _ = tokio::signal::ctrl_c() => false,
     }
-}
-
-/// Returns `true` if the input is an affirmative answer (empty, "y", or "yes").
-fn is_affirmative(input: &str) -> bool {
-    let answer = input.trim().to_lowercase();
-    answer.is_empty() || answer == "y" || answer == "yes"
 }
 
 #[cfg(test)]
@@ -373,34 +367,6 @@ mod tests {
 
         let err_msg = format!("{:#}", result.unwrap_err());
         assert!(err_msg.contains("Could not resolve ID"));
-    }
-
-    #[test]
-    fn test_is_affirmative_empty_input() {
-        // Enter key (empty input) defaults to yes
-        assert!(is_affirmative(""));
-        assert!(is_affirmative("\n"));
-        assert!(is_affirmative("  \n"));
-    }
-
-    #[test]
-    fn test_is_affirmative_yes_variants() {
-        assert!(is_affirmative("y\n"));
-        assert!(is_affirmative("Y\n"));
-        assert!(is_affirmative("yes\n"));
-        assert!(is_affirmative("YES\n"));
-        assert!(is_affirmative("Yes\n"));
-        assert!(is_affirmative("  y  \n"));
-    }
-
-    #[test]
-    fn test_is_affirmative_no_variants() {
-        assert!(!is_affirmative("n\n"));
-        assert!(!is_affirmative("N\n"));
-        assert!(!is_affirmative("no\n"));
-        assert!(!is_affirmative("NO\n"));
-        assert!(!is_affirmative("nope\n"));
-        assert!(!is_affirmative("anything else\n"));
     }
 
     #[tokio::test]
