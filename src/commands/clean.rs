@@ -248,15 +248,18 @@ struct ScanResult {
     skipped_open_prs: Vec<worktree_scanner::Worktree>,
     /// Registry entries for stopped minions with no corresponding git worktree.
     orphaned_minions: Vec<(String, PathBuf)>,
+    /// Bare repos with stale worktree references that need pruning.
+    stale_bare_repos: HashSet<PathBuf>,
+    /// Number of stale worktree references found.
+    stale_count: usize,
 }
 
 /// Discover worktrees, check their status, and categorize them for cleanup.
 ///
-/// Handles stale worktree pruning, bare repo fetching, and registry-based
-/// active/stopped minion detection. Returns `None` if no worktrees exist.
+/// Detects stale worktree references, fetches bare repos, and uses the registry
+/// for active/stopped minion detection. Returns `None` if no worktrees exist.
 async fn scan_worktrees(
     ws: &workspace::Workspace,
-    dry_run: bool,
     base_branch: &str,
 ) -> Result<Option<ScanResult>> {
     println!("Scanning for worktrees in {}...", ws.repos().display());
@@ -339,55 +342,24 @@ async fn scan_worktrees(
              typically located at ~/.gru/state/minions.json.",
         )?;
 
-    // Prune stale worktree references (directory no longer exists on disk)
+    // Detect stale worktree references (directory no longer exists on disk)
     let (stale, worktrees): (Vec<_>, Vec<_>) =
         worktrees.into_iter().partition(|wt| !wt.path.exists());
 
+    let mut stale_bare_repos = HashSet::new();
+    let stale_count = stale.len();
     if !stale.is_empty() {
-        let mut bare_repos_to_prune = HashSet::new();
         for wt in &stale {
             println!(
                 "Stale worktree reference: {} (directory missing)",
                 wt.path.display()
             );
-            bare_repos_to_prune.insert(wt.bare_repo_path.clone());
+            stale_bare_repos.insert(wt.bare_repo_path.clone());
         }
-
-        if !dry_run {
-            for bare_repo in &bare_repos_to_prune {
-                let output = Command::new("git")
-                    .arg("-C")
-                    .arg(bare_repo.as_path())
-                    .arg("worktree")
-                    .arg("prune")
-                    .output()
-                    .await;
-
-                match output {
-                    Ok(result) if result.status.success() => {}
-                    Ok(result) => {
-                        log::warn!(
-                            "Warning: git worktree prune failed for {}: {}",
-                            bare_repo.display(),
-                            String::from_utf8_lossy(&result.stderr)
-                        );
-                    }
-                    Err(e) => {
-                        log::warn!(
-                            "Warning: Failed to run git worktree prune for {}: {}",
-                            bare_repo.display(),
-                            e
-                        );
-                    }
-                }
-            }
-            println!("Pruned {} stale worktree reference(s).\n", stale.len());
-        } else {
-            println!(
-                "Found {} stale worktree reference(s) to prune.\n",
-                stale.len()
-            );
-        }
+        println!(
+            "Found {} stale worktree reference(s) to prune.\n",
+            stale.len()
+        );
     }
 
     // Build set of discovered worktree paths for orphan detection later.
@@ -519,6 +491,8 @@ async fn scan_worktrees(
         skipped_active_minions,
         skipped_open_prs,
         orphaned_minions,
+        stale_bare_repos,
+        stale_count,
     }))
 }
 
@@ -643,14 +617,46 @@ async fn confirm_removal(total_cleanable: usize, force: bool) -> Result<bool> {
 
 /// Remove cleanable worktrees and orphaned registry entries from disk.
 ///
-/// Handles git worktree removal, branch deletion, minion directory cleanup,
-/// and batch registry entry removal. Returns the process exit code (0 or 1).
+/// Also prunes stale worktree references from bare repos. Handles git worktree
+/// removal, branch deletion, minion directory cleanup, and batch registry entry
+/// removal. Returns the process exit code (0 or 1).
 async fn remove_worktrees(
     ws: &workspace::Workspace,
-    cleanable: Vec<(worktree_scanner::Worktree, worktree_scanner::WorktreeStatus)>,
-    orphaned_minions: &[(String, PathBuf)],
+    scan: &ScanResult,
     force: bool,
 ) -> Result<i32> {
+    // Prune stale worktree references from bare repos
+    if !scan.stale_bare_repos.is_empty() {
+        for bare_repo in &scan.stale_bare_repos {
+            let output = Command::new("git")
+                .arg("-C")
+                .arg(bare_repo.as_path())
+                .arg("worktree")
+                .arg("prune")
+                .output()
+                .await;
+
+            match output {
+                Ok(result) if result.status.success() => {}
+                Ok(result) => {
+                    log::warn!(
+                        "Warning: git worktree prune failed for {}: {}",
+                        bare_repo.display(),
+                        String::from_utf8_lossy(&result.stderr)
+                    );
+                }
+                Err(e) => {
+                    log::warn!(
+                        "Warning: Failed to run git worktree prune for {}: {}",
+                        bare_repo.display(),
+                        e
+                    );
+                }
+            }
+        }
+        println!("Pruned {} stale worktree reference(s).\n", scan.stale_count);
+    }
+
     println!("\nRemoving worktrees...");
     let mut removed = 0;
     let mut failed = 0;
@@ -662,8 +668,8 @@ async fn remove_worktrees(
     // We also store the parent (minion_dir) since registry entries store that as `worktree`.
     let mut registry_paths_to_remove: HashSet<PathBuf> = HashSet::new();
 
-    for (wt, _) in cleanable {
-        let label = worktree_label(&wt);
+    for (wt, _) in &scan.cleanable {
+        let label = worktree_label(wt);
         print!("Removing {}... ", label);
         std::io::stdout().flush()?;
 
@@ -829,9 +835,9 @@ async fn remove_worktrees(
     }
 
     // Clean up orphaned registry entries
-    if !orphaned_minions.is_empty() {
+    if !scan.orphaned_minions.is_empty() {
         println!("\nCleaning orphaned registry entries...");
-        for (minion_id, path) in orphaned_minions {
+        for (minion_id, path) in &scan.orphaned_minions {
             print!("  Removing {} ({})... ", minion_id, path.display());
             std::io::stdout().flush()?;
 
@@ -929,7 +935,7 @@ async fn remove_worktrees(
 pub async fn handle_clean(dry_run: bool, force: bool, base_branch: &str) -> Result<i32> {
     let ws = workspace::Workspace::new().context("Failed to initialize workspace")?;
 
-    let scan = match scan_worktrees(&ws, dry_run, base_branch).await? {
+    let scan = match scan_worktrees(&ws, base_branch).await? {
         Some(scan) => scan,
         None => return Ok(0),
     };
@@ -949,7 +955,7 @@ pub async fn handle_clean(dry_run: bool, force: bool, base_branch: &str) -> Resu
         return Ok(0);
     }
 
-    remove_worktrees(&ws, scan.cleanable, &scan.orphaned_minions, force).await
+    remove_worktrees(&ws, &scan, force).await
 }
 
 #[cfg(test)]
