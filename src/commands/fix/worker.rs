@@ -167,7 +167,9 @@ pub(crate) async fn create_pr_phase(
 /// Runs the PR monitoring phase (Phase 5).
 ///
 /// Monitors the PR lifecycle (reviews, CI, merge state) or falls back to
-/// standalone CI monitoring when no PR exists. Returns the suggested exit code.
+/// standalone CI monitoring when no PR exists. Returns `Ok(())` on normal
+/// completion and `Err` only for failures (for example, CI-failure fallback
+/// when no PR exists).
 pub(crate) async fn monitor_pr_phase(
     backend: &dyn AgentBackend,
     issue_ctx: &IssueContext,

@@ -336,8 +336,9 @@ async fn run_resume_pipeline(ctx: ResumeContext, quiet: bool) -> Result<i32> {
             );
         }
         update_orchestration_phase(&wt_ctx.minion_id, OrchestrationPhase::Completed).await;
+        cleanup_registry(&wt_ctx.minion_id).await;
         println!("✅ Resume completed for Minion {}", wt_ctx.minion_id);
-        return Ok(0);
+        return Ok(agent_exit_code(&agent_result));
     }
 
     // Phase: Monitor PR lifecycle (reviews, CI, merge).
@@ -356,12 +357,29 @@ async fn run_resume_pipeline(ctx: ResumeContext, quiet: bool) -> Result<i32> {
     .await;
 
     if monitor_result.is_err() {
+        cleanup_registry(&wt_ctx.minion_id).await;
         return Ok(1);
     }
 
     update_orchestration_phase(&wt_ctx.minion_id, OrchestrationPhase::Completed).await;
-    println!("\u{2705} Resume completed for Minion {}", wt_ctx.minion_id);
+    cleanup_registry(&wt_ctx.minion_id).await;
+    println!("✅ Resume completed for Minion {}", wt_ctx.minion_id);
     Ok(agent_exit_code(&agent_result))
+}
+
+/// Best-effort registry cleanup: clear PID and set mode to Stopped.
+///
+/// Mirrors the cleanup in `fix::run_worker` so the minion isn't left in
+/// Autonomous mode after the pipeline finishes.
+async fn cleanup_registry(minion_id: &str) {
+    let mid = minion_id.to_string();
+    let _ = with_registry(move |reg| {
+        reg.update(&mid, |info| {
+            info.clear_pid();
+            info.mode = MinionMode::Stopped;
+        })
+    })
+    .await;
 }
 
 /// Last-resort PR discovery by head branch name.
