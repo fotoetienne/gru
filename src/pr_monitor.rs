@@ -9,115 +9,12 @@ use std::process::Output;
 use tokio::time::{sleep, Duration, Instant};
 
 const POLL_INTERVAL_SECS: u64 = 30;
-// Use 5 retries for PR monitoring (lower than CLAUDE.md's 10-15 guideline)
-// because we poll every 30 seconds anyway. Total sleep time: ~62 seconds max
-// (2+4+8+16+32=62s between retries, not including API call duration).
-const DEFAULT_MAX_RETRIES: u32 = 5;
-const BASE_DELAY_SECS: u64 = 2;
-const MAX_DELAY_SECS: u64 = 60; // Cap exponential backoff at 60 seconds
 
-/// Check if an error message indicates a transient failure that should be retried.
-/// Transient failures include network issues, rate limiting, and temporary server errors.
-fn is_retryable_error(stderr: &str) -> bool {
-    // All patterns must be lowercase for case-insensitive matching
-    let retryable_patterns = [
-        // HTTP status codes
-        "502",
-        "503",
-        "504",
-        "429",
-        // Network errors
-        "timeout",
-        "timed out",
-        "connection reset",
-        "connection refused",
-        "network unreachable",
-        "network error",
-        "etimedout",
-        "econnreset",
-        "econnrefused",
-        // DNS errors
-        "resolve host",
-        "name resolution",
-        // Rate limiting
-        "rate limit",
-        "rate-limit",
-        "too many requests",
-        // Server errors
-        "internal server error",
-        "service unavailable",
-        "bad gateway",
-        "gateway timeout",
-        // Generic transient
-        "temporary",
-        "try again",
-    ];
+use github::DEFAULT_MAX_RETRIES;
 
-    let lower_stderr = stderr.to_lowercase();
-    retryable_patterns
-        .iter()
-        .any(|pattern| lower_stderr.contains(pattern))
-}
-
-/// Calculate retry delay with exponential backoff capped at MAX_DELAY_SECS.
-///
-/// Uses `BASE_DELAY_SECS^attempt` formula, capped at `MAX_DELAY_SECS`.
-/// Attempt numbers are 1-indexed (first retry = attempt 1).
-fn calculate_retry_delay(attempt: u32) -> u64 {
-    std::cmp::min(BASE_DELAY_SECS.pow(attempt), MAX_DELAY_SECS)
-}
-
-/// Execute a gh API command with retry logic and exponential backoff.
-///
-/// # Arguments
-/// * `host` - GitHub hostname (e.g., "github.com" or "ghe.example.com")
-/// * `args` - The arguments to pass to the gh command
-/// * `max_retries` - Maximum number of retry attempts (default: 5)
-///
-/// # Returns
-/// The command output on success, or an error after all retries are exhausted.
+/// Alias for the shared retry helper in `github.rs`.
 async fn gh_api_with_retry(host: &str, args: &[&str], max_retries: u32) -> Result<Output> {
-    let mut attempts = 0;
-    let args_str = args.join(" ");
-
-    loop {
-        let output = github::gh_cli_command(host)
-            .args(args)
-            .output()
-            .await
-            .with_context(|| format!("Failed to execute: gh {}", args_str))?;
-
-        if output.status.success() {
-            if attempts > 0 {
-                log::info!(
-                    "GitHub API call succeeded after {} retries: gh {}",
-                    attempts,
-                    args_str
-                );
-            }
-            return Ok(output);
-        }
-
-        let stderr = String::from_utf8_lossy(&output.stderr);
-
-        // Check if this is a retryable error
-        if attempts < max_retries && is_retryable_error(&stderr) {
-            attempts += 1;
-            let delay_secs = calculate_retry_delay(attempts);
-            let delay = Duration::from_secs(delay_secs);
-            log::warn!(
-                "GitHub API call failed (retry {}/{}): {}. Waiting {:?}...",
-                attempts,
-                max_retries,
-                stderr.trim(),
-                delay
-            );
-            sleep(delay).await;
-        } else {
-            // Either not retryable or max retries exceeded
-            return Ok(output);
-        }
-    }
+    github::gh_api_with_retry(host, args, max_retries).await
 }
 
 #[derive(Debug, Deserialize)]
@@ -228,47 +125,21 @@ fn count_completed_failures(check_runs: &[CheckRun]) -> Option<usize> {
 const READY_TO_MERGE_LABEL: &str = labels::READY_TO_MERGE;
 const AUTO_MERGE_LABEL: &str = labels::AUTO_MERGE;
 
+/// Ensure a label exists in the repository, creating it if needed (idempotent via `--force`).
+async fn ensure_label_exists(host: &str, owner: &str, repo: &str, label_name: &str) -> Result<()> {
+    let (color, description) =
+        labels::get_label_info(label_name).expect("label must be in ALL_LABELS");
+    if let Err(e) =
+        github::create_label_via_cli(host, owner, repo, label_name, color, description).await
+    {
+        log::warn!("Failed to create {} label: {}", label_name, e);
+    }
+    Ok(())
+}
+
 /// Ensure the `gru:ready-to-merge` label exists in the repository, creating it if needed.
 pub(crate) async fn ensure_ready_to_merge_label(host: &str, owner: &str, repo: &str) -> Result<()> {
-    let (color, description) =
-        labels::get_label_info(READY_TO_MERGE_LABEL).expect("READY_TO_MERGE must be in ALL_LABELS");
-    let repo_full = github::repo_slug(owner, repo);
-    let endpoint = format!("repos/{repo_full}/labels");
-    let name_field = format!("name={READY_TO_MERGE_LABEL}");
-    let color_field = format!("color={color}");
-    let desc_field = format!("description={description}");
-
-    let output = gh_api_with_retry(
-        host,
-        &[
-            "api",
-            &endpoint,
-            "-X",
-            "POST",
-            "-f",
-            &name_field,
-            "-f",
-            &color_field,
-            "-f",
-            &desc_field,
-        ],
-        DEFAULT_MAX_RETRIES,
-    )
-    .await?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        // 422 means label already exists - that's fine (idempotent)
-        if !stderr.contains("already_exists") {
-            log::warn!(
-                "Failed to create {} label: {}",
-                READY_TO_MERGE_LABEL,
-                stderr.trim()
-            );
-        }
-    }
-
-    Ok(())
+    ensure_label_exists(host, owner, repo, READY_TO_MERGE_LABEL).await
 }
 
 /// Check if a PR currently has a specific label.
@@ -320,45 +191,7 @@ async fn has_auto_merge_label(
 
 /// Ensure the `gru:auto-merge` label exists in the repository, creating it if needed.
 pub(crate) async fn ensure_auto_merge_label(host: &str, owner: &str, repo: &str) -> Result<()> {
-    let (color, description) =
-        labels::get_label_info(AUTO_MERGE_LABEL).expect("AUTO_MERGE must be in ALL_LABELS");
-    let repo_full = github::repo_slug(owner, repo);
-    let endpoint = format!("repos/{repo_full}/labels");
-    let name_field = format!("name={AUTO_MERGE_LABEL}");
-    let color_field = format!("color={color}");
-    let desc_field = format!("description={description}");
-
-    let output = gh_api_with_retry(
-        host,
-        &[
-            "api",
-            &endpoint,
-            "-X",
-            "POST",
-            "-f",
-            &name_field,
-            "-f",
-            &color_field,
-            "-f",
-            &desc_field,
-        ],
-        DEFAULT_MAX_RETRIES,
-    )
-    .await?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        // 422 means label already exists - that's fine (idempotent)
-        if !stderr.contains("already_exists") {
-            log::warn!(
-                "Failed to create {} label: {}",
-                AUTO_MERGE_LABEL,
-                stderr.trim()
-            );
-        }
-    }
-
-    Ok(())
+    ensure_label_exists(host, owner, repo, AUTO_MERGE_LABEL).await
 }
 
 /// Add the `gru:auto-merge` label to a PR.
@@ -1117,79 +950,6 @@ mod tests {
         assert!(prompt.contains("in_reply_to"));
     }
 
-    #[test]
-    fn test_is_retryable_error_http_status_codes() {
-        // HTTP 5xx errors should be retryable
-        assert!(is_retryable_error("HTTP 502 Bad Gateway"));
-        assert!(is_retryable_error("error: 503 Service Unavailable"));
-        assert!(is_retryable_error("status: 504 Gateway Timeout"));
-
-        // Rate limiting should be retryable
-        assert!(is_retryable_error("HTTP 429 Too Many Requests"));
-    }
-
-    #[test]
-    fn test_is_retryable_error_network_errors() {
-        // Network-related errors should be retryable
-        assert!(is_retryable_error("connection timed out"));
-        assert!(is_retryable_error("ETIMEDOUT")); // uppercase - should match via case-insensitive
-        assert!(is_retryable_error("connection reset by peer"));
-        assert!(is_retryable_error("ECONNRESET")); // uppercase - should match via case-insensitive
-        assert!(is_retryable_error("connection refused"));
-        assert!(is_retryable_error("ECONNREFUSED")); // uppercase - should match via case-insensitive
-        assert!(is_retryable_error("network unreachable"));
-    }
-
-    #[test]
-    fn test_is_retryable_error_dns_errors() {
-        // DNS errors should be retryable
-        assert!(is_retryable_error("could not resolve host"));
-        assert!(is_retryable_error("name resolution failed"));
-    }
-
-    #[test]
-    fn test_is_retryable_error_server_errors() {
-        // Server error messages should be retryable
-        assert!(is_retryable_error("Internal Server Error"));
-        assert!(is_retryable_error("Service Unavailable"));
-        assert!(is_retryable_error("Bad Gateway"));
-        assert!(is_retryable_error("Gateway Timeout"));
-    }
-
-    #[test]
-    fn test_is_retryable_error_generic_transient() {
-        // Generic transient messages should be retryable
-        assert!(is_retryable_error("temporary failure"));
-        assert!(is_retryable_error("please try again later"));
-        assert!(is_retryable_error("rate limit exceeded"));
-        assert!(is_retryable_error("rate-limit"));
-    }
-
-    #[test]
-    fn test_is_retryable_error_non_retryable() {
-        // Non-retryable errors should not match
-        assert!(!is_retryable_error("not found"));
-        assert!(!is_retryable_error("HTTP 404"));
-        assert!(!is_retryable_error("unauthorized"));
-        assert!(!is_retryable_error("HTTP 401"));
-        assert!(!is_retryable_error("forbidden"));
-        assert!(!is_retryable_error("HTTP 403"));
-        assert!(!is_retryable_error("bad request"));
-        assert!(!is_retryable_error("HTTP 400"));
-        assert!(!is_retryable_error("invalid token"));
-        assert!(!is_retryable_error("permission denied"));
-    }
-
-    #[test]
-    fn test_is_retryable_error_case_insensitive() {
-        // Should match regardless of case
-        assert!(is_retryable_error("TIMEOUT"));
-        assert!(is_retryable_error("Timeout"));
-        assert!(is_retryable_error("RATE LIMIT"));
-        assert!(is_retryable_error("Rate Limit"));
-        assert!(is_retryable_error("SERVICE UNAVAILABLE"));
-    }
-
     // ========================================================================
     // JSON Deserialization Tests
     // ========================================================================
@@ -1822,25 +1582,7 @@ mod tests {
         assert!(result.is_err());
     }
 
-    // --- calculate_retry_delay tests ---
-
-    #[test]
-    fn test_retry_delay_progression() {
-        // BASE_DELAY_SECS = 2, so 2^attempt: 2, 4, 8, 16, 32
-        assert_eq!(calculate_retry_delay(1), 2);
-        assert_eq!(calculate_retry_delay(2), 4);
-        assert_eq!(calculate_retry_delay(3), 8);
-        assert_eq!(calculate_retry_delay(4), 16);
-        assert_eq!(calculate_retry_delay(5), 32);
-    }
-
-    #[test]
-    fn test_retry_delay_caps_at_max() {
-        // 2^6 = 64 > MAX_DELAY_SECS (60), so it should be capped
-        assert_eq!(calculate_retry_delay(6), MAX_DELAY_SECS);
-        assert_eq!(calculate_retry_delay(7), MAX_DELAY_SECS);
-        assert_eq!(calculate_retry_delay(10), MAX_DELAY_SECS);
-    }
+    // calculate_retry_delay and is_retryable_error tests have moved to github.rs
 
     // ========================================================================
     // PullRequest Mergeable Field Tests

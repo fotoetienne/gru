@@ -1,7 +1,14 @@
 use anyhow::{anyhow, Context, Result};
+use std::process::Output;
 use tokio::process::Command;
+use tokio::time::{sleep, Duration};
 
 use crate::labels;
+
+/// Default maximum number of retry attempts for GitHub API calls.
+pub(crate) const DEFAULT_MAX_RETRIES: u32 = 5;
+const BASE_DELAY_SECS: u64 = 2;
+const MAX_DELAY_SECS: u64 = 60;
 
 /// Build a `"owner/repo"` slug from separate components.
 pub(crate) fn repo_slug(owner: &str, repo: &str) -> String {
@@ -91,6 +98,118 @@ pub(crate) async fn run_gh(host: &str, args: &[&str]) -> Result<String> {
     }
 
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+/// Check if an error message indicates a transient failure that should be retried.
+/// Transient failures include network issues, rate limiting, and temporary server errors.
+pub(crate) fn is_retryable_error(stderr: &str) -> bool {
+    // All patterns must be lowercase for case-insensitive matching
+    let retryable_patterns = [
+        // HTTP status codes
+        "502",
+        "503",
+        "504",
+        "429",
+        // Network errors
+        "timeout",
+        "timed out",
+        "connection reset",
+        "connection refused",
+        "network unreachable",
+        "network error",
+        "etimedout",
+        "econnreset",
+        "econnrefused",
+        // DNS errors
+        "resolve host",
+        "name resolution",
+        // Rate limiting
+        "rate limit",
+        "rate-limit",
+        "too many requests",
+        // Server errors
+        "internal server error",
+        "service unavailable",
+        "bad gateway",
+        "gateway timeout",
+        // Generic transient
+        "temporary",
+        "try again",
+    ];
+
+    let lower_stderr = stderr.to_lowercase();
+    retryable_patterns
+        .iter()
+        .any(|pattern| lower_stderr.contains(pattern))
+}
+
+/// Calculate retry delay with exponential backoff capped at MAX_DELAY_SECS.
+///
+/// Uses `BASE_DELAY_SECS^attempt` formula, capped at `MAX_DELAY_SECS`.
+/// Attempt numbers are 1-indexed (first retry = attempt 1).
+fn calculate_retry_delay(attempt: u32) -> u64 {
+    std::cmp::min(BASE_DELAY_SECS.pow(attempt), MAX_DELAY_SECS)
+}
+
+/// Execute a gh API command with retry logic and exponential backoff.
+///
+/// Returns the raw `Output` on success (including non-retryable failures).
+/// Retries on transient errors (network issues, rate limits, 5xx) up to `max_retries` times.
+///
+/// # Arguments
+/// * `host` - GitHub hostname (e.g., "github.com" or "ghe.example.com")
+/// * `args` - The arguments to pass to the gh command
+/// * `max_retries` - Maximum number of retry attempts
+///
+/// # Returns
+/// The command output on success or after retries are exhausted.
+/// Callers must check `output.status.success()` for non-retryable failures.
+pub(crate) async fn gh_api_with_retry(
+    host: &str,
+    args: &[&str],
+    max_retries: u32,
+) -> Result<Output> {
+    let mut attempts = 0;
+    let args_str = args.join(" ");
+
+    loop {
+        let output = gh_cli_command(host)
+            .args(args)
+            .output()
+            .await
+            .with_context(|| format!("Failed to execute: gh {}", args_str))?;
+
+        if output.status.success() {
+            if attempts > 0 {
+                log::info!(
+                    "GitHub API call succeeded after {} retries: gh {}",
+                    attempts,
+                    args_str
+                );
+            }
+            return Ok(output);
+        }
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        // Check if this is a retryable error
+        if attempts < max_retries && is_retryable_error(&stderr) {
+            attempts += 1;
+            let delay_secs = calculate_retry_delay(attempts);
+            let delay = Duration::from_secs(delay_secs);
+            log::warn!(
+                "GitHub API call failed (retry {}/{}): {}. Waiting {:?}...",
+                attempts,
+                max_retries,
+                stderr.trim(),
+                delay
+            );
+            sleep(delay).await;
+        } else {
+            // Either not retryable or max retries exceeded — return output for caller to handle
+            return Ok(output);
+        }
+    }
 }
 
 /// Build a full GitHub issue URL for a repo in "owner/repo" format, with an explicit host.
@@ -328,16 +447,69 @@ fn check_issue_eligibility(state: &str, labels: &[IssueLabel]) -> (bool, Option<
     (true, None)
 }
 
+/// Fetch the state of a GitHub issue or PR via the `gh` CLI.
+///
+/// # Arguments
+/// * `host` - GitHub hostname
+/// * `owner` - Repository owner
+/// * `repo` - Repository name
+/// * `kind` - Item kind: `"issue"` or `"pr"`
+/// * `number` - Issue or PR number
+///
+/// # Returns
+/// The state string (e.g., `"OPEN"`, `"CLOSED"`, `"MERGED"`) or an error
+/// if the API call fails or returns an empty state.
+pub(crate) async fn get_item_state_via_cli(
+    host: &str,
+    owner: &str,
+    repo: &str,
+    kind: &str,
+    number: u64,
+) -> Result<String> {
+    let repo_full = repo_slug(owner, repo);
+    let number_str = number.to_string();
+    let stdout = run_gh(
+        host,
+        &[
+            kind,
+            "view",
+            &number_str,
+            "--repo",
+            &repo_full,
+            "--json",
+            "state",
+            "--jq",
+            ".state",
+        ],
+    )
+    .await?;
+
+    let state = stdout.trim().to_string();
+    if state.is_empty() {
+        return Err(anyhow!(
+            "gh {} view returned empty state for #{} in {}/{}",
+            kind,
+            number,
+            owner,
+            repo
+        ));
+    }
+    Ok(state)
+}
+
 /// Check if a GitHub issue is closed (or has a merged/closed PR).
 ///
 /// Returns `true` if the issue state is `CLOSED` (the GraphQL enum value
 /// returned by `gh issue view --json state`).
-pub(crate) async fn is_issue_closed_via_cli(
+/// Returns `Ok(false)` if the state is empty (preserving pre-existing behavior).
+pub async fn is_issue_closed_via_cli(
     owner: &str,
     repo: &str,
     host: &str,
     number: u64,
 ) -> Result<bool> {
+    // Use run_gh directly (not get_item_state_via_cli) to preserve the original
+    // behavior of returning Ok(false) on empty state rather than Err.
     let repo_full = repo_slug(owner, repo);
     let number_str = number.to_string();
     let stdout = run_gh(
@@ -356,52 +528,14 @@ pub(crate) async fn is_issue_closed_via_cli(
     )
     .await?;
 
-    let state = stdout.trim().to_string();
-    Ok(state == "CLOSED")
+    Ok(stdout.trim() == "CLOSED")
 }
 
 /// Check whether a PR is still open (i.e., not merged or closed).
 ///
 /// Returns `true` if the PR state is "OPEN", `false` otherwise.
-///
-/// # Arguments
-/// * `owner` - Repository owner (user or organization)
-/// * `repo` - Repository name
-/// * `host` - GitHub hostname
-/// * `number` - PR number
-pub(crate) async fn is_pr_open_via_cli(
-    owner: &str,
-    repo: &str,
-    host: &str,
-    number: u64,
-) -> Result<bool> {
-    let repo_full = repo_slug(owner, repo);
-    let number_str = number.to_string();
-    let stdout = run_gh(
-        host,
-        &[
-            "pr",
-            "view",
-            &number_str,
-            "--repo",
-            &repo_full,
-            "--json",
-            "state",
-            "--jq",
-            ".state",
-        ],
-    )
-    .await?;
-
-    let state = stdout.trim().to_string();
-    if state.is_empty() {
-        return Err(anyhow!(
-            "gh pr view returned empty state for PR #{} in {}/{}",
-            number,
-            owner,
-            repo
-        ));
-    }
+pub async fn is_pr_open_via_cli(owner: &str, repo: &str, host: &str, number: u64) -> Result<bool> {
+    let state = get_item_state_via_cli(host, owner, repo, "pr", number).await?;
     Ok(state == "OPEN")
 }
 
@@ -1418,5 +1552,89 @@ mod tests {
             "create_label_via_cli failed: {:?}",
             result.err()
         );
+    }
+
+    // --- is_retryable_error tests ---
+
+    #[test]
+    fn test_is_retryable_error_http_status_codes() {
+        assert!(is_retryable_error("HTTP 502 Bad Gateway"));
+        assert!(is_retryable_error("error: 503 Service Unavailable"));
+        assert!(is_retryable_error("status: 504 Gateway Timeout"));
+        assert!(is_retryable_error("HTTP 429 Too Many Requests"));
+    }
+
+    #[test]
+    fn test_is_retryable_error_network_errors() {
+        assert!(is_retryable_error("connection timed out"));
+        assert!(is_retryable_error("ETIMEDOUT"));
+        assert!(is_retryable_error("connection reset by peer"));
+        assert!(is_retryable_error("ECONNRESET"));
+        assert!(is_retryable_error("connection refused"));
+        assert!(is_retryable_error("ECONNREFUSED"));
+        assert!(is_retryable_error("network unreachable"));
+    }
+
+    #[test]
+    fn test_is_retryable_error_dns_errors() {
+        assert!(is_retryable_error("could not resolve host"));
+        assert!(is_retryable_error("name resolution failed"));
+    }
+
+    #[test]
+    fn test_is_retryable_error_server_errors() {
+        assert!(is_retryable_error("Internal Server Error"));
+        assert!(is_retryable_error("Service Unavailable"));
+        assert!(is_retryable_error("Bad Gateway"));
+        assert!(is_retryable_error("Gateway Timeout"));
+    }
+
+    #[test]
+    fn test_is_retryable_error_generic_transient() {
+        assert!(is_retryable_error("temporary failure"));
+        assert!(is_retryable_error("please try again later"));
+        assert!(is_retryable_error("rate limit exceeded"));
+        assert!(is_retryable_error("rate-limit"));
+    }
+
+    #[test]
+    fn test_is_retryable_error_non_retryable() {
+        assert!(!is_retryable_error("not found"));
+        assert!(!is_retryable_error("HTTP 404"));
+        assert!(!is_retryable_error("unauthorized"));
+        assert!(!is_retryable_error("HTTP 401"));
+        assert!(!is_retryable_error("forbidden"));
+        assert!(!is_retryable_error("HTTP 403"));
+        assert!(!is_retryable_error("bad request"));
+        assert!(!is_retryable_error("HTTP 400"));
+        assert!(!is_retryable_error("invalid token"));
+        assert!(!is_retryable_error("permission denied"));
+    }
+
+    #[test]
+    fn test_is_retryable_error_case_insensitive() {
+        assert!(is_retryable_error("TIMEOUT"));
+        assert!(is_retryable_error("Timeout"));
+        assert!(is_retryable_error("RATE LIMIT"));
+        assert!(is_retryable_error("Rate Limit"));
+        assert!(is_retryable_error("SERVICE UNAVAILABLE"));
+    }
+
+    // --- calculate_retry_delay tests ---
+
+    #[test]
+    fn test_retry_delay_progression() {
+        assert_eq!(calculate_retry_delay(1), 2);
+        assert_eq!(calculate_retry_delay(2), 4);
+        assert_eq!(calculate_retry_delay(3), 8);
+        assert_eq!(calculate_retry_delay(4), 16);
+        assert_eq!(calculate_retry_delay(5), 32);
+    }
+
+    #[test]
+    fn test_retry_delay_caps_at_max() {
+        assert_eq!(calculate_retry_delay(6), MAX_DELAY_SECS);
+        assert_eq!(calculate_retry_delay(7), MAX_DELAY_SECS);
+        assert_eq!(calculate_retry_delay(10), MAX_DELAY_SECS);
     }
 }
