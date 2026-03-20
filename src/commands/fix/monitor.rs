@@ -84,7 +84,7 @@ async fn auto_rebase_pr(worktree_path: &Path) -> Result<bool> {
             println!("⚠️  Conflicts detected, launching agent to resolve...");
             abort_rebase(worktree_path).await?;
 
-            let exit_code = run_agent_rebase(worktree_path).await?;
+            let exit_code = run_agent_rebase(worktree_path, None).await?;
             if exit_code == 0 {
                 // Defensively force push in case the /rebase skill didn't push
                 force_push(worktree_path).await?;

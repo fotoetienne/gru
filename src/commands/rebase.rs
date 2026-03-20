@@ -16,7 +16,14 @@ use uuid::Uuid;
 /// intelligent resolution.
 ///
 /// Returns the process exit code (0 = success).
-pub async fn handle_rebase(target: Option<String>) -> Result<i32> {
+/// Default timeout for Claude conflict resolution (30 minutes).
+const DEFAULT_CONFLICT_TIMEOUT: &str = "30m";
+
+pub async fn handle_rebase(
+    target: Option<String>,
+    push: bool,
+    timeout: Option<&str>,
+) -> Result<i32> {
     let worktree_path = match target {
         Some(ref arg) => resolve_worktree_from_arg(arg).await?,
         None => resolve_worktree_from_cwd().await?,
@@ -52,9 +59,12 @@ pub async fn handle_rebase(target: Option<String>) -> Result<i32> {
                 if commit_count == 1 { "" } else { "s" }
             );
 
-            // Force-push the rebased branch
-            force_push(&worktree_path).await?;
-            println!("🚀 Force-pushed rebased branch");
+            if push {
+                force_push(&worktree_path).await?;
+                println!("🚀 Force-pushed rebased branch");
+            } else {
+                println!("ℹ️  Use --push to force-push the rebased branch to origin");
+            }
             Ok(0)
         }
         RebaseOutcome::Conflicts => {
@@ -64,14 +74,20 @@ pub async fn handle_rebase(target: Option<String>) -> Result<i32> {
             // (the /rebase command will re-initiate the rebase itself)
             abort_rebase(&worktree_path).await?;
 
+            // Use provided timeout or default to 30 minutes
+            let conflict_timeout = timeout.unwrap_or(DEFAULT_CONFLICT_TIMEOUT);
+
             // Spawn Claude Code with /rebase command
-            let exit_code = run_agent_rebase(&worktree_path).await?;
+            let exit_code = run_agent_rebase(&worktree_path, Some(conflict_timeout)).await?;
 
             if exit_code == 0 {
-                // Claude succeeded - defensively force push in case the /rebase
-                // skill didn't push (harmless no-op if already pushed)
-                force_push(&worktree_path).await?;
-                println!("🚀 Force-pushed rebased branch");
+                if push {
+                    // Defensively force push in case the /rebase skill didn't push
+                    force_push(&worktree_path).await?;
+                    println!("🚀 Force-pushed rebased branch");
+                } else {
+                    println!("ℹ️  Use --push to force-push the rebased branch to origin");
+                }
                 Ok(0)
             } else {
                 println!(
@@ -395,7 +411,7 @@ pub(crate) async fn force_push(worktree_path: &Path) -> Result<()> {
 /// Spawns the agent with the `/rebase` command to resolve conflicts.
 ///
 /// Returns the agent's exit code.
-pub(crate) async fn run_agent_rebase(worktree_path: &Path) -> Result<i32> {
+pub(crate) async fn run_agent_rebase(worktree_path: &Path, timeout: Option<&str>) -> Result<i32> {
     let backend = agent_registry::resolve_backend(agent_registry::DEFAULT_AGENT)?;
     let session_id = Uuid::new_v4();
     let github_host = super::resume::resolve_host_from_worktree(worktree_path, "").await;
@@ -405,7 +421,7 @@ pub(crate) async fn run_agent_rebase(worktree_path: &Path) -> Result<i32> {
         cmd,
         &*backend,
         worktree_path,
-        None,                    // no timeout
+        timeout,
         None::<fn(&AgentEvent)>, // no output callback
         None,                    // no on_spawn callback
     )
