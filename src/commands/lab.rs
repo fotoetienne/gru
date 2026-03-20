@@ -876,7 +876,7 @@ async fn should_resume_candidate(
 
 /// Spawn a resume process for a candidate and write its PID to the registry.
 ///
-/// Returns `Ok(true)` if the resume was successful and the child was added to `children`.
+/// Returns `true` if the resume was successful and the child was added to `children`.
 async fn try_resume_candidate(
     candidate: &ResumableMinion,
     children: &mut Vec<SpawnedChild>,
@@ -1424,8 +1424,9 @@ async fn spawn_background_cmd(
     // foreground process group) is not delivered to the child. This allows the lab
     // to shut down without killing running Minions.
     #[cfg(unix)]
+    // SAFETY: pre_exec closures run in the child after fork(). setsid() is
+    // async-signal-safe, so this is safe.
     unsafe {
-        // SAFETY: setsid() is async-signal-safe.
         cmd.pre_exec(|| {
             if libc::setsid() == -1 {
                 return Err(std::io::Error::last_os_error());
