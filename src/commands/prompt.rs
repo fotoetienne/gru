@@ -1,4 +1,4 @@
-use crate::agent::{AgentEvent, TokenUsage};
+use crate::agent::AgentEvent;
 use crate::agent_registry;
 use crate::agent_runner::{run_agent_with_stream_monitoring, EXIT_CODE_SIGNAL_TERMINATED};
 use crate::git;
@@ -700,23 +700,6 @@ fn build_progress_display(
     std::sync::Arc::new(ProgressDisplay::new(config))
 }
 
-/// Best-effort cleanup after agent run: clears PID, sets mode to Stopped,
-/// and persists token usage regardless of exit status.
-async fn cleanup_agent_run(minion_id: &str, token_usage: Option<TokenUsage>) {
-    // Best-effort: errors here must not shadow the primary run result.
-    let cleanup_id = minion_id.to_string();
-    let _ = with_registry(move |registry| {
-        registry.update(&cleanup_id, |info| {
-            info.clear_pid();
-            info.mode = MinionMode::Stopped;
-            if let Some(usage) = token_usage {
-                info.token_usage = Some(usage);
-            }
-        })
-    })
-    .await;
-}
-
 /// Interprets the agent exit status and prints appropriate result messages.
 fn handle_agent_result(
     status: std::process::ExitStatus,
@@ -799,8 +782,28 @@ async fn register_and_run_agent(
     )
     .await;
 
+    // Best-effort cleanup: clear PID, set mode to Stopped, save token usage, and
+    // mark orchestration phase as terminal. Prompt is ephemeral (does not support
+    // the full fix/resume lifecycle), so we always move to Completed/Failed to
+    // prevent the lab daemon from attempting to resume a finished prompt session.
+    let exit_ok = run_result.as_ref().is_ok_and(|r| r.status.success());
     let token_usage = run_result.as_ref().ok().map(|r| r.token_usage.clone());
-    cleanup_agent_run(&minion_id, token_usage).await;
+    let cleanup_id = minion_id.clone();
+    let _ = with_registry(move |registry| {
+        registry.update(&cleanup_id, |info| {
+            info.clear_pid();
+            info.mode = MinionMode::Stopped;
+            info.orchestration_phase = if exit_ok {
+                OrchestrationPhase::Completed
+            } else {
+                OrchestrationPhase::Failed
+            };
+            if let Some(usage) = token_usage {
+                info.token_usage = Some(usage);
+            }
+        })
+    })
+    .await;
 
     let agent_run = run_result?;
 
