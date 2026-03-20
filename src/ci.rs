@@ -697,7 +697,7 @@ pub async fn post_escalation_comment(
 
         if let Some(output) = &check.output {
             let truncated = safe_tail(output, 2000);
-            body.push_str(&format!("  ```\n  {}\n  ```\n", truncated));
+            body.push_str(&format!("```\n{}\n```\n", truncated));
         }
     }
 
