@@ -161,7 +161,6 @@ impl AgentBackend for ClaudeBackend {
                         is_error: tool_result.is_error,
                     })
                 }
-                StreamOutput::RawLine(_) => None,
             })
             .collect()
     }
