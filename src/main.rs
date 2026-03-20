@@ -66,6 +66,12 @@ enum Commands {
             help = "Repository to initialize: 'owner/repo' for GitHub, '.' for current directory, or a path. Defaults to current directory."
         )]
         repo: Option<String>,
+
+        #[arg(
+            long,
+            help = "GitHub Enterprise Server hostname (e.g., ghe.example.com)"
+        )]
+        host: Option<String>,
     },
     #[command(about = "Start an interactive project-aware chat session")]
     Chat {
@@ -394,7 +400,9 @@ async fn main() {
         .init();
 
     let result = match cli.command {
-        Commands::Init { repo } => init::handle_init(repo.unwrap_or_else(|| ".".to_string())).await,
+        Commands::Init { repo, host } => {
+            init::handle_init(repo.unwrap_or_else(|| ".".to_string()), host).await
+        }
         Commands::Chat { repo, verbose } => chat::handle_chat(repo, verbose).await,
         Commands::Do {
             issue,
