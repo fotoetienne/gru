@@ -1186,7 +1186,6 @@ async fn is_issue_claimed(repo: &str, issue_number: u64) -> Result<bool> {
     .await
 }
 
-/// Spawn a Minion to work on an issue using the `gru do` command.
 /// Build a log filename for a minion working on an issue.
 ///
 /// For `github.com` hosts the prefix is omitted; for other hosts (GHE) the
@@ -1212,6 +1211,8 @@ fn format_log_name(host: &str, repo: &str, issue_number: u64) -> String {
     format!("{}{}-issue-{}.log", safe_host, safe_repo, issue_number)
 }
 
+/// Spawn a Minion to work on an issue using the `gru do` command.
+///
 /// Returns the child process handle for lifecycle tracking.
 async fn spawn_minion(repo: &str, host: &str, issue_number: u64) -> Result<Child> {
     let issue_ref = crate::github::build_issue_url_with_host(repo, host, issue_number)
