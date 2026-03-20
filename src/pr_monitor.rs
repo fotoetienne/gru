@@ -174,6 +174,10 @@ pub(crate) struct ReviewBody {
 pub(crate) struct ReviewFeedback {
     pub comments: Vec<ReviewComment>,
     pub bodies: Vec<ReviewBody>,
+    /// True when one or more review comment fetches failed.  The caller
+    /// should avoid advancing the baseline timestamp so the reviews can
+    /// be retried on the next poll cycle.
+    pub had_fetch_failures: bool,
 }
 
 impl ReviewFeedback {
@@ -636,10 +640,13 @@ async fn poll_once(
     let pr_author = pr.user.login.as_str();
     let new_reviews = filter_new_external_reviews(&all_reviews, *last_check_time, pr_author);
     if !new_reviews.is_empty() {
-        let feedback = get_review_comments(host, owner, repo, pr_number, &new_reviews).await?;
-        // Advance past these reviews so they are not re-fetched if the caller
-        // passes the returned last_check_time back as the next baseline.
-        *last_check_time = Utc::now();
+        let feedback = get_review_feedback(host, owner, repo, pr_number, &new_reviews).await?;
+        // Only advance the baseline when we successfully fetched all reviews.
+        // If some fetches failed we leave last_check_time unchanged so the
+        // reviews are retried on the next poll cycle.
+        if !feedback.had_fetch_failures {
+            *last_check_time = Utc::now();
+        }
         // Only emit NewReviews if there is actual feedback to act on.
         // DISMISSED reviews or reviews with empty bodies and no inline
         // comments can produce an empty ReviewFeedback.
@@ -763,8 +770,9 @@ pub(crate) async fn get_all_reviews(
     Ok(reviews)
 }
 
-/// Fetch review comments and bodies for specific reviews with retry logic for transient failures
-async fn get_review_comments(
+/// Fetch review feedback (inline comments + review bodies) for specific reviews
+/// with retry logic for transient failures.
+async fn get_review_feedback(
     host: &str,
     owner: &str,
     repo: &str,
@@ -840,6 +848,7 @@ async fn get_review_comments(
     Ok(ReviewFeedback {
         comments: all_comments,
         bodies: all_bodies,
+        had_fetch_failures: failed_reviews > 0,
     })
 }
 
@@ -977,6 +986,7 @@ mod tests {
                 comment_id: 1001,
             }],
             bodies: vec![],
+            had_fetch_failures: false,
         };
 
         let prompt = format_review_prompt(123, "456", &feedback, "octocat", "hello-world", "M042");
@@ -1014,6 +1024,7 @@ mod tests {
                 },
             ],
             bodies: vec![],
+            had_fetch_failures: false,
         };
 
         let prompt = format_review_prompt(123, "456", &feedback, "octocat", "hello-world", "M042");
@@ -1041,6 +1052,7 @@ mod tests {
                 comment_id: 3001,
             }],
             bodies: vec![],
+            had_fetch_failures: false,
         };
 
         let prompt = format_review_prompt(123, "456", &feedback, "octocat", "hello-world", "M042");
@@ -1059,6 +1071,7 @@ mod tests {
                 reviewer: "dave".to_string(),
                 state: "COMMENTED".to_string(),
             }],
+            had_fetch_failures: false,
         };
 
         let prompt = format_review_prompt(42, "99", &feedback, "octocat", "hello-world", "M001");
@@ -1088,6 +1101,7 @@ mod tests {
                 reviewer: "eve".to_string(),
                 state: "CHANGES_REQUESTED".to_string(),
             }],
+            had_fetch_failures: false,
         };
 
         let prompt = format_review_prompt(10, "20", &feedback, "octocat", "hello-world", "M002");
