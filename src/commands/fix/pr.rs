@@ -235,6 +235,40 @@ async fn finalize_pr(
     Ok(())
 }
 
+/// Attempts to recover an existing PR for the given branch.
+///
+/// Looks up the PR via `gh pr list --head <branch>`, finalizes state if found,
+/// and returns the PR number. Used by error-recovery paths in `handle_pr_creation`.
+async fn recover_existing_pr(
+    issue_ctx: &IssueContext,
+    wt_ctx: &WorktreeContext,
+) -> Result<Option<String>> {
+    match crate::ci::get_pr_number(
+        &issue_ctx.host,
+        &issue_ctx.owner,
+        &issue_ctx.repo,
+        &wt_ctx.branch_name,
+        None,
+    )
+    .await
+    {
+        Ok(Some(pr_num)) => {
+            let pr_number = pr_num.to_string();
+
+            if let Err(e) = finalize_pr(issue_ctx, wt_ctx, &pr_number).await {
+                log::warn!("⚠️  Failed to finalize recovered PR state: {}", e);
+            }
+
+            Ok(Some(pr_number))
+        }
+        Ok(None) => Ok(None),
+        Err(lookup_err) => {
+            log::warn!("⚠️  Failed to look up existing PR: {}", lookup_err);
+            Ok(None)
+        }
+    }
+}
+
 /// Creates a PR for the branch and updates labels/registry.
 /// Returns the PR number if successful.
 pub(crate) async fn handle_pr_creation(
@@ -317,39 +351,17 @@ pub(crate) async fn handle_pr_creation(
                     "ℹ️  A PR already exists for branch '{}', recovering PR number...",
                     wt_ctx.branch_name
                 );
-                // Recover the existing PR number via `gh pr list --head <branch>`
-                match crate::ci::get_pr_number(
-                    &issue_ctx.host,
-                    &issue_ctx.owner,
-                    &issue_ctx.repo,
-                    &wt_ctx.branch_name,
-                    None,
-                )
-                .await
-                {
-                    Ok(Some(pr_num)) => {
-                        let pr_number = pr_num.to_string();
+                match recover_existing_pr(issue_ctx, wt_ctx).await? {
+                    Some(pr_number) => {
                         println!("✅ Recovered existing PR #{}", pr_number);
-
-                        // Best-effort: log warnings instead of propagating errors,
-                        // since losing the recovered PR number would be worse than
-                        // missing metadata (which can be recovered on next resume).
-                        if let Err(e) = finalize_pr(issue_ctx, wt_ctx, &pr_number).await {
-                            log::warn!("⚠️  Failed to finalize recovered PR state: {}", e);
-                        }
-
                         Ok(Some(pr_number))
                     }
-                    Ok(None) => {
+                    None => {
                         log::warn!(
                             "⚠️  PR exists for branch '{}' but `gh pr list --head` returned no results. \
                              This may be a transient GitHub API issue or auth problem; retry with 'gru resume'.",
                             wt_ctx.branch_name
                         );
-                        Ok(None)
-                    }
-                    Err(lookup_err) => {
-                        log::warn!("⚠️  Failed to look up existing PR: {}", lookup_err);
                         Ok(None)
                     }
                 }
@@ -370,48 +382,24 @@ pub(crate) async fn handle_pr_creation(
                 // Fallback: a PR may already exist from a previous attempt or
                 // manual creation.  Try to recover it the same way the
                 // "already exists" path does.
-                match crate::ci::get_pr_number(
-                    &issue_ctx.host,
-                    &issue_ctx.owner,
-                    &issue_ctx.repo,
-                    &wt_ctx.branch_name,
-                    None,
-                )
-                .await
-                {
-                    Ok(Some(pr_num)) => {
-                        let pr_number = pr_num.to_string();
+                let manual_link = format!(
+                    "https://{}/{}/{}/compare/{}",
+                    issue_ctx.host, issue_ctx.owner, issue_ctx.repo, wt_ctx.branch_name
+                );
+                match recover_existing_pr(issue_ctx, wt_ctx).await? {
+                    Some(pr_number) => {
                         println!(
                             "✅ Recovered existing PR #{} after creation failure",
                             pr_number
                         );
-
-                        if let Err(e) = finalize_pr(issue_ctx, wt_ctx, &pr_number).await {
-                            log::warn!("⚠️  Failed to finalize recovered PR state: {}", e);
-                        }
-
                         Ok(Some(pr_number))
                     }
-                    Ok(None) => {
+                    None => {
                         log::warn!(
                             "   No existing PR found for branch '{}'. \
-                             You can create the PR manually at: https://{}/{}/{}/compare/{}",
+                             You can create the PR manually at: {}",
                             wt_ctx.branch_name,
-                            issue_ctx.host,
-                            issue_ctx.owner,
-                            issue_ctx.repo,
-                            wt_ctx.branch_name
-                        );
-                        Ok(None)
-                    }
-                    Err(lookup_err) => {
-                        log::warn!("⚠️  Failed to look up existing PR: {}", lookup_err);
-                        log::warn!(
-                            "   You can create the PR manually at: https://{}/{}/{}/compare/{}",
-                            issue_ctx.host,
-                            issue_ctx.owner,
-                            issue_ctx.repo,
-                            wt_ctx.branch_name
+                            manual_link
                         );
                         Ok(None)
                     }
