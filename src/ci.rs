@@ -675,9 +675,8 @@ pub async fn post_escalation_comment(
     attempts: u32,
     minion_id: &str,
 ) -> Result<()> {
-    let mut body = format!(
-        "## 🚨 CI Fix Escalation\n\n\
-         Automated CI fix failed after **{}/{}** attempts. Human intervention required.\n\n\
+    let mut detail = format!(
+        "Automated CI fix failed after **{}/{}** attempts. Human intervention required.\n\n\
          ### Failed Checks\n\n",
         attempts, MAX_CI_FIX_ATTEMPTS
     );
@@ -690,20 +689,25 @@ pub async fn post_escalation_comment(
             .map(|c| c.to_string())
             .unwrap_or_else(|| "unknown".to_string());
 
-        body.push_str(&format!(
+        detail.push_str(&format!(
             "- **{}** — {} ({})\n",
             check.name, failure_type, conclusion
         ));
 
         if let Some(output) = &check.output {
             let truncated = safe_tail(output, 2000);
-            body.push_str(&format!("```\n{}\n```\n", truncated));
+            detail.push_str(&format!("```\n{}\n```\n", truncated));
         }
     }
 
-    body.push_str(&format!("\n**Labels:** `{}`\n", labels::BLOCKED));
+    detail.push_str(&format!("\n**Labels:** `{}`\n", labels::BLOCKED));
 
-    post_escalation_comment_body(host, owner, repo, pr_number, &body, minion_id).await
+    let body = crate::progress_comments::format_escalation_comment(
+        "CI Fix Escalation",
+        &detail,
+        minion_id,
+    );
+    post_escalation_comment_body(host, owner, repo, pr_number, &body).await
 }
 
 /// Post an escalation comment when CI exhaustion occurs due to timeout or no-commits.
@@ -716,9 +720,8 @@ pub async fn post_exhaustion_escalation_comment(
     attempts: u32,
     minion_id: &str,
 ) -> Result<()> {
-    let body = format!(
-        "## 🚨 CI Fix Escalation\n\n\
-         Automated CI fix failed after **{}/{}** attempts. Human intervention required.\n\n\
+    let detail = format!(
+        "Automated CI fix failed after **{}/{}** attempts. Human intervention required.\n\n\
          ### Reason\n\n\
          {}\n\n\
          **Labels:** `{}`\n",
@@ -728,7 +731,12 @@ pub async fn post_exhaustion_escalation_comment(
         labels::BLOCKED
     );
 
-    post_escalation_comment_body(host, owner, repo, pr_number, &body, minion_id).await
+    let body = crate::progress_comments::format_escalation_comment(
+        "CI Fix Escalation",
+        &detail,
+        minion_id,
+    );
+    post_escalation_comment_body(host, owner, repo, pr_number, &body).await
 }
 
 /// Posts an escalation comment body to a PR and adds the blocked label.
@@ -738,26 +746,14 @@ async fn post_escalation_comment_body(
     repo: &str,
     pr_number: u64,
     body: &str,
-    minion_id: &str,
 ) -> Result<()> {
     let repo_full = github::repo_slug(owner, repo);
-    let body_with_sig = format!(
-        "{}{}",
-        body,
-        crate::progress_comments::minion_signature(minion_id)
-    );
 
     let pr_str = pr_number.to_string();
     github::run_gh(
         host,
         &[
-            "pr",
-            "comment",
-            &pr_str,
-            "--repo",
-            &repo_full,
-            "--body",
-            &body_with_sig,
+            "pr", "comment", &pr_str, "--repo", &repo_full, "--body", body,
         ],
     )
     .await?;

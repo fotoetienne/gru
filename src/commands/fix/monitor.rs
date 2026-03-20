@@ -216,10 +216,10 @@ async fn post_escalation_comment(
     minion_id: &str,
 ) {
     let repo_full = github::repo_slug(owner, repo);
-    let body = format!(
-        "🤖 **Minion Escalation**\n\n{}{}",
+    let body = crate::progress_comments::format_escalation_comment(
+        "Minion Escalation",
         message,
-        crate::progress_comments::minion_signature(minion_id)
+        minion_id,
     );
 
     let result = crate::github::gh_cli_command(host)
