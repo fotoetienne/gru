@@ -943,7 +943,8 @@ pub async fn monitor_and_fix_ci(
                     }
                     Err(e) => {
                         eprintln!("⚠️  Claude CI fix failed: {}", e);
-                        // On timeout or other errors, check if we should escalate
+                        // On timeout or other errors, retry or escalate.
+                        // RetryNextAttempt re-polls CI from the same commit (no fix pushed).
                         match decide_after_no_commits(attempt, MAX_CI_FIX_ATTEMPTS) {
                             CiFixAction::RetryNextAttempt => continue,
                             CiFixAction::Escalate(_) => {
