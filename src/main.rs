@@ -8,6 +8,7 @@ mod codex_backend;
 mod commands;
 mod config;
 mod dependencies;
+mod display_utils;
 mod file_lock;
 mod git;
 mod github;

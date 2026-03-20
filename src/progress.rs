@@ -1,4 +1,5 @@
 use crate::agent::AgentEvent;
+use crate::display_utils::truncate_string;
 use crate::text_buffer::TextBuffer;
 use chrono::{DateTime, Local};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
@@ -141,7 +142,7 @@ impl ProgressDisplay {
             AgentEvent::Started { .. } => {
                 // Flush any buffered text from a previous turn
                 if let Some(flushed_text) = self.text_buffer.flush() {
-                    let truncated = Self::truncate_string(&flushed_text, MAX_DISPLAY_CHARS);
+                    let truncated = truncate_string(&flushed_text, MAX_DISPLAY_CHARS);
                     self.print_event(&truncated);
                 }
                 self.update_status("💭 Thinking...");
@@ -157,7 +158,7 @@ impl ProgressDisplay {
             } => {
                 // Flush any buffered text before showing tool
                 if let Some(flushed_text) = self.text_buffer.flush() {
-                    let truncated = Self::truncate_string(&flushed_text, MAX_DISPLAY_CHARS);
+                    let truncated = truncate_string(&flushed_text, MAX_DISPLAY_CHARS);
                     self.print_event(&truncated);
                 }
 
@@ -194,7 +195,7 @@ impl ProgressDisplay {
 
                 let formatted = if *is_error {
                     let first_line = content.lines().next().unwrap_or(content);
-                    let truncated = Self::truncate_string(first_line, 60);
+                    let truncated = truncate_string(first_line, 60);
                     if let Some(name) = tool_name {
                         format!("[{}] ✗ {} failed: {}", timestamp, name, truncated)
                     } else {
@@ -215,14 +216,14 @@ impl ProgressDisplay {
                 self.update_status("📝 Responding...");
                 // Add text to buffer; flush if ready
                 if let Some(flushed_text) = self.text_buffer.add(text) {
-                    let truncated = Self::truncate_string(&flushed_text, MAX_DISPLAY_CHARS);
+                    let truncated = truncate_string(&flushed_text, MAX_DISPLAY_CHARS);
                     self.print_event(&truncated);
                 }
             }
             AgentEvent::MessageComplete { stop_reason, .. } => {
                 // Flush any remaining buffered text
                 if let Some(flushed_text) = self.text_buffer.flush() {
-                    let truncated = Self::truncate_string(&flushed_text, MAX_DISPLAY_CHARS);
+                    let truncated = truncate_string(&flushed_text, MAX_DISPLAY_CHARS);
                     self.print_event(&truncated);
                 }
 
@@ -246,7 +247,7 @@ impl ProgressDisplay {
             AgentEvent::Finished { .. } => {
                 // Flush any remaining buffered text
                 if let Some(flushed_text) = self.text_buffer.flush() {
-                    let truncated = Self::truncate_string(&flushed_text, MAX_DISPLAY_CHARS);
+                    let truncated = truncate_string(&flushed_text, MAX_DISPLAY_CHARS);
                     self.print_event(&truncated);
                 }
                 self.update_status("✅ Finished");
@@ -254,7 +255,7 @@ impl ProgressDisplay {
             AgentEvent::Error { message } => {
                 // Flush any buffered text before showing error
                 if let Some(flushed_text) = self.text_buffer.flush() {
-                    let truncated = Self::truncate_string(&flushed_text, MAX_DISPLAY_CHARS);
+                    let truncated = truncate_string(&flushed_text, MAX_DISPLAY_CHARS);
                     self.print_event(&truncated);
                 }
 
@@ -274,19 +275,6 @@ impl ProgressDisplay {
 
         // Tick the spinner to show activity
         self.status_bar.tick();
-    }
-
-    /// Truncate a string to a maximum number of characters (not bytes)
-    fn truncate_string(s: &str, max_chars: usize) -> String {
-        // Collect up to max_chars + 1 characters to determine if truncation is needed
-        let chars: Vec<char> = s.chars().take(max_chars + 1).collect();
-        if chars.len() > max_chars {
-            // String is too long, truncate it
-            format!("{}...", chars[..max_chars].iter().collect::<String>())
-        } else {
-            // String is max_chars or shorter, return as-is
-            s.to_string()
-        }
     }
 
     /// Finish the progress display and show a final message
