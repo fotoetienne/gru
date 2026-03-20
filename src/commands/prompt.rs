@@ -1,4 +1,4 @@
-use crate::agent::AgentEvent;
+use crate::agent::{AgentEvent, TokenUsage};
 use crate::agent_registry;
 use crate::agent_runner::{run_agent_with_stream_monitoring, EXIT_CODE_SIGNAL_TERMINATED};
 use crate::git;
@@ -702,7 +702,8 @@ fn build_progress_display(
 
 /// Best-effort cleanup after agent run: clears PID, sets mode to Stopped,
 /// and persists token usage regardless of exit status.
-async fn cleanup_agent_run(minion_id: &str, token_usage: Option<crate::agent::TokenUsage>) {
+async fn cleanup_agent_run(minion_id: &str, token_usage: Option<TokenUsage>) {
+    // Best-effort: errors here must not shadow the primary run result.
     let cleanup_id = minion_id.to_string();
     let _ = with_registry(move |registry| {
         registry.update(&cleanup_id, |info| {
@@ -762,6 +763,8 @@ async fn register_and_run_agent(
 
     let progress = build_progress_display(cfg, fetched);
 
+    // Ad-hoc prompt without --issue or --pr: resolve from worktree git remote
+    // so GHE repos are handled correctly.
     let github_host_owned;
     let github_host = if let Some(h) = fetched.host.as_deref().or(fetched.pr_host.as_deref()) {
         h
@@ -777,6 +780,7 @@ async fn register_and_run_agent(
     );
     cmd.env("GRU_WORKSPACE", cfg.minion_id);
 
+    // Record child PID on spawn; mode is already set to Autonomous at registration.
     let minion_id = cfg.minion_id.to_string();
     let on_spawn = MinionRegistry::pid_callback(minion_id.clone(), None);
 
