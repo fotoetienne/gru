@@ -608,6 +608,7 @@ async fn poll_once(
     // If any checks are still queued or in progress, skip and re-check next cycle.
     let check_runs = get_check_runs(host, owner, repo, &pr.head.sha).await?;
     if let Some(failed_checks) = count_completed_failures(&check_runs) {
+        *last_check_time = Utc::now();
         return Ok(Some(MonitorResult::FailedChecks(failed_checks)));
     }
 
