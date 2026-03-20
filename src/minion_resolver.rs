@@ -415,17 +415,12 @@ mod tests {
     use super::*;
 
     /// Helper to create a MinionInfo for testing
-    fn test_minion(id: &str, issue: Option<u64>, _repo: &str) -> MinionInfo {
-        test_minion_with_status(id, issue, _repo, "Stopped")
+    fn test_minion(id: &str, issue: Option<u64>) -> MinionInfo {
+        test_minion_with_status(id, issue, "Stopped")
     }
 
     /// Helper to create a MinionInfo with a specific status
-    fn test_minion_with_status(
-        id: &str,
-        issue: Option<u64>,
-        _repo: &str,
-        status: &str,
-    ) -> MinionInfo {
+    fn test_minion_with_status(id: &str, issue: Option<u64>, status: &str) -> MinionInfo {
         MinionInfo {
             minion_id: id.to_string(),
             issue_number: issue,
@@ -451,10 +446,7 @@ mod tests {
 
     #[test]
     fn test_try_resolve_by_exact_minion_id() {
-        let minions = vec![
-            test_minion("M001", Some(42), "owner/repo"),
-            test_minion("M002", Some(99), "owner/repo"),
-        ];
+        let minions = vec![test_minion("M001", Some(42)), test_minion("M002", Some(99))];
         let result = try_resolve_from_list("M001", &minions);
         assert!(result.is_some());
         assert_eq!(result.unwrap().minion_id, "M001");
@@ -462,7 +454,7 @@ mod tests {
 
     #[test]
     fn test_try_resolve_with_m_prefix() {
-        let minions = vec![test_minion("M42", Some(10), "owner/repo")];
+        let minions = vec![test_minion("M42", Some(10))];
         let result = try_resolve_from_list("42", &minions);
         assert!(result.is_some());
         assert_eq!(result.unwrap().minion_id, "M42");
@@ -470,10 +462,7 @@ mod tests {
 
     #[test]
     fn test_try_resolve_by_issue_number() {
-        let minions = vec![
-            test_minion("M001", Some(42), "owner/repo"),
-            test_minion("M002", Some(99), "owner/repo"),
-        ];
+        let minions = vec![test_minion("M001", Some(42)), test_minion("M002", Some(99))];
         let result = try_resolve_from_list("99", &minions);
         assert!(result.is_some());
         assert_eq!(result.unwrap().minion_id, "M002");
@@ -481,7 +470,7 @@ mod tests {
 
     #[test]
     fn test_try_resolve_not_found() {
-        let minions = vec![test_minion("M001", Some(42), "owner/repo")];
+        let minions = vec![test_minion("M001", Some(42))];
         let result = try_resolve_from_list("M999", &minions);
         assert!(result.is_none());
     }
@@ -553,10 +542,7 @@ mod tests {
 
     #[test]
     fn test_find_by_minion_id_found() {
-        let minions = vec![
-            test_minion("M001", Some(42), "owner/repo"),
-            test_minion("M002", Some(99), "owner/repo"),
-        ];
+        let minions = vec![test_minion("M001", Some(42)), test_minion("M002", Some(99))];
         let result = find_by_minion_id_from_list("M002", &minions);
         assert!(result.is_some());
         assert_eq!(result.unwrap().minion_id, "M002");
@@ -564,7 +550,7 @@ mod tests {
 
     #[test]
     fn test_find_by_minion_id_not_found() {
-        let minions = vec![test_minion("M001", Some(42), "owner/repo")];
+        let minions = vec![test_minion("M001", Some(42))];
         assert!(find_by_minion_id_from_list("M999", &minions).is_none());
     }
 
@@ -577,10 +563,7 @@ mod tests {
 
     #[test]
     fn test_find_by_issue_number_found() {
-        let minions = vec![
-            test_minion("M001", Some(42), "owner/repo"),
-            test_minion("M002", Some(99), "owner/repo"),
-        ];
+        let minions = vec![test_minion("M001", Some(42)), test_minion("M002", Some(99))];
         let result = find_by_issue_number_from_list(99, &minions);
         assert!(result.is_some());
         assert_eq!(result.unwrap().minion_id, "M002");
@@ -588,13 +571,13 @@ mod tests {
 
     #[test]
     fn test_find_by_issue_number_not_found() {
-        let minions = vec![test_minion("M001", Some(42), "owner/repo")];
+        let minions = vec![test_minion("M001", Some(42))];
         assert!(find_by_issue_number_from_list(999, &minions).is_none());
     }
 
     #[test]
     fn test_find_by_issue_number_none_issue() {
-        let minions = vec![test_minion("M001", None, "owner/repo")];
+        let minions = vec![test_minion("M001", None)];
         assert!(find_by_issue_number_from_list(42, &minions).is_none());
     }
 
@@ -619,8 +602,8 @@ mod tests {
     #[test]
     fn test_find_by_issue_prefers_active_over_stopped() {
         let minions = vec![
-            test_minion_with_status("M0j7", Some(353), "owner/repo", "Stopped"),
-            test_minion_with_status("M0j8", Some(353), "owner/repo", "Active"),
+            test_minion_with_status("M0j7", Some(353), "Stopped"),
+            test_minion_with_status("M0j8", Some(353), "Active"),
         ];
         let result = find_by_issue_number_from_list(353, &minions);
         assert!(result.is_some());
@@ -631,8 +614,8 @@ mod tests {
     fn test_find_by_issue_prefers_active_regardless_of_order() {
         // Active minion listed first, stopped second
         let minions = vec![
-            test_minion_with_status("M0j8", Some(353), "owner/repo", "Active"),
-            test_minion_with_status("M0j7", Some(353), "owner/repo", "Stopped"),
+            test_minion_with_status("M0j8", Some(353), "Active"),
+            test_minion_with_status("M0j7", Some(353), "Stopped"),
         ];
         let result = find_by_issue_number_from_list(353, &minions);
         assert!(result.is_some());
@@ -643,8 +626,8 @@ mod tests {
     fn test_find_by_issue_tiebreaks_by_most_recent_id() {
         // Both stopped — should pick M0j8 (higher/more recent ID)
         let minions = vec![
-            test_minion_with_status("M0j7", Some(353), "owner/repo", "Stopped"),
-            test_minion_with_status("M0j8", Some(353), "owner/repo", "Stopped"),
+            test_minion_with_status("M0j7", Some(353), "Stopped"),
+            test_minion_with_status("M0j8", Some(353), "Stopped"),
         ];
         let result = find_by_issue_number_from_list(353, &minions);
         assert!(result.is_some());
@@ -655,8 +638,8 @@ mod tests {
     fn test_find_by_issue_tiebreaks_active_by_most_recent_id() {
         // Both active — should pick higher ID
         let minions = vec![
-            test_minion_with_status("M0j7", Some(353), "owner/repo", "Active"),
-            test_minion_with_status("M0j8", Some(353), "owner/repo", "Active"),
+            test_minion_with_status("M0j7", Some(353), "Active"),
+            test_minion_with_status("M0j8", Some(353), "Active"),
         ];
         let result = find_by_issue_number_from_list(353, &minions);
         assert!(result.is_some());
@@ -667,8 +650,8 @@ mod tests {
     fn test_find_by_issue_prefers_active_over_idle() {
         // Filesystem scan produces "Idle" instead of "Stopped"
         let minions = vec![
-            test_minion_with_status("M0j7", Some(353), "owner/repo", "Idle"),
-            test_minion_with_status("M0j8", Some(353), "owner/repo", "Active"),
+            test_minion_with_status("M0j7", Some(353), "Idle"),
+            test_minion_with_status("M0j8", Some(353), "Active"),
         ];
         let result = find_by_issue_number_from_list(353, &minions);
         assert!(result.is_some());
@@ -680,8 +663,8 @@ mod tests {
         // M0zz (counter 1295) vs M100 (counter 1296) — different base36 widths
         // Lexicographic would incorrectly pick M0zz; numeric comparison picks M100
         let minions = vec![
-            test_minion_with_status("M0zz", Some(42), "owner/repo", "Stopped"),
-            test_minion_with_status("M100", Some(42), "owner/repo", "Stopped"),
+            test_minion_with_status("M0zz", Some(42), "Stopped"),
+            test_minion_with_status("M100", Some(42), "Stopped"),
         ];
         let result = find_by_issue_number_from_list(42, &minions);
         assert!(result.is_some());
@@ -704,10 +687,7 @@ mod tests {
 
     #[test]
     fn test_find_by_issue_single_match_still_works() {
-        let minions = vec![
-            test_minion("M001", Some(42), "owner/repo"),
-            test_minion("M002", Some(99), "owner/repo"),
-        ];
+        let minions = vec![test_minion("M001", Some(42)), test_minion("M002", Some(99))];
         let result = find_by_issue_number_from_list(42, &minions);
         assert!(result.is_some());
         assert_eq!(result.unwrap().minion_id, "M001");

@@ -212,7 +212,7 @@ pub async fn get_issue_via_cli(
             "--repo",
             &repo_full,
             "--json",
-            "number,title,body,labels",
+            "title,body,labels",
         ],
     )
     .await?;
