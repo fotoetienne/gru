@@ -18,21 +18,12 @@ static ISSUE_LINK_REGEX: Lazy<Regex> = Lazy::new(|| {
 pub(crate) struct MinionInfo {
     pub minion_id: String,
     pub issue_number: Option<u64>,
-    #[allow(dead_code)]
-    // Populated by resolver; callers currently only use minion_id/worktree_path
-    pub repo_name: String,
-    #[allow(dead_code)]
-    // Populated by resolver; callers currently only use minion_id/worktree_path
-    pub branch: String,
     /// The top-level minion directory (metadata lives here).
     /// Use `checkout_path()` to get the git worktree location.
     pub worktree_path: PathBuf,
     /// Used by find_by_issue_number_from_list to rank candidates.
     /// Values: "Active", "Stopped" (from registry), "Idle" (from filesystem scan).
     pub status: String,
-    #[allow(dead_code)]
-    // Populated by resolver; callers currently only use minion_id/worktree_path
-    pub uptime: String,
 }
 
 impl MinionInfo {
@@ -150,14 +141,6 @@ fn load_from_registry() -> Vec<MinionInfo> {
                 None
             };
 
-            let uptime = {
-                let now = chrono::Utc::now();
-                let duration = now.signed_duration_since(info.started_at);
-                // Guard against clock skew (started_at in the future)
-                let secs = duration.num_seconds().max(0) as u64;
-                format_uptime(secs)
-            };
-
             let status = if info.is_running() {
                 "Active".to_string()
             } else {
@@ -167,11 +150,8 @@ fn load_from_registry() -> Vec<MinionInfo> {
             MinionInfo {
                 minion_id,
                 issue_number,
-                repo_name: info.repo,
-                branch: info.branch,
                 worktree_path: info.worktree,
                 status,
-                uptime,
             }
         })
         .collect()
@@ -305,22 +285,11 @@ pub(crate) fn scan_all_minions() -> Result<Vec<MinionInfo>> {
                 // Determine status (Active or Idle) based on git index modification time
                 let status = determine_status(&checkout_path)?;
 
-                // Calculate uptime from worktree creation time
-                let uptime = calculate_uptime(&minion_path)?;
-
-                // Build repo name from path components
-                let owner = owner_entry.file_name().to_string_lossy().to_string();
-                let repo = repo_entry.file_name().to_string_lossy().to_string();
-                let repo_name = github::repo_slug(&owner, &repo);
-
                 minions.push(MinionInfo {
                     minion_id,
                     issue_number,
-                    repo_name,
-                    branch,
                     worktree_path: minion_path,
                     status,
-                    uptime,
                 });
             }
         }
@@ -382,33 +351,6 @@ fn determine_status(worktree_path: &std::path::Path) -> Result<String> {
     } else {
         Ok("Idle".to_string())
     }
-}
-
-/// Formats a duration (in seconds) as a human-readable uptime string.
-/// Returns "Xd", "Xh", "Xm", or "< 1m".
-fn format_uptime(total_secs: u64) -> String {
-    let minutes = total_secs / 60;
-    let hours = minutes / 60;
-    let days = hours / 24;
-
-    if days > 0 {
-        format!("{}d", days)
-    } else if hours > 0 {
-        format!("{}h", hours)
-    } else if minutes > 0 {
-        format!("{}m", minutes)
-    } else {
-        "< 1m".to_string()
-    }
-}
-
-/// Calculates the uptime of a worktree based on its creation time
-fn calculate_uptime(worktree_path: &std::path::Path) -> Result<String> {
-    let metadata = std::fs::metadata(worktree_path)?;
-    let created = metadata.created().or_else(|_| metadata.modified())?;
-    let now = std::time::SystemTime::now();
-    let elapsed = now.duration_since(created).unwrap_or_default();
-    Ok(format_uptime(elapsed.as_secs()))
 }
 
 /// Extracts the linked issue number from a GitHub PR
@@ -473,25 +415,17 @@ mod tests {
     use super::*;
 
     /// Helper to create a MinionInfo for testing
-    fn test_minion(id: &str, issue: Option<u64>, repo: &str) -> MinionInfo {
-        test_minion_with_status(id, issue, repo, "Stopped")
+    fn test_minion(id: &str, issue: Option<u64>) -> MinionInfo {
+        test_minion_with_status(id, issue, "Stopped")
     }
 
     /// Helper to create a MinionInfo with a specific status
-    fn test_minion_with_status(
-        id: &str,
-        issue: Option<u64>,
-        repo: &str,
-        status: &str,
-    ) -> MinionInfo {
+    fn test_minion_with_status(id: &str, issue: Option<u64>, status: &str) -> MinionInfo {
         MinionInfo {
             minion_id: id.to_string(),
             issue_number: issue,
-            repo_name: repo.to_string(),
-            branch: format!("minion/issue-{}-{}", issue.unwrap_or(0), id),
             worktree_path: PathBuf::from(format!("/tmp/test/{}", id)),
             status: status.to_string(),
-            uptime: "1m".to_string(),
         }
     }
 
@@ -512,10 +446,7 @@ mod tests {
 
     #[test]
     fn test_try_resolve_by_exact_minion_id() {
-        let minions = vec![
-            test_minion("M001", Some(42), "owner/repo"),
-            test_minion("M002", Some(99), "owner/repo"),
-        ];
+        let minions = vec![test_minion("M001", Some(42)), test_minion("M002", Some(99))];
         let result = try_resolve_from_list("M001", &minions);
         assert!(result.is_some());
         assert_eq!(result.unwrap().minion_id, "M001");
@@ -523,7 +454,7 @@ mod tests {
 
     #[test]
     fn test_try_resolve_with_m_prefix() {
-        let minions = vec![test_minion("M42", Some(10), "owner/repo")];
+        let minions = vec![test_minion("M42", Some(10))];
         let result = try_resolve_from_list("42", &minions);
         assert!(result.is_some());
         assert_eq!(result.unwrap().minion_id, "M42");
@@ -531,10 +462,7 @@ mod tests {
 
     #[test]
     fn test_try_resolve_by_issue_number() {
-        let minions = vec![
-            test_minion("M001", Some(42), "owner/repo"),
-            test_minion("M002", Some(99), "owner/repo"),
-        ];
+        let minions = vec![test_minion("M001", Some(42)), test_minion("M002", Some(99))];
         let result = try_resolve_from_list("99", &minions);
         assert!(result.is_some());
         assert_eq!(result.unwrap().minion_id, "M002");
@@ -542,7 +470,7 @@ mod tests {
 
     #[test]
     fn test_try_resolve_not_found() {
-        let minions = vec![test_minion("M001", Some(42), "owner/repo")];
+        let minions = vec![test_minion("M001", Some(42))];
         let result = try_resolve_from_list("M999", &minions);
         assert!(result.is_none());
     }
@@ -614,10 +542,7 @@ mod tests {
 
     #[test]
     fn test_find_by_minion_id_found() {
-        let minions = vec![
-            test_minion("M001", Some(42), "owner/repo"),
-            test_minion("M002", Some(99), "owner/repo"),
-        ];
+        let minions = vec![test_minion("M001", Some(42)), test_minion("M002", Some(99))];
         let result = find_by_minion_id_from_list("M002", &minions);
         assert!(result.is_some());
         assert_eq!(result.unwrap().minion_id, "M002");
@@ -625,7 +550,7 @@ mod tests {
 
     #[test]
     fn test_find_by_minion_id_not_found() {
-        let minions = vec![test_minion("M001", Some(42), "owner/repo")];
+        let minions = vec![test_minion("M001", Some(42))];
         assert!(find_by_minion_id_from_list("M999", &minions).is_none());
     }
 
@@ -638,10 +563,7 @@ mod tests {
 
     #[test]
     fn test_find_by_issue_number_found() {
-        let minions = vec![
-            test_minion("M001", Some(42), "owner/repo"),
-            test_minion("M002", Some(99), "owner/repo"),
-        ];
+        let minions = vec![test_minion("M001", Some(42)), test_minion("M002", Some(99))];
         let result = find_by_issue_number_from_list(99, &minions);
         assert!(result.is_some());
         assert_eq!(result.unwrap().minion_id, "M002");
@@ -649,13 +571,13 @@ mod tests {
 
     #[test]
     fn test_find_by_issue_number_not_found() {
-        let minions = vec![test_minion("M001", Some(42), "owner/repo")];
+        let minions = vec![test_minion("M001", Some(42))];
         assert!(find_by_issue_number_from_list(999, &minions).is_none());
     }
 
     #[test]
     fn test_find_by_issue_number_none_issue() {
-        let minions = vec![test_minion("M001", None, "owner/repo")];
+        let minions = vec![test_minion("M001", None)];
         assert!(find_by_issue_number_from_list(42, &minions).is_none());
     }
 
@@ -680,8 +602,8 @@ mod tests {
     #[test]
     fn test_find_by_issue_prefers_active_over_stopped() {
         let minions = vec![
-            test_minion_with_status("M0j7", Some(353), "owner/repo", "Stopped"),
-            test_minion_with_status("M0j8", Some(353), "owner/repo", "Active"),
+            test_minion_with_status("M0j7", Some(353), "Stopped"),
+            test_minion_with_status("M0j8", Some(353), "Active"),
         ];
         let result = find_by_issue_number_from_list(353, &minions);
         assert!(result.is_some());
@@ -692,8 +614,8 @@ mod tests {
     fn test_find_by_issue_prefers_active_regardless_of_order() {
         // Active minion listed first, stopped second
         let minions = vec![
-            test_minion_with_status("M0j8", Some(353), "owner/repo", "Active"),
-            test_minion_with_status("M0j7", Some(353), "owner/repo", "Stopped"),
+            test_minion_with_status("M0j8", Some(353), "Active"),
+            test_minion_with_status("M0j7", Some(353), "Stopped"),
         ];
         let result = find_by_issue_number_from_list(353, &minions);
         assert!(result.is_some());
@@ -704,8 +626,8 @@ mod tests {
     fn test_find_by_issue_tiebreaks_by_most_recent_id() {
         // Both stopped — should pick M0j8 (higher/more recent ID)
         let minions = vec![
-            test_minion_with_status("M0j7", Some(353), "owner/repo", "Stopped"),
-            test_minion_with_status("M0j8", Some(353), "owner/repo", "Stopped"),
+            test_minion_with_status("M0j7", Some(353), "Stopped"),
+            test_minion_with_status("M0j8", Some(353), "Stopped"),
         ];
         let result = find_by_issue_number_from_list(353, &minions);
         assert!(result.is_some());
@@ -716,8 +638,8 @@ mod tests {
     fn test_find_by_issue_tiebreaks_active_by_most_recent_id() {
         // Both active — should pick higher ID
         let minions = vec![
-            test_minion_with_status("M0j7", Some(353), "owner/repo", "Active"),
-            test_minion_with_status("M0j8", Some(353), "owner/repo", "Active"),
+            test_minion_with_status("M0j7", Some(353), "Active"),
+            test_minion_with_status("M0j8", Some(353), "Active"),
         ];
         let result = find_by_issue_number_from_list(353, &minions);
         assert!(result.is_some());
@@ -728,8 +650,8 @@ mod tests {
     fn test_find_by_issue_prefers_active_over_idle() {
         // Filesystem scan produces "Idle" instead of "Stopped"
         let minions = vec![
-            test_minion_with_status("M0j7", Some(353), "owner/repo", "Idle"),
-            test_minion_with_status("M0j8", Some(353), "owner/repo", "Active"),
+            test_minion_with_status("M0j7", Some(353), "Idle"),
+            test_minion_with_status("M0j8", Some(353), "Active"),
         ];
         let result = find_by_issue_number_from_list(353, &minions);
         assert!(result.is_some());
@@ -741,8 +663,8 @@ mod tests {
         // M0zz (counter 1295) vs M100 (counter 1296) — different base36 widths
         // Lexicographic would incorrectly pick M0zz; numeric comparison picks M100
         let minions = vec![
-            test_minion_with_status("M0zz", Some(42), "owner/repo", "Stopped"),
-            test_minion_with_status("M100", Some(42), "owner/repo", "Stopped"),
+            test_minion_with_status("M0zz", Some(42), "Stopped"),
+            test_minion_with_status("M100", Some(42), "Stopped"),
         ];
         let result = find_by_issue_number_from_list(42, &minions);
         assert!(result.is_some());
@@ -765,46 +687,9 @@ mod tests {
 
     #[test]
     fn test_find_by_issue_single_match_still_works() {
-        let minions = vec![
-            test_minion("M001", Some(42), "owner/repo"),
-            test_minion("M002", Some(99), "owner/repo"),
-        ];
+        let minions = vec![test_minion("M001", Some(42)), test_minion("M002", Some(99))];
         let result = find_by_issue_number_from_list(42, &minions);
         assert!(result.is_some());
         assert_eq!(result.unwrap().minion_id, "M001");
-    }
-
-    // --- format_uptime tests ---
-
-    #[test]
-    fn test_format_uptime_days() {
-        assert_eq!(format_uptime(86400), "1d"); // exactly 1 day
-        assert_eq!(format_uptime(172800), "2d"); // 2 days
-        assert_eq!(format_uptime(90000), "1d"); // 1 day + 1 hour
-    }
-
-    #[test]
-    fn test_format_uptime_hours() {
-        assert_eq!(format_uptime(3600), "1h"); // exactly 1 hour
-        assert_eq!(format_uptime(7200), "2h"); // 2 hours
-        assert_eq!(format_uptime(7260), "2h"); // 2 hours + 1 minute
-    }
-
-    #[test]
-    fn test_format_uptime_minutes() {
-        assert_eq!(format_uptime(60), "1m");
-        assert_eq!(format_uptime(300), "5m");
-        assert_eq!(format_uptime(3599), "59m"); // just under 1 hour
-    }
-
-    #[test]
-    fn test_format_uptime_just_under_one_day() {
-        assert_eq!(format_uptime(86399), "23h");
-    }
-
-    #[test]
-    fn test_format_uptime_less_than_a_minute() {
-        assert_eq!(format_uptime(0), "< 1m");
-        assert_eq!(format_uptime(59), "< 1m");
     }
 }

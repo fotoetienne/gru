@@ -212,7 +212,7 @@ pub async fn get_issue_via_cli(
             "--repo",
             &repo_full,
             "--json",
-            "number,title,body,labels",
+            "title,body,labels",
         ],
     )
     .await?;
@@ -298,8 +298,6 @@ pub async fn is_pr_open_via_cli(owner: &str, repo: &str, host: &str, number: u64
 /// Simple struct to hold issue information from gh CLI
 #[derive(Debug, serde::Deserialize)]
 pub struct IssueInfo {
-    #[allow(dead_code)] // Included for serde completeness; callers use .title, .body, and .labels
-    pub number: u64,
     pub title: String,
     pub body: Option<String>,
     /// Labels attached to the issue (from `gh issue view --json labels`)
@@ -971,7 +969,6 @@ mod tests {
     fn test_issue_info_deserialize_full() {
         let json = r#"{"number": 42, "title": "Fix the bug", "body": "Details here"}"#;
         let info: IssueInfo = serde_json::from_str(json).unwrap();
-        assert_eq!(info.number, 42);
         assert_eq!(info.title, "Fix the bug");
         assert_eq!(info.body.as_deref(), Some("Details here"));
     }
@@ -980,7 +977,6 @@ mod tests {
     fn test_issue_info_deserialize_null_body() {
         let json = r#"{"number": 1, "title": "No body", "body": null}"#;
         let info: IssueInfo = serde_json::from_str(json).unwrap();
-        assert_eq!(info.number, 1);
         assert_eq!(info.title, "No body");
         assert!(info.body.is_none());
     }
@@ -990,7 +986,6 @@ mod tests {
         // serde treats a missing Option<T> field as None by default
         let json = r#"{"number": 5, "title": "Minimal"}"#;
         let info: IssueInfo = serde_json::from_str(json).unwrap();
-        assert_eq!(info.number, 5);
         assert!(info.body.is_none());
     }
 
@@ -998,13 +993,12 @@ mod tests {
     fn test_issue_info_deserialize_extra_fields() {
         let json = r#"{"number": 10, "title": "Has extras", "body": "body", "labels": [], "url": "https://example.com"}"#;
         let info: IssueInfo = serde_json::from_str(json).unwrap();
-        assert_eq!(info.number, 10);
         assert_eq!(info.title, "Has extras");
     }
 
     #[test]
-    fn test_issue_info_deserialize_missing_required_field() {
-        let json = r#"{"title": "No number"}"#;
+    fn test_issue_info_deserialize_missing_title() {
+        let json = r#"{"number": 5}"#;
         let result: Result<IssueInfo, _> = serde_json::from_str(json);
         assert!(result.is_err());
     }

@@ -1,5 +1,4 @@
 use anyhow::{bail, Context, Result};
-use std::path::PathBuf;
 
 use crate::config::LabConfig;
 use crate::git::GitRepo;
@@ -12,20 +11,12 @@ use crate::workspace::Workspace;
 pub(crate) enum RepoSource {
     /// GitHub repository in "owner/repo" format
     GitHub(String),
-    /// Local filesystem path (not yet implemented)
-    #[allow(dead_code)]
-    LocalPath(PathBuf),
     /// Current directory (detect from git remote)
     CurrentDir,
 }
 
 /// Parse repository source from command line argument
 pub(crate) fn parse_repo_source(arg: &str) -> Result<RepoSource> {
-    // Explicit path markers
-    if arg.starts_with("./") || arg.starts_with("../") || arg.starts_with('/') {
-        return Ok(RepoSource::LocalPath(PathBuf::from(arg)));
-    }
-
     // Current directory
     if arg == "." {
         return Ok(RepoSource::CurrentDir);
@@ -44,11 +35,10 @@ pub(crate) fn parse_repo_source(arg: &str) -> Result<RepoSource> {
     bail!(
         "Ambiguous repository path: {}\n\n\
         Did you mean:\n\
-        • Local path: gru init ./{}\n\
-        • GitHub repo: gru init owner/repo\n\n\
-        Tip: Use ./ prefix for local paths, or specify owner/repo for GitHub.",
+        • GitHub repo: gru init owner/repo\n\
+        • Current directory: gru init .\n\n\
+        Tip: Specify owner/repo for GitHub or use . for current directory.",
         arg,
-        arg
     );
 }
 
@@ -68,9 +58,6 @@ pub async fn handle_init(repo_arg: String) -> Result<i32> {
         RepoSource::CurrentDir => {
             println!("🔍 Detecting repository from current directory...");
             detect_current_repo().await?
-        }
-        RepoSource::LocalPath(_) => {
-            bail!("Local path repositories are not yet supported. Please use GitHub repositories in owner/repo format.");
         }
     };
 
@@ -227,12 +214,12 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_local_path() {
-        let result = parse_repo_source("./path/to/repo").unwrap();
-        assert!(matches!(result, RepoSource::LocalPath(_)));
+    fn test_parse_local_path_now_fails() {
+        let result = parse_repo_source("./path/to/repo");
+        assert!(result.is_err());
 
-        let result = parse_repo_source("/absolute/path").unwrap();
-        assert!(matches!(result, RepoSource::LocalPath(_)));
+        let result = parse_repo_source("/absolute/path");
+        assert!(result.is_err());
     }
 
     #[test]
@@ -256,7 +243,7 @@ mod tests {
 
         // Empty parts
         let result = parse_repo_source("/repo");
-        matches!(result.unwrap(), RepoSource::LocalPath(_));
+        assert!(result.is_err());
 
         let result = parse_repo_source("owner/");
         assert!(result.is_err());

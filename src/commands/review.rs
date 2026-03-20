@@ -294,8 +294,11 @@ async fn resolve_pr_from_current_worktree() -> Result<(String, String, String, S
 async fn resolve_pr_from_arg(arg: &str) -> Result<(String, String, String, String, String)> {
     let mut errors = Vec::new();
 
-    // Strategy 1: Try as Minion ID (if it looks like one)
-    if looks_like_minion_id(arg) {
+    // Strategy 1: Try as Minion ID (only if it looks like one — avoids
+    // unnecessary registry/filesystem I/O for URLs and PR numbers)
+    let looks_like_minion =
+        arg.len() >= 2 && arg.starts_with('M') && arg[1..].chars().all(|c| c.is_alphanumeric());
+    if looks_like_minion {
         match resolve_pr_from_minion_id(arg).await {
             Ok(pr_info) => return Ok(pr_info),
             Err(e) => errors.push(format!("Minion ID '{}': {:#}", arg, e)),
@@ -332,16 +335,6 @@ async fn resolve_pr_from_arg(arg: &str) -> Result<(String, String, String, Strin
             .collect::<Vec<_>>()
             .join("\n")
     )
-}
-
-/// Checks if a string looks like a Minion ID
-/// Minion IDs start with 'M' followed by alphanumeric characters
-///
-/// # Examples
-/// Valid: "M001", "M42", "M0tk", "MABC123"
-/// Invalid: "42", "M", "m001", "M-42"
-fn looks_like_minion_id(s: &str) -> bool {
-    s.starts_with('M') && s.len() > 1 && s.chars().all(|c| c.is_alphanumeric())
 }
 
 /// Resolves PR information from a Minion ID
@@ -552,24 +545,6 @@ fn build_review_prompt(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_looks_like_minion_id_valid() {
-        assert!(looks_like_minion_id("M001"));
-        assert!(looks_like_minion_id("M42"));
-        assert!(looks_like_minion_id("M0tk"));
-        assert!(looks_like_minion_id("MABC123"));
-    }
-
-    #[test]
-    fn test_looks_like_minion_id_invalid() {
-        assert!(!looks_like_minion_id("42")); // No M prefix
-        assert!(!looks_like_minion_id("M")); // Too short
-        assert!(!looks_like_minion_id("m001")); // Lowercase m
-        assert!(!looks_like_minion_id("M-42")); // Contains non-alphanumeric
-        assert!(!looks_like_minion_id("M 42")); // Contains space
-        assert!(!looks_like_minion_id("")); // Empty string
-    }
 
     #[test]
     fn test_build_review_prompt_with_details() {
