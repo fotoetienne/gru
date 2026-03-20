@@ -66,7 +66,12 @@ pub fn gh_cli_command(host: &str) -> Command {
 /// # Errors
 /// Returns an error if the command fails to execute or exits with a non-zero status.
 pub(crate) async fn run_gh(host: &str, args: &[&str]) -> Result<String> {
-    let args_display = args.join(" ");
+    // Truncate long args (e.g., --body content) to keep error messages readable
+    let args_display: String = args
+        .iter()
+        .map(|a| if a.len() > 80 { &a[..80] } else { a })
+        .collect::<Vec<_>>()
+        .join(" ");
     let output = gh_cli_command(host)
         .args(args)
         .output()
