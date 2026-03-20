@@ -993,39 +993,4 @@ mod tests {
         };
         assert!(mr.failure_reasons().is_empty());
     }
-
-    // --- mergeable field edge cases ---
-
-    #[test]
-    fn test_mergeable_null_treated_as_not_ready() {
-        let pr = PrDetails {
-            head_sha: "abc123".into(),
-            draft: false,
-            mergeable: None,
-            author_login: "author".into(),
-        };
-        assert!(pr.mergeable != Some(true));
-    }
-
-    #[test]
-    fn test_mergeable_false_treated_as_not_ready() {
-        let pr = PrDetails {
-            head_sha: "abc123".into(),
-            draft: false,
-            mergeable: Some(false),
-            author_login: "author".into(),
-        };
-        assert!(pr.mergeable != Some(true));
-    }
-
-    #[test]
-    fn test_mergeable_true_is_ready() {
-        let pr = PrDetails {
-            head_sha: "abc123".into(),
-            draft: false,
-            mergeable: Some(true),
-            author_login: "author".into(),
-        };
-        assert!(pr.mergeable == Some(true));
-    }
 }

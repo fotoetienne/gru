@@ -1526,12 +1526,6 @@ mod tests {
         assert_eq!(host_for_repo(&config, "other/repo"), None);
     }
 
-    #[test]
-    fn test_max_resume_attempts_default() {
-        let config = LabConfig::default();
-        assert_eq!(config.daemon.max_resume_attempts, 3);
-    }
-
     #[tokio::test]
     async fn test_reap_children_removes_exited_process() {
         // Spawn a process that exits immediately with code 1

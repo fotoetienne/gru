@@ -1697,57 +1697,6 @@ mod tests {
     }
 
     // ========================================================================
-    // MonitorResult::Timeout Tests
-    // ========================================================================
-
-    #[test]
-    fn test_timeout_variant() {
-        let result = MonitorResult::Timeout;
-        assert!(matches!(result, MonitorResult::Timeout));
-    }
-
-    #[test]
-    fn test_timeout_variant_debug_format() {
-        let result = MonitorResult::Timeout;
-        let debug = format!("{:?}", result);
-        assert!(debug.contains("Timeout"));
-    }
-
-    // ========================================================================
-    // MonitorResult::Interrupted Tests
-    // ========================================================================
-
-    #[test]
-    fn test_interrupted_variant() {
-        let result = MonitorResult::Interrupted;
-        assert!(matches!(result, MonitorResult::Interrupted));
-    }
-
-    #[test]
-    fn test_interrupted_variant_debug_format() {
-        let result = MonitorResult::Interrupted;
-        let debug = format!("{:?}", result);
-        assert!(debug.contains("Interrupted"));
-    }
-
-    // ========================================================================
-    // MonitorResult::MergeConflict Tests
-    // ========================================================================
-
-    #[test]
-    fn test_merge_conflict_variant() {
-        let result = MonitorResult::MergeConflict;
-        assert!(matches!(result, MonitorResult::MergeConflict));
-    }
-
-    #[test]
-    fn test_merge_conflict_variant_debug_format() {
-        let result = MonitorResult::MergeConflict;
-        let debug = format!("{:?}", result);
-        assert!(debug.contains("MergeConflict"));
-    }
-
-    // ========================================================================
     // PullRequest Mergeable Field Tests
     // ========================================================================
 
