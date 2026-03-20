@@ -239,6 +239,9 @@ async fn finalize_pr(
 ///
 /// Looks up the PR via `gh pr list --head <branch>`, finalizes state if found,
 /// and returns the PR number. Used by error-recovery paths in `handle_pr_creation`.
+///
+/// This function always returns `Ok(_)`: internal lookup errors are logged as
+/// warnings and mapped to `Ok(None)`, so callers can use `?` safely.
 async fn recover_existing_pr(
     issue_ctx: &IssueContext,
     wt_ctx: &WorktreeContext,
@@ -255,6 +258,9 @@ async fn recover_existing_pr(
         Ok(Some(pr_num)) => {
             let pr_number = pr_num.to_string();
 
+            // Best-effort: log warnings instead of propagating errors,
+            // since losing the recovered PR number would be worse than
+            // missing metadata (which can be recovered on next resume).
             if let Err(e) = finalize_pr(issue_ctx, wt_ctx, &pr_number).await {
                 log::warn!("⚠️  Failed to finalize recovered PR state: {}", e);
             }
