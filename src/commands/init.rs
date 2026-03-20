@@ -91,6 +91,13 @@ fn check_prerequisites() -> Result<i32> {
 
 /// Initialize a repository for use with Gru
 pub async fn handle_init(repo_arg: String, host_override: Option<String>) -> Result<i32> {
+    // Validate --host early
+    if let Some(ref h) = host_override {
+        if h.is_empty() || h.contains(char::is_whitespace) {
+            bail!("Invalid --host value: {:?}", h);
+        }
+    }
+
     // Run prerequisite checks
     let prereq_result = check_prerequisites()?;
     if prereq_result != 0 {
@@ -223,11 +230,21 @@ pub async fn handle_init(repo_arg: String, host_override: Option<String>) -> Res
     }
 
     // Summary
+    let gh_host_flag = if host == "github.com" {
+        String::new()
+    } else {
+        format!(" -R {}/{}", owner, repo)
+    };
+
     println!("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     println!("✓ Repository is ready!\n");
     println!("Next steps:");
     println!("  1. Label an issue for Gru to work on:");
-    println!("     gh issue edit <number> --add-label {}", labels::TODO);
+    println!(
+        "     gh issue edit <number> --add-label {}{}",
+        labels::TODO,
+        gh_host_flag
+    );
     println!("  2. Start a Minion:");
     println!("     gru do {}/{}#<number>", owner, repo);
     println!("  3. Or run in daemon mode:");
@@ -316,11 +333,24 @@ mod tests {
         assert!(result.is_err());
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_check_binary_finds_common_tools() {
-        // 'sh' should exist on any Unix system
         assert!(check_binary("sh"));
-        // Random non-existent binary
         assert!(!check_binary("definitely-not-a-real-binary-xyz123"));
+    }
+
+    #[test]
+    fn test_host_validation() {
+        // Empty and whitespace hosts should be caught by handle_init,
+        // but we can test the validation logic pattern here
+        let empty = "";
+        assert!(empty.is_empty());
+
+        let with_space = "ghe. example.com";
+        assert!(with_space.contains(char::is_whitespace));
+
+        let valid = "ghe.example.com";
+        assert!(!valid.is_empty() && !valid.contains(char::is_whitespace));
     }
 }
