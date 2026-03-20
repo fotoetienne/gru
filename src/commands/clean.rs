@@ -620,18 +620,8 @@ async fn display_scan_results(scan: &ScanResult) -> bool {
 
 /// Prompt the user for confirmation before removing worktrees.
 ///
-/// Returns `true` if the user confirms (or if `force` is set), `false` otherwise.
-/// Returns `None` if this is a dry run (caller should exit early).
-async fn confirm_removal(
-    total_cleanable: usize,
-    dry_run: bool,
-    force: bool,
-) -> Result<Option<bool>> {
-    if dry_run {
-        println!("Dry run mode - nothing was removed.");
-        return Ok(None);
-    }
-
+/// Returns `true` if the user confirms (or if `force` is set), `false` if cancelled.
+async fn confirm_removal(total_cleanable: usize, force: bool) -> Result<bool> {
     if !force {
         print!("Remove {} item(s)? [y/N]: ", total_cleanable);
         std::io::stdout().flush()?;
@@ -644,11 +634,11 @@ async fn confirm_removal(
 
         if input != "y" && input != "yes" {
             println!("Cancelled.");
-            return Ok(Some(false));
+            return Ok(false);
         }
     }
 
-    Ok(Some(true))
+    Ok(true)
 }
 
 /// Remove cleanable worktrees and orphaned registry entries from disk.
@@ -950,10 +940,13 @@ pub async fn handle_clean(dry_run: bool, force: bool, base_branch: &str) -> Resu
 
     let total_cleanable = scan.cleanable.len() + scan.orphaned_minions.len();
 
-    match confirm_removal(total_cleanable, dry_run, force).await? {
-        None => return Ok(0),        // dry run
-        Some(false) => return Ok(0), // user cancelled
-        Some(true) => {}             // confirmed
+    if dry_run {
+        println!("Dry run mode - nothing was removed.");
+        return Ok(0);
+    }
+
+    if !confirm_removal(total_cleanable, force).await? {
+        return Ok(0);
     }
 
     remove_worktrees(&ws, scan.cleanable, &scan.orphaned_minions, force).await
