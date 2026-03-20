@@ -17,7 +17,7 @@ use tokio::time::sleep;
 macro_rules! tprintln {
     () => { println!() };
     ($($arg:tt)*) => {
-        println!("[{}] {}", Local::now().format("%H:%M:%S"), format!($($arg)*))
+        println!("[{}] {}", Local::now().format("%H:%M:%S"), format_args!($($arg)*))
     };
 }
 
@@ -146,12 +146,14 @@ pub async fn handle_lab(
     loop {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {
-                tprintln!("\n🛑 Received shutdown signal (SIGINT), stopping daemon...");
+                tprintln!();
+                tprintln!("🛑 Received shutdown signal (SIGINT), stopping daemon...");
                 shutdown_children(&mut children, stop_minions).await;
                 break;
             }
             _ = sigterm.recv() => {
-                tprintln!("\n🛑 Received shutdown signal (SIGTERM), stopping daemon...");
+                tprintln!();
+                tprintln!("🛑 Received shutdown signal (SIGTERM), stopping daemon...");
                 shutdown_children(&mut children, stop_minions).await;
                 break;
             }
