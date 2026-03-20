@@ -325,25 +325,9 @@ pub async fn fetch_check_runs(
 ) -> Result<Vec<CheckRun>> {
     let repo_full = github::repo_slug(owner, repo);
 
-    let output = github::gh_cli_command(host)
-        .args([
-            "api",
-            &format!("repos/{}/commits/{}/check-runs", repo_full, git_ref),
-            "--jq",
-            ".check_runs[] | {name: .name, status: .status, conclusion: .conclusion, started_at: .started_at, completed_at: .completed_at, output_title: .output.title, output_summary: .output.summary, output_text: .output.text}",
-        ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .await
-        .context("Failed to execute gh CLI for check runs")?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("Failed to fetch check runs: {}", stderr);
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let endpoint = format!("repos/{}/commits/{}/check-runs", repo_full, git_ref);
+    let jq_filter = ".check_runs[] | {name: .name, status: .status, conclusion: .conclusion, started_at: .started_at, completed_at: .completed_at, output_title: .output.title, output_summary: .output.summary, output_text: .output.text}";
+    let stdout = github::run_gh(host, &["api", &endpoint, "--jq", jq_filter]).await?;
     let mut checks = Vec::new();
 
     for line in stdout.lines() {
@@ -763,42 +747,35 @@ async fn post_escalation_comment_body(
         crate::progress_comments::minion_signature(minion_id)
     );
 
-    let output = github::gh_cli_command(host)
-        .args([
+    let pr_str = pr_number.to_string();
+    github::run_gh(
+        host,
+        &[
             "pr",
             "comment",
-            &pr_number.to_string(),
+            &pr_str,
             "--repo",
             &repo_full,
             "--body",
             &body_with_sig,
-        ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .await
-        .context("Failed to post escalation comment")?;
+        ],
+    )
+    .await?;
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("Failed to post escalation comment: {}", stderr);
-    }
-
-    // Add the blocked label
-    let _ = github::gh_cli_command(host)
-        .args([
+    // Add the blocked label (best-effort)
+    let _ = github::run_gh(
+        host,
+        &[
             "pr",
             "edit",
-            &pr_number.to_string(),
+            &pr_str,
             "--repo",
             &repo_full,
             "--add-label",
             labels::BLOCKED,
-        ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .await;
+        ],
+    )
+    .await;
 
     Ok(())
 }

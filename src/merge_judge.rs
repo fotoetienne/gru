@@ -178,15 +178,7 @@ pub async fn get_pr_fingerprint(
         let host = host.to_string();
         let ep = format!("repos/{repo_full}/pulls/{pr_number}");
         async move {
-            let output = github::gh_cli_command(&host)
-                .args(["api", &ep])
-                .output()
-                .await
-                .context("Failed to fetch PR for fingerprint")?;
-            if !output.status.success() {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                anyhow::bail!("Failed to fetch PR details: {}", stderr.trim());
-            }
+            let stdout = github::run_gh(&host, &["api", &ep]).await?;
             #[derive(Deserialize)]
             struct PrHead {
                 head: Head,
@@ -195,8 +187,7 @@ pub async fn get_pr_fingerprint(
             struct Head {
                 sha: String,
             }
-            let pr: PrHead =
-                serde_json::from_slice(&output.stdout).context("Failed to parse PR JSON")?;
+            let pr: PrHead = serde_json::from_str(&stdout).context("Failed to parse PR JSON")?;
             Ok::<String, anyhow::Error>(pr.head.sha)
         }
     };
@@ -205,11 +196,9 @@ pub async fn get_pr_fingerprint(
         let host = host.to_string();
         let ep = format!("repos/{repo_full}/issues/{pr_number}/comments");
         async move {
-            let output = github::gh_cli_command(&host)
-                .args(["api", &ep, "--paginate", "--jq", "length"])
-                .output()
-                .await?;
-            Ok::<usize, anyhow::Error>(parse_paginated_lengths(&output.stdout))
+            let stdout =
+                github::run_gh(&host, &["api", &ep, "--paginate", "--jq", "length"]).await?;
+            Ok::<usize, anyhow::Error>(parse_paginated_lengths(stdout.as_bytes()))
         }
     };
 
@@ -217,11 +206,9 @@ pub async fn get_pr_fingerprint(
         let host = host.to_string();
         let ep = format!("repos/{repo_full}/pulls/{pr_number}/reviews");
         async move {
-            let output = github::gh_cli_command(&host)
-                .args(["api", &ep, "--paginate", "--jq", "length"])
-                .output()
-                .await?;
-            Ok::<usize, anyhow::Error>(parse_paginated_lengths(&output.stdout))
+            let stdout =
+                github::run_gh(&host, &["api", &ep, "--paginate", "--jq", "length"]).await?;
+            Ok::<usize, anyhow::Error>(parse_paginated_lengths(stdout.as_bytes()))
         }
     };
 
@@ -229,11 +216,9 @@ pub async fn get_pr_fingerprint(
         let host = host.to_string();
         let ep = format!("repos/{repo_full}/pulls/{pr_number}/comments");
         async move {
-            let output = github::gh_cli_command(&host)
-                .args(["api", &ep, "--paginate", "--jq", "length"])
-                .output()
-                .await?;
-            Ok::<usize, anyhow::Error>(parse_paginated_lengths(&output.stdout))
+            let stdout =
+                github::run_gh(&host, &["api", &ep, "--paginate", "--jq", "length"]).await?;
+            Ok::<usize, anyhow::Error>(parse_paginated_lengths(stdout.as_bytes()))
         }
     };
 
@@ -271,16 +256,8 @@ async fn fetch_pr_context(
         let rf = repo_full.clone();
         let pr = pr_number.to_string();
         async move {
-            let output = github::gh_cli_command(&host)
-                .args(["pr", "diff", &pr, "-R", &rf])
-                .output()
-                .await
-                .context("Failed to fetch PR diff")?;
-            if !output.status.success() {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                anyhow::bail!("Failed to fetch PR diff: {}", stderr.trim());
-            }
-            Ok::<String, anyhow::Error>(String::from_utf8_lossy(&output.stdout).to_string())
+            let stdout = github::run_gh(&host, &["pr", "diff", &pr, "-R", &rf]).await?;
+            Ok::<String, anyhow::Error>(stdout)
         }
     };
 
@@ -290,16 +267,9 @@ async fn fetch_pr_context(
         let pr = pr_number.to_string();
         async move {
             let endpoint = format!("repos/{rf}/issues/{pr}/comments");
-            let output = github::gh_cli_command(&host)
-                .args(["api", &endpoint, "--paginate", "--jq", ".[]"])
-                .output()
-                .await
-                .context("Failed to fetch PR comments")?;
-            if !output.status.success() {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                anyhow::bail!("Failed to fetch PR comments: {}", stderr.trim());
-            }
-            Ok::<String, anyhow::Error>(wrap_ndjson(&output.stdout))
+            let stdout =
+                github::run_gh(&host, &["api", &endpoint, "--paginate", "--jq", ".[]"]).await?;
+            Ok::<String, anyhow::Error>(wrap_ndjson(stdout.as_bytes()))
         }
     };
 
@@ -309,16 +279,9 @@ async fn fetch_pr_context(
         let pr = pr_number.to_string();
         async move {
             let endpoint = format!("repos/{rf}/pulls/{pr}/reviews");
-            let output = github::gh_cli_command(&host)
-                .args(["api", &endpoint, "--paginate", "--jq", ".[]"])
-                .output()
-                .await
-                .context("Failed to fetch PR reviews")?;
-            if !output.status.success() {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                anyhow::bail!("Failed to fetch PR reviews: {}", stderr.trim());
-            }
-            Ok::<String, anyhow::Error>(wrap_ndjson(&output.stdout))
+            let stdout =
+                github::run_gh(&host, &["api", &endpoint, "--paginate", "--jq", ".[]"]).await?;
+            Ok::<String, anyhow::Error>(wrap_ndjson(stdout.as_bytes()))
         }
     };
 
@@ -328,16 +291,9 @@ async fn fetch_pr_context(
         let pr = pr_number.to_string();
         async move {
             let endpoint = format!("repos/{rf}/pulls/{pr}/comments");
-            let output = github::gh_cli_command(&host)
-                .args(["api", &endpoint, "--paginate", "--jq", ".[]"])
-                .output()
-                .await
-                .context("Failed to fetch review comments")?;
-            if !output.status.success() {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                anyhow::bail!("Failed to fetch review comments: {}", stderr.trim());
-            }
-            Ok::<String, anyhow::Error>(wrap_ndjson(&output.stdout))
+            let stdout =
+                github::run_gh(&host, &["api", &endpoint, "--paginate", "--jq", ".[]"]).await?;
+            Ok::<String, anyhow::Error>(wrap_ndjson(stdout.as_bytes()))
         }
     };
 
@@ -662,8 +618,9 @@ pub async fn add_needs_human_review_label(
     pr_number: &str,
 ) -> Result<()> {
     let repo_full = github::repo_slug(owner, repo);
-    let output = github::gh_cli_command(host)
-        .args([
+    github::run_gh(
+        host,
+        &[
             "pr",
             "edit",
             pr_number,
@@ -671,19 +628,9 @@ pub async fn add_needs_human_review_label(
             NEEDS_HUMAN_REVIEW_LABEL,
             "-R",
             &repo_full,
-        ])
-        .output()
-        .await
-        .context("Failed to add gru:needs-human-review label")?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!(
-            "Failed to add gru:needs-human-review label to PR #{}: {}",
-            pr_number,
-            stderr
-        );
-    }
+        ],
+    )
+    .await?;
 
     Ok(())
 }
@@ -698,8 +645,9 @@ pub async fn ensure_needs_human_review_label(host: &str, owner: &str, repo: &str
     let color_field = format!("color={color}");
     let desc_field = format!("description={description}");
 
-    let output = github::gh_cli_command(host)
-        .args([
+    if let Err(e) = github::run_gh(
+        host,
+        &[
             "api",
             &endpoint,
             "-X",
@@ -710,17 +658,16 @@ pub async fn ensure_needs_human_review_label(host: &str, owner: &str, repo: &str
             &color_field,
             "-f",
             &desc_field,
-        ])
-        .output()
-        .await?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        if !stderr.contains("already_exists") {
+        ],
+    )
+    .await
+    {
+        let msg = e.to_string();
+        if !msg.contains("already_exists") {
             log::warn!(
                 "Failed to create {} label: {}",
                 NEEDS_HUMAN_REVIEW_LABEL,
-                stderr.trim()
+                msg
             );
         }
     }
@@ -741,20 +688,7 @@ pub async fn has_needs_human_review_label(
     let repo_full = github::repo_slug(owner, repo);
     let endpoint = format!("repos/{repo_full}/issues/{pr_number}/labels");
 
-    let output = github::gh_cli_command(host)
-        .args(["api", &endpoint])
-        .output()
-        .await
-        .context("Failed to fetch labels")?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!(
-            "Failed to fetch labels for PR #{}: {}",
-            pr_number,
-            stderr.trim()
-        );
-    }
+    let stdout = github::run_gh(host, &["api", &endpoint]).await?;
 
     #[derive(Deserialize)]
     struct Label {
@@ -762,7 +696,7 @@ pub async fn has_needs_human_review_label(
     }
 
     let labels: Vec<Label> =
-        serde_json::from_slice(&output.stdout).context("Failed to parse labels JSON")?;
+        serde_json::from_str(&stdout).context("Failed to parse labels JSON")?;
     Ok(labels.iter().any(|l| l.name == NEEDS_HUMAN_REVIEW_LABEL))
 }
 
@@ -782,27 +716,23 @@ pub async fn post_judge_escalation_comment(
         response.confidence, response.reasoning
     );
 
-    let result = github::gh_cli_command(host)
-        .args([
+    match github::run_gh(
+        host,
+        &[
             "pr", "comment", pr_number, "--repo", &repo_full, "--body", &body,
-        ])
-        .output()
-        .await;
-
-    match result {
-        Ok(output) if output.status.success() => {
+        ],
+    )
+    .await
+    {
+        Ok(_) => {
             log::info!("Posted merge judge escalation comment on PR #{}", pr_number);
         }
-        Ok(output) => {
-            let stderr = String::from_utf8_lossy(&output.stderr);
+        Err(e) => {
             log::warn!(
                 "Failed to post judge escalation comment on PR #{}: {}",
                 pr_number,
-                stderr.trim()
+                e
             );
-        }
-        Err(e) => {
-            log::warn!("Failed to run gh pr comment: {}", e);
         }
     }
 }

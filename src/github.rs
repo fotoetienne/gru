@@ -50,6 +50,37 @@ pub fn gh_cli_command(host: &str) -> Command {
     cmd
 }
 
+/// Run a `gh` CLI command and return its stdout on success.
+///
+/// This is the standard helper for executing `gh` commands. It handles the
+/// common boilerplate of running the command, checking the exit status, and
+/// extracting stdout.
+///
+/// # Arguments
+/// * `host` - GitHub hostname (sets `GH_HOST` env var)
+/// * `args` - Arguments to pass to `gh` (e.g., `&["pr", "view", "123"]`)
+///
+/// # Returns
+/// The command's stdout as a String on success.
+///
+/// # Errors
+/// Returns an error if the command fails to execute or exits with a non-zero status.
+pub(crate) async fn run_gh(host: &str, args: &[&str]) -> Result<String> {
+    let args_display = args.join(" ");
+    let output = gh_cli_command(host)
+        .args(args)
+        .output()
+        .await
+        .with_context(|| format!("Failed to execute: gh {}", args_display))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("gh {} failed: {}", args_display, stderr.trim());
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
 /// Build a full GitHub issue URL for a repo in "owner/repo" format, with an explicit host.
 ///
 /// Returns `Some(url)` when `repo` is a valid `owner/repo` string, otherwise `None`.
@@ -82,23 +113,7 @@ pub async fn mark_pr_ready_via_cli(
     pr_number: &str,
 ) -> Result<()> {
     let repo_full = repo_slug(owner, repo);
-    let output = gh_cli_command(host)
-        .args(["pr", "ready", pr_number, "--repo", &repo_full])
-        .output()
-        .await
-        .context("Failed to execute gh pr ready command")?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(anyhow!(
-            "Failed to mark PR #{} as ready in {}/{}: {}",
-            pr_number,
-            owner,
-            repo,
-            stderr
-        ));
-    }
-
+    run_gh(host, &["pr", "ready", pr_number, "--repo", &repo_full]).await?;
     Ok(())
 }
 
@@ -136,8 +151,9 @@ pub async fn list_ready_issues_via_cli(
 ) -> Result<Vec<CandidateIssue>> {
     let repo_full = repo_slug(owner, repo);
     let search_query = build_ready_issues_search_query(label);
-    let output = gh_cli_command(host)
-        .args([
+    let stdout = run_gh(
+        host,
+        &[
             "issue",
             "list",
             "--repo",
@@ -150,21 +166,10 @@ pub async fn list_ready_issues_via_cli(
             "number,body",
             "--limit",
             "100",
-        ])
-        .output()
-        .await
-        .context("Failed to execute gh issue list command")?;
+        ],
+    )
+    .await?;
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(anyhow!(
-            "Failed to list ready issues in {}: {}",
-            repo_full,
-            stderr
-        ));
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
     let items: Vec<CandidateIssue> =
         serde_json::from_str(&stdout).context("Failed to parse gh issue list JSON output")?;
 
@@ -192,32 +197,21 @@ pub async fn get_issue_via_cli(
     number: u64,
 ) -> Result<IssueInfo> {
     let repo_full = repo_slug(owner, repo);
-    let output = gh_cli_command(host)
-        .args([
+    let number_str = number.to_string();
+    let stdout = run_gh(
+        host,
+        &[
             "issue",
             "view",
-            &number.to_string(),
+            &number_str,
             "--repo",
             &repo_full,
             "--json",
             "number,title,body,labels",
-        ])
-        .output()
-        .await
-        .context("Failed to execute gh issue view command")?;
+        ],
+    )
+    .await?;
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(anyhow!(
-            "Failed to fetch issue #{} from {}/{}: {}",
-            number,
-            owner,
-            repo,
-            stderr
-        ));
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
     let issue: IssueInfo =
         serde_json::from_str(&stdout).context("Failed to parse gh issue view JSON output")?;
 
@@ -235,34 +229,24 @@ pub async fn is_issue_closed_via_cli(
     number: u64,
 ) -> Result<bool> {
     let repo_full = repo_slug(owner, repo);
-    let output = gh_cli_command(host)
-        .args([
+    let number_str = number.to_string();
+    let stdout = run_gh(
+        host,
+        &[
             "issue",
             "view",
-            &number.to_string(),
+            &number_str,
             "--repo",
             &repo_full,
             "--json",
             "state",
             "--jq",
             ".state",
-        ])
-        .output()
-        .await
-        .context("Failed to execute gh issue view command")?;
+        ],
+    )
+    .await?;
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(anyhow!(
-            "Failed to fetch issue #{} state from {}/{}: {}",
-            number,
-            owner,
-            repo,
-            stderr
-        ));
-    }
-
-    let state = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let state = stdout.trim().to_string();
     Ok(state == "CLOSED")
 }
 
@@ -277,34 +261,24 @@ pub async fn is_issue_closed_via_cli(
 /// * `number` - PR number
 pub async fn is_pr_open_via_cli(owner: &str, repo: &str, host: &str, number: u64) -> Result<bool> {
     let repo_full = repo_slug(owner, repo);
-    let output = gh_cli_command(host)
-        .args([
+    let number_str = number.to_string();
+    let stdout = run_gh(
+        host,
+        &[
             "pr",
             "view",
-            &number.to_string(),
+            &number_str,
             "--repo",
             &repo_full,
             "--json",
             "state",
             "--jq",
             ".state",
-        ])
-        .output()
-        .await
-        .context("Failed to execute gh pr view command")?;
+        ],
+    )
+    .await?;
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(anyhow!(
-            "Failed to fetch PR #{} state from {}/{}: {}",
-            number,
-            owner,
-            repo,
-            stderr
-        ));
-    }
-
-    let state = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let state = stdout.trim().to_string();
     if state.is_empty() {
         return Err(anyhow!(
             "gh pr view returned empty state for PR #{} in {}/{}",
@@ -351,32 +325,21 @@ pub struct PrInfo {
 /// * `number` - PR number
 pub async fn get_pr_via_cli(owner: &str, repo: &str, host: &str, number: u64) -> Result<PrInfo> {
     let repo_full = repo_slug(owner, repo);
-    let output = gh_cli_command(host)
-        .args([
+    let number_str = number.to_string();
+    let stdout = run_gh(
+        host,
+        &[
             "pr",
             "view",
-            &number.to_string(),
+            &number_str,
             "--repo",
             &repo_full,
             "--json",
             "title,body,headRefName",
-        ])
-        .output()
-        .await
-        .context("Failed to execute gh pr view command")?;
+        ],
+    )
+    .await?;
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(anyhow!(
-            "Failed to fetch PR #{} from {}/{}: {}",
-            number,
-            owner,
-            repo,
-            stderr
-        ));
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
     let pr: PrInfo =
         serde_json::from_str(&stdout).context("Failed to parse gh pr view JSON output")?;
 
@@ -404,27 +367,15 @@ pub async fn create_draft_pr_via_cli(
     body: &str,
 ) -> Result<String> {
     let repo_full = repo_slug(owner, repo);
-    let output = gh_cli_command(host)
-        .args([
+    let stdout = run_gh(
+        host,
+        &[
             "pr", "create", "--repo", &repo_full, "--head", branch, "--base", base, "--title",
             title, "--body", body, "--draft",
-        ])
-        .output()
-        .await
-        .context("Failed to execute gh pr create command")?;
+        ],
+    )
+    .await?;
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(anyhow!(
-            "Failed to create draft PR for branch '{}' in {}/{}: {}",
-            branch,
-            owner,
-            repo,
-            stderr
-        ));
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
     let pr_url = stdout.trim();
 
     // Validate URL format (gh returns URL like https://<host>/owner/repo/pull/123)
@@ -486,29 +437,20 @@ pub async fn post_comment_via_cli(
     body: &str,
 ) -> Result<()> {
     let repo_full = repo_slug(owner, repo);
-    let output = gh_cli_command(host)
-        .args([
+    let number_str = number.to_string();
+    run_gh(
+        host,
+        &[
             "issue",
             "comment",
-            &number.to_string(),
+            &number_str,
             "--repo",
             &repo_full,
             "--body",
             body,
-        ])
-        .output()
-        .await
-        .context("Failed to execute gh issue comment command")?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(anyhow!(
-            "Failed to post comment on #{} in {}: {}",
-            number,
-            repo_full,
-            stderr
-        ));
-    }
+        ],
+    )
+    .await?;
 
     Ok(())
 }
@@ -535,38 +477,19 @@ pub async fn edit_labels_via_cli(
     }
 
     let repo_full = repo_slug(owner, repo);
-    let mut args = vec![
-        "issue".to_string(),
-        "edit".to_string(),
-        number.to_string(),
-        "--repo".to_string(),
-        repo_full.clone(),
-    ];
+    let number_str = number.to_string();
+    let mut args: Vec<&str> = vec!["issue", "edit", &number_str, "--repo", &repo_full];
 
     for label in add {
-        args.push("--add-label".to_string());
-        args.push(label.to_string());
+        args.push("--add-label");
+        args.push(label);
     }
     for label in remove {
-        args.push("--remove-label".to_string());
-        args.push(label.to_string());
+        args.push("--remove-label");
+        args.push(label);
     }
 
-    let output = gh_cli_command(host)
-        .args(&args)
-        .output()
-        .await
-        .context("Failed to execute gh issue edit command")?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(anyhow!(
-            "Failed to edit labels on #{} in {}: {}",
-            number,
-            repo_full,
-            stderr
-        ));
-    }
+    run_gh(host, &args).await?;
 
     Ok(())
 }
@@ -591,8 +514,9 @@ pub async fn create_label_via_cli(
     description: &str,
 ) -> Result<()> {
     let repo_full = repo_slug(owner, repo);
-    let output = gh_cli_command(host)
-        .args([
+    run_gh(
+        host,
+        &[
             "label",
             "create",
             name,
@@ -603,20 +527,9 @@ pub async fn create_label_via_cli(
             "-d",
             description,
             "--force",
-        ])
-        .output()
-        .await
-        .context("Failed to execute gh label create command")?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(anyhow!(
-            "Failed to create label '{}' in {}: {}",
-            name,
-            repo_full,
-            stderr
-        ));
-    }
+        ],
+    )
+    .await?;
 
     Ok(())
 }
@@ -630,21 +543,7 @@ pub async fn create_label_via_cli(
 /// * `Ok(())` if authenticated
 /// * `Err(_)` if not authenticated or check failed
 pub async fn check_auth_via_cli(host: &str) -> Result<()> {
-    let output = gh_cli_command(host)
-        .args(["auth", "status", "--hostname", host])
-        .output()
-        .await
-        .context("Failed to execute gh auth status command")?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(anyhow!(
-            "Not authenticated with gh CLI for host {}: {}",
-            host,
-            stderr
-        ));
-    }
-
+    run_gh(host, &["auth", "status", "--hostname", host]).await?;
     Ok(())
 }
 
@@ -741,27 +640,27 @@ pub async fn remove_blocked_label(
     issue_number: u64,
 ) -> Result<()> {
     let repo_full = repo_slug(owner, repo);
+    let pr_str = pr_number.to_string();
 
     // Remove gru:blocked from the PR (where ci.rs adds it)
-    let output = gh_cli_command(host)
-        .args([
+    // Ignore "not found" errors — label may not be present
+    if let Err(e) = run_gh(
+        host,
+        &[
             "pr",
             "edit",
-            &pr_number.to_string(),
+            &pr_str,
             "--repo",
             &repo_full,
             "--remove-label",
             labels::BLOCKED,
-        ])
-        .output()
-        .await
-        .context("Failed to remove blocked label from PR")?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        // Ignore "not found" errors — label may not be present
-        if !stderr.contains("404") && !stderr.contains("not found") {
-            anyhow::bail!("Failed to remove blocked label from PR: {}", stderr);
+        ],
+    )
+    .await
+    {
+        let msg = e.to_string();
+        if !msg.contains("404") && !msg.contains("not found") {
+            return Err(e);
         }
     }
 
@@ -829,18 +728,9 @@ pub struct ReviewUser {
 /// Uses `gh api user` to fetch the authenticated account. Returns an error
 /// if `gh` is not authenticated or the API call fails.
 pub async fn get_authenticated_user(host: &str) -> Result<String> {
-    let output = gh_cli_command(host)
-        .args(["api", "user", "--jq", ".login"])
-        .output()
-        .await
-        .context("Failed to execute gh api user command")?;
+    let stdout = run_gh(host, &["api", "user", "--jq", ".login"]).await?;
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(anyhow!("Failed to get authenticated user: {}", stderr));
-    }
-
-    let login = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let login = stdout.trim().to_string();
     if login.is_empty() {
         return Err(anyhow!("gh api user returned empty login"));
     }
@@ -858,25 +748,9 @@ pub async fn list_pr_reviews(
     pr_number: &str,
 ) -> Result<Vec<PrReview>> {
     let endpoint = format!("repos/{}/{}/pulls/{}/reviews", owner, repo, pr_number);
-    let output = gh_cli_command(host)
-        .args(["api", &endpoint, "--paginate", "--jq", ".[]"])
-        .output()
-        .await
-        .context("Failed to execute gh api reviews command")?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(anyhow!(
-            "Failed to list PR reviews for {}/{} #{}: {}",
-            owner,
-            repo,
-            pr_number,
-            stderr
-        ));
-    }
+    let stdout = run_gh(host, &["api", &endpoint, "--paginate", "--jq", ".[]"]).await?;
 
     // --paginate --jq '.[]' outputs one JSON object per line (NDJSON).
-    let stdout = String::from_utf8_lossy(&output.stdout);
     parse_pr_reviews_ndjson(&stdout)
 }
 
