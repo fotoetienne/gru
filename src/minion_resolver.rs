@@ -154,18 +154,8 @@ fn load_from_registry() -> Vec<MinionInfo> {
                 let now = chrono::Utc::now();
                 let duration = now.signed_duration_since(info.started_at);
                 // Guard against clock skew (started_at in the future)
-                let minutes = duration.num_minutes().max(0);
-                let hours = duration.num_hours().max(0);
-                let days = duration.num_days().max(0);
-                if days > 0 {
-                    format!("{}d", days)
-                } else if hours > 0 {
-                    format!("{}h", hours)
-                } else if minutes > 0 {
-                    format!("{}m", minutes)
-                } else {
-                    "< 1m".to_string()
-                }
+                let secs = duration.num_seconds().max(0) as u64;
+                format_uptime(secs)
             };
 
             let status = if info.is_running() {
@@ -394,26 +384,31 @@ fn determine_status(worktree_path: &std::path::Path) -> Result<String> {
     }
 }
 
+/// Formats a duration (in seconds) as a human-readable uptime string.
+/// Returns "Xd", "Xh", "Xm", or "< 1m".
+fn format_uptime(total_secs: u64) -> String {
+    let minutes = total_secs / 60;
+    let hours = minutes / 60;
+    let days = hours / 24;
+
+    if days > 0 {
+        format!("{}d", days)
+    } else if hours > 0 {
+        format!("{}h", hours)
+    } else if minutes > 0 {
+        format!("{}m", minutes)
+    } else {
+        "< 1m".to_string()
+    }
+}
+
 /// Calculates the uptime of a worktree based on its creation time
 fn calculate_uptime(worktree_path: &std::path::Path) -> Result<String> {
     let metadata = std::fs::metadata(worktree_path)?;
     let created = metadata.created().or_else(|_| metadata.modified())?;
     let now = std::time::SystemTime::now();
     let elapsed = now.duration_since(created).unwrap_or_default();
-
-    let minutes = elapsed.as_secs() / 60;
-    let hours = minutes / 60;
-    let days = hours / 24;
-
-    if days > 0 {
-        Ok(format!("{}d", days))
-    } else if hours > 0 {
-        Ok(format!("{}h", hours))
-    } else if minutes > 0 {
-        Ok(format!("{}m", minutes))
-    } else {
-        Ok("< 1m".to_string())
-    }
+    Ok(format_uptime(elapsed.as_secs()))
 }
 
 /// Extracts the linked issue number from a GitHub PR
@@ -777,5 +772,39 @@ mod tests {
         let result = find_by_issue_number_from_list(42, &minions);
         assert!(result.is_some());
         assert_eq!(result.unwrap().minion_id, "M001");
+    }
+
+    // --- format_uptime tests ---
+
+    #[test]
+    fn test_format_uptime_days() {
+        assert_eq!(format_uptime(86400), "1d"); // exactly 1 day
+        assert_eq!(format_uptime(172800), "2d"); // 2 days
+        assert_eq!(format_uptime(90000), "1d"); // 1 day + 1 hour
+    }
+
+    #[test]
+    fn test_format_uptime_hours() {
+        assert_eq!(format_uptime(3600), "1h"); // exactly 1 hour
+        assert_eq!(format_uptime(7200), "2h"); // 2 hours
+        assert_eq!(format_uptime(7260), "2h"); // 2 hours + 1 minute
+    }
+
+    #[test]
+    fn test_format_uptime_minutes() {
+        assert_eq!(format_uptime(60), "1m");
+        assert_eq!(format_uptime(300), "5m");
+        assert_eq!(format_uptime(3599), "59m"); // just under 1 hour
+    }
+
+    #[test]
+    fn test_format_uptime_just_under_one_day() {
+        assert_eq!(format_uptime(86399), "23h");
+    }
+
+    #[test]
+    fn test_format_uptime_less_than_a_minute() {
+        assert_eq!(format_uptime(0), "< 1m");
+        assert_eq!(format_uptime(59), "< 1m");
     }
 }
