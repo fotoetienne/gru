@@ -7,6 +7,15 @@ use std::path::{Path, PathBuf};
 /// Uses OnceCell so transient failures don't get permanently cached.
 static GLOBAL_WORKSPACE: OnceCell<Workspace> = OnceCell::new();
 
+// Thread-local override for tests. When set, `Workspace::global()` returns
+// a reference to this workspace instead of the process-wide singleton.
+// This allows parallel tests to each have their own isolated workspace root.
+#[cfg(test)]
+thread_local! {
+    static TEST_WORKSPACE_OVERRIDE: std::cell::RefCell<Option<Workspace>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 /// Manages the Gru workspace directory structure at `~/.gru`.
 ///
 /// The workspace consists of:
@@ -30,7 +39,27 @@ impl Workspace {
     ///
     /// Initialized on first successful call. Subsequent calls return the same instance.
     /// If initialization fails, the next call will retry (transient errors are not cached).
+    ///
+    /// In test builds, checks for a thread-local override set via
+    /// [`set_test_workspace`] before falling back to the process-wide singleton.
     pub fn global() -> io::Result<&'static Workspace> {
+        #[cfg(test)]
+        {
+            // SAFETY: We transmute the lifetime from the thread-local borrow to 'static.
+            // This is safe because:
+            // 1. The thread-local is only set/cleared within a single test function
+            // 2. The returned reference is used within the same test scope
+            // 3. Tests run on their own thread, so the thread-local outlives all uses
+            let maybe = TEST_WORKSPACE_OVERRIDE.with(|cell| {
+                let borrow = cell.borrow();
+                borrow
+                    .as_ref()
+                    .map(|ws| unsafe { &*(ws as *const Workspace) as &'static Workspace })
+            });
+            if let Some(ws) = maybe {
+                return Ok(ws);
+            }
+        }
         GLOBAL_WORKSPACE.get_or_try_init(Workspace::new)
     }
 
@@ -227,6 +256,45 @@ impl Workspace {
     }
 }
 
+/// Sets a thread-local workspace override for the current test.
+///
+/// While the returned guard is alive, `Workspace::global()` on this thread
+/// will return the provided workspace instead of the process-wide singleton.
+/// The override is automatically cleared when the guard is dropped.
+///
+/// # Example
+///
+/// ```ignore
+/// let tmp = tempfile::tempdir().unwrap();
+/// let _guard = set_test_workspace(tmp.path().to_path_buf()).unwrap();
+/// // Now Workspace::global() returns a workspace rooted at tmp
+/// let ws = Workspace::global().unwrap();
+/// assert!(ws.state().starts_with(tmp.path()));
+/// ```
+#[cfg(test)]
+pub fn set_test_workspace(root: PathBuf) -> io::Result<TestWorkspaceGuard> {
+    let ws = Workspace::init(root)?;
+    TEST_WORKSPACE_OVERRIDE.with(|cell| {
+        *cell.borrow_mut() = Some(ws);
+    });
+    Ok(TestWorkspaceGuard { _private: () })
+}
+
+/// RAII guard that clears the thread-local workspace override on drop.
+#[cfg(test)]
+pub struct TestWorkspaceGuard {
+    _private: (),
+}
+
+#[cfg(test)]
+impl Drop for TestWorkspaceGuard {
+    fn drop(&mut self) {
+        TEST_WORKSPACE_OVERRIDE.with(|cell| {
+            *cell.borrow_mut() = None;
+        });
+    }
+}
+
 /// Resolves the checkout path from a minion directory.
 ///
 /// Prefers `minion_dir/checkout` only if it looks like a Git worktree
@@ -394,5 +462,49 @@ mod tests {
         let metadata = fs::metadata(ws.root()).unwrap();
         let permissions = metadata.permissions();
         assert_eq!(permissions.mode() & 0o777, 0o755);
+    }
+
+    #[test]
+    fn test_set_test_workspace_overrides_global() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = super::set_test_workspace(tmp.path().to_path_buf()).unwrap();
+
+        let ws = Workspace::global().unwrap();
+        assert_eq!(ws.state(), tmp.path().join("state"));
+        assert!(ws.state().exists());
+        assert!(ws.repos().exists());
+        assert!(ws.work().exists());
+    }
+
+    #[test]
+    fn test_set_test_workspace_guard_clears_on_drop() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        {
+            let _guard = super::set_test_workspace(tmp.path().to_path_buf()).unwrap();
+            let ws = Workspace::global().unwrap();
+            assert_eq!(ws.state(), tmp.path().join("state"));
+        }
+
+        // After guard is dropped, global() should no longer return the override.
+        // It will return the real singleton (which may or may not be initialized).
+        // We just verify the override was cleared by checking the thread-local directly.
+        super::TEST_WORKSPACE_OVERRIDE.with(|cell| {
+            assert!(cell.borrow().is_none());
+        });
+    }
+
+    #[test]
+    fn test_minion_id_with_workspace_override() {
+        // Verify that generate_minion_id() respects the workspace override
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = super::set_test_workspace(tmp.path().to_path_buf()).unwrap();
+
+        let id = crate::minion::generate_minion_id().unwrap();
+        assert!(id.starts_with('M'));
+
+        // Counter file should be in the overridden state dir
+        let counter_path = tmp.path().join("state").join("next_id.txt");
+        assert!(counter_path.exists());
     }
 }
