@@ -58,6 +58,7 @@ pub(super) fn build_fix_prompt(ctx: &IssueContext, wt_ctx: &WorktreeContext) -> 
     prompt_ctx.worktree_path = Some(wt_ctx.checkout_path.clone());
     prompt_ctx.minion_dir = Some(wt_ctx.minion_dir.clone());
     prompt_ctx.branch_name = Some(wt_ctx.branch_name.clone());
+    prompt_ctx.minion_id = Some(wt_ctx.minion_id.clone());
 
     let mut variables = prompt_ctx.to_variables();
     // Add the labels variable (fix-specific, not in the standard PromptContext).

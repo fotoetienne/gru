@@ -30,7 +30,7 @@ Respond to all comments and reviews on a GitHub pull request.
 
 ## 5. Update Code
 - For each response, update the code accordingly
-- Commit changes with a descriptive message prefixed with your Minion ID, e.g. `[{{ minion_id }}] Address review feedback`
+- Commit changes with a descriptive message prefixed with your Minion ID (from the branch name), e.g. `[M042] Address review feedback`
 - Push changes to the branch
 
 ## 6. Post follow-up
