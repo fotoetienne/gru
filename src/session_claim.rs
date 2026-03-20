@@ -1,6 +1,4 @@
 use crate::minion_registry::{with_registry, MinionInfo, MinionMode, MinionRegistry};
-#[cfg(test)]
-use anyhow::Context;
 use anyhow::Result;
 use chrono::Utc;
 
@@ -162,6 +160,7 @@ pub(crate) async fn check_and_claim_session_with_dir(
     target_mode: MinionMode,
     graceful: bool,
 ) -> Result<Option<MinionInfo>> {
+    use anyhow::Context as _;
     let id = minion_id.to_string();
     let dir = state_dir.to_path_buf();
     let result = tokio::task::spawn_blocking(move || {
@@ -315,7 +314,8 @@ mod tests {
     #[tokio::test]
     async fn test_dead_pid_resets_and_claims() {
         let tmp = tempdir().unwrap();
-        // Use a PID that definitely doesn't exist
+        // PID 4,194,304 (2^22) exceeds Linux's PID_MAX_LIMIT and typical macOS
+        // pid_max, so it is guaranteed never to be assigned to a live process.
         let dead_pid = 4_194_304_u32;
         let info = MinionInfo {
             mode: MinionMode::Autonomous,
