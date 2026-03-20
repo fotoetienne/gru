@@ -58,7 +58,9 @@ pub async fn handle_rebase(
             );
 
             if push {
-                maybe_force_push(&worktree_path, yes).await?;
+                if !maybe_force_push(&worktree_path, yes).await? {
+                    return Ok(1);
+                }
             } else {
                 println!("ℹ️  Use --push to force-push the rebased branch to origin");
             }
@@ -77,7 +79,9 @@ pub async fn handle_rebase(
             if exit_code == 0 {
                 if push {
                     // Defensively force push in case the /rebase skill didn't push
-                    maybe_force_push(&worktree_path, yes).await?;
+                    if !maybe_force_push(&worktree_path, yes).await? {
+                        return Ok(1);
+                    }
                 } else {
                     println!("ℹ️  Use --push to force-push the rebased branch to origin");
                 }
@@ -376,7 +380,9 @@ pub(crate) async fn abort_rebase(worktree_path: &Path) -> Result<()> {
 }
 
 /// Confirms with the user, then force-pushes. Skips the prompt when `yes` is true.
-async fn maybe_force_push(worktree_path: &Path, yes: bool) -> Result<()> {
+///
+/// Returns `true` if the push happened, `false` if the user cancelled.
+async fn maybe_force_push(worktree_path: &Path, yes: bool) -> Result<bool> {
     let branch = get_current_branch(worktree_path).await.unwrap_or_default();
     println!(
         "⚠️  About to force-push branch '{}' to origin (using --force-with-lease)",
@@ -387,12 +393,12 @@ async fn maybe_force_push(worktree_path: &Path, yes: bool) -> Result<()> {
         println!("Force-push cancelled.");
         println!("ℹ️  Run again with --yes to skip this prompt, or push manually:");
         println!("    git push --force-with-lease origin HEAD");
-        return Ok(());
+        return Ok(false);
     }
 
     force_push(worktree_path).await?;
     println!("🚀 Force-pushed rebased branch");
-    Ok(())
+    Ok(true)
 }
 
 /// Prompts the user to confirm a force-push.
