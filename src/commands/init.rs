@@ -47,8 +47,44 @@ fn check_binary(name: &str) -> bool {
     which::which(name).is_ok()
 }
 
+/// Validate that a `--host` value is a bare hostname (no scheme, path, or special characters).
+fn validate_host(host: &str) -> Result<()> {
+    if host.is_empty() {
+        bail!("Invalid --host value: hostname cannot be empty");
+    }
+    if host.contains(char::is_whitespace) {
+        bail!("Invalid --host value: {:?} contains whitespace", host);
+    }
+    if host.contains("://") {
+        bail!(
+            "Invalid --host value: {:?} looks like a URL — use just the hostname (e.g. \"ghe.example.com\")",
+            host
+        );
+    }
+    if host.contains('/') {
+        bail!(
+            "Invalid --host value: {:?} contains a path — use just the hostname (e.g. \"ghe.example.com\")",
+            host
+        );
+    }
+    if host.contains('@') {
+        bail!(
+            "Invalid --host value: {:?} contains '@' — use just the hostname (e.g. \"ghe.example.com\")",
+            host
+        );
+    }
+    if host.starts_with('.') || host.ends_with('.') {
+        bail!(
+            "Invalid --host value: {:?} has a leading or trailing dot",
+            host
+        );
+    }
+    Ok(())
+}
+
 /// Run prerequisite checks before initialization.
-/// Returns Ok(()) if all critical prerequisites are met, Err with exit code 1 otherwise.
+/// Returns `Ok(0)` if all critical prerequisites are met, or `Ok(1)` if required tools
+/// are missing. The integer value is intended to be used as a process exit code.
 fn check_prerequisites() -> Result<i32> {
     println!("Checking prerequisites...\n");
     let mut has_errors = false;
@@ -93,9 +129,7 @@ fn check_prerequisites() -> Result<i32> {
 pub async fn handle_init(repo_arg: String, host_override: Option<String>) -> Result<i32> {
     // Validate --host early
     if let Some(ref h) = host_override {
-        if h.is_empty() || h.contains(char::is_whitespace) {
-            bail!("Invalid --host value: {:?}", h);
-        }
+        validate_host(h)?;
     }
 
     // Run prerequisite checks
@@ -135,15 +169,16 @@ pub async fn handle_init(repo_arg: String, host_override: Option<String>) -> Res
         Ok(()) => {
             println!("✓ Authenticated via gh CLI");
         }
-        Err(_) => {
-            println!("\n❌ GitHub authentication failed for host: {}", host);
-            println!("\nTo authenticate, run:\n");
-            if host == "github.com" {
-                println!("  gh auth login");
+        Err(e) => {
+            log::debug!("auth check error detail: {:#}", e);
+            eprintln!("\n❌ GitHub authentication failed for host: {}", host);
+            eprintln!("\nTo authenticate, run:\n");
+            if host.eq_ignore_ascii_case("github.com") {
+                eprintln!("  gh auth login");
             } else {
-                println!("  gh auth login --hostname {}", host);
+                eprintln!("  gh auth login --hostname {}", host);
             }
-            println!();
+            eprintln!();
             return Ok(1);
         }
     }
@@ -230,10 +265,10 @@ pub async fn handle_init(repo_arg: String, host_override: Option<String>) -> Res
     }
 
     // Summary
-    let gh_host_flag = if host == "github.com" {
+    let gh_host_prefix = if host.eq_ignore_ascii_case("github.com") {
         String::new()
     } else {
-        format!(" -R {}/{}", owner, repo)
+        format!("GH_HOST={} ", host)
     };
 
     println!("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
@@ -241,9 +276,11 @@ pub async fn handle_init(repo_arg: String, host_override: Option<String>) -> Res
     println!("Next steps:");
     println!("  1. Label an issue for Gru to work on:");
     println!(
-        "     gh issue edit <number> --add-label {}{}",
+        "     {}gh issue edit <number> --add-label {} -R {}/{}",
+        gh_host_prefix,
         labels::TODO,
-        gh_host_flag
+        owner,
+        repo,
     );
     println!("  2. Start a Minion:");
     println!("     gru do {}/{}#<number>", owner, repo);
@@ -341,16 +378,43 @@ mod tests {
     }
 
     #[test]
-    fn test_host_validation() {
-        // Empty and whitespace hosts should be caught by handle_init,
-        // but we can test the validation logic pattern here
-        let empty = "";
-        assert!(empty.is_empty());
+    fn test_validate_host_accepts_valid_hostnames() {
+        assert!(validate_host("github.com").is_ok());
+        assert!(validate_host("ghe.example.com").is_ok());
+        assert!(validate_host("my-github.corp.net").is_ok());
+        assert!(validate_host("localhost").is_ok());
+    }
 
-        let with_space = "ghe. example.com";
-        assert!(with_space.contains(char::is_whitespace));
+    #[test]
+    fn test_validate_host_rejects_empty() {
+        assert!(validate_host("").is_err());
+    }
 
-        let valid = "ghe.example.com";
-        assert!(!valid.is_empty() && !valid.contains(char::is_whitespace));
+    #[test]
+    fn test_validate_host_rejects_whitespace() {
+        assert!(validate_host("ghe. example.com").is_err());
+        assert!(validate_host(" github.com").is_err());
+    }
+
+    #[test]
+    fn test_validate_host_rejects_urls() {
+        assert!(validate_host("https://ghe.example.com").is_err());
+        assert!(validate_host("http://github.com").is_err());
+    }
+
+    #[test]
+    fn test_validate_host_rejects_paths() {
+        assert!(validate_host("ghe.example.com/path").is_err());
+    }
+
+    #[test]
+    fn test_validate_host_rejects_at_sign() {
+        assert!(validate_host("user@ghe.example.com").is_err());
+    }
+
+    #[test]
+    fn test_validate_host_rejects_leading_trailing_dots() {
+        assert!(validate_host(".example.com").is_err());
+        assert!(validate_host("example.com.").is_err());
     }
 }
