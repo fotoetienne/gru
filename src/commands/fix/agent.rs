@@ -93,19 +93,25 @@ pub(super) async fn run_agent_session(
 /// Runs a resumed agent session, continuing from a previous interrupted session.
 ///
 /// Uses the backend's resume command to continue the existing conversation.
+/// If `resume_prompt` is provided, it is used instead of the default continuation prompt.
 pub(super) async fn resume_agent_session(
     backend: &dyn AgentBackend,
     issue_ctx: &IssueContext,
     wt_ctx: &WorktreeContext,
     quiet: bool,
     timeout_opt: Option<&str>,
+    resume_prompt: Option<&str>,
 ) -> Result<AgentResult> {
     println!("🔄 Resuming {} session...\n", backend.name());
-    let prompt = format!(
-        "Continue working on issue #{}. Pick up where you left off. \
-         If you've already completed the implementation, proceed to push and write PR_DESCRIPTION.md.",
-        issue_ctx.issue_num
-    );
+    let prompt = resume_prompt
+        .map(|p| p.to_string())
+        .unwrap_or_else(|| {
+            format!(
+                "Continue working on issue #{}. Pick up where you left off. \
+                 If you've already completed the implementation, proceed to push and write PR_DESCRIPTION.md.",
+                issue_ctx.issue_num
+            )
+        });
     let mut cmd = backend
         .build_resume_command(
             &wt_ctx.checkout_path,

@@ -1,23 +1,18 @@
-use crate::agent::{AgentBackend, AgentEvent};
+use crate::agent::AgentBackend;
 use crate::agent_registry;
-use crate::agent_runner::{
-    is_stuck_or_timeout_error, run_agent_with_stream_monitoring, EXIT_CODE_SIGNAL_TERMINATED,
-};
+use crate::agent_runner::{is_stuck_or_timeout_error, EXIT_CODE_SIGNAL_TERMINATED};
 use crate::commands::fix::{
-    handle_pr_creation, monitor_ci_after_fix, monitor_pr_lifecycle, try_mark_issue_blocked,
-    try_mark_issue_failed, update_orchestration_phase, IssueContext, WorktreeContext,
+    agent_exit_code, create_pr_phase, monitor_pr_phase, run_agent_phase,
+    update_orchestration_phase, IssueContext, WorktreeContext,
 };
 use crate::config::{LabConfig, DEFAULT_MAX_RESUME_ATTEMPTS};
 use crate::minion_registry::{
-    mark_minion_failed, revert_to_stopped, with_registry, MinionMode, MinionRegistry,
-    OrchestrationPhase,
+    mark_minion_failed, revert_to_stopped, with_registry, MinionMode, OrchestrationPhase,
 };
 use crate::minion_resolver;
-use crate::pr_monitor::MonitorResult;
-use crate::progress::{ProgressConfig, ProgressDisplay};
 use crate::session_claim;
 use crate::tmux::TmuxGuard;
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Result};
 use chrono::{DateTime, Utc};
 use tokio::time::Duration;
 use uuid::Uuid;
@@ -29,6 +24,17 @@ fn load_max_resume_attempts() -> u32 {
         .and_then(|p| LabConfig::load_partial(&p).ok())
         .map(|c| c.daemon.max_resume_attempts)
         .unwrap_or(DEFAULT_MAX_RESUME_ATTEMPTS)
+}
+
+/// Context produced by `check_resumption_preconditions`, consumed by `run_resume_pipeline`.
+struct ResumeContext {
+    wt_ctx: WorktreeContext,
+    issue_ctx: IssueContext,
+    backend: Box<dyn AgentBackend>,
+    resume_prompt: Option<String>,
+    start_phase: OrchestrationPhase,
+    effective_timeout: Option<String>,
+    no_watch: bool,
 }
 
 /// Handles the resume command: resumes a stopped Minion in autonomous mode.
@@ -50,6 +56,19 @@ pub async fn handle_resume(
     timeout_opt: Option<String>,
     quiet: bool,
 ) -> Result<i32> {
+    let ctx = check_resumption_preconditions(id, additional_prompt, timeout_opt).await?;
+    run_resume_pipeline(ctx, quiet).await
+}
+
+/// Validates resumption preconditions: resolves the minion, claims the session,
+/// checks attempt count and timeout, builds the prompt, and resolves the backend.
+///
+/// Returns a `ResumeContext` ready for `run_resume_pipeline`.
+async fn check_resumption_preconditions(
+    id: String,
+    additional_prompt: Option<String>,
+    timeout_opt: Option<String>,
+) -> Result<ResumeContext> {
     // Resolve the minion ID (same smart resolution as gru path/attach)
     let minion = minion_resolver::resolve_minion(&id).await?;
 
@@ -169,46 +188,20 @@ pub async fn handle_resume(
     }
 
     // Build the continuation prompt.
-    // Priority: explicit additional_prompt > wake_reason (review-focused) > generic continuation.
+    // Priority: explicit additional_prompt > wake_reason (review-focused) > None (use default).
     //
     // Note: when the lab daemon wakes a minion for new reviews it sets start_phase =
-    // MonitoringPr, so the agent-run branch below (`start_phase <= RunningAgent`) is
-    // skipped and `prompt` is never passed to the agent directly.  In that case
-    // `wake_reason` acts as metadata signalling WHY the minion was woken, and the actual
-    // review response is handled by `monitor_pr_lifecycle`'s own review-detection loop
-    // (which uses `last_review_check_time` as a baseline for new reviews).
-    let prompt = if let Some(ref extra) = additional_prompt {
-        format!(
+    // MonitoringPr, so the agent-run phase is skipped and the prompt is never passed
+    // to the agent directly. In that case `wake_reason` acts as metadata signalling
+    // WHY the minion was woken, and the actual review response is handled by
+    // `monitor_pr_lifecycle`'s own review-detection loop.
+    let resume_prompt = if let Some(ref extra) = additional_prompt {
+        Some(format!(
             "Continue working on this issue. Additional instructions: {}",
             extra
-        )
-    } else if let Some(ref reason) = wake_reason {
-        reason.clone()
+        ))
     } else {
-        format!(
-            "Continue working on issue #{}. Pick up where you left off. \
-             If you've already completed the implementation, proceed to push and write PR_DESCRIPTION.md.",
-            issue_num
-        )
-    };
-
-    // Rename tmux window for the resume session
-    let _tmux_guard = TmuxGuard::new(&format!("gru:{}", minion.minion_id));
-
-    println!(
-        "🔄 Resuming Minion {} in autonomous mode...",
-        minion.minion_id
-    );
-    let checkout_path = minion.checkout_path();
-    println!("📂 Workspace: {}", checkout_path.display());
-
-    // Build WorktreeContext for PR creation
-    let wt_ctx = WorktreeContext {
-        minion_id: minion.minion_id.clone(),
-        branch_name: branch_name.clone(),
-        minion_dir: minion.worktree_path.clone(),
-        checkout_path,
-        session_id: session_uuid,
+        wake_reason
     };
 
     // Resolve the agent backend from registry (use stored agent name)
@@ -244,7 +237,17 @@ pub async fn handle_resume(
     };
 
     // Resolve host from worktree git remote, falling back to config-based inference
-    let host = resolve_host_from_worktree(&wt_ctx.checkout_path, &owner).await;
+    let checkout_path = minion.checkout_path();
+    let host = resolve_host_from_worktree(&checkout_path, &owner).await;
+
+    let wt_ctx = WorktreeContext {
+        minion_id: minion.minion_id.clone(),
+        branch_name,
+        minion_dir: minion.worktree_path.clone(),
+        checkout_path,
+        session_id: session_uuid,
+    };
+
     let issue_ctx = IssueContext {
         owner,
         repo: repo_name,
@@ -253,121 +256,76 @@ pub async fn handle_resume(
         details: None,
     };
 
-    // Phase: Run agent (skip if already past this phase)
-    if start_phase <= OrchestrationPhase::RunningAgent {
-        update_orchestration_phase(&minion.minion_id, OrchestrationPhase::RunningAgent).await;
+    Ok(ResumeContext {
+        wt_ctx,
+        issue_ctx,
+        backend,
+        resume_prompt,
+        start_phase,
+        effective_timeout,
+        no_watch,
+    })
+}
 
-        let claude_result = run_autonomous_agent(
-            &*backend,
-            &wt_ctx,
-            &prompt,
-            quiet,
-            effective_timeout.as_deref(),
-            issue_num,
-            &issue_ctx.host,
-        )
-        .await;
+/// Runs the resume pipeline: agent session, PR creation, and PR monitoring.
+///
+/// Reuses the phase helpers from `fix/worker.rs` to avoid duplicating
+/// orchestration logic.
+async fn run_resume_pipeline(ctx: ResumeContext, quiet: bool) -> Result<i32> {
+    let ResumeContext {
+        wt_ctx,
+        issue_ctx,
+        backend,
+        resume_prompt,
+        start_phase,
+        effective_timeout,
+        no_watch,
+    } = ctx;
 
-        match claude_result {
-            Ok(status) => {
-                if !status.success() {
-                    update_orchestration_phase(&minion.minion_id, OrchestrationPhase::Failed).await;
-                    try_mark_issue_failed(
-                        &issue_ctx.host,
-                        &issue_ctx.owner,
-                        &issue_ctx.repo,
-                        issue_ctx.issue_num,
-                    )
-                    .await;
-                    println!("❌ Claude session exited with non-zero status");
-                    return Ok(status.code().unwrap_or(EXIT_CODE_SIGNAL_TERMINATED));
-                }
-            }
-            Err(e) if is_stuck_or_timeout_error(&e) => {
-                update_orchestration_phase(&minion.minion_id, OrchestrationPhase::Failed).await;
-                try_mark_issue_blocked(
-                    &issue_ctx.host,
-                    &issue_ctx.owner,
-                    &issue_ctx.repo,
-                    issue_ctx.issue_num,
-                )
-                .await;
-                log::error!("🚨 {:#}", e);
-                return Ok(1);
-            }
-            Err(e) => {
-                update_orchestration_phase(&minion.minion_id, OrchestrationPhase::Failed).await;
-                return Err(e);
-            }
+    // Rename tmux window for the resume session
+    let _tmux_guard = TmuxGuard::new(&format!("gru:{}", wt_ctx.minion_id));
+
+    println!(
+        "🔄 Resuming Minion {} in autonomous mode...",
+        wt_ctx.minion_id
+    );
+    println!("📂 Workspace: {}", wt_ctx.checkout_path.display());
+
+    // Phase: Run agent
+    let agent_result = match run_agent_phase(
+        &*backend,
+        &issue_ctx,
+        &wt_ctx,
+        &start_phase,
+        quiet,
+        effective_timeout.as_deref(),
+        resume_prompt.as_deref(),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(e) if is_stuck_or_timeout_error(&e) => {
+            log::error!("🚨 {:#}", e);
+            return Ok(1);
         }
-    } else {
-        println!("⏭️  Skipping agent session (already completed)");
+        Err(e) => return Err(e),
+    };
+
+    // Check agent result — non-zero exit means failure
+    if let Some(ref result) = agent_result {
+        if !result.status.success() {
+            println!("❌ Agent session exited with non-zero status");
+            return Ok(result.status.code().unwrap_or(EXIT_CODE_SIGNAL_TERMINATED));
+        }
     }
 
-    // Phase: Create PR (skip if already past this phase)
-    let pr_number = if start_phase <= OrchestrationPhase::CreatingPr {
-        update_orchestration_phase(&minion.minion_id, OrchestrationPhase::CreatingPr).await;
-
-        let pr_number = match handle_pr_creation(&issue_ctx, &wt_ctx).await {
-            Ok(pr) => pr,
-            Err(e) => {
-                update_orchestration_phase(&minion.minion_id, OrchestrationPhase::Failed).await;
-                return Err(e);
-            }
-        };
-
-        // If handle_pr_creation didn't return a PR number, check the registry
-        // (the PR may have been created in a previous session)
-        match pr_number {
-            Some(pr) => Some(pr),
-            None => {
-                let mid = minion.minion_id.clone();
-                with_registry(move |registry| {
-                    Ok(registry.get(&mid).and_then(|info| info.pr.clone()))
-                })
-                .await
-                .unwrap_or_else(|e| {
-                    log::warn!("Failed to look up PR number from registry: {}", e);
-                    None
-                })
-            }
-        }
-    } else {
-        println!("⏭️  Skipping PR creation (already completed)");
-        let mid = minion.minion_id.clone();
-        with_registry(move |registry| Ok(registry.get(&mid).and_then(|info| info.pr.clone())))
-            .await
-            .unwrap_or_else(|e| {
-                log::warn!("Failed to look up PR number from registry: {}", e);
-                None
-            })
-    };
+    // Phase: Create PR
+    let mut pr_number = create_pr_phase(&issue_ctx, &wt_ctx, &start_phase, false).await?;
 
     // Last resort: discover PR by head branch (handles manual PR creation or missing registry state)
-    let pr_number = match pr_number {
-        Some(pr) => Some(pr),
-        None => {
-            match crate::ci::get_pr_number(
-                &issue_ctx.host,
-                &issue_ctx.owner,
-                &issue_ctx.repo,
-                &wt_ctx.branch_name,
-                None,
-            )
-            .await
-            {
-                Ok(Some(num)) => {
-                    log::info!("Discovered PR #{} by branch name", num);
-                    Some(num.to_string())
-                }
-                Ok(None) => None,
-                Err(e) => {
-                    log::warn!("Failed to discover PR by branch: {}", e);
-                    None
-                }
-            }
-        }
-    };
+    if pr_number.is_none() {
+        pr_number = discover_pr_by_branch(&issue_ctx, &wt_ctx).await;
+    }
 
     // Respect no_watch: skip lifecycle monitoring for fire-and-forget minions
     if no_watch {
@@ -377,64 +335,79 @@ pub async fn handle_resume(
                 pr_num
             );
         }
-        update_orchestration_phase(&minion.minion_id, OrchestrationPhase::Completed).await;
-        println!("✅ Resume completed for Minion {}", minion.minion_id);
-        return Ok(0);
+        update_orchestration_phase(&wt_ctx.minion_id, OrchestrationPhase::Completed).await;
+        cleanup_registry(&wt_ctx.minion_id).await;
+        println!("✅ Resume completed for Minion {}", wt_ctx.minion_id);
+        return Ok(agent_exit_code(&agent_result));
     }
 
-    // Phase: Monitor PR lifecycle (reviews, CI, merge)
-    let mut pr_terminal_result = None;
-    if let Some(ref pr_num) = pr_number {
-        update_orchestration_phase(&minion.minion_id, OrchestrationPhase::MonitoringPr).await;
-        let monitor_timeout = Duration::from_secs(24 * 3600);
-        pr_terminal_result = monitor_pr_lifecycle(
-            &*backend,
-            &issue_ctx,
-            &wt_ctx,
-            pr_num,
-            effective_timeout.as_deref(),
-            None, // review_timeout: use default
-            monitor_timeout,
-        )
-        .await;
+    // Phase: Monitor PR lifecycle (reviews, CI, merge).
+    // When no PR exists, monitor_pr_phase falls back to standalone CI monitoring —
+    // aligning resume behavior with `gru do`.
+    let monitor_timeout = Duration::from_secs(24 * 3600);
+    let monitor_result = monitor_pr_phase(
+        &*backend,
+        &issue_ctx,
+        &wt_ctx,
+        &pr_number,
+        effective_timeout.as_deref(),
+        None, // review_timeout: use default
+        monitor_timeout,
+    )
+    .await;
+
+    if monitor_result.is_err() {
+        cleanup_registry(&wt_ctx.minion_id).await;
+        return Ok(1);
     }
 
-    // CI monitoring (only if a PR exists and wasn't already merged/closed)
-    let skip_ci = matches!(
-        pr_terminal_result,
-        Some(MonitorResult::Merged) | Some(MonitorResult::Closed)
-    );
-    if pr_number.is_some() && !skip_ci {
-        let ci_passed = monitor_ci_after_fix(
-            &issue_ctx.host,
-            &issue_ctx.owner,
-            &issue_ctx.repo,
-            &wt_ctx.branch_name,
-            &wt_ctx.checkout_path,
-            &wt_ctx.minion_id,
-        )
-        .await;
-        match ci_passed {
-            Ok(true) => log::info!("✅ CI checks passed"),
-            Ok(false) => {
-                log::warn!("⚠️  CI checks failed or were escalated");
-                update_orchestration_phase(&minion.minion_id, OrchestrationPhase::Failed).await;
-                try_mark_issue_blocked(
-                    &issue_ctx.host,
-                    &issue_ctx.owner,
-                    &issue_ctx.repo,
-                    issue_ctx.issue_num,
-                )
-                .await;
-                return Ok(1);
-            }
-            Err(e) => log::warn!("⚠️  CI monitoring error (non-fatal): {}", e),
+    update_orchestration_phase(&wt_ctx.minion_id, OrchestrationPhase::Completed).await;
+    cleanup_registry(&wt_ctx.minion_id).await;
+    println!("✅ Resume completed for Minion {}", wt_ctx.minion_id);
+    Ok(agent_exit_code(&agent_result))
+}
+
+/// Best-effort registry cleanup: clear PID and set mode to Stopped.
+///
+/// Mirrors the cleanup in `fix::run_worker` so the minion isn't left in
+/// Autonomous mode after the pipeline finishes.
+async fn cleanup_registry(minion_id: &str) {
+    let mid = minion_id.to_string();
+    let _ = with_registry(move |reg| {
+        reg.update(&mid, |info| {
+            info.clear_pid();
+            info.mode = MinionMode::Stopped;
+        })
+    })
+    .await;
+}
+
+/// Last-resort PR discovery by head branch name.
+///
+/// Handles cases where the PR was created manually or the registry state is missing.
+async fn discover_pr_by_branch(
+    issue_ctx: &IssueContext,
+    wt_ctx: &WorktreeContext,
+) -> Option<String> {
+    match crate::ci::get_pr_number(
+        &issue_ctx.host,
+        &issue_ctx.owner,
+        &issue_ctx.repo,
+        &wt_ctx.branch_name,
+        None,
+    )
+    .await
+    {
+        Ok(Some(num)) => {
+            log::info!("Discovered PR #{} by branch name", num);
+            Some(num.to_string())
+        }
+        Ok(None) => None,
+        Err(e) => {
+            log::warn!("Failed to discover PR by branch: {}", e);
+            None
         }
     }
-
-    update_orchestration_phase(&minion.minion_id, OrchestrationPhase::Completed).await;
-    println!("✅ Resume completed for Minion {}", minion.minion_id);
-    Ok(0)
 }
 
 /// Resolve the GitHub host for a worktree by inspecting its git remote.
@@ -493,71 +466,6 @@ fn extract_host_from_remote_url(url: &str) -> Option<String> {
     } else {
         None
     }
-}
-
-/// Runs the agent in autonomous mode with stream monitoring.
-///
-/// Spawns the agent with resume and stream-json output, tracks progress,
-/// and updates the registry with PID/mode during execution.
-async fn run_autonomous_agent(
-    backend: &dyn AgentBackend,
-    wt_ctx: &WorktreeContext,
-    prompt: &str,
-    quiet: bool,
-    timeout_opt: Option<&str>,
-    issue_num: u64,
-    github_host: &str,
-) -> Result<std::process::ExitStatus> {
-    let mut cmd = backend
-        .build_resume_command(
-            &wt_ctx.checkout_path,
-            &wt_ctx.session_id,
-            prompt,
-            github_host,
-        )
-        .context("Agent backend does not support resume")?;
-    cmd.env("GRU_WORKSPACE", &wt_ctx.minion_id);
-
-    let config = ProgressConfig {
-        minion_id: wt_ctx.minion_id.clone(),
-        issue: issue_num.to_string(),
-        quiet,
-    };
-    let progress = ProgressDisplay::new(config);
-
-    let callback = move |event: &AgentEvent| {
-        progress.handle_event(event);
-    };
-
-    let on_spawn =
-        MinionRegistry::pid_callback(wt_ctx.minion_id.clone(), Some(MinionMode::Autonomous));
-
-    let run_result = run_agent_with_stream_monitoring(
-        cmd,
-        backend,
-        &wt_ctx.minion_dir,
-        timeout_opt,
-        Some(callback),
-        Some(on_spawn),
-    )
-    .await;
-
-    // Cleanup: clear PID, set mode to Stopped, save token usage
-    let token_usage = run_result.as_ref().ok().map(|r| r.token_usage.clone());
-    let exit_minion_id = wt_ctx.minion_id.clone();
-    let _ = with_registry(move |registry| {
-        registry.update(&exit_minion_id, |info| {
-            info.clear_pid();
-            info.mode = MinionMode::Stopped;
-            if let Some(usage) = token_usage {
-                info.token_usage = Some(usage);
-            }
-        })
-    })
-    .await;
-
-    let agent_run = run_result?;
-    Ok(agent_run.status)
 }
 
 #[cfg(test)]

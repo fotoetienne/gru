@@ -9,15 +9,11 @@ mod worktree;
 
 // Re-export public API used by other modules (e.g., resume.rs)
 pub(crate) use helpers::update_orchestration_phase;
-pub(crate) use pr::handle_pr_creation;
-pub use types::FixOptions;
-pub(crate) use types::{IssueContext, WorktreeContext};
-
-pub(crate) use helpers::{try_mark_issue_blocked, try_mark_issue_failed};
-pub(crate) use monitor::monitor_ci_after_fix;
-pub(crate) use monitor::monitor_pr_lifecycle;
 use resolve::{check_existing_minions, claim_issue, resolve_issue};
 use types::ExistingMinionCheck;
+pub use types::FixOptions;
+pub(crate) use types::{IssueContext, WorktreeContext};
+pub(crate) use worker::{agent_exit_code, create_pr_phase, monitor_pr_phase, run_agent_phase};
 use worktree::setup_worktree;
 
 use crate::agent_registry;
@@ -204,6 +200,7 @@ async fn run_worker(minion_id: &str, issue: &str, opts: FixOptions) -> Result<i3
         &start_phase,
         quiet,
         timeout_opt.as_deref(),
+        None, // use default resume prompt
     )
     .await
     {
