@@ -630,21 +630,19 @@ struct AgentRunConfig<'a> {
     quiet: bool,
 }
 
-/// Registers the minion, runs the agent, cleans up registry, and returns the exit code.
-async fn register_and_run_agent(
+/// Builds the registry entry for a new minion.
+fn build_minion_registry_info(
     cfg: &AgentRunConfig<'_>,
     fetched: &FetchedContext,
     ws: &WorkspaceSetup,
-) -> Result<i32> {
-    let backend = agent_registry::resolve_backend(cfg.agent_name)?;
-
+) -> RegistryMinionInfo {
     let repo_display = if let (Some(ref owner), Some(ref repo)) = (&fetched.owner, &fetched.repo) {
         format!("{}/{}", owner, repo)
     } else {
         "ad-hoc".to_string()
     };
     let now = Utc::now();
-    let registry_info = RegistryMinionInfo {
+    RegistryMinionInfo {
         repo: repo_display,
         issue: fetched.issue_number.unwrap_or(0),
         command: "prompt".to_string(),
@@ -667,14 +665,14 @@ async fn register_and_run_agent(
         no_watch: false,
         last_review_check_time: None,
         wake_reason: None,
-    };
+    }
+}
 
-    let minion_id_owned = cfg.minion_id.to_string();
-    with_registry(move |registry| registry.register(minion_id_owned, registry_info)).await?;
-
-    println!("🤖 Launching {}...\n", backend.name());
-
-    // Create progress display
+/// Builds a progress display for tracking agent execution.
+fn build_progress_display(
+    cfg: &AgentRunConfig<'_>,
+    fetched: &FetchedContext,
+) -> std::sync::Arc<ProgressDisplay> {
     let issue_display = if let Some(issue_num) = fetched.issue_number {
         format!(
             "#{}: {}",
@@ -699,14 +697,75 @@ async fn register_and_run_agent(
         issue: issue_display,
         quiet: cfg.quiet,
     };
-    let progress = std::sync::Arc::new(ProgressDisplay::new(config));
+    std::sync::Arc::new(ProgressDisplay::new(config))
+}
+
+/// Best-effort cleanup after agent run: clears PID, sets mode to Stopped,
+/// and persists token usage regardless of exit status.
+async fn cleanup_agent_run(minion_id: &str, token_usage: Option<crate::agent::TokenUsage>) {
+    let cleanup_id = minion_id.to_string();
+    let _ = with_registry(move |registry| {
+        registry.update(&cleanup_id, |info| {
+            info.clear_pid();
+            info.mode = MinionMode::Stopped;
+            if let Some(usage) = token_usage {
+                info.token_usage = Some(usage);
+            }
+        })
+    })
+    .await;
+}
+
+/// Interprets the agent exit status and prints appropriate result messages.
+fn handle_agent_result(
+    status: std::process::ExitStatus,
+    progress: &ProgressDisplay,
+    cfg: &AgentRunConfig<'_>,
+    ws: &WorkspaceSetup,
+) -> i32 {
+    if status.success() {
+        progress.finish_with_message("✅ Task completed");
+        println!("\n📁 Session workspace: {}", ws.workspace_path.display());
+        println!(
+            "💡 To resume this session, use: gru resume {}",
+            cfg.minion_id
+        );
+        0
+    } else {
+        let exit_code = status.code().unwrap_or(EXIT_CODE_SIGNAL_TERMINATED);
+        progress.finish_with_message(&format!("❌ Task failed (exit code: {})", exit_code));
+        println!(
+            "\n📝 Events saved to: {}",
+            ws.workspace_path.join("events.jsonl").display()
+        );
+        println!(
+            "📄 Prompt saved to: {}",
+            ws.workspace_path.join("prompt.txt").display()
+        );
+        exit_code
+    }
+}
+
+/// Registers the minion, runs the agent, cleans up registry, and returns the exit code.
+async fn register_and_run_agent(
+    cfg: &AgentRunConfig<'_>,
+    fetched: &FetchedContext,
+    ws: &WorkspaceSetup,
+) -> Result<i32> {
+    let backend = agent_registry::resolve_backend(cfg.agent_name)?;
+
+    let registry_info = build_minion_registry_info(cfg, fetched, ws);
+    let minion_id_owned = cfg.minion_id.to_string();
+    with_registry(move |registry| registry.register(minion_id_owned, registry_info)).await?;
+
+    println!("🤖 Launching {}...\n", backend.name());
+
+    let progress = build_progress_display(cfg, fetched);
 
     let github_host_owned;
     let github_host = if let Some(h) = fetched.host.as_deref().or(fetched.pr_host.as_deref()) {
         h
     } else {
-        // Ad-hoc prompt without --issue or --pr: resolve from worktree git remote
-        // so GHE repos are handled correctly.
         github_host_owned = super::resume::resolve_host_from_worktree(&ws.run_dir, "").await;
         &github_host_owned
     };
@@ -718,7 +777,6 @@ async fn register_and_run_agent(
     );
     cmd.env("GRU_WORKSPACE", cfg.minion_id);
 
-    // Record child PID on spawn; mode is already set to Autonomous at registration.
     let minion_id = cfg.minion_id.to_string();
     let on_spawn = MinionRegistry::pid_callback(minion_id.clone(), None);
 
@@ -737,25 +795,10 @@ async fn register_and_run_agent(
     )
     .await;
 
-    // Best-effort cleanup: clear PID, set mode to Stopped, and save token usage.
-    // Token usage is persisted regardless of exit status because cost data is
-    // valuable even for failed tasks.
     let token_usage = run_result.as_ref().ok().map(|r| r.token_usage.clone());
-    let cleanup_id = minion_id.clone();
-    let _ = with_registry(move |registry| {
-        registry.update(&cleanup_id, |info| {
-            info.clear_pid();
-            info.mode = MinionMode::Stopped;
-            if let Some(usage) = token_usage {
-                info.token_usage = Some(usage);
-            }
-        })
-    })
-    .await;
+    cleanup_agent_run(&minion_id, token_usage).await;
 
-    // Now check if there was a stream error (after cleanup)
     let agent_run = run_result?;
-    let status = agent_run.status;
 
     if agent_run.token_usage.total_tokens() > 0 {
         log::info!(
@@ -764,27 +807,7 @@ async fn register_and_run_agent(
         );
     }
 
-    if status.success() {
-        progress.finish_with_message("✅ Task completed");
-        println!("\n📁 Session workspace: {}", ws.workspace_path.display());
-        println!(
-            "💡 To resume this session, use: gru resume {}",
-            cfg.minion_id
-        );
-        Ok(0)
-    } else {
-        let exit_code = status.code().unwrap_or(EXIT_CODE_SIGNAL_TERMINATED);
-        progress.finish_with_message(&format!("❌ Task failed (exit code: {})", exit_code));
-        println!(
-            "\n📝 Events saved to: {}",
-            ws.workspace_path.join("events.jsonl").display()
-        );
-        println!(
-            "📄 Prompt saved to: {}",
-            ws.workspace_path.join("prompt.txt").display()
-        );
-        Ok(exit_code)
-    }
+    Ok(handle_agent_result(agent_run.status, &progress, cfg, ws))
 }
 
 /// Renders the prompt template with context variables and saves it to the workspace.
