@@ -1,18 +1,38 @@
-# Gru: Local-First LLM Agent Orchestrator
+# Gru
 
-Gru is a local-first LLM agent orchestrator that autonomously works on GitHub issues. It manages "Minions" (agent sessions) that claim issues, implement fixes, create PRs, monitor CI, and respond to reviews.
+[![CI](https://github.com/fotoetienne/gru/actions/workflows/ci.yml/badge.svg)](https://github.com/fotoetienne/gru/actions/workflows/ci.yml)
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 
-Gru supports multiple agent backends — currently [Claude Code](https://github.com/anthropics/claude-code) and [OpenAI Codex](https://github.com/openai/codex) — with a pluggable architecture for adding more.
+**Local-first LLM agent orchestrator for GitHub issues.**
+
+Point Gru at an issue. It creates an isolated worktree, spawns an AI coding agent, implements the fix, opens a PR, monitors CI, responds to reviews, and iterates until done — all without touching your working directory.
+
+Gru is **agent-agnostic**. It ships with backends for [Claude Code](https://github.com/anthropics/claude-code) and [OpenAI Codex](https://github.com/openai/codex), and its pluggable architecture makes it straightforward to add more.
+
+## Quick Start
+
+```bash
+# Install
+cargo install --path .
+
+# Initialize a repo
+gru init owner/repo
+
+# Fix an issue — Gru handles the rest
+gru do 42
+```
+
+That's it. Gru creates a worktree, spawns the agent, opens a PR, and monitors CI and reviews autonomously.
 
 ## Installation
 
 ### Prerequisites
 
 - [Rust](https://rustup.rs/) (1.73 or later)
+- [GitHub CLI](https://cli.github.com/) (`gh`), authenticated
 - At least one agent backend:
-  - [Claude Code CLI](https://github.com/anthropics/claude-code) (default)
-  - [OpenAI Codex CLI](https://github.com/openai/codex) (optional)
-- Git and GitHub CLI (`gh`) recommended
+  - [Claude Code](https://github.com/anthropics/claude-code) (default) — `npm install -g @anthropic-ai/claude-code`
+  - [OpenAI Codex](https://github.com/openai/codex) (optional) — `npm install -g @openai/codex`
 
 ### Install from Source
 
@@ -22,245 +42,154 @@ cd gru
 cargo install --path .
 ```
 
-This will install the `gru` binary to `~/.cargo/bin/gru`.
+The `gru` binary is installed to `~/.cargo/bin/gru`. Make sure `~/.cargo/bin` is on your `$PATH`.
+
+For a detailed walkthrough, see [docs/GETTING_STARTED.md](docs/GETTING_STARTED.md).
 
 ## Usage
 
-### Core Commands
-
-**`gru do <issue>`** - Work on a GitHub issue autonomously
-
-Creates a worktree, spawns Claude CLI, monitors progress via stream parsing, creates a PR, monitors CI and reviews, and iterates until done.
+### Work on Issues
 
 ```bash
-# Work on an issue by number (must be run from within the repo)
+# By issue number (from within the repo)
 gru do 42
 
-# Work on an issue by URL (works from anywhere)
+# By URL (from anywhere)
 gru do https://github.com/owner/repo/issues/42
 
-# With timeout
+# With a timeout
 gru do 42 --timeout 30m
 
-# Use a specific agent backend
+# Using a different agent backend
 gru do 42 --agent codex
 ```
 
-**`gru review <pr>`** - Review a GitHub pull request using the configured agent backend
+Gru creates an isolated git worktree, spawns the agent, streams progress to your terminal, opens a PR when ready, then monitors CI and reviews — fixing failures and responding to feedback automatically.
+
+### Review PRs
 
 ```bash
 gru review 42
 gru review https://github.com/owner/repo/pull/42
 ```
 
-**`gru chat`** - Start an interactive project-aware chat session
+### Interactive Chat
 
 ```bash
 gru chat
 gru chat --repo owner/repo
 ```
 
-**`gru prompt <name>`** - Run a custom or built-in prompt
+### Custom Prompts
 
 ```bash
-# Run a named prompt
 gru prompt my-prompt --issue 42
-
-# List available prompts
-gru prompts
+gru prompts                        # List available prompts
 ```
 
-### Agent Backends
+### Manage Minions
 
-Gru supports multiple agent backends via the `--agent` flag. The default is `claude`.
+Each agent session is a "Minion." Track and control them with:
 
 ```bash
-# Use Claude Code (default)
-gru do 42
+gru status              # List all active Minions
+gru status M001         # Details for a specific Minion
+gru logs M001           # View event stream
+gru attach M001         # Attach terminal to a running Minion
+gru stop M001           # Pause a Minion
+gru resume M001         # Resume a stopped Minion
+gru rebase M001         # Rebase a Minion's branch onto latest base
+gru path M001           # Print the Minion's worktree path
+gru clean               # Remove worktrees for merged/closed PRs
+```
 
-# Use OpenAI Codex
-gru do 42 --agent codex
+### Multi-Agent Support
 
-# Agent flag works with review and prompt commands too
+Gru is not tied to any single AI backend. Use the `--agent` flag to switch:
+
+```bash
+gru do 42                   # Claude Code (default)
+gru do 42 --agent codex     # OpenAI Codex
 gru review 42 --agent codex
 gru prompt my-prompt --agent codex
 ```
 
-Set a default backend in `~/.gru/config.toml`:
+Set a default in `~/.gru/config.toml`:
 
 ```toml
 [agent]
 default = "codex"
-
-[agent.claude]
-binary = "/usr/local/bin/claude"   # Optional: override binary path
 ```
 
 `gru status` shows which agent each Minion is using:
 
 ```
-MINION   AGENT    REPO                 ISSUE  TASK       PR       BRANCH                         MODE                   UPTIME   TOKENS
-M001     claude   owner/repo           #42    do         #43      minion/issue-42-M001           monitoring (PR ready)  5m       1.2M
-M002     codex    owner/repo           #44    do         -        minion/issue-44-M002           working                2m       -
+MINION   AGENT    REPO         ISSUE  TASK  PR    BRANCH                MODE                   UPTIME   TOKENS
+M001     claude   owner/repo   #42    do    #43   minion/issue-42-M001  monitoring (PR ready)  5m       1.2M
+M002     codex    owner/repo   #44    do    -     minion/issue-44-M002  working                2m       -
 ```
 
-See [docs/AGENTS.md](docs/AGENTS.md) for setup instructions for each backend.
+See [docs/AGENTS.md](docs/AGENTS.md) for setup details and feature comparison.
 
-### Minion Management
+## Lab Mode
+
+Run Gru as a daemon that continuously polls for `gru:todo` issues and spawns Minions to work on them:
 
 ```bash
-gru status              # List all active Minions
-gru status M001         # Show details for a specific Minion
-gru logs M001           # View a Minion's event stream
-gru attach M001         # Attach terminal to a running Minion
-gru stop M001           # Stop a running Minion
-gru resume M001         # Resume a stopped Minion
-gru rebase M001         # Rebase a Minion's branch
-gru path M001           # Print worktree path for a Minion
-gru clean               # Remove worktrees for merged/closed PRs
+gru lab --repos owner/repo
 ```
 
-### Workspace Setup
+Or configure repos in `~/.gru/config.toml` and run `gru lab` with no arguments:
+
+```toml
+[daemon]
+repos = ["owner/frontend", "owner/backend"]
+max_slots = 4
+poll_interval_secs = 30
+```
+
+## Configuration
+
+All configuration lives in `~/.gru/config.toml`. Everything is optional — Gru works out of the box with sensible defaults.
+
+Copy the annotated example to get started:
 
 ```bash
-gru init owner/repo                 # Initialize workspace for a repo
-gru lab --repos owner/repo          # Start daemon mode with explicit repos
-# or configure repos in ~/.gru/config.toml and run: gru lab
+cp docs/config.example.toml ~/.gru/config.toml
 ```
 
-### Other Commands
+Key options: default agent backend, polling intervals, concurrency slots, merge confidence thresholds, and GitHub Enterprise Server hosts. See [docs/config.example.toml](docs/config.example.toml) for the full reference.
 
-```bash
-gru --version           # Show version
-gru --help              # Show help
-gru do --help           # Show help for do command
-```
+## How It Works
 
-## Error Handling
-
-Gru provides helpful error messages:
-
-- **Invalid issue format**: Clear examples of valid formats (number or GitHub URL)
-- **Claude CLI not found**: Direct link to installation instructions
-- **Other errors**: Contextual error messages with actionable information
-
-## Development
-
-### Building
-
-```bash
-cargo build
-```
-
-### Running Tests
-
-This project uses [cargo-nextest](https://nexte.st/) as the test runner. Install it first:
-
-```bash
-cargo install cargo-nextest
-```
-
-Then run tests:
-
-```bash
-cargo nextest run
-```
-
-### Running Clippy
-
-```bash
-cargo clippy
-```
-
-### Using Just (optional)
-
-This project includes a [Justfile](https://just.systems/) for common tasks:
-
-```bash
-just build   # Build the project
-just test    # Run tests
-just lint    # Run clippy
-just check   # Run all checks
-```
-
-For a full list of commands with descriptions, run `just --list`.
-
-### Pre-commit Hooks
-
-This project includes pre-commit hooks to ensure code quality before commits are made. The hooks automatically run:
-
-- **Code formatting check** (`just fmt-check`) - Ensures code follows Rust formatting standards
-- **Linting** (`just lint`) - Catches common mistakes and enforces best practices across all code including tests
-- **Tests** (`just test`) - Validates that all tests pass
-- **Branch protection** - Prevents direct commits to the main branch
-- **TODO/FIXME check** - Warns about TODO/FIXME comments (warning only, doesn't block commits)
-
-#### Installing Hooks
-
-To enable the pre-commit hooks, run:
-
-```bash
-git config core.hooksPath .githooks
-```
-
-This tells git to use hooks from the `.githooks/` directory. Simple and standard!
-
-#### Bypassing Hooks
-
-In emergencies, you can bypass the hooks using:
-
-```bash
-git commit --no-verify
-```
-
-**Note:** Use this sparingly, as it skips important code quality checks.
+1. `gru init owner/repo` creates a bare git mirror at `~/.gru/repos/`
+2. `gru do 42` creates an isolated worktree under `~/.gru/work/`, spawns the agent, and monitors its progress via streaming JSON
+3. The agent reads the issue, explores the code, makes changes, and runs tests
+4. Gru opens a PR, watches CI, and feeds failures back to the agent for auto-fix
+5. Review comments are forwarded to the agent for responses
+6. Labels (`gru:todo` → `gru:in-progress` → `gru:done`) track state on GitHub
 
 ## Roadmap
 
-Gru is being developed in phases. V1 is feature-complete with worktree management, lab mode, CI monitoring, and PR lifecycle management.
+V1 is feature-complete: autonomous issue fixing, worktree isolation, lab mode, CI monitoring, PR lifecycle management, multi-agent backends, and Minion management.
 
-### Completed (V1)
-- Autonomous issue fixing with full PR lifecycle
-- Git worktree isolation (`~/.gru/work/`, `~/.gru/repos/`)
-- Lab mode — continuous polling with configurable slots
-- CI monitoring and auto-fix (up to 3 attempts)
-- PR review monitoring and automated responses
-- Minion management (attach, stop, resume, rebase)
-- Custom prompt system with template variables
-- Persistent Minion registry
-
-### Future Phases
-- **V2:** Multi-Lab coordination, distributed locking via GitHub Projects
-- **V3:** Tower web UI, WebSocket live updates, OAuth auth
-- **V4:** Issue dependency DAG, RAG embeddings, learned prioritization
-- **V5:** Multi-repo orchestration, cost accounting, notifications
-
-## Architecture
-
-Gru's long-term vision includes three main components:
-
-- **Lab**: Local worker that manages Minions and processes GitHub issues
-- **Tower** (optional): Web UI and relay for remote access to Labs
-- **GitHub**: Acts as the distributed database using issues, labels, and PRs
-
-See [ARCHITECTURE.md](ARCHITECTURE.md) for the complete architecture documentation (coming soon).
+Future plans include multi-Lab coordination (V2), a web UI (V3), issue dependency graphs (V4), and multi-repo orchestration (V5). See [docs/DESIGN.md](docs/DESIGN.md) for the full architecture vision.
 
 ## Contributing
 
-Contributions are welcome! Please feel free to submit issues and pull requests.
+Contributions are welcome! See [CONTRIBUTING.md](CONTRIBUTING.md) for dev setup, build commands, testing, and PR workflow.
 
 ## License
 
-This project is licensed under the [Apache License, Version 2.0](LICENSE).
+[Apache License, Version 2.0](LICENSE)
 
 ## Related Projects
 
-- [Claude Code](https://github.com/anthropics/claude-code) - Official CLI for Claude
-- [Claude Agent SDK](https://github.com/anthropics/claude-agent-sdk) - Agent protocol implementation
-- [Happy](https://happy.engineering/) - Mobile client for controlling Claude Code remotely
-- [Emdash](https://github.com/generalaction/emdash) - Coding agent orchestration layer supporting 15+ CLIs with parallel execution
-- [Code Conductor](https://github.com/ryanmac/code-conductor) - Run multiple Claude Code sub-agents in parallel with GitHub-native orchestration
-- [Beads](https://github.com/steveyegge/beads) - Git-backed issue tracker giving coding agents persistent memory across sessions
-- [Worktree CLI](https://github.com/agenttools/worktree) - Git worktree management for coding agents with isolated workspaces
-- [Vibe Kanban](https://www.vibekanban.com/) - Local orchestration platform for running multiple AI coding agents in parallel with kanban-style task management
-- [Cowork](https://support.claude.com/en/articles/13345190-getting-started-with-cowork) - Claude Desktop feature for autonomous multi-step task execution
+- [Claude Code](https://github.com/anthropics/claude-code) — CLI for Claude
+- [OpenAI Codex](https://github.com/openai/codex) — CLI for OpenAI models
+- [Emdash](https://github.com/generalaction/emdash) — Orchestration layer supporting 15+ agent CLIs
+- [Code Conductor](https://github.com/ryanmac/code-conductor) — Parallel Claude Code sub-agents with GitHub-native orchestration
+- [Beads](https://github.com/steveyegge/beads) — Git-backed issue tracker with persistent agent memory
+- [Worktree CLI](https://github.com/agenttools/worktree) — Git worktree management for coding agents
+- [Vibe Kanban](https://www.vibekanban.com/) — Local orchestration with kanban-style task management
+- [Cowork](https://support.claude.com/en/articles/13345190-getting-started-with-cowork) — Claude Desktop autonomous task execution
