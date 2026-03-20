@@ -792,42 +792,54 @@ async fn resume_interrupted_minions(
                 // Issue is still open — but the PR may already be merged
                 // (e.g. PR body lacked "Closes #N" so the issue wasn't auto-closed).
                 if let Some(pr_str) = &candidate.info.pr {
-                    if let Ok(pr_num) = pr_str.parse::<u64>() {
-                        match github::is_pr_open_via_cli(owner, repo_name, &host, pr_num).await {
-                            Ok(true) => {} // PR still open, proceed with resume
-                            Ok(false) => {
-                                tprintln!(
-                                    "⏭️  Skipping {} (issue #{}, {}): PR #{} is merged/closed",
+                    match pr_str.parse::<u64>() {
+                        Ok(pr_num) => {
+                            match github::is_pr_open_via_cli(owner, repo_name, &host, pr_num).await
+                            {
+                                Ok(true) => {} // PR still open, proceed with resume
+                                Ok(false) => {
+                                    tprintln!(
+                                        "⏭️  Skipping {} (issue #{}, {}): PR #{} is merged/closed",
+                                        candidate.minion_id,
+                                        candidate.info.issue,
+                                        candidate.info.repo,
+                                        pr_num,
+                                    );
+                                    let mid = candidate.minion_id.clone();
+                                    if let Err(e) = with_registry(move |reg| {
+                                        reg.update(&mid, |info| {
+                                            info.orchestration_phase =
+                                                OrchestrationPhase::Completed;
+                                        })
+                                    })
+                                    .await
+                                    {
+                                        log::warn!(
+                                            "Failed to mark {} as completed: {}",
+                                            candidate.minion_id,
+                                            e
+                                        );
+                                    }
+                                    continue;
+                                }
+                                Err(e) => {
+                                    log::warn!(
+                                    "⚠️  Failed to check PR #{} state for {} (issue #{}): {} — will retry next poll",
+                                    pr_num,
                                     candidate.minion_id,
                                     candidate.info.issue,
-                                    candidate.info.repo,
-                                    pr_num,
-                                );
-                                let mid = candidate.minion_id.clone();
-                                if let Err(e) = with_registry(move |reg| {
-                                    reg.update(&mid, |info| {
-                                        info.orchestration_phase = OrchestrationPhase::Completed;
-                                    })
-                                })
-                                .await
-                                {
-                                    log::warn!(
-                                        "Failed to mark {} as completed: {}",
-                                        candidate.minion_id,
-                                        e
-                                    );
-                                }
-                                continue;
-                            }
-                            Err(e) => {
-                                log::warn!(
-                                    "⚠️  Failed to check PR #{} state for {}: {} — skipping to be safe",
-                                    pr_num,
-                                    candidate.minion_id,
                                     e,
                                 );
-                                continue;
+                                    continue;
+                                }
                             }
+                        }
+                        Err(_) => {
+                            log::warn!(
+                                "Minion {} has unparseable PR value '{}', skipping PR check",
+                                candidate.minion_id,
+                                pr_str,
+                            );
                         }
                     }
                 }
