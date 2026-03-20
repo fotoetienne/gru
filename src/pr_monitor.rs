@@ -125,7 +125,10 @@ fn count_completed_failures(check_runs: &[CheckRun]) -> Option<usize> {
 const READY_TO_MERGE_LABEL: &str = labels::READY_TO_MERGE;
 const AUTO_MERGE_LABEL: &str = labels::AUTO_MERGE;
 
-/// Ensure a label exists in the repository, creating it if needed (idempotent via `--force`).
+/// Ensure a label exists in the repository with canonical color/description.
+///
+/// Uses `gh label create --force` which creates the label if missing or updates
+/// it if it already exists, keeping labels consistent with their definitions.
 async fn ensure_label_exists(host: &str, owner: &str, repo: &str, label_name: &str) -> Result<()> {
     let (color, description) =
         labels::get_label_info(label_name).expect("label must be in ALL_LABELS");
@@ -1581,8 +1584,6 @@ mod tests {
         let result: Result<PullRequest, _> = serde_json::from_str(json);
         assert!(result.is_err());
     }
-
-    // calculate_retry_delay and is_retryable_error tests have moved to github.rs
 
     // ========================================================================
     // PullRequest Mergeable Field Tests
