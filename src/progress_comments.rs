@@ -63,6 +63,23 @@ pub fn minion_signature(id: &str) -> String {
     format!("\n\n<sub>🤖 {}</sub>", id)
 }
 
+/// Format an escalation comment with a consistent structure.
+///
+/// All escalation paths (CI failures, rebase conflicts, etc.) share this
+/// envelope so that downstream tooling can identify escalations uniformly.
+///
+/// - `reason` — short heading shown after the 🚨 emoji (e.g. "CI Fix Escalation")
+/// - `detail` — the full markdown body (check lists, error messages, etc.)
+/// - `minion_id` — appended as the standard minion signature
+pub fn format_escalation_comment(reason: &str, detail: &str, minion_id: &str) -> String {
+    format!(
+        "## 🚨 {}\n\n{}{}",
+        reason,
+        detail,
+        minion_signature(minion_id)
+    )
+}
+
 /// Tracks progress and manages comment posting
 pub struct ProgressCommentTracker {
     minion_id: String,
@@ -102,6 +119,16 @@ impl ProgressCommentTracker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_format_escalation_comment() {
+        let comment =
+            format_escalation_comment("CI Fix Escalation", "Something went wrong.\n", "M042");
+        assert_eq!(
+            comment,
+            "## 🚨 CI Fix Escalation\n\nSomething went wrong.\n\n\n<sub>🤖 M042</sub>"
+        );
+    }
 
     #[test]
     fn test_minion_signature() {
