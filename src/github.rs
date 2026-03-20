@@ -258,18 +258,28 @@ pub async fn is_issue_still_eligible(owner: &str, repo: &str, host: &str, number
     match result {
         Ok(stdout) => match serde_json::from_str::<RevalidationInfo>(&stdout) {
             Ok(info) => {
-                if info.state == "CLOSED" {
-                    log::info!("⏭️  Issue #{} was closed since last poll, skipping", number);
+                if info.state != "OPEN" {
+                    log::info!(
+                        "⏭️  Issue #{} is no longer open (state: {}), skipping",
+                        number,
+                        info.state
+                    );
                     return false;
                 }
-                if info
+                let ineligible_labels = [
+                    crate::labels::IN_PROGRESS,
+                    crate::labels::DONE,
+                    crate::labels::FAILED,
+                ];
+                if let Some(label) = info
                     .labels
                     .iter()
-                    .any(|l| l.name == crate::labels::IN_PROGRESS)
+                    .find(|l| ineligible_labels.contains(&l.name.as_str()))
                 {
                     log::info!(
-                        "⏭️  Issue #{} was claimed (gru:in-progress) since last poll, skipping",
-                        number
+                        "⏭️  Issue #{} has ineligible label ({}) since last poll, skipping",
+                        number,
+                        label.name
                     );
                     return false;
                 }
