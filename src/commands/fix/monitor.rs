@@ -382,14 +382,14 @@ impl MonitorLoopState {
     }
 }
 
-async fn handle_merged(state: &mut MonitorLoopState, ctx: &MonitorContext<'_>) -> LoopAction {
+fn handle_merged(state: &mut MonitorLoopState, ctx: &MonitorContext<'_>) -> LoopAction {
     println!("✅ PR #{} was merged successfully!", ctx.pr_number);
     println!("🎉 Issue {} is complete!", ctx.issue_ctx.issue_num);
     state.terminal_result = Some(MonitorResult::Merged);
     LoopAction::Break
 }
 
-async fn handle_closed(state: &mut MonitorLoopState, ctx: &MonitorContext<'_>) -> LoopAction {
+fn handle_closed(state: &mut MonitorLoopState, ctx: &MonitorContext<'_>) -> LoopAction {
     println!("⚠️  PR #{} was closed without merging", ctx.pr_number);
     println!("   The issue may need to be reopened or addressed differently");
     state.terminal_result = Some(MonitorResult::Closed);
@@ -875,8 +875,8 @@ async fn handle_pr_event(
     }
 
     match event {
-        Ok((MonitorResult::Merged, _)) => handle_merged(state, ctx).await,
-        Ok((MonitorResult::Closed, _)) => handle_closed(state, ctx).await,
+        Ok((MonitorResult::Merged, _)) => handle_merged(state, ctx),
+        Ok((MonitorResult::Closed, _)) => handle_closed(state, ctx),
         Ok((MonitorResult::ReadyToMerge, _)) => handle_ready_to_merge(state, ctx).await,
         Ok((MonitorResult::NewReviews(comments), check_time)) => {
             handle_new_reviews(state, ctx, comments, check_time).await
@@ -1031,8 +1031,9 @@ pub(crate) async fn monitor_pr_lifecycle(
     };
 
     loop {
-        // Compute remaining time so the timeout spans the entire lifecycle,
-        // not just a single monitor_pr invocation.
+        // Guard: check if the outer lifecycle budget is exhausted before starting
+        // a new monitor_pr call. Distinct from MonitorResult::Timeout, which fires
+        // when monitor_pr's own polling loop exceeds the remaining duration.
         let remaining = ctx
             .monitor_timeout
             .checked_sub(state.monitor_start.elapsed());
