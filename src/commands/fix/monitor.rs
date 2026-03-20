@@ -328,6 +328,571 @@ async fn trigger_pr_review(
     }
 }
 
+/// Controls the monitoring loop flow after handling a PR event.
+enum LoopAction {
+    /// Continue to the next poll iteration.
+    Continue,
+    /// Break out of the monitoring loop.
+    Break,
+}
+
+/// Immutable context shared across all event handlers.
+struct MonitorContext<'a> {
+    backend: &'a dyn AgentBackend,
+    issue_ctx: &'a IssueContext,
+    wt_ctx: &'a WorktreeContext,
+    pr_number: &'a str,
+    timeout_opt: Option<&'a str>,
+    monitor_timeout: Duration,
+}
+
+/// Mutable state tracked across monitoring loop iterations.
+struct MonitorLoopState {
+    review_round: usize,
+    ci_escalated: bool,
+    issue_was_blocked: bool,
+    rebase_attempts: usize,
+    judge_state: JudgeState,
+    judge_label_ensured: bool,
+    terminal_result: Option<MonitorResult>,
+    consecutive_errors: u32,
+    review_baseline: Option<DateTime<Utc>>,
+    monitor_start: tokio::time::Instant,
+    confidence_threshold: u8,
+}
+
+/// 10 consecutive monitor_pr invocation failures before giving up.
+const MAX_CONSECUTIVE_ERRORS: u32 = 10;
+
+impl MonitorLoopState {
+    fn new(initial_baseline: DateTime<Utc>, confidence_threshold: u8) -> Self {
+        Self {
+            review_round: 0,
+            ci_escalated: false,
+            issue_was_blocked: false,
+            rebase_attempts: 0,
+            judge_state: JudgeState::new(),
+            judge_label_ensured: false,
+            terminal_result: None,
+            consecutive_errors: 0,
+            review_baseline: Some(initial_baseline),
+            monitor_start: tokio::time::Instant::now(),
+            confidence_threshold,
+        }
+    }
+}
+
+fn handle_merged(state: &mut MonitorLoopState, ctx: &MonitorContext<'_>) -> LoopAction {
+    println!("✅ PR #{} was merged successfully!", ctx.pr_number);
+    println!("🎉 Issue {} is complete!", ctx.issue_ctx.issue_num);
+    state.terminal_result = Some(MonitorResult::Merged);
+    LoopAction::Break
+}
+
+fn handle_closed(state: &mut MonitorLoopState, ctx: &MonitorContext<'_>) -> LoopAction {
+    println!("⚠️  PR #{} was closed without merging", ctx.pr_number);
+    println!("   The issue may need to be reopened or addressed differently");
+    state.terminal_result = Some(MonitorResult::Closed);
+    LoopAction::Break
+}
+
+async fn handle_ready_to_merge(
+    state: &mut MonitorLoopState,
+    ctx: &MonitorContext<'_>,
+) -> LoopAction {
+    // All merge gates pass — remove gru:blocked if it was stale
+    if state.issue_was_blocked {
+        if let Ok(pr_num) = ctx.pr_number.parse::<u64>() {
+            super::helpers::try_remove_blocked_label(
+                &ctx.issue_ctx.host,
+                &ctx.issue_ctx.owner,
+                &ctx.issue_ctx.repo,
+                pr_num,
+                ctx.issue_ctx.issue_num,
+            )
+            .await;
+        }
+        state.issue_was_blocked = false;
+        state.ci_escalated = false;
+    }
+
+    // Lazily ensure the gru:needs-human-review label exists on
+    // first ReadyToMerge, rather than unconditionally at startup.
+    if !state.judge_label_ensured {
+        if let Err(e) = merge_judge::ensure_needs_human_review_label(
+            &ctx.issue_ctx.host,
+            &ctx.issue_ctx.owner,
+            &ctx.issue_ctx.repo,
+        )
+        .await
+        {
+            log::warn!("⚠️  Failed to ensure gru:needs-human-review label: {}", e);
+        }
+        state.judge_label_ensured = true;
+    }
+
+    // Check if gru:needs-human-review was previously applied and
+    // not yet cleared — skip judge until human removes it.
+    // On API failure, be conservative and skip (don't proceed).
+    match merge_judge::has_needs_human_review_label(
+        &ctx.issue_ctx.host,
+        &ctx.issue_ctx.owner,
+        &ctx.issue_ctx.repo,
+        ctx.pr_number,
+    )
+    .await
+    {
+        Ok(true) => {
+            println!(
+                "⏸️  PR #{} has gru:needs-human-review — waiting for human to remove it",
+                ctx.pr_number
+            );
+            return LoopAction::Continue;
+        }
+        Ok(false) => {
+            // Only clear escalation if we previously confirmed the
+            // label was applied. This prevents premature clearing if
+            // the label add previously failed.
+            if state.judge_state.label_was_applied() {
+                state.judge_state.mark_escalation_cleared();
+            }
+        }
+        Err(e) => {
+            log::warn!(
+                "Failed to check needs-human-review label: {} — skipping judge",
+                e
+            );
+            return LoopAction::Continue;
+        }
+    }
+
+    // Invoke the merge-readiness judge.
+    match merge_judge::evaluate(
+        &ctx.issue_ctx.host,
+        &ctx.issue_ctx.owner,
+        &ctx.issue_ctx.repo,
+        ctx.pr_number,
+        &ctx.wt_ctx.checkout_path,
+        &mut state.judge_state,
+        state.confidence_threshold,
+    )
+    .await
+    {
+        Ok(Some(response)) => match &response.action {
+            JudgeAction::Merge => {
+                println!(
+                    "🚀 Judge approved merge for PR #{} (confidence: {}/10)",
+                    ctx.pr_number, response.confidence
+                );
+                let repo_full = github::repo_slug(&ctx.issue_ctx.owner, &ctx.issue_ctx.repo);
+                match crate::github::gh_cli_command(&ctx.issue_ctx.host)
+                    .args([
+                        "pr",
+                        "merge",
+                        ctx.pr_number,
+                        "--squash",
+                        "--auto",
+                        "-R",
+                        &repo_full,
+                    ])
+                    .output()
+                    .await
+                {
+                    Ok(output) if output.status.success() => {
+                        println!("✅ Auto-merge queued for PR #{}!", ctx.pr_number);
+                        println!("🎉 Issue {} is complete!", ctx.issue_ctx.issue_num);
+                        return LoopAction::Break;
+                    }
+                    Ok(output) => {
+                        let stderr = String::from_utf8_lossy(&output.stderr);
+                        log::warn!(
+                            "⚠️  Auto-merge failed for PR #{}: {}",
+                            ctx.pr_number,
+                            stderr.trim()
+                        );
+                        println!("🔄 Will retry on next poll cycle...");
+                    }
+                    Err(e) => {
+                        log::warn!("⚠️  Failed to run merge command: {}", e);
+                        println!("🔄 Will retry on next poll cycle...");
+                    }
+                }
+            }
+            JudgeAction::Wait(duration) => {
+                println!(
+                    "⏳ Judge says wait {}m before re-evaluating PR #{}",
+                    duration.as_secs() / 60,
+                    ctx.pr_number
+                );
+                println!("🔄 Continuing to monitor PR...\n");
+            }
+            JudgeAction::Escalate => {
+                println!(
+                    "🚨 Judge escalated PR #{} for human review (confidence: {}/10)",
+                    ctx.pr_number, response.confidence
+                );
+                // Apply label and post comment.
+                match merge_judge::add_needs_human_review_label(
+                    &ctx.issue_ctx.host,
+                    &ctx.issue_ctx.owner,
+                    &ctx.issue_ctx.repo,
+                    ctx.pr_number,
+                )
+                .await
+                {
+                    Ok(()) => state.judge_state.mark_label_applied(),
+                    Err(e) => {
+                        log::warn!("Failed to add needs-human-review label: {}", e);
+                    }
+                }
+                merge_judge::post_judge_escalation_comment(
+                    &ctx.issue_ctx.host,
+                    &ctx.issue_ctx.owner,
+                    &ctx.issue_ctx.repo,
+                    ctx.pr_number,
+                    &response,
+                )
+                .await;
+                println!("🔄 Continuing to monitor PR...\n");
+            }
+        },
+        Ok(None) => {
+            // Judge invocation skipped (same state, no timer expired).
+            log::debug!("Judge invocation skipped — PR state unchanged");
+        }
+        Err(e) => {
+            log::warn!("⚠️  Merge judge failed: {}", e);
+            println!("🔄 Will retry on next poll cycle...");
+        }
+    }
+    LoopAction::Continue
+}
+
+async fn handle_new_reviews(
+    state: &mut MonitorLoopState,
+    ctx: &MonitorContext<'_>,
+    comments: Vec<pr_monitor::ReviewComment>,
+    check_time: DateTime<Utc>,
+) -> LoopAction {
+    state.review_round += 1;
+    let count = comments.len();
+    println!(
+        "💬 Detected {} new review comment(s) on PR #{} (review round {}/{})",
+        count, ctx.pr_number, state.review_round, MAX_REVIEW_ROUNDS
+    );
+
+    if state.review_round > MAX_REVIEW_ROUNDS {
+        println!(
+            "⚠️  Reached maximum review rounds limit ({})",
+            MAX_REVIEW_ROUNDS
+        );
+        println!("   Additional reviews will need manual handling");
+        println!(
+            "   View PR: https://github.com/{}/{}/pull/{}",
+            ctx.issue_ctx.owner, ctx.issue_ctx.repo, ctx.pr_number
+        );
+        return LoopAction::Break;
+    }
+
+    let review_prompt = pr_monitor::format_review_prompt(
+        ctx.issue_ctx.issue_num,
+        ctx.pr_number,
+        &comments,
+        &ctx.issue_ctx.owner,
+        &ctx.issue_ctx.repo,
+        &ctx.wt_ctx.minion_id,
+    );
+
+    println!("🔄 Re-invoking to address review feedback...\n");
+
+    match invoke_agent_for_reviews(
+        ctx.backend,
+        &ctx.wt_ctx.checkout_path,
+        &ctx.wt_ctx.minion_dir,
+        &ctx.wt_ctx.session_id,
+        &review_prompt,
+        ctx.timeout_opt,
+        &ctx.issue_ctx.host,
+    )
+    .await
+    {
+        Ok(()) => {
+            println!("\n✅ Finished addressing review comments");
+            println!("🔄 Continuing to monitor PR...\n");
+            // Use the check_time returned by monitor_pr, which was
+            // advanced past the reviews we just handled. This ensures
+            // those reviews aren't re-fetched while still catching
+            // any new reviews posted during handling.
+            state.review_baseline = Some(check_time);
+            // Persist updated baseline after successfully handling reviews.
+            save_review_check_time(&ctx.wt_ctx.minion_id, check_time).await;
+            // Reset attempt_count so the cap only triggers on consecutive
+            // failures, not cumulative resume cycles across successful rounds.
+            reset_attempt_count(&ctx.wt_ctx.minion_id).await;
+            LoopAction::Continue
+        }
+        Err(e) => {
+            log::warn!("⚠️  Failed to address review comments: {}", e);
+            log::warn!("   You can address them manually");
+            LoopAction::Break
+        }
+    }
+}
+
+async fn handle_failed_checks(
+    state: &mut MonitorLoopState,
+    ctx: &MonitorContext<'_>,
+    count: usize,
+) -> LoopAction {
+    if state.ci_escalated {
+        // Already escalated — wait for human intervention
+        println!(
+            "ℹ️  CI still failing ({} check(s)) on PR #{}, waiting for human fix",
+            count, ctx.pr_number
+        );
+        return LoopAction::Continue;
+    }
+
+    println!(
+        "❌ Detected {} failed CI check(s) on PR #{}, attempting auto-fix...",
+        count, ctx.pr_number
+    );
+
+    let pr_num_u64 = match ctx.pr_number.parse::<u64>() {
+        Ok(n) => n,
+        Err(_) => {
+            println!("⚠️  Could not parse PR number, skipping CI auto-fix");
+            println!("🔄 Continuing to monitor PR for other events...\n");
+            return LoopAction::Continue;
+        }
+    };
+
+    match ci::monitor_and_fix_ci(
+        &ctx.issue_ctx.host,
+        &ctx.issue_ctx.owner,
+        &ctx.issue_ctx.repo,
+        pr_num_u64,
+        &ctx.wt_ctx.branch_name,
+        &ctx.wt_ctx.checkout_path,
+        &ctx.wt_ctx.minion_id,
+    )
+    .await
+    {
+        Ok(true) => {
+            println!("✅ CI checks now pass after auto-fix");
+            if state.issue_was_blocked {
+                super::helpers::try_remove_blocked_label(
+                    &ctx.issue_ctx.host,
+                    &ctx.issue_ctx.owner,
+                    &ctx.issue_ctx.repo,
+                    pr_num_u64,
+                    ctx.issue_ctx.issue_num,
+                )
+                .await;
+                state.issue_was_blocked = false;
+            }
+            state.ci_escalated = false;
+            println!("🔄 Continuing to monitor PR...\n");
+        }
+        Ok(false) => {
+            state.ci_escalated = true;
+            state.issue_was_blocked = true;
+            println!("⚠️  CI auto-fix escalated to human after max attempts");
+            println!(
+                "   Review the checks at: https://github.com/{}/{}/pull/{}/checks",
+                ctx.issue_ctx.owner, ctx.issue_ctx.repo, ctx.pr_number
+            );
+            println!("🔄 Continuing to monitor PR for other events...\n");
+        }
+        Err(e) => {
+            println!("⚠️  CI auto-fix error: {}", e);
+            println!(
+                "   Review the checks at: https://github.com/{}/{}/pull/{}/checks",
+                ctx.issue_ctx.owner, ctx.issue_ctx.repo, ctx.pr_number
+            );
+            println!("🔄 Will retry CI auto-fix on subsequent monitoring cycles...\n");
+        }
+    }
+    LoopAction::Continue
+}
+
+async fn handle_merge_conflict(
+    state: &mut MonitorLoopState,
+    ctx: &MonitorContext<'_>,
+    check_time: DateTime<Utc>,
+) -> LoopAction {
+    if state.rebase_attempts >= MAX_REBASE_ATTEMPTS {
+        println!(
+            "❌ Reached maximum rebase attempts ({}), escalating",
+            MAX_REBASE_ATTEMPTS
+        );
+        post_escalation_comment(
+            &ctx.issue_ctx.owner,
+            &ctx.issue_ctx.repo,
+            &ctx.issue_ctx.host,
+            ctx.pr_number,
+            "Auto-rebase failed after multiple attempts. Manual conflict resolution required.",
+            &ctx.wt_ctx.minion_id,
+        )
+        .await;
+        return LoopAction::Break;
+    }
+
+    state.rebase_attempts += 1;
+    println!(
+        "⚠️  Merge conflict detected on PR #{} (rebase attempt {}/{})",
+        ctx.pr_number, state.rebase_attempts, MAX_REBASE_ATTEMPTS
+    );
+
+    match auto_rebase_pr(&ctx.wt_ctx.checkout_path).await {
+        Ok(true) => {
+            // Reset counter on success — GitHub may still report
+            // mergeable: false for a few poll cycles after force-push
+            // while it recomputes. We don't want stale signals to
+            // exhaust the attempt budget.
+            state.rebase_attempts = 0;
+            // Use the check_time from just before the conflict was
+            // detected. Reviews posted during the rebase will have
+            // submitted_at > check_time and be caught on the next poll.
+            state.review_baseline = Some(check_time);
+            // Note: save_review_check_time is intentionally not called here.
+            // check_time marks the start of the conflict window, not a point
+            // where reviews were processed. The exit-time save will persist it.
+            println!("✅ Rebase succeeded, continuing to monitor PR...\n");
+            LoopAction::Continue
+        }
+        Ok(false) => {
+            // Agent couldn't resolve conflicts
+            println!("❌ Could not resolve merge conflicts automatically");
+            post_escalation_comment(
+                &ctx.issue_ctx.owner,
+                &ctx.issue_ctx.repo,
+                &ctx.issue_ctx.host,
+                ctx.pr_number,
+                "Auto-rebase failed: could not resolve merge conflicts automatically. Manual intervention required.",
+                &ctx.wt_ctx.minion_id,
+            )
+            .await;
+            LoopAction::Break
+        }
+        Err(e) => {
+            log::warn!("⚠️  Auto-rebase error: {:#}", e);
+            post_escalation_comment(
+                &ctx.issue_ctx.owner,
+                &ctx.issue_ctx.repo,
+                &ctx.issue_ctx.host,
+                ctx.pr_number,
+                "Auto-rebase encountered an unexpected error. Check Minion logs for details.",
+                &ctx.wt_ctx.minion_id,
+            )
+            .await;
+            LoopAction::Break
+        }
+    }
+}
+
+fn handle_timeout(state: &MonitorLoopState, ctx: &MonitorContext<'_>) -> LoopAction {
+    let display = format_duration(state.monitor_start.elapsed().as_secs());
+    println!("⏰ PR monitoring timed out after {}", display);
+    println!(
+        "   PR is still open: https://github.com/{}/{}/pull/{}",
+        ctx.issue_ctx.owner, ctx.issue_ctx.repo, ctx.pr_number
+    );
+    LoopAction::Break
+}
+
+fn handle_interrupted(ctx: &MonitorContext<'_>) -> LoopAction {
+    println!("\n⚠️  Monitoring interrupted by user");
+    println!(
+        "   PR is still open: https://github.com/{}/{}/pull/{}",
+        ctx.issue_ctx.owner, ctx.issue_ctx.repo, ctx.pr_number
+    );
+    LoopAction::Break
+}
+
+async fn handle_monitor_error(
+    state: &mut MonitorLoopState,
+    ctx: &MonitorContext<'_>,
+    error: anyhow::Error,
+) -> LoopAction {
+    state.consecutive_errors += 1;
+    if state.consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
+        log::warn!(
+            "⚠️  PR monitoring failed {} consecutive times, giving up: {}",
+            state.consecutive_errors,
+            error
+        );
+        log::warn!(
+            "   You can monitor manually at: https://github.com/{}/{}/pull/{}",
+            ctx.issue_ctx.owner,
+            ctx.issue_ctx.repo,
+            ctx.pr_number
+        );
+        return LoopAction::Break;
+    }
+    log::warn!(
+        "⚠️  PR monitoring error ({}/{}): {}",
+        state.consecutive_errors,
+        MAX_CONSECUTIVE_ERRORS,
+        error
+    );
+    // Sleep before retrying to avoid hammering the API if monitor_pr
+    // fails before its internal poll sleep. Cap at remaining timeout
+    // so we don't overshoot the configured monitor_timeout.
+    let backoff = Duration::from_secs(30);
+    let remaining = ctx
+        .monitor_timeout
+        .checked_sub(state.monitor_start.elapsed());
+    match remaining {
+        Some(r) if r > Duration::ZERO => {
+            tokio::select! {
+                _ = tokio::time::sleep(backoff.min(r)) => {}
+                _ = tokio::signal::ctrl_c() => {
+                    println!("\n⚠️  Monitoring interrupted by user");
+                    println!(
+                        "   PR is still open: https://github.com/{}/{}/pull/{}",
+                        ctx.issue_ctx.owner, ctx.issue_ctx.repo, ctx.pr_number
+                    );
+                    return LoopAction::Break;
+                }
+            }
+        }
+        _ => {
+            // Timeout already expired, let the loop's timeout check handle it.
+        }
+    }
+    LoopAction::Continue
+}
+
+/// Dispatches a PR monitoring event to the appropriate handler.
+async fn handle_pr_event(
+    event: Result<(MonitorResult, DateTime<Utc>)>,
+    state: &mut MonitorLoopState,
+    ctx: &MonitorContext<'_>,
+) -> LoopAction {
+    if event.is_ok() {
+        state.consecutive_errors = 0;
+    }
+
+    match event {
+        Ok((MonitorResult::Merged, _)) => handle_merged(state, ctx),
+        Ok((MonitorResult::Closed, _)) => handle_closed(state, ctx),
+        Ok((MonitorResult::ReadyToMerge, _)) => handle_ready_to_merge(state, ctx).await,
+        Ok((MonitorResult::NewReviews(comments), check_time)) => {
+            handle_new_reviews(state, ctx, comments, check_time).await
+        }
+        Ok((MonitorResult::FailedChecks(count), _)) => {
+            handle_failed_checks(state, ctx, count).await
+        }
+        Ok((MonitorResult::MergeConflict, check_time)) => {
+            handle_merge_conflict(state, ctx, check_time).await
+        }
+        Ok((MonitorResult::Timeout, _)) => handle_timeout(state, ctx),
+        Ok((MonitorResult::Interrupted, _)) => handle_interrupted(ctx),
+        Err(e) => handle_monitor_error(state, ctx, e).await,
+    }
+}
+
 /// Monitors a PR for reviews, CI failures, and merge/close events.
 /// Handles automatic review rounds up to MAX_REVIEW_ROUNDS.
 ///
@@ -419,19 +984,6 @@ pub(crate) async fn monitor_pr_lifecycle(
     println!("\n👀 Monitoring PR for updates (polling every 30s)...");
     println!("   Press Ctrl+C to stop monitoring\n");
 
-    let monitor_start = tokio::time::Instant::now();
-    let mut review_round = 0;
-    let mut ci_escalated = false;
-    let mut issue_was_blocked = false;
-    let mut rebase_attempts = 0;
-    let mut judge_state = JudgeState::new();
-    let mut judge_label_ensured = false;
-    let mut terminal_result: Option<MonitorResult> = None;
-    let mut consecutive_errors: u32 = 0;
-    // 10 consecutive monitor_pr invocation failures before giving up.
-    // Wall-clock time per failure varies since monitor_pr does its own internal
-    // polling and retries before returning an error.
-    const MAX_CONSECUTIVE_ERRORS: u32 = 10;
     // Load merge confidence threshold from config (falls back to default).
     // Uses load_partial to avoid requiring [daemon].repos for non-daemon commands.
     let confidence_threshold = LabConfig::default_path()
@@ -446,6 +998,7 @@ pub(crate) async fn monitor_pr_lifecycle(
         })
         .map(|c| c.merge.confidence_threshold.clamp(1, 10))
         .unwrap_or(merge_judge::DEFAULT_CONFIDENCE_THRESHOLD);
+
     // Track review baseline across monitor_pr re-entries so reviews posted
     // before/during event handling (e.g. rebase) are not silently dropped.
     // On a fresh run, initialize to pre_review_time so reviews submitted
@@ -466,483 +1019,50 @@ pub(crate) async fn monitor_pr_lifecycle(
     } else {
         pre_review_time
     };
-    let mut review_baseline: Option<chrono::DateTime<chrono::Utc>> = Some(initial_baseline);
+
+    let mut state = MonitorLoopState::new(initial_baseline, confidence_threshold);
+    let ctx = MonitorContext {
+        backend,
+        issue_ctx,
+        wt_ctx,
+        pr_number,
+        timeout_opt,
+        monitor_timeout,
+    };
+
     loop {
-        // Compute remaining time so the timeout spans the entire lifecycle,
-        // not just a single monitor_pr invocation.
-        let remaining = monitor_timeout.checked_sub(monitor_start.elapsed());
+        // Guard: check if the outer lifecycle budget is exhausted before starting
+        // a new monitor_pr call. Distinct from MonitorResult::Timeout, which fires
+        // when monitor_pr's own polling loop exceeds the remaining duration.
+        let remaining = ctx
+            .monitor_timeout
+            .checked_sub(state.monitor_start.elapsed());
         if remaining.is_none() || remaining == Some(Duration::ZERO) {
-            let display = format_duration(monitor_start.elapsed().as_secs());
+            let display = format_duration(state.monitor_start.elapsed().as_secs());
             println!("⏰ PR monitoring timed out after {}", display);
             println!(
                 "   PR is still open: https://github.com/{}/{}/pull/{}",
-                issue_ctx.owner, issue_ctx.repo, pr_number
+                ctx.issue_ctx.owner, ctx.issue_ctx.repo, ctx.pr_number
             );
             break;
         }
 
-        let monitor_result = pr_monitor::monitor_pr(
-            &issue_ctx.host,
-            &issue_ctx.owner,
-            &issue_ctx.repo,
-            pr_number,
-            &wt_ctx.checkout_path,
+        let event = pr_monitor::monitor_pr(
+            &ctx.issue_ctx.host,
+            &ctx.issue_ctx.owner,
+            &ctx.issue_ctx.repo,
+            ctx.pr_number,
+            &ctx.wt_ctx.checkout_path,
             remaining,
-            review_baseline,
+            state.review_baseline,
         )
         .await;
 
-        if monitor_result.is_ok() {
-            consecutive_errors = 0;
-        }
+        let action = handle_pr_event(event, &mut state, &ctx).await;
 
-        match monitor_result {
-            Ok((MonitorResult::Merged, _)) => {
-                println!("✅ PR #{} was merged successfully!", pr_number);
-                println!("🎉 Issue {} is complete!", issue_ctx.issue_num);
-                terminal_result = Some(MonitorResult::Merged);
-                break;
-            }
-            Ok((MonitorResult::Closed, _)) => {
-                println!("⚠️  PR #{} was closed without merging", pr_number);
-                println!("   The issue may need to be reopened or addressed differently");
-                terminal_result = Some(MonitorResult::Closed);
-                break;
-            }
-            Ok((MonitorResult::ReadyToMerge, _)) => {
-                // All merge gates pass — remove gru:blocked if it was stale
-                if issue_was_blocked {
-                    if let Ok(pr_num) = pr_number.parse::<u64>() {
-                        super::helpers::try_remove_blocked_label(
-                            &issue_ctx.host,
-                            &issue_ctx.owner,
-                            &issue_ctx.repo,
-                            pr_num,
-                            issue_ctx.issue_num,
-                        )
-                        .await;
-                    }
-                    issue_was_blocked = false;
-                    ci_escalated = false;
-                }
-
-                // Lazily ensure the gru:needs-human-review label exists on
-                // first ReadyToMerge, rather than unconditionally at startup.
-                if !judge_label_ensured {
-                    if let Err(e) = merge_judge::ensure_needs_human_review_label(
-                        &issue_ctx.host,
-                        &issue_ctx.owner,
-                        &issue_ctx.repo,
-                    )
-                    .await
-                    {
-                        log::warn!("⚠️  Failed to ensure gru:needs-human-review label: {}", e);
-                    }
-                    judge_label_ensured = true;
-                }
-
-                // Check if gru:needs-human-review was previously applied and
-                // not yet cleared — skip judge until human removes it.
-                // On API failure, be conservative and skip (don't proceed).
-                match merge_judge::has_needs_human_review_label(
-                    &issue_ctx.host,
-                    &issue_ctx.owner,
-                    &issue_ctx.repo,
-                    pr_number,
-                )
-                .await
-                {
-                    Ok(true) => {
-                        println!(
-                            "⏸️  PR #{} has gru:needs-human-review — waiting for human to remove it",
-                            pr_number
-                        );
-                        continue;
-                    }
-                    Ok(false) => {
-                        // Only clear escalation if we previously confirmed the
-                        // label was applied. This prevents premature clearing if
-                        // the label add previously failed.
-                        if judge_state.label_was_applied() {
-                            judge_state.mark_escalation_cleared();
-                        }
-                    }
-                    Err(e) => {
-                        log::warn!(
-                            "Failed to check needs-human-review label: {} — skipping judge",
-                            e
-                        );
-                        continue;
-                    }
-                }
-
-                // Invoke the merge-readiness judge.
-                match merge_judge::evaluate(
-                    &issue_ctx.host,
-                    &issue_ctx.owner,
-                    &issue_ctx.repo,
-                    pr_number,
-                    &wt_ctx.checkout_path,
-                    &mut judge_state,
-                    confidence_threshold,
-                )
-                .await
-                {
-                    Ok(Some(response)) => match &response.action {
-                        JudgeAction::Merge => {
-                            println!(
-                                "🚀 Judge approved merge for PR #{} (confidence: {}/10)",
-                                pr_number, response.confidence
-                            );
-                            let repo_full = github::repo_slug(&issue_ctx.owner, &issue_ctx.repo);
-                            match crate::github::gh_cli_command(&issue_ctx.host)
-                                .args([
-                                    "pr", "merge", pr_number, "--squash", "--auto", "-R",
-                                    &repo_full,
-                                ])
-                                .output()
-                                .await
-                            {
-                                Ok(output) if output.status.success() => {
-                                    println!("✅ Auto-merge queued for PR #{}!", pr_number);
-                                    println!("🎉 Issue {} is complete!", issue_ctx.issue_num);
-                                    break;
-                                }
-                                Ok(output) => {
-                                    let stderr = String::from_utf8_lossy(&output.stderr);
-                                    log::warn!(
-                                        "⚠️  Auto-merge failed for PR #{}: {}",
-                                        pr_number,
-                                        stderr.trim()
-                                    );
-                                    println!("🔄 Will retry on next poll cycle...");
-                                }
-                                Err(e) => {
-                                    log::warn!("⚠️  Failed to run merge command: {}", e);
-                                    println!("🔄 Will retry on next poll cycle...");
-                                }
-                            }
-                        }
-                        JudgeAction::Wait(duration) => {
-                            println!(
-                                "⏳ Judge says wait {}m before re-evaluating PR #{}",
-                                duration.as_secs() / 60,
-                                pr_number
-                            );
-                            println!("🔄 Continuing to monitor PR...\n");
-                        }
-                        JudgeAction::Escalate => {
-                            println!(
-                                "🚨 Judge escalated PR #{} for human review (confidence: {}/10)",
-                                pr_number, response.confidence
-                            );
-                            // Apply label and post comment.
-                            match merge_judge::add_needs_human_review_label(
-                                &issue_ctx.host,
-                                &issue_ctx.owner,
-                                &issue_ctx.repo,
-                                pr_number,
-                            )
-                            .await
-                            {
-                                Ok(()) => judge_state.mark_label_applied(),
-                                Err(e) => {
-                                    log::warn!("Failed to add needs-human-review label: {}", e);
-                                }
-                            }
-                            merge_judge::post_judge_escalation_comment(
-                                &issue_ctx.host,
-                                &issue_ctx.owner,
-                                &issue_ctx.repo,
-                                pr_number,
-                                &response,
-                            )
-                            .await;
-                            println!("🔄 Continuing to monitor PR...\n");
-                        }
-                    },
-                    Ok(None) => {
-                        // Judge invocation skipped (same state, no timer expired).
-                        log::debug!("Judge invocation skipped — PR state unchanged");
-                    }
-                    Err(e) => {
-                        log::warn!("⚠️  Merge judge failed: {}", e);
-                        println!("🔄 Will retry on next poll cycle...");
-                    }
-                }
-            }
-            Ok((MonitorResult::NewReviews(comments), check_time)) => {
-                review_round += 1;
-                let count = comments.len();
-                println!(
-                    "💬 Detected {} new review comment(s) on PR #{} (review round {}/{})",
-                    count, pr_number, review_round, MAX_REVIEW_ROUNDS
-                );
-
-                if review_round > MAX_REVIEW_ROUNDS {
-                    println!(
-                        "⚠️  Reached maximum review rounds limit ({})",
-                        MAX_REVIEW_ROUNDS
-                    );
-                    println!("   Additional reviews will need manual handling");
-                    println!(
-                        "   View PR: https://github.com/{}/{}/pull/{}",
-                        issue_ctx.owner, issue_ctx.repo, pr_number
-                    );
-                    break;
-                }
-
-                let review_prompt = pr_monitor::format_review_prompt(
-                    issue_ctx.issue_num,
-                    pr_number,
-                    &comments,
-                    &issue_ctx.owner,
-                    &issue_ctx.repo,
-                    &wt_ctx.minion_id,
-                );
-
-                println!("🔄 Re-invoking to address review feedback...\n");
-
-                match invoke_agent_for_reviews(
-                    backend,
-                    &wt_ctx.checkout_path,
-                    &wt_ctx.minion_dir,
-                    &wt_ctx.session_id,
-                    &review_prompt,
-                    timeout_opt,
-                    &issue_ctx.host,
-                )
-                .await
-                {
-                    Ok(()) => {
-                        println!("\n✅ Finished addressing review comments");
-                        println!("🔄 Continuing to monitor PR...\n");
-                        // Use the check_time returned by monitor_pr, which was
-                        // advanced past the reviews we just handled. This ensures
-                        // those reviews aren't re-fetched while still catching
-                        // any new reviews posted during handling.
-                        review_baseline = Some(check_time);
-                        // Persist updated baseline after successfully handling reviews.
-                        save_review_check_time(&wt_ctx.minion_id, check_time).await;
-                        // Reset attempt_count so the cap only triggers on consecutive
-                        // failures, not cumulative resume cycles across successful rounds.
-                        reset_attempt_count(&wt_ctx.minion_id).await;
-                    }
-                    Err(e) => {
-                        log::warn!("⚠️  Failed to address review comments: {}", e);
-                        log::warn!("   You can address them manually");
-                        break;
-                    }
-                }
-            }
-            Ok((MonitorResult::FailedChecks(count), _)) => {
-                if ci_escalated {
-                    // Already escalated — wait for human intervention
-                    println!(
-                        "ℹ️  CI still failing ({} check(s)) on PR #{}, waiting for human fix",
-                        count, pr_number
-                    );
-                    // Continue monitoring for merge/close/review events
-                    continue;
-                }
-
-                println!(
-                    "❌ Detected {} failed CI check(s) on PR #{}, attempting auto-fix...",
-                    count, pr_number
-                );
-
-                // Parse pr_number for the CI fix API
-                let pr_num_u64 = match pr_number.parse::<u64>() {
-                    Ok(n) => n,
-                    Err(_) => {
-                        println!("⚠️  Could not parse PR number, skipping CI auto-fix");
-                        println!("🔄 Continuing to monitor PR for other events...\n");
-                        continue;
-                    }
-                };
-
-                match ci::monitor_and_fix_ci(
-                    &issue_ctx.host,
-                    &issue_ctx.owner,
-                    &issue_ctx.repo,
-                    pr_num_u64,
-                    &wt_ctx.branch_name,
-                    &wt_ctx.checkout_path,
-                    &wt_ctx.minion_id,
-                )
-                .await
-                {
-                    Ok(true) => {
-                        println!("✅ CI checks now pass after auto-fix");
-                        // Remove gru:blocked label if it was added during escalation
-                        if issue_was_blocked {
-                            super::helpers::try_remove_blocked_label(
-                                &issue_ctx.host,
-                                &issue_ctx.owner,
-                                &issue_ctx.repo,
-                                pr_num_u64,
-                                issue_ctx.issue_num,
-                            )
-                            .await;
-                            issue_was_blocked = false;
-                        }
-                        ci_escalated = false;
-                        println!("🔄 Continuing to monitor PR...\n");
-                    }
-                    Ok(false) => {
-                        ci_escalated = true;
-                        issue_was_blocked = true;
-                        println!("⚠️  CI auto-fix escalated to human after max attempts");
-                        println!(
-                            "   Review the checks at: https://github.com/{}/{}/pull/{}/checks",
-                            issue_ctx.owner, issue_ctx.repo, pr_number
-                        );
-                        println!("🔄 Continuing to monitor PR for other events...\n");
-                    }
-                    Err(e) => {
-                        println!("⚠️  CI auto-fix error: {}", e);
-                        println!(
-                            "   Review the checks at: https://github.com/{}/{}/pull/{}/checks",
-                            issue_ctx.owner, issue_ctx.repo, pr_number
-                        );
-                        println!("🔄 Will retry CI auto-fix on subsequent monitoring cycles...\n");
-                    }
-                }
-            }
-            Ok((MonitorResult::MergeConflict, check_time)) => {
-                if rebase_attempts >= MAX_REBASE_ATTEMPTS {
-                    println!(
-                        "❌ Reached maximum rebase attempts ({}), escalating",
-                        MAX_REBASE_ATTEMPTS
-                    );
-                    post_escalation_comment(
-                        &issue_ctx.owner,
-                        &issue_ctx.repo,
-                        &issue_ctx.host,
-                        pr_number,
-                        "Auto-rebase failed after multiple attempts. Manual conflict resolution required.",
-                        &wt_ctx.minion_id,
-                    )
-                    .await;
-                    break;
-                }
-
-                rebase_attempts += 1;
-                println!(
-                    "⚠️  Merge conflict detected on PR #{} (rebase attempt {}/{})",
-                    pr_number, rebase_attempts, MAX_REBASE_ATTEMPTS
-                );
-
-                match auto_rebase_pr(&wt_ctx.checkout_path).await {
-                    Ok(true) => {
-                        // Reset counter on success — GitHub may still report
-                        // mergeable: false for a few poll cycles after force-push
-                        // while it recomputes. We don't want stale signals to
-                        // exhaust the attempt budget.
-                        rebase_attempts = 0;
-                        // Use the check_time from just before the conflict was
-                        // detected. Reviews posted during the rebase will have
-                        // submitted_at > check_time and be caught on the next poll.
-                        review_baseline = Some(check_time);
-                        // Note: save_review_check_time is intentionally not called here.
-                        // check_time marks the start of the conflict window, not a point
-                        // where reviews were processed. The exit-time save will persist it.
-                        println!("✅ Rebase succeeded, continuing to monitor PR...\n");
-                    }
-                    Ok(false) => {
-                        // Agent couldn't resolve conflicts
-                        println!("❌ Could not resolve merge conflicts automatically");
-                        post_escalation_comment(
-                            &issue_ctx.owner,
-                            &issue_ctx.repo,
-                            &issue_ctx.host,
-                            pr_number,
-                            "Auto-rebase failed: could not resolve merge conflicts automatically. Manual intervention required.",
-                            &wt_ctx.minion_id,
-                        )
-                        .await;
-                        break;
-                    }
-                    Err(e) => {
-                        log::warn!("⚠️  Auto-rebase error: {:#}", e);
-                        post_escalation_comment(
-                            &issue_ctx.owner,
-                            &issue_ctx.repo,
-                            &issue_ctx.host,
-                            pr_number,
-                            "Auto-rebase encountered an unexpected error. Check Minion logs for details.",
-                            &wt_ctx.minion_id,
-                        )
-                        .await;
-                        break;
-                    }
-                }
-            }
-            Ok((MonitorResult::Timeout, _)) => {
-                // Use the lifecycle-level start time for an accurate total elapsed display
-                let display = format_duration(monitor_start.elapsed().as_secs());
-                println!("⏰ PR monitoring timed out after {}", display);
-                println!(
-                    "   PR is still open: https://github.com/{}/{}/pull/{}",
-                    issue_ctx.owner, issue_ctx.repo, pr_number
-                );
-                break;
-            }
-            Ok((MonitorResult::Interrupted, _)) => {
-                println!("\n⚠️  Monitoring interrupted by user");
-                println!(
-                    "   PR is still open: https://github.com/{}/{}/pull/{}",
-                    issue_ctx.owner, issue_ctx.repo, pr_number
-                );
-                break;
-            }
-            Err(e) => {
-                consecutive_errors += 1;
-                if consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
-                    log::warn!(
-                        "⚠️  PR monitoring failed {} consecutive times, giving up: {}",
-                        consecutive_errors,
-                        e
-                    );
-                    log::warn!(
-                        "   You can monitor manually at: https://github.com/{}/{}/pull/{}",
-                        issue_ctx.owner,
-                        issue_ctx.repo,
-                        pr_number
-                    );
-                    break;
-                }
-                log::warn!(
-                    "⚠️  PR monitoring error ({}/{}): {}",
-                    consecutive_errors,
-                    MAX_CONSECUTIVE_ERRORS,
-                    e
-                );
-                // Sleep before retrying to avoid hammering the API if monitor_pr
-                // fails before its internal poll sleep. Cap at remaining timeout
-                // so we don't overshoot the configured monitor_timeout.
-                let backoff = Duration::from_secs(30);
-                let remaining = monitor_timeout.checked_sub(monitor_start.elapsed());
-                match remaining {
-                    Some(r) if r > Duration::ZERO => {
-                        tokio::select! {
-                            _ = tokio::time::sleep(backoff.min(r)) => {}
-                            _ = tokio::signal::ctrl_c() => {
-                                println!("\n⚠️  Monitoring interrupted by user");
-                                println!(
-                                    "   PR is still open: https://github.com/{}/{}/pull/{}",
-                                    issue_ctx.owner, issue_ctx.repo, pr_number
-                                );
-                                break;
-                            }
-                        }
-                    }
-                    _ => {
-                        // Timeout already expired, let the loop's timeout check handle it.
-                    }
-                }
-                continue;
-            }
+        match action {
+            LoopAction::Continue => continue,
+            LoopAction::Break => break,
         }
     }
 
@@ -950,20 +1070,20 @@ pub(crate) async fn monitor_pr_lifecycle(
     // scan knows where to resume without re-processing already-seen reviews.
     // Also check if the PR is still open with unaddressed external reviews and
     // post a notification if so.
-    if let Some(baseline) = review_baseline {
-        save_review_check_time(&wt_ctx.minion_id, baseline).await;
+    if let Some(baseline) = state.review_baseline {
+        save_review_check_time(&ctx.wt_ctx.minion_id, baseline).await;
         post_exit_notification_if_needed(
-            &issue_ctx.owner,
-            &issue_ctx.repo,
-            &issue_ctx.host,
-            pr_number,
-            &wt_ctx.minion_id,
+            &ctx.issue_ctx.owner,
+            &ctx.issue_ctx.repo,
+            &ctx.issue_ctx.host,
+            ctx.pr_number,
+            &ctx.wt_ctx.minion_id,
             baseline,
         )
         .await;
     }
 
-    terminal_result
+    state.terminal_result
 }
 
 /// Monitors CI after the initial fix and attempts auto-fixes if checks fail.
