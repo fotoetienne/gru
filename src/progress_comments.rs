@@ -40,13 +40,13 @@ impl ProgressUpdate {
             self.minion_id
         ));
 
-        // YAML frontmatter
-        comment.push_str("---\n");
+        // YAML frontmatter (wrapped in code block to prevent GitHub markdown interpretation)
+        comment.push_str("```yaml\n");
         comment.push_str("event: minion:progress\n");
         comment.push_str(&format!("minion_id: {}\n", self.minion_id));
         comment.push_str(&format!("phase: {}\n", self.phase.as_str()));
         comment.push_str(&format!("timestamp: {}\n", self.timestamp.to_rfc3339()));
-        comment.push_str("---\n\n");
+        comment.push_str("```\n\n");
 
         // Body message
         comment.push_str(&self.message);
@@ -133,7 +133,8 @@ mod tests {
         // Check header
         assert!(formatted.contains("🤖 **Minion M042 progress update**"));
 
-        // Check YAML frontmatter
+        // Check YAML frontmatter in code block
+        assert!(formatted.contains("```yaml\n"));
         assert!(formatted.contains("event: minion:progress"));
         assert!(formatted.contains("minion_id: M042"));
         assert!(formatted.contains("phase: implementing"));
