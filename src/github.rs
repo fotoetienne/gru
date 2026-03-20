@@ -148,22 +148,20 @@ pub(crate) fn is_retryable_error(stderr: &str) -> bool {
 /// Uses `BASE_DELAY_SECS^attempt` formula, capped at `MAX_DELAY_SECS`.
 /// Attempt numbers are 1-indexed (first retry = attempt 1).
 fn calculate_retry_delay(attempt: u32) -> u64 {
-    std::cmp::min(BASE_DELAY_SECS.pow(attempt), MAX_DELAY_SECS)
+    std::cmp::min(BASE_DELAY_SECS.saturating_pow(attempt), MAX_DELAY_SECS)
 }
 
 /// Execute a gh API command with retry logic and exponential backoff.
 ///
-/// Returns the raw `Output` on success (including non-retryable failures).
 /// Retries on transient errors (network issues, rate limits, 5xx) up to `max_retries` times.
+/// Returns the raw [`Output`] regardless of exit status — both successful
+/// responses and non-retryable failures are returned as `Ok(Output)`.
+/// Callers **must** check `output.status.success()` to distinguish the two.
 ///
 /// # Arguments
 /// * `host` - GitHub hostname (e.g., "github.com" or "ghe.example.com")
 /// * `args` - The arguments to pass to the gh command
 /// * `max_retries` - Maximum number of retry attempts
-///
-/// # Returns
-/// The command output on success or after retries are exhausted.
-/// Callers must check `output.status.success()` for non-retryable failures.
 pub(crate) async fn gh_api_with_retry(
     host: &str,
     args: &[&str],

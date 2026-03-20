@@ -11,11 +11,10 @@
 
 use crate::github;
 use crate::github::ReviewUser;
+use crate::github::DEFAULT_MAX_RETRIES;
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::fmt;
-
-use github::DEFAULT_MAX_RETRIES;
 
 /// Result of a deterministic merge-readiness check for a PR.
 ///

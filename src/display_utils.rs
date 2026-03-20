@@ -18,11 +18,16 @@ pub(crate) fn shorten_path(path: &str) -> String {
 }
 
 /// Shorten a file path for display, showing the last N components.
+///
+/// # Panics
+/// Debug-asserts that `tail_components > 0`.  In release builds a zero value
+/// returns the full path unchanged (no truncation).
 pub(crate) fn shorten_path_tail(path: &str, tail_components: usize) -> String {
+    debug_assert!(tail_components > 0, "tail_components must be > 0");
     let path_obj = std::path::Path::new(path);
     let components: Vec<_> = path_obj.components().collect();
 
-    if components.len() <= tail_components {
+    if tail_components == 0 || components.len() <= tail_components {
         path.to_string()
     } else {
         let last_parts: Vec<_> = components

@@ -8,9 +8,9 @@ use serde::Deserialize;
 use std::process::Output;
 use tokio::time::{sleep, Duration, Instant};
 
-const POLL_INTERVAL_SECS: u64 = 30;
+use crate::github::DEFAULT_MAX_RETRIES;
 
-use github::DEFAULT_MAX_RETRIES;
+const POLL_INTERVAL_SECS: u64 = 30;
 
 /// Alias for the shared retry helper in `github.rs`.
 async fn gh_api_with_retry(host: &str, args: &[&str], max_retries: u32) -> Result<Output> {
