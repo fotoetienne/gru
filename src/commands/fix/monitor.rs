@@ -1033,23 +1033,25 @@ pub(crate) async fn monitor_pr_lifecycle(
     loop {
         // Compute remaining time so the timeout spans the entire lifecycle,
         // not just a single monitor_pr invocation.
-        let remaining = monitor_timeout.checked_sub(state.monitor_start.elapsed());
+        let remaining = ctx
+            .monitor_timeout
+            .checked_sub(state.monitor_start.elapsed());
         if remaining.is_none() || remaining == Some(Duration::ZERO) {
             let display = format_duration(state.monitor_start.elapsed().as_secs());
             println!("⏰ PR monitoring timed out after {}", display);
             println!(
                 "   PR is still open: https://github.com/{}/{}/pull/{}",
-                issue_ctx.owner, issue_ctx.repo, pr_number
+                ctx.issue_ctx.owner, ctx.issue_ctx.repo, ctx.pr_number
             );
             break;
         }
 
         let event = pr_monitor::monitor_pr(
-            &issue_ctx.host,
-            &issue_ctx.owner,
-            &issue_ctx.repo,
-            pr_number,
-            &wt_ctx.checkout_path,
+            &ctx.issue_ctx.host,
+            &ctx.issue_ctx.owner,
+            &ctx.issue_ctx.repo,
+            ctx.pr_number,
+            &ctx.wt_ctx.checkout_path,
             remaining,
             state.review_baseline,
         )
@@ -1068,13 +1070,13 @@ pub(crate) async fn monitor_pr_lifecycle(
     // Also check if the PR is still open with unaddressed external reviews and
     // post a notification if so.
     if let Some(baseline) = state.review_baseline {
-        save_review_check_time(&wt_ctx.minion_id, baseline).await;
+        save_review_check_time(&ctx.wt_ctx.minion_id, baseline).await;
         post_exit_notification_if_needed(
-            &issue_ctx.owner,
-            &issue_ctx.repo,
-            &issue_ctx.host,
-            pr_number,
-            &wt_ctx.minion_id,
+            &ctx.issue_ctx.owner,
+            &ctx.issue_ctx.repo,
+            &ctx.issue_ctx.host,
+            ctx.pr_number,
+            &ctx.wt_ctx.minion_id,
             baseline,
         )
         .await;
