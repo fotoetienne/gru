@@ -316,6 +316,10 @@ async fn trigger_pr_review(
 
 /// Monitors a PR for reviews, CI failures, and merge/close events.
 /// Handles automatic review rounds up to MAX_REVIEW_ROUNDS.
+///
+/// Returns `Some(Merged)` or `Some(Closed)` when the PR reaches a terminal
+/// state. Returns `None` for all other exit paths (timeout, user interrupt,
+/// review-round cap, rebase failure, consecutive errors).
 pub(crate) async fn monitor_pr_lifecycle(
     backend: &dyn AgentBackend,
     issue_ctx: &IssueContext,
@@ -324,7 +328,7 @@ pub(crate) async fn monitor_pr_lifecycle(
     timeout_opt: Option<&str>,
     review_timeout: Option<Duration>,
     monitor_timeout: Duration,
-) {
+) -> Option<MonitorResult> {
     // Ensure the gru:ready-to-merge label exists in the repo
     if let Err(e) =
         pr_monitor::ensure_ready_to_merge_label(&issue_ctx.host, &issue_ctx.owner, &issue_ctx.repo)
@@ -408,6 +412,7 @@ pub(crate) async fn monitor_pr_lifecycle(
     let mut rebase_attempts = 0;
     let mut judge_state = JudgeState::new();
     let mut judge_label_ensured = false;
+    let mut terminal_result: Option<MonitorResult> = None;
     let mut consecutive_errors: u32 = 0;
     // 10 consecutive monitor_pr invocation failures before giving up.
     // Wall-clock time per failure varies since monitor_pr does its own internal
@@ -492,11 +497,13 @@ pub(crate) async fn monitor_pr_lifecycle(
             Ok((MonitorResult::Merged, _)) => {
                 println!("✅ PR #{} was merged successfully!", pr_number);
                 println!("🎉 Issue {} is complete!", issue_ctx.issue_num);
+                terminal_result = Some(MonitorResult::Merged);
                 break;
             }
             Ok((MonitorResult::Closed, _)) => {
                 println!("⚠️  PR #{} was closed without merging", pr_number);
                 println!("   The issue may need to be reopened or addressed differently");
+                terminal_result = Some(MonitorResult::Closed);
                 break;
             }
             Ok((MonitorResult::ReadyToMerge, _)) => {
@@ -962,6 +969,8 @@ pub(crate) async fn monitor_pr_lifecycle(
         )
         .await;
     }
+
+    terminal_result
 }
 
 /// Monitors CI after the initial fix and attempts auto-fixes if checks fail.

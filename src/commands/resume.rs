@@ -13,6 +13,7 @@ use crate::minion_registry::{
     OrchestrationPhase,
 };
 use crate::minion_resolver;
+use crate::pr_monitor::MonitorResult;
 use crate::progress::{ProgressConfig, ProgressDisplay};
 use crate::session_claim;
 use crate::tmux::TmuxGuard;
@@ -382,10 +383,11 @@ pub async fn handle_resume(
     }
 
     // Phase: Monitor PR lifecycle (reviews, CI, merge)
+    let mut pr_terminal_result = None;
     if let Some(ref pr_num) = pr_number {
         update_orchestration_phase(&minion.minion_id, OrchestrationPhase::MonitoringPr).await;
         let monitor_timeout = Duration::from_secs(24 * 3600);
-        monitor_pr_lifecycle(
+        pr_terminal_result = monitor_pr_lifecycle(
             &*backend,
             &issue_ctx,
             &wt_ctx,
@@ -397,8 +399,12 @@ pub async fn handle_resume(
         .await;
     }
 
-    // CI monitoring (only if a PR exists)
-    if pr_number.is_some() {
+    // CI monitoring (only if a PR exists and wasn't already merged/closed)
+    let skip_ci = matches!(
+        pr_terminal_result,
+        Some(MonitorResult::Merged) | Some(MonitorResult::Closed)
+    );
+    if pr_number.is_some() && !skip_ci {
         let ci_passed = monitor_ci_after_fix(
             &issue_ctx.host,
             &issue_ctx.owner,
