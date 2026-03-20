@@ -230,12 +230,6 @@ enum Commands {
     Path {
         #[arg(help = "Minion ID, issue number, or PR number (e.g., M42, 42)")]
         id: String,
-
-        #[arg(long, help = "[DEPRECATED] Resolve from issue number")]
-        issue: Option<u64>,
-
-        #[arg(long, help = "[DEPRECATED] Resolve from PR number")]
-        pr: Option<u64>,
     },
     #[command(about = "Attach to a Minion's Claude session")]
     Attach {
@@ -456,7 +450,7 @@ async fn main() {
             push,
             timeout,
         } => rebase::handle_rebase(target, push, timeout.as_deref()).await,
-        Commands::Path { id, issue, pr } => path::handle_path(id, issue, pr).await,
+        Commands::Path { id } => path::handle_path(id).await,
         Commands::Attach {
             id,
             yolo,

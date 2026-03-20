@@ -890,123 +890,6 @@ impl GitRepo {
         }))
     }
 
-    /// Removes a worktree
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if:
-    /// - The bare repository doesn't exist
-    /// - The worktree removal fails (e.g., worktree doesn't exist or has uncommitted changes)
-    #[allow(dead_code)] // Part of worktree API; clean.rs uses inline git commands currently
-    pub async fn cleanup_worktree(&self, worktree_path: &Path) -> Result<()> {
-        if !self.bare_path.exists() {
-            anyhow::bail!(
-                "Bare repository does not exist at {}",
-                self.bare_path.display()
-            );
-        }
-
-        let output = Command::new("git")
-            .arg("-C")
-            .arg(&self.bare_path)
-            .arg("worktree")
-            .arg("remove")
-            .arg(worktree_path)
-            .output()
-            .await
-            .context("Failed to execute git worktree remove")?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            anyhow::bail!(
-                "git worktree remove failed with exit code {:?}: {}",
-                output.status.code(),
-                stderr
-            );
-        }
-
-        Ok(())
-    }
-
-    /// Removes a worktree forcefully, handling stale or locked worktrees
-    ///
-    /// This is useful when a worktree is locked or stale from a previous minion session.
-    /// It uses the `--force` flag to bypass checks for locks, but will refuse to remove
-    /// a worktree with uncommitted changes to prevent data loss.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if:
-    /// - The bare repository doesn't exist
-    /// - The worktree has uncommitted changes (safety check)
-    /// - The worktree removal fails
-    #[allow(dead_code)] // Part of worktree API; clean.rs uses inline git commands currently
-    pub async fn cleanup_worktree_force(&self, worktree_path: &Path) -> Result<()> {
-        if !self.bare_path.exists() {
-            anyhow::bail!(
-                "Bare repository does not exist at {}",
-                self.bare_path.display()
-            );
-        }
-
-        // Safety check: refuse to force-remove worktree with uncommitted changes
-        // First check if this is a valid git worktree
-        if worktree_path.exists() {
-            let is_worktree = Command::new("git")
-                .arg("-C")
-                .arg(worktree_path)
-                .arg("rev-parse")
-                .arg("--is-inside-work-tree")
-                .output()
-                .await;
-
-            // If it's a valid worktree, check for uncommitted changes
-            if let Ok(output) = is_worktree {
-                if output.status.success() {
-                    let status = Command::new("git")
-                        .arg("-C")
-                        .arg(worktree_path)
-                        .arg("status")
-                        .arg("--porcelain")
-                        .output()
-                        .await;
-
-                    if let Ok(status_output) = status {
-                        if !status_output.stdout.is_empty() {
-                            anyhow::bail!(
-                                "Worktree at {} has uncommitted changes. Refusing to force-remove. \
-                                 Commit or stash changes first.",
-                                worktree_path.display()
-                            );
-                        }
-                    }
-                }
-            }
-        }
-
-        let output = Command::new("git")
-            .arg("-C")
-            .arg(&self.bare_path)
-            .arg("worktree")
-            .arg("remove")
-            .arg("--force")
-            .arg(worktree_path)
-            .output()
-            .await
-            .context("Failed to execute git worktree remove --force")?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            anyhow::bail!(
-                "git worktree remove --force failed with exit code {:?}: {}",
-                output.status.code(),
-                stderr
-            );
-        }
-
-        Ok(())
-    }
-
     /// Fetches the latest changes for a branch in the bare repository
     /// This is useful for updating an existing worktree's branch before checking it out
     ///
@@ -1268,23 +1151,6 @@ mod tests {
         let result = repo
             .create_worktree("test-branch", Path::new("/tmp/test-worktree"))
             .await;
-
-        assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("Bare repository does not exist"));
-    }
-
-    #[tokio::test]
-    async fn test_cleanup_worktree_fails_without_bare_repo() {
-        let repo = GitRepo::new(
-            "owner",
-            "repo",
-            "github.com",
-            PathBuf::from("/tmp/nonexistent-bare-repo.git"),
-        );
-        let result = repo.cleanup_worktree(Path::new("/tmp/test-worktree")).await;
 
         assert!(result.is_err());
         assert!(result
@@ -1642,9 +1508,20 @@ mod tests {
             "Should return None for non-existent branch"
         );
 
-        // Test cleanup_worktree
-        let result = repo.cleanup_worktree(&worktree_path).await;
-        assert!(result.is_ok(), "Failed to cleanup worktree: {:?}", result);
+        // Clean up worktree using git directly
+        let cleanup_output = Command::new("git")
+            .arg("-C")
+            .arg(&bare_path)
+            .arg("worktree")
+            .arg("remove")
+            .arg(&worktree_path)
+            .output()
+            .await
+            .expect("Failed to execute git worktree remove");
+        assert!(
+            cleanup_output.status.success(),
+            "Failed to cleanup worktree"
+        );
 
         // Test find_worktree_for_branch after cleanup - should return None
         let result = repo.find_worktree_for_branch("test-branch").await;
