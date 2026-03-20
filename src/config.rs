@@ -406,18 +406,6 @@ impl LabConfig {
         Ok(config)
     }
 
-    /// Load configuration from a specific file path without daemon validation.
-    ///
-    /// This is the primary constructor for loading config from an explicit path,
-    /// useful for testing with isolated config files or when the config path is
-    /// known ahead of time.
-    ///
-    /// Equivalent to [`load_partial`](Self::load_partial).
-    #[allow(dead_code)] // Public API for callers that want an explicit-path constructor
-    pub fn from_path(path: &Path) -> Result<Self> {
-        Self::load_partial(path)
-    }
-
     /// Load configuration without daemon validation.
     ///
     /// Use this for non-daemon commands (e.g., `gru do`) that only need
@@ -1258,7 +1246,7 @@ repos = ["corp:team/app"]
     }
 
     #[test]
-    fn test_from_path_loads_config() {
+    fn test_load_partial_loads_config() {
         let config_toml = r#"
 [agent]
 default = "codex"
@@ -1267,13 +1255,13 @@ default = "codex"
         temp_file.write_all(config_toml.as_bytes()).unwrap();
         temp_file.flush().unwrap();
 
-        let config = LabConfig::from_path(temp_file.path()).unwrap();
+        let config = LabConfig::load_partial(temp_file.path()).unwrap();
         assert_eq!(config.agent.default, "codex");
     }
 
     #[test]
-    fn test_from_path_nonexistent_file_returns_error() {
-        let result = LabConfig::from_path(Path::new("/nonexistent/config.toml"));
+    fn test_load_partial_nonexistent_file_returns_error() {
+        let result = LabConfig::load_partial(Path::new("/nonexistent/config.toml"));
         assert!(result.is_err());
     }
 

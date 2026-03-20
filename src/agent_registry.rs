@@ -18,8 +18,8 @@ pub const DEFAULT_AGENT: &str = "claude";
 /// Returns an error with available agents listed if the name is unknown.
 pub fn resolve_backend(agent_name: &str) -> anyhow::Result<Box<dyn AgentBackend>> {
     match agent_name {
-        "claude" => Ok(Box::new(ClaudeBackend::new())),
-        "codex" => Ok(Box::new(CodexBackend::new())),
+        "claude" => Ok(Box::new(ClaudeBackend::default())),
+        "codex" => Ok(Box::new(CodexBackend)),
         unknown => {
             let available = AVAILABLE_AGENTS.join(", ");
             anyhow::bail!("Unknown agent '{}'. Available: {}", unknown, available);

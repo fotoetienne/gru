@@ -208,36 +208,4 @@ mod tests {
             .collect();
         assert!(!repo_override_names.contains(&"do"));
     }
-
-    #[test]
-    fn test_reserved_commands_excluded() {
-        let temp_dir = TempDir::new().unwrap();
-        let prompts_dir = temp_dir.path().join(".gru").join("prompts");
-        fs::create_dir_all(&prompts_dir).unwrap();
-
-        // Create a prompt with a reserved name
-        fs::write(
-            prompts_dir.join("status.md"),
-            "---\ndescription: Should be filtered\n---\nContent",
-        )
-        .unwrap();
-
-        // And a valid prompt
-        fs::write(
-            prompts_dir.join("valid.md"),
-            "---\ndescription: Valid prompt\n---\nContent",
-        )
-        .unwrap();
-
-        let result = prompt_loader::list_prompts_by_source_internal(
-            Some(temp_dir.path()),
-            Some(temp_dir.path()),
-        );
-        assert!(result.is_ok());
-
-        let prompts = result.unwrap();
-        // "status" should be filtered out, only "valid" should be present
-        assert_eq!(prompts.repo.len(), 1);
-        assert_eq!(prompts.repo[0].name, "valid");
-    }
 }

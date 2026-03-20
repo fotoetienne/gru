@@ -5,7 +5,6 @@ use crate::merge_readiness;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
-use std::path::Path;
 use std::process::Output;
 use tokio::time::{sleep, Duration, Instant};
 
@@ -500,7 +499,6 @@ pub(crate) async fn monitor_pr(
     owner: &str,
     repo: &str,
     pr_number: &str,
-    _worktree_path: &Path,
     max_duration: Option<Duration>,
     baseline: Option<DateTime<Utc>>,
 ) -> Result<(MonitorResult, DateTime<Utc>)> {

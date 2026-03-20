@@ -32,17 +32,12 @@ struct ToolBuffer {
 /// internally, emitting a single `AgentEvent::ToolUse` with a populated
 /// `input_summary` when `ContentBlockStop` arrives. This eliminates the UX
 /// regression of showing "Tool: Bash" instead of "Run: git status".
+#[derive(Default)]
 pub struct ClaudeBackend {
     tool_buffer: Mutex<Option<ToolBuffer>>,
 }
 
 impl ClaudeBackend {
-    pub fn new() -> Self {
-        Self {
-            tool_buffer: Mutex::new(None),
-        }
-    }
-
     /// Map a `ClaudeEvent` to an `AgentEvent`, using internal state to buffer
     /// tool invocations until their input JSON is complete.
     fn map_event(&self, event: &ClaudeEvent) -> Option<AgentEvent> {
@@ -274,7 +269,7 @@ mod tests {
     use super::*;
 
     fn backend() -> ClaudeBackend {
-        ClaudeBackend::new()
+        ClaudeBackend::default()
     }
 
     /// Assert that parse_events returns exactly one event and return it.
