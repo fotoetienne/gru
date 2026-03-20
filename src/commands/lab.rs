@@ -353,7 +353,7 @@ fn configured_repos(config: &LabConfig) -> HashSet<String> {
         .iter()
         .filter_map(|spec| {
             let (_host, owner, repo) = parse_repo_entry_with_hosts(spec, &config.github_hosts)?;
-            Some(format!("{}/{}", owner, repo))
+            Some(github::repo_slug(&owner, &repo))
         })
         .collect()
 }
@@ -363,7 +363,7 @@ fn configured_repos(config: &LabConfig) -> HashSet<String> {
 fn host_for_repo(config: &LabConfig, owner_repo: &str) -> Option<String> {
     for spec in &config.daemon.repos {
         if let Some((host, owner, repo)) = parse_repo_entry_with_hosts(spec, &config.github_hosts) {
-            if format!("{}/{}", owner, repo) == owner_repo {
+            if github::repo_slug(&owner, &repo) == owner_repo {
                 return Some(host);
             }
         }
@@ -971,7 +971,7 @@ async fn poll_and_spawn(
             }
         };
         // Canonical owner/repo form for registry lookups and issue URL building
-        let repo_full = format!("{}/{}", owner, repo);
+        let repo_full = github::repo_slug(&owner, &repo);
 
         // Fetch ready issues, excluding blocked ones (both GitHub-blocked and gru:blocked).
         // Try CLI first (supports -is:blocked qualifier), fall back to simpler CLI query
@@ -1344,7 +1344,7 @@ async fn fallback_list_issues(
     host: &str,
     label: &str,
 ) -> Result<Vec<github::CandidateIssue>> {
-    let repo_full = format!("{}/{}", owner, repo);
+    let repo_full = github::repo_slug(owner, repo);
     let output = github::gh_cli_command(host)
         .args([
             "issue",

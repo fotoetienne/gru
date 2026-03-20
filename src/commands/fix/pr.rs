@@ -16,7 +16,7 @@ pub(crate) async fn is_branch_pushed(
     host: &str,
     branch_name: &str,
 ) -> Result<bool> {
-    let repo_full = format!("{}/{}", owner, repo);
+    let repo_full = crate::github::repo_slug(owner, repo);
     let endpoint = format!("repos/{}/git/ref/heads/{}", repo_full, branch_name);
     let output = crate::github::gh_cli_command(host)
         .args(["api", &endpoint, "--silent"])

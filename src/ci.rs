@@ -265,7 +265,7 @@ pub async fn fetch_check_runs(
     repo: &str,
     git_ref: &str,
 ) -> Result<Vec<CheckRun>> {
-    let repo_full = format!("{}/{}", owner, repo);
+    let repo_full = github::repo_slug(owner, repo);
 
     let output = github::gh_cli_command(host)
         .args([
@@ -365,7 +365,7 @@ pub async fn fetch_check_logs(
     branch: &str,
 ) -> Result<Option<String>> {
     // Use gh to get the workflow run associated with this PR
-    let repo_full = format!("{}/{}", owner, repo);
+    let repo_full = github::repo_slug(owner, repo);
 
     let output = github::gh_cli_command(host)
         .args([
@@ -551,7 +551,7 @@ pub async fn get_pr_number(
     branch: &str,
     state: Option<&str>,
 ) -> Result<Option<u64>> {
-    let repo_full = format!("{}/{}", owner, repo);
+    let repo_full = github::repo_slug(owner, repo);
 
     let mut args = vec![
         "pr", "list", "--repo", &repo_full, "--head", branch, "--json", "number", "--limit", "1",
@@ -698,7 +698,7 @@ async fn post_escalation_comment_body(
     body: &str,
     minion_id: &str,
 ) -> Result<()> {
-    let repo_full = format!("{}/{}", owner, repo);
+    let repo_full = github::repo_slug(owner, repo);
     let body_with_sig = format!(
         "{}{}",
         body,

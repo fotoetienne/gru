@@ -13,6 +13,20 @@ use std::path::Path;
 use tokio::process::Command as TokioCommand;
 use tokio::time::{timeout, Duration};
 
+/// Format a duration in seconds into a human-readable string (e.g. "2h15m", "5m", "30s").
+fn format_duration(secs: u64) -> String {
+    let hours = secs / 3600;
+    let minutes = (secs % 3600) / 60;
+    let s = secs % 60;
+    if hours > 0 {
+        format!("{}h{}m", hours, minutes)
+    } else if minutes > 0 {
+        format!("{}m", minutes)
+    } else {
+        format!("{}s", s)
+    }
+}
+
 /// Persists a review-check timestamp to the minion registry (best-effort).
 /// Errors are logged as warnings since this is non-critical metadata.
 async fn save_review_check_time(minion_id: &str, ts: DateTime<Utc>) {
@@ -162,7 +176,7 @@ async fn post_exit_notification_if_needed(
     }
 
     let body = format_exit_notification_comment(minion_id, count);
-    let repo_full = format!("{}/{}", owner, repo);
+    let repo_full = github::repo_slug(owner, repo);
     let result = crate::github::gh_cli_command(host)
         .args([
             "pr", "comment", pr_number, "--repo", &repo_full, "--body", &body,
@@ -201,7 +215,7 @@ async fn post_escalation_comment(
     message: &str,
     minion_id: &str,
 ) {
-    let repo_full = format!("{}/{}", owner, repo);
+    let repo_full = github::repo_slug(owner, repo);
     let body = format!(
         "🤖 **Minion Escalation**\n\n{}{}",
         message,
@@ -453,18 +467,7 @@ pub(crate) async fn monitor_pr_lifecycle(
         // not just a single monitor_pr invocation.
         let remaining = monitor_timeout.checked_sub(monitor_start.elapsed());
         if remaining.is_none() || remaining == Some(Duration::ZERO) {
-            let elapsed = monitor_start.elapsed();
-            let total_secs = elapsed.as_secs();
-            let hours = total_secs / 3600;
-            let minutes = (total_secs % 3600) / 60;
-            let secs = total_secs % 60;
-            let display = if hours > 0 {
-                format!("{}h{}m", hours, minutes)
-            } else if minutes > 0 {
-                format!("{}m", minutes)
-            } else {
-                format!("{}s", secs)
-            };
+            let display = format_duration(monitor_start.elapsed().as_secs());
             println!("⏰ PR monitoring timed out after {}", display);
             println!(
                 "   PR is still open: https://github.com/{}/{}/pull/{}",
@@ -584,7 +587,7 @@ pub(crate) async fn monitor_pr_lifecycle(
                                 "🚀 Judge approved merge for PR #{} (confidence: {}/10)",
                                 pr_number, response.confidence
                             );
-                            let repo_full = format!("{}/{}", issue_ctx.owner, issue_ctx.repo);
+                            let repo_full = github::repo_slug(&issue_ctx.owner, &issue_ctx.repo);
                             match crate::github::gh_cli_command(&issue_ctx.host)
                                 .args([
                                     "pr", "merge", pr_number, "--squash", "--auto", "-R",
@@ -870,17 +873,7 @@ pub(crate) async fn monitor_pr_lifecycle(
             }
             Ok((MonitorResult::Timeout, _)) => {
                 // Use the lifecycle-level start time for an accurate total elapsed display
-                let total_secs = monitor_start.elapsed().as_secs();
-                let hours = total_secs / 3600;
-                let minutes = (total_secs % 3600) / 60;
-                let secs = total_secs % 60;
-                let display = if hours > 0 {
-                    format!("{}h{}m", hours, minutes)
-                } else if minutes > 0 {
-                    format!("{}m", minutes)
-                } else {
-                    format!("{}s", secs)
-                };
+                let display = format_duration(monitor_start.elapsed().as_secs());
                 println!("⏰ PR monitoring timed out after {}", display);
                 println!(
                     "   PR is still open: https://github.com/{}/{}/pull/{}",

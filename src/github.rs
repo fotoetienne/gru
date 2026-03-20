@@ -3,6 +3,11 @@ use tokio::process::Command;
 
 use crate::labels;
 
+/// Build a `"owner/repo"` slug from separate components.
+pub(crate) fn repo_slug(owner: &str, repo: &str) -> String {
+    format!("{}/{}", owner, repo)
+}
+
 /// Infer GitHub hostname from repository owner.
 ///
 /// This is a fallback heuristic used when the host isn't known from a URL.
@@ -76,7 +81,7 @@ pub async fn mark_pr_ready_via_cli(
     host: &str,
     pr_number: &str,
 ) -> Result<()> {
-    let repo_full = format!("{}/{}", owner, repo);
+    let repo_full = repo_slug(owner, repo);
     let output = gh_cli_command(host)
         .args(["pr", "ready", pr_number, "--repo", &repo_full])
         .output()
@@ -129,7 +134,7 @@ pub async fn list_ready_issues_via_cli(
     host: &str,
     label: &str,
 ) -> Result<Vec<CandidateIssue>> {
-    let repo_full = format!("{}/{}", owner, repo);
+    let repo_full = repo_slug(owner, repo);
     let search_query = build_ready_issues_search_query(label);
     let output = gh_cli_command(host)
         .args([
@@ -186,7 +191,7 @@ pub async fn get_issue_via_cli(
     host: &str,
     number: u64,
 ) -> Result<IssueInfo> {
-    let repo_full = format!("{}/{}", owner, repo);
+    let repo_full = repo_slug(owner, repo);
     let output = gh_cli_command(host)
         .args([
             "issue",
@@ -229,7 +234,7 @@ pub async fn is_issue_closed_via_cli(
     host: &str,
     number: u64,
 ) -> Result<bool> {
-    let repo_full = format!("{}/{}", owner, repo);
+    let repo_full = repo_slug(owner, repo);
     let output = gh_cli_command(host)
         .args([
             "issue",
@@ -271,7 +276,7 @@ pub async fn is_issue_closed_via_cli(
 /// * `host` - GitHub hostname
 /// * `number` - PR number
 pub async fn is_pr_open_via_cli(owner: &str, repo: &str, host: &str, number: u64) -> Result<bool> {
-    let repo_full = format!("{}/{}", owner, repo);
+    let repo_full = repo_slug(owner, repo);
     let output = gh_cli_command(host)
         .args([
             "pr",
@@ -345,7 +350,7 @@ pub struct PrInfo {
 /// * `repo` - Repository name
 /// * `number` - PR number
 pub async fn get_pr_via_cli(owner: &str, repo: &str, host: &str, number: u64) -> Result<PrInfo> {
-    let repo_full = format!("{}/{}", owner, repo);
+    let repo_full = repo_slug(owner, repo);
     let output = gh_cli_command(host)
         .args([
             "pr",
@@ -398,7 +403,7 @@ pub async fn create_draft_pr_via_cli(
     title: &str,
     body: &str,
 ) -> Result<String> {
-    let repo_full = format!("{}/{}", owner, repo);
+    let repo_full = repo_slug(owner, repo);
     let output = gh_cli_command(host)
         .args([
             "pr", "create", "--repo", &repo_full, "--head", branch, "--base", base, "--title",
@@ -480,7 +485,7 @@ pub async fn post_comment_via_cli(
     number: u64,
     body: &str,
 ) -> Result<()> {
-    let repo_full = format!("{}/{}", owner, repo);
+    let repo_full = repo_slug(owner, repo);
     let output = gh_cli_command(host)
         .args([
             "issue",
@@ -529,7 +534,7 @@ pub async fn edit_labels_via_cli(
         return Ok(());
     }
 
-    let repo_full = format!("{}/{}", owner, repo);
+    let repo_full = repo_slug(owner, repo);
     let mut args = vec![
         "issue".to_string(),
         "edit".to_string(),
@@ -585,7 +590,7 @@ pub async fn create_label_via_cli(
     color: &str,
     description: &str,
 ) -> Result<()> {
-    let repo_full = format!("{}/{}", owner, repo);
+    let repo_full = repo_slug(owner, repo);
     let output = gh_cli_command(host)
         .args([
             "label",
@@ -735,7 +740,7 @@ pub async fn remove_blocked_label(
     pr_number: u64,
     issue_number: u64,
 ) -> Result<()> {
-    let repo_full = format!("{}/{}", owner, repo);
+    let repo_full = repo_slug(owner, repo);
 
     // Remove gru:blocked from the PR (where ci.rs adds it)
     let output = gh_cli_command(host)
