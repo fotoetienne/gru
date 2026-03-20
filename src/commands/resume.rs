@@ -40,7 +40,7 @@ struct ResumeContext {
 /// Handles the resume command: resumes a stopped Minion in autonomous mode.
 ///
 /// Unlike `gru attach` (which runs interactively), `gru resume` runs in
-/// autonomous mode with stream-json monitoring and auto-PR creation -- the
+/// autonomous mode with stream-json monitoring and auto-PR creation — the
 /// same execution model as `gru do`.
 ///
 /// Flow:
@@ -123,7 +123,7 @@ async fn check_resumption_preconditions(
     let start_phase = info.orchestration_phase.clone();
     let wake_reason = info.wake_reason.clone();
 
-    // Check if timeout_deadline has passed -- fail instead of resuming
+    // Check if timeout_deadline has passed — fail instead of resuming
     if let Some(deadline) = timeout_deadline {
         if Utc::now() >= deadline {
             mark_minion_failed(&minion.minion_id).await;
@@ -224,7 +224,7 @@ async fn check_resumption_preconditions(
         if remaining.num_seconds() > 0 {
             Some(format!("{}s", remaining.num_seconds()))
         } else {
-            // Deadline just passed between the check above and here -- treat as expired
+            // Deadline just passed between the check above and here — treat as expired
             mark_minion_failed(&minion.minion_id).await;
             bail!(
                 "Minion {} has passed its timeout deadline ({}). Marking as failed.",
@@ -286,10 +286,10 @@ async fn run_resume_pipeline(ctx: ResumeContext, quiet: bool) -> Result<i32> {
     let _tmux_guard = TmuxGuard::new(&format!("gru:{}", wt_ctx.minion_id));
 
     println!(
-        "\u{1f504} Resuming Minion {} in autonomous mode...",
+        "🔄 Resuming Minion {} in autonomous mode...",
         wt_ctx.minion_id
     );
-    println!("\u{1f4c2} Workspace: {}", wt_ctx.checkout_path.display());
+    println!("📂 Workspace: {}", wt_ctx.checkout_path.display());
 
     // Phase: Run agent
     let agent_result = match run_agent_phase(
@@ -305,16 +305,16 @@ async fn run_resume_pipeline(ctx: ResumeContext, quiet: bool) -> Result<i32> {
     {
         Ok(result) => result,
         Err(e) if is_stuck_or_timeout_error(&e) => {
-            log::error!("\u{1f6a8} {:#}", e);
+            log::error!("🚨 {:#}", e);
             return Ok(1);
         }
         Err(e) => return Err(e),
     };
 
-    // Check agent result -- non-zero exit means failure
+    // Check agent result — non-zero exit means failure
     if let Some(ref result) = agent_result {
         if !result.status.success() {
-            println!("\u{274c} Agent session exited with non-zero status");
+            println!("❌ Agent session exited with non-zero status");
             return Ok(result.status.code().unwrap_or(EXIT_CODE_SIGNAL_TERMINATED));
         }
     }
@@ -336,11 +336,13 @@ async fn run_resume_pipeline(ctx: ResumeContext, quiet: bool) -> Result<i32> {
             );
         }
         update_orchestration_phase(&wt_ctx.minion_id, OrchestrationPhase::Completed).await;
-        println!("\u{2705} Resume completed for Minion {}", wt_ctx.minion_id);
+        println!("✅ Resume completed for Minion {}", wt_ctx.minion_id);
         return Ok(0);
     }
 
-    // Phase: Monitor PR lifecycle (reviews, CI, merge)
+    // Phase: Monitor PR lifecycle (reviews, CI, merge).
+    // When no PR exists, monitor_pr_phase falls back to standalone CI monitoring —
+    // aligning resume behavior with `gru do`.
     let monitor_timeout = Duration::from_secs(24 * 3600);
     let monitor_result = monitor_pr_phase(
         &*backend,
