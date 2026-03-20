@@ -788,7 +788,50 @@ async fn resume_interrupted_minions(
                 }
                 continue;
             }
-            Ok(false) => {} // Issue is still open, proceed with resume
+            Ok(false) => {
+                // Issue is still open — but the PR may already be merged
+                // (e.g. PR body lacked "Closes #N" so the issue wasn't auto-closed).
+                if let Some(pr_str) = &candidate.info.pr {
+                    if let Ok(pr_num) = pr_str.parse::<u64>() {
+                        match github::is_pr_open_via_cli(owner, repo_name, &host, pr_num).await {
+                            Ok(true) => {} // PR still open, proceed with resume
+                            Ok(false) => {
+                                tprintln!(
+                                    "⏭️  Skipping {} (issue #{}, {}): PR #{} is merged/closed",
+                                    candidate.minion_id,
+                                    candidate.info.issue,
+                                    candidate.info.repo,
+                                    pr_num,
+                                );
+                                let mid = candidate.minion_id.clone();
+                                if let Err(e) = with_registry(move |reg| {
+                                    reg.update(&mid, |info| {
+                                        info.orchestration_phase = OrchestrationPhase::Completed;
+                                    })
+                                })
+                                .await
+                                {
+                                    log::warn!(
+                                        "Failed to mark {} as completed: {}",
+                                        candidate.minion_id,
+                                        e
+                                    );
+                                }
+                                continue;
+                            }
+                            Err(e) => {
+                                log::warn!(
+                                    "⚠️  Failed to check PR #{} state for {}: {} — skipping to be safe",
+                                    pr_num,
+                                    candidate.minion_id,
+                                    e,
+                                );
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
             Err(e) => {
                 // Transient failure (network, auth, etc.) — skip this cycle;
                 // the candidate stays active so it will be retried next poll.
@@ -1942,5 +1985,56 @@ mod tests {
         let result = sort_and_dedup_resumable(candidates);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].minion_id, "M001");
+    }
+
+    // --- PR merge state check tests (resume_interrupted_minions logic) ---
+
+    /// Verifies that PR numbers stored in MinionInfo.pr parse correctly,
+    /// which is the prerequisite for the merged-PR check in resume_interrupted_minions.
+    #[test]
+    fn test_resumable_minion_pr_number_parsing() {
+        let mut candidate = make_resumable("M001", "owner/repo", 42);
+
+        // No PR — parsing should not produce a number
+        assert!(candidate.info.pr.is_none());
+
+        // Valid PR number
+        candidate.info.pr = Some("123".to_string());
+        let pr_num: Result<u64, _> = candidate.info.pr.as_ref().unwrap().parse();
+        assert_eq!(pr_num.unwrap(), 123);
+
+        // Invalid PR string — should fail gracefully (the code uses if let Ok)
+        candidate.info.pr = Some("not-a-number".to_string());
+        let pr_num: Result<u64, _> = candidate.info.pr.as_ref().unwrap().parse();
+        assert!(pr_num.is_err());
+    }
+
+    /// Verifies that resumable minions can carry PR metadata,
+    /// which resume_interrupted_minions uses to check merge state.
+    #[test]
+    fn test_resumable_minion_with_pr_is_deduped_correctly() {
+        let mut c1 = make_resumable("M001", "owner/repo", 42);
+        c1.info.pr = Some("100".to_string());
+        let mut c2 = make_resumable("M003", "owner/repo", 42);
+        c2.info.pr = Some("101".to_string());
+
+        let result = sort_and_dedup_resumable(vec![c1, c2]);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].minion_id, "M003");
+        // The most recent minion's PR is the one that will be checked
+        assert_eq!(result[0].info.pr.as_deref(), Some("101"));
+    }
+
+    /// Verifies the repo slug splitting used before the PR check.
+    #[test]
+    fn test_repo_slug_split_for_pr_check() {
+        // Valid slug
+        let repo = "owner/repo";
+        let (owner, repo_name) = repo.split_once('/').unwrap();
+        assert_eq!(owner, "owner");
+        assert_eq!(repo_name, "repo");
+
+        // Invalid slug — split_once returns None, which causes `continue` in the main loop
+        assert!("invalid".split_once('/').is_none());
     }
 }
