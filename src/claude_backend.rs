@@ -36,13 +36,15 @@ pub struct ClaudeBackend {
     tool_buffer: Mutex<Option<ToolBuffer>>,
 }
 
-impl ClaudeBackend {
-    pub fn new() -> Self {
+impl Default for ClaudeBackend {
+    fn default() -> Self {
         Self {
             tool_buffer: Mutex::new(None),
         }
     }
+}
 
+impl ClaudeBackend {
     /// Map a `ClaudeEvent` to an `AgentEvent`, using internal state to buffer
     /// tool invocations until their input JSON is complete.
     fn map_event(&self, event: &ClaudeEvent) -> Option<AgentEvent> {
@@ -274,7 +276,7 @@ mod tests {
     use super::*;
 
     fn backend() -> ClaudeBackend {
-        ClaudeBackend::new()
+        ClaudeBackend::default()
     }
 
     /// Assert that parse_events returns exactly one event and return it.

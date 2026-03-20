@@ -16,8 +16,6 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::reserved_commands;
-
 /// Built-in prompt definitions: (name, description, content, requires)
 ///
 /// These are the default prompts that ship with Gru. Repo-local prompts in
@@ -493,12 +491,6 @@ fn load_prompts_internal(
         let global_files = scan_prompt_directory(&global_dir)?;
 
         for (name, path) in global_files {
-            // Validate against reserved commands
-            if let Err(e) = reserved_commands::validate_not_reserved(&name) {
-                log::warn!("Warning: Skipping global prompt '{}': {}", name, e);
-                continue;
-            }
-
             match load_prompt_file(&path, &name, PromptSource::Global(path.clone())) {
                 Ok(prompt) => {
                     prompts.insert(name, prompt);
@@ -523,12 +515,6 @@ fn load_prompts_internal(
         let repo_files = scan_prompt_directory(&repo_dir)?;
 
         for (name, path) in repo_files {
-            // Validate against reserved commands
-            if let Err(e) = reserved_commands::validate_not_reserved(&name) {
-                log::warn!("Warning: Skipping repo prompt '{}': {}", name, e);
-                continue;
-            }
-
             match load_prompt_file(&path, &name, PromptSource::Repo(path.clone())) {
                 Ok(prompt) => {
                     // This will override any global or built-in prompt with the same name
@@ -620,7 +606,7 @@ fn collect_missing_params<'a>(
 /// // Missing "component" param → returns error
 /// validate_required_params(&metadata, &provided)?;
 /// ```
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 pub(crate) fn validate_required_params(
     metadata: &PromptMetadata,
     provided: &HashMap<String, String>,
@@ -674,9 +660,6 @@ pub(crate) fn list_prompts_by_source_internal(
         sorted_files.sort_by(|a, b| a.0.cmp(&b.0));
 
         for (name, path) in sorted_files {
-            if reserved_commands::is_reserved(&name) {
-                continue;
-            }
             match load_prompt_file(&path, &name, PromptSource::Repo(path.clone())) {
                 Ok(prompt) => repo_prompts.push(prompt),
                 Err(e) => log::warn!("Warning: Failed to load repo prompt '{}': {}", name, e),
@@ -694,9 +677,6 @@ pub(crate) fn list_prompts_by_source_internal(
         sorted_files.sort_by(|a, b| a.0.cmp(&b.0));
 
         for (name, path) in sorted_files {
-            if reserved_commands::is_reserved(&name) {
-                continue;
-            }
             match load_prompt_file(&path, &name, PromptSource::Global(path.clone())) {
                 Ok(prompt) => global_prompts.push(prompt),
                 Err(e) => log::warn!("Warning: Failed to load global prompt '{}': {}", name, e),
@@ -998,29 +978,6 @@ Test content"#,
         assert_eq!(prompt.name, "test");
         assert_eq!(prompt.metadata.description, Some("Test prompt".to_string()));
         assert_eq!(prompt.content, "Test content");
-    }
-
-    #[test]
-    fn test_load_prompts_reserved_name_rejected() {
-        let temp_dir = TempDir::new().unwrap();
-        let prompts_dir = temp_dir.path().join(".gru").join("prompts");
-        fs::create_dir_all(&prompts_dir).unwrap();
-
-        // Try to create a prompt with a reserved name
-        let prompt_file = prompts_dir.join("status.md");
-        fs::write(
-            &prompt_file,
-            r#"---
-description: Should be rejected
----
-Content"#,
-        )
-        .unwrap();
-
-        let prompts = load_prompts(Some(temp_dir.path())).unwrap();
-
-        // 'status' is reserved and should be filtered out
-        assert!(!prompts.contains_key("status"));
     }
 
     #[test]

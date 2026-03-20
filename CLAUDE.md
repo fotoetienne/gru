@@ -130,7 +130,6 @@ git commit --no-verify
 - `src/prompt_loader.rs` - Built-in and custom prompt file loading
 - `src/prompt_renderer.rs` - `{{ variable }}` template rendering for prompts
 - `src/text_buffer.rs` - Streaming text buffer with flush intervals
-- `src/reserved_commands.rs` - Reserved command name validation
 - `src/progress_comments.rs` - GitHub PR progress comment formatting
 - `src/labels.rs` - GitHub label constants and helpers (`gru:todo`, `gru:in-progress`, etc.)
 - `src/file_lock.rs` - Atomic file locking utilities

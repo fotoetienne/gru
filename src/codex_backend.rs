@@ -25,12 +25,6 @@ use uuid::Uuid;
 #[derive(Default)]
 pub struct CodexBackend;
 
-impl CodexBackend {
-    pub fn new() -> Self {
-        Self
-    }
-}
-
 impl AgentBackend for CodexBackend {
     fn name(&self) -> &str {
         "codex"
@@ -349,7 +343,7 @@ mod tests {
     use super::*;
 
     fn backend() -> CodexBackend {
-        CodexBackend::new()
+        CodexBackend
     }
 
     /// Assert that parse_events returns exactly one event and return it.

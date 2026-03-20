@@ -1052,7 +1052,6 @@ pub(crate) async fn monitor_pr_lifecycle(
             &ctx.issue_ctx.owner,
             &ctx.issue_ctx.repo,
             ctx.pr_number,
-            &ctx.wt_ctx.checkout_path,
             remaining,
             state.review_baseline,
         )
