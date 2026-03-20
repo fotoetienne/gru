@@ -228,9 +228,11 @@ pub async fn get_issue_via_cli(
 /// Fetches the issue's current state and labels in a single API call to detect
 /// TOCTOU races (issue closed or claimed between poll and dispatch).
 ///
-/// Returns `true` if the issue is still eligible (open and not in-progress).
-/// Returns `true` (fail-open) if the API call fails, so that transient errors
-/// don't block dispatch.
+/// Returns `true` if the issue is still eligible: the issue is still open and
+/// does not have any ineligible label such as `gru:in-progress`, `gru:done`,
+/// or `gru:failed`.
+/// Returns `true` (fail-open) if the API call or response parsing fails, so that
+/// transient errors don't block dispatch.
 pub async fn is_issue_still_eligible(owner: &str, repo: &str, host: &str, number: u64) -> bool {
     #[derive(serde::Deserialize)]
     struct RevalidationInfo {
@@ -258,32 +260,15 @@ pub async fn is_issue_still_eligible(owner: &str, repo: &str, host: &str, number
     match result {
         Ok(stdout) => match serde_json::from_str::<RevalidationInfo>(&stdout) {
             Ok(info) => {
-                if info.state != "OPEN" {
+                let eligible = check_issue_eligibility(&info.state, &info.labels);
+                if !eligible.0 {
                     log::info!(
-                        "⏭️  Issue #{} is no longer open (state: {}), skipping",
+                        "⏭️  Issue #{} {}, skipping",
                         number,
-                        info.state
+                        eligible.1.unwrap_or_default()
                     );
-                    return false;
                 }
-                let ineligible_labels = [
-                    crate::labels::IN_PROGRESS,
-                    crate::labels::DONE,
-                    crate::labels::FAILED,
-                ];
-                if let Some(label) = info
-                    .labels
-                    .iter()
-                    .find(|l| ineligible_labels.contains(&l.name.as_str()))
-                {
-                    log::info!(
-                        "⏭️  Issue #{} has ineligible label ({}) since last poll, skipping",
-                        number,
-                        label.name
-                    );
-                    return false;
-                }
-                true
+                eligible.0
             }
             Err(e) => {
                 log::warn!(
@@ -303,6 +288,33 @@ pub async fn is_issue_still_eligible(owner: &str, repo: &str, host: &str, number
             true // fail-open
         }
     }
+}
+
+/// Pure decision logic for issue eligibility based on state and labels.
+///
+/// Returns `(true, None)` if eligible, or `(false, Some(reason))` if not.
+fn check_issue_eligibility(state: &str, labels: &[IssueLabel]) -> (bool, Option<String>) {
+    if state != "OPEN" {
+        return (false, Some(format!("is no longer open (state: {})", state)));
+    }
+    let ineligible_labels = [
+        crate::labels::IN_PROGRESS,
+        crate::labels::DONE,
+        crate::labels::FAILED,
+    ];
+    if let Some(label) = labels
+        .iter()
+        .find(|l| ineligible_labels.contains(&l.name.as_str()))
+    {
+        return (
+            false,
+            Some(format!(
+                "has ineligible label ({}) since last poll",
+                label.name
+            )),
+        );
+    }
+    (true, None)
 }
 
 /// Check if a GitHub issue is closed (or has a merged/closed PR).
@@ -1254,6 +1266,85 @@ mod tests {
             "edit_labels_via_cli failed: {:?}",
             result.err()
         );
+    }
+
+    // --- check_issue_eligibility tests ---
+
+    fn make_labels(names: &[&str]) -> Vec<IssueLabel> {
+        names
+            .iter()
+            .map(|n| IssueLabel {
+                name: n.to_string(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_eligibility_open_no_labels() {
+        let (eligible, reason) = check_issue_eligibility("OPEN", &[]);
+        assert!(eligible);
+        assert!(reason.is_none());
+    }
+
+    #[test]
+    fn test_eligibility_open_with_todo_label() {
+        let labels = make_labels(&["gru:todo"]);
+        let (eligible, _) = check_issue_eligibility("OPEN", &labels);
+        assert!(eligible);
+    }
+
+    #[test]
+    fn test_eligibility_closed_state() {
+        let (eligible, reason) = check_issue_eligibility("CLOSED", &[]);
+        assert!(!eligible);
+        assert!(reason.unwrap().contains("no longer open"));
+    }
+
+    #[test]
+    fn test_eligibility_unexpected_state() {
+        let (eligible, reason) = check_issue_eligibility("MERGED", &[]);
+        assert!(!eligible);
+        assert!(reason.unwrap().contains("MERGED"));
+    }
+
+    #[test]
+    fn test_eligibility_in_progress_label() {
+        let labels = make_labels(&["gru:in-progress"]);
+        let (eligible, reason) = check_issue_eligibility("OPEN", &labels);
+        assert!(!eligible);
+        assert!(reason.unwrap().contains("gru:in-progress"));
+    }
+
+    #[test]
+    fn test_eligibility_done_label() {
+        let labels = make_labels(&["gru:done"]);
+        let (eligible, reason) = check_issue_eligibility("OPEN", &labels);
+        assert!(!eligible);
+        assert!(reason.unwrap().contains("gru:done"));
+    }
+
+    #[test]
+    fn test_eligibility_failed_label() {
+        let labels = make_labels(&["gru:failed"]);
+        let (eligible, reason) = check_issue_eligibility("OPEN", &labels);
+        assert!(!eligible);
+        assert!(reason.unwrap().contains("gru:failed"));
+    }
+
+    #[test]
+    fn test_eligibility_mixed_labels_one_ineligible() {
+        let labels = make_labels(&["bug", "gru:done", "priority:high"]);
+        let (eligible, _) = check_issue_eligibility("OPEN", &labels);
+        assert!(!eligible);
+    }
+
+    #[test]
+    fn test_eligibility_state_checked_before_labels() {
+        // Closed + ineligible label: should report state, not label
+        let labels = make_labels(&["gru:in-progress"]);
+        let (eligible, reason) = check_issue_eligibility("CLOSED", &labels);
+        assert!(!eligible);
+        assert!(reason.unwrap().contains("no longer open"));
     }
 
     #[tokio::test]
