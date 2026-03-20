@@ -739,6 +739,185 @@ fn sort_and_dedup_resumable(mut candidates: Vec<ResumableMinion>) -> Vec<Resumab
         .collect()
 }
 
+/// Determine whether a resume candidate should be skipped, and handle side-effects
+/// (marking closed issues as completed, marking exhausted minions as failed).
+///
+/// Returns `Ok(true)` if the candidate should be resumed, `Ok(false)` to skip.
+async fn should_resume_candidate(
+    candidate: &ResumableMinion,
+    host: &str,
+    max_attempts: u32,
+) -> Result<bool> {
+    // Cross-cycle guard: skip if another minion for this issue is already running
+    match is_issue_claimed(&candidate.info.repo, candidate.info.issue).await {
+        Ok(true) => {
+            log::info!(
+                "Skipping {} (issue #{}, {}): another minion for this issue is already running",
+                candidate.minion_id,
+                candidate.info.issue,
+                candidate.info.repo,
+            );
+            return Ok(false);
+        }
+        Ok(false) => {}
+        Err(e) => {
+            log::warn!(
+                "⚠️  Failed to check if issue #{} is claimed: {} — skipping to be safe",
+                candidate.info.issue,
+                e,
+            );
+            return Ok(false);
+        }
+    }
+
+    // Skip minions whose issue is already closed (PR merged or issue resolved)
+    let (owner, repo_name) = match candidate.info.repo.split_once('/') {
+        Some(parts) => parts,
+        None => return Ok(false),
+    };
+    match github::is_issue_closed_via_cli(owner, repo_name, host, candidate.info.issue).await {
+        Ok(true) => {
+            tprintln!(
+                "⏭️  Skipping {} (issue #{}, {}): issue is closed",
+                candidate.minion_id,
+                candidate.info.issue,
+                candidate.info.repo,
+            );
+            mark_minion_completed(&candidate.minion_id).await;
+            return Ok(false);
+        }
+        Ok(false) => {
+            // Issue is still open — but the PR may already be merged
+            // (e.g. PR body lacked "Closes #N" so the issue wasn't auto-closed).
+            let pr_field = candidate.info.pr.as_deref();
+            let decision = check_pr_merge_state(pr_field, |pr_num| {
+                tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current()
+                        .block_on(github::is_pr_open_via_cli(owner, repo_name, host, pr_num))
+                })
+            });
+            match decision {
+                PrResumeDecision::Resume => {} // proceed with resume
+                PrResumeDecision::SkipCompleted { pr_num } => {
+                    tprintln!(
+                        "⏭️  Skipping {} (issue #{}, {}): PR #{} is merged/closed",
+                        candidate.minion_id,
+                        candidate.info.issue,
+                        candidate.info.repo,
+                        pr_num,
+                    );
+                    mark_minion_completed(&candidate.minion_id).await;
+                    return Ok(false);
+                }
+                PrResumeDecision::RetryNextPoll { pr_num, error } => {
+                    log::warn!(
+                        "⚠️  Failed to check PR #{} state for {} (issue #{}): {} — will retry next poll",
+                        pr_num,
+                        candidate.minion_id,
+                        candidate.info.issue,
+                        error,
+                    );
+                    return Ok(false);
+                }
+            }
+        }
+        Err(e) => {
+            log::warn!(
+                "⚠️  Failed to check issue state for {} (issue #{}): {} — will retry next poll",
+                candidate.minion_id,
+                candidate.info.issue,
+                e,
+            );
+            return Ok(false);
+        }
+    }
+
+    // Skip minions whose timeout_deadline has passed
+    if let Some(deadline) = candidate.info.timeout_deadline {
+        if Utc::now() >= deadline {
+            tprintln!(
+                "⏭️  Skipping {} (issue #{}, {}): timeout_deadline has passed",
+                candidate.minion_id,
+                candidate.info.issue,
+                candidate.info.repo,
+            );
+            mark_exhausted_minion(
+                &candidate.minion_id,
+                &candidate.info,
+                host,
+                "timeout deadline has passed",
+            )
+            .await;
+            return Ok(false);
+        }
+    }
+
+    // Skip minions that have exceeded max attempts
+    if candidate.info.attempt_count > max_attempts {
+        tprintln!(
+            "⏭️  Skipping {} (issue #{}, {}): attempt_count {} > max {}",
+            candidate.minion_id,
+            candidate.info.issue,
+            candidate.info.repo,
+            candidate.info.attempt_count,
+            max_attempts,
+        );
+        let reason = format!("exceeded maximum resume attempts ({})", max_attempts);
+        mark_exhausted_minion(&candidate.minion_id, &candidate.info, host, &reason).await;
+        return Ok(false);
+    }
+
+    Ok(true)
+}
+
+/// Spawn a resume process for a candidate and write its PID to the registry.
+///
+/// Returns `Ok(true)` if the resume was successful and the child was added to `children`.
+async fn try_resume_candidate(
+    candidate: &ResumableMinion,
+    children: &mut Vec<SpawnedChild>,
+) -> bool {
+    match spawn_resume(&candidate.minion_id).await {
+        Ok(child) => {
+            // Write the `gru resume` PID to registry immediately to prevent
+            // duplicate spawns. The inner agent subprocess will later
+            // overwrite this with the agent PID via pid_callback.
+            if let Some(pid) = child.id() {
+                let mid = candidate.minion_id.clone();
+                if let Err(e) = with_registry(move |registry| {
+                    registry.update(&mid, |info| {
+                        info.pid = Some(pid);
+                        info.pid_start_time = crate::minion_registry::get_process_start_time(pid);
+                        info.mode = MinionMode::Autonomous;
+                    })
+                })
+                .await
+                {
+                    log::warn!(
+                        "⚠️  Failed to write PID for resumed {}: {}",
+                        candidate.minion_id,
+                        e
+                    );
+                }
+            }
+            children.push(SpawnedChild {
+                child,
+                spawn_meta: None, // Resumed minions don't need label restoration
+            });
+            true
+        }
+        Err(e) => {
+            log::warn!(
+                "⚠️  Failed to resume {} for issue #{}: {}",
+                candidate.minion_id,
+                candidate.info.issue,
+                e
+            );
+            false
+        }
+    }
+}
+
 /// Resume interrupted minions, filling available slots before new issue claims.
 ///
 /// Returns the number of minions successfully resumed.
@@ -785,137 +964,17 @@ async fn resume_interrupted_minions(
 
     let mut resumed = 0;
 
-    for candidate in resumable {
+    for candidate in &resumable {
         if *available == 0 {
             break;
         }
 
         let host = match host_for_repo(config, &candidate.info.repo) {
             Some(h) => h,
-            None => continue, // repo no longer in config
-        };
-
-        // Cross-cycle guard: skip if another minion for this issue is already running
-        // (e.g. the most-recent was resumed in the previous cycle and is still alive).
-        match is_issue_claimed(&candidate.info.repo, candidate.info.issue).await {
-            Ok(true) => {
-                log::info!(
-                    "Skipping {} (issue #{}, {}): another minion for this issue is already running",
-                    candidate.minion_id,
-                    candidate.info.issue,
-                    candidate.info.repo,
-                );
-                continue;
-            }
-            Ok(false) => {}
-            Err(e) => {
-                log::warn!(
-                    "⚠️  Failed to check if issue #{} is claimed: {} — skipping to be safe",
-                    candidate.info.issue,
-                    e,
-                );
-                continue;
-            }
-        }
-
-        // Skip minions whose issue is already closed (PR merged or issue resolved)
-        let (owner, repo_name) = match candidate.info.repo.split_once('/') {
-            Some(parts) => parts,
             None => continue,
         };
-        match github::is_issue_closed_via_cli(owner, repo_name, &host, candidate.info.issue).await {
-            Ok(true) => {
-                tprintln!(
-                    "⏭️  Skipping {} (issue #{}, {}): issue is closed",
-                    candidate.minion_id,
-                    candidate.info.issue,
-                    candidate.info.repo,
-                );
-                mark_minion_completed(&candidate.minion_id).await;
-                continue;
-            }
-            Ok(false) => {
-                // Issue is still open — but the PR may already be merged
-                // (e.g. PR body lacked "Closes #N" so the issue wasn't auto-closed).
-                let pr_field = candidate.info.pr.as_deref();
-                let decision = check_pr_merge_state(pr_field, |pr_num| {
-                    // We can't use async closures directly, so we block on the future.
-                    // This runs inside the Tokio runtime already, so we use block_in_place.
-                    tokio::task::block_in_place(|| {
-                        tokio::runtime::Handle::current()
-                            .block_on(github::is_pr_open_via_cli(owner, repo_name, &host, pr_num))
-                    })
-                });
-                match decision {
-                    PrResumeDecision::Resume => {} // proceed with resume
-                    PrResumeDecision::SkipCompleted { pr_num } => {
-                        tprintln!(
-                            "⏭️  Skipping {} (issue #{}, {}): PR #{} is merged/closed",
-                            candidate.minion_id,
-                            candidate.info.issue,
-                            candidate.info.repo,
-                            pr_num,
-                        );
-                        mark_minion_completed(&candidate.minion_id).await;
-                        continue;
-                    }
-                    PrResumeDecision::RetryNextPoll { pr_num, error } => {
-                        log::warn!(
-                            "⚠️  Failed to check PR #{} state for {} (issue #{}): {} — will retry next poll",
-                            pr_num,
-                            candidate.minion_id,
-                            candidate.info.issue,
-                            error,
-                        );
-                        continue;
-                    }
-                }
-            }
-            Err(e) => {
-                // Transient failure (network, auth, etc.) — skip this cycle;
-                // the candidate stays active so it will be retried next poll.
-                log::warn!(
-                    "⚠️  Failed to check issue state for {} (issue #{}): {} — will retry next poll",
-                    candidate.minion_id,
-                    candidate.info.issue,
-                    e,
-                );
-                continue;
-            }
-        }
 
-        // Skip minions whose timeout_deadline has passed
-        if let Some(deadline) = candidate.info.timeout_deadline {
-            if Utc::now() >= deadline {
-                tprintln!(
-                    "⏭️  Skipping {} (issue #{}, {}): timeout_deadline has passed",
-                    candidate.minion_id,
-                    candidate.info.issue,
-                    candidate.info.repo,
-                );
-                mark_exhausted_minion(
-                    &candidate.minion_id,
-                    &candidate.info,
-                    &host,
-                    "timeout deadline has passed",
-                )
-                .await;
-                continue;
-            }
-        }
-
-        // Skip minions that have exceeded max attempts
-        if candidate.info.attempt_count > max_attempts {
-            tprintln!(
-                "⏭️  Skipping {} (issue #{}, {}): attempt_count {} > max {}",
-                candidate.minion_id,
-                candidate.info.issue,
-                candidate.info.repo,
-                candidate.info.attempt_count,
-                max_attempts,
-            );
-            let reason = format!("exceeded maximum resume attempts ({})", max_attempts);
-            mark_exhausted_minion(&candidate.minion_id, &candidate.info, &host, &reason).await;
+        if !should_resume_candidate(candidate, &host, max_attempts).await? {
             continue;
         }
 
@@ -930,45 +989,9 @@ async fn resume_interrupted_minions(
         // Record this minion as attempted regardless of outcome
         resumed_this_session.insert(candidate.minion_id.clone());
 
-        match spawn_resume(&candidate.minion_id).await {
-            Ok(child) => {
-                // Write the `gru resume` PID to registry immediately to prevent
-                // duplicate spawns. The inner agent subprocess will later
-                // overwrite this with the agent PID via pid_callback.
-                if let Some(pid) = child.id() {
-                    let mid = candidate.minion_id.clone();
-                    if let Err(e) = with_registry(move |registry| {
-                        registry.update(&mid, |info| {
-                            info.pid = Some(pid);
-                            info.pid_start_time =
-                                crate::minion_registry::get_process_start_time(pid);
-                            info.mode = MinionMode::Autonomous;
-                        })
-                    })
-                    .await
-                    {
-                        log::warn!(
-                            "⚠️  Failed to write PID for resumed {}: {}",
-                            candidate.minion_id,
-                            e
-                        );
-                    }
-                }
-                children.push(SpawnedChild {
-                    child,
-                    spawn_meta: None, // Resumed minions don't need label restoration
-                });
-                resumed += 1;
-                *available -= 1;
-            }
-            Err(e) => {
-                log::warn!(
-                    "⚠️  Failed to resume {} for issue #{}: {}",
-                    candidate.minion_id,
-                    candidate.info.issue,
-                    e
-                );
-            }
+        if try_resume_candidate(candidate, children).await {
+            resumed += 1;
+            *available -= 1;
         }
     }
 
@@ -977,6 +1000,247 @@ async fn resume_interrupted_minions(
     }
 
     Ok(resumed)
+}
+
+/// Fetch candidate issues for a single repository, with fallback on failure.
+async fn fetch_candidate_issues(
+    owner: &str,
+    repo: &str,
+    host: &str,
+    label: &str,
+    repo_spec: &str,
+) -> Option<Vec<github::CandidateIssue>> {
+    match list_ready_issues_via_cli(owner, repo, host, label).await {
+        Ok(issues) => Some(issues),
+        Err(cli_err) => {
+            log::warn!(
+                "⚠️  CLI issue fetch failed for {}: {}, trying basic CLI fallback",
+                repo_spec,
+                cli_err
+            );
+            match fallback_list_issues(owner, repo, host, label).await {
+                Ok(issues) => Some(issues),
+                Err(e) => {
+                    log::warn!("⚠️  Fallback also failed for {}: {}", repo_spec, e);
+                    None
+                }
+            }
+        }
+    }
+}
+
+/// Parsed repository identity for a single poll cycle iteration.
+struct RepoContext<'a> {
+    host: String,
+    owner: String,
+    repo: String,
+    /// Canonical `owner/repo` slug.
+    full: String,
+    /// Original repo spec string from config (for log messages).
+    spec: &'a str,
+}
+
+/// Try to claim and spawn a Minion for a single issue.
+///
+/// Assumes the caller has already checked for dependency blockers and that the
+/// issue is not already claimed. Returns `Ok(true)` if a minion was successfully
+/// spawned, `Ok(false)` if the claim or spawn failed.
+async fn try_spawn_for_issue(
+    ctx: &RepoContext<'_>,
+    issue_number: u64,
+    label: &str,
+    children: &mut Vec<SpawnedChild>,
+) -> Result<bool> {
+    // Try to claim the issue via CLI
+    if let Err(e) =
+        github::claim_issue_via_cli(&ctx.host, &ctx.owner, &ctx.repo, issue_number, label).await
+    {
+        log::warn!(
+            "⚠️  Failed to claim issue {}/issues/{}: {}",
+            ctx.spec,
+            issue_number,
+            e
+        );
+        return Ok(false);
+    }
+
+    // Successfully claimed, spawn Minion
+    match spawn_minion(&ctx.full, &ctx.host, issue_number).await {
+        Ok(child) => {
+            // Write PID to registry immediately (if the subprocess has
+            // already created the entry) to prevent duplicate spawns.
+            if let Some(pid) = child.id() {
+                let repo_cl = ctx.full.clone();
+                if let Err(e) = with_registry(move |registry| {
+                    let entries = registry.find_by_issue(&repo_cl, issue_number);
+                    if entries.is_empty() {
+                        log::debug!(
+                            "No registry entry yet for issue #{} — \
+                             subprocess will register its own PID",
+                            issue_number
+                        );
+                    }
+                    for (mid, _) in entries {
+                        registry.update(&mid, |info| {
+                            info.pid = Some(pid);
+                            info.pid_start_time =
+                                crate::minion_registry::get_process_start_time(pid);
+                            info.mode = MinionMode::Autonomous;
+                        })?;
+                    }
+                    Ok(())
+                })
+                .await
+                {
+                    log::warn!(
+                        "⚠️  Failed to write PID for new spawn on issue #{}: {}",
+                        issue_number,
+                        e
+                    );
+                }
+            }
+            children.push(SpawnedChild {
+                child,
+                spawn_meta: Some(SpawnMeta {
+                    host: ctx.host.clone(),
+                    owner: ctx.owner.clone(),
+                    repo: ctx.repo.clone(),
+                    issue_number,
+                    ready_label: label.to_string(),
+                    spawned_at: Instant::now(),
+                }),
+            });
+            tprintln!("✨ Spawned Minion for {}/issues/{}", ctx.spec, issue_number);
+            Ok(true)
+        }
+        Err(e) => {
+            log::warn!(
+                "⚠️  Failed to spawn Minion for {}/issues/{}: {}",
+                ctx.spec,
+                issue_number,
+                e
+            );
+            // Unclaim the issue since we failed to spawn: remove in-progress, restore ready label
+            if let Err(e) = github::edit_labels_via_cli(
+                &ctx.host,
+                &ctx.owner,
+                &ctx.repo,
+                issue_number,
+                &[label],
+                &[labels::IN_PROGRESS],
+            )
+            .await
+            {
+                log::warn!(
+                    "⚠️  Failed to restore labels on issue #{}: {} \
+                     — issue may need manual label fix",
+                    issue_number,
+                    e
+                );
+            }
+            Ok(false)
+        }
+    }
+}
+
+/// Poll all configured repositories for ready issues and spawn Minions for them.
+///
+/// Returns the number of minions successfully spawned.
+async fn spawn_for_candidate_issues(
+    config: &LabConfig,
+    children: &mut Vec<SpawnedChild>,
+    available: &mut usize,
+    label: &str,
+) -> Result<usize> {
+    let mut spawned = 0usize;
+
+    for repo_spec in &config.daemon.repos {
+        if *available == 0 {
+            break;
+        }
+
+        let (host, owner, repo) = match parse_repo_entry_with_hosts(repo_spec, &config.github_hosts)
+        {
+            Some(parsed) => parsed,
+            None => {
+                log::warn!("⚠️  Invalid repo format: '{}', skipping", repo_spec);
+                continue;
+            }
+        };
+        let ctx = RepoContext {
+            full: github::repo_slug(&owner, &repo),
+            host,
+            owner,
+            repo,
+            spec: repo_spec,
+        };
+
+        let candidates =
+            match fetch_candidate_issues(&ctx.owner, &ctx.repo, &ctx.host, label, ctx.spec).await {
+                Some(c) => c,
+                None => continue,
+            };
+
+        let candidate_count = candidates.len();
+        let mut blocked_count = 0usize;
+        let mut spawned_this_repo = 0usize;
+
+        for candidate in &candidates {
+            if *available == 0 {
+                break;
+            }
+
+            // Check if issue is already being worked on (by a live process)
+            if is_issue_claimed(&ctx.full, candidate.number).await? {
+                continue;
+            }
+
+            // Check if issue has unresolved dependencies (body parsing + API verify)
+            let body = candidate.body.as_deref().unwrap_or("");
+            let blockers = crate::dependencies::get_blockers(
+                &ctx.host,
+                &ctx.owner,
+                &ctx.repo,
+                candidate.number,
+                body,
+            )
+            .await;
+            if !blockers.is_empty() {
+                let blocker_list: Vec<String> = blockers.iter().map(|n| format!("#{n}")).collect();
+                log::info!(
+                    "⏭️  Skipping issue #{}: blocked by {}",
+                    candidate.number,
+                    blocker_list.join(", ")
+                );
+                blocked_count += 1;
+                continue;
+            }
+
+            // Revalidate issue state to prevent TOCTOU races between poll and dispatch
+            if !github::is_issue_still_eligible(&ctx.owner, &ctx.repo, &ctx.host, candidate.number)
+                .await
+            {
+                continue;
+            }
+
+            if try_spawn_for_issue(&ctx, candidate.number, label, children).await? {
+                spawned += 1;
+                spawned_this_repo += 1;
+                *available -= 1;
+            }
+        }
+
+        if candidate_count > 0 && spawned_this_repo == 0 && blocked_count > 0 {
+            log::warn!(
+                "🚫 {}/{} candidate issue(s) in {} blocked by dependencies — nothing spawned this cycle",
+                blocked_count,
+                candidate_count,
+                ctx.spec
+            );
+        }
+    }
+
+    Ok(spawned)
 }
 
 /// Poll GitHub for ready issues and spawn Minions if slots are available
@@ -1037,198 +1301,9 @@ async fn poll_and_spawn(
         return Ok(());
     }
 
-    // Poll each configured repository
-    for repo_spec in &config.daemon.repos {
-        if available == 0 {
-            break;
-        }
-
-        // Parse owner/repo, host/owner/repo, or name:owner/repo
-        let (host, owner, repo) = match parse_repo_entry_with_hosts(repo_spec, &config.github_hosts)
-        {
-            Some(parsed) => parsed,
-            None => {
-                log::warn!("⚠️  Invalid repo format: '{}', skipping", repo_spec);
-                continue;
-            }
-        };
-        // Canonical owner/repo form for registry lookups and issue URL building
-        let repo_full = github::repo_slug(&owner, &repo);
-
-        // Fetch ready issues, excluding blocked ones (both GitHub-blocked and gru:blocked).
-        // Try CLI first (supports -is:blocked qualifier), fall back to simpler CLI query
-        // with client-side filtering.
-        let candidates =
-            match list_ready_issues_via_cli(&owner, &repo, &host, &config.daemon.label).await {
-                Ok(issues) => issues,
-                Err(cli_err) => {
-                    log::warn!(
-                        "⚠️  CLI issue fetch failed for {}: {}, trying basic CLI fallback",
-                        repo_spec,
-                        cli_err
-                    );
-                    match fallback_list_issues(&owner, &repo, &host, &config.daemon.label).await {
-                        Ok(issues) => issues,
-                        Err(e) => {
-                            log::warn!("⚠️  Fallback also failed for {}: {}", repo_spec, e);
-                            continue;
-                        }
-                    }
-                }
-            };
-
-        let candidate_count = candidates.len();
-        let mut blocked_count = 0usize;
-        let mut spawned_this_repo = 0usize;
-
-        // Try to spawn a Minion for each ready issue
-        for candidate in candidates {
-            let issue_number = candidate.number;
-            if available == 0 {
-                break;
-            }
-
-            // Check if issue is already being worked on (by a live process)
-            if is_issue_claimed(&repo_full, issue_number).await? {
-                continue;
-            }
-
-            // Check if issue has unresolved dependencies (body parsing + API verify)
-            let body = candidate.body.as_deref().unwrap_or("");
-            let blockers =
-                crate::dependencies::get_blockers(&host, &owner, &repo, issue_number, body).await;
-            if !blockers.is_empty() {
-                let blocker_list: Vec<String> = blockers.iter().map(|n| format!("#{n}")).collect();
-                log::info!(
-                    "⏭️  Skipping issue #{}: blocked by {}",
-                    issue_number,
-                    blocker_list.join(", ")
-                );
-                blocked_count += 1;
-                continue;
-            }
-
-            // Revalidate issue state to prevent TOCTOU races between poll and dispatch
-            if !github::is_issue_still_eligible(&owner, &repo, &host, issue_number).await {
-                continue;
-            }
-
-            // Try to claim the issue via CLI
-            match github::claim_issue_via_cli(
-                &host,
-                &owner,
-                &repo,
-                issue_number,
-                &config.daemon.label,
-            )
-            .await
-            {
-                Ok(()) => {
-                    // Successfully claimed, spawn Minion
-                    match spawn_minion(&repo_full, &host, issue_number).await {
-                        Ok(child) => {
-                            // Write PID to registry immediately (if the subprocess has
-                            // already created the entry) to prevent duplicate spawns.
-                            if let Some(pid) = child.id() {
-                                let repo_cl = repo_full.clone();
-                                if let Err(e) = with_registry(move |registry| {
-                                    let entries = registry.find_by_issue(&repo_cl, issue_number);
-                                    if entries.is_empty() {
-                                        log::debug!(
-                                            "No registry entry yet for issue #{} — \
-                                             subprocess will register its own PID",
-                                            issue_number
-                                        );
-                                    }
-                                    for (mid, _) in entries {
-                                        registry.update(&mid, |info| {
-                                            info.pid = Some(pid);
-                                            info.pid_start_time =
-                                                crate::minion_registry::get_process_start_time(pid);
-                                            info.mode = MinionMode::Autonomous;
-                                        })?;
-                                    }
-                                    Ok(())
-                                })
-                                .await
-                                {
-                                    log::warn!(
-                                        "⚠️  Failed to write PID for new spawn on issue #{}: {}",
-                                        issue_number,
-                                        e
-                                    );
-                                }
-                            }
-                            children.push(SpawnedChild {
-                                child,
-                                spawn_meta: Some(SpawnMeta {
-                                    host: host.clone(),
-                                    owner: owner.clone(),
-                                    repo: repo.clone(),
-                                    issue_number,
-                                    ready_label: config.daemon.label.clone(),
-                                    spawned_at: Instant::now(),
-                                }),
-                            });
-                            tprintln!(
-                                "✨ Spawned Minion for {}/issues/{}",
-                                repo_spec,
-                                issue_number
-                            );
-                            spawned += 1;
-                            spawned_this_repo += 1;
-                            available -= 1; // Decrement available slots after successful spawn
-                        }
-                        Err(e) => {
-                            log::warn!(
-                                "⚠️  Failed to spawn Minion for {}/issues/{}: {}",
-                                repo_spec,
-                                issue_number,
-                                e
-                            );
-                            // Unclaim the issue since we failed to spawn: remove in-progress, restore ready label
-                            if let Err(e) = github::edit_labels_via_cli(
-                                &host,
-                                &owner,
-                                &repo,
-                                issue_number,
-                                &[&config.daemon.label],
-                                &[labels::IN_PROGRESS],
-                            )
-                            .await
-                            {
-                                log::warn!(
-                                    "⚠️  Failed to restore labels on issue #{}: {} \
-                                     — issue may need manual label fix",
-                                    issue_number,
-                                    e
-                                );
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    log::warn!(
-                        "⚠️  Failed to claim issue {}/issues/{}: {}",
-                        repo_spec,
-                        issue_number,
-                        e
-                    );
-                    continue;
-                }
-            }
-        }
-
-        // Log when no candidates were spawned and some were blocked
-        if candidate_count > 0 && spawned_this_repo == 0 && blocked_count > 0 {
-            log::warn!(
-                "🚫 {}/{} candidate issue(s) in {} blocked by dependencies — nothing spawned this cycle",
-                blocked_count,
-                candidate_count,
-                repo_spec
-            );
-        }
-    }
+    // Poll each configured repository and spawn minions for ready issues
+    spawned +=
+        spawn_for_candidate_issues(config, children, &mut available, &config.daemon.label).await?;
 
     if spawned > 0 {
         tprintln!();
@@ -1298,24 +1373,18 @@ fn format_log_name(host: &str, repo: &str, issue_number: u64) -> String {
     format!("{}{}-issue-{}.log", safe_host, safe_repo, issue_number)
 }
 
-/// Spawn a Minion to work on an issue using the `gru do` command.
+/// Create the log directory and open a log file, returning cloned handles for
+/// stdout and stderr redirection.
 ///
-/// Returns the child process handle for lifecycle tracking.
-async fn spawn_minion(repo: &str, host: &str, issue_number: u64) -> Result<Child> {
-    let issue_ref = crate::github::build_issue_url_with_host(repo, host, issue_number)
-        .with_context(|| format!("Invalid repo format: '{}'", repo))?;
-
-    // Get the current executable path
-    let exe = std::env::current_exe().context("Failed to get current executable path")?;
-
-    // Create log directory and open log file for this minion's output
+/// The returned `PathBuf` is the resolved log file path (for display purposes).
+async fn setup_log_file(log_name: &str) -> Result<(std::fs::File, std::fs::File, PathBuf)> {
     let home = dirs::home_dir().context("Failed to determine home directory")?;
     let log_dir = home.join(".gru").join("state").join("logs");
     tokio::fs::create_dir_all(&log_dir)
         .await
         .with_context(|| format!("Failed to create log directory: {}", log_dir.display()))?;
 
-    let log_path = log_dir.join(format_log_name(host, repo, issue_number));
+    let log_path = log_dir.join(log_name);
     let log_file = tokio::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -1329,15 +1398,21 @@ async fn spawn_minion(repo: &str, host: &str, issue_number: u64) -> Result<Child
         .context("Failed to clone log file handle")?;
     let stderr_file = log_file;
 
-    // Spawn `gru do <issue>` as a background process with output captured to log file.
-    // Remove TMUX/TMUX_PANE so the child doesn't inherit the lab's tmux session —
-    // otherwise TmuxGuard renames arbitrary windows in the parent's tmux.
-    let mut cmd = tokio::process::Command::new(exe);
-    cmd.arg("do")
-        .arg(&issue_ref)
-        .env_remove("TMUX")
-        .env_remove("TMUX_PANE")
-        .stdin(Stdio::null())
+    Ok((stdout_file, stderr_file, log_path))
+}
+
+/// Spawn a command as a background process with stdin null and stdout/stderr
+/// redirected to the given file handles.
+///
+/// Gives the child its own session (setsid) so Ctrl-C doesn't propagate, waits
+/// briefly for immediate failures, and returns the child handle.
+async fn spawn_background_cmd(
+    mut cmd: tokio::process::Command,
+    stdout_file: std::fs::File,
+    stderr_file: std::fs::File,
+    description: &str,
+) -> Result<Child> {
+    cmd.stdin(Stdio::null())
         .stdout(Stdio::from(stdout_file))
         .stderr(Stdio::from(stderr_file));
 
@@ -1355,20 +1430,51 @@ async fn spawn_minion(repo: &str, host: &str, issue_number: u64) -> Result<Child
         });
     }
 
-    let mut child = cmd.spawn().context("Failed to spawn gru do command")?;
+    let mut child = cmd
+        .spawn()
+        .with_context(|| format!("Failed to spawn {}", description))?;
 
-    // Give the process a moment to fail if there are startup issues
-    // This prevents phantom slot occupancy from processes that immediately fail
+    // Give the process a moment to fail if there are startup issues.
+    // This prevents phantom slot occupancy from processes that immediately fail.
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    // Check if the process is still running
     if let Ok(Some(status)) = child.try_wait() {
         anyhow::bail!(
-            "Spawned process for {} exited immediately with status: {:?}",
-            issue_ref,
+            "{} exited immediately with status: {:?}",
+            description,
             status
         );
     }
+
+    Ok(child)
+}
+
+/// Spawn a Minion to work on an issue using the `gru do` command.
+///
+/// Returns the child process handle for lifecycle tracking.
+async fn spawn_minion(repo: &str, host: &str, issue_number: u64) -> Result<Child> {
+    let issue_ref = crate::github::build_issue_url_with_host(repo, host, issue_number)
+        .with_context(|| format!("Invalid repo format: '{}'", repo))?;
+
+    let exe = std::env::current_exe().context("Failed to get current executable path")?;
+    let log_name = format_log_name(host, repo, issue_number);
+    let (stdout_file, stderr_file, log_path) = setup_log_file(&log_name).await?;
+
+    // Remove TMUX/TMUX_PANE so the child doesn't inherit the lab's tmux session —
+    // otherwise TmuxGuard renames arbitrary windows in the parent's tmux.
+    let mut cmd = tokio::process::Command::new(exe);
+    cmd.arg("do")
+        .arg(&issue_ref)
+        .env_remove("TMUX")
+        .env_remove("TMUX_PANE");
+
+    let child = spawn_background_cmd(
+        cmd,
+        stdout_file,
+        stderr_file,
+        &format!("gru do {}", issue_ref),
+    )
+    .await?;
 
     tprintln!("📝 Log: {}", log_path.display());
 
@@ -1379,47 +1485,19 @@ async fn spawn_minion(repo: &str, host: &str, issue_number: u64) -> Result<Child
 /// Returns the child process handle for lifecycle tracking.
 async fn spawn_resume(minion_id: &str) -> Result<Child> {
     let exe = std::env::current_exe().context("Failed to get current executable path")?;
+    let log_name = format!("resume-{}.log", minion_id);
+    let (stdout_file, stderr_file, log_path) = setup_log_file(&log_name).await?;
 
-    // Create log directory and open log file
-    let home = dirs::home_dir().context("Failed to determine home directory")?;
-    let log_dir = home.join(".gru").join("state").join("logs");
-    tokio::fs::create_dir_all(&log_dir)
-        .await
-        .with_context(|| format!("Failed to create log directory: {}", log_dir.display()))?;
+    let mut cmd = tokio::process::Command::new(exe);
+    cmd.arg("resume").arg(minion_id);
 
-    let log_path = log_dir.join(format!("resume-{}.log", minion_id));
-    let log_file = tokio::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)
-        .await
-        .with_context(|| format!("Failed to open log file: {}", log_path.display()))?
-        .try_into_std()
-        .expect("no in-flight I/O immediately after open");
-    let stdout_file = log_file
-        .try_clone()
-        .context("Failed to clone log file handle")?;
-    let stderr_file = log_file;
-
-    let mut child = tokio::process::Command::new(exe)
-        .arg("resume")
-        .arg(minion_id)
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(stdout_file))
-        .stderr(Stdio::from(stderr_file))
-        .spawn()
-        .context("Failed to spawn gru resume command")?;
-
-    // Give the process a moment to fail if there are startup issues
-    tokio::time::sleep(Duration::from_millis(100)).await;
-
-    if let Ok(Some(status)) = child.try_wait() {
-        anyhow::bail!(
-            "Spawned gru resume for {} exited immediately with status: {:?}",
-            minion_id,
-            status
-        );
-    }
+    let child = spawn_background_cmd(
+        cmd,
+        stdout_file,
+        stderr_file,
+        &format!("gru resume {}", minion_id),
+    )
+    .await?;
 
     tprintln!("📝 Log: {}", log_path.display());
 
