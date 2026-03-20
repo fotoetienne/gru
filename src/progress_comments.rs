@@ -75,7 +75,7 @@ pub fn format_escalation_comment(reason: &str, detail: &str, minion_id: &str) ->
     format!(
         "## 🚨 {}\n\n{}{}",
         reason,
-        detail,
+        detail.trim_end_matches('\n'),
         minion_signature(minion_id)
     )
 }
@@ -124,9 +124,19 @@ mod tests {
     fn test_format_escalation_comment() {
         let comment =
             format_escalation_comment("CI Fix Escalation", "Something went wrong.\n", "M042");
+        // Trailing newline in detail is trimmed so the signature lands cleanly
         assert_eq!(
             comment,
-            "## 🚨 CI Fix Escalation\n\nSomething went wrong.\n\n\n<sub>🤖 M042</sub>"
+            "## 🚨 CI Fix Escalation\n\nSomething went wrong.\n\n<sub>🤖 M042</sub>"
+        );
+    }
+
+    #[test]
+    fn test_format_escalation_comment_no_trailing_newline() {
+        let comment = format_escalation_comment("Minion Escalation", "Rebase failed.", "M001");
+        assert_eq!(
+            comment,
+            "## 🚨 Minion Escalation\n\nRebase failed.\n\n<sub>🤖 M001</sub>"
         );
     }
 
