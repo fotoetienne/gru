@@ -21,12 +21,6 @@ pub struct FixOptions {
     pub worker: Option<String>,
 }
 
-/// Maximum size of the output buffer for test detection (in bytes)
-pub(crate) const MAX_OUTPUT_BUFFER_SIZE: usize = 10000;
-
-/// Size to trim the output buffer to when it exceeds the maximum (in bytes)
-pub(crate) const TRIM_OUTPUT_BUFFER_SIZE: usize = 5000;
-
 /// Maximum number of review rounds to handle automatically
 /// After this limit, the user must handle additional reviews manually
 pub(crate) const MAX_REVIEW_ROUNDS: usize = 5;

@@ -1,7 +1,5 @@
 use super::helpers::try_post_progress_comment;
-use super::types::{
-    AgentResult, IssueContext, WorktreeContext, MAX_OUTPUT_BUFFER_SIZE, TRIM_OUTPUT_BUFFER_SIZE,
-};
+use super::types::{AgentResult, IssueContext, WorktreeContext};
 use crate::agent::{AgentBackend, AgentEvent};
 use crate::agent_runner::{run_agent_with_stream_monitoring, EXIT_CODE_SIGNAL_TERMINATED};
 use crate::minion_registry::{with_registry, MinionMode, MinionRegistry};
@@ -140,61 +138,46 @@ async fn run_agent_session_inner(
     let mut progress_tracker = ProgressCommentTracker::new(wt_ctx.minion_id.clone());
 
     struct CallbackState<'a> {
-        text_output_buffer: String,
         progress: &'a ProgressDisplay,
         progress_tracker: &'a mut ProgressCommentTracker,
     }
 
-    let mut callback_state = CallbackState {
-        text_output_buffer: String::new(),
+    let callback_state = CallbackState {
         progress: &progress,
         progress_tracker: &mut progress_tracker,
     };
 
     let callback = |event: &AgentEvent| {
-        // Accumulate text output for phase detection
-        if let AgentEvent::TextDelta { ref text } = event {
-            callback_state.text_output_buffer.push_str(text);
-            if callback_state.text_output_buffer.len() > MAX_OUTPUT_BUFFER_SIZE {
-                let mut trim_pos = TRIM_OUTPUT_BUFFER_SIZE;
-                while trim_pos > 0 && !callback_state.text_output_buffer.is_char_boundary(trim_pos)
+        // Detect phase transitions from structured tool-use events rather than
+        // raw text, avoiding false positives on code snippets or file names.
+        let previous_phase = callback_state.progress_tracker.current_phase();
+        if let AgentEvent::ToolUse {
+            ref tool_name,
+            ref input_summary,
+            ..
+        } = event
+        {
+            match tool_name.as_str() {
+                // Edit/Write tools signal the implementing phase
+                "Edit" | "Write" | "NotebookEdit"
+                    if previous_phase != MinionPhase::Implementing
+                        && previous_phase != MinionPhase::Testing =>
                 {
-                    trim_pos -= 1;
-                }
-                callback_state.text_output_buffer =
-                    callback_state.text_output_buffer.split_off(trim_pos);
-            }
-
-            // Detect phase transitions from a rolling window of the accumulated
-            // buffer (last 200 chars). Using the buffer instead of just the current
-            // chunk ensures we catch markers split across multiple TextDelta events.
-            let buf = &callback_state.text_output_buffer;
-            let window_start = buf.len().saturating_sub(200);
-            // Align to a char boundary
-            let window_start = (window_start..buf.len())
-                .find(|&i| buf.is_char_boundary(i))
-                .unwrap_or(buf.len());
-            let window = &buf[window_start..];
-
-            let previous_phase = callback_state.progress_tracker.current_phase();
-            if window.contains("Plan") || window.contains("plan") {
-                if previous_phase != MinionPhase::Planning {
                     callback_state
                         .progress_tracker
-                        .set_phase(MinionPhase::Planning);
+                        .set_phase(MinionPhase::Implementing);
                 }
-            } else if (window.contains("Implement") || window.contains("Writing"))
-                && previous_phase != MinionPhase::Implementing
-            {
-                callback_state
-                    .progress_tracker
-                    .set_phase(MinionPhase::Implementing);
-            } else if (window.contains("test") || window.contains("Test"))
-                && previous_phase != MinionPhase::Testing
-            {
-                callback_state
-                    .progress_tracker
-                    .set_phase(MinionPhase::Testing);
+                // Bash tool with test-related commands signals the testing phase
+                "Bash" if previous_phase != MinionPhase::Testing => {
+                    if let Some(ref summary) = input_summary {
+                        if is_test_command(summary) {
+                            callback_state
+                                .progress_tracker
+                                .set_phase(MinionPhase::Testing);
+                        }
+                    }
+                }
+                _ => {}
             }
         }
 
@@ -275,6 +258,45 @@ async fn run_agent_session_inner(
     })
 }
 
+/// Checks whether a Bash tool input summary looks like a test command.
+///
+/// Matches common test runners and invocations (e.g., `cargo test`, `just test`,
+/// `npm test`, `pytest`). The summary is expected to start with "Run: " as
+/// produced by the Claude Code backend.
+fn is_test_command(summary: &str) -> bool {
+    // Strip the "Run: " prefix that Claude Code prepends to Bash summaries
+    let cmd = summary.strip_prefix("Run: ").unwrap_or(summary);
+    let cmd_lower = cmd.to_lowercase();
+
+    // Common test runner patterns
+    let test_patterns = [
+        "cargo test",
+        "cargo nextest",
+        "just test",
+        "just check",
+        "npm test",
+        "npm run test",
+        "npx jest",
+        "npx vitest",
+        "yarn test",
+        "pnpm test",
+        "pytest",
+        "python -m pytest",
+        "python -m unittest",
+        "go test",
+        "make test",
+        "gradle test",
+        "./gradlew test",
+        "mvn test",
+        "bundle exec rspec",
+        "rspec",
+    ];
+
+    test_patterns
+        .iter()
+        .any(|pattern| cmd_lower.starts_with(pattern))
+}
+
 /// Invokes the agent to address review comments using the same session
 pub(super) async fn invoke_agent_for_reviews(
     backend: &dyn AgentBackend,
@@ -304,4 +326,84 @@ pub(super) async fn invoke_agent_for_reviews(
         anyhow::bail!("Review response process exited with code {}", exit_code);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_test_command_cargo_test() {
+        assert!(is_test_command("Run: cargo test"));
+        assert!(is_test_command("Run: cargo test --lib"));
+        assert!(is_test_command("Run: cargo test -- --nocapture"));
+    }
+
+    #[test]
+    fn test_is_test_command_just_test() {
+        assert!(is_test_command("Run: just test"));
+        assert!(is_test_command("Run: just test-verbose"));
+        assert!(is_test_command("Run: just check"));
+    }
+
+    #[test]
+    fn test_is_test_command_npm() {
+        assert!(is_test_command("Run: npm test"));
+        assert!(is_test_command("Run: npm run test"));
+        assert!(is_test_command("Run: npx jest"));
+        assert!(is_test_command("Run: npx vitest"));
+    }
+
+    #[test]
+    fn test_is_test_command_python() {
+        assert!(is_test_command("Run: pytest"));
+        assert!(is_test_command("Run: pytest -v tests/"));
+        assert!(is_test_command("Run: python -m pytest"));
+        assert!(is_test_command("Run: python -m unittest"));
+    }
+
+    #[test]
+    fn test_is_test_command_other_runners() {
+        assert!(is_test_command("Run: go test ./..."));
+        assert!(is_test_command("Run: make test"));
+        assert!(is_test_command("Run: gradle test"));
+        assert!(is_test_command("Run: ./gradlew test"));
+        assert!(is_test_command("Run: mvn test"));
+        assert!(is_test_command("Run: bundle exec rspec"));
+        assert!(is_test_command("Run: rspec spec/"));
+    }
+
+    #[test]
+    fn test_is_test_command_without_run_prefix() {
+        // Should work without the "Run: " prefix
+        assert!(is_test_command("cargo test"));
+        assert!(is_test_command("pytest -v"));
+    }
+
+    #[test]
+    fn test_is_test_command_false_positives() {
+        // These should NOT be detected as test commands
+        assert!(!is_test_command("Run: cargo build"));
+        assert!(!is_test_command("Run: git status"));
+        assert!(!is_test_command("Run: echo test"));
+        assert!(!is_test_command("Run: cat test_helper.rs"));
+        assert!(!is_test_command("Run: ls tests/"));
+        assert!(!is_test_command("Run: cargo fmt"));
+        assert!(!is_test_command("Run: cargo clippy"));
+        assert!(!is_test_command("Run: npm install"));
+        assert!(!is_test_command("Run: pip install pytest"));
+    }
+
+    #[test]
+    fn test_is_test_command_case_insensitive() {
+        assert!(is_test_command("Run: Cargo Test"));
+        assert!(is_test_command("Run: CARGO TEST"));
+        assert!(is_test_command("Run: PYTEST"));
+    }
+
+    #[test]
+    fn test_is_test_command_nextest() {
+        assert!(is_test_command("Run: cargo nextest run"));
+        assert!(is_test_command("Run: cargo nextest run --lib"));
+    }
 }
