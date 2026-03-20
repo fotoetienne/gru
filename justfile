@@ -14,8 +14,8 @@ build-release:
     cargo build --release
 
 # Install the binary locally
-install:
-    cargo install --path .
+install: build-release
+    cp target/release/gru ~/.cargo/bin/gru.tmp && mv ~/.cargo/bin/gru.tmp ~/.cargo/bin/gru
 
 # Update binary
 update:
