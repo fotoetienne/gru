@@ -121,11 +121,57 @@ impl Default for DaemonConfig {
     }
 }
 
+// Thread-local override for the config path in tests.
+// When set, `try_load_config()` loads from this path instead of `~/.gru/config.toml`.
+#[cfg(test)]
+thread_local! {
+    static TEST_CONFIG_PATH_OVERRIDE: std::cell::RefCell<Option<std::path::PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Sets a thread-local config path override for the current test.
+///
+/// While the returned guard is alive, `try_load_config()` on this thread
+/// will load from the provided path instead of `~/.gru/config.toml`.
+/// The override is automatically cleared when the guard is dropped.
+#[cfg(test)]
+pub fn set_test_config_path(path: PathBuf) -> TestConfigGuard {
+    TEST_CONFIG_PATH_OVERRIDE.with(|cell| {
+        *cell.borrow_mut() = Some(path);
+    });
+    TestConfigGuard { _private: () }
+}
+
+/// RAII guard that clears the thread-local config path override on drop.
+#[cfg(test)]
+pub struct TestConfigGuard {
+    _private: (),
+}
+
+#[cfg(test)]
+impl Drop for TestConfigGuard {
+    fn drop(&mut self) {
+        TEST_CONFIG_PATH_OVERRIDE.with(|cell| {
+            *cell.borrow_mut() = None;
+        });
+    }
+}
+
 /// Try to load the config file, returning `None` on any error.
 ///
 /// This is a convenience for callers that want to inspect config
 /// but can gracefully handle its absence.
+///
+/// In test builds, checks for a thread-local path override set via
+/// [`set_test_config_path`] before falling back to the default path.
 pub fn try_load_config() -> Option<LabConfig> {
+    #[cfg(test)]
+    {
+        let override_path = TEST_CONFIG_PATH_OVERRIDE.with(|cell| cell.borrow().clone());
+        if let Some(path) = override_path {
+            return LabConfig::load_partial(&path).ok();
+        }
+    }
     let path = LabConfig::default_path().ok()?;
     LabConfig::load_partial(&path).ok()
 }
@@ -135,14 +181,12 @@ pub fn try_load_config() -> Option<LabConfig> {
 /// Returns a registry with just `github.com` if the config can't be loaded.
 /// This is a convenience for callers that need host info but don't require
 /// full daemon config validation.
+///
+/// Respects the test config path override set via [`set_test_config_path`].
 pub fn load_host_registry() -> HostRegistry {
-    let path = match LabConfig::default_path() {
-        Ok(p) => p,
-        Err(_) => return HostRegistry::from_config(&LabConfig::default()),
-    };
-    match LabConfig::load_partial(&path) {
-        Ok(cfg) => HostRegistry::from_config(&cfg),
-        Err(_) => HostRegistry::from_config(&LabConfig::default()),
+    match try_load_config() {
+        Some(cfg) => HostRegistry::from_config(&cfg),
+        None => HostRegistry::from_config(&LabConfig::default()),
     }
 }
 
@@ -405,6 +449,18 @@ impl LabConfig {
         config.validate()?;
 
         Ok(config)
+    }
+
+    /// Load configuration from a specific file path without daemon validation.
+    ///
+    /// This is the primary constructor for loading config from an explicit path,
+    /// useful for testing with isolated config files or when the config path is
+    /// known ahead of time.
+    ///
+    /// Equivalent to [`load_partial`](Self::load_partial).
+    #[allow(dead_code)] // Public API for callers that want an explicit-path constructor
+    pub fn from_path(path: &Path) -> Result<Self> {
+        Self::load_partial(path)
     }
 
     /// Load configuration without daemon validation.
@@ -1306,5 +1362,58 @@ repos = ["corp:team/app"]
             "docs/config.example.toml contains fields not recognized by LabConfig: {:?}",
             ignored
         );
+    }
+
+    #[test]
+    fn test_from_path_loads_config() {
+        let config_toml = r#"
+[agent]
+default = "codex"
+"#;
+        let mut temp_file = NamedTempFile::new().unwrap();
+        temp_file.write_all(config_toml.as_bytes()).unwrap();
+        temp_file.flush().unwrap();
+
+        let config = LabConfig::from_path(temp_file.path()).unwrap();
+        assert_eq!(config.agent.default, "codex");
+    }
+
+    #[test]
+    fn test_from_path_nonexistent_file_returns_error() {
+        let result = LabConfig::from_path(Path::new("/nonexistent/config.toml"));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_set_test_config_path_overrides_try_load() {
+        let config_toml = r#"
+[agent]
+default = "test-agent"
+"#;
+        let mut temp_file = NamedTempFile::new().unwrap();
+        temp_file.write_all(config_toml.as_bytes()).unwrap();
+        temp_file.flush().unwrap();
+
+        let _guard = super::set_test_config_path(temp_file.path().to_path_buf());
+        let config = super::try_load_config().expect("should load from override path");
+        assert_eq!(config.agent.default, "test-agent");
+    }
+
+    #[test]
+    fn test_set_test_config_path_guard_clears_on_drop() {
+        let config_toml = "[agent]\ndefault = \"test-agent\"\n";
+        let mut temp_file = NamedTempFile::new().unwrap();
+        temp_file.write_all(config_toml.as_bytes()).unwrap();
+        temp_file.flush().unwrap();
+
+        {
+            let _guard = super::set_test_config_path(temp_file.path().to_path_buf());
+            assert!(super::try_load_config().is_some());
+        }
+
+        // After guard drops, the override should be cleared
+        super::TEST_CONFIG_PATH_OVERRIDE.with(|cell| {
+            assert!(cell.borrow().is_none());
+        });
     }
 }
