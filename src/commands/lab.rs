@@ -1026,6 +1026,11 @@ async fn poll_and_spawn(
                 continue;
             }
 
+            // Revalidate issue state to prevent TOCTOU races between poll and dispatch
+            if !github::is_issue_still_eligible(&owner, &repo, &host, issue_number).await {
+                continue;
+            }
+
             // Try to claim the issue via CLI
             match github::claim_issue_via_cli(
                 &host,
