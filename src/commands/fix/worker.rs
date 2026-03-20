@@ -16,13 +16,17 @@ use tokio::time::Duration;
 /// a non-zero exit — callers must check `result.status.success()`).
 /// Returns `Ok(None)` if the phase was already completed (resume skip).
 /// Returns `Err` on stuck/timeout or other failures that should stop the pipeline.
-pub(super) async fn run_agent_phase(
+///
+/// If `resume_prompt` is provided, it overrides the default continuation prompt
+/// when resuming an interrupted session.
+pub(crate) async fn run_agent_phase(
     backend: &dyn AgentBackend,
     issue_ctx: &IssueContext,
     wt_ctx: &WorktreeContext,
     start_phase: &OrchestrationPhase,
     quiet: bool,
     timeout_opt: Option<&str>,
+    resume_prompt: Option<&str>,
 ) -> Result<Option<AgentResult>> {
     if *start_phase > OrchestrationPhase::RunningAgent {
         println!("⏭️  Skipping agent session (already completed)");
@@ -35,7 +39,15 @@ pub(super) async fn run_agent_phase(
     // If interrupted during Setup, the session was never started.
     let use_resume = *start_phase > OrchestrationPhase::Setup;
     let result = if use_resume {
-        resume_agent_session(backend, issue_ctx, wt_ctx, quiet, timeout_opt).await
+        resume_agent_session(
+            backend,
+            issue_ctx,
+            wt_ctx,
+            quiet,
+            timeout_opt,
+            resume_prompt,
+        )
+        .await
     } else {
         run_agent_session(backend, issue_ctx, wt_ctx, quiet, timeout_opt).await
     };
@@ -77,7 +89,7 @@ pub(super) async fn run_agent_phase(
 ///
 /// Creates the PR (or looks it up if already created) and optionally applies
 /// the `gru:auto-merge` label. Returns the PR number if one was created.
-pub(super) async fn create_pr_phase(
+pub(crate) async fn create_pr_phase(
     issue_ctx: &IssueContext,
     wt_ctx: &WorktreeContext,
     start_phase: &OrchestrationPhase,
@@ -156,7 +168,7 @@ pub(super) async fn create_pr_phase(
 ///
 /// Monitors the PR lifecycle (reviews, CI, merge state) or falls back to
 /// standalone CI monitoring when no PR exists. Returns the suggested exit code.
-pub(super) async fn monitor_pr_phase(
+pub(crate) async fn monitor_pr_phase(
     backend: &dyn AgentBackend,
     issue_ctx: &IssueContext,
     wt_ctx: &WorktreeContext,
@@ -216,7 +228,7 @@ pub(super) async fn monitor_pr_phase(
 }
 
 /// Computes the agent exit code from an optional `AgentResult`.
-pub(super) fn agent_exit_code(agent_result: &Option<AgentResult>) -> i32 {
+pub(crate) fn agent_exit_code(agent_result: &Option<AgentResult>) -> i32 {
     agent_result
         .as_ref()
         .map(|r| r.status.code().unwrap_or(EXIT_CODE_SIGNAL_TERMINATED))
