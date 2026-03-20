@@ -155,10 +155,12 @@ pub struct ReviewComment {
     pub line: Option<u64>,
     pub body: String,
     pub reviewer: String,
+    pub comment_id: u64,
 }
 
 #[derive(Debug, Deserialize)]
 struct ApiReviewComment {
+    id: u64,
     path: String,
     line: Option<u64>,
     body: String,
@@ -758,6 +760,7 @@ async fn get_review_comments(
                 line: comment.line,
                 body: comment.body,
                 reviewer: comment.user.login,
+                comment_id: comment.id,
             });
         }
     }
@@ -775,7 +778,14 @@ async fn get_review_comments(
 }
 
 /// Format review comments into a prompt for Claude
-pub fn format_review_prompt(issue_num: u64, pr_number: &str, comments: &[ReviewComment]) -> String {
+pub fn format_review_prompt(
+    issue_num: u64,
+    pr_number: &str,
+    comments: &[ReviewComment],
+    owner: &str,
+    repo: &str,
+    minion_id: &str,
+) -> String {
     let mut prompt = format!(
         "You previously implemented a fix for issue #{}. Review feedback has been provided \
         on PR #{}. Please address the following comments:\n\n",
@@ -790,10 +800,26 @@ pub fn format_review_prompt(issue_num: u64, pr_number: &str, comments: &[ReviewC
         }
         prompt.push('\n');
         prompt.push_str(&format!("**Reviewer:** @{}\n", comment.reviewer));
+        prompt.push_str(&format!("**Comment ID:** {}\n", comment.comment_id));
         prompt.push_str(&format!("**Comment:** {}\n\n", comment.body));
     }
 
-    prompt.push_str("Please make the requested changes, run tests, and commit.\n");
+    prompt.push_str("Please make the requested changes, run tests, and commit.\n\n");
+
+    // Instruct the agent to reply to each review comment thread
+    prompt.push_str(&format!(
+        "After committing your changes, reply to EACH review comment thread to explain what you changed. \
+For each comment, post an inline reply using the GitHub API:\n\n\
+```\n\
+gh api --method POST repos/{owner}/{repo}/pulls/{pr_number}/comments \\\n  \
+-f body=$'<reply text>\\n\\n<sub>🤖 {minion_id}</sub>' \\\n  \
+-F in_reply_to=<comment_id>\n\
+```\n\n\
+Where `<comment_id>` is the Comment ID listed above for each review comment. \
+Each reply must:\n\
+- Summarize what was changed to address the feedback\n\
+- End with the signature: `\\n\\n<sub>🤖 {minion_id}</sub>`\n"
+    ));
 
     prompt
 }
@@ -866,17 +892,22 @@ mod tests {
             line: Some(45),
             body: "This function needs error handling for null inputs.".to_string(),
             reviewer: "alice".to_string(),
+            comment_id: 1001,
         }];
 
-        let prompt = format_review_prompt(123, "456", &comments);
+        let prompt = format_review_prompt(123, "456", &comments, "octocat", "hello-world", "M042");
 
         assert!(prompt.contains("issue #123"));
         assert!(prompt.contains("PR #456"));
         assert!(prompt.contains("## Review Comment 1"));
         assert!(prompt.contains("**File:** src/main.rs:45"));
         assert!(prompt.contains("**Reviewer:** @alice"));
+        assert!(prompt.contains("**Comment ID:** 1001"));
         assert!(prompt.contains("This function needs error handling for null inputs."));
         assert!(prompt.contains("Please make the requested changes, run tests, and commit."));
+        assert!(prompt.contains("in_reply_to"));
+        assert!(prompt.contains("repos/octocat/hello-world/pulls/456/comments"));
+        assert!(prompt.contains("<sub>🤖 M042</sub>"));
     }
 
     #[test]
@@ -887,16 +918,18 @@ mod tests {
                 line: Some(45),
                 body: "Add error handling.".to_string(),
                 reviewer: "alice".to_string(),
+                comment_id: 2001,
             },
             ReviewComment {
                 file: "tests/test_main.rs".to_string(),
                 line: Some(12),
                 body: "Add a test case for the edge case.".to_string(),
                 reviewer: "bob".to_string(),
+                comment_id: 2002,
             },
         ];
 
-        let prompt = format_review_prompt(123, "456", &comments);
+        let prompt = format_review_prompt(123, "456", &comments, "octocat", "hello-world", "M042");
 
         assert!(prompt.contains("## Review Comment 1"));
         assert!(prompt.contains("## Review Comment 2"));
@@ -904,6 +937,10 @@ mod tests {
         assert!(prompt.contains("**File:** tests/test_main.rs:12"));
         assert!(prompt.contains("@alice"));
         assert!(prompt.contains("@bob"));
+        assert!(prompt.contains("**Comment ID:** 2001"));
+        assert!(prompt.contains("**Comment ID:** 2002"));
+        assert!(prompt.contains("in_reply_to"));
+        assert!(prompt.contains("End with the signature"));
     }
 
     #[test]
@@ -913,9 +950,10 @@ mod tests {
             line: None,
             body: "Update the documentation.".to_string(),
             reviewer: "charlie".to_string(),
+            comment_id: 3001,
         }];
 
-        let prompt = format_review_prompt(123, "456", &comments);
+        let prompt = format_review_prompt(123, "456", &comments, "octocat", "hello-world", "M042");
 
         // Should not have a colon if line is None
         assert!(prompt.contains("**File:** README.md\n"));
@@ -1245,6 +1283,7 @@ mod tests {
     #[test]
     fn test_api_review_comment_deserialize() {
         let json = r#"{
+            "id": 100,
             "path": "src/main.rs",
             "line": 42,
             "body": "This needs refactoring",
@@ -1262,6 +1301,7 @@ mod tests {
     fn test_api_review_comment_deserialize_null_line() {
         // File-level comments don't have a line number
         let json = r#"{
+            "id": 200,
             "path": "README.md",
             "line": null,
             "body": "Update documentation",

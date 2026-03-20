@@ -681,8 +681,14 @@ pub(crate) async fn monitor_pr_lifecycle(
                     break;
                 }
 
-                let review_prompt =
-                    pr_monitor::format_review_prompt(issue_ctx.issue_num, pr_number, &comments);
+                let review_prompt = pr_monitor::format_review_prompt(
+                    issue_ctx.issue_num,
+                    pr_number,
+                    &comments,
+                    &issue_ctx.owner,
+                    &issue_ctx.repo,
+                    &wt_ctx.minion_id,
+                );
 
                 println!("🔄 Re-invoking to address review feedback...\n");
 
