@@ -28,7 +28,7 @@ export GITHUB_TOKEN=$(gh auth token)
    version = "0.2.0"
    ```
 
-2. **Update the lockfile**:
+2. **Run a quick check**:
    ```bash
    cargo check
    ```
