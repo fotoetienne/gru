@@ -571,13 +571,13 @@ async fn handle_ready_to_merge(
 async fn handle_new_reviews(
     state: &mut MonitorLoopState,
     ctx: &MonitorContext<'_>,
-    comments: Vec<pr_monitor::ReviewComment>,
+    feedback: pr_monitor::ReviewFeedback,
     check_time: DateTime<Utc>,
 ) -> LoopAction {
     state.review_round += 1;
-    let count = comments.len();
+    let count = feedback.comments.len() + feedback.bodies.len();
     println!(
-        "💬 Detected {} new review comment(s) on PR #{} (review round {}/{})",
+        "💬 Detected {} new review feedback item(s) on PR #{} (review round {}/{})",
         count, ctx.pr_number, state.review_round, MAX_REVIEW_ROUNDS
     );
 
@@ -597,7 +597,7 @@ async fn handle_new_reviews(
     let review_prompt = pr_monitor::format_review_prompt(
         ctx.issue_ctx.issue_num,
         ctx.pr_number,
-        &comments,
+        &feedback,
         &ctx.issue_ctx.owner,
         &ctx.issue_ctx.repo,
         &ctx.wt_ctx.minion_id,
@@ -878,8 +878,8 @@ async fn handle_pr_event(
         Ok((MonitorResult::Merged, _)) => handle_merged(state, ctx),
         Ok((MonitorResult::Closed, _)) => handle_closed(state, ctx),
         Ok((MonitorResult::ReadyToMerge, _)) => handle_ready_to_merge(state, ctx).await,
-        Ok((MonitorResult::NewReviews(comments), check_time)) => {
-            handle_new_reviews(state, ctx, comments, check_time).await
+        Ok((MonitorResult::NewReviews(feedback), check_time)) => {
+            handle_new_reviews(state, ctx, feedback, check_time).await
         }
         Ok((MonitorResult::FailedChecks(count), _)) => {
             handle_failed_checks(state, ctx, count).await

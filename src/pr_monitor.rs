@@ -140,6 +140,10 @@ pub(crate) struct Review {
     id: u64,
     pub(crate) submitted_at: DateTime<Utc>,
     pub(crate) user: User,
+    #[serde(default)]
+    body: Option<String>,
+    #[serde(default)]
+    state: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -155,6 +159,21 @@ pub(crate) struct ReviewComment {
     pub body: String,
     pub reviewer: String,
     pub comment_id: u64,
+}
+
+/// A review-level body (not tied to a specific file/line)
+#[derive(Debug, Clone)]
+pub(crate) struct ReviewBody {
+    pub body: String,
+    pub reviewer: String,
+    pub state: String,
+}
+
+/// All feedback from reviews: inline comments + review bodies
+#[derive(Debug, Clone)]
+pub(crate) struct ReviewFeedback {
+    pub comments: Vec<ReviewComment>,
+    pub bodies: Vec<ReviewBody>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -611,11 +630,11 @@ async fn poll_once(
     let pr_author = pr.user.login.as_str();
     let new_reviews = filter_new_external_reviews(&all_reviews, *last_check_time, pr_author);
     if !new_reviews.is_empty() {
-        let comments = get_review_comments(host, owner, repo, pr_number, &new_reviews).await?;
+        let feedback = get_review_comments(host, owner, repo, pr_number, &new_reviews).await?;
         // Advance past these reviews so they are not re-fetched if the caller
         // passes the returned last_check_time back as the next baseline.
         *last_check_time = Utc::now();
-        return Ok(Some(MonitorResult::NewReviews(comments)));
+        return Ok(Some(MonitorResult::NewReviews(feedback)));
     }
 
     // Check merge conflict status.
@@ -680,8 +699,8 @@ pub(crate) enum MonitorResult {
     Merged,
     /// PR was closed without merging
     Closed,
-    /// New review comments detected with details
-    NewReviews(Vec<ReviewComment>),
+    /// New review feedback detected (inline comments and/or review bodies)
+    NewReviews(ReviewFeedback),
     /// CI checks failed (count)
     FailedChecks(usize),
     /// PR has merge conflicts (mergeable: false)
@@ -733,20 +752,36 @@ pub(crate) async fn get_all_reviews(
     Ok(reviews)
 }
 
-/// Fetch review comments for specific reviews with retry logic for transient failures
+/// Fetch review comments and bodies for specific reviews with retry logic for transient failures
 async fn get_review_comments(
     host: &str,
     owner: &str,
     repo: &str,
     pr_number: &str,
     reviews: &[Review],
-) -> Result<Vec<ReviewComment>> {
+) -> Result<ReviewFeedback> {
     let repo_full = github::repo_slug(owner, repo);
     let mut all_comments = Vec::new();
+    let mut all_bodies = Vec::new();
     let mut failed_reviews = 0;
 
     for review in reviews {
-        // Fetch comments for this specific review with retry
+        // Collect review body text (non-empty bodies that aren't just whitespace)
+        if let Some(ref body) = review.body {
+            let trimmed = body.trim();
+            if !trimmed.is_empty() {
+                all_bodies.push(ReviewBody {
+                    body: trimmed.to_string(),
+                    reviewer: review.user.login.clone(),
+                    state: review
+                        .state
+                        .clone()
+                        .unwrap_or_else(|| "COMMENTED".to_string()),
+                });
+            }
+        }
+
+        // Fetch inline comments for this specific review with retry
         let endpoint = format!(
             "repos/{repo_full}/pulls/{pr_number}/reviews/{}/comments",
             review.id
@@ -789,52 +824,70 @@ async fn get_review_comments(
         );
     }
 
-    Ok(all_comments)
+    Ok(ReviewFeedback {
+        comments: all_comments,
+        bodies: all_bodies,
+    })
 }
 
-/// Format review comments into a prompt for Claude
+/// Format review feedback (bodies + inline comments) into a prompt for Claude
 pub(crate) fn format_review_prompt(
     issue_num: u64,
     pr_number: &str,
-    comments: &[ReviewComment],
+    feedback: &ReviewFeedback,
     owner: &str,
     repo: &str,
     minion_id: &str,
 ) -> String {
     let mut prompt = format!(
         "You previously implemented a fix for issue #{}. Review feedback has been provided \
-        on PR #{}. Please address the following comments:\n\n",
+        on PR #{}. Please address the following feedback:\n\n",
         issue_num, pr_number
     );
 
-    for (i, comment) in comments.iter().enumerate() {
-        prompt.push_str(&format!("## Review Comment {}\n", i + 1));
-        prompt.push_str(&format!("**File:** {}", comment.file));
-        if let Some(line) = comment.line {
-            prompt.push_str(&format!(":{}", line));
+    // Include review bodies (top-level review feedback not tied to specific lines)
+    for (i, review_body) in feedback.bodies.iter().enumerate() {
+        prompt.push_str(&format!("## Review {} ({})\n", i + 1, review_body.state));
+        prompt.push_str(&format!("**Reviewer:** @{}\n", review_body.reviewer));
+        prompt.push_str(&format!("**Feedback:**\n{}\n\n", review_body.body));
+    }
+
+    // Include inline comments (file/line-specific feedback)
+    if !feedback.comments.is_empty() {
+        if !feedback.bodies.is_empty() {
+            prompt.push_str("---\n\n");
         }
-        prompt.push('\n');
-        prompt.push_str(&format!("**Reviewer:** @{}\n", comment.reviewer));
-        prompt.push_str(&format!("**Comment ID:** {}\n", comment.comment_id));
-        prompt.push_str(&format!("**Comment:** {}\n\n", comment.body));
+        for (i, comment) in feedback.comments.iter().enumerate() {
+            prompt.push_str(&format!("## Inline Comment {}\n", i + 1));
+            prompt.push_str(&format!("**File:** {}", comment.file));
+            if let Some(line) = comment.line {
+                prompt.push_str(&format!(":{}", line));
+            }
+            prompt.push('\n');
+            prompt.push_str(&format!("**Reviewer:** @{}\n", comment.reviewer));
+            prompt.push_str(&format!("**Comment ID:** {}\n", comment.comment_id));
+            prompt.push_str(&format!("**Comment:** {}\n\n", comment.body));
+        }
     }
 
     prompt.push_str("Please make the requested changes, run tests, and commit.\n\n");
 
-    // Instruct the agent to reply to each review comment thread
-    prompt.push_str(&format!(
-        "After committing your changes, reply to EACH review comment thread to explain what you changed. \
+    // Instruct the agent to reply to each inline review comment thread
+    if !feedback.comments.is_empty() {
+        prompt.push_str(&format!(
+            "After committing your changes, reply to EACH inline review comment thread to explain what you changed. \
 For each comment, post an inline reply using the GitHub API:\n\n\
 ```\n\
 gh api --method POST repos/{owner}/{repo}/pulls/{pr_number}/comments \\\n  \
 -f body=$'<reply text>\\n\\n<sub>🤖 {minion_id}</sub>' \\\n  \
 -F in_reply_to=<comment_id>\n\
 ```\n\n\
-Where `<comment_id>` is the Comment ID listed above for each review comment. \
+Where `<comment_id>` is the Comment ID listed above for each inline review comment. \
 Each reply must:\n\
 - Summarize what was changed to address the feedback\n\
 - End with the signature: `\\n\\n<sub>🤖 {minion_id}</sub>`\n"
-    ));
+        ));
+    }
 
     prompt
 }
@@ -902,19 +955,22 @@ mod tests {
 
     #[test]
     fn test_format_review_prompt_single_comment() {
-        let comments = vec![ReviewComment {
-            file: "src/main.rs".to_string(),
-            line: Some(45),
-            body: "This function needs error handling for null inputs.".to_string(),
-            reviewer: "alice".to_string(),
-            comment_id: 1001,
-        }];
+        let feedback = ReviewFeedback {
+            comments: vec![ReviewComment {
+                file: "src/main.rs".to_string(),
+                line: Some(45),
+                body: "This function needs error handling for null inputs.".to_string(),
+                reviewer: "alice".to_string(),
+                comment_id: 1001,
+            }],
+            bodies: vec![],
+        };
 
-        let prompt = format_review_prompt(123, "456", &comments, "octocat", "hello-world", "M042");
+        let prompt = format_review_prompt(123, "456", &feedback, "octocat", "hello-world", "M042");
 
         assert!(prompt.contains("issue #123"));
         assert!(prompt.contains("PR #456"));
-        assert!(prompt.contains("## Review Comment 1"));
+        assert!(prompt.contains("## Inline Comment 1"));
         assert!(prompt.contains("**File:** src/main.rs:45"));
         assert!(prompt.contains("**Reviewer:** @alice"));
         assert!(prompt.contains("**Comment ID:** 1001"));
@@ -927,27 +983,30 @@ mod tests {
 
     #[test]
     fn test_format_review_prompt_multiple_comments() {
-        let comments = vec![
-            ReviewComment {
-                file: "src/main.rs".to_string(),
-                line: Some(45),
-                body: "Add error handling.".to_string(),
-                reviewer: "alice".to_string(),
-                comment_id: 2001,
-            },
-            ReviewComment {
-                file: "tests/test_main.rs".to_string(),
-                line: Some(12),
-                body: "Add a test case for the edge case.".to_string(),
-                reviewer: "bob".to_string(),
-                comment_id: 2002,
-            },
-        ];
+        let feedback = ReviewFeedback {
+            comments: vec![
+                ReviewComment {
+                    file: "src/main.rs".to_string(),
+                    line: Some(45),
+                    body: "Add error handling.".to_string(),
+                    reviewer: "alice".to_string(),
+                    comment_id: 2001,
+                },
+                ReviewComment {
+                    file: "tests/test_main.rs".to_string(),
+                    line: Some(12),
+                    body: "Add a test case for the edge case.".to_string(),
+                    reviewer: "bob".to_string(),
+                    comment_id: 2002,
+                },
+            ],
+            bodies: vec![],
+        };
 
-        let prompt = format_review_prompt(123, "456", &comments, "octocat", "hello-world", "M042");
+        let prompt = format_review_prompt(123, "456", &feedback, "octocat", "hello-world", "M042");
 
-        assert!(prompt.contains("## Review Comment 1"));
-        assert!(prompt.contains("## Review Comment 2"));
+        assert!(prompt.contains("## Inline Comment 1"));
+        assert!(prompt.contains("## Inline Comment 2"));
         assert!(prompt.contains("**File:** src/main.rs:45"));
         assert!(prompt.contains("**File:** tests/test_main.rs:12"));
         assert!(prompt.contains("@alice"));
@@ -960,19 +1019,75 @@ mod tests {
 
     #[test]
     fn test_format_review_prompt_no_line_number() {
-        let comments = vec![ReviewComment {
-            file: "README.md".to_string(),
-            line: None,
-            body: "Update the documentation.".to_string(),
-            reviewer: "charlie".to_string(),
-            comment_id: 3001,
-        }];
+        let feedback = ReviewFeedback {
+            comments: vec![ReviewComment {
+                file: "README.md".to_string(),
+                line: None,
+                body: "Update the documentation.".to_string(),
+                reviewer: "charlie".to_string(),
+                comment_id: 3001,
+            }],
+            bodies: vec![],
+        };
 
-        let prompt = format_review_prompt(123, "456", &comments, "octocat", "hello-world", "M042");
+        let prompt = format_review_prompt(123, "456", &feedback, "octocat", "hello-world", "M042");
 
         // Should not have a colon if line is None
         assert!(prompt.contains("**File:** README.md\n"));
         assert!(!prompt.contains("README.md:"));
+    }
+
+    #[test]
+    fn test_format_review_prompt_body_only() {
+        let feedback = ReviewFeedback {
+            comments: vec![],
+            bodies: vec![ReviewBody {
+                body: "Consider refactoring the error handling to use Result types.".to_string(),
+                reviewer: "dave".to_string(),
+                state: "COMMENTED".to_string(),
+            }],
+        };
+
+        let prompt = format_review_prompt(42, "99", &feedback, "octocat", "hello-world", "M001");
+
+        assert!(prompt.contains("issue #42"));
+        assert!(prompt.contains("PR #99"));
+        assert!(prompt.contains("## Review 1 (COMMENTED)"));
+        assert!(prompt.contains("**Reviewer:** @dave"));
+        assert!(prompt.contains("Consider refactoring the error handling"));
+        assert!(prompt.contains("Please make the requested changes"));
+        // No inline comments, so no in_reply_to instructions
+        assert!(!prompt.contains("in_reply_to"));
+    }
+
+    #[test]
+    fn test_format_review_prompt_body_and_comments() {
+        let feedback = ReviewFeedback {
+            comments: vec![ReviewComment {
+                file: "src/lib.rs".to_string(),
+                line: Some(10),
+                body: "Fix this line.".to_string(),
+                reviewer: "eve".to_string(),
+                comment_id: 6001,
+            }],
+            bodies: vec![ReviewBody {
+                body: "Overall looks good but needs some tweaks.".to_string(),
+                reviewer: "eve".to_string(),
+                state: "CHANGES_REQUESTED".to_string(),
+            }],
+        };
+
+        let prompt = format_review_prompt(10, "20", &feedback, "octocat", "hello-world", "M002");
+
+        // Review body appears
+        assert!(prompt.contains("## Review 1 (CHANGES_REQUESTED)"));
+        assert!(prompt.contains("Overall looks good"));
+        // Inline comment appears
+        assert!(prompt.contains("## Inline Comment 1"));
+        assert!(prompt.contains("**File:** src/lib.rs:10"));
+        assert!(prompt.contains("Fix this line."));
+        // Reply instructions present for inline comments
+        assert!(prompt.contains("in_reply_to"));
     }
 
     #[test]
@@ -1500,6 +1615,8 @@ mod tests {
                 // filter a no-op.
                 login: "reviewer".to_string(),
             },
+            body: None,
+            state: None,
         }
     }
 
@@ -1572,6 +1689,8 @@ mod tests {
             user: User {
                 login: login.to_string(),
             },
+            body: None,
+            state: None,
         }
     }
 
@@ -1891,6 +2010,8 @@ mod tests {
             user: User {
                 login: login.to_string(),
             },
+            body: None,
+            state: None,
         }
     }
 
