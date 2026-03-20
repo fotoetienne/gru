@@ -158,8 +158,9 @@ async fn run_agent_session_inner(
         } = event
         {
             match tool_name.as_str() {
-                // Edit/Write tools signal the implementing phase
-                "Edit" | "Write" | "NotebookEdit"
+                // Edit/Write tools signal the implementing phase.
+                // "file_change" is the Codex backend equivalent of Edit/Write.
+                "Edit" | "Write" | "NotebookEdit" | "file_change"
                     if previous_phase != MinionPhase::Implementing
                         && previous_phase != MinionPhase::Testing =>
                 {
@@ -167,8 +168,9 @@ async fn run_agent_session_inner(
                         .progress_tracker
                         .set_phase(MinionPhase::Implementing);
                 }
-                // Bash tool with test-related commands signals the testing phase
-                "Bash" if previous_phase != MinionPhase::Testing => {
+                // Bash tool with test-related commands signals the testing phase.
+                // "command" is the Codex backend equivalent of Bash.
+                "Bash" | "command" if previous_phase != MinionPhase::Testing => {
                     if let Some(ref summary) = input_summary {
                         if is_test_command(summary) {
                             callback_state
@@ -268,12 +270,12 @@ fn is_test_command(summary: &str) -> bool {
     let cmd = summary.strip_prefix("Run: ").unwrap_or(summary);
     let cmd_lower = cmd.to_lowercase();
 
-    // Common test runner patterns
+    // Common test runner patterns (non-exhaustive; add new runners as needed)
     let test_patterns = [
         "cargo test",
         "cargo nextest",
         "just test",
-        "just check",
+        "just check", // runs fmt+lint+test+build; close enough to "testing"
         "npm test",
         "npm run test",
         "npx jest",
@@ -405,5 +407,11 @@ mod tests {
     fn test_is_test_command_nextest() {
         assert!(is_test_command("Run: cargo nextest run"));
         assert!(is_test_command("Run: cargo nextest run --lib"));
+    }
+
+    #[test]
+    fn test_is_test_command_empty_and_no_match() {
+        assert!(!is_test_command(""));
+        assert!(!is_test_command("Run: "));
     }
 }
