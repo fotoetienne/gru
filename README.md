@@ -53,6 +53,13 @@ gru review 42
 gru review https://github.com/owner/repo/pull/42
 ```
 
+**`gru chat`** - Start an interactive project-aware chat session
+
+```bash
+gru chat
+gru chat --repo owner/repo
+```
+
 **`gru prompt <name>`** - Run a custom or built-in prompt
 
 ```bash
@@ -104,6 +111,7 @@ See [docs/AGENTS.md](docs/AGENTS.md) for setup instructions for each backend.
 ```bash
 gru status              # List all active Minions
 gru status M001         # Show details for a specific Minion
+gru logs M001           # View a Minion's event stream
 gru attach M001         # Attach terminal to a running Minion
 gru stop M001           # Stop a running Minion
 gru resume M001         # Resume a stopped Minion

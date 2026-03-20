@@ -504,3 +504,39 @@ async fn main() {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    #[test]
+    fn readme_mentions_all_cli_subcommands() {
+        let readme = include_str!("../README.md");
+        let cmd = Cli::command();
+
+        let mut missing = Vec::new();
+        for sub in cmd.get_subcommands() {
+            if sub.is_hide_set() {
+                continue;
+            }
+            let name = sub.get_name();
+            // Check for "gru <name>" followed by a non-alphanumeric character
+            // (word boundary) to avoid "gru prompt" matching "gru prompts"
+            let pattern = format!("gru {name}");
+            let found = readme.match_indices(&pattern).any(|(i, _)| {
+                let after = i + pattern.len();
+                after >= readme.len() || !readme.as_bytes()[after].is_ascii_alphanumeric()
+            });
+            if !found {
+                missing.push(name.to_string());
+            }
+        }
+
+        assert!(
+            missing.is_empty(),
+            "README.md is missing documentation for these CLI subcommands: {:?}",
+            missing
+        );
+    }
+}

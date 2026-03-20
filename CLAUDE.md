@@ -232,6 +232,14 @@ Located in `.claude/skills/`:
 - **Pre-commit tests:** All tests must pass before commits are allowed
 - Use `just test-verbose` for verbose test output with `--nocapture`
 
+## Documentation Maintenance
+
+When making changes, keep docs in sync:
+
+- **Config fields:** When adding, removing, or renaming fields in `LabConfig` (or its nested structs in `src/config.rs`), update `docs/config.example.toml` to match. CI will fail if the example doesn't parse.
+- **CLI commands:** When adding or removing CLI subcommands in `src/main.rs`, update the README.md command list. CI will fail if a non-hidden subcommand is missing from README.md.
+- **Filesystem layout:** When changing the `~/.gru/` directory structure (paths in `src/workspace.rs`), update the Filesystem Layout section in this file.
+
 ## Important Implementation Notes
 
 ### Claude Code Integration
