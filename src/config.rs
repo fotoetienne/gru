@@ -181,14 +181,12 @@ pub fn try_load_config() -> Option<LabConfig> {
 /// Returns a registry with just `github.com` if the config can't be loaded.
 /// This is a convenience for callers that need host info but don't require
 /// full daemon config validation.
+///
+/// Respects the test config path override set via [`set_test_config_path`].
 pub fn load_host_registry() -> HostRegistry {
-    let path = match LabConfig::default_path() {
-        Ok(p) => p,
-        Err(_) => return HostRegistry::from_config(&LabConfig::default()),
-    };
-    match LabConfig::load_partial(&path) {
-        Ok(cfg) => HostRegistry::from_config(&cfg),
-        Err(_) => HostRegistry::from_config(&LabConfig::default()),
+    match try_load_config() {
+        Some(cfg) => HostRegistry::from_config(&cfg),
+        None => HostRegistry::from_config(&LabConfig::default()),
     }
 }
 

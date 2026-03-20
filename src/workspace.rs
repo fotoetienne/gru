@@ -1,6 +1,7 @@
 use once_cell::sync::OnceCell;
 use std::fs;
 use std::io;
+use std::ops::Deref;
 use std::path::{Path, PathBuf};
 
 /// Cached workspace instance initialized once on first successful call.
@@ -8,7 +9,7 @@ use std::path::{Path, PathBuf};
 static GLOBAL_WORKSPACE: OnceCell<Workspace> = OnceCell::new();
 
 // Thread-local override for tests. When set, `Workspace::global()` returns
-// a reference to this workspace instead of the process-wide singleton.
+// an owned clone instead of the process-wide singleton.
 // This allows parallel tests to each have their own isolated workspace root.
 #[cfg(test)]
 thread_local! {
@@ -24,6 +25,7 @@ thread_local! {
 /// - `work`: Active working directories for minions
 /// - `archive`: Completed or archived minion workspaces
 /// - `state`: State files (e.g., minion ID counter)
+#[derive(Clone)]
 pub struct Workspace {
     #[allow(dead_code)] // Accessed via root() in tests
     root: PathBuf,
@@ -34,6 +36,31 @@ pub struct Workspace {
     state: PathBuf,
 }
 
+/// A reference to a `Workspace` — either a `&'static` from the process-wide
+/// singleton or an owned clone from a thread-local test override.
+///
+/// Dereferences to `&Workspace`, so callers can use it identically regardless
+/// of which variant is active. In production builds only `Static` is used.
+pub enum WorkspaceRef {
+    /// Reference to the process-wide singleton (production path).
+    Static(&'static Workspace),
+    /// Owned clone from a thread-local test override.
+    #[cfg(test)]
+    Owned(Workspace),
+}
+
+impl Deref for WorkspaceRef {
+    type Target = Workspace;
+
+    fn deref(&self) -> &Workspace {
+        match self {
+            WorkspaceRef::Static(ws) => ws,
+            #[cfg(test)]
+            WorkspaceRef::Owned(ws) => ws,
+        }
+    }
+}
+
 impl Workspace {
     /// Returns a reference to the global cached Workspace instance.
     ///
@@ -42,25 +69,18 @@ impl Workspace {
     ///
     /// In test builds, checks for a thread-local override set via
     /// [`set_test_workspace`] before falling back to the process-wide singleton.
-    pub fn global() -> io::Result<&'static Workspace> {
+    /// Returns a [`WorkspaceRef`] that dereferences to `&Workspace`.
+    pub fn global() -> io::Result<WorkspaceRef> {
         #[cfg(test)]
         {
-            // SAFETY: We transmute the lifetime from the thread-local borrow to 'static.
-            // This is safe because:
-            // 1. The thread-local is only set/cleared within a single test function
-            // 2. The returned reference is used within the same test scope
-            // 3. Tests run on their own thread, so the thread-local outlives all uses
-            let maybe = TEST_WORKSPACE_OVERRIDE.with(|cell| {
-                let borrow = cell.borrow();
-                borrow
-                    .as_ref()
-                    .map(|ws| unsafe { &*(ws as *const Workspace) as &'static Workspace })
-            });
+            let maybe = TEST_WORKSPACE_OVERRIDE.with(|cell| cell.borrow().clone());
             if let Some(ws) = maybe {
-                return Ok(ws);
+                return Ok(WorkspaceRef::Owned(ws));
             }
         }
-        GLOBAL_WORKSPACE.get_or_try_init(Workspace::new)
+        Ok(WorkspaceRef::Static(
+            GLOBAL_WORKSPACE.get_or_try_init(Workspace::new)?,
+        ))
     }
 
     /// Creates directories with appropriate permissions (0755 on Unix).
