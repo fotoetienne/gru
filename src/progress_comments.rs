@@ -128,6 +128,10 @@ mod tests {
         assert!(comment.contains("## 🚨 CI Fix Escalation"));
         assert!(comment.contains("Something went wrong."));
         assert!(comment.contains("<sub>🤖 M042</sub>"));
+        // Detail appears before signature (structural ordering)
+        let detail_pos = comment.find("Something went wrong.").unwrap();
+        let sig_pos = comment.find("<sub>🤖 M042</sub>").unwrap();
+        assert!(detail_pos < sig_pos);
         // Trailing newline in detail is trimmed so the signature lands cleanly
         assert!(!comment.contains("Something went wrong.\n\n\n"));
     }
@@ -139,6 +143,10 @@ mod tests {
         assert!(comment.contains("## 🚨 Minion Escalation"));
         assert!(comment.contains("Rebase failed."));
         assert!(comment.contains("<sub>🤖 M001</sub>"));
+        // Detail appears before signature (structural ordering)
+        let detail_pos = comment.find("Rebase failed.").unwrap();
+        let sig_pos = comment.find("<sub>🤖 M001</sub>").unwrap();
+        assert!(detail_pos < sig_pos);
     }
 
     #[test]
