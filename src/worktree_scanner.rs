@@ -232,10 +232,10 @@ impl Worktree {
         {
             // Treat API errors (Err→None) and branches without issue numbers (Ok(None))
             // as "still open" — conservative: don't clean unless we have positive
-            // confirmation the issue is done. Only Some(false) means explicitly open.
-            let issue_still_open =
-                matches!(self.check_issue_closed().await.unwrap_or(None), Some(false));
-            if !issue_still_open {
+            // confirmation the issue is done. Only Some(true) means explicitly closed.
+            let issue_closed =
+                matches!(self.check_issue_closed().await.unwrap_or(None), Some(true));
+            if issue_closed {
                 return Ok(WorktreeStatus::Merged);
             }
         }
@@ -544,74 +544,49 @@ mod tests {
         cmd
     }
 
+    /// Run a git command and assert it succeeds, including stderr in the
+    /// failure message for easier debugging.
+    async fn run_git(args: &[&str]) -> std::process::Output {
+        let output = clean_git_cmd().args(args).output().await.unwrap();
+        assert!(
+            output.status.success(),
+            "git {} failed ({}): {}",
+            args.join(" "),
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+        output
+    }
+
     /// Set up a bare repo + working clone with an initial commit on main.
     /// Returns (bare_path, work_path).
     async fn setup_test_repo(base: &Path) -> (PathBuf, PathBuf) {
         let bare_path = base.join("test.git");
         std::fs::create_dir_all(&bare_path).unwrap();
-        clean_git_cmd()
-            .args(["init", "--bare"])
-            .current_dir(&bare_path)
-            .output()
-            .await
-            .unwrap();
+        run_git(&[
+            "init",
+            "--bare",
+            "--initial-branch=main",
+            &bare_path.to_string_lossy(),
+        ])
+        .await;
 
         let work_path = base.join("work");
-        clean_git_cmd()
-            .args([
-                "clone",
-                &bare_path.to_string_lossy(),
-                &work_path.to_string_lossy(),
-            ])
-            .output()
-            .await
-            .unwrap();
+        run_git(&[
+            "clone",
+            &bare_path.to_string_lossy(),
+            &work_path.to_string_lossy(),
+        ])
+        .await;
 
-        clean_git_cmd()
-            .args([
-                "-C",
-                &work_path.to_string_lossy(),
-                "config",
-                "user.email",
-                "test@test.com",
-            ])
-            .output()
-            .await
-            .unwrap();
-        clean_git_cmd()
-            .args([
-                "-C",
-                &work_path.to_string_lossy(),
-                "config",
-                "user.name",
-                "Test",
-            ])
-            .output()
-            .await
-            .unwrap();
+        let wl = work_path.to_string_lossy().to_string();
+        run_git(&["-C", &wl, "config", "user.email", "test@test.com"]).await;
+        run_git(&["-C", &wl, "config", "user.name", "Test"]).await;
 
         std::fs::write(work_path.join("file.txt"), "hello").unwrap();
-        clean_git_cmd()
-            .args(["-C", &work_path.to_string_lossy(), "add", "file.txt"])
-            .output()
-            .await
-            .unwrap();
-        clean_git_cmd()
-            .args([
-                "-C",
-                &work_path.to_string_lossy(),
-                "commit",
-                "-m",
-                "initial",
-            ])
-            .output()
-            .await
-            .unwrap();
-        clean_git_cmd()
-            .args(["-C", &work_path.to_string_lossy(), "push", "origin", "main"])
-            .output()
-            .await
-            .unwrap();
+        run_git(&["-C", &wl, "add", "file.txt"]).await;
+        run_git(&["-C", &wl, "commit", "-m", "initial"]).await;
+        run_git(&["-C", &wl, "push", "origin", "main"]).await;
 
         (bare_path, work_path)
     }
@@ -624,30 +599,11 @@ mod tests {
     async fn test_check_merged_returns_true_for_fresh_branch() {
         let temp_dir = tempfile::tempdir().unwrap();
         let (bare_path, work_path) = setup_test_repo(temp_dir.path()).await;
+        let wl = work_path.to_string_lossy().to_string();
 
         // Create a new branch (no new commits) and push it
-        clean_git_cmd()
-            .args([
-                "-C",
-                &work_path.to_string_lossy(),
-                "checkout",
-                "-b",
-                "minion/issue-42-M001",
-            ])
-            .output()
-            .await
-            .unwrap();
-        clean_git_cmd()
-            .args([
-                "-C",
-                &work_path.to_string_lossy(),
-                "push",
-                "origin",
-                "minion/issue-42-M001",
-            ])
-            .output()
-            .await
-            .unwrap();
+        run_git(&["-C", &wl, "checkout", "-b", "minion/issue-42-M001"]).await;
+        run_git(&["-C", &wl, "push", "origin", "minion/issue-42-M001"]).await;
 
         let wt = Worktree {
             path: work_path,
@@ -670,47 +626,14 @@ mod tests {
     async fn test_check_merged_returns_false_for_diverged_branch() {
         let temp_dir = tempfile::tempdir().unwrap();
         let (bare_path, work_path) = setup_test_repo(temp_dir.path()).await;
+        let wl = work_path.to_string_lossy().to_string();
 
         // Create branch with a new commit
-        clean_git_cmd()
-            .args([
-                "-C",
-                &work_path.to_string_lossy(),
-                "checkout",
-                "-b",
-                "minion/issue-99-M002",
-            ])
-            .output()
-            .await
-            .unwrap();
+        run_git(&["-C", &wl, "checkout", "-b", "minion/issue-99-M002"]).await;
         std::fs::write(work_path.join("new_file.txt"), "new work").unwrap();
-        clean_git_cmd()
-            .args(["-C", &work_path.to_string_lossy(), "add", "new_file.txt"])
-            .output()
-            .await
-            .unwrap();
-        clean_git_cmd()
-            .args([
-                "-C",
-                &work_path.to_string_lossy(),
-                "commit",
-                "-m",
-                "new work",
-            ])
-            .output()
-            .await
-            .unwrap();
-        clean_git_cmd()
-            .args([
-                "-C",
-                &work_path.to_string_lossy(),
-                "push",
-                "origin",
-                "minion/issue-99-M002",
-            ])
-            .output()
-            .await
-            .unwrap();
+        run_git(&["-C", &wl, "add", "new_file.txt"]).await;
+        run_git(&["-C", &wl, "commit", "-m", "new work"]).await;
+        run_git(&["-C", &wl, "push", "origin", "minion/issue-99-M002"]).await;
 
         let wt = Worktree {
             path: work_path,
