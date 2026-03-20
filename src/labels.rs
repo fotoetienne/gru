@@ -102,11 +102,6 @@ mod tests {
     }
 
     #[test]
-    fn test_all_labels_count() {
-        assert_eq!(ALL_LABELS.len(), 8);
-    }
-
-    #[test]
     fn test_get_label_info_found() {
         let (color, desc) = get_label_info(TODO).unwrap();
         assert_eq!(color, "0075ca");

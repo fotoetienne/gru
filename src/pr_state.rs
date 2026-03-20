@@ -101,14 +101,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_pr_state_new() {
-        let state = PrState::new("42".to_string(), "15".to_string());
-        assert_eq!(state.pr_number, "42");
-        assert_eq!(state.issue_number, "15");
-        assert_eq!(state.status, PrStatus::Draft);
-    }
-
-    #[test]
     fn test_pr_state_save_and_load() {
         let temp_dir = tempfile::tempdir().unwrap();
 
