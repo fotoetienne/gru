@@ -33,7 +33,8 @@ mod tests {
 
     #[test]
     fn test_resolve_claude() {
-        assert!(resolve_backend("claude").is_ok());
+        let backend = resolve_backend("claude").unwrap();
+        assert_eq!(backend.name(), "claude-code");
     }
 
     #[test]

@@ -479,8 +479,7 @@ mod tests {
         };
 
         let prompt = agent::build_fix_prompt(&ctx, &wt_ctx);
-        assert!(!prompt.is_empty());
-        assert!(prompt.contains("42"));
+        assert_eq!(prompt, "/do 42");
     }
 
     #[test]
