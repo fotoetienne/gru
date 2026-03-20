@@ -847,6 +847,7 @@ pub async fn monitor_and_fix_ci(
                 return Ok(true);
             }
             CiFixAction::RetryNextAttempt => {
+                // Only reachable via CiResult::Timeout (non-final attempt)
                 eprintln!("⏱️  CI checks timed out");
                 continue;
             }
@@ -869,10 +870,23 @@ pub async fn monitor_and_fix_ci(
                 return Ok(false);
             }
             CiFixAction::Escalate(EscalationReason::ChecksFailed) => {
-                let failed_checks = match ci_result {
+                let mut failed_checks = match ci_result {
                     CiResult::Failed(checks) => checks,
                     _ => unreachable!(),
                 };
+
+                // Enrich with detailed logs before escalating
+                for check in &mut failed_checks {
+                    if check.output.is_none() || check.output.as_deref() == Some("") {
+                        if let Ok(Some(logs)) =
+                            fetch_check_logs(host, owner, repo, &check.name, pr_number, branch)
+                                .await
+                        {
+                            check.output = Some(logs);
+                        }
+                    }
+                }
+
                 eprintln!(
                     "🚨 Max fix attempts ({}) reached, escalating to human",
                     MAX_CI_FIX_ATTEMPTS
