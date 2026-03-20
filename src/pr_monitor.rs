@@ -1,5 +1,6 @@
 use crate::ci::CheckRun;
 use crate::github;
+use crate::github::DEFAULT_MAX_RETRIES;
 use crate::labels;
 use crate::merge_readiness;
 use anyhow::{Context, Result};
@@ -7,8 +8,6 @@ use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use std::process::Output;
 use tokio::time::{sleep, Duration, Instant};
-
-use crate::github::DEFAULT_MAX_RETRIES;
 
 const POLL_INTERVAL_SECS: u64 = 30;
 
