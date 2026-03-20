@@ -238,10 +238,27 @@ async fn check_worktree_files(worktree_path: &Path) -> Result<WorktreeFileStatus
     })
 }
 
-/// Handles the clean command to remove merged/closed worktrees
-pub async fn handle_clean(dry_run: bool, force: bool, base_branch: &str) -> Result<i32> {
-    let ws = workspace::Workspace::new().context("Failed to initialize workspace")?;
+/// Result of scanning worktrees for cleanup eligibility.
+struct ScanResult {
+    /// Worktrees eligible for removal, with their status reason.
+    cleanable: Vec<(worktree_scanner::Worktree, worktree_scanner::WorktreeStatus)>,
+    /// Worktrees skipped because they have active minion processes.
+    skipped_active_minions: Vec<worktree_scanner::Worktree>,
+    /// Worktrees skipped because they have open PRs.
+    skipped_open_prs: Vec<worktree_scanner::Worktree>,
+    /// Registry entries for stopped minions with no corresponding git worktree.
+    orphaned_minions: Vec<(String, PathBuf)>,
+}
 
+/// Discover worktrees, check their status, and categorize them for cleanup.
+///
+/// Handles stale worktree pruning, bare repo fetching, and registry-based
+/// active/stopped minion detection. Returns `None` if no worktrees exist.
+async fn scan_worktrees(
+    ws: &workspace::Workspace,
+    dry_run: bool,
+    base_branch: &str,
+) -> Result<Option<ScanResult>> {
     println!("Scanning for worktrees in {}...", ws.repos().display());
 
     // Discover all worktrees
@@ -251,7 +268,7 @@ pub async fn handle_clean(dry_run: bool, force: bool, base_branch: &str) -> Resu
 
     if worktrees.is_empty() {
         println!("No worktrees found.");
-        return Ok(0);
+        return Ok(None);
     }
 
     println!("Found {} worktrees. Checking status...\n", worktrees.len());
@@ -497,13 +514,25 @@ pub async fn handle_clean(dry_run: bool, force: bool, base_branch: &str) -> Resu
         .filter(|(_id, path)| !discovered_paths.contains(path))
         .collect();
 
+    Ok(Some(ScanResult {
+        cleanable,
+        skipped_active_minions,
+        skipped_open_prs,
+        orphaned_minions,
+    }))
+}
+
+/// Display the scan results: skipped worktrees, cleanable worktrees, and orphaned entries.
+///
+/// Returns `false` if there is nothing to clean (early exit).
+async fn display_scan_results(scan: &ScanResult) -> bool {
     // Display skipped worktrees with active minions
-    if !skipped_active_minions.is_empty() {
+    if !scan.skipped_active_minions.is_empty() {
         println!(
             "Skipped {} worktree(s) with active minions:\n",
-            skipped_active_minions.len()
+            scan.skipped_active_minions.len()
         );
-        for wt in &skipped_active_minions {
+        for wt in &scan.skipped_active_minions {
             println!("  {} (active minion)", worktree_label(wt));
             println!("    Branch: {}", wt.branch);
             println!("    Repo: {}", wt.repo);
@@ -512,12 +541,12 @@ pub async fn handle_clean(dry_run: bool, force: bool, base_branch: &str) -> Resu
     }
 
     // Display skipped worktrees with open PRs
-    if !skipped_open_prs.is_empty() {
+    if !scan.skipped_open_prs.is_empty() {
         println!(
             "Skipped {} worktree(s) with open PRs:\n",
-            skipped_open_prs.len()
+            scan.skipped_open_prs.len()
         );
-        for wt in &skipped_open_prs {
+        for wt in &scan.skipped_open_prs {
             println!("  {} (open PR)", worktree_label(wt));
             println!("    Branch: {}", wt.branch);
             println!("    Repo: {}", wt.repo);
@@ -525,8 +554,9 @@ pub async fn handle_clean(dry_run: bool, force: bool, base_branch: &str) -> Resu
         }
     }
 
-    if cleanable.is_empty() && orphaned_minions.is_empty() {
-        let has_skips = !skipped_active_minions.is_empty() || !skipped_open_prs.is_empty();
+    if scan.cleanable.is_empty() && scan.orphaned_minions.is_empty() {
+        let has_skips =
+            !scan.skipped_active_minions.is_empty() || !scan.skipped_open_prs.is_empty();
         if !has_skips {
             println!("No worktrees to clean.");
         } else {
@@ -534,13 +564,13 @@ pub async fn handle_clean(dry_run: bool, force: bool, base_branch: &str) -> Resu
                 "No cleanable worktrees found (skipped worktrees have active minions or open PRs)."
             );
         }
-        return Ok(0);
+        return false;
     }
 
     // Display cleanable worktrees
-    if !cleanable.is_empty() {
+    if !scan.cleanable.is_empty() {
         println!("Cleanable worktrees:\n");
-        for (wt, status) in &cleanable {
+        for (wt, status) in &scan.cleanable {
             let reason = match status {
                 worktree_scanner::WorktreeStatus::Merged => "no unmerged commits",
                 worktree_scanner::WorktreeStatus::PrMerged => "PR merged",
@@ -576,23 +606,32 @@ pub async fn handle_clean(dry_run: bool, force: bool, base_branch: &str) -> Resu
     }
 
     // Display orphaned registry entries
-    if !orphaned_minions.is_empty() {
+    if !scan.orphaned_minions.is_empty() {
         println!("Orphaned registry entries:\n");
-        for (minion_id, path) in &orphaned_minions {
+        for (minion_id, path) in &scan.orphaned_minions {
             println!("  {} (minion stopped, no git worktree)", minion_id);
             println!("    Path: {}", path.display());
             println!();
         }
     }
 
-    let total_cleanable = cleanable.len() + orphaned_minions.len();
+    true
+}
 
+/// Prompt the user for confirmation before removing worktrees.
+///
+/// Returns `true` if the user confirms (or if `force` is set), `false` otherwise.
+/// Returns `None` if this is a dry run (caller should exit early).
+async fn confirm_removal(
+    total_cleanable: usize,
+    dry_run: bool,
+    force: bool,
+) -> Result<Option<bool>> {
     if dry_run {
         println!("Dry run mode - nothing was removed.");
-        return Ok(0);
+        return Ok(None);
     }
 
-    // Confirm removal unless force flag is set
     if !force {
         print!("Remove {} item(s)? [y/N]: ", total_cleanable);
         std::io::stdout().flush()?;
@@ -605,11 +644,23 @@ pub async fn handle_clean(dry_run: bool, force: bool, base_branch: &str) -> Resu
 
         if input != "y" && input != "yes" {
             println!("Cancelled.");
-            return Ok(0);
+            return Ok(Some(false));
         }
     }
 
-    // Remove worktrees
+    Ok(Some(true))
+}
+
+/// Remove cleanable worktrees and orphaned registry entries from disk.
+///
+/// Handles git worktree removal, branch deletion, minion directory cleanup,
+/// and batch registry entry removal. Returns the process exit code (0 or 1).
+async fn remove_worktrees(
+    ws: &workspace::Workspace,
+    cleanable: Vec<(worktree_scanner::Worktree, worktree_scanner::WorktreeStatus)>,
+    orphaned_minions: &[(String, PathBuf)],
+    force: bool,
+) -> Result<i32> {
     println!("\nRemoving worktrees...");
     let mut removed = 0;
     let mut failed = 0;
@@ -790,7 +841,7 @@ pub async fn handle_clean(dry_run: bool, force: bool, base_branch: &str) -> Resu
     // Clean up orphaned registry entries
     if !orphaned_minions.is_empty() {
         println!("\nCleaning orphaned registry entries...");
-        for (minion_id, path) in &orphaned_minions {
+        for (minion_id, path) in orphaned_minions {
             print!("  Removing {} ({})... ", minion_id, path.display());
             std::io::stdout().flush()?;
 
@@ -882,6 +933,30 @@ pub async fn handle_clean(dry_run: bool, force: bool, base_branch: &str) -> Resu
     println!();
 
     Ok(if failed > 0 { 1 } else { 0 })
+}
+
+/// Handles the clean command to remove merged/closed worktrees
+pub async fn handle_clean(dry_run: bool, force: bool, base_branch: &str) -> Result<i32> {
+    let ws = workspace::Workspace::new().context("Failed to initialize workspace")?;
+
+    let scan = match scan_worktrees(&ws, dry_run, base_branch).await? {
+        Some(scan) => scan,
+        None => return Ok(0),
+    };
+
+    if !display_scan_results(&scan).await {
+        return Ok(0);
+    }
+
+    let total_cleanable = scan.cleanable.len() + scan.orphaned_minions.len();
+
+    match confirm_removal(total_cleanable, dry_run, force).await? {
+        None => return Ok(0),        // dry run
+        Some(false) => return Ok(0), // user cancelled
+        Some(true) => {}             // confirmed
+    }
+
+    remove_worktrees(&ws, scan.cleanable, &scan.orphaned_minions, force).await
 }
 
 #[cfg(test)]
