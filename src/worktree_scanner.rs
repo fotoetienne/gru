@@ -377,14 +377,15 @@ async fn find_bare_repos(dir: &Path) -> Result<Vec<PathBuf>> {
                         current_dir.display(),
                         e
                     );
-                    continue;
+                    break;
                 }
             };
             let path = entry.path();
 
-            let is_dir = tokio::fs::metadata(&path)
+            let is_dir = entry
+                .file_type()
                 .await
-                .map(|m| m.is_dir())
+                .map(|ft| ft.is_dir())
                 .unwrap_or(false);
             if !is_dir {
                 continue;

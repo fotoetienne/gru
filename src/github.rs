@@ -25,14 +25,12 @@ pub(crate) fn repo_slug(owner: &str, repo: &str) -> String {
 /// Returns the appropriate GitHub hostname
 pub(crate) fn infer_github_host(owner: &str, config: Option<&crate::config::LabConfig>) -> String {
     // Check daemon.repos config for an explicit host for this owner
-    let loaded;
-    let cfg = match config {
-        Some(c) => Some(c),
-        None => {
-            loaded = crate::config::try_load_config();
-            loaded.as_ref()
-        }
+    let loaded = if config.is_none() {
+        crate::config::try_load_config()
+    } else {
+        None
     };
+    let cfg = config.or(loaded.as_ref());
     if let Some(cfg) = cfg {
         for repo_spec in &cfg.daemon.repos {
             if let Some((host, repo_owner, _repo)) =
