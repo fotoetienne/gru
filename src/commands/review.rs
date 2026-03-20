@@ -294,10 +294,15 @@ async fn resolve_pr_from_current_worktree() -> Result<(String, String, String, S
 async fn resolve_pr_from_arg(arg: &str) -> Result<(String, String, String, String, String)> {
     let mut errors = Vec::new();
 
-    // Strategy 1: Try as Minion ID
-    match resolve_pr_from_minion_id(arg).await {
-        Ok(pr_info) => return Ok(pr_info),
-        Err(e) => errors.push(format!("Minion ID '{}': {:#}", arg, e)),
+    // Strategy 1: Try as Minion ID (only if it looks like one — avoids
+    // unnecessary registry/filesystem I/O for URLs and PR numbers)
+    let looks_like_minion =
+        arg.len() >= 2 && arg.starts_with('M') && arg[1..].chars().all(|c| c.is_alphanumeric());
+    if looks_like_minion {
+        match resolve_pr_from_minion_id(arg).await {
+            Ok(pr_info) => return Ok(pr_info),
+            Err(e) => errors.push(format!("Minion ID '{}': {:#}", arg, e)),
+        }
     }
 
     // Strategy 2: Try as PR number or URL (existing behavior)
