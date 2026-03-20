@@ -59,7 +59,7 @@ Gru will handle:
 - Run tests to verify the fix
 
 ## 5. Code Review
-- Make a commit with the changes
+- Make a commit with the changes, prefixing the commit message with your Minion ID, e.g. `[{{ minion_id }}] Fix null pointer in parser`
 - Use the Task tool with `subagent_type='code-reviewer'` to perform an autonomous code review
 - The code-reviewer agent will analyze the changes for:
   - Code correctness and logic errors
@@ -75,7 +75,7 @@ Gru will handle:
 
 When your implementation is complete and ready for human review:
 
-1. **Commit your implementation changes** with a descriptive commit message
+1. **Commit your implementation changes** with a descriptive commit message prefixed with your Minion ID, e.g. `[{{ minion_id }}] Fix null pointer in parser`
 2. **Push the branch** to the remote repository
 3. Write `PR_DESCRIPTION.md` in the root of the repository with this format:
    ```markdown
