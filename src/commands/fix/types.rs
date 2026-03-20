@@ -3,22 +3,22 @@ use std::process::ExitStatus;
 use uuid::Uuid;
 
 /// Options for the `gru do` (fix) command.
-pub(crate) struct FixOptions {
-    pub(crate) timeout: Option<String>,
-    pub(crate) review_timeout: Option<String>,
-    pub(crate) monitor_timeout: Option<String>,
-    pub(crate) quiet: bool,
-    pub(crate) force_new: bool,
-    pub(crate) agent_name: String,
-    pub(crate) no_watch: bool,
-    pub(crate) auto_merge: bool,
+pub struct FixOptions {
+    pub timeout: Option<String>,
+    pub review_timeout: Option<String>,
+    pub monitor_timeout: Option<String>,
+    pub quiet: bool,
+    pub force_new: bool,
+    pub agent_name: String,
+    pub no_watch: bool,
+    pub auto_merge: bool,
     /// Detach immediately after spawning background worker (don't follow logs).
-    pub(crate) detach: bool,
+    pub detach: bool,
     /// Skip dependency checking entirely.
-    pub(crate) ignore_deps: bool,
+    pub ignore_deps: bool,
     /// Internal: run as background worker for a previously-registered minion.
     /// Value is the minion ID to look up in the registry.
-    pub(crate) worker: Option<String>,
+    pub worker: Option<String>,
 }
 
 /// Maximum number of review rounds to handle automatically
