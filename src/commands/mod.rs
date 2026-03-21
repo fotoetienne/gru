@@ -6,6 +6,7 @@ pub(crate) mod fix;
 pub(crate) mod init;
 pub(crate) mod lab;
 pub(crate) mod logs;
+pub(crate) mod mcp;
 pub(crate) mod path;
 pub(crate) mod prompt;
 pub(crate) mod prompts;

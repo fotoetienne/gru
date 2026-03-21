@@ -170,6 +170,18 @@ repos = ["owner/frontend", "owner/backend"]
 max_slots = 4            # default is 2
 ```
 
+## MCP Server
+
+Gru can act as an MCP (Model Context Protocol) server, giving any Claude session live access to Minion status, logs, and Gru knowledge:
+
+```bash
+gru mcp              # Start stdio MCP server (used by Claude)
+gru mcp install      # Register in ~/.claude.json
+gru mcp uninstall    # Remove from ~/.claude.json
+```
+
+Once installed, Claude Code sessions can query Minion status and read Gru guides without leaving the conversation.
+
 ## Configuration
 
 All configuration lives in `~/.gru/config.toml`. Everything is optional — Gru works out of the box with sensible defaults.

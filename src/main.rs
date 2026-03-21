@@ -14,6 +14,7 @@ mod git;
 mod github;
 mod labels;
 mod log_viewer;
+mod mcp;
 mod merge_judge;
 mod merge_readiness;
 mod minion;
@@ -370,6 +371,11 @@ enum Commands {
     },
     #[command(about = "List available prompts")]
     Prompts,
+    #[command(about = "Start Gru as an MCP server")]
+    Mcp {
+        #[command(subcommand)]
+        action: Option<McpAction>,
+    },
     #[command(about = "Run Gru Lab in daemon mode to automatically work on issues")]
     Lab {
         #[arg(long, help = "Path to config file (default: ~/.gru/config.toml)")]
@@ -398,6 +404,15 @@ enum Commands {
         )]
         stop_minions: bool,
     },
+}
+
+/// MCP server subcommands
+#[derive(Subcommand)]
+enum McpAction {
+    #[command(about = "Register Gru as an MCP server in ~/.claude.json")]
+    Install,
+    #[command(about = "Remove Gru MCP server from ~/.claude.json")]
+    Uninstall,
 }
 
 #[tokio::main]
@@ -520,6 +535,11 @@ async fn main() {
             }
         }
         Commands::Prompts => prompts::handle_prompts().await,
+        Commands::Mcp { action } => match action {
+            None => commands::mcp::handle_mcp_server().await,
+            Some(McpAction::Install) => commands::mcp::handle_mcp_install().await,
+            Some(McpAction::Uninstall) => commands::mcp::handle_mcp_uninstall().await,
+        },
         Commands::Lab {
             config,
             repos,
