@@ -540,6 +540,45 @@ pub async fn is_pr_open_via_cli(owner: &str, repo: &str, host: &str, number: u64
     Ok(state == "OPEN")
 }
 
+/// Check whether a PR has been merged.
+///
+/// Returns `true` if the PR state is "MERGED", `false` otherwise.
+pub async fn is_pr_merged_via_cli(
+    owner: &str,
+    repo: &str,
+    host: &str,
+    number: u64,
+) -> Result<bool> {
+    let repo_full = repo_slug(owner, repo);
+    let number_str = number.to_string();
+    let stdout = run_gh(
+        host,
+        &[
+            "pr",
+            "view",
+            &number_str,
+            "--repo",
+            &repo_full,
+            "--json",
+            "state",
+            "--jq",
+            ".state",
+        ],
+    )
+    .await?;
+
+    let state = stdout.trim().to_string();
+    if state.is_empty() {
+        return Err(anyhow!(
+            "gh pr view returned empty state for PR #{} in {}/{}",
+            number,
+            owner,
+            repo
+        ));
+    }
+    Ok(state == "MERGED")
+}
+
 /// Simple struct to hold issue information from gh CLI
 #[derive(Debug, serde::Deserialize)]
 pub(crate) struct IssueInfo {

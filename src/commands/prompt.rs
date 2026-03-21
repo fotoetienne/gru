@@ -665,6 +665,7 @@ fn build_minion_registry_info(
         no_watch: false,
         last_review_check_time: None,
         wake_reason: None,
+        archived_at: None,
     }
 }
 

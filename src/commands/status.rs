@@ -1,6 +1,7 @@
 use crate::agent::TokenUsage;
 use crate::minion_registry::{is_process_alive_with_start_time, with_registry, MinionMode};
 use anyhow::{Context, Result};
+use chrono::{DateTime, Utc};
 
 /// Combined Minion information from registry and filesystem scanning
 #[derive(Debug, Clone)]
@@ -20,6 +21,7 @@ struct EnhancedMinionInfo {
     worktree_path: String,
     agent_name: String,
     is_stale: bool,
+    is_archived: bool,
 }
 
 /// Intermediate Minion data extracted from registry (without expensive status checks)
@@ -40,6 +42,7 @@ struct BasicMinionData {
     token_usage: Option<TokenUsage>,
     agent_name: String,
     is_stale: bool,
+    archived_at: Option<DateTime<Utc>>,
 }
 
 /// Calculates uptime from a timestamp
@@ -133,12 +136,22 @@ fn format_mode_display(
 ///
 /// This ensures the lock is only held for the minimum time needed to read/write
 /// the registry file, not for I/O operations.
-pub(crate) async fn handle_status(id: Option<String>, verbose: bool) -> Result<i32> {
-    // Prune stale entries using the shared two-phase approach that checks
+pub(crate) async fn handle_status(
+    id: Option<String>,
+    verbose: bool,
+    show_all: bool,
+) -> Result<i32> {
+    // Prune stale entries using the shared three-phase approach that checks
     // GitHub PR status before removing entries with open PRs.
     // Non-fatal: a transient GitHub API error should not prevent status display.
     if let Err(e) = crate::minion_registry::prune_stale_entries().await {
         log::warn!("Failed to prune stale registry entries: {:#}", e);
+    }
+
+    // Auto-archive stopped minions whose PR is merged or issue is closed.
+    // Non-fatal: a transient GitHub API error should not prevent status display.
+    if let Err(e) = crate::minion_registry::auto_archive_completed_minions().await {
+        log::warn!("Failed to auto-archive completed minions: {:#}", e);
     }
 
     // Phase 1: Load registry and perform remaining cleanup (with lock held)
@@ -187,6 +200,7 @@ pub(crate) async fn handle_status(id: Option<String>, verbose: bool) -> Result<i
                     token_usage: info.token_usage,
                     agent_name: info.agent_name,
                     is_stale,
+                    archived_at: info.archived_at,
                 }
             })
             .collect();
@@ -205,6 +219,7 @@ pub(crate) async fn handle_status(id: Option<String>, verbose: bool) -> Result<i
                     // Stale entry: worktree doesn't exist (detected in Phase 1,
                     // or removed between Phase 1 and Phase 2). Skip git operations.
                     let uptime = calculate_uptime(basic.started_at);
+                    let is_archived = basic.archived_at.is_some();
                     EnhancedMinionInfo {
                         minion_id: basic.minion_id,
                         repo: basic.repo,
@@ -213,7 +228,11 @@ pub(crate) async fn handle_status(id: Option<String>, verbose: bool) -> Result<i
                         pr: basic.pr,
                         branch: basic.branch,
                         is_running: false,
-                        mode_display: "stale".to_string(),
+                        mode_display: if is_archived {
+                            "archived".to_string()
+                        } else {
+                            "stale".to_string()
+                        },
                         uptime,
                         token_usage: basic.token_usage,
                         session_id: basic.session_id,
@@ -221,10 +240,19 @@ pub(crate) async fn handle_status(id: Option<String>, verbose: bool) -> Result<i
                         worktree_path: basic.worktree.display().to_string(),
                         agent_name: basic.agent_name,
                         is_stale: true,
+                        is_archived,
                     }
                 } else {
                     let (is_running, mode_display) =
                         format_mode_display(basic.pid, basic.pid_start_time, &basic.mode);
+                    // Treat a minion as archived only when it has an archived_at
+                    // timestamp and is not currently running.
+                    let is_archived = basic.archived_at.is_some() && !is_running;
+                    let mode_display = if is_archived {
+                        "archived".to_string()
+                    } else {
+                        mode_display
+                    };
                     let uptime = calculate_uptime(basic.started_at);
                     // Get current branch from checkout path (checks for detached HEAD, branch changes, etc.)
                     let checkout_path = crate::workspace::resolve_checkout_path(&basic.worktree);
@@ -247,6 +275,7 @@ pub(crate) async fn handle_status(id: Option<String>, verbose: bool) -> Result<i
                         worktree_path,
                         agent_name: basic.agent_name,
                         is_stale: false,
+                        is_archived,
                     }
                 }
             })
@@ -283,8 +312,23 @@ pub(crate) async fn handle_status(id: Option<String>, verbose: bool) -> Result<i
         minions = filtered;
     }
 
+    // Count archived entries before filtering them out
+    let archived_count = minions.iter().filter(|m| m.is_archived).count();
+
+    // Hide archived entries unless --all is passed
+    if !show_all {
+        minions.retain(|m| !m.is_archived);
+    }
+
     if minions.is_empty() {
-        println!("No active Minions");
+        if archived_count > 0 {
+            println!(
+                "No active Minions ({} archived — use --all to show)",
+                archived_count
+            );
+        } else {
+            println!("No active Minions");
+        }
         return Ok(0);
     }
 
@@ -361,15 +405,28 @@ pub(crate) async fn handle_status(id: Option<String>, verbose: bool) -> Result<i
     }
 
     println!();
-    let stale_count = minions.iter().filter(|m| m.is_stale).count();
+    let stale_count = minions
+        .iter()
+        .filter(|m| m.is_stale && !m.is_archived)
+        .count();
+    // Build footer with counts
+    let mut footer_parts = Vec::new();
     if stale_count > 0 {
-        println!(
-            "{} Minion(s) found ({} stale - run 'gru clean' to remove)",
-            minions.len(),
-            stale_count
-        );
-    } else {
+        footer_parts.push(format!("{} stale - run 'gru clean' to remove", stale_count));
+    }
+    // Show archived hint when entries are hidden (not using --all)
+    if !show_all && archived_count > 0 {
+        footer_parts.push(format!("{} archived — use --all to show", archived_count));
+    }
+
+    if footer_parts.is_empty() {
         println!("{} Minion(s) found", minions.len());
+    } else {
+        println!(
+            "{} Minion(s) found ({})",
+            minions.len(),
+            footer_parts.join(", ")
+        );
     }
 
     Ok(0)
@@ -383,7 +440,7 @@ mod tests {
     #[ignore] // Integration test - performs real I/O and git operations
     async fn test_handle_status_no_filter() {
         // This test verifies that handle_status succeeds without filtering
-        let result = handle_status(None, false).await;
+        let result = handle_status(None, false, false).await;
         assert!(result.is_ok());
     }
 

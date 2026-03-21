@@ -85,10 +85,12 @@ fn claim_session_in_registry(
         }
     }
 
-    // Claim the session with the requested mode
+    // Claim the session with the requested mode.
+    // Clear archived_at so a resumed/attached minion is visible in `gru status`.
     reg.update(&id, |i| {
         i.mode = target_mode.clone();
         i.last_activity = Utc::now();
+        i.archived_at = None;
     })?;
 
     Ok(Some(info))
@@ -206,6 +208,7 @@ mod tests {
             no_watch: false,
             last_review_check_time: None,
             wake_reason: None,
+            archived_at: None,
         }
     }
 
