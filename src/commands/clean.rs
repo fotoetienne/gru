@@ -1,3 +1,4 @@
+use crate::display_utils;
 use crate::minion_registry::with_registry;
 use crate::workspace;
 use crate::worktree_scanner;
@@ -95,12 +96,7 @@ fn worktree_label(wt: &worktree_scanner::Worktree) -> String {
 
 /// Shorten a path by replacing the home directory prefix with `~`.
 fn shorten_path(path: &Path) -> String {
-    if let Some(home) = dirs::home_dir() {
-        if let Ok(suffix) = path.strip_prefix(&home) {
-            return format!("~/{}", suffix.display());
-        }
-    }
-    path.display().to_string()
+    display_utils::shorten_path_home(path)
 }
 
 /// File-change summary from `git status --porcelain` output.

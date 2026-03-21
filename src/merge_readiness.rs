@@ -11,14 +11,10 @@
 
 use crate::github;
 use crate::github::ReviewUser;
+use crate::github::DEFAULT_MAX_RETRIES;
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::fmt;
-use std::process::Output;
-
-const DEFAULT_MAX_RETRIES: u32 = 5;
-const BASE_DELAY_SECS: u64 = 2;
-const MAX_DELAY_SECS: u64 = 60;
 
 /// Result of a deterministic merge-readiness check for a PR.
 ///
@@ -176,68 +172,26 @@ struct CombinedStatus {
 
 // --- API helpers ---
 
-async fn gh_api_with_retry(host: &str, args: &[&str], max_retries: u32) -> Result<Output> {
-    let mut attempts = 0;
-    let args_str = args.join(" ");
-
-    loop {
-        let output = github::gh_cli_command(host)
-            .args(args)
-            .output()
-            .await
-            .with_context(|| format!("Failed to execute: gh {}", args_str))?;
-
-        if output.status.success() {
-            return Ok(output);
-        }
-
+/// Wrapper around the shared retry helper that bails on non-success output.
+///
+/// merge_readiness callers expect the function to return `Err` on API failure
+/// (not just a non-zero exit status), so this wrapper adds the bail check.
+async fn gh_api_with_retry(
+    host: &str,
+    args: &[&str],
+    max_retries: u32,
+) -> Result<std::process::Output> {
+    let output = github::gh_api_with_retry(host, args, max_retries).await?;
+    if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-
-        if attempts >= max_retries || !is_retryable_error(&stderr) {
-            anyhow::bail!(
-                "GitHub API call failed after {} attempt(s): gh {} — {}",
-                attempts + 1,
-                args_str,
-                stderr.trim()
-            );
-        }
-
-        attempts += 1;
-        let delay = std::cmp::min(BASE_DELAY_SECS.pow(attempts), MAX_DELAY_SECS);
-        log::warn!(
-            "Retrying ({}/{}) after {}s: gh {}",
-            attempts,
-            max_retries,
-            delay,
+        let args_str = args.join(" ");
+        anyhow::bail!(
+            "GitHub API call failed: gh {} — {}",
             args_str,
+            stderr.trim()
         );
-        tokio::time::sleep(tokio::time::Duration::from_secs(delay)).await;
     }
-}
-
-fn is_retryable_error(stderr: &str) -> bool {
-    let lower = stderr.to_lowercase();
-    [
-        "502",
-        "503",
-        "504",
-        "429",
-        "timeout",
-        "timed out",
-        "connection reset",
-        "connection refused",
-        "rate limit",
-        "rate-limit",
-        "too many requests",
-        "internal server error",
-        "service unavailable",
-        "bad gateway",
-        "gateway timeout",
-        "temporary",
-        "try again",
-    ]
-    .iter()
-    .any(|p| lower.contains(p))
+    Ok(output)
 }
 
 // --- Data fetching ---
