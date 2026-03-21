@@ -112,16 +112,12 @@ pub(crate) async fn prune_stale_entries() -> Result<usize> {
     let mut pr_checks = tokio::task::JoinSet::new();
 
     for (id, pr, repo, issue) in &candidates {
-        // Skip invalid issue numbers (e.g., issue #0 from ad-hoc `gru prompt` minions)
-        // when there's no PR to check. If a PR exists, fall through to PR validation.
-        if *issue == 0 && pr.is_none() {
-            log::info!("Minion {} has issue #0 (ad-hoc), pruning stale entry", id);
-            to_remove.push(id.clone());
-            continue;
-        }
-
         match pr {
             None => {
+                if *issue == 0 {
+                    // Issue #0 from ad-hoc `gru prompt` minions — log explicitly before pruning
+                    log::info!("Minion {} has issue #0 (ad-hoc), pruning stale entry", id);
+                }
                 // No PR associated — safe to prune
                 to_remove.push(id.clone());
             }
