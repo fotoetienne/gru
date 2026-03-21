@@ -108,7 +108,6 @@ async fn check_resumption_preconditions(
     let branch_name = info.branch;
     let agent_name = info.agent_name;
     let timeout_deadline: Option<DateTime<Utc>> = info.timeout_deadline;
-    let _attempt_count = info.attempt_count;
     let no_watch = info.no_watch;
     let start_phase = info.orchestration_phase.clone();
     let wake_reason = info.wake_reason.clone();
@@ -128,15 +127,22 @@ async fn check_resumption_preconditions(
     // Increment attempt_count for observability.  We do NOT enforce
     // max_resume_attempts here — that limit is enforced by `gru lab`'s
     // `should_resume_candidate()` for daemon-driven retries.  User-initiated
-    // paths (`gru resume`, `gru attach` auto-resume) should always succeed
-    // because the human made an explicit decision.
+    // paths (`gru resume`, `gru attach` auto-resume) should not be blocked
+    // by max_resume_attempts since the human made an explicit decision.
     let mid = minion.minion_id.clone();
-    let _ = with_registry(move |reg| {
+    if let Err(e) = with_registry(move |reg| {
         reg.update(&mid, |info| {
             info.attempt_count = info.attempt_count.saturating_add(1);
         })
     })
-    .await;
+    .await
+    {
+        log::warn!(
+            "Failed to increment attempt_count for {}: {:#}",
+            minion.minion_id,
+            e
+        );
+    }
 
     let session_uuid = match Uuid::parse_str(&session_id) {
         Ok(uuid) => uuid,
