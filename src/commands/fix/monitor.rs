@@ -1019,21 +1019,57 @@ pub(crate) async fn monitor_pr_lifecycle(
 
     // Track review baseline across monitor_pr re-entries so reviews posted
     // before/during event handling (e.g. rebase) are not silently dropped.
-    // On a fresh run, initialize to pre_review_time so reviews submitted
-    // during the self-review are detected on the first poll.
-    // On re-entry (already_reviewed), load the stored baseline from the
-    // registry so reviews posted while the minion was stopped are not skipped.
+    //
+    // On a fresh run (first self-review), use pre_review_time so reviews
+    // submitted during the self-review are detected on the first poll.
+    //
+    // On re-entry (already_reviewed, e.g. after crash+resume), resolve the
+    // baseline using a fallback chain that avoids losing reviews posted
+    // while the minion was stopped:
+    //   1. Persisted last_review_check_time (saved before crash)
+    //   2. PR creation time from GitHub API (catches all reviews ever posted)
+    //   3. Current time (last resort)
     let initial_baseline = if already_reviewed {
         let mid = wt_ctx.minion_id.clone();
-        minion_registry::with_registry(move |registry| {
+        let persisted = minion_registry::with_registry(move |registry| {
             Ok(registry
                 .get(&mid)
-                .map(|info| info.last_review_check_time.unwrap_or(info.started_at)))
+                .and_then(|info| info.last_review_check_time))
         })
         .await
         .ok()
-        .flatten()
-        .unwrap_or(pre_review_time)
+        .flatten();
+
+        match persisted {
+            Some(ts) => ts,
+            None => {
+                // No persisted baseline — fall back to PR creation time so
+                // reviews posted between PR creation and resume are detected.
+                match pr_monitor::get_pr_created_at(
+                    &issue_ctx.host,
+                    &issue_ctx.owner,
+                    &issue_ctx.repo,
+                    pr_number,
+                )
+                .await
+                {
+                    Ok(created) => {
+                        log::info!(
+                            "📅 Using PR creation time {} as review baseline (no persisted state)",
+                            created
+                        );
+                        created
+                    }
+                    Err(e) => {
+                        log::warn!(
+                            "⚠️  Failed to fetch PR creation time, falling back to now: {}",
+                            e
+                        );
+                        pre_review_time
+                    }
+                }
+            }
+        }
     } else {
         pre_review_time
     };
