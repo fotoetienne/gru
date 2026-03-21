@@ -139,44 +139,42 @@ pub async fn handle_lab(
     }
 
     // Listen for both SIGINT (Ctrl-C) and SIGTERM (kill, systemd, docker)
+    // Use persistent Signal handles so queued signals are never lost between select! arms
+    let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+        .context("Failed to register SIGINT handler")?;
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .context("Failed to register SIGTERM handler")?;
+
+    macro_rules! shutdown {
+        ($signal:expr) => {{
+            tprintln!();
+            tprintln!(concat!(
+                "🛑 Received shutdown signal (",
+                $signal,
+                "), stopping daemon..."
+            ));
+            shutdown_children(&mut children, stop_minions).await;
+            break;
+        }};
+    }
 
     // Main polling loop
     loop {
         // Phase 1: Wait for poll interval or shutdown signal
         tokio::select! {
-            _ = tokio::signal::ctrl_c() => {
-                tprintln!();
-                tprintln!("🛑 Received shutdown signal (SIGINT), stopping daemon...");
-                shutdown_children(&mut children, stop_minions).await;
-                break;
-            }
-            _ = sigterm.recv() => {
-                tprintln!();
-                tprintln!("🛑 Received shutdown signal (SIGTERM), stopping daemon...");
-                shutdown_children(&mut children, stop_minions).await;
-                break;
-            }
+            _ = sigint.recv() => { shutdown!("SIGINT"); }
+            _ = sigterm.recv() => { shutdown!("SIGTERM"); }
             _ = sleep(config.poll_interval()) => {
                 // Clean up finished child processes
                 reap_children(&mut children).await;
 
                 // Phase 2: Race poll_and_spawn against shutdown signals
-                // so Ctrl+C during polling cancels all in-flight API calls at once
+                // so Ctrl+C during polling cancels all in-flight API calls at once.
+                // Note: block_in_place sections inside poll_and_spawn (e.g. PR-open
+                // checks) cannot be interrupted by cancellation until they return.
                 tokio::select! {
-                    _ = tokio::signal::ctrl_c() => {
-                        tprintln!();
-                        tprintln!("🛑 Received shutdown signal (SIGINT), stopping daemon...");
-                        shutdown_children(&mut children, stop_minions).await;
-                        break;
-                    }
-                    _ = sigterm.recv() => {
-                        tprintln!();
-                        tprintln!("🛑 Received shutdown signal (SIGTERM), stopping daemon...");
-                        shutdown_children(&mut children, stop_minions).await;
-                        break;
-                    }
+                    _ = sigint.recv() => { shutdown!("SIGINT"); }
+                    _ = sigterm.recv() => { shutdown!("SIGTERM"); }
                     result = poll_and_spawn(
                         &config,
                         &mut children,
