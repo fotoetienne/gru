@@ -32,36 +32,36 @@ pub(crate) const MAX_REBASE_ATTEMPTS: usize = 2;
 /// Result of resolving an issue argument into validated context.
 /// Contains the parsed issue number as `u64`, eliminating repeated string parsing.
 pub(crate) struct IssueContext {
-    pub owner: String,
-    pub repo: String,
+    pub(crate) owner: String,
+    pub(crate) repo: String,
     /// GitHub hostname (e.g., "github.com" or "ghe.example.com")
-    pub host: String,
-    pub issue_num: u64,
+    pub(crate) host: String,
+    pub(crate) issue_num: u64,
     /// Fetched issue details: (title, body, labels). None if fetch failed.
-    pub details: Option<IssueDetails>,
+    pub(crate) details: Option<IssueDetails>,
 }
 
 /// Fetched issue metadata from GitHub.
 pub(crate) struct IssueDetails {
-    pub title: String,
-    pub body: String,
-    pub labels: String,
+    pub(crate) title: String,
+    pub(crate) body: String,
+    pub(crate) labels: String,
 }
 
 /// Result of setting up a worktree for a minion.
 pub(crate) struct WorktreeContext {
-    pub minion_id: String,
-    pub branch_name: String,
+    pub(crate) minion_id: String,
+    pub(crate) branch_name: String,
     /// Top-level minion directory where metadata lives (events.jsonl, PR_DESCRIPTION.md, etc.)
-    pub minion_dir: PathBuf,
+    pub(crate) minion_dir: PathBuf,
     /// Git worktree checkout path (minion_dir/checkout for new layout, minion_dir for legacy)
-    pub checkout_path: PathBuf,
-    pub session_id: Uuid,
+    pub(crate) checkout_path: PathBuf,
+    pub(crate) session_id: Uuid,
 }
 
 /// Result of running an agent session.
 pub(crate) struct AgentResult {
-    pub status: ExitStatus,
+    pub(crate) status: ExitStatus,
 }
 
 /// Result of checking for existing minions on an issue.

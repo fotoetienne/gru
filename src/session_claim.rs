@@ -4,7 +4,7 @@ use chrono::Utc;
 
 /// Typed errors from session-claim operations (shared by attach and resume).
 #[derive(Debug)]
-pub enum SessionClaimError {
+pub(crate) enum SessionClaimError {
     /// The minion has a live process — user must stop it first.
     AlreadyRunning { minion_id: String, mode: MinionMode },
     /// Registry shows a non-Stopped mode but no PID is recorded.
@@ -139,7 +139,7 @@ fn handle_claim_result(
 /// If `graceful` is true, transient registry failures (lock contention, IO
 /// errors) are swallowed and the function returns `Ok(None)`. When false, all
 /// registry errors propagate.
-pub async fn check_and_claim_session(
+pub(crate) async fn check_and_claim_session(
     minion_id: &str,
     target_mode: MinionMode,
     graceful: bool,

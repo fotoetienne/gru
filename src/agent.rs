@@ -17,7 +17,7 @@ use uuid::Uuid;
 /// consume, regardless of the underlying agent implementation.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
-pub enum AgentEvent {
+pub(crate) enum AgentEvent {
     /// Agent session has started (or a new message turn began).
     Started {
         /// Token usage from the initial message (e.g., input tokens, cache tokens).
@@ -86,20 +86,20 @@ pub enum AgentEvent {
 /// recording the wall-clock time (RFC 3339). Legacy events without `ts`
 /// deserialize with `ts: None`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct TimestampedEvent {
+pub(crate) struct TimestampedEvent {
     /// Wall-clock timestamp when the event was recorded (RFC 3339).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ts: Option<String>,
+    pub(crate) ts: Option<String>,
 
     /// The underlying agent event.
     #[serde(flatten)]
-    pub event: AgentEvent,
+    pub(crate) event: AgentEvent,
 }
 
 impl TimestampedEvent {
     /// Wraps an `AgentEvent` with the current UTC time.
     #[cfg(test)]
-    pub fn now(event: AgentEvent) -> Self {
+    pub(crate) fn now(event: AgentEvent) -> Self {
         Self {
             ts: Some(chrono::Utc::now().to_rfc3339()),
             event,
@@ -110,10 +110,10 @@ impl TimestampedEvent {
 /// Borrowing wrapper for serializing an `AgentEvent` with a timestamp
 /// without cloning the event.
 #[derive(Serialize)]
-pub struct TimestampedEventRef<'a> {
-    pub ts: &'a str,
+pub(crate) struct TimestampedEventRef<'a> {
+    pub(crate) ts: &'a str,
     #[serde(flatten)]
-    pub event: &'a AgentEvent,
+    pub(crate) event: &'a AgentEvent,
 }
 
 /// Agent-agnostic accumulated token usage.
@@ -123,23 +123,23 @@ pub struct TimestampedEventRef<'a> {
 /// caching — `None` means the backend does not report cache metrics, while
 /// `Some(0)` means caching is supported but no tokens were cached.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
-pub struct TokenUsage {
-    pub input_tokens: u64,
-    pub output_tokens: u64,
+pub(crate) struct TokenUsage {
+    pub(crate) input_tokens: u64,
+    pub(crate) output_tokens: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cache_creation_input_tokens: Option<u64>,
+    pub(crate) cache_creation_input_tokens: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cache_read_input_tokens: Option<u64>,
+    pub(crate) cache_read_input_tokens: Option<u64>,
 }
 
 impl TokenUsage {
     /// Returns total tokens (input + output).
-    pub fn total_tokens(&self) -> u64 {
+    pub(crate) fn total_tokens(&self) -> u64 {
         self.input_tokens + self.output_tokens
     }
 
     /// Format as a compact display string (e.g., "12.3k in / 4.5k out").
-    pub fn display_compact(&self) -> String {
+    pub(crate) fn display_compact(&self) -> String {
         format!(
             "{} in / {} out",
             format_token_count(self.input_tokens),
@@ -165,7 +165,7 @@ fn format_token_count(count: u64) -> String {
 /// (e.g., Claude Code, Aider, Codex) without changes to core orchestration code.
 ///
 /// The trait is `Send + Sync` for async compatibility.
-pub trait AgentBackend: Send + Sync {
+pub(crate) trait AgentBackend: Send + Sync {
     /// Returns the human-readable name of this agent backend (e.g., "claude-code").
     fn name(&self) -> &str;
 

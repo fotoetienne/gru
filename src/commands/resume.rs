@@ -50,7 +50,7 @@ struct ResumeContext {
 /// 4. Monitor output with progress display and timeout detection
 /// 5. Auto-create PR if branch was pushed
 /// 6. Update registry on exit
-pub async fn handle_resume(
+pub(crate) async fn handle_resume(
     id: String,
     additional_prompt: Option<String>,
     timeout_opt: Option<String>,

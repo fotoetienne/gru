@@ -55,57 +55,57 @@ static VARIABLE_PATTERN: Lazy<Regex> =
 /// Variables that are not available are set to None and will be
 /// replaced with empty strings during rendering.
 #[derive(Debug, Clone, Default)]
-pub struct PromptContext {
+pub(crate) struct PromptContext {
     // GitHub context (when --issue or --pr provided)
     /// GitHub issue number
-    pub issue_number: Option<u64>,
+    pub(crate) issue_number: Option<u64>,
     /// GitHub issue title
-    pub issue_title: Option<String>,
+    pub(crate) issue_title: Option<String>,
     /// GitHub issue body/description
-    pub issue_body: Option<String>,
+    pub(crate) issue_body: Option<String>,
     /// GitHub PR number
-    pub pr_number: Option<u64>,
+    pub(crate) pr_number: Option<u64>,
     /// GitHub PR title
-    pub pr_title: Option<String>,
+    pub(crate) pr_title: Option<String>,
     /// GitHub PR body/description
-    pub pr_body: Option<String>,
+    pub(crate) pr_body: Option<String>,
 
     // Git context
     /// Path to the worktree directory (checkout path where git lives)
-    pub worktree_path: Option<PathBuf>,
+    pub(crate) worktree_path: Option<PathBuf>,
     /// Path to the minion directory (where metadata files like PR_DESCRIPTION.md live)
-    pub minion_dir: Option<PathBuf>,
+    pub(crate) minion_dir: Option<PathBuf>,
     /// Current git branch name
-    pub branch_name: Option<String>,
+    pub(crate) branch_name: Option<String>,
     /// Base branch (e.g., main, master)
-    pub base_branch: Option<String>,
+    pub(crate) base_branch: Option<String>,
     /// Repository owner (GitHub username or org)
-    pub repo_owner: Option<String>,
+    pub(crate) repo_owner: Option<String>,
     /// Repository name
-    pub repo_name: Option<String>,
+    pub(crate) repo_name: Option<String>,
 
     // Environment
     /// Current working directory
-    pub cwd: Option<PathBuf>,
+    pub(crate) cwd: Option<PathBuf>,
 
     // Minion context
     /// Minion ID (e.g. "M042") for attribution footers
-    pub minion_id: Option<String>,
+    pub(crate) minion_id: Option<String>,
 
     // Custom params from --param key=value
     /// Custom parameters provided via CLI
-    pub params: HashMap<String, String>,
+    pub(crate) params: HashMap<String, String>,
 }
 
 impl PromptContext {
     /// Creates a new empty PromptContext
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self::default()
     }
 
     /// Creates a PromptContext with custom parameters
     #[cfg(test)]
-    pub fn with_params(params: HashMap<String, String>) -> Self {
+    pub(crate) fn with_params(params: HashMap<String, String>) -> Self {
         Self {
             params,
             ..Default::default()
@@ -116,7 +116,7 @@ impl PromptContext {
     ///
     /// This flattens all context variables into a single map for easy lookup.
     /// None values are not included in the map (they will be replaced with empty strings).
-    pub fn to_variables(&self) -> HashMap<String, String> {
+    pub(crate) fn to_variables(&self) -> HashMap<String, String> {
         let mut vars = HashMap::new();
 
         // GitHub context
@@ -198,7 +198,7 @@ impl PromptContext {
 ///
 /// # Returns
 /// The rendered string with all variables substituted
-pub fn render_template(template: &str, variables: &HashMap<String, String>) -> String {
+pub(crate) fn render_template(template: &str, variables: &HashMap<String, String>) -> String {
     VARIABLE_PATTERN
         .replace_all(template, |caps: &regex::Captures| {
             let var_name = &caps[1];
@@ -216,7 +216,10 @@ pub fn render_template(template: &str, variables: &HashMap<String, String>) -> S
 /// # Returns
 /// The rendered prompt content
 #[cfg(test)]
-pub fn render_prompt(prompt: &crate::prompt_loader::Prompt, context: &PromptContext) -> String {
+pub(crate) fn render_prompt(
+    prompt: &crate::prompt_loader::Prompt,
+    context: &PromptContext,
+) -> String {
     let variables = context.to_variables();
     render_template(&prompt.content, &variables)
 }
@@ -232,7 +235,7 @@ pub fn render_prompt(prompt: &crate::prompt_loader::Prompt, context: &PromptCont
 /// # Returns
 /// A vector of unique variable names found in the template
 #[cfg(test)]
-pub fn extract_variables(template: &str) -> Vec<String> {
+pub(crate) fn extract_variables(template: &str) -> Vec<String> {
     use std::collections::HashSet;
 
     let vars: HashSet<String> = VARIABLE_PATTERN

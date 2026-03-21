@@ -26,7 +26,7 @@ use crate::workspace::Workspace;
 ///
 /// The double `??` (JoinError then inner Result) is a subtle footgun that
 /// this helper eliminates.
-pub async fn with_registry<F, R>(f: F) -> Result<R>
+pub(crate) async fn with_registry<F, R>(f: F) -> Result<R>
 where
     F: FnOnce(&mut MinionRegistry) -> Result<R> + Send + 'static,
     R: Send + 'static,
@@ -44,7 +44,7 @@ where
 /// Used when a command has claimed a session (e.g. as Interactive or Autonomous)
 /// but cannot proceed (spawn failure, bad session ID, unsupported backend, etc.).
 /// Errors are silently ignored since this is a cleanup path.
-pub async fn revert_to_stopped(minion_id: &str) {
+pub(crate) async fn revert_to_stopped(minion_id: &str) {
     let mid = minion_id.to_string();
     let _ = with_registry(move |reg| {
         reg.update(&mid, |info| {
@@ -58,7 +58,7 @@ pub async fn revert_to_stopped(minion_id: &str) {
 
 /// Atomically mark a minion as failed: clear the process claim and set the
 /// orchestration phase to [`OrchestrationPhase::Failed`] in a single registry write.
-pub async fn mark_minion_failed(minion_id: &str) {
+pub(crate) async fn mark_minion_failed(minion_id: &str) {
     let mid = minion_id.to_string();
     let _ = with_registry(move |reg| {
         reg.update(&mid, |info| {
@@ -86,7 +86,7 @@ pub async fn mark_minion_failed(minion_id: &str) {
 ///    entries.
 ///
 /// Returns the number of entries pruned.
-pub async fn prune_stale_entries() -> Result<usize> {
+pub(crate) async fn prune_stale_entries() -> Result<usize> {
     // Phase 1: Collect candidates (sync, lock held briefly)
     let candidates: Vec<(String, Option<String>, String)> = with_registry(|registry| {
         let minions = registry.list();
@@ -188,7 +188,7 @@ pub async fn prune_stale_entries() -> Result<usize> {
 /// The execution mode of a Minion session
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
-pub enum MinionMode {
+pub(crate) enum MinionMode {
     /// Autonomous operation via `gru do` or `gru resume` - stream monitoring
     Autonomous,
     /// Interactive operation via `gru attach` - user in terminal
@@ -217,7 +217,7 @@ impl std::fmt::Display for MinionMode {
 /// `Failed` sorts last since it is a terminal state.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
-pub enum OrchestrationPhase {
+pub(crate) enum OrchestrationPhase {
     /// Initial state - worktree setup in progress or not started
     #[default]
     Setup,
@@ -237,7 +237,7 @@ pub enum OrchestrationPhase {
 impl OrchestrationPhase {
     /// Returns true if this phase represents an active (in-progress) state
     /// that can be resumed after interruption.
-    pub fn is_active(&self) -> bool {
+    pub(crate) fn is_active(&self) -> bool {
         matches!(
             self,
             OrchestrationPhase::RunningAgent
@@ -248,7 +248,7 @@ impl OrchestrationPhase {
 
     /// Returns true if this phase is a terminal state (Completed or Failed).
     /// Minions in terminal states do not block new attempts for the same issue.
-    pub fn is_terminal(&self) -> bool {
+    pub(crate) fn is_terminal(&self) -> bool {
         matches!(
             self,
             OrchestrationPhase::Completed | OrchestrationPhase::Failed
@@ -268,67 +268,67 @@ fn default_last_activity() -> DateTime<Utc> {
 
 /// Metadata about a Minion tracked by the Lab
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MinionInfo {
+pub(crate) struct MinionInfo {
     /// Repository the Minion is working on (e.g., "fotoetienne/gru")
-    pub repo: String,
+    pub(crate) repo: String,
     /// Issue number the Minion is addressing
-    pub issue: u64,
+    pub(crate) issue: u64,
     /// Command that started the Minion (e.g., "do", "review", "respond", "rebase")
-    pub command: String,
+    pub(crate) command: String,
     /// The prompt that was given to the Minion
-    pub prompt: String,
+    pub(crate) prompt: String,
     /// When the Minion was started (ISO 8601 timestamp)
-    pub started_at: DateTime<Utc>,
+    pub(crate) started_at: DateTime<Utc>,
     /// Git branch the Minion is working on
-    pub branch: String,
+    pub(crate) branch: String,
     /// Worktree path where the Minion is working
-    pub worktree: PathBuf,
+    pub(crate) worktree: PathBuf,
     /// Current status (e.g., "active", "idle")
-    pub status: String,
+    pub(crate) status: String,
     /// PR number associated with this Minion (if any)
-    pub pr: Option<String>,
+    pub(crate) pr: Option<String>,
 
     // Session lifecycle fields
     /// Claude Code session UUID for resume/attach operations
     #[serde(default = "default_session_id")]
-    pub session_id: String,
+    pub(crate) session_id: String,
     /// Process ID of the Claude Code process (None when not running)
     #[serde(default)]
-    pub pid: Option<u32>,
+    pub(crate) pid: Option<u32>,
     /// Process start time (seconds since epoch) recorded at spawn.
     /// Used to detect PID reuse: if the OS-reported start time for the PID
     /// differs from this value, the PID was recycled to a different process.
     #[serde(default)]
-    pub pid_start_time: Option<i64>,
+    pub(crate) pid_start_time: Option<i64>,
     /// Current execution mode of the Minion
     #[serde(default)]
-    pub mode: MinionMode,
+    pub(crate) mode: MinionMode,
     /// Timestamp of the last observed activity (for stuck detection)
     #[serde(default = "default_last_activity")]
-    pub last_activity: DateTime<Utc>,
+    pub(crate) last_activity: DateTime<Utc>,
     /// Which orchestration phase this minion has reached (for resume after interruption)
     #[serde(default)]
-    pub orchestration_phase: OrchestrationPhase,
+    pub(crate) orchestration_phase: OrchestrationPhase,
     /// Accumulated token usage for this minion's session
     #[serde(default)]
-    pub token_usage: Option<TokenUsage>,
+    pub(crate) token_usage: Option<TokenUsage>,
     /// Name of the agent backend used by this minion (e.g., "claude", "codex")
     #[serde(default = "default_agent_name")]
-    pub agent_name: String,
+    pub(crate) agent_name: String,
     /// Absolute deadline after which the minion should be timed out
     #[serde(default)]
-    pub timeout_deadline: Option<DateTime<Utc>>,
+    pub(crate) timeout_deadline: Option<DateTime<Utc>>,
     /// Number of attempts made for this minion (for retry tracking)
     #[serde(default)]
-    pub attempt_count: u32,
+    pub(crate) attempt_count: u32,
     /// Whether to skip watching (PR monitoring) after agent completes
     #[serde(default)]
-    pub no_watch: bool,
+    pub(crate) no_watch: bool,
     /// Timestamp of the last review check, used as baseline for detecting new reviews.
     /// Set before self-review, after addressing review feedback, and on monitor exit.
     /// Fallback: if None (e.g., old registry entries), callers should fall back to started_at.
     #[serde(default)]
-    pub last_review_check_time: Option<DateTime<Utc>>,
+    pub(crate) last_review_check_time: Option<DateTime<Utc>>,
     /// Set by the lab daemon when waking a Completed minion due to new reviews
     /// (e.g., "Address review comments on PR #42"). Cleared by the resume path after it is read.
     ///
@@ -340,7 +340,7 @@ pub struct MinionInfo {
     /// useful as an observability signal (visible in `gru status` and the registry JSON) and
     /// would take effect for any non-MonitoringPr resume that happens to have wake_reason set.
     #[serde(default)]
-    pub wake_reason: Option<String>,
+    pub(crate) wake_reason: Option<String>,
 }
 
 /// Default agent name for backwards compatibility with existing registry entries
@@ -354,12 +354,12 @@ impl MinionInfo {
     /// New-style minions store the git worktree in `worktree/checkout/`.
     /// Legacy minions have the git worktree directly in `worktree/`.
     /// This method detects the layout at runtime and returns the correct path.
-    pub fn checkout_path(&self) -> PathBuf {
+    pub(crate) fn checkout_path(&self) -> PathBuf {
         crate::workspace::resolve_checkout_path(&self.worktree)
     }
 
     /// Clears the PID and its associated start time.
-    pub fn clear_pid(&mut self) {
+    pub(crate) fn clear_pid(&mut self) {
         self.pid = None;
         self.pid_start_time = None;
     }
@@ -372,7 +372,7 @@ impl MinionInfo {
     /// 3. The process start time matches what was recorded at spawn (if available)
     ///
     /// If `pid_start_time` is `None` (legacy entries), falls back to the basic kill check.
-    pub fn is_running(&self) -> bool {
+    pub(crate) fn is_running(&self) -> bool {
         match self.pid {
             Some(pid) => is_process_alive_with_start_time(pid, self.pid_start_time),
             None => false,
@@ -389,7 +389,7 @@ impl MinionInfo {
 ///
 /// **Warning:** This does NOT detect PID reuse. Prefer [`is_process_alive_with_start_time`]
 /// or [`MinionInfo::is_running`] when a recorded start time is available.
-pub fn is_process_alive(pid: u32) -> bool {
+pub(crate) fn is_process_alive(pid: u32) -> bool {
     #[cfg(unix)]
     {
         // Guard against PIDs that cannot be represented as a positive i32: kill() with a
@@ -415,7 +415,7 @@ pub fn is_process_alive(pid: u32) -> bool {
 /// against it. If they differ, the PID was recycled to a different process and this returns
 /// `false`. If `recorded_start_time` is `None` (legacy entries), falls back to the basic
 /// kill-signal check.
-pub fn is_process_alive_with_start_time(pid: u32, recorded_start_time: Option<i64>) -> bool {
+pub(crate) fn is_process_alive_with_start_time(pid: u32, recorded_start_time: Option<i64>) -> bool {
     if !is_process_alive(pid) {
         return false;
     }
@@ -451,7 +451,7 @@ pub fn is_process_alive_with_start_time(pid: u32, recorded_start_time: Option<i6
 /// On macOS, uses `proc_pidinfo` with `PROC_PIDTBSDINFO`.
 /// On Linux, reads `/proc/<pid>/stat` and combines with boot time from `/proc/stat`.
 #[cfg(unix)]
-pub fn get_process_start_time(pid: u32) -> Option<i64> {
+pub(crate) fn get_process_start_time(pid: u32) -> Option<i64> {
     #[cfg(target_os = "macos")]
     {
         get_process_start_time_macos(pid)
@@ -468,7 +468,7 @@ pub fn get_process_start_time(pid: u32) -> Option<i64> {
 }
 
 #[cfg(not(unix))]
-pub fn get_process_start_time(_pid: u32) -> Option<i64> {
+pub(crate) fn get_process_start_time(_pid: u32) -> Option<i64> {
     None
 }
 
@@ -579,7 +579,7 @@ struct RegistryData {
 /// writes (temp file + rename) to prevent corruption.
 ///
 /// File locking ensures that concurrent access to the registry is properly serialized.
-pub struct MinionRegistry {
+pub(crate) struct MinionRegistry {
     /// Path to the registry file
     registry_path: PathBuf,
     /// In-memory registry data
@@ -602,7 +602,7 @@ impl MinionRegistry {
     /// - The state directory cannot be accessed
     /// - The registry file exists but cannot be read
     /// - The registry file contains invalid JSON
-    pub fn load(state_dir: Option<&Path>) -> Result<Self> {
+    pub(crate) fn load(state_dir: Option<&Path>) -> Result<Self> {
         let state_path = if let Some(custom_dir) = state_dir {
             // Test path: use provided directory and ensure it exists
             fs::create_dir_all(custom_dir)
@@ -658,7 +658,7 @@ impl MinionRegistry {
     /// - The JSON cannot be serialized
     /// - The file cannot be written
     /// - The rename operation fails
-    pub fn save(&self) -> Result<()> {
+    pub(crate) fn save(&self) -> Result<()> {
         // Serialize to pretty JSON
         let json = serde_json::to_string_pretty(&self.data)
             .context("Failed to serialize registry to JSON")?;
@@ -703,7 +703,7 @@ impl MinionRegistry {
     /// Returns an error if:
     /// - A Minion with the same ID already exists
     /// - The registry cannot be saved to disk
-    pub fn register(&mut self, minion_id: String, info: MinionInfo) -> Result<()> {
+    pub(crate) fn register(&mut self, minion_id: String, info: MinionInfo) -> Result<()> {
         if self.data.minions.contains_key(&minion_id) {
             anyhow::bail!("Minion {} is already registered", minion_id);
         }
@@ -726,7 +726,7 @@ impl MinionRegistry {
     /// Returns an error if:
     /// - The Minion ID does not exist in the registry
     /// - The registry cannot be saved to disk
-    pub fn update<F>(&mut self, minion_id: &str, update_fn: F) -> Result<()>
+    pub(crate) fn update<F>(&mut self, minion_id: &str, update_fn: F) -> Result<()>
     where
         F: FnOnce(&mut MinionInfo),
     {
@@ -754,7 +754,7 @@ impl MinionRegistry {
     /// `on_spawn` contract is `FnOnce(u32) + Send` (not async). The registry
     /// update is dispatched to a background thread so that lock contention
     /// (with retry backoff) does not block the Tokio worker thread.
-    pub fn pid_callback(
+    pub(crate) fn pid_callback(
         minion_id: String,
         mode: Option<MinionMode>,
     ) -> Box<dyn FnOnce(u32) + Send> {
@@ -786,7 +786,7 @@ impl MinionRegistry {
     }
 
     /// Returns all Minions in the registry
-    pub fn list(&self) -> Vec<(String, MinionInfo)> {
+    pub(crate) fn list(&self) -> Vec<(String, MinionInfo)> {
         self.data
             .minions
             .iter()
@@ -796,12 +796,12 @@ impl MinionRegistry {
 
     /// Checks if a Minion exists in the registry
     #[cfg(test)]
-    pub fn exists(&self, minion_id: &str) -> bool {
+    pub(crate) fn exists(&self, minion_id: &str) -> bool {
         self.data.minions.contains_key(minion_id)
     }
 
     /// Gets a Minion's metadata by ID
-    pub fn get(&self, minion_id: &str) -> Option<&MinionInfo> {
+    pub(crate) fn get(&self, minion_id: &str) -> Option<&MinionInfo> {
         self.data.minions.get(minion_id)
     }
 
@@ -810,7 +810,7 @@ impl MinionRegistry {
     /// Returns all matching Minions as (minion_id, MinionInfo) pairs regardless
     /// of mode or PID status (including stopped entries). Callers should check
     /// [`MinionInfo::is_running`] to determine which Minions are actually running.
-    pub fn find_by_issue(&self, repo: &str, issue: u64) -> Vec<(String, MinionInfo)> {
+    pub(crate) fn find_by_issue(&self, repo: &str, issue: u64) -> Vec<(String, MinionInfo)> {
         self.data
             .minions
             .iter()
@@ -824,7 +824,7 @@ impl MinionRegistry {
     /// # Errors
     ///
     /// Returns an error if the registry cannot be saved to disk
-    pub fn remove(&mut self, minion_id: &str) -> Result<Option<MinionInfo>> {
+    pub(crate) fn remove(&mut self, minion_id: &str) -> Result<Option<MinionInfo>> {
         let removed = self.data.minions.remove(minion_id);
         if removed.is_some() {
             self.save()
@@ -840,7 +840,7 @@ impl MinionRegistry {
     /// # Errors
     ///
     /// Returns an error if the registry cannot be saved to disk
-    pub fn remove_batch(&mut self, minion_ids: &[String]) -> Result<usize> {
+    pub(crate) fn remove_batch(&mut self, minion_ids: &[String]) -> Result<usize> {
         let mut count = 0;
         for id in minion_ids {
             if self.data.minions.remove(id).is_some() {

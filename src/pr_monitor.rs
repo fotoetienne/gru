@@ -154,11 +154,11 @@ pub(crate) struct User {
 /// A review comment with file location and content
 #[derive(Debug, Clone)]
 pub(crate) struct ReviewComment {
-    pub file: String,
-    pub line: Option<u64>,
-    pub body: String,
-    pub reviewer: String,
-    pub comment_id: u64,
+    pub(crate) file: String,
+    pub(crate) line: Option<u64>,
+    pub(crate) body: String,
+    pub(crate) reviewer: String,
+    pub(crate) comment_id: u64,
 }
 
 /// A review-level body (not tied to a specific file/line)

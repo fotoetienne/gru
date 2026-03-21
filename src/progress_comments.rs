@@ -2,7 +2,7 @@ use chrono::{DateTime, Utc};
 
 /// Represents the phase of Minion execution
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MinionPhase {
+pub(crate) enum MinionPhase {
     Planning,
     Implementing,
     Testing,
@@ -10,7 +10,7 @@ pub enum MinionPhase {
 }
 
 impl MinionPhase {
-    pub fn as_str(&self) -> &'static str {
+    pub(crate) fn as_str(&self) -> &'static str {
         match self {
             MinionPhase::Planning => "planning",
             MinionPhase::Implementing => "implementing",
@@ -22,16 +22,16 @@ impl MinionPhase {
 
 /// Progress update data
 #[derive(Debug, Clone)]
-pub struct ProgressUpdate {
-    pub minion_id: String,
-    pub phase: MinionPhase,
-    pub timestamp: DateTime<Utc>,
-    pub message: String,
+pub(crate) struct ProgressUpdate {
+    pub(crate) minion_id: String,
+    pub(crate) phase: MinionPhase,
+    pub(crate) timestamp: DateTime<Utc>,
+    pub(crate) message: String,
 }
 
 impl ProgressUpdate {
     /// Format as a GitHub comment with YAML frontmatter
-    pub fn format_comment(&self) -> String {
+    pub(crate) fn format_comment(&self) -> String {
         let mut comment = String::new();
 
         // Header
@@ -59,7 +59,7 @@ impl ProgressUpdate {
 ///
 /// Renders as small subscript text on GitHub. A blank line before prevents
 /// it from blending into the last line of content.
-pub fn minion_signature(id: &str) -> String {
+pub(crate) fn minion_signature(id: &str) -> String {
     format!("\n\n<sub>🤖 {}</sub>", id)
 }
 
@@ -71,7 +71,7 @@ pub fn minion_signature(id: &str) -> String {
 /// - `reason` — short heading shown after the 🚨 emoji (e.g. "CI Fix Escalation")
 /// - `detail` — the full markdown body (check lists, error messages, etc.)
 /// - `minion_id` — appended as the standard minion signature
-pub fn format_escalation_comment(reason: &str, detail: &str, minion_id: &str) -> String {
+pub(crate) fn format_escalation_comment(reason: &str, detail: &str, minion_id: &str) -> String {
     format!(
         "## 🚨 {}\n\n{}{}",
         reason,
@@ -81,14 +81,14 @@ pub fn format_escalation_comment(reason: &str, detail: &str, minion_id: &str) ->
 }
 
 /// Tracks progress and manages comment posting
-pub struct ProgressCommentTracker {
+pub(crate) struct ProgressCommentTracker {
     minion_id: String,
     current_phase: MinionPhase,
 }
 
 impl ProgressCommentTracker {
     /// Create a new progress comment tracker
-    pub fn new(minion_id: String) -> Self {
+    pub(crate) fn new(minion_id: String) -> Self {
         Self {
             minion_id,
             current_phase: MinionPhase::Planning,
@@ -96,12 +96,12 @@ impl ProgressCommentTracker {
     }
 
     /// Update the current phase
-    pub fn set_phase(&mut self, phase: MinionPhase) {
+    pub(crate) fn set_phase(&mut self, phase: MinionPhase) {
         self.current_phase = phase;
     }
 
     /// Create a progress update (without posting it)
-    pub fn create_update(&self, message: String) -> ProgressUpdate {
+    pub(crate) fn create_update(&self, message: String) -> ProgressUpdate {
         ProgressUpdate {
             minion_id: self.minion_id.clone(),
             phase: self.current_phase,
@@ -111,7 +111,7 @@ impl ProgressCommentTracker {
     }
 
     /// Get the current phase
-    pub fn current_phase(&self) -> MinionPhase {
+    pub(crate) fn current_phase(&self) -> MinionPhase {
         self.current_phase
     }
 }

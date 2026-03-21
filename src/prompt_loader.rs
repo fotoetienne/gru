@@ -242,10 +242,10 @@ After resolving each conflict:
 /// A built-in prompt definition compiled into the binary
 #[derive(Debug)]
 pub(crate) struct BuiltInPrompt {
-    pub name: &'static str,
-    pub description: &'static str,
-    pub requires: &'static [&'static str],
-    pub content: &'static str,
+    pub(crate) name: &'static str,
+    pub(crate) description: &'static str,
+    pub(crate) requires: &'static [&'static str],
+    pub(crate) content: &'static str,
 }
 
 impl BuiltInPrompt {
@@ -270,54 +270,54 @@ impl BuiltInPrompt {
 
 /// Prompts grouped by their source, for display in `gru prompts`
 pub(crate) struct PromptsBySource {
-    pub built_in: Vec<(String, String)>,
-    pub repo: Vec<Prompt>,
-    pub global: Vec<Prompt>,
+    pub(crate) built_in: Vec<(String, String)>,
+    pub(crate) repo: Vec<Prompt>,
+    pub(crate) global: Vec<Prompt>,
 }
 
 /// Metadata for a prompt file, parsed from YAML frontmatter
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub(crate) struct PromptMetadata {
     /// Short description of what the prompt does
-    pub description: Option<String>,
+    pub(crate) description: Option<String>,
 
     /// Context requirements (e.g., "issue", "pr")
     #[serde(default)]
-    pub requires: Vec<String>,
+    pub(crate) requires: Vec<String>,
 
     /// Parameter definitions for the prompt
     #[serde(default)]
-    pub params: Vec<PromptParam>,
+    pub(crate) params: Vec<PromptParam>,
 }
 
 /// Definition of a prompt parameter
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub(crate) struct PromptParam {
     /// Parameter name
-    pub name: String,
+    pub(crate) name: String,
 
     /// Description of what the parameter does
-    pub description: Option<String>,
+    pub(crate) description: Option<String>,
 
     /// Whether the parameter is required
     #[serde(default)]
-    pub required: bool,
+    pub(crate) required: bool,
 }
 
 /// A loaded prompt with metadata and content
 #[derive(Debug, Clone)]
 pub(crate) struct Prompt {
     /// Name of the prompt (filename without .md extension)
-    pub name: String,
+    pub(crate) name: String,
 
     /// Metadata parsed from frontmatter
-    pub metadata: PromptMetadata,
+    pub(crate) metadata: PromptMetadata,
 
     /// Prompt content (body after frontmatter)
-    pub content: String,
+    pub(crate) content: String,
 
     /// Source location of the prompt file
-    pub source: PromptSource,
+    pub(crate) source: PromptSource,
 }
 
 /// Location where a prompt was loaded from

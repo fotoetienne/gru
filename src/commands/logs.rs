@@ -11,7 +11,7 @@ const DEFAULT_LAST_N: usize = 20;
 /// Auto-detects follow mode based on minion state (running → follow, stopped → replay only).
 /// Use `-f` to force follow, `--no-follow` to force replay-only.
 /// Supports `--raw` for piping raw JSONL and `-n` for showing last N events.
-pub async fn handle_logs(
+pub(crate) async fn handle_logs(
     id: String,
     force_follow: bool,
     no_follow: bool,

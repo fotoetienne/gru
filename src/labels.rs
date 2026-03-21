@@ -7,33 +7,33 @@
 // ============================================================================
 
 /// Issue ready for a Minion to claim.
-pub const TODO: &str = "gru:todo";
+pub(crate) const TODO: &str = "gru:todo";
 /// Minion actively working on an issue.
-pub const IN_PROGRESS: &str = "gru:in-progress";
+pub(crate) const IN_PROGRESS: &str = "gru:in-progress";
 /// Minion completed successfully.
-pub const DONE: &str = "gru:done";
+pub(crate) const DONE: &str = "gru:done";
 /// Minion encountered failure.
-pub const FAILED: &str = "gru:failed";
+pub(crate) const FAILED: &str = "gru:failed";
 /// Needs human intervention.
-pub const BLOCKED: &str = "gru:blocked";
+pub(crate) const BLOCKED: &str = "gru:blocked";
 
 // ============================================================================
 // PR labels
 // ============================================================================
 
 /// All merge-readiness checks pass.
-pub const READY_TO_MERGE: &str = "gru:ready-to-merge";
+pub(crate) const READY_TO_MERGE: &str = "gru:ready-to-merge";
 /// Auto-merge when checks pass.
-pub const AUTO_MERGE: &str = "gru:auto-merge";
+pub(crate) const AUTO_MERGE: &str = "gru:auto-merge";
 /// LLM judge escalated for human review.
-pub const NEEDS_HUMAN_REVIEW: &str = "gru:needs-human-review";
+pub(crate) const NEEDS_HUMAN_REVIEW: &str = "gru:needs-human-review";
 
 // ============================================================================
 // Label definitions: (name, color_hex, description)
 // ============================================================================
 
 /// All labels that `gru init` should create.
-pub const ALL_LABELS: &[(&str, &str, &str)] = &[
+pub(crate) const ALL_LABELS: &[(&str, &str, &str)] = &[
     (TODO, "0075ca", "Issue ready for autonomous agent"),
     (IN_PROGRESS, "fbca04", "Agent actively working"),
     (DONE, "0ecab9", "Agent completed successfully"),
@@ -54,7 +54,7 @@ pub const ALL_LABELS: &[(&str, &str, &str)] = &[
 
 /// Look up the color and description for a label by its canonical name.
 /// Returns `Some((color, description))` if found in `ALL_LABELS`.
-pub fn get_label_info(canonical: &str) -> Option<(&'static str, &'static str)> {
+pub(crate) fn get_label_info(canonical: &str) -> Option<(&'static str, &'static str)> {
     ALL_LABELS
         .iter()
         .find(|(name, _, _)| *name == canonical)
@@ -62,7 +62,7 @@ pub fn get_label_info(canonical: &str) -> Option<(&'static str, &'static str)> {
 }
 
 /// Check if any label in the list matches the given canonical label.
-pub fn has_label(labels: &[String], canonical: &str) -> bool {
+pub(crate) fn has_label(labels: &[String], canonical: &str) -> bool {
     labels.iter().any(|l| l == canonical)
 }
 

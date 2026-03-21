@@ -5,7 +5,7 @@ use crate::prompt_loader::{self, BUILT_IN_PROMPTS};
 
 /// Handles the `gru prompts` command by listing all available prompts
 /// grouped by source (built-in, repo, global).
-pub async fn handle_prompts() -> Result<i32> {
+pub(crate) async fn handle_prompts() -> Result<i32> {
     let repo_root = git::detect_git_repo().await.ok();
 
     let prompts_by_source = prompt_loader::list_prompts_by_source(repo_root.as_deref())?;

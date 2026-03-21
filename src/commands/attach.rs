@@ -37,7 +37,7 @@ use uuid::Uuid;
 /// - After exit: updates registry with mode=Stopped and clears PID
 /// - Signal handling: Ctrl-C is caught to ensure registry cleanup runs
 /// - On error: registry is reverted to Stopped via [`revert_to_stopped`]
-pub async fn handle_attach(
+pub(crate) async fn handle_attach(
     id: String,
     yolo: bool,
     no_auto_resume: bool,

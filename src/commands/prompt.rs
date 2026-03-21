@@ -315,7 +315,7 @@ fn format_builtin_prompt_info(builtin: &prompt_loader::BuiltInPrompt) -> String 
 }
 
 /// Handles the `gru prompt <name> --info` command by displaying prompt details
-pub async fn handle_prompt_info(prompt_name: &str) -> Result<i32> {
+pub(crate) async fn handle_prompt_info(prompt_name: &str) -> Result<i32> {
     let trimmed = prompt_name.trim();
     if trimmed.is_empty() {
         anyhow::bail!("Prompt name cannot be empty");
@@ -361,15 +361,15 @@ pub async fn handle_prompt_info(prompt_name: &str) -> Result<i32> {
 
 /// Options for the prompt command, grouped to avoid too many function arguments
 #[derive(Debug, Default)]
-pub struct PromptOptions {
-    pub issue: Option<String>,
-    pub pr: Option<String>,
-    pub no_worktree: bool,
-    pub worktree: Option<String>,
-    pub params: Vec<String>,
-    pub timeout: Option<String>,
-    pub quiet: bool,
-    pub agent_name: String,
+pub(crate) struct PromptOptions {
+    pub(crate) issue: Option<String>,
+    pub(crate) pr: Option<String>,
+    pub(crate) no_worktree: bool,
+    pub(crate) worktree: Option<String>,
+    pub(crate) params: Vec<String>,
+    pub(crate) timeout: Option<String>,
+    pub(crate) quiet: bool,
+    pub(crate) agent_name: String,
 }
 
 /// Contextual information gathered from --issue and --pr flags
@@ -846,7 +846,7 @@ async fn render_and_save_prompt(
 ///   4. Set up workspace / worktree
 ///   5. Render prompt template
 ///   6. Register minion, run agent, clean up
-pub async fn handle_prompt(prompt: &str, opts: PromptOptions) -> Result<i32> {
+pub(crate) async fn handle_prompt(prompt: &str, opts: PromptOptions) -> Result<i32> {
     // Phase 1: Validate input and agent backend
     validate_prompt_input(prompt, &opts.worktree)?;
     agent_registry::resolve_backend(&opts.agent_name)?;

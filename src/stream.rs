@@ -7,32 +7,32 @@ use serde::{Deserialize, Serialize};
 
 /// Token usage information from stream events
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
-pub struct Usage {
+pub(crate) struct Usage {
     #[serde(default)]
-    pub input_tokens: u64,
+    pub(crate) input_tokens: u64,
     #[serde(default)]
-    pub output_tokens: u64,
+    pub(crate) output_tokens: u64,
     #[serde(default)]
-    pub cache_creation_input_tokens: Option<u64>,
+    pub(crate) cache_creation_input_tokens: Option<u64>,
     #[serde(default)]
-    pub cache_read_input_tokens: Option<u64>,
+    pub(crate) cache_read_input_tokens: Option<u64>,
 }
 
 /// Information about a message in a MessageStart event
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
-pub struct MessageInfo {
+pub(crate) struct MessageInfo {
     #[serde(default)]
-    pub id: Option<String>,
+    pub(crate) id: Option<String>,
     #[serde(default)]
-    pub role: Option<String>,
+    pub(crate) role: Option<String>,
     #[serde(default)]
-    pub usage: Option<Usage>,
+    pub(crate) usage: Option<Usage>,
 }
 
 /// A content block within a message (text or tool_use)
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(tag = "type")]
-pub enum ContentBlock {
+pub(crate) enum ContentBlock {
     #[serde(rename = "tool_use")]
     ToolUse {
         #[serde(default)]
@@ -54,7 +54,7 @@ pub enum ContentBlock {
 /// A delta update within a content block
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(tag = "type")]
-pub enum ContentDelta {
+pub(crate) enum ContentDelta {
     #[serde(rename = "text_delta")]
     TextDelta {
         #[serde(default)]
@@ -73,32 +73,32 @@ pub enum ContentDelta {
 
 /// The body of a MessageDelta event (e.g., stop_reason)
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
-pub struct MessageDeltaBody {
+pub(crate) struct MessageDeltaBody {
     #[serde(default)]
-    pub stop_reason: Option<String>,
+    pub(crate) stop_reason: Option<String>,
 }
 
 /// Usage information that appears alongside MessageDelta events
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
-pub struct MessageDeltaUsage {
+pub(crate) struct MessageDeltaUsage {
     #[serde(default)]
-    pub output_tokens: u64,
+    pub(crate) output_tokens: u64,
 }
 
 /// Error information from the API
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
-pub struct ErrorInfo {
+pub(crate) struct ErrorInfo {
     #[serde(rename = "type", default)]
-    pub error_type: String,
+    pub(crate) error_type: String,
     #[serde(default)]
-    pub message: String,
+    pub(crate) message: String,
 }
 
 /// Represents the different types of events that can be emitted by Claude Code
 /// in stream-json mode. These follow the Anthropic Messages API streaming format.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type")]
-pub enum ClaudeEvent {
+pub(crate) enum ClaudeEvent {
     /// Start of a new message
     #[serde(rename = "message_start")]
     MessageStart {
@@ -158,35 +158,35 @@ pub enum ClaudeEvent {
 
 /// Represents a tool result from the Messages API
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct ToolResult {
+pub(crate) struct ToolResult {
     #[serde(rename = "type")]
-    pub result_type: String,
-    pub tool_use_id: String,
-    pub content: serde_json::Value,
+    pub(crate) result_type: String,
+    pub(crate) tool_use_id: String,
+    pub(crate) content: serde_json::Value,
     #[serde(default)]
-    pub is_error: bool,
+    pub(crate) is_error: bool,
 }
 
 /// Represents a conversation message from the Messages API
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct ConversationMessage {
+pub(crate) struct ConversationMessage {
     #[serde(rename = "type")]
-    pub message_type: String,
-    pub message: MessageContent,
+    pub(crate) message_type: String,
+    pub(crate) message: MessageContent,
 }
 
 /// Represents the content of a conversation message.
 /// Content is parsed as raw JSON values to tolerate mixed content types
 /// (e.g., text + tool_result items) without failing deserialization.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct MessageContent {
-    pub role: String,
-    pub content: Vec<serde_json::Value>,
+pub(crate) struct MessageContent {
+    pub(crate) role: String,
+    pub(crate) content: Vec<serde_json::Value>,
 }
 
 /// Represents the output from parsing a stream line.
 #[derive(Debug, Clone, PartialEq)]
-pub enum StreamOutput {
+pub(crate) enum StreamOutput {
     /// A parsed Claude event
     Event(ClaudeEvent),
     /// A parsed tool result message

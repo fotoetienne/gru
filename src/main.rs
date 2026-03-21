@@ -12,7 +12,7 @@ mod display_utils;
 mod file_lock;
 mod git;
 mod github;
-pub(crate) mod labels;
+mod labels;
 mod log_viewer;
 mod merge_judge;
 mod merge_readiness;

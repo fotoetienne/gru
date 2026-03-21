@@ -55,16 +55,16 @@ struct JudgeResponseRaw {
 /// Parsed judge response with typed action.
 #[derive(Debug, Clone)]
 pub(crate) struct JudgeResponse {
-    pub confidence: u8,
-    pub action: JudgeAction,
-    pub reasoning: String,
+    pub(crate) confidence: u8,
+    pub(crate) action: JudgeAction,
+    pub(crate) reasoning: String,
 }
 
 /// Fingerprint of PR state used to avoid redundant judge invocations.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PrStateFingerprint {
-    pub head_sha: String,
-    pub comment_count: usize,
+    pub(crate) head_sha: String,
+    pub(crate) comment_count: usize,
 }
 
 /// Tracks the judge's state across poll iterations.

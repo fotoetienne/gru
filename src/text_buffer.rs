@@ -8,7 +8,7 @@ const MAX_BUFFER_SIZE: usize = 1000;
 
 /// Time-based text buffer for grouping streaming text fragments
 /// Flushes on: newline characters, sentence boundaries (. ! ?), timeout, or buffer full
-pub struct TextBuffer {
+pub(crate) struct TextBuffer {
     buffer: Arc<Mutex<BufferState>>,
 }
 
@@ -20,7 +20,7 @@ struct BufferState {
 
 impl TextBuffer {
     /// Create a new TextBuffer with the specified flush interval
-    pub fn new(flush_interval: Duration) -> Self {
+    pub(crate) fn new(flush_interval: Duration) -> Self {
         Self {
             buffer: Arc::new(Mutex::new(BufferState {
                 text: String::new(),
@@ -32,7 +32,7 @@ impl TextBuffer {
 
     /// Add text to the buffer
     /// Returns Some(flushed_text) if the buffer should be flushed, None otherwise
-    pub fn add(&self, text: &str) -> Option<String> {
+    pub(crate) fn add(&self, text: &str) -> Option<String> {
         let mut state = self
             .buffer
             .lock()
@@ -123,7 +123,7 @@ impl TextBuffer {
     }
 
     /// Force flush the buffer, returning any accumulated text
-    pub fn flush(&self) -> Option<String> {
+    pub(crate) fn flush(&self) -> Option<String> {
         let mut state = self
             .buffer
             .lock()

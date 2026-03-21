@@ -27,7 +27,7 @@ static TMUX_WINDOW_ID: Mutex<Option<String>> = Mutex::new(None);
 /// `automatic-rename` on creation and re-enable it on drop. This way, even if
 /// the guard never drops (e.g. `SIGKILL`), the next command the user runs will
 /// trigger tmux to auto-rename the window based on the running process.
-pub struct TmuxGuard {
+pub(crate) struct TmuxGuard {
     /// The `@id` of the window we renamed, used to target cleanup.
     /// `None` means we're not in tmux (no-op guard).
     window_id: Option<String>,
@@ -38,7 +38,7 @@ impl TmuxGuard {
     ///
     /// Disables `automatic-rename` so the name sticks, and registers a SIGTERM
     /// handler for cleanup. If not inside tmux, returns a no-op guard.
-    pub fn new(name: &str) -> Self {
+    pub(crate) fn new(name: &str) -> Self {
         let window_id = match current_window_id() {
             Some(id) => {
                 // Install signal hook first, before we modify tmux state,
@@ -65,7 +65,7 @@ impl TmuxGuard {
     /// Update the window name while keeping the same restore-on-drop behavior.
     ///
     /// No-op if not inside tmux (i.e., if the guard was created as a no-op).
-    pub fn rename(&self, name: &str) {
+    pub(crate) fn rename(&self, name: &str) {
         if let Some(ref id) = self.window_id {
             rename_window(id, name);
         }

@@ -12,7 +12,7 @@ use uuid::Uuid;
 /// Builds a standard Claude command with common flags.
 ///
 /// Creates a TokioCommand configured for non-interactive stream-json output.
-pub fn build_claude_command(
+pub(crate) fn build_claude_command(
     worktree_path: &Path,
     session_id: &Uuid,
     prompt: &str,
@@ -39,7 +39,7 @@ pub fn build_claude_command(
 /// Builds a Claude command to resume an existing session.
 ///
 /// Uses --resume instead of --session-id to avoid "session already in use" errors.
-pub fn build_claude_resume_command(
+pub(crate) fn build_claude_resume_command(
     worktree_path: &Path,
     session_id: &Uuid,
     prompt: &str,

@@ -27,25 +27,25 @@ const MAX_DELAY_SECS: u64 = 60;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct MergeReadiness {
     /// PR is not a draft.
-    pub not_draft: bool,
+    pub(crate) not_draft: bool,
     /// All CI check runs passed (success, skipped, or neutral), none pending/in-progress.
-    pub ci_passing: bool,
+    pub(crate) ci_passing: bool,
     /// Review gate satisfied: at least one APPROVED review with no outstanding
     /// CHANGES_REQUESTED, or the PR author left a self-review comment (GitHub prevents
     /// self-approval) and no reviewer has blocked.
-    pub review_approved: bool,
+    pub(crate) review_approved: bool,
     /// No merge conflicts. `false` when GitHub's `mergeable` is `Some(false)` or `None`.
-    pub no_conflicts: bool,
+    pub(crate) no_conflicts: bool,
 }
 
 impl MergeReadiness {
     /// Returns `true` if all merge prerequisites are satisfied.
-    pub fn is_ready(&self) -> bool {
+    pub(crate) fn is_ready(&self) -> bool {
         self.not_draft && self.ci_passing && self.review_approved && self.no_conflicts
     }
 
     /// Returns human-readable reasons for any failing checks.
-    pub fn failure_reasons(&self) -> Vec<String> {
+    pub(crate) fn failure_reasons(&self) -> Vec<String> {
         let mut reasons = Vec::new();
         if !self.not_draft {
             reasons.push("PR is still a draft".to_string());

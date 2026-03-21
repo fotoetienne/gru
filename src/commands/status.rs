@@ -133,7 +133,7 @@ fn format_mode_display(
 ///
 /// This ensures the lock is only held for the minimum time needed to read/write
 /// the registry file, not for I/O operations.
-pub async fn handle_status(id: Option<String>, verbose: bool) -> Result<i32> {
+pub(crate) async fn handle_status(id: Option<String>, verbose: bool) -> Result<i32> {
     // Prune stale entries using the shared two-phase approach that checks
     // GitHub PR status before removing entries with open PRs.
     // Non-fatal: a transient GitHub API error should not prevent status display.

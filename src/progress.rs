@@ -37,17 +37,17 @@ fn format_timestamp(ts: Option<&str>) -> String {
 const MAX_DISPLAY_CHARS: usize = 200;
 
 /// Configuration for the progress display
-pub struct ProgressConfig {
-    pub minion_id: String,
-    pub issue: String,
-    pub quiet: bool,
+pub(crate) struct ProgressConfig {
+    pub(crate) minion_id: String,
+    pub(crate) issue: String,
+    pub(crate) quiet: bool,
 }
 
 /// Progress display manager for Minion work.
 ///
 /// Consumes normalized `AgentEvent` values to drive the spinner, status bar,
 /// and scrolling event log — regardless of which agent backend produced them.
-pub struct ProgressDisplay {
+pub(crate) struct ProgressDisplay {
     multi: MultiProgress,
     status_bar: ProgressBar,
     start_time: Instant,
@@ -59,7 +59,7 @@ pub struct ProgressDisplay {
 
 impl ProgressDisplay {
     /// Create a new progress display
-    pub fn new(config: ProgressConfig) -> Self {
+    pub(crate) fn new(config: ProgressConfig) -> Self {
         let multi = MultiProgress::new();
 
         // Status bar at bottom (single line)
@@ -109,7 +109,7 @@ impl ProgressDisplay {
     ///
     /// Uses the current wall-clock time for the timestamp. Suitable for
     /// live streaming where events are displayed in real-time.
-    pub fn handle_event(&self, event: &AgentEvent) {
+    pub(crate) fn handle_event(&self, event: &AgentEvent) {
         let ts = Local::now().format("%H:%M:%S").to_string();
         self.handle_event_inner(event, &ts);
     }
@@ -119,7 +119,7 @@ impl ProgressDisplay {
     /// When `ts` is a valid RFC 3339 string, it is converted to local
     /// `HH:MM:SS`. When `ts` is `None` (legacy events without a persisted
     /// timestamp) or unparseable, `--:--:--` is displayed.
-    pub fn handle_event_with_ts(&self, event: &AgentEvent, ts: Option<&str>) {
+    pub(crate) fn handle_event_with_ts(&self, event: &AgentEvent, ts: Option<&str>) {
         let timestamp = format_timestamp(ts);
         self.handle_event_inner(event, &timestamp);
     }
@@ -278,7 +278,7 @@ impl ProgressDisplay {
     }
 
     /// Finish the progress display and show a final message
-    pub fn finish_with_message(&self, message: &str) {
+    pub(crate) fn finish_with_message(&self, message: &str) {
         self.status_bar.finish_with_message(message.to_string());
     }
 }

@@ -7,37 +7,37 @@ use std::time::Duration;
 
 /// Configuration for a GitHub Enterprise host
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GhHostConfig {
+pub(crate) struct GhHostConfig {
     /// Hostname for GH_HOST, gh --hostname, and git remote matching
-    pub host: String,
+    pub(crate) host: String,
     /// Web UI URL (defaults to https://{host}). Only needed when the web UI
     /// is on a different domain than the git/API host.
-    pub web_url: Option<String>,
+    pub(crate) web_url: Option<String>,
 }
 
 /// Configuration for Gru Lab daemon mode
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct LabConfig {
+pub(crate) struct LabConfig {
     #[serde(default)]
-    pub github_hosts: HashMap<String, GhHostConfig>,
+    pub(crate) github_hosts: HashMap<String, GhHostConfig>,
 
     #[serde(default)]
-    pub daemon: DaemonConfig,
+    pub(crate) daemon: DaemonConfig,
 
     #[serde(default)]
-    pub agent: AgentConfig,
+    pub(crate) agent: AgentConfig,
 
     #[serde(default)]
-    pub merge: MergeConfig,
+    pub(crate) merge: MergeConfig,
 }
 
 /// Merge judge configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MergeConfig {
+pub(crate) struct MergeConfig {
     /// Confidence threshold (1-10) for the merge-readiness judge.
     /// Only merge when the judge's confidence >= this value.
     #[serde(default = "default_confidence_threshold")]
-    pub confidence_threshold: u8,
+    pub(crate) confidence_threshold: u8,
 }
 
 impl Default for MergeConfig {
@@ -54,14 +54,14 @@ fn default_confidence_threshold() -> u8 {
 
 /// Agent backend configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AgentConfig {
+pub(crate) struct AgentConfig {
     /// Which agent backend to use by default (e.g., "claude")
     #[serde(default = "default_agent_name")]
-    pub default: String,
+    pub(crate) default: String,
 
     /// Claude-specific configuration ([agent.claude] in TOML)
     #[serde(default)]
-    pub claude: ClaudeAgentConfig,
+    pub(crate) claude: ClaudeAgentConfig,
 }
 
 impl Default for AgentConfig {
@@ -75,10 +75,10 @@ impl Default for AgentConfig {
 
 /// Claude-specific agent configuration
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct ClaudeAgentConfig {
+pub(crate) struct ClaudeAgentConfig {
     /// Override the binary path for Claude Code CLI
     #[serde(default)]
-    pub binary: Option<String>,
+    pub(crate) binary: Option<String>,
 }
 
 fn default_agent_name() -> String {
@@ -87,26 +87,26 @@ fn default_agent_name() -> String {
 
 /// Daemon configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DaemonConfig {
+pub(crate) struct DaemonConfig {
     /// Repositories to monitor for gru:todo issues
     #[serde(default)]
-    pub repos: Vec<String>,
+    pub(crate) repos: Vec<String>,
 
     /// Polling interval in seconds (default: 30s)
     #[serde(default = "default_poll_interval")]
-    pub poll_interval_secs: u64,
+    pub(crate) poll_interval_secs: u64,
 
     /// Maximum concurrent Minion slots (default: 2)
     #[serde(default = "default_max_slots")]
-    pub max_slots: usize,
+    pub(crate) max_slots: usize,
 
     /// Label to watch for issues (default: "gru:todo")
     #[serde(default = "default_label")]
-    pub label: String,
+    pub(crate) label: String,
 
     /// Maximum resume attempts before marking a Minion as failed (default: 3)
     #[serde(default = "default_max_resume_attempts")]
-    pub max_resume_attempts: u32,
+    pub(crate) max_resume_attempts: u32,
 }
 
 impl Default for DaemonConfig {
@@ -135,7 +135,7 @@ thread_local! {
 /// will load from the provided path instead of `~/.gru/config.toml`.
 /// The override is automatically cleared when the guard is dropped.
 #[cfg(test)]
-pub fn set_test_config_path(path: PathBuf) -> TestConfigGuard {
+pub(crate) fn set_test_config_path(path: PathBuf) -> TestConfigGuard {
     TEST_CONFIG_PATH_OVERRIDE.with(|cell| {
         *cell.borrow_mut() = Some(path);
     });
@@ -144,7 +144,7 @@ pub fn set_test_config_path(path: PathBuf) -> TestConfigGuard {
 
 /// RAII guard that clears the thread-local config path override on drop.
 #[cfg(test)]
-pub struct TestConfigGuard {
+pub(crate) struct TestConfigGuard {
     _private: (),
 }
 
@@ -164,7 +164,7 @@ impl Drop for TestConfigGuard {
 ///
 /// In test builds, checks for a thread-local path override set via
 /// [`set_test_config_path`] before falling back to the default path.
-pub fn try_load_config() -> Option<LabConfig> {
+pub(crate) fn try_load_config() -> Option<LabConfig> {
     #[cfg(test)]
     {
         let override_path = TEST_CONFIG_PATH_OVERRIDE.with(|cell| cell.borrow().clone());
@@ -183,7 +183,7 @@ pub fn try_load_config() -> Option<LabConfig> {
 /// full daemon config validation.
 ///
 /// Respects the test config path override set via [`set_test_config_path`].
-pub fn load_host_registry() -> HostRegistry {
+pub(crate) fn load_host_registry() -> HostRegistry {
     match try_load_config() {
         Some(cfg) => HostRegistry::from_config(&cfg),
         None => HostRegistry::from_config(&LabConfig::default()),
@@ -203,7 +203,7 @@ fn default_label() -> String {
 }
 
 /// Default maximum resume attempts (exposed for use in resume.rs when no config is available)
-pub const DEFAULT_MAX_RESUME_ATTEMPTS: u32 = 3;
+pub(crate) const DEFAULT_MAX_RESUME_ATTEMPTS: u32 = 3;
 
 fn default_max_resume_attempts() -> u32 {
     DEFAULT_MAX_RESUME_ATTEMPTS
@@ -217,7 +217,7 @@ fn default_max_resume_attempts() -> u32 {
 /// - `"name:owner/repo"` → resolves name via `github_hosts` map (e.g., `"netflix:corp/service"`)
 ///
 /// Pass `&HashMap::new()` for `github_hosts` if named references aren't needed.
-pub fn parse_repo_entry_with_hosts(
+pub(crate) fn parse_repo_entry_with_hosts(
     spec: &str,
     github_hosts: &HashMap<String, GhHostConfig>,
 ) -> Option<(String, String, String)> {
@@ -278,7 +278,7 @@ pub fn parse_repo_entry_with_hosts(
 /// Always includes an implicit `github.com` entry. Additional hosts come from
 /// `[github_hosts.*]` config sections and legacy `host/owner/repo` entries in `daemon.repos`.
 #[derive(Debug, Clone)]
-pub struct HostRegistry {
+pub(crate) struct HostRegistry {
     /// Map from hostname to optional web_url override
     hosts: HashMap<String, Option<String>>,
 }
@@ -288,7 +288,7 @@ impl HostRegistry {
     ///
     /// Includes hosts from `[github_hosts.*]` sections and legacy
     /// `host/owner/repo` entries in `daemon.repos`.
-    pub fn from_config(config: &LabConfig) -> Self {
+    pub(crate) fn from_config(config: &LabConfig) -> Self {
         let mut hosts: HashMap<String, Option<String>> = HashMap::new();
 
         // Always include github.com
@@ -312,7 +312,7 @@ impl HostRegistry {
     }
 
     /// All known hostnames (always includes `github.com`).
-    pub fn all_hosts(&self) -> Vec<String> {
+    pub(crate) fn all_hosts(&self) -> Vec<String> {
         self.hosts.keys().cloned().collect()
     }
 }
@@ -324,7 +324,7 @@ impl LabConfig {
     /// - `# [section]` — single `#` for TOML section headers
     /// - `# # description` / `# key = value` — double `#` for descriptions,
     ///   single `#` + space for option lines (so uncommenting removes one `#` layer)
-    pub fn default_config_toml() -> &'static str {
+    pub(crate) fn default_config_toml() -> &'static str {
         r#"# Gru configuration file
 # Uncomment and modify options as needed.
 
@@ -368,7 +368,7 @@ impl LabConfig {
     /// Write the default config file to the given path if it doesn't exist.
     /// Returns Ok(true) if the file was created, Ok(false) if it already existed.
     /// Uses create_new to atomically check existence and create in one operation.
-    pub fn write_default_config(path: &Path) -> Result<bool> {
+    pub(crate) fn write_default_config(path: &Path) -> Result<bool> {
         use std::io::Write;
 
         if let Some(parent) = path.parent() {
@@ -394,7 +394,7 @@ impl LabConfig {
     }
 
     /// Load configuration from file (validates daemon config — use for `gru lab`).
-    pub fn load(path: &Path) -> Result<Self> {
+    pub(crate) fn load(path: &Path) -> Result<Self> {
         let contents = fs::read_to_string(path)
             .with_context(|| format!("Failed to read config file: {}", path.display()))?;
 
@@ -410,7 +410,7 @@ impl LabConfig {
     ///
     /// Use this for non-daemon commands (e.g., `gru do`) that only need
     /// agent/merge config but may not have `[daemon].repos` configured.
-    pub fn load_partial(path: &Path) -> Result<Self> {
+    pub(crate) fn load_partial(path: &Path) -> Result<Self> {
         let contents = fs::read_to_string(path)
             .with_context(|| format!("Failed to read config file: {}", path.display()))?;
 
@@ -421,13 +421,13 @@ impl LabConfig {
     }
 
     /// Get default config file path (~/.gru/config.toml)
-    pub fn default_path() -> Result<PathBuf> {
+    pub(crate) fn default_path() -> Result<PathBuf> {
         let home = dirs::home_dir().context("Failed to determine home directory")?;
         Ok(home.join(".gru").join("config.toml"))
     }
 
     /// Validate configuration
-    pub fn validate(&self) -> Result<()> {
+    pub(crate) fn validate(&self) -> Result<()> {
         if self.daemon.repos.is_empty() {
             anyhow::bail!(
                 "No repositories configured. Add repos to config.toml or use --repos flag"
@@ -506,12 +506,12 @@ impl LabConfig {
     }
 
     /// Get poll interval as Duration
-    pub fn poll_interval(&self) -> Duration {
+    pub(crate) fn poll_interval(&self) -> Duration {
         Duration::from_secs(self.daemon.poll_interval_secs)
     }
 
     /// Merge with CLI overrides
-    pub fn with_overrides(
+    pub(crate) fn with_overrides(
         mut self,
         repos: Option<Vec<String>>,
         poll_interval_secs: Option<u64>,

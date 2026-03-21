@@ -21,7 +21,7 @@ const MAX_BACKOFF: Duration = Duration::from_secs(3);
 ///
 /// Retries up to [`MAX_LOCK_ATTEMPTS`] times with exponential backoff starting
 /// at [`INITIAL_BACKOFF`] and capped at [`MAX_BACKOFF`] (~42s total).
-pub fn lock_with_timeout(file: &File) -> io::Result<()> {
+pub(crate) fn lock_with_timeout(file: &File) -> io::Result<()> {
     lock_with_attempts(file, MAX_LOCK_ATTEMPTS)
 }
 

@@ -9,7 +9,7 @@ use tokio::process::Command;
 use tokio::time::{sleep, Duration};
 
 /// Maximum number of auto-fix attempts before escalating to human
-pub const MAX_CI_FIX_ATTEMPTS: u32 = 2;
+pub(crate) const MAX_CI_FIX_ATTEMPTS: u32 = 2;
 
 /// Polling interval for checking CI status (30 seconds)
 const CI_POLL_INTERVAL_SECS: u64 = 30;
@@ -29,7 +29,7 @@ const CI_FIX_TIMEOUT_SECS: u64 = 1200;
 /// The status of a CI check run
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum CheckStatus {
+pub(crate) enum CheckStatus {
     #[default]
     Queued,
     InProgress,
@@ -42,7 +42,7 @@ pub enum CheckStatus {
 /// The conclusion of a completed check run
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum CheckConclusion {
+pub(crate) enum CheckConclusion {
     Success,
     Failure,
     Cancelled,
@@ -58,7 +58,7 @@ pub enum CheckConclusion {
 
 impl CheckConclusion {
     /// Returns true if this conclusion represents a CI failure.
-    pub fn is_failed(&self) -> bool {
+    pub(crate) fn is_failed(&self) -> bool {
         matches!(
             self,
             CheckConclusion::Failure
@@ -92,21 +92,21 @@ impl fmt::Display for CheckConclusion {
 /// deserialized from both the rich `--jq`-transformed output (ci.rs)
 /// and the raw GitHub API response (pr_monitor.rs).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CheckRun {
+pub(crate) struct CheckRun {
     #[serde(default)]
-    pub name: String,
+    pub(crate) name: String,
     #[serde(default)]
-    pub status: CheckStatus,
-    pub conclusion: Option<CheckConclusion>,
+    pub(crate) status: CheckStatus,
+    pub(crate) conclusion: Option<CheckConclusion>,
     /// Duration string from GitHub (e.g., "2m 34s")
-    pub duration: Option<String>,
+    pub(crate) duration: Option<String>,
     /// Failure output/logs if available
-    pub output: Option<String>,
+    pub(crate) output: Option<String>,
 }
 
 /// The type of CI failure for classification
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub enum FailureType {
+pub(crate) enum FailureType {
     TestFailure,
     BuildError,
     LintError,
@@ -130,7 +130,7 @@ impl fmt::Display for FailureType {
 
 /// Overall result of waiting for CI checks
 #[derive(Debug)]
-pub enum CiResult {
+pub(crate) enum CiResult {
     /// All checks passed
     AllPassed,
     /// Some checks failed
@@ -143,7 +143,7 @@ pub enum CiResult {
 
 /// Action to take after evaluating CI status in the fix loop.
 #[derive(Debug, Clone, PartialEq)]
-pub enum CiFixAction {
+pub(crate) enum CiFixAction {
     /// CI passed or no checks configured — done successfully.
     Done,
     /// CI failed and we have remaining attempts — try to fix.
@@ -156,7 +156,7 @@ pub enum CiFixAction {
 
 /// Reason for escalating a CI failure to a human.
 #[derive(Debug, Clone, PartialEq)]
-pub enum EscalationReason {
+pub(crate) enum EscalationReason {
     /// CI checks timed out on the final attempt.
     Timeout,
     /// CI checks failed on the final attempt.
@@ -168,7 +168,11 @@ pub enum EscalationReason {
 /// Decides what action to take after observing a CI result.
 ///
 /// Pure function — no I/O, no side effects.
-pub fn decide_ci_action(ci_result: &CiResult, attempt: u32, max_attempts: u32) -> CiFixAction {
+pub(crate) fn decide_ci_action(
+    ci_result: &CiResult,
+    attempt: u32,
+    max_attempts: u32,
+) -> CiFixAction {
     match ci_result {
         CiResult::AllPassed | CiResult::NoChecks => CiFixAction::Done,
         CiResult::Timeout => {
@@ -191,7 +195,7 @@ pub fn decide_ci_action(ci_result: &CiResult, attempt: u32, max_attempts: u32) -
 /// Decides what action to take when a fix attempt produced no new commits.
 ///
 /// Pure function — no I/O, no side effects.
-pub fn decide_after_no_commits(attempt: u32, max_attempts: u32) -> CiFixAction {
+pub(crate) fn decide_after_no_commits(attempt: u32, max_attempts: u32) -> CiFixAction {
     if attempt >= max_attempts {
         CiFixAction::Escalate(EscalationReason::NoCommits)
     } else {
@@ -214,7 +218,7 @@ fn safe_tail(s: &str, max_bytes: usize) -> &str {
 }
 
 /// Classifies a CI failure based on the check name and output
-pub fn classify_failure(check: &CheckRun) -> FailureType {
+pub(crate) fn classify_failure(check: &CheckRun) -> FailureType {
     let name_lower = check.name.to_lowercase();
     let output_lower = check.output.as_deref().unwrap_or("").to_lowercase();
 
@@ -264,7 +268,7 @@ pub fn classify_failure(check: &CheckRun) -> FailureType {
 }
 
 /// Builds the CI failure prompt for Claude to fix the issue
-pub fn build_ci_fix_prompt(failed_checks: &[CheckRun], attempt: u32) -> String {
+pub(crate) fn build_ci_fix_prompt(failed_checks: &[CheckRun], attempt: u32) -> String {
     let mut prompt = format!(
         "Your PR's CI checks failed (attempt {}/{}). Please analyze the failure and fix it.\n\n",
         attempt, MAX_CI_FIX_ATTEMPTS
@@ -317,7 +321,7 @@ pub fn build_ci_fix_prompt(failed_checks: &[CheckRun], attempt: u32) -> String {
 
 /// Fetches check runs for a given PR ref using the gh CLI.
 /// Returns a list of CheckRun structs parsed from the gh CLI output.
-pub async fn fetch_check_runs(
+pub(crate) async fn fetch_check_runs(
     host: &str,
     owner: &str,
     repo: &str,
@@ -398,7 +402,7 @@ pub async fn fetch_check_runs(
 
 /// Fetches the workflow run logs for a failed check to get more detailed output.
 /// Falls back gracefully if logs aren't available.
-pub async fn fetch_check_logs(
+pub(crate) async fn fetch_check_logs(
     host: &str,
     owner: &str,
     repo: &str,
@@ -491,7 +495,12 @@ pub async fn fetch_check_logs(
 
 /// Waits for CI checks to complete on a PR, polling at regular intervals.
 /// Returns the overall CI result.
-pub async fn wait_for_ci(host: &str, owner: &str, repo: &str, head_sha: &str) -> Result<CiResult> {
+pub(crate) async fn wait_for_ci(
+    host: &str,
+    owner: &str,
+    repo: &str,
+    head_sha: &str,
+) -> Result<CiResult> {
     let start = std::time::Instant::now();
     let wait_timeout = Duration::from_secs(CI_WAIT_TIMEOUT_SECS);
     let completion_timeout = Duration::from_secs(CI_COMPLETION_TIMEOUT_SECS);
@@ -563,7 +572,7 @@ pub async fn wait_for_ci(host: &str, owner: &str, repo: &str, head_sha: &str) ->
 }
 
 /// Gets the HEAD SHA for a PR branch in a worktree
-pub async fn get_head_sha(worktree_path: &Path) -> Result<String> {
+pub(crate) async fn get_head_sha(worktree_path: &Path) -> Result<String> {
     let output = Command::new("git")
         .args(["rev-parse", "HEAD"])
         .current_dir(worktree_path)
@@ -586,7 +595,7 @@ pub async fn get_head_sha(worktree_path: &Path) -> Result<String> {
 ///
 /// When `state` is `None`, only open PRs are returned (gh default).
 /// Pass `Some("all")` to include open, closed, and merged PRs.
-pub async fn get_pr_number(
+pub(crate) async fn get_pr_number(
     host: &str,
     owner: &str,
     repo: &str,
@@ -629,7 +638,7 @@ pub async fn get_pr_number(
 
 /// Invokes Claude Code to fix CI failures in the given worktree.
 /// Returns the exit code from the Claude process.
-pub async fn invoke_ci_fix(
+pub(crate) async fn invoke_ci_fix(
     worktree_path: &Path,
     failed_checks: &[CheckRun],
     attempt: u32,
@@ -666,7 +675,7 @@ pub async fn invoke_ci_fix(
 }
 
 /// Posts an escalation comment on the PR when CI fixes are exhausted
-pub async fn post_escalation_comment(
+pub(crate) async fn post_escalation_comment(
     host: &str,
     owner: &str,
     repo: &str,
@@ -711,7 +720,7 @@ pub async fn post_escalation_comment(
 }
 
 /// Post an escalation comment when CI exhaustion occurs due to timeout or no-commits.
-pub async fn post_exhaustion_escalation_comment(
+pub(crate) async fn post_exhaustion_escalation_comment(
     host: &str,
     owner: &str,
     repo: &str,
@@ -785,7 +794,7 @@ async fn post_escalation_comment_body(
 /// 4. Escalate if all attempts fail
 ///
 /// Returns Ok(true) if CI passed (possibly after fixes), Ok(false) if escalated.
-pub async fn monitor_and_fix_ci(
+pub(crate) async fn monitor_and_fix_ci(
     host: &str,
     owner: &str,
     repo: &str,

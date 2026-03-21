@@ -52,7 +52,7 @@ fn should_restore_label(spawned_at: Instant) -> bool {
 }
 
 /// Handles the lab daemon command
-pub async fn handle_lab(
+pub(crate) async fn handle_lab(
     config_path: Option<PathBuf>,
     repos: Option<Vec<String>>,
     poll_interval: Option<u64>,

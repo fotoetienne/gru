@@ -126,7 +126,7 @@ fn check_prerequisites() -> Result<i32> {
 }
 
 /// Initialize a repository for use with Gru
-pub async fn handle_init(repo_arg: String, host_override: Option<String>) -> Result<i32> {
+pub(crate) async fn handle_init(repo_arg: String, host_override: Option<String>) -> Result<i32> {
     // Validate --host early
     if let Some(ref h) = host_override {
         validate_host(h)?;

@@ -33,7 +33,7 @@ struct ToolBuffer {
 /// `input_summary` when `ContentBlockStop` arrives. This eliminates the UX
 /// regression of showing "Tool: Bash" instead of "Run: git status".
 #[derive(Default)]
-pub struct ClaudeBackend {
+pub(crate) struct ClaudeBackend {
     tool_buffer: Mutex<Option<ToolBuffer>>,
 }
 
