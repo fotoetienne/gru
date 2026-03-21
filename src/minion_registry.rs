@@ -91,7 +91,7 @@ pub(crate) async fn mark_minion_failed(minion_id: &str) {
 pub(crate) async fn prune_stale_entries() -> Result<usize> {
     // Phase 1: Collect candidates (sync, lock held briefly)
     // Tuple: (minion_id, pr, repo, issue_number)
-    let candidates: Vec<(String, Option<String>, String, u64)> = with_registry(|registry| {
+    let candidates: Vec<(String, Option<String>, String, Option<u64>)> = with_registry(|registry| {
         let minions = registry.list();
         let candidates = minions
             .iter()
@@ -114,9 +114,9 @@ pub(crate) async fn prune_stale_entries() -> Result<usize> {
     for (id, pr, repo, issue) in &candidates {
         match pr {
             None => {
-                if *issue == 0 {
-                    // Issue #0 from ad-hoc `gru prompt` minions — log explicitly before pruning
-                    log::info!("Minion {} has issue #0 (ad-hoc), pruning stale entry", id);
+                if issue.is_none() {
+                    // No issue from ad-hoc `gru prompt` minions — log explicitly before pruning
+                    log::info!("Minion {} has no issue (ad-hoc), pruning stale entry", id);
                 }
                 // No PR associated — safe to prune
                 to_remove.push(id.clone());
