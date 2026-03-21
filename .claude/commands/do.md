@@ -60,7 +60,8 @@ Gru will handle:
 
 ## 5. Code Review
 - Make a commit with the changes, prefixing the commit message with your Minion ID (from the branch name), e.g. `[M042] Fix null pointer in parser`
-- Use the Task tool with `subagent_type='code-reviewer'` to perform an autonomous code review
+- Use the Agent tool with `subagent_type='code-reviewer'` to perform an autonomous code review
+- **Wait for the review agent to complete and read its full output before proceeding**
 - The code-reviewer agent will analyze the changes for:
   - Code correctness and logic errors
   - Security vulnerabilities
@@ -70,6 +71,7 @@ Gru will handle:
   - Test coverage
 - Address any issues raised by the code-reviewer before proceeding
 - If the review identifies significant problems, iterate on the implementation
+- **Do NOT push your branch or write PR_DESCRIPTION.md until you have read and addressed all review findings**
 
 ## 6. Finish Your Work
 
