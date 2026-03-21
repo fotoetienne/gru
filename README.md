@@ -106,6 +106,13 @@ gru chat
 gru chat --repo owner/repo
 ```
 
+### Product Manager / TPM Sessions
+
+```bash
+gru pm                # Interactive product manager session
+gru tpm               # Interactive technical project manager session
+```
+
 ### Custom Prompts
 
 ```bash

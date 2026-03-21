@@ -37,7 +37,7 @@ mod worktree_scanner;
 
 use clap::{Parser, Subcommand};
 use commands::{
-    attach, chat, clean, fix, init, lab, logs, path, prompt, prompts, rebase, resume, review,
+    attach, chat, clean, fix, init, lab, logs, path, pm, prompt, prompts, rebase, resume, review,
     status, stop, tail,
 };
 
@@ -79,6 +79,16 @@ enum Commands {
         #[arg(long, help = "Repository context as 'owner/repo'")]
         repo: Option<String>,
 
+        #[arg(short, long, help = "Show additional context information")]
+        verbose: bool,
+    },
+    #[command(about = "Start an interactive product manager session")]
+    Pm {
+        #[arg(short, long, help = "Show additional context information")]
+        verbose: bool,
+    },
+    #[command(about = "Start an interactive technical project manager session")]
+    Tpm {
         #[arg(short, long, help = "Show additional context information")]
         verbose: bool,
     },
@@ -437,6 +447,8 @@ async fn main() {
             init::handle_init(repo.unwrap_or_else(|| ".".to_string()), host).await
         }
         Commands::Chat { repo, verbose } => chat::handle_chat(repo, verbose).await,
+        Commands::Pm { verbose } => pm::handle_pm(verbose).await,
+        Commands::Tpm { verbose } => pm::handle_tpm(verbose).await,
         Commands::Do {
             issue,
             timeout,

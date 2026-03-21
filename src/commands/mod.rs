@@ -8,6 +8,7 @@ pub(crate) mod lab;
 pub(crate) mod logs;
 pub(crate) mod mcp;
 pub(crate) mod path;
+pub(crate) mod pm;
 pub(crate) mod prompt;
 pub(crate) mod prompts;
 pub(crate) mod rebase;
