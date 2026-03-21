@@ -91,16 +91,17 @@ pub(crate) async fn mark_minion_failed(minion_id: &str) {
 pub(crate) async fn prune_stale_entries() -> Result<usize> {
     // Phase 1: Collect candidates (sync, lock held briefly)
     // Tuple: (minion_id, pr, repo, issue_number)
-    let candidates: Vec<(String, Option<String>, String, Option<u64>)> = with_registry(|registry| {
-        let minions = registry.list();
-        let candidates = minions
-            .iter()
-            .filter(|(_id, info)| !info.worktree.exists())
-            .map(|(id, info)| (id.clone(), info.pr.clone(), info.repo.clone(), info.issue))
-            .collect();
-        Ok(candidates)
-    })
-    .await?;
+    let candidates: Vec<(String, Option<String>, String, Option<u64>)> =
+        with_registry(|registry| {
+            let minions = registry.list();
+            let candidates = minions
+                .iter()
+                .filter(|(_id, info)| !info.worktree.exists())
+                .map(|(id, info)| (id.clone(), info.pr.clone(), info.repo.clone(), info.issue))
+                .collect();
+            Ok(candidates)
+        })
+        .await?;
 
     if candidates.is_empty() {
         return Ok(0);
