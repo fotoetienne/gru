@@ -144,6 +144,7 @@ pub async fn handle_lab(
 
     // Main polling loop
     loop {
+        // Phase 1: Wait for poll interval or shutdown signal
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {
                 tprintln!();
@@ -161,17 +162,33 @@ pub async fn handle_lab(
                 // Clean up finished child processes
                 reap_children(&mut children).await;
 
-                if let Err(e) = poll_and_spawn(
-                    &config,
-                    &mut children,
-                    no_resume,
-                    &mut resumed_this_session,
-                    &mut wake_check_times,
-                )
-                .await
-                {
-                    log::warn!("⚠️  Polling error: {}", e);
-                    log::warn!("   Continuing to poll...");
+                // Phase 2: Race poll_and_spawn against shutdown signals
+                // so Ctrl+C during polling cancels all in-flight API calls at once
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {
+                        tprintln!();
+                        tprintln!("🛑 Received shutdown signal (SIGINT), stopping daemon...");
+                        shutdown_children(&mut children, stop_minions).await;
+                        break;
+                    }
+                    _ = sigterm.recv() => {
+                        tprintln!();
+                        tprintln!("🛑 Received shutdown signal (SIGTERM), stopping daemon...");
+                        shutdown_children(&mut children, stop_minions).await;
+                        break;
+                    }
+                    result = poll_and_spawn(
+                        &config,
+                        &mut children,
+                        no_resume,
+                        &mut resumed_this_session,
+                        &mut wake_check_times,
+                    ) => {
+                        if let Err(e) = result {
+                            log::warn!("⚠️  Polling error: {}", e);
+                            log::warn!("   Continuing to poll...");
+                        }
+                    }
                 }
             }
         }
