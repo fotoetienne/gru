@@ -140,9 +140,15 @@ pub(crate) async fn handle_lab(
         let flag = shutdown_flag.clone();
         let notify = shutdown_notify.clone();
         tokio::spawn(async move {
-            let _ = tokio::signal::ctrl_c().await;
-            flag.store(true, Ordering::Release);
-            notify.notify_one();
+            match tokio::signal::ctrl_c().await {
+                Ok(()) => {
+                    flag.store(true, Ordering::Release);
+                    notify.notify_one();
+                }
+                Err(e) => {
+                    log::warn!("Failed to register SIGINT handler: {e} — CTRL-C will not trigger graceful shutdown");
+                }
+            }
         });
     }
     {
@@ -151,9 +157,12 @@ pub(crate) async fn handle_lab(
         tokio::spawn(async move {
             match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
                 Ok(mut sigterm) => {
-                    sigterm.recv().await;
-                    flag.store(true, Ordering::Release);
-                    notify.notify_one();
+                    if sigterm.recv().await.is_some() {
+                        flag.store(true, Ordering::Release);
+                        notify.notify_one();
+                    } else {
+                        log::warn!("SIGTERM signal stream closed without receiving SIGTERM; not triggering graceful shutdown");
+                    }
                 }
                 Err(e) => {
                     log::warn!("Failed to register SIGTERM handler: {e} — SIGTERM will not trigger graceful shutdown");
