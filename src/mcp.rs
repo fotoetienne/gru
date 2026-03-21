@@ -26,6 +26,9 @@ const GUIDE_URI: &str = "gru://guide";
 const PM_SKILL_URI: &str = "gru://skills/pm";
 const TPM_SKILL_URI: &str = "gru://skills/tpm";
 
+/// Maximum number of log lines returned by `gru_logs`.
+const MAX_LOG_LINES: usize = 5_000;
+
 /// Serializable minion summary for MCP tool output.
 #[derive(Debug, Serialize)]
 struct MinionSummary {
@@ -73,7 +76,7 @@ pub struct StatusParams {
 pub struct LogsParams {
     /// Minion ID to get logs for (e.g., "M001")
     pub minion_id: String,
-    /// Number of recent events to return (default: 50)
+    /// Number of recent events to return (default: 50, max: 5000)
     #[serde(default)]
     pub lines: Option<usize>,
 }
@@ -108,7 +111,7 @@ impl GruMcpServer {
                 .map(|(id, info)| MinionSummary::from_registry(id.clone(), info))
                 .collect();
 
-            // Apply filter if provided
+            // Apply filter if provided (case-insensitive for minion IDs)
             if let Some(ref filter) = filter {
                 if let Ok(num) = filter.parse::<u64>() {
                     summaries.retain(|m| {
@@ -116,7 +119,9 @@ impl GruMcpServer {
                             || m.pr.as_ref().and_then(|pr| pr.parse::<u64>().ok()) == Some(num)
                     });
                 } else {
-                    summaries.retain(|m| m.id == *filter || m.id == format!("M{}", filter));
+                    let filter_upper = filter.to_uppercase();
+                    let with_prefix = format!("M{}", filter_upper);
+                    summaries.retain(|m| m.id.eq_ignore_ascii_case(filter) || m.id == with_prefix);
                 }
             }
 
@@ -130,7 +135,7 @@ impl GruMcpServer {
                     .unwrap_or_else(|e| json!({"error": e.to_string()}).to_string());
                 Ok(CallToolResult::success(vec![Content::text(json)]))
             }
-            Err(e) => Ok(CallToolResult::success(vec![Content::text(
+            Err(e) => Ok(CallToolResult::error(vec![Content::text(
                 json!({"error": format!("Failed to load registry: {}", e)}).to_string(),
             )])),
         }
@@ -138,15 +143,14 @@ impl GruMcpServer {
 
     /// Returns recent log events for a Minion.
     #[tool(
-        description = "Get recent log events from a Gru Minion's event stream. Returns the last N events (default 50) as raw JSONL from the Minion's events.jsonl file. Each line is a timestamped agent event."
+        description = "Get recent log events from a Gru Minion's event stream. Returns the last N events (default 50, max 5000) from the Minion's events.jsonl file. Each line is a timestamped agent event in JSONL format. Returns \"No events recorded yet\" if the file is empty."
     )]
     async fn gru_logs(
         &self,
         Parameters(params): Parameters<LogsParams>,
     ) -> Result<CallToolResult, McpError> {
-        const MAX_LOG_LINES: usize = 5_000;
         let lines = params.lines.unwrap_or(50).min(MAX_LOG_LINES);
-        let minion_id = params.minion_id.clone();
+        let minion_id = params.minion_id;
 
         // Look up the minion's worktree to find events.jsonl
         let events_path =
@@ -159,7 +163,7 @@ impl GruMcpServer {
         let events_path = match events_path {
             Ok(p) => p,
             Err(e) => {
-                return Ok(CallToolResult::success(vec![Content::text(
+                return Ok(CallToolResult::error(vec![Content::text(
                     json!({"error": e.to_string()}).to_string(),
                 )]));
             }
@@ -167,7 +171,7 @@ impl GruMcpServer {
 
         // Read events.jsonl (blocking I/O in spawn_blocking)
         let result = tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
-            read_last_n_lines(&events_path, lines)
+            tail_lines(&events_path, lines)
         })
         .await;
 
@@ -178,10 +182,10 @@ impl GruMcpServer {
                 )]))
             }
             Ok(Ok(content)) => Ok(CallToolResult::success(vec![Content::text(content)])),
-            Ok(Err(e)) => Ok(CallToolResult::success(vec![Content::text(
+            Ok(Err(e)) => Ok(CallToolResult::error(vec![Content::text(
                 json!({"error": e.to_string()}).to_string(),
             )])),
-            Err(e) => Ok(CallToolResult::success(vec![Content::text(
+            Err(e) => Ok(CallToolResult::error(vec![Content::text(
                 json!({"error": format!("Task failed: {}", e)}).to_string(),
             )])),
         }
@@ -258,15 +262,29 @@ impl ServerHandler for GruMcpServer {
     }
 }
 
-/// Reads the last `n` lines from a file, returning them as a single string.
-fn read_last_n_lines(path: &std::path::Path, n: usize) -> anyhow::Result<String> {
+/// Reads the last `n` lines from a file using a memory-efficient ring buffer.
+///
+/// Only keeps `n` lines in memory at a time rather than loading the entire file.
+/// For a 100K-line file with n=50, memory is proportional to 50 lines, not 100K.
+fn tail_lines(path: &std::path::Path, n: usize) -> anyhow::Result<String> {
     use anyhow::Context;
+    use std::collections::VecDeque;
+
     let file =
         std::fs::File::open(path).with_context(|| format!("Failed to open {}", path.display()))?;
     let reader = std::io::BufReader::new(file);
-    let all_lines: Vec<String> = reader.lines().collect::<Result<_, _>>()?;
-    let start = all_lines.len().saturating_sub(n);
-    Ok(all_lines[start..].join("\n"))
+
+    // Ring buffer: keep only the last `n` lines
+    let mut ring: VecDeque<String> = VecDeque::with_capacity(n);
+    for line_result in reader.lines() {
+        let line = line_result?;
+        if ring.len() == n {
+            ring.pop_front();
+        }
+        ring.push_back(line);
+    }
+
+    Ok(ring.into_iter().collect::<Vec<_>>().join("\n"))
 }
 
 /// Start the MCP server on stdio.
@@ -318,7 +336,7 @@ mod tests {
     }
 
     #[test]
-    fn test_read_last_n_lines() {
+    fn test_tail_lines() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         std::io::Write::write_all(
             &mut std::fs::File::create(tmp.path()).unwrap(),
@@ -326,16 +344,23 @@ mod tests {
         )
         .unwrap();
 
-        let result = read_last_n_lines(tmp.path(), 3).unwrap();
+        let result = tail_lines(tmp.path(), 3).unwrap();
         assert_eq!(result, "line3\nline4\nline5");
 
-        let result = read_last_n_lines(tmp.path(), 100).unwrap();
+        let result = tail_lines(tmp.path(), 100).unwrap();
         assert_eq!(result, "line1\nline2\nline3\nline4\nline5");
     }
 
     #[test]
-    fn test_read_last_n_lines_missing_file() {
-        let result = read_last_n_lines(std::path::Path::new("/nonexistent/file"), 10);
+    fn test_tail_lines_empty_file() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let result = tail_lines(tmp.path(), 10).unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_tail_lines_missing_file() {
+        let result = tail_lines(std::path::Path::new("/nonexistent/file"), 10);
         assert!(result.is_err());
     }
 
