@@ -141,7 +141,10 @@ mod tests {
 
     #[test]
     fn test_format_branch_name_large_issue() {
-        assert_eq!(format_branch_name(Some(99999), "M1a2"), "minion/issue-99999-M1a2");
+        assert_eq!(
+            format_branch_name(Some(99999), "M1a2"),
+            "minion/issue-99999-M1a2"
+        );
     }
 
     #[test]

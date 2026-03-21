@@ -828,7 +828,14 @@ mod tests {
             had_fetch_failures: false,
         };
 
-        let prompt = format_review_prompt(Some(123), "456", &feedback, "octocat", "hello-world", "M042");
+        let prompt = format_review_prompt(
+            Some(123),
+            "456",
+            &feedback,
+            "octocat",
+            "hello-world",
+            "M042",
+        );
 
         assert!(prompt.contains("issue #123"));
         assert!(prompt.contains("PR #456"));
@@ -866,7 +873,14 @@ mod tests {
             had_fetch_failures: false,
         };
 
-        let prompt = format_review_prompt(Some(123), "456", &feedback, "octocat", "hello-world", "M042");
+        let prompt = format_review_prompt(
+            Some(123),
+            "456",
+            &feedback,
+            "octocat",
+            "hello-world",
+            "M042",
+        );
 
         assert!(prompt.contains("## Inline Comment 1"));
         assert!(prompt.contains("## Inline Comment 2"));
@@ -894,7 +908,14 @@ mod tests {
             had_fetch_failures: false,
         };
 
-        let prompt = format_review_prompt(Some(123), "456", &feedback, "octocat", "hello-world", "M042");
+        let prompt = format_review_prompt(
+            Some(123),
+            "456",
+            &feedback,
+            "octocat",
+            "hello-world",
+            "M042",
+        );
 
         // Should not have a colon if line is None
         assert!(prompt.contains("**File:** README.md\n"));
@@ -913,7 +934,8 @@ mod tests {
             had_fetch_failures: false,
         };
 
-        let prompt = format_review_prompt(Some(42), "99", &feedback, "octocat", "hello-world", "M001");
+        let prompt =
+            format_review_prompt(Some(42), "99", &feedback, "octocat", "hello-world", "M001");
 
         assert!(prompt.contains("issue #42"));
         assert!(prompt.contains("PR #99"));
@@ -943,7 +965,8 @@ mod tests {
             had_fetch_failures: false,
         };
 
-        let prompt = format_review_prompt(Some(10), "20", &feedback, "octocat", "hello-world", "M002");
+        let prompt =
+            format_review_prompt(Some(10), "20", &feedback, "octocat", "hello-world", "M002");
 
         // Review body appears
         assert!(prompt.contains("## Review 1 (CHANGES_REQUESTED)"));
