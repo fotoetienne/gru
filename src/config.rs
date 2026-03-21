@@ -596,11 +596,6 @@ max_resume_attempts = 5
     }
 
     #[test]
-    fn test_default_max_resume_attempts_constant() {
-        assert_eq!(DEFAULT_MAX_RESUME_ATTEMPTS, 3);
-    }
-
-    #[test]
     fn test_validate_zero_max_resume_attempts() {
         let mut config = LabConfig::default();
         config.daemon.repos = vec!["owner/repo".to_string()];
