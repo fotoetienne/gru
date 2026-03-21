@@ -629,6 +629,62 @@ async fn find_resumable_minions(config: &LabConfig) -> Result<Vec<ResumableMinio
     .await
 }
 
+/// Mark a minion as Completed in the registry.
+/// Used when a minion's issue is closed or its PR is merged/closed.
+async fn mark_minion_completed(minion_id: &str) {
+    let mid = minion_id.to_string();
+    if let Err(e) = with_registry(move |reg| {
+        reg.update(&mid, |info| {
+            info.orchestration_phase = OrchestrationPhase::Completed;
+        })
+    })
+    .await
+    {
+        log::warn!("Failed to mark {} as completed: {}", minion_id, e);
+    }
+}
+
+/// Decision returned by [`check_pr_merge_state`] indicating whether a minion
+/// should be resumed, skipped (PR merged/closed), or retried next poll.
+#[derive(Debug, PartialEq)]
+enum PrResumeDecision {
+    /// PR is still open (or no PR exists) — proceed with resume.
+    Resume,
+    /// PR is merged or closed — mark minion as completed and skip.
+    SkipCompleted { pr_num: u64 },
+    /// Transient error checking PR state — skip this cycle, retry next poll.
+    RetryNextPoll { pr_num: u64, error: String },
+}
+
+/// Check whether a minion's associated PR has been merged or closed.
+///
+/// This is a pure decision function that takes the result of the GitHub API call
+/// as a parameter, making it easy to test without mocking.
+fn check_pr_merge_state(
+    pr_field: Option<&str>,
+    pr_open_result: impl FnOnce(u64) -> Result<bool>,
+) -> PrResumeDecision {
+    let pr_str = match pr_field {
+        Some(s) => s,
+        None => return PrResumeDecision::Resume,
+    };
+    let pr_num = match pr_str.parse::<u64>() {
+        Ok(n) => n,
+        Err(_) => {
+            log::warn!("Unparseable PR value '{}', skipping PR check", pr_str,);
+            return PrResumeDecision::Resume;
+        }
+    };
+    match pr_open_result(pr_num) {
+        Ok(true) => PrResumeDecision::Resume,
+        Ok(false) => PrResumeDecision::SkipCompleted { pr_num },
+        Err(e) => PrResumeDecision::RetryNextPoll {
+            pr_num,
+            error: e.to_string(),
+        },
+    }
+}
+
 /// Mark a minion as failed in the registry and post an escalation comment on the issue.
 async fn mark_exhausted_minion(minion_id: &str, info: &MinionInfo, host: &str, reason: &str) {
     let mid = minion_id.to_string();
@@ -775,20 +831,46 @@ async fn resume_interrupted_minions(
                     candidate.info.issue,
                     candidate.info.repo,
                 );
-                // Mark as Completed in the registry
-                let mid = candidate.minion_id.clone();
-                if let Err(e) = with_registry(move |reg| {
-                    reg.update(&mid, |info| {
-                        info.orchestration_phase = OrchestrationPhase::Completed;
-                    })
-                })
-                .await
-                {
-                    log::warn!("Failed to mark {} as completed: {}", candidate.minion_id, e);
-                }
+                mark_minion_completed(&candidate.minion_id).await;
                 continue;
             }
-            Ok(false) => {} // Issue is still open, proceed with resume
+            Ok(false) => {
+                // Issue is still open — but the PR may already be merged
+                // (e.g. PR body lacked "Closes #N" so the issue wasn't auto-closed).
+                let pr_field = candidate.info.pr.as_deref();
+                let decision = check_pr_merge_state(pr_field, |pr_num| {
+                    // We can't use async closures directly, so we block on the future.
+                    // This runs inside the Tokio runtime already, so we use block_in_place.
+                    tokio::task::block_in_place(|| {
+                        tokio::runtime::Handle::current()
+                            .block_on(github::is_pr_open_via_cli(owner, repo_name, &host, pr_num))
+                    })
+                });
+                match decision {
+                    PrResumeDecision::Resume => {} // proceed with resume
+                    PrResumeDecision::SkipCompleted { pr_num } => {
+                        tprintln!(
+                            "⏭️  Skipping {} (issue #{}, {}): PR #{} is merged/closed",
+                            candidate.minion_id,
+                            candidate.info.issue,
+                            candidate.info.repo,
+                            pr_num,
+                        );
+                        mark_minion_completed(&candidate.minion_id).await;
+                        continue;
+                    }
+                    PrResumeDecision::RetryNextPoll { pr_num, error } => {
+                        log::warn!(
+                            "⚠️  Failed to check PR #{} state for {} (issue #{}): {} — will retry next poll",
+                            pr_num,
+                            candidate.minion_id,
+                            candidate.info.issue,
+                            error,
+                        );
+                        continue;
+                    }
+                }
+            }
             Err(e) => {
                 // Transient failure (network, auth, etc.) — skip this cycle;
                 // the candidate stays active so it will be retried next poll.
@@ -1947,5 +2029,65 @@ mod tests {
         let result = sort_and_dedup_resumable(candidates);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].minion_id, "M001");
+    }
+
+    // --- check_pr_merge_state tests ---
+
+    #[test]
+    fn test_check_pr_merge_state_no_pr() {
+        let decision = check_pr_merge_state(None, |_| unreachable!());
+        assert_eq!(decision, PrResumeDecision::Resume);
+    }
+
+    #[test]
+    fn test_check_pr_merge_state_pr_still_open() {
+        let decision = check_pr_merge_state(Some("42"), |num| {
+            assert_eq!(num, 42);
+            Ok(true) // PR is open
+        });
+        assert_eq!(decision, PrResumeDecision::Resume);
+    }
+
+    #[test]
+    fn test_check_pr_merge_state_pr_merged_or_closed() {
+        let decision = check_pr_merge_state(Some("99"), |num| {
+            assert_eq!(num, 99);
+            Ok(false) // PR is merged/closed
+        });
+        assert_eq!(decision, PrResumeDecision::SkipCompleted { pr_num: 99 });
+    }
+
+    #[test]
+    fn test_check_pr_merge_state_transient_error() {
+        let decision = check_pr_merge_state(Some("7"), |_| Err(anyhow::anyhow!("network timeout")));
+        match decision {
+            PrResumeDecision::RetryNextPoll { pr_num, error } => {
+                assert_eq!(pr_num, 7);
+                assert!(error.contains("network timeout"));
+            }
+            other => panic!("expected RetryNextPoll, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_check_pr_merge_state_unparseable_pr() {
+        let decision = check_pr_merge_state(Some("not-a-number"), |_| unreachable!());
+        assert_eq!(decision, PrResumeDecision::Resume);
+    }
+
+    /// Verifies that resumable minions can carry PR metadata,
+    /// which resume_interrupted_minions uses to check merge state.
+    #[test]
+    fn test_resumable_minion_with_pr_is_deduped_correctly() {
+        let mut c1 = make_resumable("M001", "owner/repo", 42);
+        c1.info.pr = Some("100".to_string());
+        let mut c2 = make_resumable("M003", "owner/repo", 42);
+        c2.info.pr = Some("101".to_string());
+
+        let result = sort_and_dedup_resumable(vec![c1, c2]);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].minion_id, "M003");
+        // The most recent minion's PR is the one that will be checked
+        assert_eq!(result[0].info.pr.as_deref(), Some("101"));
     }
 }
