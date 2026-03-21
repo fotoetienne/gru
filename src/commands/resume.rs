@@ -289,8 +289,7 @@ async fn run_resume_pipeline(ctx: ResumeContext, quiet: bool) -> Result<i32> {
 
     // Non-"do" minions (e.g., "prompt", "review") only run the agent phase —
     // they should not create PRs or enter the monitoring lifecycle.
-    // Accept the legacy "fix" alias used in registries written before the rename.
-    let agent_only = command != "do" && command != "fix";
+    let agent_only = is_agent_only_command(&command);
 
     // Rename tmux window for the resume session
     let _tmux_guard = TmuxGuard::new(&format!("gru:{}", wt_ctx.minion_id));
@@ -332,9 +331,13 @@ async fn run_resume_pipeline(ctx: ResumeContext, quiet: bool) -> Result<i32> {
         }
     }
 
-    // For agent-only commands (prompt, review, etc.), skip PR creation and monitoring
+    // For agent-only commands (prompt, review, etc.), skip PR creation and monitoring.
+    // Only transition to Completed if the agent actually ran in this invocation;
+    // otherwise preserve the existing phase (e.g., a prior Failed state).
     if agent_only {
-        update_orchestration_phase(&wt_ctx.minion_id, OrchestrationPhase::Completed).await;
+        if agent_result.is_some() {
+            update_orchestration_phase(&wt_ctx.minion_id, OrchestrationPhase::Completed).await;
+        }
         cleanup_registry(&wt_ctx.minion_id).await;
         println!("✅ Resume completed for Minion {}", wt_ctx.minion_id);
         return Ok(agent_exit_code(&agent_result));
@@ -386,6 +389,13 @@ async fn run_resume_pipeline(ctx: ResumeContext, quiet: bool) -> Result<i32> {
     cleanup_registry(&wt_ctx.minion_id).await;
     println!("✅ Resume completed for Minion {}", wt_ctx.minion_id);
     Ok(agent_exit_code(&agent_result))
+}
+
+/// Returns `true` for commands that should only run the agent phase on resume,
+/// skipping PR creation and monitoring. Accepts the legacy `"fix"` alias as
+/// equivalent to `"do"` for registries written before the rename.
+fn is_agent_only_command(command: &str) -> bool {
+    command != "do" && command != "fix"
 }
 
 /// Best-effort registry cleanup: clear PID and set mode to Stopped.
@@ -553,5 +563,25 @@ mod tests {
     fn test_extract_host_from_remote_url_invalid() {
         assert_eq!(extract_host_from_remote_url("not-a-url"), None);
         assert_eq!(extract_host_from_remote_url(""), None);
+    }
+
+    #[test]
+    fn test_is_agent_only_command_do() {
+        assert!(!is_agent_only_command("do"));
+    }
+
+    #[test]
+    fn test_is_agent_only_command_legacy_fix() {
+        assert!(!is_agent_only_command("fix"));
+    }
+
+    #[test]
+    fn test_is_agent_only_command_prompt() {
+        assert!(is_agent_only_command("prompt"));
+    }
+
+    #[test]
+    fn test_is_agent_only_command_review() {
+        assert!(is_agent_only_command("review"));
     }
 }
