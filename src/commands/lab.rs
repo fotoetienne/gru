@@ -487,7 +487,7 @@ pub(crate) fn within_wake_cooldown(
 ///
 /// `wake_check_times` is an in-memory map of minion_id → last GitHub API poll time,
 /// used to enforce `WAKE_COOLDOWN` across poll cycles without persisting to disk.
-async fn find_minions_needing_review_wake(
+async fn find_minions_needing_wake(
     config: &LabConfig,
     max_attempts: u32,
     wake_check_times: &mut HashMap<String, DateTime<Utc>>,
@@ -578,6 +578,17 @@ async fn find_minions_needing_review_wake(
                 }
             };
         let (pr_open, pr_author, mergeable) = pr_info;
+
+        // Skip closed/merged PRs early to avoid unnecessary review API calls.
+        if !pr_open {
+            log::debug!(
+                "Skipping {} — PR #{} is closed/merged",
+                minion_id,
+                pr_number
+            );
+            continue;
+        }
+
         let has_merge_conflict = mergeable == Some(false);
 
         let reviews = match pr_monitor::get_all_reviews(&host, &owner, &repo_name, &pr_number).await
@@ -1374,16 +1385,12 @@ async fn poll_and_spawn(
 
     let max_attempts = config.daemon.max_resume_attempts;
 
-    // Wake up Completed minions with new external reviews so they re-enter MonitoringPr.
+    // Wake up Completed minions with new external reviews or merge conflicts so they re-enter MonitoringPr.
     // Runs after prune_stale_entries so stale entries don't generate spurious wake-ups.
     if !no_resume {
-        if let Err(e) = find_minions_needing_review_wake(
-            config,
-            max_attempts,
-            wake_check_times,
-            resumed_this_session,
-        )
-        .await
+        if let Err(e) =
+            find_minions_needing_wake(config, max_attempts, wake_check_times, resumed_this_session)
+                .await
         {
             log::warn!("⚠️  Review wake scan error: {}", e);
         }
