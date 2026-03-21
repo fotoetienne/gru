@@ -340,11 +340,6 @@ async fn update_readiness_label(
     }
 }
 
-#[derive(Debug, Deserialize)]
-struct CheckRunsResponse {
-    check_runs: Vec<CheckRun>,
-}
-
 /// Monitor a PR for actionable events (reviews, CI failures, merge conflicts, etc.).
 ///
 /// `baseline` optionally provides a timestamp to seed the review tracker.
@@ -753,21 +748,41 @@ Each reply must:\n\
     prompt
 }
 
-/// Fetch check runs for a given commit SHA with retry logic for transient failures
+/// Fetch check runs for a given commit SHA with retry logic for transient failures.
+///
+/// Uses `--jq ".check_runs[]"` to extract individual check run objects line-by-line,
+/// which is resilient to wrapper structure changes and handles pagination.
 async fn get_check_runs(host: &str, owner: &str, repo: &str, sha: &str) -> Result<Vec<CheckRun>> {
     let repo_full = github::repo_slug(owner, repo);
     let endpoint = format!("repos/{repo_full}/commits/{sha}/check-runs");
-    let output = gh_api_with_retry(host, &["api", &endpoint], DEFAULT_MAX_RETRIES).await?;
+    // --paginate with --jq streams individual check run objects, one per line
+    let output = gh_api_with_retry(
+        host,
+        &["api", "--paginate", &endpoint, "--jq", ".check_runs[]"],
+        DEFAULT_MAX_RETRIES,
+    )
+    .await?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         anyhow::bail!("Failed to fetch check runs: {}", stderr);
     }
 
-    let response: CheckRunsResponse = serde_json::from_slice(&output.stdout)
-        .context("Failed to parse check runs JSON response")?;
+    let stdout = std::str::from_utf8(&output.stdout)
+        .context("Failed to decode check runs stdout as UTF-8")?;
 
-    Ok(response.check_runs)
+    let mut check_runs = Vec::new();
+    for line in stdout.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let check_run: CheckRun =
+            serde_json::from_str(line).context("Failed to parse check run JSON line")?;
+        check_runs.push(check_run);
+    }
+
+    Ok(check_runs)
 }
 
 /// Returns the count of external (non-author) reviews submitted after `since`.
@@ -1207,39 +1222,37 @@ mod tests {
     }
 
     #[test]
-    fn test_check_runs_response_deserialize() {
+    fn test_check_run_line_by_line_deserialize() {
         use crate::ci::CheckConclusion;
-        let json = r#"{
-            "total_count": 3,
-            "check_runs": [
-                {"conclusion": "success"},
-                {"conclusion": "failure"},
-                {"conclusion": null}
-            ]
-        }"#;
+        // Simulates --jq ".check_runs[]" output: one JSON object per line
+        let lines = r#"{"conclusion": "success"}
+{"conclusion": "failure"}
+{"conclusion": null}"#;
 
-        let response: CheckRunsResponse = serde_json::from_str(json).unwrap();
-        assert_eq!(response.check_runs.len(), 3);
-        assert_eq!(
-            response.check_runs[0].conclusion,
-            Some(CheckConclusion::Success)
-        );
-        assert_eq!(
-            response.check_runs[1].conclusion,
-            Some(CheckConclusion::Failure)
-        );
-        assert!(response.check_runs[2].conclusion.is_none());
+        let check_runs: Vec<CheckRun> = lines
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+
+        assert_eq!(check_runs.len(), 3);
+        assert_eq!(check_runs[0].conclusion, Some(CheckConclusion::Success));
+        assert_eq!(check_runs[1].conclusion, Some(CheckConclusion::Failure));
+        assert!(check_runs[2].conclusion.is_none());
     }
 
     #[test]
-    fn test_check_runs_response_empty() {
-        let json = r#"{
-            "total_count": 0,
-            "check_runs": []
-        }"#;
+    fn test_check_run_line_by_line_empty() {
+        // Simulates --jq ".check_runs[]" output when there are no check runs
+        let lines = "";
 
-        let response: CheckRunsResponse = serde_json::from_str(json).unwrap();
-        assert!(response.check_runs.is_empty());
+        let check_runs: Vec<CheckRun> = lines
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+
+        assert!(check_runs.is_empty());
     }
 
     #[test]
@@ -1602,12 +1615,10 @@ mod tests {
     }
 
     #[test]
-    fn test_check_runs_response_missing_check_runs_fails() {
-        let json = r#"{
-            "total_count": 0
-        }"#;
+    fn test_check_run_malformed_line_fails() {
+        let line = r#"{ this is not valid json }"#;
 
-        let result: Result<CheckRunsResponse, _> = serde_json::from_str(json);
+        let result: Result<CheckRun, _> = serde_json::from_str(line);
         assert!(result.is_err());
     }
 
