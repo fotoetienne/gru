@@ -20,7 +20,7 @@ use crate::agent_registry;
 use crate::agent_runner::{is_stuck_or_timeout_error, parse_timeout, EXIT_CODE_SIGNAL_TERMINATED};
 use crate::minion_registry::{with_registry, MinionMode, OrchestrationPhase};
 use crate::tmux::TmuxGuard;
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use chrono::Utc;
 use std::path::Path;
 use tokio::time::Duration;
@@ -261,6 +261,58 @@ async fn run_worker(minion_id: &str, issue: &str, opts: FixOptions) -> Result<i3
     Ok(worker::agent_exit_code(&agent_result))
 }
 
+/// User action from the `--discuss` interactive prompt.
+enum DiscussAction {
+    Proceed,
+    Append(String),
+    Abort,
+}
+
+/// Reads a line-based command: empty line (just Enter) to proceed, 'a' + Enter to
+/// append context, or 'q' + Enter to abort. When 'a' is chosen, reads additional
+/// lines until an empty line or EOF.
+fn read_discuss_input() -> Result<DiscussAction> {
+    use std::io::{BufRead, Write};
+
+    let stdin = std::io::stdin();
+
+    loop {
+        print!("> ");
+        std::io::stdout().flush()?;
+
+        let mut line = String::new();
+        stdin.lock().read_line(&mut line)?;
+        let trimmed = line.trim();
+
+        match trimmed {
+            "" => return Ok(DiscussAction::Proceed),
+            "q" | "Q" => return Ok(DiscussAction::Abort),
+            "a" | "A" => {
+                println!("Enter extra context (empty line to finish):");
+                let mut context_lines = Vec::new();
+                loop {
+                    let mut buf = String::new();
+                    stdin.lock().read_line(&mut buf)?;
+                    if buf.trim().is_empty() {
+                        break;
+                    }
+                    context_lines.push(buf);
+                }
+                let text = context_lines.concat().trim_end().to_string();
+                if text.is_empty() {
+                    println!("No context entered. Proceeding with original prompt.\n");
+                    return Ok(DiscussAction::Proceed);
+                } else {
+                    return Ok(DiscussAction::Append(text));
+                }
+            }
+            other => {
+                println!("Unknown input '{}'. Enter, 'a', or 'q'.", other);
+            }
+        }
+    }
+}
+
 /// Handles the fix command by delegating to the agent backend.
 /// Returns the exit code from the agent process.
 ///
@@ -287,10 +339,19 @@ pub(crate) async fn handle_fix(issue: &str, opts: FixOptions) -> Result<i32> {
     let quiet = opts.quiet;
     let force_new = opts.force_new;
     let detach = opts.detach;
+    let discuss = opts.discuss;
     let agent_name = &opts.agent_name;
 
     // Validate agent name early (fail fast on unknown agents)
     let _backend = agent_registry::resolve_backend(agent_name)?;
+
+    // --discuss requires an interactive terminal
+    if discuss {
+        use std::io::IsTerminal;
+        if !std::io::stdin().is_terminal() {
+            bail!("--discuss requires an interactive terminal (stdin is not a TTY)");
+        }
+    }
 
     let ignore_deps = opts.ignore_deps;
 
@@ -396,6 +457,52 @@ pub(crate) async fn handle_fix(issue: &str, opts: FixOptions) -> Result<i32> {
             issue_ctx.issue_num,
         )
         .await;
+    }
+
+    // --discuss: show prompt and wait for user input before launching.
+    // Uses build_full_prompt so the user sees exactly what the agent will receive.
+    // Loops after append so the user can verify the final prompt before proceeding.
+    if discuss {
+        loop {
+            let prompt = agent::build_full_prompt(&issue_ctx, &wt_ctx);
+            println!("\n--- Assembled Prompt ---");
+            println!("{}", prompt);
+            println!("--- End Prompt ---\n");
+            println!("Press Enter to launch, or:");
+            println!("  a  - append extra context");
+            println!("  q  - abort (worktree preserved)\n");
+
+            match read_discuss_input()? {
+                DiscussAction::Proceed => break,
+                DiscussAction::Append(text) => {
+                    let extra_path = wt_ctx.minion_dir.join(agent::EXTRA_CONTEXT_FILENAME);
+                    std::fs::write(&extra_path, &text)
+                        .with_context(|| format!("Failed to write {}", extra_path.display()))?;
+                    println!("Extra context saved. Rebuilding prompt...\n");
+                    continue;
+                }
+                DiscussAction::Abort => {
+                    // Only unclaim on fresh starts — resumed minions were already claimed
+                    // by a previous session, and unclaiming would incorrectly release that claim.
+                    if is_fresh {
+                        if let Some(issue_num) = issue_ctx.issue_num {
+                            helpers::try_unclaim_issue(
+                                &issue_ctx.host,
+                                &issue_ctx.owner,
+                                &issue_ctx.repo,
+                                issue_num,
+                            )
+                            .await;
+                        }
+                    }
+                    println!(
+                        "Aborted. Worktree preserved at: {}",
+                        wt_ctx.checkout_path.display()
+                    );
+                    return Ok(0);
+                }
+            }
+        }
     }
 
     // Phase 3: Spawn background worker
@@ -620,5 +727,81 @@ CUSTOM: Fix #{{ issue_number }} - {{ issue_title }}"#,
         let err: anyhow::Error = AgentRunnerError::InactivityStuck { minutes: 15 }.into();
         let wrapped = err.context("Claude session failed");
         assert!(is_stuck_or_timeout_error(&wrapped));
+    }
+
+    #[test]
+    fn test_extra_context_appended_to_prompt() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wt_ctx = test_wt_ctx(tmp.path());
+
+        let ctx = IssueContext {
+            owner: "octocat".to_string(),
+            repo: "hello-world".to_string(),
+            host: "github.com".to_string(),
+            issue_num: Some(42),
+            details: Some(IssueDetails {
+                title: "Fix the widget".to_string(),
+                body: "The widget is broken".to_string(),
+                labels: "bug".to_string(),
+            }),
+        };
+
+        // Write extra_context.txt to minion_dir (simulates --discuss append)
+        let extra_path = wt_ctx.minion_dir.join(agent::EXTRA_CONTEXT_FILENAME);
+        std::fs::write(&extra_path, "use the new API, not the deprecated one").unwrap();
+
+        let prompt = agent::build_full_prompt(&ctx, &wt_ctx);
+        assert!(prompt.contains("## Additional Context from User"));
+        assert!(prompt.contains("use the new API, not the deprecated one"));
+        // Base prompt should still be present
+        assert!(prompt.contains("# Issue #42: Fix the widget"));
+    }
+
+    #[test]
+    fn test_extra_context_empty_file_ignored() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wt_ctx = test_wt_ctx(tmp.path());
+
+        let ctx = IssueContext {
+            owner: "octocat".to_string(),
+            repo: "hello-world".to_string(),
+            host: "github.com".to_string(),
+            issue_num: Some(42),
+            details: Some(IssueDetails {
+                title: "Fix the widget".to_string(),
+                body: "The widget is broken".to_string(),
+                labels: String::new(),
+            }),
+        };
+
+        // Write empty extra_context.txt — should not appear in prompt
+        let extra_path = wt_ctx.minion_dir.join(agent::EXTRA_CONTEXT_FILENAME);
+        std::fs::write(&extra_path, "   \n  ").unwrap();
+
+        let prompt = agent::build_full_prompt(&ctx, &wt_ctx);
+        assert!(!prompt.contains("## Additional Context from User"));
+    }
+
+    #[test]
+    fn test_no_extra_context_file_produces_normal_prompt() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wt_ctx = test_wt_ctx(tmp.path());
+
+        let ctx = IssueContext {
+            owner: "octocat".to_string(),
+            repo: "hello-world".to_string(),
+            host: "github.com".to_string(),
+            issue_num: Some(42),
+            details: Some(IssueDetails {
+                title: "Fix the widget".to_string(),
+                body: "The widget is broken".to_string(),
+                labels: String::new(),
+            }),
+        };
+
+        // No extra_context.txt — normal case without --discuss
+        let prompt = agent::build_full_prompt(&ctx, &wt_ctx);
+        assert!(!prompt.contains("## Additional Context from User"));
+        assert!(prompt.contains("# Issue #42: Fix the widget"));
     }
 }

@@ -11,6 +11,10 @@ use anyhow::{Context, Result};
 use tokio::process::Command as TokioCommand;
 use uuid::Uuid;
 
+/// Filename for extra context appended via `--discuss`.
+/// Written by `handle_fix` on user input, read by `run_agent_session` at launch.
+pub(super) const EXTRA_CONTEXT_FILENAME: &str = "extra_context.txt";
+
 /// Builds the prompt string from issue context using the prompt template system.
 ///
 /// Loads the "do" prompt template (built-in or overridden via `.gru/prompts/do.md`
@@ -73,6 +77,36 @@ pub(super) fn build_fix_prompt(ctx: &IssueContext, wt_ctx: &WorktreeContext) -> 
     render_template(template_content, &variables)
 }
 
+/// Builds the full prompt including any extra context from `--discuss`.
+///
+/// Calls `build_fix_prompt` for the base prompt, then appends the contents
+/// of `extra_context.txt` in the minion directory if present and non-empty.
+pub(super) fn build_full_prompt(issue_ctx: &IssueContext, wt_ctx: &WorktreeContext) -> String {
+    let mut prompt = build_fix_prompt(issue_ctx, wt_ctx);
+
+    let extra_path = wt_ctx.minion_dir.join(EXTRA_CONTEXT_FILENAME);
+    match std::fs::read_to_string(&extra_path) {
+        Ok(extra) => {
+            if !extra.trim().is_empty() {
+                prompt.push_str("\n\n## Additional Context from User\n\n");
+                prompt.push_str(extra.trim());
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // Normal case: no extra context file (--discuss was not used)
+        }
+        Err(e) => {
+            log::warn!(
+                "⚠️  Failed to read extra context from {}: {}",
+                extra_path.display(),
+                e
+            );
+        }
+    }
+
+    prompt
+}
+
 /// Runs an agent session with stream monitoring and progress tracking.
 ///
 /// Spawns the agent CLI, tracks progress, records PID in registry,
@@ -85,7 +119,8 @@ pub(super) async fn run_agent_session(
     timeout_opt: Option<&str>,
 ) -> Result<AgentResult> {
     println!("🤖 Launching {}...\n", backend.name());
-    let prompt = build_fix_prompt(issue_ctx, wt_ctx);
+    let prompt = build_full_prompt(issue_ctx, wt_ctx);
+
     let mut cmd = backend.build_command(
         &wt_ctx.checkout_path,
         &wt_ctx.session_id,
