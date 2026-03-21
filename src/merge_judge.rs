@@ -189,10 +189,19 @@ async fn run_gh_parallel(host: &str, arg_sets: Vec<Vec<String>>) -> Result<Vec<S
 
     let mut results: Vec<Option<String>> = (0..count).map(|_| None).collect();
     while let Some(join_result) = set.join_next().await {
-        let (idx, output) = join_result.context("gh task panicked")??;
-        results[idx] = Some(output);
+        match join_result.context("gh task panicked")? {
+            Ok((idx, output)) => {
+                results[idx] = Some(output);
+            }
+            Err(e) => {
+                // Cancel remaining tasks to match try_join! short-circuit semantics.
+                set.abort_all();
+                return Err(e);
+            }
+        }
     }
 
+    // Every spawned task populates its index, so None is unreachable here.
     results
         .into_iter()
         .enumerate()

@@ -866,7 +866,7 @@ pub(crate) async fn monitor_and_fix_ci(
                     CiResult::Failed(checks) => checks,
                     _ => unreachable!(),
                 };
-                let fix_result = run_ci_fix_with_retries(
+                let fix_result = run_ci_fix_attempt(
                     backend,
                     host,
                     owner,
@@ -895,7 +895,7 @@ pub(crate) async fn monitor_and_fix_ci(
     Ok(false)
 }
 
-/// Internal signal from `run_ci_fix_with_retries` back to the main loop.
+/// Internal signal from `run_ci_fix_attempt` back to the main loop.
 enum CiFixLoopAction {
     /// Retry: `continue` the outer attempt loop.
     Continue,
@@ -999,7 +999,7 @@ async fn escalate_exhaustion(
 /// Run a single CI fix attempt: enrich logs, invoke Claude, check for new
 /// commits, and push. Returns a loop-control signal for the caller.
 #[allow(clippy::too_many_arguments)]
-async fn run_ci_fix_with_retries(
+async fn run_ci_fix_attempt(
     backend: &dyn AgentBackend,
     host: &str,
     owner: &str,
