@@ -608,31 +608,52 @@ async fn find_minions_needing_review_wake(
             continue;
         }
 
+        // Build a wake_reason that captures all triggers. This string is stored as
+        // registry metadata for observability (visible in `gru status` and the JSON).
+        // It is NOT sent to the agent as a prompt — conflict resolution is handled by
+        // monitor_pr_lifecycle's MergeConflict re-detection path, and review handling
+        // is driven by last_review_check_time.
         let issue_display = info.issue.map_or("?".to_string(), |n| n.to_string());
-        let wake_reason = if has_merge_conflict && unaddressed == 0 {
-            tprintln!(
-                "🔔 Waking up {} (issue #{}, {}): merge conflict detected on PR #{}",
-                minion_id,
-                issue_display,
-                info.repo,
-                pr_number
-            );
-            format!("Rebase PR #{} to resolve merge conflicts", pr_number)
-        } else {
-            tprintln!(
-                "🔔 Waking up {} (issue #{}, {}): {} new external review(s){} on PR #{}",
-                minion_id,
-                issue_display,
-                info.repo,
-                unaddressed,
-                if has_merge_conflict {
-                    " + merge conflict"
-                } else {
-                    ""
-                },
-                pr_number
-            );
-            format!("Address the review comments on PR #{}", pr_number)
+        let wake_reason = match (unaddressed > 0, has_merge_conflict) {
+            (true, true) => {
+                tprintln!(
+                    "🔔 Waking up {} (issue #{}, {}): {} new review(s) + merge conflict on PR #{}",
+                    minion_id,
+                    issue_display,
+                    info.repo,
+                    unaddressed,
+                    pr_number
+                );
+                format!(
+                    "Address review comments and resolve merge conflicts on PR #{}",
+                    pr_number
+                )
+            }
+            (true, false) => {
+                tprintln!(
+                    "🔔 Waking up {} (issue #{}, {}): {} new external review(s) on PR #{}",
+                    minion_id,
+                    issue_display,
+                    info.repo,
+                    unaddressed,
+                    pr_number
+                );
+                format!("Address the review comments on PR #{}", pr_number)
+            }
+            (false, true) => {
+                tprintln!(
+                    "🔔 Waking up {} (issue #{}, {}): merge conflict detected on PR #{}",
+                    minion_id,
+                    issue_display,
+                    info.repo,
+                    pr_number
+                );
+                format!("Rebase PR #{} to resolve merge conflicts", pr_number)
+            }
+            (false, false) => {
+                // should_wake_minion returned true, so at least one trigger must be set.
+                unreachable!("should_wake_minion returned true with no trigger");
+            }
         };
         let mid = minion_id.clone();
         if let Err(e) = with_registry(move |reg| {
