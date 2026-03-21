@@ -146,7 +146,7 @@ pub async fn handle_lab(
         .context("Failed to register SIGTERM handler")?;
 
     macro_rules! shutdown {
-        ($signal:expr) => {{
+        ($signal:literal) => {{
             tprintln!();
             tprintln!(concat!(
                 "🛑 Received shutdown signal (",
@@ -170,8 +170,16 @@ pub async fn handle_lab(
 
                 // Phase 2: Race poll_and_spawn against shutdown signals
                 // so Ctrl+C during polling cancels all in-flight API calls at once.
-                // Note: block_in_place sections inside poll_and_spawn (e.g. PR-open
-                // checks) cannot be interrupted by cancellation until they return.
+                //
+                // Cancellation safety: dropping poll_and_spawn mid-flight could
+                // theoretically leave an issue labeled gru:in-progress without a
+                // running child (if cancelled between claim_issue and spawn_minion).
+                // This is acceptable because reap_children already restores labels
+                // for early-exit children, and the next lab restart will pick up
+                // orphaned in-progress issues.
+                //
+                // Note: block_in_place sections (e.g. PR-open checks) cannot be
+                // interrupted by cancellation until they return.
                 tokio::select! {
                     _ = sigint.recv() => { shutdown!("SIGINT"); }
                     _ = sigterm.recv() => { shutdown!("SIGTERM"); }
