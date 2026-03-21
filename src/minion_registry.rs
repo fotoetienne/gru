@@ -90,12 +90,13 @@ pub(crate) async fn mark_minion_failed(minion_id: &str) {
 /// Returns the number of entries pruned.
 pub(crate) async fn prune_stale_entries() -> Result<usize> {
     // Phase 1: Collect candidates (sync, lock held briefly)
-    let candidates: Vec<(String, Option<String>, String)> = with_registry(|registry| {
+    // Tuple: (minion_id, pr, repo, issue_number)
+    let candidates: Vec<(String, Option<String>, String, u64)> = with_registry(|registry| {
         let minions = registry.list();
         let candidates = minions
             .iter()
             .filter(|(_id, info)| !info.worktree.exists())
-            .map(|(id, info)| (id.clone(), info.pr.clone(), info.repo.clone()))
+            .map(|(id, info)| (id.clone(), info.pr.clone(), info.repo.clone(), info.issue))
             .collect();
         Ok(candidates)
     })
@@ -105,9 +106,20 @@ pub(crate) async fn prune_stale_entries() -> Result<usize> {
         return Ok(0);
     }
 
-    // Phase 2: Check PR status for candidates that have an open PR (async, no lock)
+    // Phase 2: Check PR status for candidates that have an open PR (async, no lock).
+    // Checks run concurrently via JoinSet to avoid sequential gh CLI hangs.
     let mut to_remove = Vec::new();
-    for (id, pr, repo) in &candidates {
+    let mut pr_checks = tokio::task::JoinSet::new();
+
+    for (id, pr, repo, issue) in &candidates {
+        // Skip invalid issue numbers (e.g., issue #0 from ad-hoc `gru prompt` minions).
+        // These will never have meaningful GitHub state — prune immediately.
+        if *issue == 0 {
+            log::info!("Minion {} has issue #0 (ad-hoc), pruning stale entry", id);
+            to_remove.push(id.clone());
+            continue;
+        }
+
         match pr {
             None => {
                 // No PR associated — safe to prune
@@ -137,29 +149,42 @@ pub(crate) async fn prune_stale_entries() -> Result<usize> {
                 let (owner, repo_name) = (parts[0], parts[1]);
                 let host = infer_github_host(owner, None);
 
-                match is_pr_open_via_cli(owner, repo_name, &host, pr_number).await {
-                    Ok(true) => {
-                        // PR is still open — do NOT prune
-                        log::info!(
-                            "Minion {} has open PR #{}, keeping registry entry",
-                            id,
-                            pr_number
-                        );
-                    }
-                    Ok(false) => {
-                        // PR is merged or closed — safe to prune
-                        to_remove.push(id.clone());
-                    }
-                    Err(e) => {
-                        // API error — be conservative, don't prune
-                        log::warn!(
-                            "Failed to check PR #{} status for Minion {}: {}. Keeping entry.",
-                            pr_number,
-                            id,
-                            e
-                        );
-                    }
-                }
+                // Spawn concurrent PR check
+                let id = id.clone();
+                let owner = owner.to_string();
+                let repo_name = repo_name.to_string();
+                pr_checks.spawn(async move {
+                    let result = is_pr_open_via_cli(&owner, &repo_name, &host, pr_number).await;
+                    (id, pr_number, result)
+                });
+            }
+        }
+    }
+
+    // Collect all concurrent PR check results
+    while let Some(join_result) = pr_checks.join_next().await {
+        let (id, pr_number, result) = join_result.context("PR check task panicked")?;
+        match result {
+            Ok(true) => {
+                // PR is still open — do NOT prune
+                log::info!(
+                    "Minion {} has open PR #{}, keeping registry entry",
+                    id,
+                    pr_number
+                );
+            }
+            Ok(false) => {
+                // PR is merged or closed — safe to prune
+                to_remove.push(id);
+            }
+            Err(e) => {
+                // API error — be conservative, don't prune
+                log::warn!(
+                    "Failed to check PR #{} status for Minion {}: {}. Keeping entry.",
+                    pr_number,
+                    id,
+                    e
+                );
             }
         }
     }

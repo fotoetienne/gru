@@ -82,7 +82,12 @@ impl Worktree {
             None => return Ok(None),
         };
 
-        let output = github::gh_cli_command(&self.host)
+        // Skip invalid issue numbers (e.g., #0 from ad-hoc prompts)
+        if issue_num == 0 {
+            return Ok(None);
+        }
+
+        let child = github::gh_cli_command(&self.host)
             .args([
                 "issue",
                 "view",
@@ -94,8 +99,11 @@ impl Worktree {
                 "--repo",
                 &self.repo,
             ])
-            .output()
+            .output();
+
+        let output = tokio::time::timeout(std::time::Duration::from_secs(30), child)
             .await
+            .context("Timed out checking issue status")?
             .context("Failed to check issue status")?;
 
         if !output.status.success() {
@@ -152,7 +160,7 @@ impl Worktree {
     /// - Non-zero CLI exit (e.g., auth failure, network error) propagates as `Err`.
     ///   Callers decide the conservative default for their use case.
     async fn count_prs_in_state(&self, state: &str) -> Result<u64> {
-        let output = github::gh_cli_command(&self.host)
+        let child = github::gh_cli_command(&self.host)
             .args([
                 "pr",
                 "list",
@@ -167,8 +175,11 @@ impl Worktree {
                 "--jq",
                 "length",
             ])
-            .output()
+            .output();
+
+        let output = tokio::time::timeout(std::time::Duration::from_secs(30), child)
             .await
+            .with_context(|| format!("`gh pr list --state {}` timed out", state))?
             .with_context(|| format!("Failed to run `gh pr list --state {}`", state))?;
 
         if !output.status.success() {

@@ -10,6 +10,11 @@ pub(crate) const DEFAULT_MAX_RETRIES: u32 = 5;
 const BASE_DELAY_SECS: u64 = 2;
 const MAX_DELAY_SECS: u64 = 60;
 
+/// Default timeout for `gh` CLI commands (seconds).
+/// Prevents `gru status` and other commands from hanging indefinitely
+/// when `gh` calls fail slowly (e.g., querying non-existent issues).
+const GH_TIMEOUT_SECS: u64 = 30;
+
 /// Build a `"owner/repo"` slug from separate components.
 pub(crate) fn repo_slug(owner: &str, repo: &str) -> String {
     format!("{}/{}", owner, repo)
@@ -86,10 +91,10 @@ pub(crate) async fn run_gh(host: &str, args: &[&str]) -> Result<String> {
         .map(|a| if a.len() > 80 { &a[..80] } else { a })
         .collect::<Vec<_>>()
         .join(" ");
-    let output = gh_cli_command(host)
-        .args(args)
-        .output()
+    let child = gh_cli_command(host).args(args).output();
+    let output = tokio::time::timeout(Duration::from_secs(GH_TIMEOUT_SECS), child)
         .await
+        .with_context(|| format!("gh {} timed out after {}s", args_display, GH_TIMEOUT_SECS))?
         .with_context(|| format!("Failed to execute: gh {}", args_display))?;
 
     if !output.status.success() {
