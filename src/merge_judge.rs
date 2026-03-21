@@ -467,11 +467,15 @@ async fn invoke_judge_cli(
     let output = child
         .wait_with_output()
         .await
-        .with_context(|| format!("Failed to wait for {}", backend.name()))?;
+        .with_context(|| format!("Failed to wait for agent backend '{}'", backend.name()))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("{} exited with error: {}", backend.name(), stderr.trim());
+        anyhow::bail!(
+            "Agent backend '{}' exited with error: {}",
+            backend.name(),
+            stderr.trim()
+        );
     }
 
     let response_text = String::from_utf8_lossy(&output.stdout);

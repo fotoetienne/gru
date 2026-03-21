@@ -24,7 +24,7 @@ const CI_COMPLETION_TIMEOUT_SECS: u64 = 1800;
 /// Delay after pushing before polling CI, to allow GitHub to register checks (60s)
 const POST_PUSH_DELAY_SECS: u64 = 60;
 
-/// Maximum time for a single Claude CI fix invocation (20 minutes)
+/// Maximum time for a single agent CI fix invocation (20 minutes)
 const CI_FIX_TIMEOUT_SECS: u64 = 1200;
 
 /// The status of a CI check run
@@ -268,7 +268,7 @@ pub(crate) fn classify_failure(check: &CheckRun) -> FailureType {
     FailureType::Other(name_lower)
 }
 
-/// Builds the CI failure prompt for Claude to fix the issue
+/// Builds the CI failure prompt for the agent to fix the issue
 pub(crate) fn build_ci_fix_prompt(failed_checks: &[CheckRun], attempt: u32) -> String {
     let mut prompt = format!(
         "Your PR's CI checks failed (attempt {}/{}). Please analyze the failure and fix it.\n\n",
@@ -929,13 +929,13 @@ pub(crate) async fn monitor_and_fix_ci(
                     Ok(exit_code) => {
                         if exit_code != 0 {
                             eprintln!(
-                                "⚠️  Claude fix attempt returned non-zero exit code: {}",
+                                "⚠️  Agent fix attempt returned non-zero exit code: {}",
                                 exit_code
                             );
                         }
                     }
                     Err(e) => {
-                        eprintln!("⚠️  Claude CI fix failed: {}", e);
+                        eprintln!("⚠️  Agent CI fix failed: {}", e);
                         // On timeout or other errors, retry or escalate.
                         // RetryNextAttempt re-polls CI from the same commit (no fix pushed).
                         match decide_after_no_commits(attempt, MAX_CI_FIX_ATTEMPTS) {
@@ -965,10 +965,10 @@ pub(crate) async fn monitor_and_fix_ci(
                     }
                 }
 
-                // Check if Claude actually made new commits
+                // Check if the agent actually made new commits
                 let new_sha = get_head_sha(worktree_path).await?;
                 if new_sha == head_sha {
-                    eprintln!("⚠️  Claude made no new commits, cannot retry");
+                    eprintln!("⚠️  Agent made no new commits, cannot retry");
                     match decide_after_no_commits(attempt, MAX_CI_FIX_ATTEMPTS) {
                         CiFixAction::RetryNextAttempt => continue,
                         CiFixAction::Escalate(_) => {
