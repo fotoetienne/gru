@@ -199,7 +199,7 @@ pub(crate) async fn prune_stale_entries() -> Result<usize> {
 /// Returns the number of entries archived.
 pub async fn auto_archive_completed_minions() -> Result<usize> {
     // Phase 1: Collect candidates (sync, lock held briefly)
-    let candidates: Vec<(String, Option<String>, String, u64)> = with_registry(|registry| {
+    let candidates: Vec<(String, Option<String>, String, Option<u64>)> = with_registry(|registry| {
         let minions = registry.list();
         let candidates = minions
             .iter()
@@ -258,15 +258,23 @@ pub async fn auto_archive_completed_minions() -> Result<usize> {
             }
             None => {
                 // No PR: check if issue is closed
-                match is_issue_closed_via_cli(owner, repo_name, &host, *issue).await {
-                    Ok(closed) => closed,
-                    Err(e) => {
-                        log::warn!(
-                            "Failed to check issue #{} status for Minion {}: {}",
-                            issue,
-                            id,
-                            e
-                        );
+                match issue {
+                    Some(issue_num) => {
+                        match is_issue_closed_via_cli(owner, repo_name, &host, *issue_num).await {
+                            Ok(closed) => closed,
+                            Err(e) => {
+                                log::warn!(
+                                    "Failed to check issue #{} status for Minion {}: {}",
+                                    issue_num,
+                                    id,
+                                    e
+                                );
+                                false
+                            }
+                        }
+                    }
+                    None => {
+                        // No PR and no issue — nothing to check, skip
                         false
                     }
                 }

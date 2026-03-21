@@ -609,7 +609,7 @@ async fn handle_new_reviews(
     }
 
     let review_prompt = pr_monitor::format_review_prompt(
-        ctx.issue_ctx.issue_num.unwrap_or(0),
+        ctx.issue_ctx.issue_num,
         ctx.pr_number,
         &feedback,
         &ctx.issue_ctx.owner,

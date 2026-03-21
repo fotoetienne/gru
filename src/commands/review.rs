@@ -127,18 +127,16 @@ pub(crate) async fn handle_review(pr_arg: Option<String>, agent_name: &str) -> R
     };
 
     // Fetch the issue number linked to this PR (if any)
-    let linked_issue = match find_issue_for_pr(&owner, &repo, &host, &pr_num).await {
-        Ok(0) => None,
-        Ok(n) => Some(n),
-        Err(e) => {
+    let linked_issue = find_issue_for_pr(&owner, &repo, &host, &pr_num)
+        .await
+        .unwrap_or_else(|e| {
             log::warn!(
                 "Warning: Failed to fetch linked issue for PR #{}: {}",
                 pr_num,
                 e
             );
             None
-        }
-    };
+        });
 
     // Generate a unique session ID for conversation continuity
     let session_id = Uuid::new_v4();
@@ -430,8 +428,13 @@ async fn find_pr_for_issue(issue_num: u64) -> Result<String> {
 
 /// Finds issue numbers linked to a PR
 /// Uses gh CLI to fetch issues that this PR closes/fixes
-/// Returns the first linked issue number, or 0 if no issues are linked
-async fn find_issue_for_pr(owner: &str, repo: &str, host: &str, pr_num: &str) -> Result<u64> {
+/// Returns the first linked issue number, or None if no issues are linked
+async fn find_issue_for_pr(
+    owner: &str,
+    repo: &str,
+    host: &str,
+    pr_num: &str,
+) -> Result<Option<u64>> {
     let repo_full = github::repo_slug(owner, repo);
     // Safe: pr_num is already validated as a number earlier in the call chain
     let output = github::gh_cli_command(host)
@@ -457,7 +460,7 @@ async fn find_issue_for_pr(owner: &str, repo: &str, host: &str, pr_num: &str) ->
             pr_num,
             stderr
         );
-        return Ok(0);
+        return Ok(None);
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -465,16 +468,17 @@ async fn find_issue_for_pr(owner: &str, repo: &str, host: &str, pr_num: &str) ->
 
     // If the output is "null" or empty, no issue is linked
     if trimmed.is_empty() || trimmed == "null" {
-        return Ok(0);
+        return Ok(None);
     }
 
     // Parse the issue number
     trimmed
         .parse::<u64>()
+        .map(Some)
         .context("Failed to parse issue number from PR")
         .or_else(|e| {
             log::warn!("Warning: {}", e);
-            Ok(0)
+            Ok(None)
         })
 }
 
