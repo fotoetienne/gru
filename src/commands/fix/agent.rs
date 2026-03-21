@@ -85,12 +85,22 @@ pub(super) fn build_full_prompt(issue_ctx: &IssueContext, wt_ctx: &WorktreeConte
     let mut prompt = build_fix_prompt(issue_ctx, wt_ctx);
 
     let extra_path = wt_ctx.minion_dir.join(EXTRA_CONTEXT_FILENAME);
-    if extra_path.exists() {
-        if let Ok(extra) = std::fs::read_to_string(&extra_path) {
+    match std::fs::read_to_string(&extra_path) {
+        Ok(extra) => {
             if !extra.trim().is_empty() {
                 prompt.push_str("\n\n## Additional Context from User\n\n");
                 prompt.push_str(extra.trim());
             }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // Normal case: no extra context file (--discuss was not used)
+        }
+        Err(e) => {
+            log::warn!(
+                "⚠️  Failed to read extra context from {}: {}",
+                extra_path.display(),
+                e
+            );
         }
     }
 

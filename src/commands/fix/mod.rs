@@ -268,10 +268,9 @@ enum DiscussAction {
     Abort,
 }
 
-/// Reads user input for the `--discuss` checkpoint.
-///
-/// Waits for a single key: Enter (proceed), 'a' (append context), or 'q' (abort).
-/// When 'a' is chosen, reads additional lines until an empty line or EOF.
+/// Reads a line-based command: empty line (just Enter) to proceed, 'a' + Enter to
+/// append context, or 'q' + Enter to abort. When 'a' is chosen, reads additional
+/// lines until an empty line or EOF.
 fn read_discuss_input() -> Result<DiscussAction> {
     use std::io::{BufRead, Write};
 
@@ -460,41 +459,48 @@ pub(crate) async fn handle_fix(issue: &str, opts: FixOptions) -> Result<i32> {
         .await;
     }
 
-    // --discuss: show prompt and wait for user input before launching
+    // --discuss: show prompt and wait for user input before launching.
+    // Uses build_full_prompt so the user sees exactly what the agent will receive.
+    // Loops after append so the user can verify the final prompt before proceeding.
     if discuss {
-        let prompt = agent::build_fix_prompt(&issue_ctx, &wt_ctx);
-        println!("\n--- Assembled Prompt ---");
-        println!("{}", prompt);
-        println!("--- End Prompt ---\n");
-        println!("Press Enter to launch, or:");
-        println!("  a  - append extra context");
-        println!("  q  - abort (worktree preserved)\n");
+        loop {
+            let prompt = agent::build_full_prompt(&issue_ctx, &wt_ctx);
+            println!("\n--- Assembled Prompt ---");
+            println!("{}", prompt);
+            println!("--- End Prompt ---\n");
+            println!("Press Enter to launch, or:");
+            println!("  a  - append extra context");
+            println!("  q  - abort (worktree preserved)\n");
 
-        match read_discuss_input()? {
-            DiscussAction::Proceed => {}
-            DiscussAction::Append(text) => {
-                let extra_path = wt_ctx.minion_dir.join(agent::EXTRA_CONTEXT_FILENAME);
-                std::fs::write(&extra_path, &text)
-                    .with_context(|| format!("Failed to write {}", extra_path.display()))?;
-                println!("Extra context saved. Launching agent...\n");
-            }
-            DiscussAction::Abort => {
-                if is_fresh {
-                    if let Some(issue_num) = issue_ctx.issue_num {
-                        helpers::try_unclaim_issue(
-                            &issue_ctx.host,
-                            &issue_ctx.owner,
-                            &issue_ctx.repo,
-                            issue_num,
-                        )
-                        .await;
-                    }
+            match read_discuss_input()? {
+                DiscussAction::Proceed => break,
+                DiscussAction::Append(text) => {
+                    let extra_path = wt_ctx.minion_dir.join(agent::EXTRA_CONTEXT_FILENAME);
+                    std::fs::write(&extra_path, &text)
+                        .with_context(|| format!("Failed to write {}", extra_path.display()))?;
+                    println!("Extra context saved. Rebuilding prompt...\n");
+                    continue;
                 }
-                println!(
-                    "Aborted. Worktree preserved at: {}",
-                    wt_ctx.checkout_path.display()
-                );
-                return Ok(0);
+                DiscussAction::Abort => {
+                    // Only unclaim on fresh starts — resumed minions were already claimed
+                    // by a previous session, and unclaiming would incorrectly release that claim.
+                    if is_fresh {
+                        if let Some(issue_num) = issue_ctx.issue_num {
+                            helpers::try_unclaim_issue(
+                                &issue_ctx.host,
+                                &issue_ctx.owner,
+                                &issue_ctx.repo,
+                                issue_num,
+                            )
+                            .await;
+                        }
+                    }
+                    println!(
+                        "Aborted. Worktree preserved at: {}",
+                        wt_ctx.checkout_path.display()
+                    );
+                    return Ok(0);
+                }
             }
         }
     }
