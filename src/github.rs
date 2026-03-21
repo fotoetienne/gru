@@ -217,29 +217,19 @@ pub(crate) async fn gh_api_with_retry(
 
 /// Queries the GitHub API for the repository's default branch.
 ///
-/// Uses `gh api /repos/OWNER/REPO --jq .default_branch`.
-pub(crate) async fn get_default_branch(owner: &str, repo: &str, host: &str) -> Result<String> {
-    let repo_full = repo_slug(owner, repo);
-    let endpoint = format!("repos/{}", repo_full);
-    let output = gh_cli_command(host)
-        .args(["api", &endpoint, "--jq", ".default_branch"])
-        .output()
-        .await
-        .context("Failed to query GitHub API for default branch")?;
-
-    if output.status.success() {
-        let branch = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if !branch.is_empty() {
-            return Ok(branch);
-        }
+/// Uses `gh api repos/OWNER/REPO --jq .default_branch`.
+pub(crate) async fn get_default_branch(host: &str, owner: &str, repo: &str) -> Result<String> {
+    let endpoint = format!("repos/{}", repo_slug(owner, repo));
+    let stdout = run_gh(host, &["api", &endpoint, "--jq", ".default_branch"]).await?;
+    let branch = stdout.trim().to_string();
+    if branch.is_empty() {
+        anyhow::bail!(
+            "GitHub API returned an empty default_branch for {}/{}",
+            owner,
+            repo
+        );
     }
-
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    Err(anyhow!(
-        "Failed to get default branch for {}: {}",
-        repo_full,
-        stderr.trim()
-    ))
+    Ok(branch)
 }
 
 /// Build a full GitHub issue URL for a repo in "owner/repo" format, with an explicit host.
@@ -1534,7 +1524,7 @@ mod tests {
     #[ignore]
     async fn test_get_default_branch_github_com() {
         // Requires gh auth for github.com
-        let result = get_default_branch("fotoetienne", "gru", "github.com").await;
+        let result = get_default_branch("github.com", "fotoetienne", "gru").await;
         match result {
             Ok(branch) => {
                 assert!(!branch.is_empty(), "Default branch should not be empty");

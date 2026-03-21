@@ -103,7 +103,7 @@ async fn create_pr_for_issue(
             .to_string()
     } else {
         // symbolic-ref failed (common in bare-repo worktrees); query GitHub API
-        match crate::github::get_default_branch(owner, repo, host).await {
+        match crate::github::get_default_branch(host, owner, repo).await {
             Ok(branch) => branch,
             Err(e) => {
                 log::warn!(
