@@ -1479,7 +1479,7 @@ Issue #655 revisited #515 after observing real-world Minion behavior and found O
 
 **Data (from #655, estimated from manual audit of Minion runs):**
 - ~92% of Minion runs invoke the code-reviewer agent via prompt instructions
-- When consumed, reviews consistently find actionable issues (~63% high-priority)
+- When consumed, 100% of reviews find actionable issues (~63% high-priority)
 - Minions consistently address review findings when they read them
 - The ~8% that skip review have legitimate reasons (duplicate issues, mechanical changes, post-review fixups)
 
