@@ -3,7 +3,7 @@ name: Release
 on:
   push:
     tags:
-      - "v[0-9]+.*"
+      - "v*"
 
 jobs:
   build:
@@ -37,7 +37,7 @@ jobs:
           shared-key: "release-${{ matrix.target }}"
 
       - name: Build release binary
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --locked --release --target ${{ matrix.target }}
 
       - name: Package binary
         shell: bash

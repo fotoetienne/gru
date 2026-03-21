@@ -13,7 +13,7 @@ Gru is **agent-agnostic**. It ships with backends for [Claude Code](https://gith
 
 ```bash
 # Install (macOS Apple Silicon — see Installation for other platforms)
-curl -L https://github.com/fotoetienne/gru/releases/latest/download/gru-aarch64-apple-darwin.tar.gz | tar xz
+curl -fL https://github.com/fotoetienne/gru/releases/latest/download/gru-aarch64-apple-darwin.tar.gz | tar xz
 sudo mv gru /usr/local/bin/
 
 # Initialize a repo
@@ -39,16 +39,19 @@ Gru creates an isolated worktree, spawns the agent, opens a PR, and monitors CI 
 Grab the latest release from [GitHub Releases](https://github.com/fotoetienne/gru/releases/latest):
 
 ```bash
-# macOS Apple Silicon
-curl -L https://github.com/fotoetienne/gru/releases/latest/download/gru-aarch64-apple-darwin.tar.gz | tar xz
-sudo mv gru /usr/local/bin/
+# Set target: aarch64-apple-darwin, x86_64-apple-darwin, or x86_64-unknown-linux-gnu
+TARGET=aarch64-apple-darwin
 
-# macOS Intel
-curl -L https://github.com/fotoetienne/gru/releases/latest/download/gru-x86_64-apple-darwin.tar.gz | tar xz
-sudo mv gru /usr/local/bin/
+# Download binary and checksum
+curl -fLO "https://github.com/fotoetienne/gru/releases/latest/download/gru-${TARGET}.tar.gz"
+curl -fLO "https://github.com/fotoetienne/gru/releases/latest/download/gru-${TARGET}.tar.gz.sha256"
 
-# Linux x86_64
-curl -L https://github.com/fotoetienne/gru/releases/latest/download/gru-x86_64-unknown-linux-gnu.tar.gz | tar xz
+# Verify checksum
+sha256sum --check "gru-${TARGET}.tar.gz.sha256" 2>/dev/null \
+  || shasum -a 256 --check "gru-${TARGET}.tar.gz.sha256"
+
+# Install
+tar xzf "gru-${TARGET}.tar.gz"
 sudo mv gru /usr/local/bin/
 ```
 
