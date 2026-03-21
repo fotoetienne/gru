@@ -180,19 +180,20 @@ async fn setup_pr_worktree(
         .context("Failed to fetch PR branch")?;
 
     let repo_slug = github::repo_slug(owner, repo);
-    let worktree_path = workspace
+    let minion_dir = workspace
         .work_dir(&repo_slug, branch_name)
         .context("Failed to compute worktree path")?;
+    let checkout_path = minion_dir.join("checkout");
 
     println!("🌿 Creating worktree for branch: {}", branch_name);
     git_repo
-        .create_worktree(branch_name, &worktree_path)
+        .checkout_worktree(branch_name, &checkout_path)
         .await
         .context("Failed to create worktree")?;
 
-    println!("📂 Worktree created at: {}", worktree_path.display());
+    println!("📂 Worktree created at: {}", checkout_path.display());
 
-    Ok(worktree_path)
+    Ok(checkout_path)
 }
 
 /// Sets up a worktree for an issue, returning the worktree path and branch name
