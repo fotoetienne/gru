@@ -227,7 +227,7 @@ pub async fn auto_archive_completed_minions() -> Result<usize> {
             continue;
         }
         let (owner, repo_name) = (parts[0], parts[1]);
-        let host = infer_github_host(owner);
+        let host = infer_github_host(owner, None);
 
         let should_archive = match pr {
             Some(pr_number_str) => {
@@ -282,24 +282,10 @@ pub async fn auto_archive_completed_minions() -> Result<usize> {
         return Ok(0);
     }
 
-    // Phase 3: Stamp archived_at on confirmed entries (sync, lock held briefly)
+    // Phase 3: Stamp archived_at on confirmed entries (sync, lock held briefly).
+    // Uses archive_batch for a single disk write regardless of how many entries are archived.
     let now = Utc::now();
-    let count = with_registry(move |registry| {
-        let mut archived = 0usize;
-        for id in &to_archive {
-            // Re-verify the minion is still stopped and not archived
-            if let Some(info) = registry.get(id) {
-                if info.mode == MinionMode::Stopped && info.archived_at.is_none() {
-                    registry.update(id, |info| {
-                        info.archived_at = Some(now);
-                    })?;
-                    archived += 1;
-                }
-            }
-        }
-        Ok(archived)
-    })
-    .await?;
+    let count = with_registry(move |registry| registry.archive_batch(&to_archive, now)).await?;
 
     if count > 0 {
         log::info!("📦 Auto-archived {} completed Minion(s)", count);
@@ -967,6 +953,26 @@ impl MinionRegistry {
     /// # Errors
     ///
     /// Returns an error if the registry cannot be saved to disk
+    /// Stamp `archived_at` on a batch of minions in a single save.
+    /// Only archives entries that are still Stopped and not yet archived.
+    /// Returns the number of entries archived.
+    pub(crate) fn archive_batch(&mut self, minion_ids: &[String], now: DateTime<Utc>) -> Result<usize> {
+        let mut count = 0;
+        for id in minion_ids {
+            if let Some(info) = self.data.minions.get_mut(id) {
+                if info.mode == MinionMode::Stopped && info.archived_at.is_none() {
+                    info.archived_at = Some(now);
+                    count += 1;
+                }
+            }
+        }
+        if count > 0 {
+            self.save()
+                .context("Failed to save registry after archiving")?;
+        }
+        Ok(count)
+    }
+
     pub(crate) fn remove_batch(&mut self, minion_ids: &[String]) -> Result<usize> {
         let mut count = 0;
         for id in minion_ids {

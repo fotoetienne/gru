@@ -433,6 +433,14 @@ pub async fn is_pr_merged_via_cli(
     .await?;
 
     let state = stdout.trim().to_string();
+    if state.is_empty() {
+        return Err(anyhow!(
+            "gh pr view returned empty state for PR #{} in {}/{}",
+            number,
+            owner,
+            repo
+        ));
+    }
     Ok(state == "MERGED")
 }
 
