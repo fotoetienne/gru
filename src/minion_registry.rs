@@ -954,7 +954,11 @@ impl MinionRegistry {
     /// # Errors
     ///
     /// Returns an error if the registry cannot be saved to disk.
-    pub(crate) fn archive_batch(&mut self, minion_ids: &[String], now: DateTime<Utc>) -> Result<usize> {
+    pub(crate) fn archive_batch(
+        &mut self,
+        minion_ids: &[String],
+        now: DateTime<Utc>,
+    ) -> Result<usize> {
         let mut count = 0;
         for id in minion_ids {
             if let Some(info) = self.data.minions.get_mut(id) {
