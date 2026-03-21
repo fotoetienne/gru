@@ -137,20 +137,22 @@ async fn fetch_pr_context(pr_str: &str) -> Result<(PromptContext, String, String
     Ok((context, owner, repo, host, branch_name))
 }
 
-/// Sets up a worktree for a PR by finding an existing one for the branch, or falling back to CWD
+/// Sets up a worktree for a PR by finding an existing one or creating a new one for the branch.
+/// Returns `(minion_dir, checkout_path)` where `minion_dir` holds metadata (events, prompt)
+/// and `checkout_path` is the git working directory.
 async fn setup_pr_worktree(
     owner: &str,
     repo: &str,
     host: &str,
     branch_name: &str,
-) -> Result<Option<PathBuf>> {
+) -> Result<(PathBuf, PathBuf)> {
     let workspace = workspace::Workspace::new().context("Failed to initialize Gru workspace")?;
 
     let bare_path = workspace.repos().join(owner).join(format!("{}.git", repo));
 
     // Only look for existing worktrees if the bare repo exists
     if bare_path.exists() {
-        let git_repo = git::GitRepo::new(owner, repo, host, bare_path);
+        let git_repo = git::GitRepo::new(owner, repo, host, bare_path.clone());
         if let Some(existing_path) = git_repo
             .find_worktree_for_branch(branch_name)
             .await
@@ -160,11 +162,53 @@ async fn setup_pr_worktree(
                 "♻️  Found existing worktree at: {}",
                 existing_path.display()
             );
-            return Ok(Some(existing_path));
+            // Detect layout: new-style has checkout/ subdir, legacy does not
+            let minion_dir = if existing_path
+                .file_name()
+                .map(|n| n == "checkout")
+                .unwrap_or(false)
+            {
+                existing_path
+                    .parent()
+                    .unwrap_or(&existing_path)
+                    .to_path_buf()
+            } else {
+                existing_path.clone()
+            };
+            return Ok((minion_dir, existing_path));
         }
     }
 
-    Ok(None)
+    // No existing worktree found — clone/update bare repo and create one
+    let git_repo = git::GitRepo::new(owner, repo, host, bare_path);
+
+    println!("📦 Ensuring repository is cloned...");
+    git_repo
+        .ensure_bare_clone()
+        .await
+        .context("Failed to clone or update repository")?;
+
+    println!("🔄 Fetching PR branch: {}", branch_name);
+    git_repo
+        .fetch_branch(branch_name)
+        .await
+        .context("Failed to fetch PR branch")?;
+
+    let repo_slug = github::repo_slug(owner, repo);
+    let minion_dir = workspace
+        .work_dir(&repo_slug, branch_name)
+        .context("Failed to compute worktree path")?;
+    let checkout_path = minion_dir.join("checkout");
+
+    println!("🌿 Creating worktree for branch: {}", branch_name);
+    git_repo
+        .checkout_worktree(branch_name, &checkout_path)
+        .await
+        .context("Failed to create worktree")?;
+
+    println!("📂 Worktree created at: {}", checkout_path.display());
+
+    Ok((minion_dir, checkout_path))
 }
 
 /// Sets up a worktree for an issue, returning the worktree path and branch name
@@ -518,7 +562,7 @@ async fn build_prompt_context(
 ///   1. --worktree <path>: use explicit path
 ///   2. --no-worktree: force CWD even when --issue/--pr provided
 ///   3. --issue: auto-create worktree for issue
-///   4. --pr: reuse existing worktree or fall back to CWD
+///   4. --pr: reuse existing worktree or create a new one
 ///   5. Default: ad-hoc workspace with CWD as run directory
 async fn setup_prompt_workspace(
     fetched: &mut FetchedContext,
@@ -568,28 +612,14 @@ async fn setup_prompt_workspace(
         let repo = fetched.pr_repo.as_deref().unwrap();
         let branch = fetched.pr_branch.as_deref().unwrap();
         let host = fetched.pr_host.as_deref().unwrap_or("github.com");
-        if let Some(wt_path) = setup_pr_worktree(owner, repo, host, branch).await? {
-            fetched.context.worktree_path = Some(wt_path.clone());
-            fetched.context.branch_name = Some(branch.to_string());
-            let run_dir = wt_path.clone();
-            Ok(WorkspaceSetup {
-                workspace_path: wt_path,
-                branch_name: branch.to_string(),
-                run_dir,
-            })
-        } else {
-            println!("ℹ️  No existing worktree found for PR branch - using current directory");
-            let run_dir =
-                std::env::current_dir().context("Failed to get current working directory")?;
-            let wt_path = run_dir.clone();
-            fetched.context.worktree_path = Some(wt_path.clone());
-            fetched.context.branch_name = Some(branch.to_string());
-            Ok(WorkspaceSetup {
-                workspace_path: wt_path,
-                branch_name: branch.to_string(),
-                run_dir,
-            })
-        }
+        let (minion_dir, checkout_path) = setup_pr_worktree(owner, repo, host, branch).await?;
+        fetched.context.worktree_path = Some(checkout_path.clone());
+        fetched.context.branch_name = Some(branch.to_string());
+        Ok(WorkspaceSetup {
+            workspace_path: minion_dir,
+            branch_name: branch.to_string(),
+            run_dir: checkout_path,
+        })
     } else if opts.no_worktree && has_context {
         println!("ℹ️  Running without worktree - agent will work in the current directory");
         let run_dir = std::env::current_dir().context("Failed to get current working directory")?;
