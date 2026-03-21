@@ -368,7 +368,7 @@ mod tests {
     }
 
     #[test]
-    fn test_handle_event_with_ts_valid_rfc3339() {
+    fn test_format_timestamp_valid_rfc3339() {
         let ts = format_timestamp(Some("2025-01-15T14:30:45.123+00:00"));
         // Should produce a valid HH:MM:SS timestamp (not the placeholder)
         assert_ne!(ts, "--:--:--");
@@ -380,13 +380,13 @@ mod tests {
     }
 
     #[test]
-    fn test_handle_event_with_ts_none_shows_placeholder() {
+    fn test_format_timestamp_none_shows_placeholder() {
         let ts = format_timestamp(None);
         assert_eq!(ts, "--:--:--");
     }
 
     #[test]
-    fn test_handle_event_with_ts_invalid_shows_placeholder() {
+    fn test_format_timestamp_invalid_shows_placeholder() {
         let ts = format_timestamp(Some("not-a-timestamp"));
         assert_eq!(ts, "--:--:--");
     }

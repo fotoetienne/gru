@@ -240,14 +240,18 @@ pub(crate) fn agent_exit_code(agent_result: &Option<AgentResult>) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::process::Command;
 
+    #[cfg(unix)]
     fn exit_status(code: i32) -> std::process::ExitStatus {
-        // Use a real process to get an ExitStatus with a specific code.
-        Command::new("sh")
-            .args(["-c", &format!("exit {}", code)])
-            .status()
-            .unwrap()
+        use std::os::unix::process::ExitStatusExt;
+        // On Unix, the raw wait status encodes the exit code in the high byte.
+        ExitStatusExt::from_raw((code & 0xff) << 8)
+    }
+
+    #[cfg(windows)]
+    fn exit_status(code: i32) -> std::process::ExitStatus {
+        use std::os::windows::process::ExitStatusExt;
+        ExitStatusExt::from_raw(code as u32)
     }
 
     #[test]
