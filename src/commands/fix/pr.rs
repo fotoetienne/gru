@@ -390,7 +390,11 @@ pub(crate) async fn handle_pr_creation(
     .await
     {
         Ok(pr_number) => {
-            finalize_pr(issue_ctx, wt_ctx, &pr_number).await?;
+            // Best-effort: the PR already exists on GitHub, so losing
+            // local metadata is recoverable on next resume.
+            if let Err(e) = finalize_pr(issue_ctx, wt_ctx, &pr_number).await {
+                log::warn!("⚠️  Failed to finalize new PR state: {}", e);
+            }
 
             println!("✅ Draft PR created: #{}", pr_number);
             println!(
