@@ -5,7 +5,6 @@ use crate::commands::fix::{
     agent_exit_code, create_pr_phase, monitor_pr_phase, run_agent_phase,
     update_orchestration_phase, IssueContext, WorktreeContext,
 };
-use crate::config::{LabConfig, DEFAULT_MAX_RESUME_ATTEMPTS};
 use crate::minion_registry::{
     mark_minion_failed, revert_to_stopped, with_registry, MinionMode, OrchestrationPhase,
 };
@@ -16,15 +15,6 @@ use anyhow::{bail, Result};
 use chrono::{DateTime, Utc};
 use tokio::time::Duration;
 use uuid::Uuid;
-
-/// Load the `max_resume_attempts` setting from config, falling back to the default.
-fn load_max_resume_attempts() -> u32 {
-    LabConfig::default_path()
-        .ok()
-        .and_then(|p| LabConfig::load_partial(&p).ok())
-        .map(|c| c.daemon.max_resume_attempts)
-        .unwrap_or(DEFAULT_MAX_RESUME_ATTEMPTS)
-}
 
 /// Context produced by `check_resumption_preconditions`, consumed by `run_resume_pipeline`.
 struct ResumeContext {
@@ -118,7 +108,7 @@ async fn check_resumption_preconditions(
     let branch_name = info.branch;
     let agent_name = info.agent_name;
     let timeout_deadline: Option<DateTime<Utc>> = info.timeout_deadline;
-    let attempt_count = info.attempt_count;
+    let _attempt_count = info.attempt_count;
     let no_watch = info.no_watch;
     let start_phase = info.orchestration_phase.clone();
     let wake_reason = info.wake_reason.clone();
@@ -135,29 +125,18 @@ async fn check_resumption_preconditions(
         }
     }
 
-    // Increment attempt_count for this resume
+    // Increment attempt_count for observability.  We do NOT enforce
+    // max_resume_attempts here — that limit is enforced by `gru lab`'s
+    // `should_resume_candidate()` for daemon-driven retries.  User-initiated
+    // paths (`gru resume`, `gru attach` auto-resume) should always succeed
+    // because the human made an explicit decision.
     let mid = minion.minion_id.clone();
-    let new_attempt_count = with_registry(move |reg| {
+    let _ = with_registry(move |reg| {
         reg.update(&mid, |info| {
             info.attempt_count = info.attempt_count.saturating_add(1);
-        })?;
-        let count = reg.get(&mid).map(|i| i.attempt_count).unwrap_or(0);
-        Ok(count)
+        })
     })
-    .await
-    .unwrap_or(attempt_count.saturating_add(1));
-
-    // Check if attempt_count exceeds max_resume_attempts
-    let max_attempts = load_max_resume_attempts();
-    if new_attempt_count > max_attempts {
-        mark_minion_failed(&minion.minion_id).await;
-        bail!(
-            "Minion {} has exceeded maximum resume attempts ({} > {}). Marking as failed.",
-            minion.minion_id,
-            new_attempt_count,
-            max_attempts
-        );
-    }
+    .await;
 
     let session_uuid = match Uuid::parse_str(&session_id) {
         Ok(uuid) => uuid,
@@ -495,13 +474,6 @@ mod tests {
 
         let err_msg = format!("{:#}", result.unwrap_err());
         assert!(err_msg.contains("Could not resolve ID"));
-    }
-
-    #[test]
-    fn test_load_max_resume_attempts_returns_default_without_config() {
-        assert_eq!(DEFAULT_MAX_RESUME_ATTEMPTS, 3);
-        let max = load_max_resume_attempts();
-        assert!(max >= 1, "load_max_resume_attempts must return at least 1");
     }
 
     #[test]
