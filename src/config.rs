@@ -411,10 +411,11 @@ impl LabConfig {
             // When the document is all-comments (e.g., default template), toml_edit
             // would insert the new table before the comments. Instead, we append the
             // section as raw TOML at the end of the file after building it.
+            let repo_value = toml_edit::value(repo_entry);
             let output = format!(
-                "{}\n[daemon]\nrepos = [\"{}\"]\n",
+                "{}\n[daemon]\nrepos = [{}]\n",
                 contents.trim_end(),
-                repo_entry
+                repo_value
             );
             let mut file = fs::OpenOptions::new()
                 .write(true)

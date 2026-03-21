@@ -205,23 +205,39 @@ pub(crate) async fn handle_init(repo_arg: String, host_override: Option<String>)
 
     // 4. Add repo to daemon.repos in config
     let repo_entry = if host.eq_ignore_ascii_case("github.com") {
+        // Default GitHub host uses owner/repo format
         format!("{}/{}", owner, repo)
-    } else {
+    } else if host.contains('.') {
+        // Non-GitHub host with a dot is supported in legacy host/owner/repo form
         format!("{}/{}/{}", host, owner, repo)
+    } else {
+        // Hosts without dots (e.g., "localhost") can't be represented in
+        // host/owner/repo format (config parser requires a dot). Skip and advise.
+        log::warn!(
+            "  ⚠️  Cannot add {}/{}/{} to daemon.repos: host {:?} has no dot. \
+             Add the repo manually using a [github_hosts.*] named entry.",
+            host,
+            owner,
+            repo,
+            host,
+        );
+        String::new()
     };
-    match LabConfig::add_repo_to_config(&config_path, &repo_entry) {
-        Ok(true) => {
-            println!(
-                "✓ Added {} to daemon.repos in {}",
-                repo_entry,
-                config_path.display()
-            );
-        }
-        Ok(false) => {
-            println!("  ℹ {} already in daemon.repos", repo_entry);
-        }
-        Err(e) => {
-            log::warn!("  ⚠️  Could not update daemon.repos: {}", e);
+    if !repo_entry.is_empty() {
+        match LabConfig::add_repo_to_config(&config_path, &repo_entry) {
+            Ok(true) => {
+                println!(
+                    "✓ Added {} to daemon.repos in {}",
+                    repo_entry,
+                    config_path.display()
+                );
+            }
+            Ok(false) => {
+                println!("  ℹ {} already in daemon.repos", repo_entry);
+            }
+            Err(e) => {
+                log::warn!("  ⚠️  Could not update daemon.repos: {}", e);
+            }
         }
     }
 
