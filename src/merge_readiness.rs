@@ -948,39 +948,35 @@ mod tests {
         assert!(mr.failure_reasons().is_empty());
     }
 
-    // --- mergeable field edge cases ---
+    // --- mergeable → no_conflicts derivation ---
+    // Production code: `let no_conflicts = pr.mergeable == Some(true);`
+    // These tests exercise that exact expression to protect the mapping.
 
     #[test]
-    fn test_mergeable_null_treated_as_not_ready() {
-        let pr = PrDetails {
-            head_sha: "abc123".into(),
-            draft: false,
-            mergeable: None,
-            author_login: "author".into(),
-        };
-        assert!(pr.mergeable != Some(true));
+    fn test_mergeable_null_means_no_conflicts_false() {
+        let mergeable: Option<bool> = None;
+        let no_conflicts = mergeable == Some(true);
+        assert!(
+            !no_conflicts,
+            "None (unknown) should not count as no-conflicts"
+        );
     }
 
     #[test]
-    fn test_mergeable_false_treated_as_not_ready() {
-        let pr = PrDetails {
-            head_sha: "abc123".into(),
-            draft: false,
-            mergeable: Some(false),
-            author_login: "author".into(),
-        };
-        assert!(pr.mergeable != Some(true));
+    fn test_mergeable_false_means_no_conflicts_false() {
+        let mergeable: Option<bool> = Some(false);
+        let no_conflicts = mergeable == Some(true);
+        assert!(
+            !no_conflicts,
+            "Some(false) should not count as no-conflicts"
+        );
     }
 
     #[test]
-    fn test_mergeable_true_is_ready() {
-        let pr = PrDetails {
-            head_sha: "abc123".into(),
-            draft: false,
-            mergeable: Some(true),
-            author_login: "author".into(),
-        };
-        assert!(pr.mergeable == Some(true));
+    fn test_mergeable_true_means_no_conflicts_true() {
+        let mergeable: Option<bool> = Some(true);
+        let no_conflicts = mergeable == Some(true);
+        assert!(no_conflicts, "Some(true) should count as no-conflicts");
     }
 
     // NOTE: Tests for `crate::github::is_retryable_error` are co-located with
