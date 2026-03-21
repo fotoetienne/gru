@@ -578,7 +578,11 @@ async fn get_pr(host: &str, owner: &str, repo: &str, pr_number: &str) -> Result<
     Ok(pr)
 }
 
-/// Fetch all reviews for a PR with retry logic for transient failures
+/// Fetch all reviews for a PR with retry logic for transient failures.
+///
+/// Uses `--jq ".[]"` to extract individual review objects line-by-line.
+/// The reviews endpoint returns a bare JSON array (unlike check-runs which
+/// wraps results in a `.check_runs` field).
 pub(crate) async fn get_all_reviews(
     host: &str,
     owner: &str,
@@ -587,15 +591,32 @@ pub(crate) async fn get_all_reviews(
 ) -> Result<Vec<Review>> {
     let repo_full = github::repo_slug(owner, repo);
     let endpoint = format!("repos/{repo_full}/pulls/{pr_number}/reviews");
-    let output = gh_api_with_retry(host, &["api", &endpoint], DEFAULT_MAX_RETRIES).await?;
+    // --paginate with --jq streams individual review objects, one per line
+    let output = gh_api_with_retry(
+        host,
+        &["api", "--paginate", &endpoint, "--jq", ".[]"],
+        DEFAULT_MAX_RETRIES,
+    )
+    .await?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         anyhow::bail!("Failed to fetch reviews for PR #{}: {}", pr_number, stderr);
     }
 
-    let reviews: Vec<Review> =
-        serde_json::from_slice(&output.stdout).context("Failed to parse reviews JSON response")?;
+    let stdout =
+        std::str::from_utf8(&output.stdout).context("Failed to decode reviews stdout as UTF-8")?;
+
+    let mut reviews = Vec::new();
+    for line in stdout.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let review: Review =
+            serde_json::from_str(line).context("Failed to parse review JSON line")?;
+        reviews.push(review);
+    }
 
     Ok(reviews)
 }
@@ -752,6 +773,8 @@ Each reply must:\n\
 ///
 /// Uses `--jq ".check_runs[]"` to extract individual check run objects line-by-line,
 /// which is resilient to wrapper structure changes and handles pagination.
+/// Note: the check-runs endpoint wraps results in a `.check_runs` field (hence
+/// `.check_runs[]`), unlike the reviews endpoint which returns a bare array (`.[]`).
 async fn get_check_runs(host: &str, owner: &str, repo: &str, sha: &str) -> Result<Vec<CheckRun>> {
     let repo_full = github::repo_slug(owner, repo);
     let endpoint = format!("repos/{repo_full}/commits/{sha}/check-runs");
@@ -1123,21 +1146,17 @@ mod tests {
     }
 
     #[test]
-    fn test_review_list_deserialize() {
-        let json = r#"[
-            {
-                "id": 1,
-                "submitted_at": "2024-06-15T10:30:00Z",
-                "user": {"login": "alice"}
-            },
-            {
-                "id": 2,
-                "submitted_at": "2024-06-15T11:30:00Z",
-                "user": {"login": "bob"}
-            }
-        ]"#;
+    fn test_review_line_by_line_deserialize() {
+        // Simulates --jq ".[]" output: one JSON object per line
+        let lines = r#"{"id": 1, "submitted_at": "2024-06-15T10:30:00Z", "user": {"login": "alice"}}
+{"id": 2, "submitted_at": "2024-06-15T11:30:00Z", "user": {"login": "bob"}}"#;
 
-        let reviews: Vec<Review> = serde_json::from_str(json).unwrap();
+        let reviews: Vec<Review> = lines
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+
         assert_eq!(reviews.len(), 2);
         assert_eq!(reviews[0].id, 1);
         assert_eq!(reviews[0].user.login, "alice");
@@ -1146,9 +1165,16 @@ mod tests {
     }
 
     #[test]
-    fn test_review_list_empty() {
-        let json = "[]";
-        let reviews: Vec<Review> = serde_json::from_str(json).unwrap();
+    fn test_review_line_by_line_empty() {
+        // Simulates --jq ".[]" output when there are no reviews
+        let lines = "";
+
+        let reviews: Vec<Review> = lines
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+
         assert!(reviews.is_empty());
     }
 
