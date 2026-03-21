@@ -18,7 +18,7 @@ pub async fn handle_pm(verbose: bool) -> Result<i32> {
 
 /// Handles the `gru tpm` command — interactive TPM session.
 pub async fn handle_tpm(verbose: bool) -> Result<i32> {
-    launch_skill_session("project manager", TPM_SKILL, verbose).await
+    launch_skill_session("technical project manager", TPM_SKILL, verbose).await
 }
 
 /// Launches an interactive Claude session with the given skill as the system prompt.
@@ -60,10 +60,27 @@ fn strip_frontmatter(content: &str) -> &str {
     if !content.starts_with("---") {
         return content;
     }
-    // Find the closing "---" (after the first line)
-    if let Some(end) = content[3..].find("\n---") {
-        let after_frontmatter = 3 + end + 4; // skip past "\n---"
-        content[after_frontmatter..].trim_start_matches('\n')
+    // Find the closing "---" on its own line (after the first line)
+    let rest = &content[3..];
+    let closing = rest
+        .find("\n---\n")
+        .map(|i| (i, 5)) // skip "\n---\n"
+        .or_else(|| {
+            // Handle "---" as the very last line (no trailing newline)
+            if rest.ends_with("\n---") {
+                Some((rest.len() - 4, rest.len() - rest.rfind('\n').unwrap_or(0)))
+            } else {
+                None
+            }
+        });
+    if let Some((end, skip)) = closing {
+        let after_frontmatter = 3 + end + skip;
+        if after_frontmatter < content.len() {
+            content[after_frontmatter..].trim_start_matches('\n')
+        } else {
+            // Frontmatter only, no content after it
+            ""
+        }
     } else {
         content
     }
@@ -97,6 +114,21 @@ mod tests {
         let content = "No frontmatter here.\nJust content.";
         let result = strip_frontmatter(content);
         assert_eq!(result, content);
+    }
+
+    #[test]
+    fn test_strip_frontmatter_closing_requires_own_line() {
+        // "--- extra" must NOT be treated as a closing delimiter
+        let content = "---\nname: test\n--- extra\n\nContent.";
+        let result = strip_frontmatter(content);
+        assert_eq!(result, content);
+    }
+
+    #[test]
+    fn test_strip_frontmatter_no_trailing_newline() {
+        let content = "---\nname: test\n---";
+        let result = strip_frontmatter(content);
+        assert_eq!(result, "");
     }
 
     #[test]
