@@ -109,11 +109,11 @@ async fn check_resumption_preconditions(
     let issue_num = info.issue;
     let branch_name = info.branch;
     let agent_name = info.agent_name;
+    let command = info.command;
     let timeout_deadline: Option<DateTime<Utc>> = info.timeout_deadline;
     let no_watch = info.no_watch;
     let start_phase = info.orchestration_phase.clone();
     let wake_reason = info.wake_reason.clone();
-    let command = info.command.clone();
 
     // Check if timeout_deadline has passed — fail instead of resuming
     if let Some(deadline) = timeout_deadline {
