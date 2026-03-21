@@ -31,7 +31,7 @@ const TPM_SKILL_URI: &str = "gru://skills/tpm";
 struct MinionSummary {
     id: String,
     repo: String,
-    issue: u64,
+    issue: Option<u64>,
     command: String,
     branch: String,
     mode: String,
@@ -112,7 +112,7 @@ impl GruMcpServer {
             if let Some(ref filter) = filter {
                 if let Ok(num) = filter.parse::<u64>() {
                     summaries.retain(|m| {
-                        m.issue == num
+                        m.issue == Some(num)
                             || m.pr.as_ref().and_then(|pr| pr.parse::<u64>().ok()) == Some(num)
                     });
                 } else {
@@ -302,7 +302,7 @@ mod tests {
         let summary = MinionSummary {
             id: "M001".to_string(),
             repo: "owner/repo".to_string(),
-            issue: 42,
+            issue: Some(42),
             command: "do".to_string(),
             branch: "minion/issue-42-M001".to_string(),
             mode: "autonomous".to_string(),
