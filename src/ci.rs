@@ -842,46 +842,15 @@ pub(crate) async fn monitor_and_fix_ci(
                 continue;
             }
             CiFixAction::Escalate(EscalationReason::Timeout) => {
-                eprintln!(
-                    "🚨 Max fix attempts ({}) reached with CI timeout, escalating to human",
-                    MAX_CI_FIX_ATTEMPTS
-                );
-                post_exhaustion_escalation_comment(
-                    host,
-                    owner,
-                    repo,
-                    pr_number,
-                    "CI checks timed out on all attempts.",
-                    attempt,
-                    minion_id,
-                )
-                .await
-                .unwrap_or_else(|e| eprintln!("⚠️  Failed to post escalation: {}", e));
-                return Ok(false);
+                return escalate_timeout(host, owner, repo, pr_number, attempt, minion_id).await;
             }
             CiFixAction::Escalate(EscalationReason::ChecksFailed) => {
                 let mut failed_checks = match ci_result {
                     CiResult::Failed(checks) => checks,
                     _ => unreachable!(),
                 };
-
-                // Enrich with detailed logs before escalating
-                for check in &mut failed_checks {
-                    if check.output.is_none() || check.output.as_deref() == Some("") {
-                        if let Ok(Some(logs)) =
-                            fetch_check_logs(host, owner, repo, &check.name, pr_number, branch)
-                                .await
-                        {
-                            check.output = Some(logs);
-                        }
-                    }
-                }
-
-                eprintln!(
-                    "🚨 Max fix attempts ({}) reached, escalating to human",
-                    MAX_CI_FIX_ATTEMPTS
-                );
-                post_escalation_comment(
+                enrich_check_logs(host, owner, repo, pr_number, branch, &mut failed_checks).await;
+                return escalate_checks_failed(
                     host,
                     owner,
                     repo,
@@ -890,134 +859,32 @@ pub(crate) async fn monitor_and_fix_ci(
                     attempt,
                     minion_id,
                 )
-                .await
-                .unwrap_or_else(|e| eprintln!("⚠️  Failed to post escalation: {}", e));
-                return Ok(false);
+                .await;
             }
             CiFixAction::AttemptFix => {
-                let mut failed_checks = match ci_result {
+                let failed_checks = match ci_result {
                     CiResult::Failed(checks) => checks,
                     _ => unreachable!(),
                 };
-                let check_names: Vec<&str> =
-                    failed_checks.iter().map(|c| c.name.as_str()).collect();
-                eprintln!("❌ CI checks failed: {}", check_names.join(", "));
-
-                // Try to fetch more detailed logs for each failed check
-                for check in &mut failed_checks {
-                    if check.output.is_none() || check.output.as_deref() == Some("") {
-                        if let Ok(Some(logs)) =
-                            fetch_check_logs(host, owner, repo, &check.name, pr_number, branch)
-                                .await
-                        {
-                            check.output = Some(logs);
-                        }
-                    }
-                }
-
-                // Invoke agent to fix
-                eprintln!(
-                    "🔧 Invoking {} to fix CI failures (attempt {}/{})...",
-                    backend.name(),
+                let fix_result = run_ci_fix_with_retries(
+                    backend,
+                    host,
+                    owner,
+                    repo,
+                    pr_number,
+                    branch,
+                    worktree_path,
+                    minion_id,
+                    &head_sha,
+                    failed_checks,
                     attempt,
-                    MAX_CI_FIX_ATTEMPTS
-                );
-                let fix_result =
-                    invoke_ci_fix(backend, worktree_path, &failed_checks, attempt).await;
-
+                )
+                .await?;
                 match fix_result {
-                    Ok(exit_code) => {
-                        if exit_code != 0 {
-                            eprintln!(
-                                "⚠️  Agent fix attempt returned non-zero exit code: {}",
-                                exit_code
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!("⚠️  Agent CI fix failed: {}", e);
-                        // On timeout or other errors, retry or escalate.
-                        // RetryNextAttempt re-polls CI from the same commit (no fix pushed).
-                        match decide_after_no_commits(attempt, MAX_CI_FIX_ATTEMPTS) {
-                            CiFixAction::RetryNextAttempt => continue,
-                            CiFixAction::Escalate(_) => {
-                                eprintln!(
-                                    "🚨 Max fix attempts ({}) reached with CI fix error, escalating to human",
-                                    MAX_CI_FIX_ATTEMPTS
-                                );
-                                post_exhaustion_escalation_comment(
-                                    host,
-                                    owner,
-                                    repo,
-                                    pr_number,
-                                    &format!("CI fix process failed: {}", e),
-                                    attempt,
-                                    minion_id,
-                                )
-                                .await
-                                .unwrap_or_else(|e| {
-                                    eprintln!("⚠️  Failed to post escalation: {}", e)
-                                });
-                                return Ok(false);
-                            }
-                            _ => unreachable!(),
-                        }
-                    }
+                    CiFixLoopAction::Continue => continue,
+                    CiFixLoopAction::Break => break,
+                    CiFixLoopAction::Return(val) => return Ok(val),
                 }
-
-                // Check if the agent actually made new commits
-                let new_sha = get_head_sha(worktree_path).await?;
-                if new_sha == head_sha {
-                    eprintln!("⚠️  Agent made no new commits, cannot retry");
-                    match decide_after_no_commits(attempt, MAX_CI_FIX_ATTEMPTS) {
-                        CiFixAction::RetryNextAttempt => continue,
-                        CiFixAction::Escalate(_) => {
-                            eprintln!(
-                                "🚨 Max fix attempts ({}) reached with no commits, escalating to human",
-                                MAX_CI_FIX_ATTEMPTS
-                            );
-                            post_exhaustion_escalation_comment(
-                                host,
-                                owner,
-                                repo,
-                                pr_number,
-                                "CI fix attempt produced no new commits on all attempts.",
-                                attempt,
-                                minion_id,
-                            )
-                            .await
-                            .unwrap_or_else(|e| eprintln!("⚠️  Failed to post escalation: {}", e));
-                            return Ok(false);
-                        }
-                        _ => unreachable!(),
-                    }
-                }
-
-                // Push the fix
-                eprintln!("📤 Pushing CI fix...");
-                let push_output = Command::new("git")
-                    .args(["push", "origin", branch])
-                    .current_dir(worktree_path)
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .output()
-                    .await
-                    .context("Failed to push CI fix")?;
-
-                if !push_output.status.success() {
-                    let stderr = String::from_utf8_lossy(&push_output.stderr);
-                    eprintln!("⚠️  Push failed: {}", stderr);
-                    break;
-                }
-
-                // Wait for GitHub to register checks for the new commit
-                eprintln!(
-                    "⏳ Waiting {}s for CI to register new checks...",
-                    POST_PUSH_DELAY_SECS
-                );
-                sleep(Duration::from_secs(POST_PUSH_DELAY_SECS)).await;
-
-                // Loop continues to check CI again
             }
             // NoCommits escalation is only returned by decide_after_no_commits
             CiFixAction::Escalate(EscalationReason::NoCommits) => unreachable!(),
@@ -1026,6 +893,225 @@ pub(crate) async fn monitor_and_fix_ci(
 
     // Should not reach here, but handle gracefully
     Ok(false)
+}
+
+/// Internal signal from `run_ci_fix_with_retries` back to the main loop.
+enum CiFixLoopAction {
+    /// Retry: `continue` the outer attempt loop.
+    Continue,
+    /// Push failed: `break` the outer loop.
+    Break,
+    /// Escalated to human: return this value immediately.
+    Return(bool),
+}
+
+/// Enrich failed checks with detailed logs when output is missing.
+async fn enrich_check_logs(
+    host: &str,
+    owner: &str,
+    repo: &str,
+    pr_number: u64,
+    branch: &str,
+    failed_checks: &mut [CheckRun],
+) {
+    for check in failed_checks.iter_mut() {
+        if check.output.is_none() || check.output.as_deref() == Some("") {
+            if let Ok(Some(logs)) =
+                fetch_check_logs(host, owner, repo, &check.name, pr_number, branch).await
+            {
+                check.output = Some(logs);
+            }
+        }
+    }
+}
+
+/// Escalate when CI checks timed out on final attempt.
+async fn escalate_timeout(
+    host: &str,
+    owner: &str,
+    repo: &str,
+    pr_number: u64,
+    attempt: u32,
+    minion_id: &str,
+) -> Result<bool> {
+    eprintln!(
+        "🚨 Max fix attempts ({}) reached with CI timeout, escalating to human",
+        MAX_CI_FIX_ATTEMPTS
+    );
+    post_exhaustion_escalation_comment(
+        host,
+        owner,
+        repo,
+        pr_number,
+        "CI checks timed out on all attempts.",
+        attempt,
+        minion_id,
+    )
+    .await
+    .unwrap_or_else(|e| eprintln!("⚠️  Failed to post escalation: {}", e));
+    Ok(false)
+}
+
+/// Escalate when CI checks failed on final attempt.
+async fn escalate_checks_failed(
+    host: &str,
+    owner: &str,
+    repo: &str,
+    pr_number: u64,
+    failed_checks: &[CheckRun],
+    attempt: u32,
+    minion_id: &str,
+) -> Result<bool> {
+    eprintln!(
+        "🚨 Max fix attempts ({}) reached, escalating to human",
+        MAX_CI_FIX_ATTEMPTS
+    );
+    post_escalation_comment(
+        host,
+        owner,
+        repo,
+        pr_number,
+        failed_checks,
+        attempt,
+        minion_id,
+    )
+    .await
+    .unwrap_or_else(|e| eprintln!("⚠️  Failed to post escalation: {}", e));
+    Ok(false)
+}
+
+/// Escalate with a reason string (timeout, fix error, or no commits).
+async fn escalate_exhaustion(
+    host: &str,
+    owner: &str,
+    repo: &str,
+    pr_number: u64,
+    reason: &str,
+    attempt: u32,
+    minion_id: &str,
+) -> CiFixLoopAction {
+    post_exhaustion_escalation_comment(host, owner, repo, pr_number, reason, attempt, minion_id)
+        .await
+        .unwrap_or_else(|e| eprintln!("⚠️  Failed to post escalation: {}", e));
+    CiFixLoopAction::Return(false)
+}
+
+/// Run a single CI fix attempt: enrich logs, invoke Claude, check for new
+/// commits, and push. Returns a loop-control signal for the caller.
+#[allow(clippy::too_many_arguments)]
+async fn run_ci_fix_with_retries(
+    backend: &dyn AgentBackend,
+    host: &str,
+    owner: &str,
+    repo: &str,
+    pr_number: u64,
+    branch: &str,
+    worktree_path: &Path,
+    minion_id: &str,
+    head_sha: &str,
+    mut failed_checks: Vec<CheckRun>,
+    attempt: u32,
+) -> Result<CiFixLoopAction> {
+    let check_names: Vec<&str> = failed_checks.iter().map(|c| c.name.as_str()).collect();
+    eprintln!("❌ CI checks failed: {}", check_names.join(", "));
+
+    enrich_check_logs(host, owner, repo, pr_number, branch, &mut failed_checks).await;
+
+    // Invoke agent to fix
+    eprintln!(
+        "🔧 Invoking {} to fix CI failures (attempt {}/{})...",
+        backend.name(),
+        attempt,
+        MAX_CI_FIX_ATTEMPTS
+    );
+    let fix_result = invoke_ci_fix(backend, worktree_path, &failed_checks, attempt).await;
+
+    match fix_result {
+        Ok(exit_code) => {
+            if exit_code != 0 {
+                eprintln!(
+                    "⚠️  Agent fix attempt returned non-zero exit code: {}",
+                    exit_code
+                );
+            }
+        }
+        Err(e) => {
+            eprintln!("⚠️  Agent CI fix failed: {}", e);
+            match decide_after_no_commits(attempt, MAX_CI_FIX_ATTEMPTS) {
+                CiFixAction::RetryNextAttempt => return Ok(CiFixLoopAction::Continue),
+                CiFixAction::Escalate(_) => {
+                    eprintln!(
+                        "🚨 Max fix attempts ({}) reached with CI fix error, escalating to human",
+                        MAX_CI_FIX_ATTEMPTS
+                    );
+                    return Ok(escalate_exhaustion(
+                        host,
+                        owner,
+                        repo,
+                        pr_number,
+                        &format!("CI fix process failed: {}", e),
+                        attempt,
+                        minion_id,
+                    )
+                    .await);
+                }
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    // Check if the agent actually made new commits
+    let new_sha = get_head_sha(worktree_path).await?;
+    if new_sha == head_sha {
+        eprintln!("⚠️  Agent made no new commits, cannot retry");
+        match decide_after_no_commits(attempt, MAX_CI_FIX_ATTEMPTS) {
+            CiFixAction::RetryNextAttempt => return Ok(CiFixLoopAction::Continue),
+            CiFixAction::Escalate(_) => {
+                eprintln!(
+                    "🚨 Max fix attempts ({}) reached with no commits, escalating to human",
+                    MAX_CI_FIX_ATTEMPTS
+                );
+                return Ok(escalate_exhaustion(
+                    host,
+                    owner,
+                    repo,
+                    pr_number,
+                    "CI fix attempt produced no new commits on all attempts.",
+                    attempt,
+                    minion_id,
+                )
+                .await);
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    // Push the fix
+    eprintln!("📤 Pushing CI fix...");
+    let push_output = Command::new("git")
+        .args(["push", "origin", branch])
+        .current_dir(worktree_path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .await
+        .context("Failed to push CI fix")?;
+
+    if !push_output.status.success() {
+        let stderr = String::from_utf8_lossy(&push_output.stderr);
+        eprintln!("⚠️  Push failed: {}", stderr);
+        return Ok(CiFixLoopAction::Break);
+    }
+
+    // Wait for GitHub to register checks for the new commit
+    eprintln!(
+        "⏳ Waiting {}s for CI to register new checks...",
+        POST_PUSH_DELAY_SECS
+    );
+    sleep(Duration::from_secs(POST_PUSH_DELAY_SECS)).await;
+
+    // Loop continues to check CI again
+    Ok(CiFixLoopAction::Continue)
 }
 
 /// Computes a human-readable duration string from start/end timestamps

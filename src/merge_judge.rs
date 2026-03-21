@@ -14,6 +14,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
+use tokio::task::JoinSet;
 
 use crate::agent::AgentBackend;
 use crate::github;
@@ -168,6 +169,37 @@ impl JudgeState {
     }
 }
 
+/// Run multiple `gh` commands in parallel, returning results in input order.
+///
+/// Each entry in `arg_sets` is a list of arguments passed to `github::run_gh`.
+/// All commands are spawned concurrently and the function returns once all
+/// complete, or propagates the first error encountered.
+async fn run_gh_parallel(host: &str, arg_sets: Vec<Vec<String>>) -> Result<Vec<String>> {
+    let count = arg_sets.len();
+    let mut set = JoinSet::new();
+
+    for (idx, args) in arg_sets.into_iter().enumerate() {
+        let host = host.to_string();
+        set.spawn(async move {
+            let refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+            let result = github::run_gh(&host, &refs).await?;
+            Ok::<_, anyhow::Error>((idx, result))
+        });
+    }
+
+    let mut results: Vec<Option<String>> = (0..count).map(|_| None).collect();
+    while let Some(join_result) = set.join_next().await {
+        let (idx, output) = join_result.context("gh task panicked")??;
+        results[idx] = Some(output);
+    }
+
+    results
+        .into_iter()
+        .enumerate()
+        .map(|(i, opt)| opt.ok_or_else(|| anyhow::anyhow!("missing result at index {i}")))
+        .collect()
+}
+
 /// Lightweight fingerprint fetch — only head SHA + comment counts.
 /// Used to check `should_invoke` before fetching full context.
 pub(crate) async fn get_pr_fingerprint(
@@ -178,58 +210,51 @@ pub(crate) async fn get_pr_fingerprint(
 ) -> Result<PrStateFingerprint> {
     let repo_full = github::repo_slug(owner, repo);
 
-    let pr_fut = {
-        let host = host.to_string();
-        let ep = format!("repos/{repo_full}/pulls/{pr_number}");
-        async move {
-            let stdout = github::run_gh(&host, &["api", &ep]).await?;
-            #[derive(Deserialize)]
-            struct PrHead {
-                head: Head,
-            }
-            #[derive(Deserialize)]
-            struct Head {
-                sha: String,
-            }
-            let pr: PrHead = serde_json::from_str(&stdout).context("Failed to parse PR JSON")?;
-            Ok::<String, anyhow::Error>(pr.head.sha)
-        }
-    };
+    let results = run_gh_parallel(
+        host,
+        vec![
+            vec!["api".into(), format!("repos/{repo_full}/pulls/{pr_number}")],
+            vec![
+                "api".into(),
+                format!("repos/{repo_full}/issues/{pr_number}/comments"),
+                "--paginate".into(),
+                "--jq".into(),
+                "length".into(),
+            ],
+            vec![
+                "api".into(),
+                format!("repos/{repo_full}/pulls/{pr_number}/reviews"),
+                "--paginate".into(),
+                "--jq".into(),
+                "length".into(),
+            ],
+            vec![
+                "api".into(),
+                format!("repos/{repo_full}/pulls/{pr_number}/comments"),
+                "--paginate".into(),
+                "--jq".into(),
+                "length".into(),
+            ],
+        ],
+    )
+    .await?;
 
-    let ic_fut = {
-        let host = host.to_string();
-        let ep = format!("repos/{repo_full}/issues/{pr_number}/comments");
-        async move {
-            let stdout =
-                github::run_gh(&host, &["api", &ep, "--paginate", "--jq", "length"]).await?;
-            Ok::<usize, anyhow::Error>(parse_paginated_lengths(stdout.as_bytes()))
-        }
-    };
+    #[derive(Deserialize)]
+    struct PrHead {
+        head: Head,
+    }
+    #[derive(Deserialize)]
+    struct Head {
+        sha: String,
+    }
+    let pr: PrHead = serde_json::from_str(&results[0]).context("Failed to parse PR JSON")?;
 
-    let rv_fut = {
-        let host = host.to_string();
-        let ep = format!("repos/{repo_full}/pulls/{pr_number}/reviews");
-        async move {
-            let stdout =
-                github::run_gh(&host, &["api", &ep, "--paginate", "--jq", "length"]).await?;
-            Ok::<usize, anyhow::Error>(parse_paginated_lengths(stdout.as_bytes()))
-        }
-    };
-
-    let rc_fut = {
-        let host = host.to_string();
-        let ep = format!("repos/{repo_full}/pulls/{pr_number}/comments");
-        async move {
-            let stdout =
-                github::run_gh(&host, &["api", &ep, "--paginate", "--jq", "length"]).await?;
-            Ok::<usize, anyhow::Error>(parse_paginated_lengths(stdout.as_bytes()))
-        }
-    };
-
-    let (head_sha, ic, rv, rc) = tokio::try_join!(pr_fut, ic_fut, rv_fut, rc_fut)?;
+    let ic = parse_paginated_lengths(results[1].as_bytes());
+    let rv = parse_paginated_lengths(results[2].as_bytes());
+    let rc = parse_paginated_lengths(results[3].as_bytes());
 
     Ok(PrStateFingerprint {
-        head_sha,
+        head_sha: pr.head.sha,
         comment_count: ic + rv + rc,
     })
 }
@@ -244,6 +269,10 @@ fn parse_paginated_lengths(stdout: &[u8]) -> usize {
 }
 
 /// Fetch the full PR context for the judge prompt via `gh`.
+///
+/// Fetches diff, comments, reviews, and review comments in parallel.
+/// Uses `--paginate --jq '.[]'` to flatten multi-page JSON arrays into
+/// a newline-delimited JSON stream, then wraps in `[...]` for valid JSON.
 async fn fetch_pr_context(
     host: &str,
     owner: &str,
@@ -252,63 +281,46 @@ async fn fetch_pr_context(
 ) -> Result<PrContext> {
     let repo_full = github::repo_slug(owner, repo);
 
-    // Fetch diff, comments, reviews, and review comments in parallel.
-    // Use `--paginate --jq '.[]'` to flatten multi-page JSON arrays into
-    // a newline-delimited JSON stream, then wrap in `[...]` for valid JSON.
-    let diff_fut = {
-        let host = host.to_string();
-        let rf = repo_full.clone();
-        let pr = pr_number.to_string();
-        async move {
-            let stdout = github::run_gh(&host, &["pr", "diff", &pr, "-R", &rf]).await?;
-            Ok::<String, anyhow::Error>(stdout)
-        }
-    };
-
-    let comments_fut = {
-        let host = host.to_string();
-        let rf = repo_full.clone();
-        let pr = pr_number.to_string();
-        async move {
-            let endpoint = format!("repos/{rf}/issues/{pr}/comments");
-            let stdout =
-                github::run_gh(&host, &["api", &endpoint, "--paginate", "--jq", ".[]"]).await?;
-            Ok::<String, anyhow::Error>(wrap_ndjson(stdout.as_bytes()))
-        }
-    };
-
-    let reviews_fut = {
-        let host = host.to_string();
-        let rf = repo_full.clone();
-        let pr = pr_number.to_string();
-        async move {
-            let endpoint = format!("repos/{rf}/pulls/{pr}/reviews");
-            let stdout =
-                github::run_gh(&host, &["api", &endpoint, "--paginate", "--jq", ".[]"]).await?;
-            Ok::<String, anyhow::Error>(wrap_ndjson(stdout.as_bytes()))
-        }
-    };
-
-    let review_comments_fut = {
-        let host = host.to_string();
-        let rf = repo_full.clone();
-        let pr = pr_number.to_string();
-        async move {
-            let endpoint = format!("repos/{rf}/pulls/{pr}/comments");
-            let stdout =
-                github::run_gh(&host, &["api", &endpoint, "--paginate", "--jq", ".[]"]).await?;
-            Ok::<String, anyhow::Error>(wrap_ndjson(stdout.as_bytes()))
-        }
-    };
-
-    let (diff, comments, reviews, review_comments) =
-        tokio::try_join!(diff_fut, comments_fut, reviews_fut, review_comments_fut)?;
+    let results = run_gh_parallel(
+        host,
+        vec![
+            vec![
+                "pr".into(),
+                "diff".into(),
+                pr_number.into(),
+                "-R".into(),
+                repo_full.clone(),
+            ],
+            vec![
+                "api".into(),
+                format!("repos/{repo_full}/issues/{pr_number}/comments"),
+                "--paginate".into(),
+                "--jq".into(),
+                ".[]".into(),
+            ],
+            vec![
+                "api".into(),
+                format!("repos/{repo_full}/pulls/{pr_number}/reviews"),
+                "--paginate".into(),
+                "--jq".into(),
+                ".[]".into(),
+            ],
+            vec![
+                "api".into(),
+                format!("repos/{repo_full}/pulls/{pr_number}/comments"),
+                "--paginate".into(),
+                "--jq".into(),
+                ".[]".into(),
+            ],
+        ],
+    )
+    .await?;
 
     Ok(PrContext {
-        diff,
-        comments,
-        reviews,
-        review_comments,
+        diff: results[0].clone(),
+        comments: wrap_ndjson(results[1].as_bytes()),
+        reviews: wrap_ndjson(results[2].as_bytes()),
+        review_comments: wrap_ndjson(results[3].as_bytes()),
     })
 }
 
