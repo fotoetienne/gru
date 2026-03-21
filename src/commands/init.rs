@@ -149,7 +149,7 @@ pub async fn handle_init(repo_arg: String, host_override: Option<String>) -> Res
             let host = if let Some(ref h) = host_override {
                 h.clone()
             } else {
-                github::infer_github_host(&owner)
+                github::infer_github_host(&owner, None)
             };
             (owner, parts[1].to_string(), host)
         }
