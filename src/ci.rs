@@ -1,3 +1,4 @@
+use crate::agent::AgentBackend;
 use crate::github;
 use crate::labels;
 use anyhow::{Context, Result};
@@ -23,7 +24,7 @@ const CI_COMPLETION_TIMEOUT_SECS: u64 = 1800;
 /// Delay after pushing before polling CI, to allow GitHub to register checks (60s)
 const POST_PUSH_DELAY_SECS: u64 = 60;
 
-/// Maximum time for a single Claude CI fix invocation (20 minutes)
+/// Maximum time for a single agent CI fix invocation (20 minutes)
 const CI_FIX_TIMEOUT_SECS: u64 = 1200;
 
 /// The status of a CI check run
@@ -267,7 +268,7 @@ pub(crate) fn classify_failure(check: &CheckRun) -> FailureType {
     FailureType::Other(name_lower)
 }
 
-/// Builds the CI failure prompt for Claude to fix the issue
+/// Builds the CI failure prompt for the agent to fix the issue
 pub(crate) fn build_ci_fix_prompt(failed_checks: &[CheckRun], attempt: u32) -> String {
     let mut prompt = format!(
         "Your PR's CI checks failed (attempt {}/{}). Please analyze the failure and fix it.\n\n",
@@ -649,40 +650,32 @@ pub(crate) async fn get_pr_number(
     Ok(prs.first().and_then(|pr| pr["number"].as_u64()))
 }
 
-/// Invokes Claude Code to fix CI failures in the given worktree.
-/// Returns the exit code from the Claude process.
+/// Invokes the agent backend to fix CI failures in the given worktree.
+/// Returns the exit code from the agent process.
 pub(crate) async fn invoke_ci_fix(
+    backend: &dyn AgentBackend,
     worktree_path: &Path,
     failed_checks: &[CheckRun],
     attempt: u32,
 ) -> Result<i32> {
     let prompt = build_ci_fix_prompt(failed_checks, attempt);
 
-    let mut cmd = Command::new("claude");
-    cmd.arg("--print")
-        .arg("--output-format")
-        .arg("stream-json")
-        .arg("--dangerously-skip-permissions")
-        .arg(&prompt)
-        .stdin(Stdio::inherit())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .current_dir(worktree_path);
-
-    let child = cmd.spawn().context(
-        "claude command not found. Install from: https://github.com/anthropics/claude-code",
-    )?;
+    let child = backend
+        .build_oneshot_command(worktree_path, &prompt)
+        .spawn()
+        .with_context(|| format!("Agent backend '{}' failed to start", backend.name()))?;
 
     let fix_timeout = Duration::from_secs(CI_FIX_TIMEOUT_SECS);
     let output = tokio::time::timeout(fix_timeout, child.wait_with_output())
         .await
         .map_err(|_| {
             anyhow::anyhow!(
-                "Claude CI fix timed out after {} seconds",
+                "{} CI fix timed out after {} seconds",
+                backend.name(),
                 CI_FIX_TIMEOUT_SECS
             )
         })?
-        .context("Failed to wait for Claude process")?;
+        .with_context(|| format!("Failed to wait for {} process", backend.name()))?;
 
     Ok(output.status.code().unwrap_or(128))
 }
@@ -802,12 +795,14 @@ async fn post_escalation_comment_body(
 ///
 /// After a PR is created/updated:
 /// 1. Wait for CI checks to complete
-/// 2. If checks fail, invoke Claude to fix
+/// 2. If checks fail, invoke the agent backend to fix
 /// 3. Retry up to MAX_CI_FIX_ATTEMPTS times
 /// 4. Escalate if all attempts fail
 ///
 /// Returns Ok(true) if CI passed (possibly after fixes), Ok(false) if escalated.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn monitor_and_fix_ci(
+    backend: &dyn AgentBackend,
     host: &str,
     owner: &str,
     repo: &str,
@@ -920,24 +915,27 @@ pub(crate) async fn monitor_and_fix_ci(
                     }
                 }
 
-                // Invoke Claude to fix
+                // Invoke agent to fix
                 eprintln!(
-                    "🔧 Invoking Claude to fix CI failures (attempt {}/{})...",
-                    attempt, MAX_CI_FIX_ATTEMPTS
+                    "🔧 Invoking {} to fix CI failures (attempt {}/{})...",
+                    backend.name(),
+                    attempt,
+                    MAX_CI_FIX_ATTEMPTS
                 );
-                let fix_result = invoke_ci_fix(worktree_path, &failed_checks, attempt).await;
+                let fix_result =
+                    invoke_ci_fix(backend, worktree_path, &failed_checks, attempt).await;
 
                 match fix_result {
                     Ok(exit_code) => {
                         if exit_code != 0 {
                             eprintln!(
-                                "⚠️  Claude fix attempt returned non-zero exit code: {}",
+                                "⚠️  Agent fix attempt returned non-zero exit code: {}",
                                 exit_code
                             );
                         }
                     }
                     Err(e) => {
-                        eprintln!("⚠️  Claude CI fix failed: {}", e);
+                        eprintln!("⚠️  Agent CI fix failed: {}", e);
                         // On timeout or other errors, retry or escalate.
                         // RetryNextAttempt re-polls CI from the same commit (no fix pushed).
                         match decide_after_no_commits(attempt, MAX_CI_FIX_ATTEMPTS) {
@@ -967,10 +965,10 @@ pub(crate) async fn monitor_and_fix_ci(
                     }
                 }
 
-                // Check if Claude actually made new commits
+                // Check if the agent actually made new commits
                 let new_sha = get_head_sha(worktree_path).await?;
                 if new_sha == head_sha {
-                    eprintln!("⚠️  Claude made no new commits, cannot retry");
+                    eprintln!("⚠️  Agent made no new commits, cannot retry");
                     match decide_after_no_commits(attempt, MAX_CI_FIX_ATTEMPTS) {
                         CiFixAction::RetryNextAttempt => continue,
                         CiFixAction::Escalate(_) => {

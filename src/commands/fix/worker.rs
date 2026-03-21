@@ -204,6 +204,7 @@ pub(crate) async fn monitor_pr_phase(
         // CI monitoring fallback — only when no PR exists, since
         // monitor_pr_lifecycle handles CI internally when a PR is present.
         let ci_passed = monitor_ci_after_fix(
+            backend,
             &issue_ctx.host,
             &issue_ctx.owner,
             &issue_ctx.repo,

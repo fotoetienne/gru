@@ -69,6 +69,24 @@ impl AgentBackend for CodexBackend {
         // Codex CLI does not support interactive resume mode
         None
     }
+
+    fn build_oneshot_command(&self, worktree_path: &Path, prompt_arg: &str) -> TokioCommand {
+        let mut cmd = TokioCommand::new("codex");
+        cmd.arg("exec").arg("--full-auto");
+
+        // When prompt_arg is "-", callers stream the actual prompt via stdin.
+        if prompt_arg == "-" {
+            cmd.stdin(std::process::Stdio::piped());
+        } else {
+            cmd.arg(prompt_arg);
+            cmd.stdin(std::process::Stdio::null());
+        }
+
+        cmd.current_dir(worktree_path)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::inherit());
+        cmd
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -446,6 +464,35 @@ mod tests {
         assert!(b
             .build_interactive_resume_command(&path, &id, "github.com")
             .is_none());
+    }
+
+    #[test]
+    fn test_build_oneshot_command_produces_expected_args() {
+        let b = backend();
+        let path = std::path::PathBuf::from("/tmp/worktree");
+        let cmd = b.build_oneshot_command(&path, "fix the tests");
+        let inner = cmd.as_std();
+
+        assert_eq!(inner.get_program(), "codex");
+        let args: Vec<&std::ffi::OsStr> = inner.get_args().collect();
+        assert!(args.contains(&"exec".as_ref()));
+        assert!(args.contains(&"--full-auto".as_ref()));
+        assert!(args.contains(&"fix the tests".as_ref()));
+    }
+
+    #[test]
+    fn test_build_oneshot_command_stdin_sentinel_omits_prompt_arg() {
+        let b = backend();
+        let path = std::path::PathBuf::from("/tmp/worktree");
+        let cmd = b.build_oneshot_command(&path, "-");
+        let inner = cmd.as_std();
+
+        assert_eq!(inner.get_program(), "codex");
+        let args: Vec<&std::ffi::OsStr> = inner.get_args().collect();
+        assert!(args.contains(&"exec".as_ref()));
+        assert!(args.contains(&"--full-auto".as_ref()));
+        // "-" should NOT appear as an argument when using stdin sentinel
+        assert!(!args.contains(&"-".as_ref()));
     }
 
     // ---- parse_event tests ----

@@ -215,6 +215,22 @@ pub(crate) trait AgentBackend: Send + Sync {
         session_id: &Uuid,
         github_host: &str,
     ) -> Option<TokioCommand>;
+
+    /// Build a command for a one-shot utility task (no session tracking, text output).
+    ///
+    /// Used for fire-and-forget invocations like CI fix and merge-readiness judge
+    /// where the caller just needs to run the agent once and capture its text output.
+    ///
+    /// `prompt_arg` is passed as a CLI argument to the underlying agent binary.
+    /// Callers may either:
+    ///
+    /// - Pass the full prompt text directly, or
+    /// - Pass `"-"` and stream the actual prompt on stdin (the convention used by
+    ///   the merge-readiness judge for large prompts that may exceed arg limits).
+    ///
+    /// Backends must support the `"-"` stdin-sentinel convention.
+    /// The command should produce plain-text output on stdout with piped stdio.
+    fn build_oneshot_command(&self, worktree_path: &Path, prompt_arg: &str) -> TokioCommand;
 }
 
 #[cfg(test)]

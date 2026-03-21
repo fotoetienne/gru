@@ -477,6 +477,7 @@ async fn handle_ready_to_merge(
 
     // Invoke the merge-readiness judge.
     match merge_judge::evaluate(
+        ctx.backend,
         &ctx.issue_ctx.host,
         &ctx.issue_ctx.owner,
         &ctx.issue_ctx.repo,
@@ -682,6 +683,7 @@ async fn handle_failed_checks(
     };
 
     match ci::monitor_and_fix_ci(
+        ctx.backend,
         &ctx.issue_ctx.host,
         &ctx.issue_ctx.owner,
         &ctx.issue_ctx.repo,
@@ -1104,6 +1106,7 @@ pub(crate) async fn monitor_pr_lifecycle(
 /// Monitors CI after the initial fix and attempts auto-fixes if checks fail.
 /// Returns Ok(true) if CI passed, Ok(false) if escalated/failed.
 pub(crate) async fn monitor_ci_after_fix(
+    backend: &dyn AgentBackend,
     host: &str,
     owner: &str,
     repo: &str,
@@ -1153,6 +1156,7 @@ pub(crate) async fn monitor_ci_after_fix(
 
     eprintln!("🔍 Monitoring CI for PR #{}", pr_number);
     ci::monitor_and_fix_ci(
+        backend,
         host,
         owner,
         repo,

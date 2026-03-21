@@ -191,6 +191,21 @@ impl AgentBackend for ClaudeBackend {
             .env("GH_HOST", github_host);
         Some(cmd)
     }
+
+    fn build_oneshot_command(&self, worktree_path: &Path, prompt_arg: &str) -> TokioCommand {
+        let mut cmd = TokioCommand::new("claude");
+        cmd.arg("--print")
+            .arg("--output-format")
+            .arg("text")
+            .arg("--max-turns")
+            .arg("1")
+            .arg("--dangerously-skip-permissions")
+            .arg(prompt_arg)
+            .current_dir(worktree_path)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::inherit());
+        cmd
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -376,6 +391,28 @@ mod tests {
         // Interactive mode should NOT have --print or --output-format
         assert!(!args.contains(&"--print".as_ref()));
         assert!(!args.contains(&"--output-format".as_ref()));
+        assert!(!args.contains(&"stream-json".as_ref()));
+    }
+
+    #[test]
+    fn test_build_oneshot_command_produces_expected_args() {
+        let b = backend();
+        let path = std::path::PathBuf::from("/tmp/worktree");
+        let cmd = b.build_oneshot_command(&path, "fix the tests");
+        let inner = cmd.as_std();
+
+        assert_eq!(inner.get_program(), "claude");
+        let args: Vec<&std::ffi::OsStr> = inner.get_args().collect();
+        assert!(args.contains(&"--print".as_ref()));
+        assert!(args.contains(&"--output-format".as_ref()));
+        assert!(args.contains(&"text".as_ref()));
+        assert!(args.contains(&"--max-turns".as_ref()));
+        assert!(args.contains(&"1".as_ref()));
+        assert!(args.contains(&"--dangerously-skip-permissions".as_ref()));
+        assert!(args.contains(&"fix the tests".as_ref()));
+        // Should NOT have session-id, verbose, or stream-json
+        assert!(!args.contains(&"--session-id".as_ref()));
+        assert!(!args.contains(&"--verbose".as_ref()));
         assert!(!args.contains(&"stream-json".as_ref()));
     }
 
