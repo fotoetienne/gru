@@ -575,7 +575,10 @@ mod tests {
     fn test_classify_inactivity_normal() {
         assert_eq!(classify_inactivity(0), InactivityState::Normal);
         assert_eq!(classify_inactivity(60), InactivityState::Normal);
-        assert_eq!(classify_inactivity(299), InactivityState::Normal);
+        assert_eq!(
+            classify_inactivity(INACTIVITY_WARNING_SECS - 1),
+            InactivityState::Normal
+        );
     }
 
     #[test]
@@ -588,8 +591,12 @@ mod tests {
 
     #[test]
     fn test_classify_inactivity_warning_between_thresholds() {
-        assert_eq!(classify_inactivity(600), InactivityState::Warning);
-        assert_eq!(classify_inactivity(899), InactivityState::Warning);
+        let mid = (INACTIVITY_WARNING_SECS + INACTIVITY_STUCK_SECS) / 2;
+        assert_eq!(classify_inactivity(mid), InactivityState::Warning);
+        assert_eq!(
+            classify_inactivity(INACTIVITY_STUCK_SECS - 1),
+            InactivityState::Warning
+        );
     }
 
     #[test]
@@ -602,15 +609,25 @@ mod tests {
 
     #[test]
     fn test_classify_inactivity_stuck_above_threshold() {
-        assert_eq!(classify_inactivity(1000), InactivityState::Stuck);
-        assert_eq!(classify_inactivity(3600), InactivityState::Stuck);
+        assert_eq!(
+            classify_inactivity(INACTIVITY_STUCK_SECS + 100),
+            InactivityState::Stuck
+        );
+        assert_eq!(
+            classify_inactivity(INACTIVITY_STUCK_SECS * 4),
+            InactivityState::Stuck
+        );
     }
 
     #[test]
     fn test_classify_inactivity_boundary_between_warning_and_stuck() {
-        // 899 seconds should be Warning (< 900)
-        assert_eq!(classify_inactivity(899), InactivityState::Warning);
-        // 900 seconds should be Stuck (>= 900)
-        assert_eq!(classify_inactivity(900), InactivityState::Stuck);
+        assert_eq!(
+            classify_inactivity(INACTIVITY_STUCK_SECS - 1),
+            InactivityState::Warning
+        );
+        assert_eq!(
+            classify_inactivity(INACTIVITY_STUCK_SECS),
+            InactivityState::Stuck
+        );
     }
 }

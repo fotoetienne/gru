@@ -385,6 +385,7 @@ fn evaluate_reviews(reviews: &[ReviewApiResponse], pr_author: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::github::is_retryable_error;
 
     // --- evaluate_ci tests ---
 

@@ -390,21 +390,4 @@ mod tests {
         let ts = format_timestamp(Some("not-a-timestamp"));
         assert_eq!(ts, "--:--:--");
     }
-
-    #[test]
-    fn test_format_timestamp_valid() {
-        let ts = format_timestamp(Some("2025-01-15T14:30:45.123+00:00"));
-        assert!(ts.contains(':'));
-        assert_ne!(ts, "--:--:--");
-    }
-
-    #[test]
-    fn test_format_timestamp_none() {
-        assert_eq!(format_timestamp(None), "--:--:--");
-    }
-
-    #[test]
-    fn test_format_timestamp_invalid() {
-        assert_eq!(format_timestamp(Some("garbage")), "--:--:--");
-    }
 }

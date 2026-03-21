@@ -1045,19 +1045,16 @@ That's my verdict."#;
             head_sha: "abc123".to_string(),
             comment_count: 5,
         };
-        // Record a Wait response with a 1ms duration so it expires immediately.
+        // Record a Wait response with Duration::ZERO so wait_until = now + 0,
+        // meaning the timer is already expired by the time we check.
         let response = JudgeResponse {
             confidence: 5,
-            action: JudgeAction::Wait(Duration::from_millis(1)),
+            action: JudgeAction::Wait(Duration::ZERO),
             reasoning: "need more time".to_string(),
         };
         state.record_response(fp.clone(), &response);
 
-        // Same fingerprint, timer not expired yet (in practice it may already be).
-        // Sleep to guarantee expiry.
-        std::thread::sleep(Duration::from_millis(5));
-
-        // Now should_invoke should return true because the timer expired.
+        // should_invoke should return true because the timer is already expired.
         assert!(
             state.should_invoke(&fp),
             "should_invoke must return true after wait timer expires"

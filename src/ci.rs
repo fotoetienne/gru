@@ -1470,6 +1470,9 @@ mod tests {
 
     #[test]
     fn test_all_checks_completed_empty() {
+        // Documents vacuous-truth behavior of Iterator::all on empty input.
+        // In practice, wait_for_ci guards against empty checks before calling
+        // all_checks_completed, so this path is not reachable in production.
         let checks: Vec<CheckRun> = vec![];
         assert!(all_checks_completed(&checks));
     }
