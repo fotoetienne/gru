@@ -407,9 +407,28 @@ impl LabConfig {
             .parse::<toml_edit::DocumentMut>()
             .with_context(|| format!("Failed to parse config: {}", config_path.display()))?;
 
-        // Ensure [daemon] table exists
         if !doc.contains_key("daemon") {
-            doc["daemon"] = toml_edit::Item::Table(toml_edit::Table::new());
+            // When the document is all-comments (e.g., default template), toml_edit
+            // would insert the new table before the comments. Instead, we append the
+            // section as raw TOML at the end of the file after building it.
+            let output = format!(
+                "{}\n[daemon]\nrepos = [\"{}\"]\n",
+                contents.trim_end(),
+                repo_entry
+            );
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .truncate(true)
+                .open(config_path)
+                .with_context(|| {
+                    format!(
+                        "Failed to open config for writing: {}",
+                        config_path.display()
+                    )
+                })?;
+            file.write_all(output.as_bytes())
+                .with_context(|| format!("Failed to write config: {}", config_path.display()))?;
+            return Ok(true);
         }
 
         let daemon = doc["daemon"]
@@ -1436,6 +1455,13 @@ repos = ["owner/repo"]
         let contents = fs::read_to_string(&config_path).unwrap();
         // Comments from default template should be preserved
         assert!(contents.contains("# Gru configuration file"));
+        // [daemon] section should appear after the header comment, not before
+        let comment_pos = contents.find("# Gru configuration file").unwrap();
+        let daemon_pos = contents.find("[daemon]").unwrap();
+        assert!(
+            comment_pos < daemon_pos,
+            "[daemon] should appear after the file header comment"
+        );
         let reloaded: LabConfig = toml::from_str(&contents).unwrap();
         assert_eq!(reloaded.daemon.repos, vec!["owner/repo"]);
     }
