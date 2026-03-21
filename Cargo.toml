@@ -31,6 +31,8 @@ uuid = { version = "1.21", features = ["v4"] }
 fs2 = "0.4"
 tempfile = "3.26"
 which = "8.0.2"
+rmcp = { version = "1.2", features = ["server", "transport-io"] }
+schemars = "1.0"
 
 [dev-dependencies]
 serde_ignored = "0.1"
