@@ -202,7 +202,7 @@ async fn reap_children(children: &mut Vec<SpawnedChild>) {
                             // Check if the issue already has a terminal label before
                             // restoring gru:todo — the minion may have finished
                             // (done or failed) before the process exited.
-                            let terminal_label = github::has_any_label_via_cli(
+                            let terminal_label = match github::has_any_label_via_cli(
                                 &meta.host,
                                 &meta.owner,
                                 &meta.repo,
@@ -210,7 +210,20 @@ async fn reap_children(children: &mut Vec<SpawnedChild>) {
                                 &[labels::DONE, labels::FAILED],
                             )
                             .await
-                            .unwrap_or(None);
+                            {
+                                Ok(label) => label,
+                                Err(e) => {
+                                    // Fail-safe: skip restoration rather than risk
+                                    // adding gru:todo on top of a terminal label.
+                                    log::warn!(
+                                        "⚠️  Failed to check labels on issue #{}: {} \
+                                         — skipping restoration to be safe",
+                                        meta.issue_number,
+                                        e
+                                    );
+                                    Some("(unknown — API error)".to_string())
+                                }
+                            };
 
                             if let Some(label) = terminal_label {
                                 log::info!(

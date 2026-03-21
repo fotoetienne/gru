@@ -555,8 +555,6 @@ pub async fn post_comment_via_cli(
     Ok(())
 }
 
-/// Edit labels on an issue using gh CLI (add and/or remove in a single call)
-///
 /// Check whether any of the given labels are present on an issue.
 ///
 /// Returns the name of the first matching label, or `None` if none match.
