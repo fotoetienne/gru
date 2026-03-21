@@ -102,7 +102,17 @@ async fn create_pr_for_issue(
             .unwrap_or("main")
             .to_string()
     } else {
-        "main".to_string()
+        // symbolic-ref failed (common in bare-repo worktrees); query GitHub API
+        match crate::github::get_default_branch(owner, repo, host).await {
+            Ok(branch) => branch,
+            Err(e) => {
+                log::warn!(
+                    "Could not determine default branch from GitHub API: {}. Falling back to 'main'.",
+                    e
+                );
+                "main".to_string()
+            }
+        }
     };
 
     // Get issue title - use provided title if available, otherwise fetch

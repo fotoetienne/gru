@@ -215,6 +215,33 @@ pub(crate) async fn gh_api_with_retry(
     }
 }
 
+/// Queries the GitHub API for the repository's default branch.
+///
+/// Uses `gh api /repos/OWNER/REPO --jq .default_branch`.
+pub(crate) async fn get_default_branch(owner: &str, repo: &str, host: &str) -> Result<String> {
+    let repo_full = repo_slug(owner, repo);
+    let endpoint = format!("repos/{}", repo_full);
+    let output = gh_cli_command(host)
+        .args(["api", &endpoint, "--jq", ".default_branch"])
+        .output()
+        .await
+        .context("Failed to query GitHub API for default branch")?;
+
+    if output.status.success() {
+        let branch = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !branch.is_empty() {
+            return Ok(branch);
+        }
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    Err(anyhow!(
+        "Failed to get default branch for {}: {}",
+        repo_full,
+        stderr.trim()
+    ))
+}
+
 /// Build a full GitHub issue URL for a repo in "owner/repo" format, with an explicit host.
 ///
 /// Returns `Some(url)` when `repo` is a valid `owner/repo` string, otherwise `None`.
@@ -1501,6 +1528,28 @@ mod tests {
         let result = check_auth_via_cli("github.com").await;
         // Will pass if gh is authenticated for github.com
         assert!(result.is_ok(), "gh auth status failed: {:?}", result.err());
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_get_default_branch_github_com() {
+        // Requires gh auth for github.com
+        let result = get_default_branch("fotoetienne", "gru", "github.com").await;
+        match result {
+            Ok(branch) => {
+                assert!(!branch.is_empty(), "Default branch should not be empty");
+                // fotoetienne/gru uses "main"
+                assert_eq!(branch, "main");
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("Failed to") || msg.contains("gh"),
+                    "Unexpected error: {}",
+                    msg
+                );
+            }
+        }
     }
 
     #[tokio::test]

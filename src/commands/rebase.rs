@@ -231,6 +231,20 @@ pub(crate) async fn detect_base_branch(worktree_path: &Path) -> Result<String> {
         }
     }
 
+    // Query GitHub API for the default branch
+    let github_hosts = crate::config::load_host_registry().all_hosts();
+    if let Ok(remote_url) = get_remote_url(worktree_path).await {
+        if let Ok((host, owner, repo)) = git::parse_github_remote(&remote_url, &github_hosts) {
+            match github::get_default_branch(&owner, &repo, &host).await {
+                Ok(branch_name) => return Ok(branch_name),
+                Err(e) => log::warn!(
+                    "Could not determine default branch from GitHub API: {}. Falling back to 'main'.",
+                    e
+                ),
+            }
+        }
+    }
+
     // Final fallback: "main"
     Ok("main".to_string())
 }
