@@ -891,7 +891,7 @@ pub(crate) async fn monitor_and_fix_ci(
         }
     }
 
-    // Should not reach here, but handle gracefully
+    // Reached when the fix attempt breaks the loop (e.g., git push failure).
     Ok(false)
 }
 
