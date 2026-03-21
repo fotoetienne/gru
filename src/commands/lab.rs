@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::process::Child;
+use tokio::sync::Notify;
 use tokio::time::sleep;
 
 /// Prints a timestamped message to stdout in `[HH:MM:SS] <message>` format.
@@ -126,31 +127,38 @@ pub(crate) async fn handle_lab(
         tprintln!();
     }
 
-    // Listen for both SIGINT (Ctrl-C) and SIGTERM (kill, systemd, docker).
-    // Use persistent Signal handles so queued signals are never lost between select! arms.
-    let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
-        .context("Failed to register SIGINT handler")?;
-    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-        .context("Failed to register SIGTERM handler")?;
-
-    // Cooperative shutdown flag: a background task sets this on SIGINT/SIGTERM so that
-    // poll_and_spawn can exit at safe checkpoints instead of being hard-cancelled via
-    // select!, which could leave external state (e.g. issue labels) inconsistent.
+    // Cooperative shutdown flag — set by background signal handlers so that
+    // long-running loops (e.g. find_minions_needing_wake) can bail out
+    // promptly instead of issuing API calls that will fail during teardown.
     let shutdown_flag = Arc::new(AtomicBool::new(false));
+    let shutdown_notify = Arc::new(Notify::new());
+
+    // Background signal handlers that set the flag and wake the main loop.
+    // Uses notify_one() so the permit is stored even if no one is waiting yet
+    // (e.g. signal arrives during poll_and_spawn).
     {
         let flag = shutdown_flag.clone();
-        let mut bg_sigint =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
-                .context("Failed to register background SIGINT watcher")?;
-        let mut bg_sigterm =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                .context("Failed to register background SIGTERM watcher")?;
+        let notify = shutdown_notify.clone();
         tokio::spawn(async move {
-            tokio::select! {
-                _ = bg_sigint.recv() => {}
-                _ = bg_sigterm.recv() => {}
-            }
+            let _ = tokio::signal::ctrl_c().await;
             flag.store(true, Ordering::Release);
+            notify.notify_one();
+        });
+    }
+    {
+        let flag = shutdown_flag.clone();
+        let notify = shutdown_notify.clone();
+        tokio::spawn(async move {
+            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                Ok(mut sigterm) => {
+                    sigterm.recv().await;
+                    flag.store(true, Ordering::Release);
+                    notify.notify_one();
+                }
+                Err(e) => {
+                    log::warn!("Failed to register SIGTERM handler: {e} — SIGTERM will not trigger graceful shutdown");
+                }
+            }
         });
     }
 
@@ -169,25 +177,22 @@ pub(crate) async fn handle_lab(
         log::warn!("   Continuing to poll...");
     }
 
-    macro_rules! shutdown {
-        ($signal:literal) => {{
-            tprintln!();
-            tprintln!(concat!(
-                "🛑 Received shutdown signal (",
-                $signal,
-                "), stopping daemon..."
-            ));
-            shutdown_children(&mut children, stop_minions).await;
-            break;
-        }};
-    }
-
     // Main polling loop
     loop {
-        // Phase 1: Wait for poll interval or shutdown signal
+        if shutdown_flag.load(Ordering::Acquire) {
+            tprintln!();
+            tprintln!("🛑 Received shutdown signal, stopping daemon...");
+            shutdown_children(&mut children, stop_minions).await;
+            break;
+        }
+
         tokio::select! {
-            _ = sigint.recv() => { shutdown!("SIGINT"); }
-            _ = sigterm.recv() => { shutdown!("SIGTERM"); }
+            biased;
+            _ = shutdown_notify.notified() => {
+                // Flag was already set by the background handler; fall through
+                // to the top-of-loop check which prints the message and breaks.
+                continue;
+            }
             _ = sleep(config.poll_interval()) => {
                 // Clean up finished child processes
                 reap_children(&mut children).await;
@@ -536,6 +541,7 @@ async fn find_minions_needing_wake(
     max_attempts: u32,
     wake_check_times: &mut HashMap<String, DateTime<Utc>>,
     resumed_this_session: &mut HashSet<String>,
+    shutdown_flag: &AtomicBool,
 ) -> Result<()> {
     let repos = configured_repos(config);
 
@@ -547,6 +553,11 @@ async fn find_minions_needing_wake(
     }
 
     for minion_id in candidate_ids {
+        if shutdown_flag.load(Ordering::Acquire) {
+            log::debug!("Shutdown requested, aborting review wake scan");
+            return Ok(());
+        }
+
         let info = match all_minions.iter().find(|(id, _)| id == &minion_id) {
             Some((_, info)) => info.clone(),
             None => continue,
@@ -1442,9 +1453,14 @@ async fn poll_and_spawn(
     // Wake up Completed minions with new external reviews or merge conflicts so they re-enter MonitoringPr.
     // Runs after prune_stale_entries so stale entries don't generate spurious wake-ups.
     if !no_resume {
-        if let Err(e) =
-            find_minions_needing_wake(config, max_attempts, wake_check_times, resumed_this_session)
-                .await
+        if let Err(e) = find_minions_needing_wake(
+            config,
+            max_attempts,
+            wake_check_times,
+            resumed_this_session,
+            shutdown_flag,
+        )
+        .await
         {
             log::warn!("⚠️  Review wake scan error: {}", e);
         }
