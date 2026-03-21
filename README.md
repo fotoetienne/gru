@@ -12,9 +12,9 @@ Gru is **agent-agnostic**. It ships with backends for [Claude Code](https://gith
 ## Quick Start
 
 ```bash
-# Install
-git clone https://github.com/fotoetienne/gru.git && cd gru
-cargo install --path .
+# Install (macOS Apple Silicon — see Installation for other platforms)
+curl -fL https://github.com/fotoetienne/gru/releases/latest/download/gru-aarch64-apple-darwin.tar.gz | tar xz
+sudo mv gru /usr/local/bin/
 
 # Initialize a repo
 gru init owner/repo
@@ -29,13 +29,35 @@ Gru creates an isolated worktree, spawns the agent, opens a PR, and monitors CI 
 
 ### Prerequisites
 
-- [Rust](https://rustup.rs/) (1.73 or later)
 - [GitHub CLI](https://cli.github.com/) (`gh`), authenticated
 - At least one agent backend:
   - [Claude Code](https://github.com/anthropics/claude-code) (default) — `npm install -g @anthropic-ai/claude-code`
   - [OpenAI Codex](https://github.com/openai/codex) (optional) — `npm install -g @openai/codex`
 
+### Download a Prebuilt Binary
+
+Grab the latest release from [GitHub Releases](https://github.com/fotoetienne/gru/releases/latest):
+
+```bash
+# Set target: aarch64-apple-darwin, x86_64-apple-darwin, or x86_64-unknown-linux-gnu
+TARGET=aarch64-apple-darwin
+
+# Download binary and checksum
+curl -fLO "https://github.com/fotoetienne/gru/releases/latest/download/gru-${TARGET}.tar.gz"
+curl -fLO "https://github.com/fotoetienne/gru/releases/latest/download/gru-${TARGET}.tar.gz.sha256"
+
+# Verify checksum
+sha256sum --check "gru-${TARGET}.tar.gz.sha256" 2>/dev/null \
+  || shasum -a 256 --check "gru-${TARGET}.tar.gz.sha256"
+
+# Install
+tar xzf "gru-${TARGET}.tar.gz"
+sudo mv gru /usr/local/bin/
+```
+
 ### Install from Source
+
+Requires [Rust](https://rustup.rs/) 1.73 or later.
 
 ```bash
 git clone https://github.com/fotoetienne/gru.git
