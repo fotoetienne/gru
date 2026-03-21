@@ -236,3 +236,50 @@ pub(crate) fn agent_exit_code(agent_result: &Option<AgentResult>) -> i32 {
         .map(|r| r.status.code().unwrap_or(EXIT_CODE_SIGNAL_TERMINATED))
         .unwrap_or(0)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(unix)]
+    fn exit_status(code: i32) -> std::process::ExitStatus {
+        use std::os::unix::process::ExitStatusExt;
+        // On Unix, the raw wait status encodes the exit code in the high byte.
+        ExitStatusExt::from_raw((code & 0xff) << 8)
+    }
+
+    #[cfg(windows)]
+    fn exit_status(code: i32) -> std::process::ExitStatus {
+        use std::os::windows::process::ExitStatusExt;
+        ExitStatusExt::from_raw(code as u32)
+    }
+
+    #[test]
+    fn test_agent_exit_code_none_returns_zero() {
+        assert_eq!(agent_exit_code(&None), 0);
+    }
+
+    #[test]
+    fn test_agent_exit_code_success() {
+        let result = AgentResult {
+            status: exit_status(0),
+        };
+        assert_eq!(agent_exit_code(&Some(result)), 0);
+    }
+
+    #[test]
+    fn test_agent_exit_code_failure() {
+        let result = AgentResult {
+            status: exit_status(1),
+        };
+        assert_eq!(agent_exit_code(&Some(result)), 1);
+    }
+
+    #[test]
+    fn test_agent_exit_code_custom_code() {
+        let result = AgentResult {
+            status: exit_status(42),
+        };
+        assert_eq!(agent_exit_code(&Some(result)), 42);
+    }
+}

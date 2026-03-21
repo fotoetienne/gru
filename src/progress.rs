@@ -296,13 +296,16 @@ mod tests {
         };
 
         let display = ProgressDisplay::new(config);
-        // Just verify that the display was created successfully
-        // Events are now printed directly to stdout, not stored
         assert_eq!(display.config.minion_id, "M001");
+        assert_eq!(display.config.issue, "42");
+        assert!(!display.config.quiet);
+        // tool_names map starts empty
+        let names = lock_or_recover(&display.tool_names, "test");
+        assert!(names.is_empty());
     }
 
     #[test]
-    fn test_quiet_mode_suppresses_output() {
+    fn test_quiet_mode_skips_tool_name_tracking() {
         let config = ProgressConfig {
             minion_id: "M001".to_string(),
             issue: "42".to_string(),
@@ -311,69 +314,80 @@ mod tests {
 
         let display = ProgressDisplay::new(config);
 
-        // In quiet mode, non-error events shouldn't be printed
-        display.handle_event(&AgentEvent::Started { usage: None });
+        // In quiet mode, non-error events are skipped entirely —
+        // tool names should NOT be stored since handle_event_inner returns early.
+        display.handle_event(&AgentEvent::ToolUse {
+            tool_name: "Bash".to_string(),
+            tool_use_id: "tu_123".to_string(),
+            input_summary: Some("Run: git status".to_string()),
+        });
 
-        // Verify quiet mode is enabled (output is suppressed in handle_event)
-        assert!(display.config.quiet);
-    }
-
-    #[test]
-    fn test_handle_event_with_ts_valid_rfc3339() {
-        // Verify handle_event_with_ts doesn't panic with a valid timestamp
-        let config = ProgressConfig {
-            minion_id: "M001".to_string(),
-            issue: "42".to_string(),
-            quiet: false,
-        };
-        let display = ProgressDisplay::new(config);
-        display.handle_event_with_ts(
-            &AgentEvent::Started { usage: None },
-            Some("2025-01-15T14:30:45.123+00:00"),
+        let names = lock_or_recover(&display.tool_names, "test");
+        assert!(
+            names.is_empty(),
+            "quiet mode should skip ToolUse processing, but tool_names was populated"
         );
     }
 
     #[test]
-    fn test_handle_event_with_ts_none_shows_placeholder() {
-        // None = legacy event without persisted timestamp → shows --:--:--
+    fn test_tool_use_stores_tool_name() {
         let config = ProgressConfig {
             minion_id: "M001".to_string(),
             issue: "42".to_string(),
             quiet: false,
         };
         let display = ProgressDisplay::new(config);
-        display.handle_event_with_ts(&AgentEvent::Started { usage: None }, None);
+
+        display.handle_event(&AgentEvent::ToolUse {
+            tool_name: "Read".to_string(),
+            tool_use_id: "tu_abc".to_string(),
+            input_summary: None,
+        });
+
+        let names = lock_or_recover(&display.tool_names, "test");
+        assert_eq!(names.get("tu_abc").map(String::as_str), Some("Read"));
     }
 
     #[test]
-    fn test_handle_event_with_ts_invalid_shows_placeholder() {
-        // Unparseable timestamp → shows --:--:--
+    fn test_tool_use_empty_name_stored_as_unknown() {
         let config = ProgressConfig {
             minion_id: "M001".to_string(),
             issue: "42".to_string(),
             quiet: false,
         };
         let display = ProgressDisplay::new(config);
-        display.handle_event_with_ts(
-            &AgentEvent::Started { usage: None },
-            Some("not-a-timestamp"),
-        );
+
+        display.handle_event(&AgentEvent::ToolUse {
+            tool_name: "".to_string(),
+            tool_use_id: "tu_xyz".to_string(),
+            input_summary: None,
+        });
+
+        let names = lock_or_recover(&display.tool_names, "test");
+        assert_eq!(names.get("tu_xyz").map(String::as_str), Some("unknown"));
     }
 
     #[test]
-    fn test_format_timestamp_valid() {
+    fn test_format_timestamp_valid_rfc3339() {
         let ts = format_timestamp(Some("2025-01-15T14:30:45.123+00:00"));
-        assert!(ts.contains(':'));
+        // Should produce a valid HH:MM:SS timestamp (not the placeholder)
         assert_ne!(ts, "--:--:--");
+        assert!(
+            ts.len() == 8 && ts.chars().filter(|c| *c == ':').count() == 2,
+            "expected HH:MM:SS format, got: {}",
+            ts
+        );
     }
 
     #[test]
-    fn test_format_timestamp_none() {
-        assert_eq!(format_timestamp(None), "--:--:--");
+    fn test_format_timestamp_none_shows_placeholder() {
+        let ts = format_timestamp(None);
+        assert_eq!(ts, "--:--:--");
     }
 
     #[test]
-    fn test_format_timestamp_invalid() {
-        assert_eq!(format_timestamp(Some("garbage")), "--:--:--");
+    fn test_format_timestamp_invalid_shows_placeholder() {
+        let ts = format_timestamp(Some("not-a-timestamp"));
+        assert_eq!(ts, "--:--:--");
     }
 }

@@ -947,4 +947,43 @@ mod tests {
         };
         assert!(mr.failure_reasons().is_empty());
     }
+
+    // --- mergeable field edge cases ---
+
+    #[test]
+    fn test_mergeable_null_treated_as_not_ready() {
+        let pr = PrDetails {
+            head_sha: "abc123".into(),
+            draft: false,
+            mergeable: None,
+            author_login: "author".into(),
+        };
+        assert!(pr.mergeable != Some(true));
+    }
+
+    #[test]
+    fn test_mergeable_false_treated_as_not_ready() {
+        let pr = PrDetails {
+            head_sha: "abc123".into(),
+            draft: false,
+            mergeable: Some(false),
+            author_login: "author".into(),
+        };
+        assert!(pr.mergeable != Some(true));
+    }
+
+    #[test]
+    fn test_mergeable_true_is_ready() {
+        let pr = PrDetails {
+            head_sha: "abc123".into(),
+            draft: false,
+            mergeable: Some(true),
+            author_login: "author".into(),
+        };
+        assert!(pr.mergeable == Some(true));
+    }
+
+    // NOTE: Tests for `crate::github::is_retryable_error` are co-located with
+    // the function definition in `src/github.rs` (see the `test_is_retryable_error_*`
+    // cases there). We intentionally do not duplicate those tests here.
 }

@@ -27,6 +27,28 @@ pub(crate) const INACTIVITY_STUCK_SECS: u64 = 900; // 15 minutes
 /// Exit code returned when a process is terminated by a signal (shell convention).
 pub(crate) const EXIT_CODE_SIGNAL_TERMINATED: i32 = 128;
 
+/// Classification of inactivity state based on elapsed time since last event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InactivityState {
+    /// Activity is within normal bounds.
+    Normal,
+    /// Inactivity has reached the warning threshold but not the stuck threshold.
+    Warning,
+    /// Inactivity has reached the stuck threshold — the task should be terminated.
+    Stuck,
+}
+
+/// Classifies the inactivity state given the elapsed seconds since the last event.
+pub(crate) fn classify_inactivity(elapsed_secs: u64) -> InactivityState {
+    if elapsed_secs >= INACTIVITY_STUCK_SECS {
+        InactivityState::Stuck
+    } else if elapsed_secs >= INACTIVITY_WARNING_SECS {
+        InactivityState::Warning
+    } else {
+        InactivityState::Normal
+    }
+}
+
 /// Errors from the agent runner that indicate the task is stuck or timed out.
 ///
 /// These are typed errors so callers can reliably detect blocked states via
@@ -231,22 +253,26 @@ where
             // Check inactivity - time since last event
             let inactivity = last_event_time.elapsed();
 
-            if inactivity.as_secs() >= INACTIVITY_STUCK_SECS {
-                log::error!(
-                    "❌ Task appears stuck (no activity for {} minutes)",
-                    INACTIVITY_STUCK_SECS / 60
-                );
-                log::info!("📝 Events saved to events.jsonl");
-                return Err(AgentRunnerError::InactivityStuck {
-                    minutes: INACTIVITY_STUCK_SECS / 60,
+            match classify_inactivity(inactivity.as_secs()) {
+                InactivityState::Stuck => {
+                    log::error!(
+                        "❌ Task appears stuck (no activity for {} minutes)",
+                        INACTIVITY_STUCK_SECS / 60
+                    );
+                    log::info!("📝 Events saved to events.jsonl");
+                    return Err(AgentRunnerError::InactivityStuck {
+                        minutes: INACTIVITY_STUCK_SECS / 60,
+                    }
+                    .into());
                 }
-                .into());
-            } else if inactivity.as_secs() >= INACTIVITY_WARNING_SECS && !inactivity_warning_shown {
-                log::warn!(
-                    "⚠️  No activity for {} minutes",
-                    INACTIVITY_WARNING_SECS / 60
-                );
-                inactivity_warning_shown = true;
+                InactivityState::Warning if !inactivity_warning_shown => {
+                    log::warn!(
+                        "⚠️  No activity for {} minutes",
+                        INACTIVITY_WARNING_SECS / 60
+                    );
+                    inactivity_warning_shown = true;
+                }
+                _ => {}
             }
 
             // Try to read next line with timeout
@@ -541,5 +567,67 @@ mod tests {
 
         let err = anyhow::anyhow!("some other error");
         assert!(!is_stuck_or_timeout_error(&err));
+    }
+
+    // --- T8: Inactivity classification tests ---
+
+    #[test]
+    fn test_classify_inactivity_normal() {
+        assert_eq!(classify_inactivity(0), InactivityState::Normal);
+        assert_eq!(classify_inactivity(60), InactivityState::Normal);
+        assert_eq!(
+            classify_inactivity(INACTIVITY_WARNING_SECS - 1),
+            InactivityState::Normal
+        );
+    }
+
+    #[test]
+    fn test_classify_inactivity_warning_at_threshold() {
+        assert_eq!(
+            classify_inactivity(INACTIVITY_WARNING_SECS),
+            InactivityState::Warning
+        );
+    }
+
+    #[test]
+    fn test_classify_inactivity_warning_between_thresholds() {
+        let mid = (INACTIVITY_WARNING_SECS + INACTIVITY_STUCK_SECS) / 2;
+        assert_eq!(classify_inactivity(mid), InactivityState::Warning);
+        assert_eq!(
+            classify_inactivity(INACTIVITY_STUCK_SECS - 1),
+            InactivityState::Warning
+        );
+    }
+
+    #[test]
+    fn test_classify_inactivity_stuck_at_threshold() {
+        assert_eq!(
+            classify_inactivity(INACTIVITY_STUCK_SECS),
+            InactivityState::Stuck
+        );
+    }
+
+    #[test]
+    fn test_classify_inactivity_stuck_above_threshold() {
+        assert_eq!(
+            classify_inactivity(INACTIVITY_STUCK_SECS + 100),
+            InactivityState::Stuck
+        );
+        assert_eq!(
+            classify_inactivity(INACTIVITY_STUCK_SECS * 4),
+            InactivityState::Stuck
+        );
+    }
+
+    #[test]
+    fn test_classify_inactivity_boundary_between_warning_and_stuck() {
+        assert_eq!(
+            classify_inactivity(INACTIVITY_STUCK_SECS - 1),
+            InactivityState::Warning
+        );
+        assert_eq!(
+            classify_inactivity(INACTIVITY_STUCK_SECS),
+            InactivityState::Stuck
+        );
     }
 }

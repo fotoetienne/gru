@@ -493,6 +493,26 @@ pub(crate) async fn fetch_check_logs(
     Ok(None)
 }
 
+/// Returns true if every check run has reached the `Completed` status.
+fn all_checks_completed(checks: &[CheckRun]) -> bool {
+    checks.iter().all(|c| c.status == CheckStatus::Completed)
+}
+
+/// Filters a list of completed check runs, returning only those that failed.
+///
+/// Treats `Success`, `Skipped`, and `Neutral` conclusions as passing.
+/// All other conclusions (including `None`) are considered failures.
+fn filter_failed_checks(checks: Vec<CheckRun>) -> Vec<CheckRun> {
+    checks
+        .into_iter()
+        .filter(|c| {
+            c.conclusion != Some(CheckConclusion::Success)
+                && c.conclusion != Some(CheckConclusion::Skipped)
+                && c.conclusion != Some(CheckConclusion::Neutral)
+        })
+        .collect()
+}
+
 /// Waits for CI checks to complete on a PR, polling at regular intervals.
 /// Returns the overall CI result.
 pub(crate) async fn wait_for_ci(
@@ -540,17 +560,10 @@ pub(crate) async fn wait_for_ci(
         }
 
         // Check if all runs are completed
-        let all_completed = checks.iter().all(|c| c.status == CheckStatus::Completed);
+        let all_completed = all_checks_completed(&checks);
 
         if all_completed {
-            let failed: Vec<CheckRun> = checks
-                .into_iter()
-                .filter(|c| {
-                    c.conclusion != Some(CheckConclusion::Success)
-                        && c.conclusion != Some(CheckConclusion::Skipped)
-                        && c.conclusion != Some(CheckConclusion::Neutral)
-                })
-                .collect();
+            let failed = filter_failed_checks(checks);
 
             if failed.is_empty() {
                 return Ok(CiResult::AllPassed);
@@ -1401,5 +1414,195 @@ mod tests {
             decide_after_no_commits(1, 1),
             CiFixAction::Escalate(EscalationReason::NoCommits)
         );
+    }
+
+    // --- T5: CI completion/failure filtering tests ---
+
+    fn make_check(
+        name: &str,
+        status: CheckStatus,
+        conclusion: Option<CheckConclusion>,
+    ) -> CheckRun {
+        CheckRun {
+            name: name.to_string(),
+            status,
+            conclusion,
+            duration: None,
+            output: None,
+        }
+    }
+
+    #[test]
+    fn test_all_checks_completed_when_all_completed() {
+        let checks = vec![
+            make_check(
+                "build",
+                CheckStatus::Completed,
+                Some(CheckConclusion::Success),
+            ),
+            make_check(
+                "lint",
+                CheckStatus::Completed,
+                Some(CheckConclusion::Success),
+            ),
+        ];
+        assert!(all_checks_completed(&checks));
+    }
+
+    #[test]
+    fn test_all_checks_completed_with_in_progress() {
+        let checks = vec![
+            make_check(
+                "build",
+                CheckStatus::Completed,
+                Some(CheckConclusion::Success),
+            ),
+            make_check("lint", CheckStatus::InProgress, None),
+        ];
+        assert!(!all_checks_completed(&checks));
+    }
+
+    #[test]
+    fn test_all_checks_completed_with_queued() {
+        let checks = vec![make_check("build", CheckStatus::Queued, None)];
+        assert!(!all_checks_completed(&checks));
+    }
+
+    #[test]
+    fn test_all_checks_completed_empty() {
+        // Documents vacuous-truth behavior of Iterator::all on empty input.
+        // In practice, wait_for_ci guards against empty checks before calling
+        // all_checks_completed, so this path is not reachable in production.
+        let checks: Vec<CheckRun> = vec![];
+        assert!(all_checks_completed(&checks));
+    }
+
+    #[test]
+    fn test_filter_failed_checks_all_passing() {
+        let checks = vec![
+            make_check(
+                "build",
+                CheckStatus::Completed,
+                Some(CheckConclusion::Success),
+            ),
+            make_check(
+                "lint",
+                CheckStatus::Completed,
+                Some(CheckConclusion::Skipped),
+            ),
+            make_check(
+                "optional",
+                CheckStatus::Completed,
+                Some(CheckConclusion::Neutral),
+            ),
+        ];
+        let failed = filter_failed_checks(checks);
+        assert!(failed.is_empty());
+    }
+
+    #[test]
+    fn test_filter_failed_checks_with_failure() {
+        let checks = vec![
+            make_check(
+                "build",
+                CheckStatus::Completed,
+                Some(CheckConclusion::Success),
+            ),
+            make_check(
+                "test",
+                CheckStatus::Completed,
+                Some(CheckConclusion::Failure),
+            ),
+        ];
+        let failed = filter_failed_checks(checks);
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].name, "test");
+    }
+
+    #[test]
+    fn test_filter_failed_checks_cancelled_is_failure() {
+        let checks = vec![make_check(
+            "deploy",
+            CheckStatus::Completed,
+            Some(CheckConclusion::Cancelled),
+        )];
+        let failed = filter_failed_checks(checks);
+        assert_eq!(failed.len(), 1);
+    }
+
+    #[test]
+    fn test_filter_failed_checks_timed_out_is_failure() {
+        let checks = vec![make_check(
+            "slow-test",
+            CheckStatus::Completed,
+            Some(CheckConclusion::TimedOut),
+        )];
+        let failed = filter_failed_checks(checks);
+        assert_eq!(failed.len(), 1);
+    }
+
+    #[test]
+    fn test_filter_failed_checks_action_required_is_failure() {
+        let checks = vec![make_check(
+            "review",
+            CheckStatus::Completed,
+            Some(CheckConclusion::ActionRequired),
+        )];
+        let failed = filter_failed_checks(checks);
+        assert_eq!(failed.len(), 1);
+    }
+
+    #[test]
+    fn test_filter_failed_checks_stale_is_failure() {
+        let checks = vec![make_check(
+            "old",
+            CheckStatus::Completed,
+            Some(CheckConclusion::Stale),
+        )];
+        let failed = filter_failed_checks(checks);
+        assert_eq!(failed.len(), 1);
+    }
+
+    #[test]
+    fn test_filter_failed_checks_none_conclusion_is_failure() {
+        let checks = vec![make_check("mystery", CheckStatus::Completed, None)];
+        let failed = filter_failed_checks(checks);
+        assert_eq!(failed.len(), 1);
+    }
+
+    #[test]
+    fn test_filter_failed_checks_mixed() {
+        let checks = vec![
+            make_check(
+                "build",
+                CheckStatus::Completed,
+                Some(CheckConclusion::Success),
+            ),
+            make_check(
+                "test",
+                CheckStatus::Completed,
+                Some(CheckConclusion::Failure),
+            ),
+            make_check(
+                "lint",
+                CheckStatus::Completed,
+                Some(CheckConclusion::Neutral),
+            ),
+            make_check(
+                "deploy",
+                CheckStatus::Completed,
+                Some(CheckConclusion::Cancelled),
+            ),
+            make_check(
+                "optional",
+                CheckStatus::Completed,
+                Some(CheckConclusion::Skipped),
+            ),
+        ];
+        let failed = filter_failed_checks(checks);
+        assert_eq!(failed.len(), 2);
+        let names: Vec<&str> = failed.iter().map(|c| c.name.as_str()).collect();
+        assert!(names.contains(&"test"));
+        assert!(names.contains(&"deploy"));
     }
 }

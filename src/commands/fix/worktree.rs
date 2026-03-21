@@ -8,6 +8,11 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use uuid::Uuid;
 
+/// Formats a branch name for a Minion working on an issue.
+pub(super) fn format_branch_name(issue_num: u64, minion_id: &str) -> String {
+    format!("minion/issue-{}-{}", issue_num, minion_id)
+}
+
 /// Sets up the workspace: generates minion ID, clones repo, creates worktree,
 /// registers the minion in the registry.
 pub(super) async fn setup_worktree(
@@ -37,7 +42,7 @@ pub(super) async fn setup_worktree(
         .await
         .context("Failed to clone or update repository")?;
 
-    let branch_name = format!("minion/issue-{}-{}", ctx.issue_num, minion_id);
+    let branch_name = format_branch_name(ctx.issue_num, &minion_id);
     println!("🌿 Creating worktree with branch: {}", branch_name);
 
     let repo_name = crate::github::repo_slug(&ctx.owner, &ctx.repo);
@@ -114,4 +119,24 @@ pub(super) async fn setup_worktree(
         checkout_path,
         session_id,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_format_branch_name() {
+        assert_eq!(format_branch_name(42, "M001"), "minion/issue-42-M001");
+    }
+
+    #[test]
+    fn test_format_branch_name_large_issue() {
+        assert_eq!(format_branch_name(99999, "M1a2"), "minion/issue-99999-M1a2");
+    }
+
+    #[test]
+    fn test_format_branch_name_zero_issue() {
+        assert_eq!(format_branch_name(0, "M000"), "minion/issue-0-M000");
+    }
 }
