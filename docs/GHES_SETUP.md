@@ -52,7 +52,6 @@ Your token needs the following scopes:
 |-------|-----|
 | `repo` | Read/write access to repositories, issues, and PRs |
 | `read:org` | Discover repos and check org membership |
-| `write:discussion` | Post issue and PR comments |
 
 If you authenticate interactively with `gh auth login`, the default scopes are usually sufficient. If you're using a personal access token, make sure it includes the scopes above.
 
@@ -75,7 +74,7 @@ The name (`netflix` in this example) is your shorthand — you'll use it when re
 
 ### Optional: `web_url`
 
-If the GHES web UI lives on a different domain than the API/git host (uncommon), set `web_url`:
+If the GHES web UI lives on a different domain than the API/git host (uncommon), set `web_url`. Note that `host` is a bare hostname while `web_url` is a full URL including scheme:
 
 ```toml
 [github_hosts.netflix]
@@ -87,7 +86,7 @@ Most GHES installations don't need this.
 
 ## Step 3: Reference repos using the named host
 
-In your config, reference GHES repos with the `name:owner/repo` format:
+In your config's `daemon.repos`, reference GHES repos with the `name:owner/repo` format (this shorthand is for config files only, not CLI arguments):
 
 ```toml
 [daemon]
@@ -111,19 +110,22 @@ The `name:owner/repo` format is recommended for GHES.
 
 ## Step 4: Initialize and run
 
-Initialize your GHES repo:
+Initialize your GHES repo using `--host` to specify the GHES hostname:
 
 ```bash
-gru init netflix:myteam/myapp
+gru init myteam/myapp --host github.netflix.com
 ```
 
 Then use Gru normally:
 
 ```bash
-# Work on a single issue
-gru do netflix:myteam/myapp#42
+# Work on a single issue (use the full URL for GHES issues)
+gru do https://github.netflix.com/myteam/myapp/issues/42
 
-# Or run lab mode to poll for gru:todo issues
+# Or from within the worktree, just use the issue number
+gru do 42
+
+# Run lab mode to poll for gru:todo issues
 gru lab
 ```
 
@@ -182,7 +184,7 @@ host = "github.netflix.com"
 Your token likely lacks required scopes. Re-authenticate with appropriate scopes:
 
 ```bash
-gh auth login --hostname ghe.example.com --scopes repo,read:org,write:discussion
+gh auth login --hostname ghe.example.com --scopes repo,read:org
 ```
 
 Or generate a new personal access token in your GHES settings with the scopes listed in [Step 1](#token-scope-requirements).
