@@ -25,6 +25,7 @@ mod progress;
 mod progress_comments;
 mod prompt_loader;
 mod prompt_renderer;
+mod prompt_utils;
 mod session_claim;
 mod stream;
 mod text_buffer;
@@ -223,6 +224,14 @@ enum Commands {
             help = "Force-push the rebased branch to origin after a successful rebase"
         )]
         push: bool,
+
+        #[arg(
+            short,
+            long,
+            requires = "push",
+            help = "Skip confirmation prompt before force-pushing (requires --push)"
+        )]
+        yes: bool,
 
         #[arg(
             short,
@@ -455,8 +464,9 @@ async fn main() {
         Commands::Rebase {
             target,
             push,
+            yes,
             timeout,
-        } => rebase::handle_rebase(target, push, timeout.as_deref()).await,
+        } => rebase::handle_rebase(target, push, yes, timeout.as_deref()).await,
         Commands::Path { id } => path::handle_path(id).await,
         Commands::Attach {
             id,

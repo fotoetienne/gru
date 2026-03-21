@@ -5,6 +5,7 @@ use crate::git;
 use crate::github;
 use crate::minion_resolver;
 use anyhow::{Context, Result};
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use tokio::process::Command;
 use uuid::Uuid;
@@ -19,6 +20,7 @@ use uuid::Uuid;
 pub async fn handle_rebase(
     target: Option<String>,
     push: bool,
+    yes: bool,
     timeout: Option<&str>,
 ) -> Result<i32> {
     let worktree_path = match target {
@@ -57,8 +59,9 @@ pub async fn handle_rebase(
             );
 
             if push {
-                force_push(&worktree_path).await?;
-                println!("🚀 Force-pushed rebased branch");
+                if !maybe_force_push(&worktree_path, yes).await? {
+                    return Ok(1);
+                }
             } else {
                 println!("ℹ️  Use --push to force-push the rebased branch to origin");
             }
@@ -77,8 +80,9 @@ pub async fn handle_rebase(
             if exit_code == 0 {
                 if push {
                     // Defensively force push in case the /rebase skill didn't push
-                    force_push(&worktree_path).await?;
-                    println!("🚀 Force-pushed rebased branch");
+                    if !maybe_force_push(&worktree_path, yes).await? {
+                        return Ok(1);
+                    }
                 } else {
                     println!("ℹ️  Use --push to force-push the rebased branch to origin");
                 }
@@ -374,6 +378,65 @@ pub(crate) async fn abort_rebase(worktree_path: &Path) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Confirms with the user, then force-pushes. Skips the prompt when `yes` is true.
+///
+/// Returns `true` if the push happened, `false` if the user cancelled.
+async fn maybe_force_push(worktree_path: &Path, yes: bool) -> Result<bool> {
+    let branch = get_current_branch(worktree_path).await?;
+
+    if !yes {
+        println!(
+            "⚠️  About to force-push branch '{}' to origin (using --force-with-lease)",
+            branch
+        );
+
+        if !std::io::stdin().is_terminal() {
+            anyhow::bail!(
+                "Non-interactive terminal detected. Use --yes to skip the confirmation prompt, \
+                 or push manually:\n    git push --force-with-lease origin HEAD"
+            );
+        }
+
+        if !confirm_force_push().await {
+            println!("Force-push cancelled.");
+            println!("ℹ️  Run again with --yes to skip this prompt, or push manually:");
+            println!("    git push --force-with-lease origin HEAD");
+            return Ok(false);
+        }
+    }
+
+    force_push(worktree_path).await?;
+    println!("🚀 Force-pushed rebased branch");
+    Ok(true)
+}
+
+/// Prompts the user to confirm a force-push.
+///
+/// Returns `true` if confirmed (y/yes/Enter), `false` otherwise.
+async fn confirm_force_push() -> bool {
+    use std::io::Write;
+    use tokio::io::AsyncBufReadExt;
+
+    print!("Proceed? [Y/n] ");
+    if std::io::stdout().flush().is_err() {
+        return false;
+    }
+
+    let mut input = String::new();
+    let stdin = tokio::io::stdin();
+    let mut reader = tokio::io::BufReader::new(stdin);
+
+    tokio::select! {
+        result = reader.read_line(&mut input) => {
+            match result {
+                Ok(0) | Err(_) => false,
+                Ok(_) => crate::prompt_utils::is_affirmative(&input),
+            }
+        }
+        _ = tokio::signal::ctrl_c() => false,
+    }
 }
 
 /// Force-pushes the current branch using --force-with-lease.
