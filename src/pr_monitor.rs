@@ -810,6 +810,22 @@ pub(crate) async fn get_pr_info_for_exit_notification(
     Ok((is_open, pr.user.login))
 }
 
+/// Fetch PR info needed for the lab daemon's wake-up scan.
+///
+/// Returns `(is_open, pr_author_login, mergeable)`.
+/// `mergeable` is `Some(false)` when GitHub detects merge conflicts,
+/// `Some(true)` when clean, or `None` when GitHub is still computing.
+pub(crate) async fn get_pr_info_for_wake_check(
+    host: &str,
+    owner: &str,
+    repo: &str,
+    pr_number: &str,
+) -> Result<(bool, String, Option<bool>)> {
+    let pr = get_pr(host, owner, repo, pr_number).await?;
+    let is_open = pr.state != "closed" && !pr.merged;
+    Ok((is_open, pr.user.login, pr.mergeable))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
