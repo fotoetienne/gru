@@ -24,6 +24,8 @@ struct PullRequest {
     user: User,
     /// GitHub's mergeable field: true, false, or null (still computing).
     mergeable: Option<bool>,
+    /// When the PR was created on GitHub.
+    created_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -873,6 +875,20 @@ pub(crate) async fn get_pr_info_for_wake_check(
     Ok((is_open, pr.user.login, pr.mergeable))
 }
 
+/// Fetch the creation timestamp of a PR from the GitHub API.
+///
+/// Used as a review-baseline fallback when the minion resumes after a crash
+/// and no persisted `last_review_check_time` is available.
+pub(crate) async fn get_pr_created_at(
+    host: &str,
+    owner: &str,
+    repo: &str,
+    pr_number: &str,
+) -> Result<DateTime<Utc>> {
+    let pr = get_pr(host, owner, repo, pr_number).await?;
+    Ok(pr.created_at)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1054,7 +1070,8 @@ mod tests {
             "head": {
                 "sha": "abc123def456"
             },
-            "user": {"login": "author"}
+            "user": {"login": "author"},
+            "created_at": "2024-01-01T00:00:00Z"
         }"#;
 
         let pr: PullRequest = serde_json::from_str(json).unwrap();
@@ -1071,7 +1088,8 @@ mod tests {
             "head": {
                 "sha": "abc123def456"
             },
-            "user": {"login": "author"}
+            "user": {"login": "author"},
+            "created_at": "2024-01-01T00:00:00Z"
         }"#;
 
         let pr: PullRequest = serde_json::from_str(json).unwrap();
@@ -1087,7 +1105,8 @@ mod tests {
             "head": {
                 "sha": "abc123def456"
             },
-            "user": {"login": "author"}
+            "user": {"login": "author"},
+            "created_at": "2024-01-01T00:00:00Z"
         }"#;
 
         let pr: PullRequest = serde_json::from_str(json).unwrap();
@@ -1117,6 +1136,10 @@ mod tests {
         assert!(!pr.merged);
         assert_eq!(pr.head.sha, "abc123def456");
         assert_eq!(pr.user.login, "author");
+        assert_eq!(
+            pr.created_at,
+            "2024-01-01T00:00:00Z".parse::<DateTime<Utc>>().unwrap()
+        );
     }
 
     #[test]
@@ -1705,7 +1728,8 @@ mod tests {
             "merged": false,
             "head": {"sha": "abc123"},
             "user": {"login": "author"},
-            "mergeable": true
+            "mergeable": true,
+            "created_at": "2024-01-01T00:00:00Z"
         }"#;
 
         let pr: PullRequest = serde_json::from_str(json).unwrap();
@@ -1719,7 +1743,8 @@ mod tests {
             "merged": false,
             "head": {"sha": "abc123"},
             "user": {"login": "author"},
-            "mergeable": false
+            "mergeable": false,
+            "created_at": "2024-01-01T00:00:00Z"
         }"#;
 
         let pr: PullRequest = serde_json::from_str(json).unwrap();
@@ -1734,7 +1759,8 @@ mod tests {
             "merged": false,
             "head": {"sha": "abc123"},
             "user": {"login": "author"},
-            "mergeable": null
+            "mergeable": null,
+            "created_at": "2024-01-01T00:00:00Z"
         }"#;
 
         let pr: PullRequest = serde_json::from_str(json).unwrap();
@@ -1748,7 +1774,8 @@ mod tests {
             "state": "open",
             "merged": false,
             "head": {"sha": "abc123"},
-            "user": {"login": "author"}
+            "user": {"login": "author"},
+            "created_at": "2024-01-01T00:00:00Z"
         }"#;
 
         let pr: PullRequest = serde_json::from_str(json).unwrap();
