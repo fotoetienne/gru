@@ -393,6 +393,83 @@ impl LabConfig {
         }
     }
 
+    /// Add a repository entry to `daemon.repos` in an existing config file,
+    /// preserving comments, formatting, and all other settings.
+    ///
+    /// Uses `toml_edit` for read-modify-write to keep user-edited config intact.
+    /// Returns `Ok(true)` if the entry was added, `Ok(false)` if already present.
+    pub fn add_repo_to_config(config_path: &Path, repo_entry: &str) -> Result<bool> {
+        use std::io::Write;
+        let contents = fs::read_to_string(config_path)
+            .with_context(|| format!("Failed to read config: {}", config_path.display()))?;
+
+        let mut doc = contents
+            .parse::<toml_edit::DocumentMut>()
+            .with_context(|| format!("Failed to parse config: {}", config_path.display()))?;
+
+        if !doc.contains_key("daemon") {
+            // When the document is all-comments (e.g., default template), toml_edit
+            // would insert the new table before the comments. Instead, we append the
+            // section as raw TOML at the end of the file after building it.
+            let repo_value = toml_edit::value(repo_entry);
+            let output = format!(
+                "{}\n[daemon]\nrepos = [{}]\n",
+                contents.trim_end(),
+                repo_value
+            );
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .truncate(true)
+                .open(config_path)
+                .with_context(|| {
+                    format!(
+                        "Failed to open config for writing: {}",
+                        config_path.display()
+                    )
+                })?;
+            file.write_all(output.as_bytes())
+                .with_context(|| format!("Failed to write config: {}", config_path.display()))?;
+            return Ok(true);
+        }
+
+        let daemon = doc["daemon"]
+            .as_table_mut()
+            .context("'daemon' is not a table")?;
+
+        // Ensure repos array exists
+        if !daemon.contains_key("repos") {
+            daemon["repos"] = toml_edit::value(toml_edit::Array::new());
+        }
+
+        let repos = daemon["repos"]
+            .as_array_mut()
+            .context("'daemon.repos' is not an array")?;
+
+        // Check if already present
+        for item in repos.iter() {
+            if item.as_str() == Some(repo_entry) {
+                return Ok(false);
+            }
+        }
+
+        repos.push(repo_entry);
+
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(config_path)
+            .with_context(|| {
+                format!(
+                    "Failed to open config for writing: {}",
+                    config_path.display()
+                )
+            })?;
+        file.write_all(doc.to_string().as_bytes())
+            .with_context(|| format!("Failed to write config: {}", config_path.display()))?;
+
+        Ok(true)
+    }
+
     /// Load configuration from file (validates daemon config — use for `gru lab`).
     pub(crate) fn load(path: &Path) -> Result<Self> {
         let contents = fs::read_to_string(path)
@@ -1291,5 +1368,102 @@ default = "test-agent"
         super::TEST_CONFIG_PATH_OVERRIDE.with(|cell| {
             assert!(cell.borrow().is_none());
         });
+    }
+
+    #[test]
+    fn test_add_repo_to_config_new_daemon_section() {
+        // Config exists but has no [daemon] section
+        let config_toml = "# My config\n";
+        let mut temp_file = NamedTempFile::new().unwrap();
+        temp_file.write_all(config_toml.as_bytes()).unwrap();
+        temp_file.flush().unwrap();
+
+        let result = LabConfig::add_repo_to_config(temp_file.path(), "owner/repo").unwrap();
+        assert!(result, "should return true when repo was added");
+
+        let contents = fs::read_to_string(temp_file.path()).unwrap();
+        assert!(contents.contains("# My config"), "should preserve comments");
+        let reloaded: LabConfig = toml::from_str(&contents).unwrap();
+        assert_eq!(reloaded.daemon.repos, vec!["owner/repo"]);
+    }
+
+    #[test]
+    fn test_add_repo_to_config_existing_repos() {
+        let config_toml = r#"
+[daemon]
+repos = ["foo/bar"]
+poll_interval_secs = 60
+"#;
+        let mut temp_file = NamedTempFile::new().unwrap();
+        temp_file.write_all(config_toml.as_bytes()).unwrap();
+        temp_file.flush().unwrap();
+
+        let result = LabConfig::add_repo_to_config(temp_file.path(), "baz/qux").unwrap();
+        assert!(result);
+
+        let contents = fs::read_to_string(temp_file.path()).unwrap();
+        let reloaded: LabConfig = toml::from_str(&contents).unwrap();
+        assert_eq!(reloaded.daemon.repos, vec!["foo/bar", "baz/qux"]);
+        assert_eq!(
+            reloaded.daemon.poll_interval_secs, 60,
+            "should preserve other settings"
+        );
+    }
+
+    #[test]
+    fn test_add_repo_to_config_already_present() {
+        let config_toml = r#"
+[daemon]
+repos = ["owner/repo"]
+"#;
+        let mut temp_file = NamedTempFile::new().unwrap();
+        temp_file.write_all(config_toml.as_bytes()).unwrap();
+        temp_file.flush().unwrap();
+
+        let result = LabConfig::add_repo_to_config(temp_file.path(), "owner/repo").unwrap();
+        assert!(!result, "should return false when repo already present");
+
+        let contents = fs::read_to_string(temp_file.path()).unwrap();
+        let reloaded: LabConfig = toml::from_str(&contents).unwrap();
+        assert_eq!(reloaded.daemon.repos, vec!["owner/repo"]);
+    }
+
+    #[test]
+    fn test_add_repo_to_config_with_host() {
+        let config_toml = "# empty config\n";
+        let mut temp_file = NamedTempFile::new().unwrap();
+        temp_file.write_all(config_toml.as_bytes()).unwrap();
+        temp_file.flush().unwrap();
+
+        let result = LabConfig::add_repo_to_config(temp_file.path(), "ghe.co/owner/repo").unwrap();
+        assert!(result);
+
+        let contents = fs::read_to_string(temp_file.path()).unwrap();
+        let reloaded: LabConfig = toml::from_str(&contents).unwrap();
+        assert_eq!(reloaded.daemon.repos, vec!["ghe.co/owner/repo"]);
+    }
+
+    #[test]
+    fn test_add_repo_to_config_default_config_template() {
+        // Simulate the flow: write_default_config then add_repo_to_config
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+
+        LabConfig::write_default_config(&config_path).unwrap();
+        let result = LabConfig::add_repo_to_config(&config_path, "owner/repo").unwrap();
+        assert!(result);
+
+        let contents = fs::read_to_string(&config_path).unwrap();
+        // Comments from default template should be preserved
+        assert!(contents.contains("# Gru configuration file"));
+        // [daemon] section should appear after the header comment, not before
+        let comment_pos = contents.find("# Gru configuration file").unwrap();
+        let daemon_pos = contents.find("[daemon]").unwrap();
+        assert!(
+            comment_pos < daemon_pos,
+            "[daemon] should appear after the file header comment"
+        );
+        let reloaded: LabConfig = toml::from_str(&contents).unwrap();
+        assert_eq!(reloaded.daemon.repos, vec!["owner/repo"]);
     }
 }
