@@ -236,3 +236,46 @@ pub(crate) fn agent_exit_code(agent_result: &Option<AgentResult>) -> i32 {
         .map(|r| r.status.code().unwrap_or(EXIT_CODE_SIGNAL_TERMINATED))
         .unwrap_or(0)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::process::Command;
+
+    fn exit_status(code: i32) -> std::process::ExitStatus {
+        // Use a real process to get an ExitStatus with a specific code.
+        Command::new("sh")
+            .args(["-c", &format!("exit {}", code)])
+            .status()
+            .unwrap()
+    }
+
+    #[test]
+    fn test_agent_exit_code_none_returns_zero() {
+        assert_eq!(agent_exit_code(&None), 0);
+    }
+
+    #[test]
+    fn test_agent_exit_code_success() {
+        let result = AgentResult {
+            status: exit_status(0),
+        };
+        assert_eq!(agent_exit_code(&Some(result)), 0);
+    }
+
+    #[test]
+    fn test_agent_exit_code_failure() {
+        let result = AgentResult {
+            status: exit_status(1),
+        };
+        assert_eq!(agent_exit_code(&Some(result)), 1);
+    }
+
+    #[test]
+    fn test_agent_exit_code_custom_code() {
+        let result = AgentResult {
+            status: exit_status(42),
+        };
+        assert_eq!(agent_exit_code(&Some(result)), 42);
+    }
+}

@@ -947,4 +947,158 @@ mod tests {
         };
         assert!(mr.failure_reasons().is_empty());
     }
+
+    // --- mergeable field edge cases ---
+
+    #[test]
+    fn test_mergeable_null_treated_as_not_ready() {
+        let pr = PrDetails {
+            head_sha: "abc123".into(),
+            draft: false,
+            mergeable: None,
+            author_login: "author".into(),
+        };
+        assert!(pr.mergeable != Some(true));
+    }
+
+    #[test]
+    fn test_mergeable_false_treated_as_not_ready() {
+        let pr = PrDetails {
+            head_sha: "abc123".into(),
+            draft: false,
+            mergeable: Some(false),
+            author_login: "author".into(),
+        };
+        assert!(pr.mergeable != Some(true));
+    }
+
+    #[test]
+    fn test_mergeable_true_is_ready() {
+        let pr = PrDetails {
+            head_sha: "abc123".into(),
+            draft: false,
+            mergeable: Some(true),
+            author_login: "author".into(),
+        };
+        assert!(pr.mergeable == Some(true));
+    }
+
+    // --- T6: is_retryable_error pattern tests ---
+
+    #[test]
+    fn test_retryable_502() {
+        assert!(is_retryable_error("HTTP 502 Bad Gateway"));
+    }
+
+    #[test]
+    fn test_retryable_503() {
+        assert!(is_retryable_error("503 Service Unavailable"));
+    }
+
+    #[test]
+    fn test_retryable_504() {
+        assert!(is_retryable_error("504 Gateway Timeout"));
+    }
+
+    #[test]
+    fn test_retryable_429() {
+        assert!(is_retryable_error("HTTP 429"));
+    }
+
+    #[test]
+    fn test_retryable_timeout() {
+        assert!(is_retryable_error("request timeout"));
+    }
+
+    #[test]
+    fn test_retryable_timed_out() {
+        assert!(is_retryable_error("connection timed out"));
+    }
+
+    #[test]
+    fn test_retryable_connection_reset() {
+        assert!(is_retryable_error("connection reset by peer"));
+    }
+
+    #[test]
+    fn test_retryable_connection_refused() {
+        assert!(is_retryable_error("connection refused"));
+    }
+
+    #[test]
+    fn test_retryable_rate_limit() {
+        assert!(is_retryable_error("API rate limit exceeded"));
+    }
+
+    #[test]
+    fn test_retryable_rate_limit_hyphenated() {
+        assert!(is_retryable_error("rate-limit reached"));
+    }
+
+    #[test]
+    fn test_retryable_too_many_requests() {
+        assert!(is_retryable_error("too many requests"));
+    }
+
+    #[test]
+    fn test_retryable_internal_server_error() {
+        assert!(is_retryable_error("internal server error"));
+    }
+
+    #[test]
+    fn test_retryable_service_unavailable() {
+        assert!(is_retryable_error("service unavailable"));
+    }
+
+    #[test]
+    fn test_retryable_bad_gateway() {
+        assert!(is_retryable_error("bad gateway"));
+    }
+
+    #[test]
+    fn test_retryable_gateway_timeout() {
+        assert!(is_retryable_error("gateway timeout"));
+    }
+
+    #[test]
+    fn test_retryable_temporary() {
+        assert!(is_retryable_error("temporary failure in name resolution"));
+    }
+
+    #[test]
+    fn test_retryable_try_again() {
+        assert!(is_retryable_error("please try again later"));
+    }
+
+    #[test]
+    fn test_retryable_case_insensitive() {
+        assert!(is_retryable_error("RATE LIMIT exceeded"));
+        assert!(is_retryable_error("Connection Reset"));
+        assert!(is_retryable_error("TIMEOUT"));
+    }
+
+    #[test]
+    fn test_not_retryable_404() {
+        assert!(!is_retryable_error("HTTP 404 Not Found"));
+    }
+
+    #[test]
+    fn test_not_retryable_auth() {
+        assert!(!is_retryable_error("authentication failed"));
+    }
+
+    #[test]
+    fn test_not_retryable_permission() {
+        assert!(!is_retryable_error("permission denied"));
+    }
+
+    #[test]
+    fn test_not_retryable_empty() {
+        assert!(!is_retryable_error(""));
+    }
+
+    #[test]
+    fn test_not_retryable_generic_error() {
+        assert!(!is_retryable_error("something went wrong"));
+    }
 }

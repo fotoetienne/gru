@@ -1035,4 +1035,54 @@ That's my verdict."#;
         assert!(prompt.contains("IMPORTANT: This is your final evaluation"));
         assert!(prompt.contains("attempt 3 of 3"));
     }
+
+    // --- T7: Wait timer expiry test ---
+
+    #[test]
+    fn test_judge_state_wait_timer_expiry() {
+        let mut state = JudgeState::new();
+        let fp = PrStateFingerprint {
+            head_sha: "abc123".to_string(),
+            comment_count: 5,
+        };
+        // Record a Wait response with a 1ms duration so it expires immediately.
+        let response = JudgeResponse {
+            confidence: 5,
+            action: JudgeAction::Wait(Duration::from_millis(1)),
+            reasoning: "need more time".to_string(),
+        };
+        state.record_response(fp.clone(), &response);
+
+        // Same fingerprint, timer not expired yet (in practice it may already be).
+        // Sleep to guarantee expiry.
+        std::thread::sleep(Duration::from_millis(5));
+
+        // Now should_invoke should return true because the timer expired.
+        assert!(
+            state.should_invoke(&fp),
+            "should_invoke must return true after wait timer expires"
+        );
+    }
+
+    #[test]
+    fn test_judge_state_wait_timer_not_expired() {
+        let mut state = JudgeState::new();
+        let fp = PrStateFingerprint {
+            head_sha: "abc123".to_string(),
+            comment_count: 5,
+        };
+        // Record a Wait response with a very long duration.
+        let response = JudgeResponse {
+            confidence: 5,
+            action: JudgeAction::Wait(Duration::from_secs(3600)),
+            reasoning: "need more time".to_string(),
+        };
+        state.record_response(fp.clone(), &response);
+
+        // Same fingerprint, timer should NOT have expired.
+        assert!(
+            !state.should_invoke(&fp),
+            "should_invoke must return false while wait timer is active"
+        );
+    }
 }
