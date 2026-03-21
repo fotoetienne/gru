@@ -304,7 +304,10 @@ pub async fn is_issue_still_eligible(owner: &str, repo: &str, host: &str, number
 /// Pure decision logic for issue eligibility based on state and labels.
 ///
 /// Returns `(true, None)` if eligible, or `(false, Some(reason))` if not.
-fn check_issue_eligibility(state: &str, labels: &[IssueLabel]) -> (bool, Option<String>) {
+pub(crate) fn check_issue_eligibility(
+    state: &str,
+    labels: &[IssueLabel],
+) -> (bool, Option<String>) {
     if state != "OPEN" {
         return (false, Some(format!("is no longer open (state: {})", state)));
     }
@@ -573,7 +576,49 @@ pub(crate) async fn post_comment_via_cli(
     Ok(())
 }
 
-/// Edit labels on an issue using gh CLI (add and/or remove in a single call)
+/// Check whether any of the given labels are present on an issue.
+///
+/// Returns the name of the first matching label, or `None` if none match.
+pub async fn has_any_label_via_cli(
+    host: &str,
+    owner: &str,
+    repo: &str,
+    number: u64,
+    labels: &[&str],
+) -> Result<Option<String>> {
+    let repo_full = repo_slug(owner, repo);
+    let number_str = number.to_string();
+    let stdout = run_gh(
+        host,
+        &[
+            "issue",
+            "view",
+            &number_str,
+            "--repo",
+            &repo_full,
+            "--json",
+            "labels",
+        ],
+    )
+    .await?;
+
+    #[derive(serde::Deserialize)]
+    struct LabelsOnly {
+        #[serde(default)]
+        labels: Vec<IssueLabel>,
+    }
+
+    let info: LabelsOnly =
+        serde_json::from_str(&stdout).context("Failed to parse gh issue view labels JSON")?;
+
+    Ok(info
+        .labels
+        .iter()
+        .find(|l| labels.contains(&l.name.as_str()))
+        .map(|l| l.name.clone()))
+}
+
+/// Edit labels on an issue using gh CLI (add and/or remove in a single call).
 ///
 /// # Arguments
 /// * `host` - GitHub hostname
@@ -1398,6 +1443,75 @@ mod tests {
         let (eligible, reason) = check_issue_eligibility("CLOSED", &labels);
         assert!(!eligible);
         assert!(reason.unwrap().contains("no longer open"));
+    }
+
+    #[test]
+    fn test_has_any_label_parses_present_label() {
+        // Simulate the JSON returned by `gh issue view --json labels`
+        #[derive(serde::Deserialize)]
+        struct LabelsOnly {
+            #[serde(default)]
+            labels: Vec<IssueLabel>,
+        }
+        let json = r#"{"labels":[{"name":"gru:done"},{"name":"bug"}]}"#;
+        let info: LabelsOnly = serde_json::from_str(json).unwrap();
+        let targets = ["gru:done", "gru:failed"];
+        let found = info
+            .labels
+            .iter()
+            .find(|l| targets.contains(&l.name.as_str()));
+        assert_eq!(found.unwrap().name, "gru:done");
+    }
+
+    #[test]
+    fn test_has_any_label_finds_failed() {
+        #[derive(serde::Deserialize)]
+        struct LabelsOnly {
+            #[serde(default)]
+            labels: Vec<IssueLabel>,
+        }
+        let json = r#"{"labels":[{"name":"gru:failed"},{"name":"bug"}]}"#;
+        let info: LabelsOnly = serde_json::from_str(json).unwrap();
+        let targets = ["gru:done", "gru:failed"];
+        let found = info
+            .labels
+            .iter()
+            .find(|l| targets.contains(&l.name.as_str()));
+        assert_eq!(found.unwrap().name, "gru:failed");
+    }
+
+    #[test]
+    fn test_has_any_label_parses_absent_label() {
+        #[derive(serde::Deserialize)]
+        struct LabelsOnly {
+            #[serde(default)]
+            labels: Vec<IssueLabel>,
+        }
+        let json = r#"{"labels":[{"name":"gru:in-progress"},{"name":"bug"}]}"#;
+        let info: LabelsOnly = serde_json::from_str(json).unwrap();
+        let targets = ["gru:done", "gru:failed"];
+        let found = info
+            .labels
+            .iter()
+            .find(|l| targets.contains(&l.name.as_str()));
+        assert!(found.is_none());
+    }
+
+    #[test]
+    fn test_has_any_label_parses_empty_labels() {
+        #[derive(serde::Deserialize)]
+        struct LabelsOnly {
+            #[serde(default)]
+            labels: Vec<IssueLabel>,
+        }
+        let json = r#"{"labels":[]}"#;
+        let info: LabelsOnly = serde_json::from_str(json).unwrap();
+        let targets = ["gru:done", "gru:failed"];
+        let found = info
+            .labels
+            .iter()
+            .find(|l| targets.contains(&l.name.as_str()));
+        assert!(found.is_none());
     }
 
     #[tokio::test]
