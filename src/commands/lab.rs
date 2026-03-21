@@ -9,6 +9,8 @@ use chrono::{DateTime, Local, Utc};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::process::Child;
 use tokio::time::sleep;
@@ -124,6 +126,34 @@ pub async fn handle_lab(
         tprintln!();
     }
 
+    // Listen for both SIGINT (Ctrl-C) and SIGTERM (kill, systemd, docker).
+    // Use persistent Signal handles so queued signals are never lost between select! arms.
+    let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+        .context("Failed to register SIGINT handler")?;
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .context("Failed to register SIGTERM handler")?;
+
+    // Cooperative shutdown flag: a background task sets this on SIGINT/SIGTERM so that
+    // poll_and_spawn can exit at safe checkpoints instead of being hard-cancelled via
+    // select!, which could leave external state (e.g. issue labels) inconsistent.
+    let shutdown_flag = Arc::new(AtomicBool::new(false));
+    {
+        let flag = shutdown_flag.clone();
+        let mut bg_sigint =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+                .context("Failed to register background SIGINT watcher")?;
+        let mut bg_sigterm =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .context("Failed to register background SIGTERM watcher")?;
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = bg_sigint.recv() => {}
+                _ = bg_sigterm.recv() => {}
+            }
+            flag.store(true, Ordering::Release);
+        });
+    }
+
     // Perform initial poll immediately for faster feedback
     if let Err(e) = poll_and_spawn(
         &config,
@@ -131,19 +161,13 @@ pub async fn handle_lab(
         no_resume,
         &mut resumed_this_session,
         &mut wake_check_times,
+        &shutdown_flag,
     )
     .await
     {
         log::warn!("⚠️  Initial polling error: {}", e);
         log::warn!("   Continuing to poll...");
     }
-
-    // Listen for both SIGINT (Ctrl-C) and SIGTERM (kill, systemd, docker)
-    // Use persistent Signal handles so queued signals are never lost between select! arms
-    let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
-        .context("Failed to register SIGINT handler")?;
-    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-        .context("Failed to register SIGTERM handler")?;
 
     macro_rules! shutdown {
         ($signal:literal) => {{
@@ -168,33 +192,30 @@ pub async fn handle_lab(
                 // Clean up finished child processes
                 reap_children(&mut children).await;
 
-                // Phase 2: Race poll_and_spawn against shutdown signals
-                // so Ctrl+C during polling cancels all in-flight API calls at once.
-                //
-                // Cancellation safety: dropping poll_and_spawn mid-flight could
-                // theoretically leave an issue labeled gru:in-progress without a
-                // running child (if cancelled between claim_issue and spawn_minion).
-                // This is acceptable because reap_children already restores labels
-                // for early-exit children, and the next lab restart will pick up
-                // orphaned in-progress issues.
-                //
-                // Note: block_in_place sections (e.g. PR-open checks) cannot be
-                // interrupted by cancellation until they return.
-                tokio::select! {
-                    _ = sigint.recv() => { shutdown!("SIGINT"); }
-                    _ = sigterm.recv() => { shutdown!("SIGTERM"); }
-                    result = poll_and_spawn(
-                        &config,
-                        &mut children,
-                        no_resume,
-                        &mut resumed_this_session,
-                        &mut wake_check_times,
-                    ) => {
-                        if let Err(e) = result {
-                            log::warn!("⚠️  Polling error: {}", e);
-                            log::warn!("   Continuing to poll...");
-                        }
-                    }
+                // Phase 2: Run poll_and_spawn with cooperative cancellation.
+                // Instead of racing the future against signals (which would hard-cancel
+                // it and could leave issue labels inconsistent mid-claim), we pass a
+                // shutdown flag that is checked between operations for a clean early exit.
+                if let Err(e) = poll_and_spawn(
+                    &config,
+                    &mut children,
+                    no_resume,
+                    &mut resumed_this_session,
+                    &mut wake_check_times,
+                    &shutdown_flag,
+                )
+                .await
+                {
+                    log::warn!("⚠️  Polling error: {}", e);
+                    log::warn!("   Continuing to poll...");
+                }
+
+                // Check if a signal arrived during poll_and_spawn
+                if shutdown_flag.load(Ordering::Acquire) {
+                    tprintln!();
+                    tprintln!("🛑 Received shutdown signal during polling, stopping daemon...");
+                    shutdown_children(&mut children, stop_minions).await;
+                    break;
                 }
             }
         }
@@ -1178,11 +1199,12 @@ async fn spawn_for_candidate_issues(
     children: &mut Vec<SpawnedChild>,
     available: &mut usize,
     label: &str,
+    shutdown_flag: &AtomicBool,
 ) -> Result<usize> {
     let mut spawned = 0usize;
 
     for repo_spec in &config.daemon.repos {
-        if *available == 0 {
+        if *available == 0 || shutdown_flag.load(Ordering::Acquire) {
             break;
         }
 
@@ -1213,7 +1235,7 @@ async fn spawn_for_candidate_issues(
         let mut spawned_this_repo = 0usize;
 
         for candidate in &candidates {
-            if *available == 0 {
+            if *available == 0 || shutdown_flag.load(Ordering::Acquire) {
                 break;
             }
 
@@ -1270,16 +1292,25 @@ async fn spawn_for_candidate_issues(
     Ok(spawned)
 }
 
-/// Poll GitHub for ready issues and spawn Minions if slots are available
+/// Poll GitHub for ready issues and spawn Minions if slots are available.
+///
+/// Checks  between major phases for cooperative cancellation.
+/// When the flag is set (signal received), returns early at the next safe checkpoint
+/// instead of continuing to the next API call.
 async fn poll_and_spawn(
     config: &LabConfig,
     children: &mut Vec<SpawnedChild>,
     no_resume: bool,
     resumed_this_session: &mut HashSet<String>,
     wake_check_times: &mut HashMap<String, DateTime<Utc>>,
+    shutdown_flag: &AtomicBool,
 ) -> Result<()> {
     // Prune stale registry entries (worktrees that no longer exist, checking PR status)
     prune_stale_entries().await?;
+
+    if shutdown_flag.load(Ordering::Acquire) {
+        return Ok(());
+    }
 
     let max_attempts = config.daemon.max_resume_attempts;
 
@@ -1296,6 +1327,10 @@ async fn poll_and_spawn(
         {
             log::warn!("⚠️  Review wake scan error: {}", e);
         }
+    }
+
+    if shutdown_flag.load(Ordering::Acquire) {
+        return Ok(());
     }
 
     // Calculate available slots using PID liveness (not registry status string)
@@ -1321,6 +1356,10 @@ async fn poll_and_spawn(
     };
     let mut spawned = resumed;
 
+    if shutdown_flag.load(Ordering::Acquire) {
+        return Ok(());
+    }
+
     if available == 0 {
         if spawned > 0 {
             tprintln!();
@@ -1329,8 +1368,14 @@ async fn poll_and_spawn(
     }
 
     // Poll each configured repository and spawn minions for ready issues
-    spawned +=
-        spawn_for_candidate_issues(config, children, &mut available, &config.daemon.label).await?;
+    spawned += spawn_for_candidate_issues(
+        config,
+        children,
+        &mut available,
+        &config.daemon.label,
+        shutdown_flag,
+    )
+    .await?;
 
     if spawned > 0 {
         tprintln!();
