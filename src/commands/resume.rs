@@ -289,7 +289,8 @@ async fn run_resume_pipeline(ctx: ResumeContext, quiet: bool) -> Result<i32> {
 
     // Non-"do" minions (e.g., "prompt", "review") only run the agent phase —
     // they should not create PRs or enter the monitoring lifecycle.
-    let agent_only = command != "do";
+    // Accept the legacy "fix" alias used in registries written before the rename.
+    let agent_only = command != "do" && command != "fix";
 
     // Rename tmux window for the resume session
     let _tmux_guard = TmuxGuard::new(&format!("gru:{}", wt_ctx.minion_id));
@@ -324,6 +325,9 @@ async fn run_resume_pipeline(ctx: ResumeContext, quiet: bool) -> Result<i32> {
     if let Some(ref result) = agent_result {
         if !result.status.success() {
             println!("❌ Agent session exited with non-zero status");
+            if agent_only {
+                cleanup_registry(&wt_ctx.minion_id).await;
+            }
             return Ok(result.status.code().unwrap_or(EXIT_CODE_SIGNAL_TERMINATED));
         }
     }
