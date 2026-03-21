@@ -1026,21 +1026,23 @@ pub(crate) async fn monitor_pr_lifecycle(
     // On re-entry (already_reviewed, e.g. after crash+resume), resolve the
     // baseline using a fallback chain that avoids losing reviews posted
     // while the minion was stopped:
-    //   1. Persisted last_review_check_time (saved before crash)
+    //   1. Persisted last_review_check_time (saved at monitor exit or after each review round)
     //   2. PR creation time from GitHub API (catches all reviews ever posted)
-    //   3. Current time (last resort)
+    //   3. Minion started_at from registry (earlier than "now", avoids dropping reviews)
+    //   4. Current time (true last resort if registry is also unavailable)
     let initial_baseline = if already_reviewed {
         let mid = wt_ctx.minion_id.clone();
-        let persisted = minion_registry::with_registry(move |registry| {
+        let (persisted_check_time, started_at) = minion_registry::with_registry(move |registry| {
             Ok(registry
                 .get(&mid)
-                .and_then(|info| info.last_review_check_time))
+                .map(|info| (info.last_review_check_time, info.started_at)))
         })
         .await
         .ok()
-        .flatten();
+        .flatten()
+        .unwrap_or((None, pre_review_time));
 
-        match persisted {
+        match persisted_check_time {
             Some(ts) => ts,
             None => {
                 // No persisted baseline — fall back to PR creation time so
@@ -1055,17 +1057,18 @@ pub(crate) async fn monitor_pr_lifecycle(
                 {
                     Ok(created) => {
                         log::info!(
-                            "📅 Using PR creation time {} as review baseline (no persisted state)",
+                            "Using PR creation time {} as review baseline (no persisted state)",
                             created
                         );
                         created
                     }
                     Err(e) => {
                         log::warn!(
-                            "⚠️  Failed to fetch PR creation time, falling back to now: {}",
+                            "⚠️  Failed to fetch PR creation time, \
+                             using minion start time as baseline: {}",
                             e
                         );
-                        pre_review_time
+                        started_at
                     }
                 }
             }
