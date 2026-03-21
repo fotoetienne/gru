@@ -597,6 +597,8 @@ pub async fn has_any_label_via_cli(
         .map(|l| l.name.clone()))
 }
 
+/// Edit labels on an issue using gh CLI (add and/or remove in a single call).
+///
 /// # Arguments
 /// * `host` - GitHub hostname
 /// * `owner` - Repository owner

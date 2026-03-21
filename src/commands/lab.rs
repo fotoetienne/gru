@@ -213,24 +213,43 @@ async fn reap_children(children: &mut Vec<SpawnedChild>) {
                             {
                                 Ok(label) => label,
                                 Err(e) => {
-                                    // Fail-safe: skip restoration rather than risk
-                                    // adding gru:todo on top of a terminal label.
+                                    // Fail-open: proceed with restoration rather than
+                                    // risk leaving the issue stuck in gru:in-progress.
                                     log::warn!(
                                         "⚠️  Failed to check labels on issue #{}: {} \
-                                         — skipping restoration to be safe",
+                                         — proceeding with label restoration (fail-open)",
                                         meta.issue_number,
                                         e
                                     );
-                                    Some("(unknown — API error)".to_string())
+                                    None
                                 }
                             };
 
                             if let Some(label) = terminal_label {
                                 log::info!(
-                                    "⏭️  Issue #{} already has {} — skipping label restoration",
+                                    "⏭️  Issue #{} already has {} — skipping gru:todo restoration, \
+                                     removing gru:in-progress only",
                                     meta.issue_number,
                                     label
                                 );
+                                // Still remove gru:in-progress so the issue doesn't
+                                // end up with both a terminal label and in-progress.
+                                if let Err(e) = github::edit_labels_via_cli(
+                                    &meta.host,
+                                    &meta.owner,
+                                    &meta.repo,
+                                    meta.issue_number,
+                                    &[],
+                                    &[labels::IN_PROGRESS],
+                                )
+                                .await
+                                {
+                                    log::warn!(
+                                        "⚠️  Failed to remove gru:in-progress from issue #{}: {}",
+                                        meta.issue_number,
+                                        e
+                                    );
+                                }
                             } else {
                                 log::warn!(
                                     "⚠️  Spawned gru do for issue #{} exited early with {} (after {:.1}s) — restoring label",
