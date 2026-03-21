@@ -451,15 +451,19 @@ pub(crate) fn find_wake_candidates(
 
 /// Returns true if a Completed minion should be woken up based on PR and review state.
 ///
-/// Conditions:
-/// - `pr_open`: the PR is still open (not merged or closed)
+/// Conditions (any of the following, when `pr_open` is true):
 /// - `unaddressed_reviews > 0`: there are new external reviews to address
+/// - `has_merge_conflict`: GitHub reports the PR has merge conflicts (`mergeable == false`)
 ///
 /// Note: cooldown rate-limiting is enforced separately via `within_wake_cooldown` before
 /// any GitHub API calls are made. This function encapsulates only the per-minion wake
-/// decision after reviews are fetched, keeping it a simple testable predicate.
-pub(crate) fn should_wake_minion(pr_open: bool, unaddressed_reviews: usize) -> bool {
-    pr_open && unaddressed_reviews > 0
+/// decision after PR info is fetched, keeping it a simple testable predicate.
+pub(crate) fn should_wake_minion(
+    pr_open: bool,
+    unaddressed_reviews: usize,
+    has_merge_conflict: bool,
+) -> bool {
+    pr_open && (unaddressed_reviews > 0 || has_merge_conflict)
 }
 
 /// Returns true if a minion is still within the wake cooldown window.
@@ -478,8 +482,8 @@ pub(crate) fn within_wake_cooldown(
     elapsed < cooldown
 }
 
-/// Scan Completed minions for open PRs with new external reviews, and flip them back
-/// to `MonitoringPr` so the resume chain picks them up.
+/// Scan Completed minions for open PRs with new external reviews or merge conflicts,
+/// and flip them back to `MonitoringPr` so the resume chain picks them up.
 ///
 /// `wake_check_times` is an in-memory map of minion_id → last GitHub API poll time,
 /// used to enforce `WAKE_COOLDOWN` across poll cycles without persisting to disk.
@@ -557,24 +561,24 @@ async fn find_minions_needing_review_wake(
         // fail — prevents hammering the GitHub API during transient outages.
         wake_check_times.insert(minion_id.clone(), Utc::now());
 
-        // Fetch PR open/author info and all reviews.
-        let pr_info = match pr_monitor::get_pr_info_for_exit_notification(
-            &host, &owner, &repo_name, &pr_number,
-        )
-        .await
-        {
-            Ok(r) => r,
-            Err(e) => {
-                log::warn!(
-                    "Failed to get PR info for {} (PR #{}): {}",
-                    minion_id,
-                    pr_number,
-                    e
-                );
-                continue;
-            }
-        };
-        let (pr_open, pr_author) = pr_info;
+        // Fetch PR open/author/mergeable info and all reviews.
+        let pr_info =
+            match pr_monitor::get_pr_info_for_wake_check(&host, &owner, &repo_name, &pr_number)
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    log::warn!(
+                        "Failed to get PR info for {} (PR #{}): {}",
+                        minion_id,
+                        pr_number,
+                        e
+                    );
+                    continue;
+                }
+            };
+        let (pr_open, pr_author, mergeable) = pr_info;
+        let has_merge_conflict = mergeable == Some(false);
 
         let reviews = match pr_monitor::get_all_reviews(&host, &owner, &repo_name, &pr_number).await
         {
@@ -593,26 +597,43 @@ async fn find_minions_needing_review_wake(
         let since = info.last_review_check_time.unwrap_or(info.started_at);
         let unaddressed = pr_monitor::has_unaddressed_reviews(&reviews, &pr_author, since);
 
-        if !should_wake_minion(pr_open, unaddressed) {
+        if !should_wake_minion(pr_open, unaddressed, has_merge_conflict) {
             log::debug!(
-                "No wake needed for {} (pr_open={}, unaddressed={})",
+                "No wake needed for {} (pr_open={}, unaddressed={}, conflict={})",
                 minion_id,
                 pr_open,
-                unaddressed
+                unaddressed,
+                has_merge_conflict
             );
             continue;
         }
 
-        tprintln!(
-            "🔔 Waking up {} (issue #{}, {}): {} new external review(s) on PR #{}",
-            minion_id,
-            info.issue.map_or("?".to_string(), |n| n.to_string()),
-            info.repo,
-            unaddressed,
-            pr_number
-        );
-
-        let wake_reason = format!("Address the review comments on PR #{}", pr_number);
+        let issue_display = info.issue.map_or("?".to_string(), |n| n.to_string());
+        let wake_reason = if has_merge_conflict && unaddressed == 0 {
+            tprintln!(
+                "🔔 Waking up {} (issue #{}, {}): merge conflict detected on PR #{}",
+                minion_id,
+                issue_display,
+                info.repo,
+                pr_number
+            );
+            format!("Rebase PR #{} to resolve merge conflicts", pr_number)
+        } else {
+            tprintln!(
+                "🔔 Waking up {} (issue #{}, {}): {} new external review(s){} on PR #{}",
+                minion_id,
+                issue_display,
+                info.repo,
+                unaddressed,
+                if has_merge_conflict {
+                    " + merge conflict"
+                } else {
+                    ""
+                },
+                pr_number
+            );
+            format!("Address the review comments on PR #{}", pr_number)
+        };
         let mid = minion_id.clone();
         if let Err(e) = with_registry(move |reg| {
             reg.update(&mid, |i| {
@@ -2062,24 +2083,48 @@ mod tests {
     #[test]
     fn test_should_wake_minion_false_for_closed_pr() {
         assert!(
-            !should_wake_minion(false, 2),
+            !should_wake_minion(false, 2, false),
             "Closed/merged PR must never trigger wake-up"
         );
     }
 
     #[test]
-    fn test_should_wake_minion_false_for_no_reviews() {
+    fn test_should_wake_minion_false_for_closed_pr_with_conflict() {
         assert!(
-            !should_wake_minion(true, 0),
-            "Open PR with zero unaddressed reviews must not trigger wake-up"
+            !should_wake_minion(false, 0, true),
+            "Closed/merged PR must never trigger wake-up even with conflict"
         );
     }
 
     #[test]
-    fn test_should_wake_minion_true_when_all_conditions_met() {
+    fn test_should_wake_minion_false_for_no_reviews_no_conflict() {
         assert!(
-            should_wake_minion(true, 1),
+            !should_wake_minion(true, 0, false),
+            "Open PR with zero unaddressed reviews and no conflict must not trigger wake-up"
+        );
+    }
+
+    #[test]
+    fn test_should_wake_minion_true_when_reviews_pending() {
+        assert!(
+            should_wake_minion(true, 1, false),
             "Wake-up must trigger when PR is open and reviews are pending"
+        );
+    }
+
+    #[test]
+    fn test_should_wake_minion_true_when_merge_conflict() {
+        assert!(
+            should_wake_minion(true, 0, true),
+            "Wake-up must trigger when PR is open and has merge conflict"
+        );
+    }
+
+    #[test]
+    fn test_should_wake_minion_true_when_reviews_and_conflict() {
+        assert!(
+            should_wake_minion(true, 2, true),
+            "Wake-up must trigger when PR has both reviews and conflict"
         );
     }
 
