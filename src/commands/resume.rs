@@ -35,6 +35,8 @@ struct ResumeContext {
     start_phase: OrchestrationPhase,
     effective_timeout: Option<String>,
     no_watch: bool,
+    /// The command that originally created this minion (e.g., "do", "prompt", "review").
+    command: String,
 }
 
 /// Handles the resume command: resumes a stopped Minion in autonomous mode.
@@ -122,6 +124,7 @@ async fn check_resumption_preconditions(
     let no_watch = info.no_watch;
     let start_phase = info.orchestration_phase.clone();
     let wake_reason = info.wake_reason.clone();
+    let command = info.command.clone();
 
     // Check if timeout_deadline has passed — fail instead of resuming
     if let Some(deadline) = timeout_deadline {
@@ -264,6 +267,7 @@ async fn check_resumption_preconditions(
         start_phase,
         effective_timeout,
         no_watch,
+        command,
     })
 }
 
@@ -280,7 +284,12 @@ async fn run_resume_pipeline(ctx: ResumeContext, quiet: bool) -> Result<i32> {
         start_phase,
         effective_timeout,
         no_watch,
+        command,
     } = ctx;
+
+    // Non-"do" minions (e.g., "prompt", "review") only run the agent phase —
+    // they should not create PRs or enter the monitoring lifecycle.
+    let agent_only = command != "do";
 
     // Rename tmux window for the resume session
     let _tmux_guard = TmuxGuard::new(&format!("gru:{}", wt_ctx.minion_id));
@@ -317,6 +326,14 @@ async fn run_resume_pipeline(ctx: ResumeContext, quiet: bool) -> Result<i32> {
             println!("❌ Agent session exited with non-zero status");
             return Ok(result.status.code().unwrap_or(EXIT_CODE_SIGNAL_TERMINATED));
         }
+    }
+
+    // For agent-only commands (prompt, review, etc.), skip PR creation and monitoring
+    if agent_only {
+        update_orchestration_phase(&wt_ctx.minion_id, OrchestrationPhase::Completed).await;
+        cleanup_registry(&wt_ctx.minion_id).await;
+        println!("✅ Resume completed for Minion {}", wt_ctx.minion_id);
+        return Ok(agent_exit_code(&agent_result));
     }
 
     // Phase: Create PR
