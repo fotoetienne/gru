@@ -380,8 +380,9 @@ fn default_last_activity() -> DateTime<Utc> {
 pub(crate) struct MinionInfo {
     /// Repository the Minion is working on (e.g., "fotoetienne/gru")
     pub(crate) repo: String,
-    /// Issue number the Minion is addressing
-    pub(crate) issue: u64,
+    /// Issue number the Minion is addressing (None for ad-hoc prompts or PRs without linked issues)
+    #[serde(default, deserialize_with = "deserialize_issue")]
+    pub(crate) issue: Option<u64>,
     /// Command that started the Minion (e.g., "do", "review", "respond", "rebase")
     pub(crate) command: String,
     /// The prompt that was given to the Minion
@@ -459,6 +460,21 @@ pub(crate) struct MinionInfo {
 /// Default agent name for backwards compatibility with existing registry entries
 fn default_agent_name() -> String {
     "claude".to_string()
+}
+
+/// Deserializes the `issue` field with backward compatibility:
+/// - `null` or missing → `None`
+/// - `0` → `None` (legacy sentinel for "no issue")
+/// - any positive number → `Some(n)`
+fn deserialize_issue<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value: Option<u64> = Option::deserialize(deserializer)?;
+    match value {
+        Some(0) => Ok(None),
+        other => Ok(other),
+    }
 }
 
 impl MinionInfo {
@@ -927,7 +943,7 @@ impl MinionRegistry {
         self.data
             .minions
             .iter()
-            .filter(|(_, info)| info.repo == repo && info.issue == issue)
+            .filter(|(_, info)| info.repo == repo && info.issue == Some(issue))
             .map(|(id, info)| (id.clone(), info.clone()))
             .collect()
     }
@@ -1007,7 +1023,7 @@ mod tests {
         let now = Utc::now();
         MinionInfo {
             repo: "fotoetienne/gru".to_string(),
-            issue: 42,
+            issue: Some(42),
             command: "do".to_string(),
             prompt: "Do issue #42".to_string(),
             started_at: now,
@@ -1051,7 +1067,7 @@ mod tests {
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].0, "M001");
         assert_eq!(list[0].1.repo, "fotoetienne/gru");
-        assert_eq!(list[0].1.issue, 42);
+        assert_eq!(list[0].1.issue, Some(42));
     }
 
     #[test]
@@ -1141,7 +1157,7 @@ mod tests {
         registry.register("M001".to_string(), info).unwrap();
         let retrieved = registry.get("M001").unwrap();
         assert_eq!(retrieved.repo, "fotoetienne/gru");
-        assert_eq!(retrieved.issue, 42);
+        assert_eq!(retrieved.issue, Some(42));
     }
 
     #[test]
@@ -1295,6 +1311,118 @@ mod tests {
         assert!(info.timeout_deadline.is_none());
         assert_eq!(info.attempt_count, 0);
         assert!(!info.no_watch);
+        // issue 42 should deserialize as Some(42)
+        assert_eq!(info.issue, Some(42));
+    }
+
+    #[test]
+    fn test_issue_zero_deserializes_as_none() {
+        let temp_dir = tempdir().unwrap();
+        let registry_path = temp_dir.path().join("minions.json");
+
+        // Legacy format with "issue": 0 (sentinel for "no issue")
+        let json = r#"{
+            "minions": {
+                "M001": {
+                    "repo": "fotoetienne/gru",
+                    "issue": 0,
+                    "command": "prompt",
+                    "prompt": "ad-hoc prompt",
+                    "started_at": "2024-01-01T00:00:00Z",
+                    "branch": "minion/prompt-M001",
+                    "worktree": "/tmp/test",
+                    "status": "active",
+                    "pr": null
+                }
+            }
+        }"#;
+        fs::write(&registry_path, json).unwrap();
+
+        let registry = MinionRegistry::load(Some(temp_dir.path())).unwrap();
+        let info = registry.get("M001").unwrap();
+        assert_eq!(info.issue, None, "issue: 0 should deserialize as None");
+    }
+
+    #[test]
+    fn test_issue_null_deserializes_as_none() {
+        let temp_dir = tempdir().unwrap();
+        let registry_path = temp_dir.path().join("minions.json");
+
+        // New format with "issue": null
+        let json = r#"{
+            "minions": {
+                "M001": {
+                    "repo": "fotoetienne/gru",
+                    "issue": null,
+                    "command": "prompt",
+                    "prompt": "ad-hoc prompt",
+                    "started_at": "2024-01-01T00:00:00Z",
+                    "branch": "minion/prompt-M001",
+                    "worktree": "/tmp/test",
+                    "status": "active",
+                    "pr": null
+                }
+            }
+        }"#;
+        fs::write(&registry_path, json).unwrap();
+
+        let registry = MinionRegistry::load(Some(temp_dir.path())).unwrap();
+        let info = registry.get("M001").unwrap();
+        assert_eq!(info.issue, None, "issue: null should deserialize as None");
+    }
+
+    #[test]
+    fn test_issue_missing_deserializes_as_none() {
+        let temp_dir = tempdir().unwrap();
+        let registry_path = temp_dir.path().join("minions.json");
+
+        // New format with issue field omitted entirely
+        let json = r#"{
+            "minions": {
+                "M001": {
+                    "repo": "fotoetienne/gru",
+                    "command": "prompt",
+                    "prompt": "ad-hoc prompt",
+                    "started_at": "2024-01-01T00:00:00Z",
+                    "branch": "minion/prompt-M001",
+                    "worktree": "/tmp/test",
+                    "status": "active",
+                    "pr": null
+                }
+            }
+        }"#;
+        fs::write(&registry_path, json).unwrap();
+
+        let registry = MinionRegistry::load(Some(temp_dir.path())).unwrap();
+        let info = registry.get("M001").unwrap();
+        assert_eq!(
+            info.issue, None,
+            "missing issue field should deserialize as None"
+        );
+    }
+
+    #[test]
+    fn test_issue_serializes_as_option() {
+        let temp_dir = tempdir().unwrap();
+
+        {
+            let mut registry = MinionRegistry::load(Some(temp_dir.path())).unwrap();
+
+            let mut info = test_minion_info();
+            info.issue = Some(42);
+            registry.register("M001".to_string(), info).unwrap();
+
+            let mut info_no_issue = test_minion_info();
+            info_no_issue.issue = None;
+            registry
+                .register("M002".to_string(), info_no_issue)
+                .unwrap();
+        }
+
+        // Reload and verify round-trip
+        let registry = MinionRegistry::load(Some(temp_dir.path())).unwrap();
+        assert_eq!(registry.get("M001").unwrap().issue, Some(42));
+        assert_eq!(registry.get("M002").unwrap().issue, None);
     }
 
     #[test]
@@ -1352,17 +1480,17 @@ mod tests {
         let mut registry = MinionRegistry::load(Some(temp_dir.path())).unwrap();
 
         let info1 = MinionInfo {
-            issue: 42,
+            issue: Some(42),
             repo: "owner/repo".to_string(),
             ..test_minion_info()
         };
         let info2 = MinionInfo {
-            issue: 42,
+            issue: Some(42),
             repo: "owner/repo".to_string(),
             ..test_minion_info()
         };
         let info3 = MinionInfo {
-            issue: 99,
+            issue: Some(99),
             repo: "owner/repo".to_string(),
             ..test_minion_info()
         };
@@ -1383,7 +1511,7 @@ mod tests {
         let mut registry = MinionRegistry::load(Some(temp_dir.path())).unwrap();
 
         let info = MinionInfo {
-            issue: 42,
+            issue: Some(42),
             repo: "owner/repo".to_string(),
             ..test_minion_info()
         };

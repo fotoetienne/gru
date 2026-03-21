@@ -56,26 +56,30 @@ pub(crate) async fn run_agent_phase(
         Ok(result) => {
             if !result.status.success() {
                 update_orchestration_phase(&wt_ctx.minion_id, OrchestrationPhase::Failed).await;
-                try_mark_issue_failed(
-                    &issue_ctx.host,
-                    &issue_ctx.owner,
-                    &issue_ctx.repo,
-                    issue_ctx.issue_num,
-                )
-                .await;
+                if let Some(issue_num) = issue_ctx.issue_num {
+                    try_mark_issue_failed(
+                        &issue_ctx.host,
+                        &issue_ctx.owner,
+                        &issue_ctx.repo,
+                        issue_num,
+                    )
+                    .await;
+                }
             }
             Ok(Some(result))
         }
         Err(e) if crate::agent_runner::is_stuck_or_timeout_error(&e) => {
             update_orchestration_phase(&wt_ctx.minion_id, OrchestrationPhase::Failed).await;
             log::error!("🚨 {:#}", e);
-            try_mark_issue_blocked(
-                &issue_ctx.host,
-                &issue_ctx.owner,
-                &issue_ctx.repo,
-                issue_ctx.issue_num,
-            )
-            .await;
+            if let Some(issue_num) = issue_ctx.issue_num {
+                try_mark_issue_blocked(
+                    &issue_ctx.host,
+                    &issue_ctx.owner,
+                    &issue_ctx.repo,
+                    issue_num,
+                )
+                .await;
+            }
             Err(e)
         }
         Err(e) => {
@@ -213,13 +217,15 @@ pub(crate) async fn monitor_pr_phase(
             Ok(false) => {
                 log::warn!("⚠️  CI checks failed or were escalated");
                 update_orchestration_phase(&wt_ctx.minion_id, OrchestrationPhase::Failed).await;
-                try_mark_issue_blocked(
-                    &issue_ctx.host,
-                    &issue_ctx.owner,
-                    &issue_ctx.repo,
-                    issue_ctx.issue_num,
-                )
-                .await;
+                if let Some(issue_num) = issue_ctx.issue_num {
+                    try_mark_issue_blocked(
+                        &issue_ctx.host,
+                        &issue_ctx.owner,
+                        &issue_ctx.repo,
+                        issue_num,
+                    )
+                    .await;
+                }
                 return Err(anyhow::anyhow!("CI checks failed"));
             }
             Err(e) => log::warn!("⚠️  CI monitoring error (non-fatal): {}", e),

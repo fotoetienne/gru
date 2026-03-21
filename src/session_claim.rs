@@ -187,7 +187,7 @@ mod tests {
         let now = Utc::now();
         MinionInfo {
             repo: "fotoetienne/gru".to_string(),
-            issue: 42,
+            issue: Some(42),
             command: "do".to_string(),
             prompt: "Do issue #42".to_string(),
             started_at: now,

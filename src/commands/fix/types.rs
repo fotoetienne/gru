@@ -36,7 +36,7 @@ pub(crate) struct IssueContext {
     pub(crate) repo: String,
     /// GitHub hostname (e.g., "github.com" or "ghe.example.com")
     pub(crate) host: String,
-    pub(crate) issue_num: u64,
+    pub(crate) issue_num: Option<u64>,
     /// Fetched issue details: (title, body, labels). None if fetch failed.
     pub(crate) details: Option<IssueDetails>,
 }

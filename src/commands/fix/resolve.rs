@@ -22,7 +22,7 @@ pub(crate) async fn resolve_issue(issue: &str, github_hosts: &[String]) -> Resul
         owner,
         repo,
         host,
-        issue_num,
+        issue_num: Some(issue_num),
         details,
     })
 }
@@ -35,8 +35,11 @@ pub(crate) async fn resolve_issue(issue: &str, github_hosts: &[String]) -> Resul
 pub(super) async fn check_existing_minions(
     owner: &str,
     repo: &str,
-    issue_num: u64,
+    issue_num: Option<u64>,
 ) -> Result<ExistingMinionCheck> {
+    let Some(issue_num) = issue_num else {
+        return Ok(ExistingMinionCheck::None);
+    };
     let repo_for_check = crate::github::repo_slug(owner, repo);
     let mut existing =
         with_registry(move |registry| Ok(registry.find_by_issue(&repo_for_check, issue_num)))
@@ -118,7 +121,10 @@ pub(super) async fn check_existing_minions(
 /// Fetches current labels first to detect race conditions (another minion
 /// already claimed the issue). Returns silently on errors since claiming
 /// is fire-and-forget.
-pub(super) async fn claim_issue(host: &str, owner: &str, repo: &str, issue_num: u64) {
+pub(super) async fn claim_issue(host: &str, owner: &str, repo: &str, issue_num: Option<u64>) {
+    let Some(issue_num) = issue_num else {
+        return;
+    };
     // Check current labels to detect race conditions
     match crate::github::get_issue_via_cli(owner, repo, host, issue_num).await {
         Ok(info) => {

@@ -386,7 +386,12 @@ impl MonitorLoopState {
 
 fn handle_merged(state: &mut MonitorLoopState, ctx: &MonitorContext<'_>) -> LoopAction {
     println!("✅ PR #{} was merged successfully!", ctx.pr_number);
-    println!("🎉 Issue {} is complete!", ctx.issue_ctx.issue_num);
+    println!(
+        "🎉 Issue {} is complete!",
+        ctx.issue_ctx
+            .issue_num
+            .map_or("?".to_string(), |n| n.to_string())
+    );
     state.terminal_result = Some(MonitorResult::Merged);
     LoopAction::Break
 }
@@ -405,14 +410,16 @@ async fn handle_ready_to_merge(
     // All merge gates pass — remove gru:blocked if it was stale
     if state.issue_was_blocked {
         if let Ok(pr_num) = ctx.pr_number.parse::<u64>() {
-            super::helpers::try_remove_blocked_label(
-                &ctx.issue_ctx.host,
-                &ctx.issue_ctx.owner,
-                &ctx.issue_ctx.repo,
-                pr_num,
-                ctx.issue_ctx.issue_num,
-            )
-            .await;
+            if let Some(issue_num) = ctx.issue_ctx.issue_num {
+                super::helpers::try_remove_blocked_label(
+                    &ctx.issue_ctx.host,
+                    &ctx.issue_ctx.owner,
+                    &ctx.issue_ctx.repo,
+                    pr_num,
+                    issue_num,
+                )
+                .await;
+            }
         }
         state.issue_was_blocked = false;
         state.ci_escalated = false;
@@ -502,7 +509,12 @@ async fn handle_ready_to_merge(
                 {
                     Ok(output) if output.status.success() => {
                         println!("✅ Auto-merge queued for PR #{}!", ctx.pr_number);
-                        println!("🎉 Issue {} is complete!", ctx.issue_ctx.issue_num);
+                        println!(
+                            "🎉 Issue {} is complete!",
+                            ctx.issue_ctx
+                                .issue_num
+                                .map_or("?".to_string(), |n| n.to_string())
+                        );
                         return LoopAction::Break;
                     }
                     Ok(output) => {
@@ -597,7 +609,7 @@ async fn handle_new_reviews(
     }
 
     let review_prompt = pr_monitor::format_review_prompt(
-        ctx.issue_ctx.issue_num,
+        ctx.issue_ctx.issue_num.unwrap_or(0),
         ctx.pr_number,
         &feedback,
         &ctx.issue_ctx.owner,
@@ -683,14 +695,16 @@ async fn handle_failed_checks(
         Ok(true) => {
             println!("✅ CI checks now pass after auto-fix");
             if state.issue_was_blocked {
-                super::helpers::try_remove_blocked_label(
-                    &ctx.issue_ctx.host,
-                    &ctx.issue_ctx.owner,
-                    &ctx.issue_ctx.repo,
-                    pr_num_u64,
-                    ctx.issue_ctx.issue_num,
-                )
-                .await;
+                if let Some(issue_num) = ctx.issue_ctx.issue_num {
+                    super::helpers::try_remove_blocked_label(
+                        &ctx.issue_ctx.host,
+                        &ctx.issue_ctx.owner,
+                        &ctx.issue_ctx.repo,
+                        pr_num_u64,
+                        issue_num,
+                    )
+                    .await;
+                }
                 state.issue_was_blocked = false;
             }
             state.ci_escalated = false;

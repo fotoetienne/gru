@@ -8,7 +8,7 @@ use chrono::{DateTime, Utc};
 struct EnhancedMinionInfo {
     minion_id: String,
     repo: String,
-    issue: u64,
+    issue: Option<u64>,
     task: String,
     pr: Option<String>,
     branch: String,
@@ -29,7 +29,7 @@ struct EnhancedMinionInfo {
 struct BasicMinionData {
     minion_id: String,
     repo: String,
-    issue: u64,
+    issue: Option<u64>,
     task: String,
     pr: Option<String>,
     branch: String,
@@ -291,7 +291,7 @@ pub(crate) async fn handle_status(
             minions
                 .iter()
                 .filter(|m| {
-                    m.issue == num
+                    m.issue == Some(num)
                         || m.pr.as_ref().and_then(|pr| pr.parse::<u64>().ok()) == Some(num)
                 })
                 .cloned()
@@ -359,7 +359,7 @@ pub(crate) async fn handle_status(
     // Print each minion
     for minion in &minions {
         if verbose {
-            let issue_display = format!("#{}", minion.issue);
+            let issue_display = minion.issue.map_or("-".to_string(), |n| format!("#{}", n));
             let pid_display = minion
                 .pid
                 .map(|p| p.to_string())
@@ -376,7 +376,7 @@ pub(crate) async fn handle_status(
                 minion.worktree_path
             );
         } else {
-            let issue_display = format!("#{}", minion.issue);
+            let issue_display = minion.issue.map_or("-".to_string(), |n| format!("#{}", n));
             let pr_display = minion
                 .pr
                 .as_ref()

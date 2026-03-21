@@ -9,8 +9,12 @@ use chrono::Utc;
 use uuid::Uuid;
 
 /// Formats a branch name for a Minion working on an issue.
-pub(super) fn format_branch_name(issue_num: u64, minion_id: &str) -> String {
-    format!("minion/issue-{}-{}", issue_num, minion_id)
+pub(super) fn format_branch_name(issue_num: Option<u64>, minion_id: &str) -> String {
+    format!(
+        "minion/issue-{}-{}",
+        issue_num.map_or("none".to_string(), |n| n.to_string()),
+        minion_id
+    )
 }
 
 /// Sets up the workspace: generates minion ID, clones repo, creates worktree,
@@ -25,7 +29,9 @@ pub(super) async fn setup_worktree(
 
     println!(
         "🚀 Setting up workspace for {}/{}#{}",
-        ctx.owner, ctx.repo, ctx.issue_num
+        ctx.owner,
+        ctx.repo,
+        ctx.issue_num.map_or("?".to_string(), |n| n.to_string())
     );
 
     let workspace = workspace::Workspace::new().context("Failed to initialize Gru workspace")?;
@@ -85,7 +91,10 @@ pub(super) async fn setup_worktree(
         repo: repo_name.clone(),
         issue: ctx.issue_num,
         command: "do".to_string(),
-        prompt: format!("/do {}", ctx.issue_num),
+        prompt: format!(
+            "/do {}",
+            ctx.issue_num.map_or("?".to_string(), |n| n.to_string())
+        ),
         started_at: now,
         branch: branch_name.clone(),
         worktree: minion_dir.clone(),
@@ -127,16 +136,16 @@ mod tests {
 
     #[test]
     fn test_format_branch_name() {
-        assert_eq!(format_branch_name(42, "M001"), "minion/issue-42-M001");
+        assert_eq!(format_branch_name(Some(42), "M001"), "minion/issue-42-M001");
     }
 
     #[test]
     fn test_format_branch_name_large_issue() {
-        assert_eq!(format_branch_name(99999, "M1a2"), "minion/issue-99999-M1a2");
+        assert_eq!(format_branch_name(Some(99999), "M1a2"), "minion/issue-99999-M1a2");
     }
 
     #[test]
-    fn test_format_branch_name_zero_issue() {
-        assert_eq!(format_branch_name(0, "M000"), "minion/issue-0-M000");
+    fn test_format_branch_name_none_issue() {
+        assert_eq!(format_branch_name(None, "M000"), "minion/issue-none-M000");
     }
 }

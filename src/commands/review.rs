@@ -127,16 +127,18 @@ pub(crate) async fn handle_review(pr_arg: Option<String>, agent_name: &str) -> R
     };
 
     // Fetch the issue number linked to this PR (if any)
-    let linked_issue = find_issue_for_pr(&owner, &repo, &host, &pr_num)
-        .await
-        .unwrap_or_else(|e| {
+    let linked_issue = match find_issue_for_pr(&owner, &repo, &host, &pr_num).await {
+        Ok(0) => None,
+        Ok(n) => Some(n),
+        Err(e) => {
             log::warn!(
                 "Warning: Failed to fetch linked issue for PR #{}: {}",
                 pr_num,
                 e
             );
-            0
-        });
+            None
+        }
+    };
 
     // Generate a unique session ID for conversation continuity
     let session_id = Uuid::new_v4();
@@ -186,13 +188,11 @@ pub(crate) async fn handle_review(pr_arg: Option<String>, agent_name: &str) -> R
     println!("🤖 Launching autonomous review agent...\n");
 
     // Create progress display for review
-    // If there's no linked issue (linked_issue == 0), display the PR number instead
     let config = ProgressConfig {
         minion_id: minion_id.clone(),
-        issue: if linked_issue == 0 {
-            format!("PR {}", pr_num)
-        } else {
-            linked_issue.to_string()
+        issue: match linked_issue {
+            Some(n) => n.to_string(),
+            None => format!("PR {}", pr_num),
         },
         quiet: false,
     };

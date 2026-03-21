@@ -305,28 +305,36 @@ pub(crate) async fn handle_fix(issue: &str, opts: FixOptions) -> Result<i32> {
             .as_ref()
             .map(|d| d.body.as_str())
             .unwrap_or("");
-        let blockers = crate::dependencies::get_blockers(
-            &issue_ctx.host,
-            &issue_ctx.owner,
-            &issue_ctx.repo,
-            issue_ctx.issue_num,
-            body,
-        )
-        .await;
+        if let Some(issue_num) = issue_ctx.issue_num {
+            let blockers = crate::dependencies::get_blockers(
+                &issue_ctx.host,
+                &issue_ctx.owner,
+                &issue_ctx.repo,
+                issue_num,
+                body,
+            )
+            .await;
 
-        if !blockers.is_empty() {
-            let blocker_list: Vec<String> = blockers.iter().map(|n| format!("#{}", n)).collect();
-            println!(
-                "⚠️  Issue #{} may have unresolved blockers: {}",
-                issue_ctx.issue_num,
-                blocker_list.join(", ")
-            );
-            println!("   Use --ignore-deps to suppress this warning.");
+            if !blockers.is_empty() {
+                let blocker_list: Vec<String> =
+                    blockers.iter().map(|n| format!("#{}", n)).collect();
+                println!(
+                    "⚠️  Issue #{} may have unresolved blockers: {}",
+                    issue_num,
+                    blocker_list.join(", ")
+                );
+                println!("   Use --ignore-deps to suppress this warning.");
+            }
         }
     }
 
     // Rename tmux window early with the initial `gru:do:#N` name
-    let tmux_guard = TmuxGuard::new(&format!("gru:do:#{}", issue_ctx.issue_num));
+    let tmux_guard = TmuxGuard::new(&format!(
+        "gru:do:#{}",
+        issue_ctx
+            .issue_num
+            .map_or("?".to_string(), |n| n.to_string())
+    ));
 
     // Phase 2: Determine whether to resume or start fresh
     let (wt_ctx, is_fresh) = if force_new {
@@ -373,7 +381,10 @@ pub(crate) async fn handle_fix(issue: &str, opts: FixOptions) -> Result<i32> {
     // Update tmux window name now that we have the Minion ID (gru:do:#N → gru:M042:#N)
     tmux_guard.rename(&format!(
         "gru:{}:#{}",
-        wt_ctx.minion_id, issue_ctx.issue_num
+        wt_ctx.minion_id,
+        issue_ctx
+            .issue_num
+            .map_or("?".to_string(), |n| n.to_string())
     ));
 
     // Claim the issue on fresh starts (skip on resume — already claimed)
@@ -392,7 +403,11 @@ pub(crate) async fn handle_fix(issue: &str, opts: FixOptions) -> Result<i32> {
 
     println!(
         "Minion {} spawned for issue #{} (PID: {})",
-        wt_ctx.minion_id, issue_ctx.issue_num, worker_pid
+        wt_ctx.minion_id,
+        issue_ctx
+            .issue_num
+            .map_or("?".to_string(), |n| n.to_string()),
+        worker_pid
     );
 
     if detach {
@@ -410,7 +425,9 @@ pub(crate) async fn handle_fix(issue: &str, opts: FixOptions) -> Result<i32> {
     );
 
     let events_path = wt_ctx.minion_dir.join("events.jsonl");
-    let issue_str = issue_ctx.issue_num.to_string();
+    let issue_str = issue_ctx
+        .issue_num
+        .map_or("?".to_string(), |n| n.to_string());
     crate::log_viewer::tail_events(events_path, &wt_ctx.minion_id, &issue_str, quiet).await?;
 
     Ok(0)
@@ -446,7 +463,7 @@ mod tests {
             owner: "octocat".to_string(),
             repo: "hello-world".to_string(),
             host: "github.com".to_string(),
-            issue_num: 42,
+            issue_num: Some(42),
             details: Some(IssueDetails {
                 title: "Fix the widget".to_string(),
                 body: "The widget is broken".to_string(),
@@ -471,7 +488,7 @@ mod tests {
             owner: "octocat".to_string(),
             repo: "hello-world".to_string(),
             host: "github.com".to_string(),
-            issue_num: 42,
+            issue_num: Some(42),
             details: None,
         };
 
@@ -488,7 +505,7 @@ mod tests {
             owner: "octocat".to_string(),
             repo: "hello-world".to_string(),
             host: "github.com".to_string(),
-            issue_num: 7,
+            issue_num: Some(7),
             details: Some(IssueDetails {
                 title: "Add feature".to_string(),
                 body: "Please add this feature".to_string(),
@@ -510,7 +527,7 @@ mod tests {
             owner: "myorg".to_string(),
             repo: "myproject".to_string(),
             host: "github.com".to_string(),
-            issue_num: 99,
+            issue_num: Some(99),
             details: Some(IssueDetails {
                 title: "Template test".to_string(),
                 body: "Body content here".to_string(),
@@ -560,7 +577,7 @@ CUSTOM: Fix #{{ issue_number }} - {{ issue_title }}"#,
             owner: "owner".to_string(),
             repo: "repo".to_string(),
             host: "github.com".to_string(),
-            issue_num: 55,
+            issue_num: Some(55),
             details: Some(IssueDetails {
                 title: "Custom test".to_string(),
                 body: "Custom body".to_string(),

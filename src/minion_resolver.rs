@@ -135,11 +135,7 @@ fn load_from_registry() -> Vec<MinionInfo> {
         .list()
         .into_iter()
         .map(|(minion_id, info)| {
-            let issue_number = if info.issue > 0 {
-                Some(info.issue)
-            } else {
-                None
-            };
+            let issue_number = info.issue;
 
             let status = if info.is_running() {
                 "Active".to_string()
