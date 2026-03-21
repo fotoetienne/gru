@@ -69,6 +69,18 @@ impl AgentBackend for CodexBackend {
         // Codex CLI does not support interactive resume mode
         None
     }
+
+    fn build_oneshot_command(&self, worktree_path: &Path, prompt: &str) -> TokioCommand {
+        let mut cmd = TokioCommand::new("codex");
+        cmd.arg("exec")
+            .arg("--full-auto")
+            .arg(prompt)
+            .current_dir(worktree_path)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::inherit());
+        cmd
+    }
 }
 
 // ---------------------------------------------------------------------------

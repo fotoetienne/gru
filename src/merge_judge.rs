@@ -14,8 +14,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
-use tokio::process::Command as TokioCommand;
 
+use crate::agent::AgentBackend;
 use crate::github;
 use crate::labels;
 
@@ -438,40 +438,38 @@ fn truncate_if_needed(s: &str, max_bytes: usize) -> String {
     }
 }
 
-/// Invoke the LLM judge via Claude CLI, passing the prompt via stdin.
-async fn invoke_judge_cli(worktree_path: &std::path::Path, prompt: &str) -> Result<JudgeResponse> {
-    let mut child = TokioCommand::new("claude")
-        .arg("--print")
-        .arg("--output-format")
-        .arg("text")
-        .arg("--dangerously-skip-permissions")
-        .arg("--max-turns")
+/// Invoke the LLM judge via the agent backend, passing the prompt via stdin.
+async fn invoke_judge_cli(
+    backend: &dyn AgentBackend,
+    worktree_path: &std::path::Path,
+    prompt: &str,
+) -> Result<JudgeResponse> {
+    let mut cmd = backend.build_oneshot_command(worktree_path, "-");
+    cmd.arg("--max-turns")
         .arg("1")
-        .arg("-") // read prompt from stdin
-        .current_dir(worktree_path)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+
+    let mut child = cmd
         .spawn()
-        .context("Failed to spawn Claude CLI for merge judge")?;
+        .with_context(|| format!("Failed to spawn {} for merge judge", backend.name()))?;
 
     // Write prompt to stdin.
     if let Some(mut stdin) = child.stdin.take() {
         stdin
             .write_all(prompt.as_bytes())
             .await
-            .context("Failed to write prompt to Claude stdin")?;
+            .context("Failed to write prompt to agent stdin")?;
         // Drop closes stdin, signaling EOF.
     }
 
     let output = child
         .wait_with_output()
         .await
-        .context("Failed to wait for Claude CLI")?;
+        .with_context(|| format!("Failed to wait for {}", backend.name()))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("Claude CLI exited with error: {}", stderr.trim());
+        anyhow::bail!("{} exited with error: {}", backend.name(), stderr.trim());
     }
 
     let response_text = String::from_utf8_lossy(&output.stdout);
@@ -551,7 +549,9 @@ fn extract_json(text: &str) -> Option<&str> {
 /// 3. Builds the judge prompt and invokes the LLM
 /// 4. Enforces max consecutive waits (coerces to escalate)
 /// 5. Returns the response
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn evaluate(
+    backend: &dyn AgentBackend,
     host: &str,
     owner: &str,
     repo: &str,
@@ -578,7 +578,7 @@ pub(crate) async fn evaluate(
         confidence_threshold,
     );
 
-    let mut response = invoke_judge_cli(worktree_path, &prompt).await?;
+    let mut response = invoke_judge_cli(backend, worktree_path, &prompt).await?;
 
     // Hard guard: if we've hit max consecutive waits and the LLM still says
     // "wait", coerce to "escalate" to prevent infinite wait loops.

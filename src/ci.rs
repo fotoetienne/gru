@@ -1,3 +1,4 @@
+use crate::agent::AgentBackend;
 use crate::github;
 use crate::labels;
 use anyhow::{Context, Result};
@@ -649,40 +650,34 @@ pub(crate) async fn get_pr_number(
     Ok(prs.first().and_then(|pr| pr["number"].as_u64()))
 }
 
-/// Invokes Claude Code to fix CI failures in the given worktree.
-/// Returns the exit code from the Claude process.
-pub(crate) async fn invoke_ci_fix(
+/// Invokes the agent backend to fix CI failures in the given worktree.
+/// Returns the exit code from the agent process.
+pub async fn invoke_ci_fix(
+    backend: &dyn AgentBackend,
     worktree_path: &Path,
     failed_checks: &[CheckRun],
     attempt: u32,
 ) -> Result<i32> {
     let prompt = build_ci_fix_prompt(failed_checks, attempt);
 
-    let mut cmd = Command::new("claude");
-    cmd.arg("--print")
-        .arg("--output-format")
-        .arg("stream-json")
-        .arg("--dangerously-skip-permissions")
-        .arg(&prompt)
-        .stdin(Stdio::inherit())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .current_dir(worktree_path);
+    let mut cmd = backend.build_oneshot_command(worktree_path, &prompt);
+    cmd.stdin(Stdio::inherit());
 
-    let child = cmd.spawn().context(
-        "claude command not found. Install from: https://github.com/anthropics/claude-code",
-    )?;
+    let child = cmd
+        .spawn()
+        .with_context(|| format!("{} command not found or failed to start", backend.name()))?;
 
     let fix_timeout = Duration::from_secs(CI_FIX_TIMEOUT_SECS);
     let output = tokio::time::timeout(fix_timeout, child.wait_with_output())
         .await
         .map_err(|_| {
             anyhow::anyhow!(
-                "Claude CI fix timed out after {} seconds",
+                "{} CI fix timed out after {} seconds",
+                backend.name(),
                 CI_FIX_TIMEOUT_SECS
             )
         })?
-        .context("Failed to wait for Claude process")?;
+        .with_context(|| format!("Failed to wait for {} process", backend.name()))?;
 
     Ok(output.status.code().unwrap_or(128))
 }
@@ -807,7 +802,9 @@ async fn post_escalation_comment_body(
 /// 4. Escalate if all attempts fail
 ///
 /// Returns Ok(true) if CI passed (possibly after fixes), Ok(false) if escalated.
-pub(crate) async fn monitor_and_fix_ci(
+#[allow(clippy::too_many_arguments)]
+pub async fn monitor_and_fix_ci(
+    backend: &dyn AgentBackend,
     host: &str,
     owner: &str,
     repo: &str,
@@ -925,7 +922,8 @@ pub(crate) async fn monitor_and_fix_ci(
                     "🔧 Invoking Claude to fix CI failures (attempt {}/{})...",
                     attempt, MAX_CI_FIX_ATTEMPTS
                 );
-                let fix_result = invoke_ci_fix(worktree_path, &failed_checks, attempt).await;
+                let fix_result =
+                    invoke_ci_fix(backend, worktree_path, &failed_checks, attempt).await;
 
                 match fix_result {
                     Ok(exit_code) => {

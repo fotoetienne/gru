@@ -191,6 +191,18 @@ impl AgentBackend for ClaudeBackend {
             .env("GH_HOST", github_host);
         Some(cmd)
     }
+
+    fn build_oneshot_command(&self, worktree_path: &Path, prompt: &str) -> TokioCommand {
+        let mut cmd = TokioCommand::new("claude");
+        cmd.arg("--print")
+            .arg("--dangerously-skip-permissions")
+            .arg(prompt)
+            .current_dir(worktree_path)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::inherit());
+        cmd
+    }
 }
 
 // ---------------------------------------------------------------------------

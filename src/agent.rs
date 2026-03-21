@@ -215,6 +215,13 @@ pub(crate) trait AgentBackend: Send + Sync {
         session_id: &Uuid,
         github_host: &str,
     ) -> Option<TokioCommand>;
+
+    /// Build a command for a one-shot utility task (no session tracking, text output).
+    ///
+    /// Used for fire-and-forget invocations like CI fix and merge-readiness judge
+    /// where the caller just needs to run the agent once and capture its text output.
+    /// The command should produce plain-text output on stdout with piped stdio.
+    fn build_oneshot_command(&self, worktree_path: &Path, prompt: &str) -> TokioCommand;
 }
 
 #[cfg(test)]
