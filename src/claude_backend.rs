@@ -192,7 +192,7 @@ impl AgentBackend for ClaudeBackend {
         Some(cmd)
     }
 
-    fn build_oneshot_command(&self, worktree_path: &Path, prompt: &str) -> TokioCommand {
+    fn build_oneshot_command(&self, worktree_path: &Path, prompt_arg: &str) -> TokioCommand {
         let mut cmd = TokioCommand::new("claude");
         cmd.arg("--print")
             .arg("--output-format")
@@ -200,7 +200,7 @@ impl AgentBackend for ClaudeBackend {
             .arg("--max-turns")
             .arg("1")
             .arg("--dangerously-skip-permissions")
-            .arg(prompt)
+            .arg(prompt_arg)
             .current_dir(worktree_path)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::inherit());

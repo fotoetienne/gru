@@ -652,7 +652,7 @@ pub(crate) async fn get_pr_number(
 
 /// Invokes the agent backend to fix CI failures in the given worktree.
 /// Returns the exit code from the agent process.
-pub async fn invoke_ci_fix(
+pub(crate) async fn invoke_ci_fix(
     backend: &dyn AgentBackend,
     worktree_path: &Path,
     failed_checks: &[CheckRun],
@@ -663,7 +663,7 @@ pub async fn invoke_ci_fix(
     let child = backend
         .build_oneshot_command(worktree_path, &prompt)
         .spawn()
-        .with_context(|| format!("{} command not found or failed to start", backend.name()))?;
+        .with_context(|| format!("Agent backend '{}' failed to start", backend.name()))?;
 
     let fix_timeout = Duration::from_secs(CI_FIX_TIMEOUT_SECS);
     let output = tokio::time::timeout(fix_timeout, child.wait_with_output())
@@ -795,13 +795,13 @@ async fn post_escalation_comment_body(
 ///
 /// After a PR is created/updated:
 /// 1. Wait for CI checks to complete
-/// 2. If checks fail, invoke Claude to fix
+/// 2. If checks fail, invoke the agent backend to fix
 /// 3. Retry up to MAX_CI_FIX_ATTEMPTS times
 /// 4. Escalate if all attempts fail
 ///
 /// Returns Ok(true) if CI passed (possibly after fixes), Ok(false) if escalated.
 #[allow(clippy::too_many_arguments)]
-pub async fn monitor_and_fix_ci(
+pub(crate) async fn monitor_and_fix_ci(
     backend: &dyn AgentBackend,
     host: &str,
     owner: &str,

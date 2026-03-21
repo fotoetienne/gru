@@ -448,9 +448,12 @@ async fn invoke_judge_cli(
     cmd.stdin(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
 
-    let mut child = cmd
-        .spawn()
-        .with_context(|| format!("Failed to spawn {} for merge judge", backend.name()))?;
+    let mut child = cmd.spawn().with_context(|| {
+        format!(
+            "Failed to spawn agent backend '{}' for merge judge",
+            backend.name()
+        )
+    })?;
 
     // Write prompt to stdin.
     if let Some(mut stdin) = child.stdin.take() {
