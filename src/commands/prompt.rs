@@ -138,12 +138,14 @@ async fn fetch_pr_context(pr_str: &str) -> Result<(PromptContext, String, String
 }
 
 /// Sets up a worktree for a PR by finding an existing one or creating a new one for the branch.
+/// Returns `(minion_dir, checkout_path)` where `minion_dir` holds metadata (events, prompt)
+/// and `checkout_path` is the git working directory.
 async fn setup_pr_worktree(
     owner: &str,
     repo: &str,
     host: &str,
     branch_name: &str,
-) -> Result<PathBuf> {
+) -> Result<(PathBuf, PathBuf)> {
     let workspace = workspace::Workspace::new().context("Failed to initialize Gru workspace")?;
 
     let bare_path = workspace.repos().join(owner).join(format!("{}.git", repo));
@@ -160,7 +162,20 @@ async fn setup_pr_worktree(
                 "♻️  Found existing worktree at: {}",
                 existing_path.display()
             );
-            return Ok(existing_path);
+            // Detect layout: new-style has checkout/ subdir, legacy does not
+            let minion_dir = if existing_path
+                .file_name()
+                .map(|n| n == "checkout")
+                .unwrap_or(false)
+            {
+                existing_path
+                    .parent()
+                    .unwrap_or(&existing_path)
+                    .to_path_buf()
+            } else {
+                existing_path.clone()
+            };
+            return Ok((minion_dir, existing_path));
         }
     }
 
@@ -193,7 +208,7 @@ async fn setup_pr_worktree(
 
     println!("📂 Worktree created at: {}", checkout_path.display());
 
-    Ok(checkout_path)
+    Ok((minion_dir, checkout_path))
 }
 
 /// Sets up a worktree for an issue, returning the worktree path and branch name
@@ -597,14 +612,13 @@ async fn setup_prompt_workspace(
         let repo = fetched.pr_repo.as_deref().unwrap();
         let branch = fetched.pr_branch.as_deref().unwrap();
         let host = fetched.pr_host.as_deref().unwrap_or("github.com");
-        let wt_path = setup_pr_worktree(owner, repo, host, branch).await?;
-        fetched.context.worktree_path = Some(wt_path.clone());
+        let (minion_dir, checkout_path) = setup_pr_worktree(owner, repo, host, branch).await?;
+        fetched.context.worktree_path = Some(checkout_path.clone());
         fetched.context.branch_name = Some(branch.to_string());
-        let run_dir = wt_path.clone();
         Ok(WorkspaceSetup {
-            workspace_path: wt_path,
+            workspace_path: minion_dir,
             branch_name: branch.to_string(),
-            run_dir,
+            run_dir: checkout_path,
         })
     } else if opts.no_worktree && has_context {
         println!("ℹ️  Running without worktree - agent will work in the current directory");
