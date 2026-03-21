@@ -11,13 +11,17 @@ use anyhow::{Context, Result};
 use tokio::process::Command as TokioCommand;
 use uuid::Uuid;
 
+/// Filename for extra context appended via `--discuss`.
+/// Written by `handle_fix` on user input, read by `run_agent_session` at launch.
+pub(super) const EXTRA_CONTEXT_FILENAME: &str = "extra_context.txt";
+
 /// Builds the prompt string from issue context using the prompt template system.
 ///
 /// Loads the "do" prompt template (built-in or overridden via `.gru/prompts/do.md`
 /// or legacy `.gru/prompts/fix.md`), builds a `PromptContext` from the issue
 /// details, and renders the template.
 /// Falls back to `/do <issue_num>` when issue details are unavailable.
-pub(crate) fn build_fix_prompt(ctx: &IssueContext, wt_ctx: &WorktreeContext) -> String {
+pub(super) fn build_fix_prompt(ctx: &IssueContext, wt_ctx: &WorktreeContext) -> String {
     let Some(ref details) = ctx.details else {
         return format!(
             "/do {}",
@@ -73,6 +77,26 @@ pub(crate) fn build_fix_prompt(ctx: &IssueContext, wt_ctx: &WorktreeContext) -> 
     render_template(template_content, &variables)
 }
 
+/// Builds the full prompt including any extra context from `--discuss`.
+///
+/// Calls `build_fix_prompt` for the base prompt, then appends the contents
+/// of `extra_context.txt` in the minion directory if present and non-empty.
+pub(super) fn build_full_prompt(issue_ctx: &IssueContext, wt_ctx: &WorktreeContext) -> String {
+    let mut prompt = build_fix_prompt(issue_ctx, wt_ctx);
+
+    let extra_path = wt_ctx.minion_dir.join(EXTRA_CONTEXT_FILENAME);
+    if extra_path.exists() {
+        if let Ok(extra) = std::fs::read_to_string(&extra_path) {
+            if !extra.trim().is_empty() {
+                prompt.push_str("\n\n## Additional Context from User\n\n");
+                prompt.push_str(extra.trim());
+            }
+        }
+    }
+
+    prompt
+}
+
 /// Runs an agent session with stream monitoring and progress tracking.
 ///
 /// Spawns the agent CLI, tracks progress, records PID in registry,
@@ -85,18 +109,7 @@ pub(super) async fn run_agent_session(
     timeout_opt: Option<&str>,
 ) -> Result<AgentResult> {
     println!("🤖 Launching {}...\n", backend.name());
-    let mut prompt = build_fix_prompt(issue_ctx, wt_ctx);
-
-    // Append extra context from --discuss if present
-    let extra_path = wt_ctx.minion_dir.join("extra_context.txt");
-    if extra_path.exists() {
-        if let Ok(extra) = std::fs::read_to_string(&extra_path) {
-            if !extra.trim().is_empty() {
-                prompt.push_str("\n\n## Additional Context from User\n\n");
-                prompt.push_str(extra.trim());
-            }
-        }
-    }
+    let prompt = build_full_prompt(issue_ctx, wt_ctx);
 
     let mut cmd = backend.build_command(
         &wt_ctx.checkout_path,

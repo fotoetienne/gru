@@ -67,6 +67,33 @@ pub(crate) async fn try_mark_issue_failed(host: &str, owner: &str, repo: &str, i
     }
 }
 
+/// Attempts to unclaim an issue by restoring `gru:todo` and removing `gru:in-progress`.
+/// Fire-and-forget: logs on failure but does not propagate errors.
+/// Used when `--discuss` abort needs to reverse a `claim_issue` call.
+pub(super) async fn try_unclaim_issue(host: &str, owner: &str, repo: &str, issue_num: u64) {
+    match crate::github::edit_labels_via_cli(
+        host,
+        owner,
+        repo,
+        issue_num,
+        &[crate::labels::TODO],
+        &[crate::labels::IN_PROGRESS],
+    )
+    .await
+    {
+        Ok(()) => {
+            println!(
+                "🏷️  Restored '{}' label on issue #{}",
+                crate::labels::TODO,
+                issue_num
+            );
+        }
+        Err(e) => {
+            log::warn!("⚠️  Failed to unclaim issue #{}: {}", issue_num, e);
+        }
+    }
+}
+
 /// Posts a progress comment to the issue via CLI (fire-and-forget).
 pub(super) async fn try_post_progress_comment(
     host: &str,

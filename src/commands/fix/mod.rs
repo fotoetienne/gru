@@ -275,42 +275,41 @@ enum DiscussAction {
 fn read_discuss_input() -> Result<DiscussAction> {
     use std::io::{BufRead, Write};
 
-    print!("> ");
-    std::io::stdout().flush()?;
-
     let stdin = std::io::stdin();
-    let mut line = String::new();
-    stdin.lock().read_line(&mut line)?;
-    let trimmed = line.trim();
 
-    match trimmed {
-        "" => Ok(DiscussAction::Proceed),
-        "q" | "Q" => Ok(DiscussAction::Abort),
-        "a" | "A" => {
-            println!("Enter extra context (empty line to finish):");
-            let mut context_lines = Vec::new();
-            loop {
-                let mut buf = String::new();
-                stdin.lock().read_line(&mut buf)?;
-                if buf.trim().is_empty() {
-                    break;
+    loop {
+        print!("> ");
+        std::io::stdout().flush()?;
+
+        let mut line = String::new();
+        stdin.lock().read_line(&mut line)?;
+        let trimmed = line.trim();
+
+        match trimmed {
+            "" => return Ok(DiscussAction::Proceed),
+            "q" | "Q" => return Ok(DiscussAction::Abort),
+            "a" | "A" => {
+                println!("Enter extra context (empty line to finish):");
+                let mut context_lines = Vec::new();
+                loop {
+                    let mut buf = String::new();
+                    stdin.lock().read_line(&mut buf)?;
+                    if buf.trim().is_empty() {
+                        break;
+                    }
+                    context_lines.push(buf);
                 }
-                context_lines.push(buf);
+                let text = context_lines.concat().trim_end().to_string();
+                if text.is_empty() {
+                    println!("No context entered. Proceeding with original prompt.\n");
+                    return Ok(DiscussAction::Proceed);
+                } else {
+                    return Ok(DiscussAction::Append(text));
+                }
             }
-            let text = context_lines.concat().trim_end().to_string();
-            if text.is_empty() {
-                println!("No context entered. Proceeding with original prompt.\n");
-                Ok(DiscussAction::Proceed)
-            } else {
-                Ok(DiscussAction::Append(text))
+            other => {
+                println!("Unknown input '{}'. Enter, 'a', or 'q'.", other);
             }
-        }
-        other => {
-            println!(
-                "Unknown input '{}'. Proceeding with original prompt.\n",
-                other
-            );
-            Ok(DiscussAction::Proceed)
         }
     }
 }
@@ -474,12 +473,23 @@ pub(crate) async fn handle_fix(issue: &str, opts: FixOptions) -> Result<i32> {
         match read_discuss_input()? {
             DiscussAction::Proceed => {}
             DiscussAction::Append(text) => {
-                let extra_path = wt_ctx.minion_dir.join("extra_context.txt");
+                let extra_path = wt_ctx.minion_dir.join(agent::EXTRA_CONTEXT_FILENAME);
                 std::fs::write(&extra_path, &text)
                     .with_context(|| format!("Failed to write {}", extra_path.display()))?;
                 println!("Extra context saved. Launching agent...\n");
             }
             DiscussAction::Abort => {
+                if is_fresh {
+                    if let Some(issue_num) = issue_ctx.issue_num {
+                        helpers::try_unclaim_issue(
+                            &issue_ctx.host,
+                            &issue_ctx.owner,
+                            &issue_ctx.repo,
+                            issue_num,
+                        )
+                        .await;
+                    }
+                }
                 println!(
                     "Aborted. Worktree preserved at: {}",
                     wt_ctx.checkout_path.display()
@@ -718,33 +728,74 @@ CUSTOM: Fix #{{ issue_number }} - {{ issue_title }}"#,
         let tmp = tempfile::tempdir().unwrap();
         let wt_ctx = test_wt_ctx(tmp.path());
 
+        let ctx = IssueContext {
+            owner: "octocat".to_string(),
+            repo: "hello-world".to_string(),
+            host: "github.com".to_string(),
+            issue_num: Some(42),
+            details: Some(IssueDetails {
+                title: "Fix the widget".to_string(),
+                body: "The widget is broken".to_string(),
+                labels: "bug".to_string(),
+            }),
+        };
+
         // Write extra_context.txt to minion_dir (simulates --discuss append)
-        let extra_path = wt_ctx.minion_dir.join("extra_context.txt");
+        let extra_path = wt_ctx.minion_dir.join(agent::EXTRA_CONTEXT_FILENAME);
         std::fs::write(&extra_path, "use the new API, not the deprecated one").unwrap();
 
-        // Verify the file exists and can be read back
-        assert!(extra_path.exists());
-        let content = std::fs::read_to_string(&extra_path).unwrap();
-        assert_eq!(content, "use the new API, not the deprecated one");
+        let prompt = agent::build_full_prompt(&ctx, &wt_ctx);
+        assert!(prompt.contains("## Additional Context from User"));
+        assert!(prompt.contains("use the new API, not the deprecated one"));
+        // Base prompt should still be present
+        assert!(prompt.contains("# Issue #42: Fix the widget"));
     }
 
     #[test]
     fn test_extra_context_empty_file_ignored() {
         let tmp = tempfile::tempdir().unwrap();
-        let extra_path = tmp.path().join("extra_context.txt");
+        let wt_ctx = test_wt_ctx(tmp.path());
 
-        // Empty file should be treated as no extra context
+        let ctx = IssueContext {
+            owner: "octocat".to_string(),
+            repo: "hello-world".to_string(),
+            host: "github.com".to_string(),
+            issue_num: Some(42),
+            details: Some(IssueDetails {
+                title: "Fix the widget".to_string(),
+                body: "The widget is broken".to_string(),
+                labels: String::new(),
+            }),
+        };
+
+        // Write empty extra_context.txt — should not appear in prompt
+        let extra_path = wt_ctx.minion_dir.join(agent::EXTRA_CONTEXT_FILENAME);
         std::fs::write(&extra_path, "   \n  ").unwrap();
-        let content = std::fs::read_to_string(&extra_path).unwrap();
-        assert!(content.trim().is_empty());
+
+        let prompt = agent::build_full_prompt(&ctx, &wt_ctx);
+        assert!(!prompt.contains("## Additional Context from User"));
     }
 
     #[test]
-    fn test_extra_context_missing_file_no_error() {
+    fn test_no_extra_context_file_produces_normal_prompt() {
         let tmp = tempfile::tempdir().unwrap();
-        let extra_path = tmp.path().join("extra_context.txt");
+        let wt_ctx = test_wt_ctx(tmp.path());
 
-        // File doesn't exist — this is the normal case without --discuss
-        assert!(!extra_path.exists());
+        let ctx = IssueContext {
+            owner: "octocat".to_string(),
+            repo: "hello-world".to_string(),
+            host: "github.com".to_string(),
+            issue_num: Some(42),
+            details: Some(IssueDetails {
+                title: "Fix the widget".to_string(),
+                body: "The widget is broken".to_string(),
+                labels: String::new(),
+            }),
+        };
+
+        // No extra_context.txt — normal case without --discuss
+        let prompt = agent::build_full_prompt(&ctx, &wt_ctx);
+        assert!(!prompt.contains("## Additional Context from User"));
+        assert!(prompt.contains("# Issue #42: Fix the widget"));
     }
 }
