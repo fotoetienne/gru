@@ -296,7 +296,10 @@ pub(crate) async fn handle_pr_creation(
             "   Push your changes with: git push origin {}",
             wt_ctx.branch_name
         );
-        return Ok(None);
+        return Err(anyhow::anyhow!(
+            "Branch '{}' was not pushed — push it and retry with `gru resume`",
+            wt_ctx.branch_name
+        ));
     }
 
     // Check if a PR (open, closed, or merged) already exists for this branch
@@ -381,7 +384,10 @@ pub(crate) async fn handle_pr_creation(
                     issue_ctx.repo,
                     wt_ctx.branch_name
                 );
-                Ok(None)
+                Err(anyhow::anyhow!(
+                    "Branch '{}' was pushed but is no longer available (deleted or force-pushed)",
+                    wt_ctx.branch_name
+                ))
             } else {
                 log::warn!("⚠️  Failed to create PR: {}", e);
 
