@@ -30,13 +30,17 @@ pub(crate) const MAX_REVIEW_ROUNDS: usize = 5;
 pub(crate) const MAX_REBASE_ATTEMPTS: usize = 2;
 
 /// Result of resolving an issue argument into validated context.
-/// Contains the parsed issue number as `u64`, eliminating repeated string parsing.
+///
+/// `issue_num` is `Some(n)` when the minion is working on a GitHub issue (e.g., `gru do`),
+/// and `None` for ad-hoc operations without a linked issue (e.g., `gru prompt --pr`, `gru review`).
+/// GitHub API calls that require an issue number (label updates, comments) are skipped when `None`.
 pub(crate) struct IssueContext {
     pub(crate) owner: String,
     pub(crate) repo: String,
     /// GitHub hostname (e.g., "github.com" or "ghe.example.com")
     pub(crate) host: String,
-    pub(crate) issue_num: u64,
+    /// GitHub issue number, or `None` for operations without a linked issue.
+    pub(crate) issue_num: Option<u64>,
     /// Fetched issue details: (title, body, labels). None if fetch failed.
     pub(crate) details: Option<IssueDetails>,
 }

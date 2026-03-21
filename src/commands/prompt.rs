@@ -674,7 +674,7 @@ fn build_minion_registry_info(
     let now = Utc::now();
     RegistryMinionInfo {
         repo: repo_display,
-        issue: fetched.issue_number.unwrap_or(0),
+        issue: fetched.issue_number,
         command: "prompt".to_string(),
         prompt: cfg.rendered_prompt.chars().take(200).collect(),
         started_at: now,

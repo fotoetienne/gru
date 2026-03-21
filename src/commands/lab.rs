@@ -606,7 +606,7 @@ async fn find_minions_needing_review_wake(
         tprintln!(
             "🔔 Waking up {} (issue #{}, {}): {} new external review(s) on PR #{}",
             minion_id,
-            info.issue,
+            info.issue.map_or("?".to_string(), |n| n.to_string()),
             info.repo,
             unaddressed,
             pr_number
@@ -770,8 +770,10 @@ async fn mark_exhausted_minion(minion_id: &str, info: &MinionInfo, host: &str, r
         info.orchestration_phase,
         crate::progress_comments::minion_signature(minion_id),
     );
-    let _ = github::post_comment_via_cli(host, owner, repo_name, info.issue, &comment).await;
-    let _ = github::mark_issue_failed_via_cli(host, owner, repo_name, info.issue).await;
+    if let Some(issue_num) = info.issue {
+        let _ = github::post_comment_via_cli(host, owner, repo_name, issue_num, &comment).await;
+        let _ = github::mark_issue_failed_via_cli(host, owner, repo_name, issue_num).await;
+    }
 }
 
 /// Sort candidates by minion ID descending (most recent first) and deduplicate by
@@ -785,7 +787,7 @@ fn sort_and_dedup_resumable(mut candidates: Vec<ResumableMinion>) -> Vec<Resumab
         std::cmp::Reverse((c.minion_id.len(), key))
     });
 
-    let mut seen: HashSet<(String, u64)> = HashSet::new();
+    let mut seen: HashSet<(String, Option<u64>)> = HashSet::new();
     candidates
         .into_iter()
         .filter(|c| seen.insert((c.info.repo.clone(), c.info.issue)))
@@ -805,13 +807,18 @@ async fn should_resume_candidate(
     host: &str,
     max_attempts: u32,
 ) -> bool {
+    let issue_display = candidate
+        .info
+        .issue
+        .map_or("?".to_string(), |n| n.to_string());
+
     // Cross-cycle guard: skip if another minion for this issue is already running
     match is_issue_claimed(&candidate.info.repo, candidate.info.issue).await {
         Ok(true) => {
             log::info!(
                 "Skipping {} (issue #{}, {}): another minion for this issue is already running",
                 candidate.minion_id,
-                candidate.info.issue,
+                issue_display,
                 candidate.info.repo,
             );
             return false;
@@ -820,7 +827,7 @@ async fn should_resume_candidate(
         Err(e) => {
             log::warn!(
                 "⚠️  Failed to check if issue #{} is claimed: {} — skipping to be safe",
-                candidate.info.issue,
+                issue_display,
                 e,
             );
             return false;
@@ -832,12 +839,18 @@ async fn should_resume_candidate(
         Some(parts) => parts,
         None => return false,
     };
-    match github::is_issue_closed_via_cli(owner, repo_name, host, candidate.info.issue).await {
+    // When no issue number is set, skip the closed-issue check entirely
+    let issue_closed_result = if let Some(issue_num) = candidate.info.issue {
+        github::is_issue_closed_via_cli(owner, repo_name, host, issue_num).await
+    } else {
+        Ok(false)
+    };
+    match issue_closed_result {
         Ok(true) => {
             tprintln!(
                 "⏭️  Skipping {} (issue #{}, {}): issue is closed",
                 candidate.minion_id,
-                candidate.info.issue,
+                issue_display,
                 candidate.info.repo,
             );
             mark_minion_completed(&candidate.minion_id).await;
@@ -859,7 +872,7 @@ async fn should_resume_candidate(
                     tprintln!(
                         "⏭️  Skipping {} (issue #{}, {}): PR #{} is merged/closed",
                         candidate.minion_id,
-                        candidate.info.issue,
+                        issue_display,
                         candidate.info.repo,
                         pr_num,
                     );
@@ -871,7 +884,7 @@ async fn should_resume_candidate(
                         "⚠️  Failed to check PR #{} state for {} (issue #{}): {} — will retry next poll",
                         pr_num,
                         candidate.minion_id,
-                        candidate.info.issue,
+                        issue_display,
                         error,
                     );
                     return false;
@@ -882,7 +895,7 @@ async fn should_resume_candidate(
             log::warn!(
                 "⚠️  Failed to check issue state for {} (issue #{}): {} — will retry next poll",
                 candidate.minion_id,
-                candidate.info.issue,
+                issue_display,
                 e,
             );
             return false;
@@ -895,7 +908,7 @@ async fn should_resume_candidate(
             tprintln!(
                 "⏭️  Skipping {} (issue #{}, {}): timeout_deadline has passed",
                 candidate.minion_id,
-                candidate.info.issue,
+                issue_display,
                 candidate.info.repo,
             );
             mark_exhausted_minion(
@@ -914,7 +927,7 @@ async fn should_resume_candidate(
         tprintln!(
             "⏭️  Skipping {} (issue #{}, {}): attempt_count {} > max {}",
             candidate.minion_id,
-            candidate.info.issue,
+            issue_display,
             candidate.info.repo,
             candidate.info.attempt_count,
             max_attempts,
@@ -967,7 +980,10 @@ async fn try_resume_candidate(
             log::warn!(
                 "⚠️  Failed to resume {} for issue #{}: {}",
                 candidate.minion_id,
-                candidate.info.issue,
+                candidate
+                    .info
+                    .issue
+                    .map_or("?".to_string(), |n| n.to_string()),
                 e
             );
             false
@@ -997,7 +1013,7 @@ async fn resume_interrupted_minions(
                 log::debug!(
                     "Skipping {} (issue #{}, {}): already resumed this session",
                     c.minion_id,
-                    c.info.issue,
+                    c.info.issue.map_or("?".to_string(), |n| n.to_string()),
                     c.info.repo,
                 );
                 false
@@ -1038,7 +1054,10 @@ async fn resume_interrupted_minions(
         tprintln!(
             "♻️  Resuming {} (issue #{}, {}, phase: {:?})",
             candidate.minion_id,
-            candidate.info.issue,
+            candidate
+                .info
+                .issue
+                .map_or("?".to_string(), |n| n.to_string()),
             candidate.info.repo,
             candidate.info.orchestration_phase,
         );
@@ -1248,7 +1267,7 @@ async fn spawn_for_candidate_issues(
             }
 
             // Check if issue is already being worked on (by a live process)
-            if is_issue_claimed(&ctx.full, candidate.number).await? {
+            if is_issue_claimed(&ctx.full, Some(candidate.number)).await? {
                 continue;
             }
 
@@ -1394,11 +1413,14 @@ async fn available_slots(max_slots: usize) -> Result<usize> {
 }
 
 /// Check if an issue is already being worked on by a live Minion process
-async fn is_issue_claimed(repo: &str, issue_number: u64) -> Result<bool> {
+async fn is_issue_claimed(repo: &str, issue_number: Option<u64>) -> Result<bool> {
+    let Some(issue_number) = issue_number else {
+        return Ok(false);
+    };
     let repo = repo.to_string();
     with_registry(move |registry| {
         let claimed = registry.list().iter().any(|(_id, info)| {
-            info.repo == repo && info.issue == issue_number && info.is_running()
+            info.repo == repo && info.issue == Some(issue_number) && info.is_running()
         });
         Ok(claimed)
     })
@@ -1923,7 +1945,7 @@ mod tests {
         use std::path::PathBuf;
         MinionInfo {
             repo: "owner/repo".to_string(),
-            issue: 42,
+            issue: Some(42),
             command: "do".to_string(),
             prompt: "test".to_string(),
             started_at: chrono::Utc::now(),
@@ -2063,7 +2085,7 @@ mod tests {
 
     // --- sort_and_dedup_resumable tests ---
 
-    fn make_resumable(minion_id: &str, repo: &str, issue: u64) -> ResumableMinion {
+    fn make_resumable(minion_id: &str, repo: &str, issue: Option<u64>) -> ResumableMinion {
         use crate::minion_registry::{MinionInfo, MinionMode, OrchestrationPhase};
         use chrono::Utc;
         use std::path::PathBuf;
@@ -2076,7 +2098,11 @@ mod tests {
                 command: "do".to_string(),
                 prompt: String::new(),
                 started_at: now,
-                branch: format!("minion/issue-{}-{}", issue, minion_id),
+                branch: format!(
+                    "minion/issue-{}-{}",
+                    issue.map_or("none".to_string(), |n| n.to_string()),
+                    minion_id
+                ),
                 worktree: PathBuf::from("/tmp/test"),
                 status: "active".to_string(),
                 pr: None,
@@ -2102,9 +2128,9 @@ mod tests {
     fn test_sort_and_dedup_resumable_picks_most_recent() {
         // Three minions for the same issue; M003 is the most recent and should win.
         let candidates = vec![
-            make_resumable("M001", "owner/repo", 42),
-            make_resumable("M003", "owner/repo", 42),
-            make_resumable("M002", "owner/repo", 42),
+            make_resumable("M001", "owner/repo", Some(42)),
+            make_resumable("M003", "owner/repo", Some(42)),
+            make_resumable("M002", "owner/repo", Some(42)),
         ];
         let result = sort_and_dedup_resumable(candidates);
         assert_eq!(result.len(), 1);
@@ -2115,10 +2141,10 @@ mod tests {
     fn test_sort_and_dedup_resumable_keeps_one_per_issue() {
         // Two issues, two minions each; only the newer one per issue should survive.
         let candidates = vec![
-            make_resumable("M001", "owner/repo", 10),
-            make_resumable("M004", "owner/repo", 10),
-            make_resumable("M002", "owner/repo", 20),
-            make_resumable("M003", "owner/repo", 20),
+            make_resumable("M001", "owner/repo", Some(10)),
+            make_resumable("M004", "owner/repo", Some(10)),
+            make_resumable("M002", "owner/repo", Some(20)),
+            make_resumable("M003", "owner/repo", Some(20)),
         ];
         let result = sort_and_dedup_resumable(candidates);
         assert_eq!(result.len(), 2);
@@ -2143,8 +2169,8 @@ mod tests {
         // uppercase ID higher than a current ID with the same numeric value.
         // M010 = 36, which is strictly greater than M00z = 35, so M010 must win.
         let candidates = vec![
-            make_resumable("M00Z", "owner/repo", 1), // legacy uppercase, value = 35
-            make_resumable("M010", "owner/repo", 1), // current lowercase, value = 36
+            make_resumable("M00Z", "owner/repo", Some(1)), // legacy uppercase, value = 35
+            make_resumable("M010", "owner/repo", Some(1)), // current lowercase, value = 36
         ];
         let result = sort_and_dedup_resumable(candidates);
         assert_eq!(result.len(), 1);
@@ -2162,7 +2188,7 @@ mod tests {
 
     #[test]
     fn test_sort_and_dedup_resumable_single() {
-        let candidates = vec![make_resumable("M001", "owner/repo", 42)];
+        let candidates = vec![make_resumable("M001", "owner/repo", Some(42))];
         let result = sort_and_dedup_resumable(candidates);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].minion_id, "M001");
@@ -2262,9 +2288,9 @@ mod tests {
     /// which resume_interrupted_minions uses to check merge state.
     #[test]
     fn test_resumable_minion_with_pr_is_deduped_correctly() {
-        let mut c1 = make_resumable("M001", "owner/repo", 42);
+        let mut c1 = make_resumable("M001", "owner/repo", Some(42));
         c1.info.pr = Some("100".to_string());
-        let mut c2 = make_resumable("M003", "owner/repo", 42);
+        let mut c2 = make_resumable("M003", "owner/repo", Some(42));
         c2.info.pr = Some("101".to_string());
 
         let result = sort_and_dedup_resumable(vec![c1, c2]);

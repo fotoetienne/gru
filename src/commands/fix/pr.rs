@@ -43,17 +43,32 @@ pub(crate) async fn is_branch_pushed(
 }
 
 /// Creates a WIP PR title and body template
-fn create_wip_template(minion_id: &str, issue_num: u64, issue_title: &str) -> (String, String) {
-    let title = format!("[{}] Fixes #{}: {}", minion_id, issue_num, issue_title);
-    let body = format!(
-        "## Summary\nAutomated fix for #{} by Minion {}\n\n\
-         ## Status\n- [ ] Implementation\n- [ ] Tests\n- [ ] Review\n\n\
-         Fixes #{}{}",
-        issue_num,
-        minion_id,
-        issue_num,
-        crate::progress_comments::minion_signature(minion_id),
-    );
+fn create_wip_template(
+    minion_id: &str,
+    issue_num: Option<u64>,
+    issue_title: &str,
+) -> (String, String) {
+    let title = match issue_num {
+        Some(n) => format!("[{}] Fixes #{}: {}", minion_id, n, issue_title),
+        None => format!("[{}] {}", minion_id, issue_title),
+    };
+    let body = match issue_num {
+        Some(n) => format!(
+            "## Summary\nAutomated fix for #{} by Minion {}\n\n\
+             ## Status\n- [ ] Implementation\n- [ ] Tests\n- [ ] Review\n\n\
+             Fixes #{}{}",
+            n,
+            minion_id,
+            n,
+            crate::progress_comments::minion_signature(minion_id),
+        ),
+        None => format!(
+            "## Summary\nAutomated work by Minion {}\n\n\
+             ## Status\n- [ ] Implementation\n- [ ] Tests\n- [ ] Review{}",
+            minion_id,
+            crate::progress_comments::minion_signature(minion_id),
+        ),
+    };
     (title, body)
 }
 
@@ -64,7 +79,7 @@ async fn create_pr_for_issue(
     repo: &str,
     host: &str,
     branch_name: &str,
-    issue_num: u64,
+    issue_num: Option<u64>,
     minion_id: &str,
     checkout_path: &Path,
     minion_dir: &Path,
@@ -93,11 +108,13 @@ async fn create_pr_for_issue(
     // Get issue title - use provided title if available, otherwise fetch
     let issue_title = if let Some(title) = issue_title_opt {
         title.to_string()
-    } else {
-        match crate::github::get_issue_via_cli(owner, repo, host, issue_num).await {
+    } else if let Some(num) = issue_num {
+        match crate::github::get_issue_via_cli(owner, repo, host, num).await {
             Ok(info) => info.title,
             Err(_) => "Fix issue".to_string(),
         }
+    } else {
+        "Fix issue".to_string()
     };
 
     // Check if work is complete (description file exists in minion_dir)
@@ -118,16 +135,21 @@ async fn create_pr_for_issue(
         match tokio::fs::read_to_string(&description_path).await {
             Ok(content) if !content.trim().is_empty() => {
                 // Work is complete - use description and mark ready
-                let pr_title = format!("Fixes #{}: {}", issue_num, issue_title);
-                let closing_line = format!("Fixes #{}", issue_num);
+                let pr_title = match issue_num {
+                    Some(n) => format!("Fixes #{}: {}", n, issue_title),
+                    None => issue_title.clone(),
+                };
                 let mut pr_body = content.trim().to_string();
                 // Append closing keyword if not already present
-                if !pr_body.contains(&closing_line) {
-                    if !pr_body.ends_with('\n') {
+                if let Some(n) = issue_num {
+                    let closing_line = format!("Fixes #{}", n);
+                    if !pr_body.contains(&closing_line) {
+                        if !pr_body.ends_with('\n') {
+                            pr_body.push('\n');
+                        }
                         pr_body.push('\n');
+                        pr_body.push_str(&closing_line);
                     }
-                    pr_body.push('\n');
-                    pr_body.push_str(&closing_line);
                 }
                 if !pr_body.contains("<sub>🤖") {
                     pr_body.push_str(&crate::progress_comments::minion_signature(minion_id));
@@ -199,7 +221,12 @@ async fn finalize_pr(
     pr_number: &str,
 ) -> Result<()> {
     // Save PR state to minion_dir (metadata)
-    let pr_state = PrState::new(pr_number.to_string(), issue_ctx.issue_num.to_string());
+    let pr_state = PrState::new(
+        pr_number.to_string(),
+        issue_ctx
+            .issue_num
+            .map_or("0".to_string(), |n| n.to_string()),
+    );
     pr_state
         .save(&wt_ctx.minion_dir)
         .context("Failed to save PR state")?;
@@ -215,20 +242,22 @@ async fn finalize_pr(
     })
     .await?;
 
-    // Mark issue as done (fire-and-forget)
-    match crate::github::mark_issue_done_via_cli(
-        &issue_ctx.host,
-        &issue_ctx.owner,
-        &issue_ctx.repo,
-        issue_ctx.issue_num,
-    )
-    .await
-    {
-        Ok(()) => {
-            println!("🏷️  Updated issue label to '{}'", crate::labels::DONE);
-        }
-        Err(e) => {
-            log::warn!("⚠️  Failed to update issue label: {}", e);
+    // Mark issue as done (fire-and-forget, skip if no linked issue)
+    if let Some(issue_num) = issue_ctx.issue_num {
+        match crate::github::mark_issue_done_via_cli(
+            &issue_ctx.host,
+            &issue_ctx.owner,
+            &issue_ctx.repo,
+            issue_num,
+        )
+        .await
+        {
+            Ok(()) => {
+                println!("🏷️  Updated issue label to '{}'", crate::labels::DONE);
+            }
+            Err(e) => {
+                log::warn!("⚠️  Failed to update issue label: {}", e);
+            }
         }
     }
 
@@ -476,7 +505,7 @@ mod tests {
 
     #[test]
     fn test_create_wip_template() {
-        let (title, body) = create_wip_template("M042", 123, "Fix login bug");
+        let (title, body) = create_wip_template("M042", Some(123), "Fix login bug");
         assert_eq!(title, "[M042] Fixes #123: Fix login bug");
         assert!(body.contains("Automated fix for #123 by Minion M042"));
         assert!(body.contains("- [ ] Implementation"));

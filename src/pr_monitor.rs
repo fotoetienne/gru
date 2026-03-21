@@ -689,18 +689,22 @@ async fn get_review_feedback(
 
 /// Format review feedback (bodies + inline comments) into a prompt for Claude
 pub(crate) fn format_review_prompt(
-    issue_num: u64,
+    issue_num: Option<u64>,
     pr_number: &str,
     feedback: &ReviewFeedback,
     owner: &str,
     repo: &str,
     minion_id: &str,
 ) -> String {
-    let mut prompt = format!(
-        "You previously implemented a fix for issue #{}. Review feedback has been provided \
-        on PR #{}. Please address the following feedback:\n\n",
-        issue_num, pr_number
-    );
+    let preamble = match issue_num {
+        Some(n) => format!(
+            "You previously implemented a fix for issue #{}. Review feedback has been provided \
+            on PR #{}.",
+            n, pr_number
+        ),
+        None => format!("Review feedback has been provided on PR #{}.", pr_number),
+    };
+    let mut prompt = format!("{} Please address the following feedback:\n\n", preamble);
 
     // Include review bodies (top-level review feedback not tied to specific lines)
     for (i, review_body) in feedback.bodies.iter().enumerate() {
@@ -824,7 +828,14 @@ mod tests {
             had_fetch_failures: false,
         };
 
-        let prompt = format_review_prompt(123, "456", &feedback, "octocat", "hello-world", "M042");
+        let prompt = format_review_prompt(
+            Some(123),
+            "456",
+            &feedback,
+            "octocat",
+            "hello-world",
+            "M042",
+        );
 
         assert!(prompt.contains("issue #123"));
         assert!(prompt.contains("PR #456"));
@@ -862,7 +873,14 @@ mod tests {
             had_fetch_failures: false,
         };
 
-        let prompt = format_review_prompt(123, "456", &feedback, "octocat", "hello-world", "M042");
+        let prompt = format_review_prompt(
+            Some(123),
+            "456",
+            &feedback,
+            "octocat",
+            "hello-world",
+            "M042",
+        );
 
         assert!(prompt.contains("## Inline Comment 1"));
         assert!(prompt.contains("## Inline Comment 2"));
@@ -890,7 +908,14 @@ mod tests {
             had_fetch_failures: false,
         };
 
-        let prompt = format_review_prompt(123, "456", &feedback, "octocat", "hello-world", "M042");
+        let prompt = format_review_prompt(
+            Some(123),
+            "456",
+            &feedback,
+            "octocat",
+            "hello-world",
+            "M042",
+        );
 
         // Should not have a colon if line is None
         assert!(prompt.contains("**File:** README.md\n"));
@@ -909,7 +934,8 @@ mod tests {
             had_fetch_failures: false,
         };
 
-        let prompt = format_review_prompt(42, "99", &feedback, "octocat", "hello-world", "M001");
+        let prompt =
+            format_review_prompt(Some(42), "99", &feedback, "octocat", "hello-world", "M001");
 
         assert!(prompt.contains("issue #42"));
         assert!(prompt.contains("PR #99"));
@@ -939,7 +965,8 @@ mod tests {
             had_fetch_failures: false,
         };
 
-        let prompt = format_review_prompt(10, "20", &feedback, "octocat", "hello-world", "M002");
+        let prompt =
+            format_review_prompt(Some(10), "20", &feedback, "octocat", "hello-world", "M002");
 
         // Review body appears
         assert!(prompt.contains("## Review 1 (CHANGES_REQUESTED)"));

@@ -19,7 +19,10 @@ use uuid::Uuid;
 /// Falls back to `/do <issue_num>` when issue details are unavailable.
 pub(super) fn build_fix_prompt(ctx: &IssueContext, wt_ctx: &WorktreeContext) -> String {
     let Some(ref details) = ctx.details else {
-        return format!("/do {}", ctx.issue_num);
+        return format!(
+            "/do {}",
+            ctx.issue_num.map_or("?".to_string(), |n| n.to_string())
+        );
     };
 
     // Try to load the prompt through the template system (allows overrides).
@@ -36,7 +39,10 @@ pub(super) fn build_fix_prompt(ctx: &IssueContext, wt_ctx: &WorktreeContext) -> 
         Some(ref p) => &p.content,
         None => {
             log::warn!("No 'do' prompt found (built-in or override), using /do fallback");
-            return format!("/do {}", ctx.issue_num);
+            return format!(
+                "/do {}",
+                ctx.issue_num.map_or("?".to_string(), |n| n.to_string())
+            );
         }
     };
 
@@ -48,7 +54,7 @@ pub(super) fn build_fix_prompt(ctx: &IssueContext, wt_ctx: &WorktreeContext) -> 
     };
 
     let mut prompt_ctx = PromptContext::new();
-    prompt_ctx.issue_number = Some(ctx.issue_num);
+    prompt_ctx.issue_number = ctx.issue_num;
     prompt_ctx.issue_title = Some(details.title.clone());
     prompt_ctx.issue_body = Some(details.body.clone());
     prompt_ctx.repo_owner = Some(ctx.owner.clone());
@@ -109,7 +115,7 @@ pub(super) async fn resume_agent_session(
             format!(
                 "Continue working on issue #{}. Pick up where you left off. \
                  If you've already completed the implementation, proceed to push and write PR_DESCRIPTION.md.",
-                issue_ctx.issue_num
+                issue_ctx.issue_num.map_or("?".to_string(), |n| n.to_string())
             )
         });
     let mut cmd = backend
@@ -137,7 +143,9 @@ async fn run_agent_session_inner(
 ) -> Result<AgentResult> {
     let config = ProgressConfig {
         minion_id: wt_ctx.minion_id.clone(),
-        issue: issue_ctx.issue_num.to_string(),
+        issue: issue_ctx
+            .issue_num
+            .map_or("?".to_string(), |n| n.to_string()),
         quiet,
     };
     let progress = ProgressDisplay::new(config);
@@ -246,21 +254,33 @@ async fn run_agent_session_inner(
         let update = progress_tracker.create_update(final_message);
         let comment_body = update.format_comment();
 
-        try_post_progress_comment(
-            &issue_ctx.host,
-            &issue_ctx.owner,
-            &issue_ctx.repo,
-            issue_ctx.issue_num,
-            &comment_body,
-        )
-        .await;
+        if let Some(issue_num) = issue_ctx.issue_num {
+            try_post_progress_comment(
+                &issue_ctx.host,
+                &issue_ctx.owner,
+                &issue_ctx.repo,
+                issue_num,
+                &comment_body,
+            )
+            .await;
+        }
     }
 
     // Finish the progress display
     if agent_run.status.success() {
-        progress.finish_with_message(&format!("✅ Completed issue {}", issue_ctx.issue_num));
+        progress.finish_with_message(&format!(
+            "✅ Completed issue {}",
+            issue_ctx
+                .issue_num
+                .map_or("?".to_string(), |n| n.to_string())
+        ));
     } else {
-        progress.finish_with_message(&format!("❌ Failed to fix issue {}", issue_ctx.issue_num));
+        progress.finish_with_message(&format!(
+            "❌ Failed to fix issue {}",
+            issue_ctx
+                .issue_num
+                .map_or("?".to_string(), |n| n.to_string())
+        ));
     }
 
     Ok(AgentResult {
