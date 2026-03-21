@@ -88,6 +88,7 @@ impl Worktree {
         }
 
         let child = github::gh_cli_command(&self.host)
+            .kill_on_drop(true)
             .args([
                 "issue",
                 "view",
@@ -101,10 +102,13 @@ impl Worktree {
             ])
             .output();
 
-        let output = tokio::time::timeout(std::time::Duration::from_secs(30), child)
-            .await
-            .context("Timed out checking issue status")?
-            .context("Failed to check issue status")?;
+        let output = tokio::time::timeout(
+            std::time::Duration::from_secs(github::GH_TIMEOUT_SECS),
+            child,
+        )
+        .await
+        .with_context(|| format!("Timed out checking issue #{} status", issue_num))?
+        .context("Failed to check issue status")?;
 
         if !output.status.success() {
             return Ok(None);
@@ -161,6 +165,7 @@ impl Worktree {
     ///   Callers decide the conservative default for their use case.
     async fn count_prs_in_state(&self, state: &str) -> Result<u64> {
         let child = github::gh_cli_command(&self.host)
+            .kill_on_drop(true)
             .args([
                 "pr",
                 "list",
@@ -177,10 +182,13 @@ impl Worktree {
             ])
             .output();
 
-        let output = tokio::time::timeout(std::time::Duration::from_secs(30), child)
-            .await
-            .with_context(|| format!("`gh pr list --state {}` timed out", state))?
-            .with_context(|| format!("Failed to run `gh pr list --state {}`", state))?;
+        let output = tokio::time::timeout(
+            std::time::Duration::from_secs(github::GH_TIMEOUT_SECS),
+            child,
+        )
+        .await
+        .with_context(|| format!("`gh pr list --state {}` timed out", state))?
+        .with_context(|| format!("Failed to run `gh pr list --state {}`", state))?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
