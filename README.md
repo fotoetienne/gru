@@ -83,6 +83,9 @@ gru do https://github.com/owner/repo/issues/42
 # With a timeout
 gru do 42 --timeout 30m
 
+# Review the prompt before launching
+gru do 42 --discuss
+
 # Using a different agent backend
 gru do 42 --agent codex
 ```

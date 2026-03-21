@@ -139,6 +139,13 @@ enum Commands {
         )]
         detach: bool,
 
+        #[arg(
+            long,
+            conflicts_with = "detach",
+            help = "Pause to review the assembled prompt before launching the agent"
+        )]
+        discuss: bool,
+
         #[arg(long, help = "Skip dependency checking entirely")]
         ignore_deps: bool,
 
@@ -440,6 +447,7 @@ async fn main() {
             no_watch,
             auto_merge,
             detach,
+            discuss,
             ignore_deps,
             worker,
         } => {
@@ -456,6 +464,7 @@ async fn main() {
                     no_watch,
                     auto_merge,
                     detach,
+                    discuss,
                     ignore_deps,
                     worker,
                 },

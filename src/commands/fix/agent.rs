@@ -17,7 +17,7 @@ use uuid::Uuid;
 /// or legacy `.gru/prompts/fix.md`), builds a `PromptContext` from the issue
 /// details, and renders the template.
 /// Falls back to `/do <issue_num>` when issue details are unavailable.
-pub(super) fn build_fix_prompt(ctx: &IssueContext, wt_ctx: &WorktreeContext) -> String {
+pub(crate) fn build_fix_prompt(ctx: &IssueContext, wt_ctx: &WorktreeContext) -> String {
     let Some(ref details) = ctx.details else {
         return format!(
             "/do {}",
@@ -85,7 +85,19 @@ pub(super) async fn run_agent_session(
     timeout_opt: Option<&str>,
 ) -> Result<AgentResult> {
     println!("🤖 Launching {}...\n", backend.name());
-    let prompt = build_fix_prompt(issue_ctx, wt_ctx);
+    let mut prompt = build_fix_prompt(issue_ctx, wt_ctx);
+
+    // Append extra context from --discuss if present
+    let extra_path = wt_ctx.minion_dir.join("extra_context.txt");
+    if extra_path.exists() {
+        if let Ok(extra) = std::fs::read_to_string(&extra_path) {
+            if !extra.trim().is_empty() {
+                prompt.push_str("\n\n## Additional Context from User\n\n");
+                prompt.push_str(extra.trim());
+            }
+        }
+    }
+
     let mut cmd = backend.build_command(
         &wt_ctx.checkout_path,
         &wt_ctx.session_id,

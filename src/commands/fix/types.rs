@@ -14,6 +14,8 @@ pub struct FixOptions {
     pub auto_merge: bool,
     /// Detach immediately after spawning background worker (don't follow logs).
     pub detach: bool,
+    /// Pause to review the assembled prompt before launching the agent.
+    pub discuss: bool,
     /// Skip dependency checking entirely.
     pub ignore_deps: bool,
     /// Internal: run as background worker for a previously-registered minion.

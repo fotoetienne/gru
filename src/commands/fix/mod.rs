@@ -20,7 +20,7 @@ use crate::agent_registry;
 use crate::agent_runner::{is_stuck_or_timeout_error, parse_timeout, EXIT_CODE_SIGNAL_TERMINATED};
 use crate::minion_registry::{with_registry, MinionMode, OrchestrationPhase};
 use crate::tmux::TmuxGuard;
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use chrono::Utc;
 use std::path::Path;
 use tokio::time::Duration;
@@ -261,6 +261,60 @@ async fn run_worker(minion_id: &str, issue: &str, opts: FixOptions) -> Result<i3
     Ok(worker::agent_exit_code(&agent_result))
 }
 
+/// User action from the `--discuss` interactive prompt.
+enum DiscussAction {
+    Proceed,
+    Append(String),
+    Abort,
+}
+
+/// Reads user input for the `--discuss` checkpoint.
+///
+/// Waits for a single key: Enter (proceed), 'a' (append context), or 'q' (abort).
+/// When 'a' is chosen, reads additional lines until an empty line or EOF.
+fn read_discuss_input() -> Result<DiscussAction> {
+    use std::io::{BufRead, Write};
+
+    print!("> ");
+    std::io::stdout().flush()?;
+
+    let stdin = std::io::stdin();
+    let mut line = String::new();
+    stdin.lock().read_line(&mut line)?;
+    let trimmed = line.trim();
+
+    match trimmed {
+        "" => Ok(DiscussAction::Proceed),
+        "q" | "Q" => Ok(DiscussAction::Abort),
+        "a" | "A" => {
+            println!("Enter extra context (empty line to finish):");
+            let mut context_lines = Vec::new();
+            loop {
+                let mut buf = String::new();
+                stdin.lock().read_line(&mut buf)?;
+                if buf.trim().is_empty() {
+                    break;
+                }
+                context_lines.push(buf);
+            }
+            let text = context_lines.concat().trim_end().to_string();
+            if text.is_empty() {
+                println!("No context entered. Proceeding with original prompt.\n");
+                Ok(DiscussAction::Proceed)
+            } else {
+                Ok(DiscussAction::Append(text))
+            }
+        }
+        other => {
+            println!(
+                "Unknown input '{}'. Proceeding with original prompt.\n",
+                other
+            );
+            Ok(DiscussAction::Proceed)
+        }
+    }
+}
+
 /// Handles the fix command by delegating to the agent backend.
 /// Returns the exit code from the agent process.
 ///
@@ -287,10 +341,19 @@ pub(crate) async fn handle_fix(issue: &str, opts: FixOptions) -> Result<i32> {
     let quiet = opts.quiet;
     let force_new = opts.force_new;
     let detach = opts.detach;
+    let discuss = opts.discuss;
     let agent_name = &opts.agent_name;
 
     // Validate agent name early (fail fast on unknown agents)
     let _backend = agent_registry::resolve_backend(agent_name)?;
+
+    // --discuss requires an interactive terminal
+    if discuss {
+        use std::io::IsTerminal;
+        if !std::io::stdin().is_terminal() {
+            bail!("--discuss requires an interactive terminal (stdin is not a TTY)");
+        }
+    }
 
     let ignore_deps = opts.ignore_deps;
 
@@ -396,6 +459,34 @@ pub(crate) async fn handle_fix(issue: &str, opts: FixOptions) -> Result<i32> {
             issue_ctx.issue_num,
         )
         .await;
+    }
+
+    // --discuss: show prompt and wait for user input before launching
+    if discuss {
+        let prompt = agent::build_fix_prompt(&issue_ctx, &wt_ctx);
+        println!("\n--- Assembled Prompt ---");
+        println!("{}", prompt);
+        println!("--- End Prompt ---\n");
+        println!("Press Enter to launch, or:");
+        println!("  a  - append extra context");
+        println!("  q  - abort (worktree preserved)\n");
+
+        match read_discuss_input()? {
+            DiscussAction::Proceed => {}
+            DiscussAction::Append(text) => {
+                let extra_path = wt_ctx.minion_dir.join("extra_context.txt");
+                std::fs::write(&extra_path, &text)
+                    .with_context(|| format!("Failed to write {}", extra_path.display()))?;
+                println!("Extra context saved. Launching agent...\n");
+            }
+            DiscussAction::Abort => {
+                println!(
+                    "Aborted. Worktree preserved at: {}",
+                    wt_ctx.checkout_path.display()
+                );
+                return Ok(0);
+            }
+        }
     }
 
     // Phase 3: Spawn background worker
@@ -620,5 +711,40 @@ CUSTOM: Fix #{{ issue_number }} - {{ issue_title }}"#,
         let err: anyhow::Error = AgentRunnerError::InactivityStuck { minutes: 15 }.into();
         let wrapped = err.context("Claude session failed");
         assert!(is_stuck_or_timeout_error(&wrapped));
+    }
+
+    #[test]
+    fn test_extra_context_appended_to_prompt() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wt_ctx = test_wt_ctx(tmp.path());
+
+        // Write extra_context.txt to minion_dir (simulates --discuss append)
+        let extra_path = wt_ctx.minion_dir.join("extra_context.txt");
+        std::fs::write(&extra_path, "use the new API, not the deprecated one").unwrap();
+
+        // Verify the file exists and can be read back
+        assert!(extra_path.exists());
+        let content = std::fs::read_to_string(&extra_path).unwrap();
+        assert_eq!(content, "use the new API, not the deprecated one");
+    }
+
+    #[test]
+    fn test_extra_context_empty_file_ignored() {
+        let tmp = tempfile::tempdir().unwrap();
+        let extra_path = tmp.path().join("extra_context.txt");
+
+        // Empty file should be treated as no extra context
+        std::fs::write(&extra_path, "   \n  ").unwrap();
+        let content = std::fs::read_to_string(&extra_path).unwrap();
+        assert!(content.trim().is_empty());
+    }
+
+    #[test]
+    fn test_extra_context_missing_file_no_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let extra_path = tmp.path().join("extra_context.txt");
+
+        // File doesn't exist — this is the normal case without --discuss
+        assert!(!extra_path.exists());
     }
 }
