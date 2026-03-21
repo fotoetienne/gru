@@ -315,6 +315,9 @@ async fn run_resume_pipeline(ctx: ResumeContext, quiet: bool) -> Result<i32> {
         Ok(result) => result,
         Err(e) if is_stuck_or_timeout_error(&e) => {
             log::error!("🚨 {:#}", e);
+            if agent_only {
+                cleanup_registry(&wt_ctx.minion_id).await;
+            }
             return Ok(1);
         }
         Err(e) => return Err(e),
