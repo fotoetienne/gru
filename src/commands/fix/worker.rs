@@ -102,7 +102,20 @@ pub(crate) async fn create_pr_phase(
     let pr_number = if *start_phase <= OrchestrationPhase::CreatingPr {
         update_orchestration_phase(&wt_ctx.minion_id, OrchestrationPhase::CreatingPr).await;
         match handle_pr_creation(issue_ctx, wt_ctx).await {
-            Ok(pr) => pr,
+            Ok(Some(pr)) => Some(pr),
+            Ok(None) => {
+                // PR creation was attempted but no PR was created (e.g., branch not
+                // pushed, creation failed with no recovery). Keep the phase at
+                // CreatingPr so that `gru resume` can retry.
+                log::warn!(
+                    "⚠️  PR creation did not produce a PR — phase stays at CreatingPr for retry"
+                );
+                return Err(anyhow::anyhow!(
+                    "PR creation failed: no PR was created for branch '{}'. \
+                     Use `gru resume` to retry.",
+                    wt_ctx.branch_name
+                ));
+            }
             Err(e) => {
                 update_orchestration_phase(&wt_ctx.minion_id, OrchestrationPhase::Failed).await;
                 return Err(e);
@@ -130,7 +143,17 @@ pub(crate) async fn create_pr_phase(
         } else {
             log::info!("ℹ️  PR not found in registry, retrying PR creation");
             match handle_pr_creation(issue_ctx, wt_ctx).await {
-                Ok(pr) => pr,
+                Ok(Some(pr)) => Some(pr),
+                Ok(None) => {
+                    log::warn!("⚠️  PR retry did not produce a PR — reverting phase to CreatingPr");
+                    update_orchestration_phase(&wt_ctx.minion_id, OrchestrationPhase::CreatingPr)
+                        .await;
+                    return Err(anyhow::anyhow!(
+                        "PR creation failed: no PR was created for branch '{}'. \
+                         Use `gru resume` to retry.",
+                        wt_ctx.branch_name
+                    ));
+                }
                 Err(e) => {
                     update_orchestration_phase(&wt_ctx.minion_id, OrchestrationPhase::Failed).await;
                     return Err(e);
