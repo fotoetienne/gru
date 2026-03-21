@@ -25,6 +25,8 @@ struct ResumeContext {
     start_phase: OrchestrationPhase,
     effective_timeout: Option<String>,
     no_watch: bool,
+    /// The command that originally created this minion (e.g., "do", "prompt", "review").
+    command: String,
 }
 
 /// Handles the resume command: resumes a stopped Minion in autonomous mode.
@@ -111,6 +113,7 @@ async fn check_resumption_preconditions(
     let no_watch = info.no_watch;
     let start_phase = info.orchestration_phase.clone();
     let wake_reason = info.wake_reason.clone();
+    let command = info.command.clone();
 
     // Check if timeout_deadline has passed — fail instead of resuming
     if let Some(deadline) = timeout_deadline {
@@ -249,6 +252,7 @@ async fn check_resumption_preconditions(
         start_phase,
         effective_timeout,
         no_watch,
+        command,
     })
 }
 
@@ -265,7 +269,12 @@ async fn run_resume_pipeline(ctx: ResumeContext, quiet: bool) -> Result<i32> {
         start_phase,
         effective_timeout,
         no_watch,
+        command,
     } = ctx;
+
+    // Non-"do" minions (e.g., "prompt", "review") only run the agent phase —
+    // they should not create PRs or enter the monitoring lifecycle.
+    let agent_only = is_agent_only_command(&command);
 
     // Rename tmux window for the resume session
     let _tmux_guard = TmuxGuard::new(&format!("gru:{}", wt_ctx.minion_id));
@@ -291,6 +300,9 @@ async fn run_resume_pipeline(ctx: ResumeContext, quiet: bool) -> Result<i32> {
         Ok(result) => result,
         Err(e) if is_stuck_or_timeout_error(&e) => {
             log::error!("🚨 {:#}", e);
+            if agent_only {
+                cleanup_registry(&wt_ctx.minion_id).await;
+            }
             return Ok(1);
         }
         Err(e) => return Err(e),
@@ -300,8 +312,23 @@ async fn run_resume_pipeline(ctx: ResumeContext, quiet: bool) -> Result<i32> {
     if let Some(ref result) = agent_result {
         if !result.status.success() {
             println!("❌ Agent session exited with non-zero status");
+            if agent_only {
+                cleanup_registry(&wt_ctx.minion_id).await;
+            }
             return Ok(result.status.code().unwrap_or(EXIT_CODE_SIGNAL_TERMINATED));
         }
+    }
+
+    // For agent-only commands (prompt, review, etc.), skip PR creation and monitoring.
+    // Only transition to Completed if the agent actually ran in this invocation;
+    // otherwise preserve the existing phase (e.g., a prior Failed state).
+    if agent_only {
+        if agent_result.is_some() {
+            update_orchestration_phase(&wt_ctx.minion_id, OrchestrationPhase::Completed).await;
+        }
+        cleanup_registry(&wt_ctx.minion_id).await;
+        println!("✅ Resume completed for Minion {}", wt_ctx.minion_id);
+        return Ok(agent_exit_code(&agent_result));
     }
 
     // Phase: Create PR
@@ -350,6 +377,13 @@ async fn run_resume_pipeline(ctx: ResumeContext, quiet: bool) -> Result<i32> {
     cleanup_registry(&wt_ctx.minion_id).await;
     println!("✅ Resume completed for Minion {}", wt_ctx.minion_id);
     Ok(agent_exit_code(&agent_result))
+}
+
+/// Returns `true` for commands that should only run the agent phase on resume,
+/// skipping PR creation and monitoring. Accepts the legacy `"fix"` alias as
+/// equivalent to `"do"` for registries written before the rename.
+fn is_agent_only_command(command: &str) -> bool {
+    command != "do" && command != "fix"
 }
 
 /// Best-effort registry cleanup: clear PID and set mode to Stopped.
@@ -510,5 +544,25 @@ mod tests {
     fn test_extract_host_from_remote_url_invalid() {
         assert_eq!(extract_host_from_remote_url("not-a-url"), None);
         assert_eq!(extract_host_from_remote_url(""), None);
+    }
+
+    #[test]
+    fn test_is_agent_only_command_do() {
+        assert!(!is_agent_only_command("do"));
+    }
+
+    #[test]
+    fn test_is_agent_only_command_legacy_fix() {
+        assert!(!is_agent_only_command("fix"));
+    }
+
+    #[test]
+    fn test_is_agent_only_command_prompt() {
+        assert!(is_agent_only_command("prompt"));
+    }
+
+    #[test]
+    fn test_is_agent_only_command_review() {
+        assert!(is_agent_only_command("review"));
     }
 }
