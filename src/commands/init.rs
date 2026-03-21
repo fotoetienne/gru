@@ -203,7 +203,29 @@ pub(crate) async fn handle_init(repo_arg: String, host_override: Option<String>)
         }
     }
 
-    // 4. Clone/update bare repository
+    // 4. Add repo to daemon.repos in config
+    let repo_entry = if host.eq_ignore_ascii_case("github.com") {
+        format!("{}/{}", owner, repo)
+    } else {
+        format!("{}/{}/{}", host, owner, repo)
+    };
+    match LabConfig::add_repo_to_config(&config_path, &repo_entry) {
+        Ok(true) => {
+            println!(
+                "✓ Added {} to daemon.repos in {}",
+                repo_entry,
+                config_path.display()
+            );
+        }
+        Ok(false) => {
+            println!("  ℹ {} already in daemon.repos", repo_entry);
+        }
+        Err(e) => {
+            log::warn!("  ⚠️  Could not update daemon.repos: {}", e);
+        }
+    }
+
+    // 5. Clone/update bare repository
     println!("\n📦 Setting up repository mirror...");
     let bare_repo_path = workspace.repos().join(&owner).join(format!("{}.git", repo));
     let git_repo = GitRepo::new(&owner, &repo, &host, bare_repo_path.clone());
@@ -222,7 +244,7 @@ pub(crate) async fn handle_init(repo_arg: String, host_override: Option<String>)
         }
     }
 
-    // 5. Create all required labels (idempotent via --force)
+    // 6. Create all required labels (idempotent via --force)
     println!("\n🏷️  Configuring labels...");
     let mut labels_failed = Vec::new();
 
@@ -245,7 +267,7 @@ pub(crate) async fn handle_init(repo_arg: String, host_override: Option<String>)
         );
     }
 
-    // 6. Check for ready issues
+    // 7. Check for ready issues
     println!("\n🔍 Checking for ready issues...");
     match github::list_ready_issues_via_cli(&owner, &repo, &host, labels::TODO).await {
         Ok(issues) => {
