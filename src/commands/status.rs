@@ -137,7 +137,7 @@ fn format_mode_display(
 /// This ensures the lock is only held for the minimum time needed to read/write
 /// the registry file, not for I/O operations.
 pub(crate) async fn handle_status(id: Option<String>, verbose: bool, show_all: bool) -> Result<i32> {
-    // Prune stale entries using the shared two-phase approach that checks
+    // Prune stale entries using the shared three-phase approach that checks
     // GitHub PR status before removing entries with open PRs.
     // Non-fatal: a transient GitHub API error should not prevent status display.
     if let Err(e) = crate::minion_registry::prune_stale_entries().await {
@@ -241,7 +241,9 @@ pub(crate) async fn handle_status(id: Option<String>, verbose: bool, show_all: b
                 } else {
                     let (is_running, mode_display) =
                         format_mode_display(basic.pid, basic.pid_start_time, &basic.mode);
-                    let is_archived = basic.archived_at.is_some();
+                    // Treat a minion as archived only when it has an archived_at
+                    // timestamp and is not currently running.
+                    let is_archived = basic.archived_at.is_some() && !is_running;
                     let mode_display = if is_archived {
                         "archived".to_string()
                     } else {

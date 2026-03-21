@@ -946,16 +946,14 @@ impl MinionRegistry {
         Ok(removed)
     }
 
-    /// Removes multiple Minions from the registry in a single save operation.
+    /// Stamp `archived_at` on a batch of minions in a single save.
     ///
-    /// Returns the number of minions actually removed (i.e., that existed in the registry).
+    /// Only archives entries that are still `Stopped` and not yet archived.
+    /// Returns the number of entries archived.
     ///
     /// # Errors
     ///
-    /// Returns an error if the registry cannot be saved to disk
-    /// Stamp `archived_at` on a batch of minions in a single save.
-    /// Only archives entries that are still Stopped and not yet archived.
-    /// Returns the number of entries archived.
+    /// Returns an error if the registry cannot be saved to disk.
     pub(crate) fn archive_batch(&mut self, minion_ids: &[String], now: DateTime<Utc>) -> Result<usize> {
         let mut count = 0;
         for id in minion_ids {
@@ -973,6 +971,13 @@ impl MinionRegistry {
         Ok(count)
     }
 
+    /// Removes multiple Minions from the registry in a single save operation.
+    ///
+    /// Returns the number of minions actually removed (i.e., that existed in the registry).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the registry cannot be saved to disk.
     pub(crate) fn remove_batch(&mut self, minion_ids: &[String]) -> Result<usize> {
         let mut count = 0;
         for id in minion_ids {
@@ -1685,5 +1690,43 @@ mod tests {
         // Callers should fall back to started_at when this field is None
         let baseline = info.last_review_check_time.unwrap_or(info.started_at);
         assert_eq!(baseline, info.started_at);
+    }
+
+    #[test]
+    fn test_archive_batch() {
+        let temp_dir = tempdir().unwrap();
+        let mut registry = MinionRegistry::load(Some(temp_dir.path())).unwrap();
+
+        // Register three minions: two stopped, one running
+        let mut stopped1 = test_minion_info();
+        stopped1.mode = MinionMode::Stopped;
+        let mut stopped2 = test_minion_info();
+        stopped2.mode = MinionMode::Stopped;
+        let running = test_minion_info(); // default is Autonomous
+
+        registry.register("M001".to_string(), stopped1).unwrap();
+        registry.register("M002".to_string(), stopped2).unwrap();
+        registry.register("M003".to_string(), running).unwrap();
+
+        let now = Utc::now();
+        let ids = vec![
+            "M001".to_string(),
+            "M002".to_string(),
+            "M003".to_string(), // not stopped — should be skipped
+            "M999".to_string(), // doesn't exist — should be skipped
+        ];
+
+        let count = registry.archive_batch(&ids, now).unwrap();
+        assert_eq!(count, 2);
+
+        // Verify archived entries have timestamp
+        assert_eq!(registry.get("M001").unwrap().archived_at, Some(now));
+        assert_eq!(registry.get("M002").unwrap().archived_at, Some(now));
+        // Running minion should NOT be archived
+        assert_eq!(registry.get("M003").unwrap().archived_at, None);
+
+        // Calling again should be a no-op (already archived)
+        let count2 = registry.archive_batch(&ids, now).unwrap();
+        assert_eq!(count2, 0);
     }
 }
