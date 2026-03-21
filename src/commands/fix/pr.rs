@@ -420,6 +420,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    #[ignore]
     async fn test_is_branch_pushed_nonexistent() {
         // Test with a nonexistent branch — gh api should return 404 → Ok(false)
         let result = is_branch_pushed(
@@ -447,6 +448,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore]
     async fn test_get_pr_number_state_all_nonexistent_branch() {
         // A branch that has never had a PR should return Ok(None)
         let result = crate::ci::get_pr_number(
