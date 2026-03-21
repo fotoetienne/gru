@@ -660,10 +660,8 @@ pub async fn invoke_ci_fix(
 ) -> Result<i32> {
     let prompt = build_ci_fix_prompt(failed_checks, attempt);
 
-    let mut cmd = backend.build_oneshot_command(worktree_path, &prompt);
-    cmd.stdin(Stdio::inherit());
-
-    let child = cmd
+    let child = backend
+        .build_oneshot_command(worktree_path, &prompt)
         .spawn()
         .with_context(|| format!("{} command not found or failed to start", backend.name()))?;
 
@@ -917,10 +915,12 @@ pub async fn monitor_and_fix_ci(
                     }
                 }
 
-                // Invoke Claude to fix
+                // Invoke agent to fix
                 eprintln!(
-                    "🔧 Invoking Claude to fix CI failures (attempt {}/{})...",
-                    attempt, MAX_CI_FIX_ATTEMPTS
+                    "🔧 Invoking {} to fix CI failures (attempt {}/{})...",
+                    backend.name(),
+                    attempt,
+                    MAX_CI_FIX_ATTEMPTS
                 );
                 let fix_result =
                     invoke_ci_fix(backend, worktree_path, &failed_checks, attempt).await;

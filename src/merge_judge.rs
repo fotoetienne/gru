@@ -445,8 +445,7 @@ async fn invoke_judge_cli(
     prompt: &str,
 ) -> Result<JudgeResponse> {
     let mut cmd = backend.build_oneshot_command(worktree_path, "-");
-    cmd.arg("--max-turns")
-        .arg("1")
+    cmd.stdin(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
 
     let mut child = cmd

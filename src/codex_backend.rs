@@ -460,6 +460,20 @@ mod tests {
             .is_none());
     }
 
+    #[test]
+    fn test_build_oneshot_command_produces_expected_args() {
+        let b = backend();
+        let path = std::path::PathBuf::from("/tmp/worktree");
+        let cmd = b.build_oneshot_command(&path, "fix the tests");
+        let inner = cmd.as_std();
+
+        assert_eq!(inner.get_program(), "codex");
+        let args: Vec<&std::ffi::OsStr> = inner.get_args().collect();
+        assert!(args.contains(&"exec".as_ref()));
+        assert!(args.contains(&"--full-auto".as_ref()));
+        assert!(args.contains(&"fix the tests".as_ref()));
+    }
+
     // ---- parse_event tests ----
 
     #[test]
