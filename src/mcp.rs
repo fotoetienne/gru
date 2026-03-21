@@ -11,6 +11,7 @@ use rmcp::{
     tool, tool_handler, tool_router, ErrorData as McpError, RoleServer, ServerHandler, ServiceExt,
 };
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use std::io::BufRead;
 
 use crate::minion_registry::{self, MinionInfo};
@@ -126,13 +127,12 @@ impl GruMcpServer {
         match result {
             Ok(summaries) => {
                 let json = serde_json::to_string_pretty(&summaries)
-                    .unwrap_or_else(|e| format!("{{\"error\": \"{}\"}}", e));
+                    .unwrap_or_else(|e| json!({"error": e.to_string()}).to_string());
                 Ok(CallToolResult::success(vec![Content::text(json)]))
             }
-            Err(e) => Ok(CallToolResult::success(vec![Content::text(format!(
-                "{{\"error\": \"Failed to load registry: {}\"}}",
-                e
-            ))])),
+            Err(e) => Ok(CallToolResult::success(vec![Content::text(
+                json!({"error": format!("Failed to load registry: {}", e)}).to_string(),
+            )])),
         }
     }
 
@@ -144,7 +144,8 @@ impl GruMcpServer {
         &self,
         Parameters(params): Parameters<LogsParams>,
     ) -> Result<CallToolResult, McpError> {
-        let lines = params.lines.unwrap_or(50);
+        const MAX_LOG_LINES: usize = 5_000;
+        let lines = params.lines.unwrap_or(50).min(MAX_LOG_LINES);
         let minion_id = params.minion_id.clone();
 
         // Look up the minion's worktree to find events.jsonl
@@ -158,10 +159,9 @@ impl GruMcpServer {
         let events_path = match events_path {
             Ok(p) => p,
             Err(e) => {
-                return Ok(CallToolResult::success(vec![Content::text(format!(
-                    "{{\"error\": \"{}\"}}",
-                    e
-                ))]));
+                return Ok(CallToolResult::success(vec![Content::text(
+                    json!({"error": e.to_string()}).to_string(),
+                )]));
             }
         };
 
@@ -172,15 +172,18 @@ impl GruMcpServer {
         .await;
 
         match result {
+            Ok(Ok(content)) if content.is_empty() => {
+                Ok(CallToolResult::success(vec![Content::text(
+                    "No events recorded yet",
+                )]))
+            }
             Ok(Ok(content)) => Ok(CallToolResult::success(vec![Content::text(content)])),
-            Ok(Err(e)) => Ok(CallToolResult::success(vec![Content::text(format!(
-                "{{\"error\": \"{}\"}}",
-                e
-            ))])),
-            Err(e) => Ok(CallToolResult::success(vec![Content::text(format!(
-                "{{\"error\": \"Task failed: {}\"}}",
-                e
-            ))])),
+            Ok(Err(e)) => Ok(CallToolResult::success(vec![Content::text(
+                json!({"error": e.to_string()}).to_string(),
+            )])),
+            Err(e) => Ok(CallToolResult::success(vec![Content::text(
+                json!({"error": format!("Task failed: {}", e)}).to_string(),
+            )])),
         }
     }
 }

@@ -65,11 +65,21 @@ pub async fn handle_mcp_install() -> Result<i32> {
         }),
     );
 
-    // Write back
+    // Write atomically: temp file + rename
     let content = serde_json::to_string_pretty(&config)?;
-    tokio::fs::write(&config_path, content)
+    let tmp_path = config_path.with_extension("json.tmp");
+    tokio::fs::write(&tmp_path, content)
         .await
-        .with_context(|| format!("Failed to write {}", config_path.display()))?;
+        .with_context(|| format!("Failed to write {}", tmp_path.display()))?;
+    tokio::fs::rename(&tmp_path, &config_path)
+        .await
+        .with_context(|| {
+            format!(
+                "Failed to rename {} to {}",
+                tmp_path.display(),
+                config_path.display()
+            )
+        })?;
 
     println!("Registered Gru MCP server in {}", config_path.display());
     println!("Restart Claude Code to activate.");
@@ -107,10 +117,21 @@ pub async fn handle_mcp_uninstall() -> Result<i32> {
         return Ok(0);
     }
 
+    // Write atomically: temp file + rename
     let content = serde_json::to_string_pretty(&config)?;
-    tokio::fs::write(&config_path, content)
+    let tmp_path = config_path.with_extension("json.tmp");
+    tokio::fs::write(&tmp_path, content)
         .await
-        .with_context(|| format!("Failed to write {}", config_path.display()))?;
+        .with_context(|| format!("Failed to write {}", tmp_path.display()))?;
+    tokio::fs::rename(&tmp_path, &config_path)
+        .await
+        .with_context(|| {
+            format!(
+                "Failed to rename {} to {}",
+                tmp_path.display(),
+                config_path.display()
+            )
+        })?;
 
     println!("Removed Gru MCP server from {}", config_path.display());
     println!("Restart Claude Code to apply.");
