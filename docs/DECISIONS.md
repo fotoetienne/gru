@@ -1465,37 +1465,39 @@ Repository setup:
 - If missing, suggests running `gru init` first
 - Auto-creates missing subdirectories if root exists
 
-## Self-Review Strategy: Prompt-Based over Structured Loop
+### Self-Review Strategy: Prompt-Based over Structured Loop
 
 **Question:** How should Minions self-review their work before opening a PR?
 
 **Answer:** **Prompt-based self-review (Option A)** — defer structured enforcement loop (Option B)
 
-**Context:** Issue #515 proposed three options for self-review:
+**Context:** Issue #515 proposed two main options for self-review:
 - **Option A (Prompt-based):** Add review instructions to the task prompt, relying on the code-reviewer agent
 - **Option B (Structured loop):** Add a dedicated review phase in the orchestration layer with DONE/ITERATE gating
-- **Option C (Model mixing):** Use different models for work vs review (future enhancement)
 
-**Data (from #655 investigation):**
-- 92% of Minion runs invoke the code-reviewer agent via prompt instructions
-- When consumed, 100% of reviews find actionable issues (63% high-priority)
+Issue #655 revisited #515 after observing real-world Minion behavior and found Option A already working well.
+
+**Data (from #655, estimated from manual audit of Minion runs):**
+- ~92% of Minion runs invoke the code-reviewer agent via prompt instructions
+- When consumed, reviews consistently find actionable issues (~63% high-priority)
 - Minions consistently address review findings when they read them
-- The 8% that skip review have legitimate reasons (duplicate issues, mechanical changes, post-review fixups)
+- The ~8% that skip review have legitimate reasons (duplicate issues, mechanical changes, post-review fixups)
 
-**Decision:** Option A is sufficient. The prompt-based approach in `src/prompt_loader.rs` (Section 4: Code Review) already achieves high review rates without orchestration complexity. The main gap was an async fire-and-forget problem where reviews were triggered but not consumed, which is a prompt fix (#648, #649), not an orchestration change.
+**Decision:** Option A is sufficient. The prompt-based approach in `src/prompt_loader.rs` (Section 4: Code Review) already achieves high review rates without orchestration complexity. The main gap was an async fire-and-forget problem where reviews were triggered but not consumed — a prompt-level fix, not an orchestration change. Role guardrails for the review prompt were addressed in #649.
 
 **Why not Option B:**
 - Adds orchestration complexity (DONE/ITERATE parsing, iteration caps, extra agent calls)
 - 2-3x token cost increase per Minion
-- Solves a problem that prompt engineering handles at 92%+ rate
+- Solves a problem that prompt engineering handles at ~92% rate
 - The remaining gap is addressable by improving prompt reliability, not adding a structured loop
+- Option B is additive and can be implemented incrementally if needed later
 
 **Revisit when:**
 - Prompt-based review rate drops below 80%
 - Review quality degrades (reviews stop finding actionable issues)
 - Multi-agent workflows require explicit review gating
 
-**See:** #515 (original proposal), #655 (data-driven update), #648/#649 (prompt fixes)
+**See:** #515 (original proposal), #655 (data-driven update), #649 (review role guardrails)
 
 ---
 
