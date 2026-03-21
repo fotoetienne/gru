@@ -557,14 +557,16 @@ pub async fn post_comment_via_cli(
 
 /// Edit labels on an issue using gh CLI (add and/or remove in a single call)
 ///
-/// Check whether a specific label is present on an issue.
-pub async fn has_label_via_cli(
+/// Check whether any of the given labels are present on an issue.
+///
+/// Returns the name of the first matching label, or `None` if none match.
+pub async fn has_any_label_via_cli(
     host: &str,
     owner: &str,
     repo: &str,
     number: u64,
-    label: &str,
-) -> Result<bool> {
+    labels: &[&str],
+) -> Result<Option<String>> {
     let repo_full = repo_slug(owner, repo);
     let number_str = number.to_string();
     let stdout = run_gh(
@@ -590,7 +592,11 @@ pub async fn has_label_via_cli(
     let info: LabelsOnly =
         serde_json::from_str(&stdout).context("Failed to parse gh issue view labels JSON")?;
 
-    Ok(info.labels.iter().any(|l| l.name == label))
+    Ok(info
+        .labels
+        .iter()
+        .find(|l| labels.contains(&l.name.as_str()))
+        .map(|l| l.name.clone()))
 }
 
 /// # Arguments
@@ -1387,7 +1393,7 @@ mod tests {
     }
 
     #[test]
-    fn test_has_label_parses_present_label() {
+    fn test_has_any_label_parses_present_label() {
         // Simulate the JSON returned by `gh issue view --json labels`
         #[derive(serde::Deserialize)]
         struct LabelsOnly {
@@ -1396,12 +1402,33 @@ mod tests {
         }
         let json = r#"{"labels":[{"name":"gru:done"},{"name":"bug"}]}"#;
         let info: LabelsOnly = serde_json::from_str(json).unwrap();
-        assert!(info.labels.iter().any(|l| l.name == "gru:done"));
-        assert!(!info.labels.iter().any(|l| l.name == "gru:todo"));
+        let targets = ["gru:done", "gru:failed"];
+        let found = info
+            .labels
+            .iter()
+            .find(|l| targets.contains(&l.name.as_str()));
+        assert_eq!(found.unwrap().name, "gru:done");
     }
 
     #[test]
-    fn test_has_label_parses_absent_label() {
+    fn test_has_any_label_finds_failed() {
+        #[derive(serde::Deserialize)]
+        struct LabelsOnly {
+            #[serde(default)]
+            labels: Vec<IssueLabel>,
+        }
+        let json = r#"{"labels":[{"name":"gru:failed"},{"name":"bug"}]}"#;
+        let info: LabelsOnly = serde_json::from_str(json).unwrap();
+        let targets = ["gru:done", "gru:failed"];
+        let found = info
+            .labels
+            .iter()
+            .find(|l| targets.contains(&l.name.as_str()));
+        assert_eq!(found.unwrap().name, "gru:failed");
+    }
+
+    #[test]
+    fn test_has_any_label_parses_absent_label() {
         #[derive(serde::Deserialize)]
         struct LabelsOnly {
             #[serde(default)]
@@ -1409,11 +1436,16 @@ mod tests {
         }
         let json = r#"{"labels":[{"name":"gru:in-progress"},{"name":"bug"}]}"#;
         let info: LabelsOnly = serde_json::from_str(json).unwrap();
-        assert!(!info.labels.iter().any(|l| l.name == "gru:done"));
+        let targets = ["gru:done", "gru:failed"];
+        let found = info
+            .labels
+            .iter()
+            .find(|l| targets.contains(&l.name.as_str()));
+        assert!(found.is_none());
     }
 
     #[test]
-    fn test_has_label_parses_empty_labels() {
+    fn test_has_any_label_parses_empty_labels() {
         #[derive(serde::Deserialize)]
         struct LabelsOnly {
             #[serde(default)]
@@ -1421,7 +1453,12 @@ mod tests {
         }
         let json = r#"{"labels":[]}"#;
         let info: LabelsOnly = serde_json::from_str(json).unwrap();
-        assert!(!info.labels.iter().any(|l| l.name == "gru:done"));
+        let targets = ["gru:done", "gru:failed"];
+        let found = info
+            .labels
+            .iter()
+            .find(|l| targets.contains(&l.name.as_str()));
+        assert!(found.is_none());
     }
 
     #[tokio::test]

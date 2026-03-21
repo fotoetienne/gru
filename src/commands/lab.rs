@@ -199,24 +199,24 @@ async fn reap_children(children: &mut Vec<SpawnedChild>) {
                     if let Some(meta) = &children[i].spawn_meta {
                         let elapsed = meta.spawned_at.elapsed();
                         if should_restore_label(meta.spawned_at) {
-                            // Check if the issue already has gru:done before
+                            // Check if the issue already has a terminal label before
                             // restoring gru:todo — the minion may have finished
-                            // successfully before the process exited.
-                            let already_done = github::has_label_via_cli(
+                            // (done or failed) before the process exited.
+                            let terminal_label = github::has_any_label_via_cli(
                                 &meta.host,
                                 &meta.owner,
                                 &meta.repo,
                                 meta.issue_number,
-                                labels::DONE,
+                                &[labels::DONE, labels::FAILED],
                             )
                             .await
-                            .unwrap_or(false);
+                            .unwrap_or(None);
 
-                            if already_done {
+                            if let Some(label) = terminal_label {
                                 log::info!(
                                     "⏭️  Issue #{} already has {} — skipping label restoration",
                                     meta.issue_number,
-                                    labels::DONE
+                                    label
                                 );
                             } else {
                                 log::warn!(
@@ -2098,12 +2098,11 @@ mod tests {
 
     /// Verifies that an issue with gru:done should not have gru:todo restored.
     /// This is the core logic behind the reap_children guard: if an issue already
-    /// has the done label, adding the ready label would cause spurious re-spawns.
+    /// has a terminal label, adding the ready label would cause spurious re-spawns.
     #[test]
     fn test_done_label_prevents_eligibility() {
         use crate::github::{check_issue_eligibility, IssueLabel};
 
-        // An issue with gru:done should never be eligible for a new minion
         let labels = vec![
             IssueLabel {
                 name: "gru:done".to_string(),
@@ -2117,17 +2116,30 @@ mod tests {
         assert!(reason.unwrap().contains("gru:done"));
     }
 
-    /// Verifies that an issue without gru:done IS eligible for label restoration,
-    /// confirming the normal early-exit path still works.
+    /// Verifies that gru:failed also prevents label restoration.
     #[test]
-    fn test_no_done_label_allows_restoration() {
+    fn test_failed_label_prevents_eligibility() {
+        use crate::github::{check_issue_eligibility, IssueLabel};
+
+        let labels = vec![IssueLabel {
+            name: "gru:failed".to_string(),
+        }];
+        let (eligible, reason) = check_issue_eligibility("OPEN", &labels);
+        assert!(!eligible, "Issue with gru:failed should not be eligible");
+        assert!(reason.unwrap().contains("gru:failed"));
+    }
+
+    /// Verifies that an issue without terminal labels IS eligible for
+    /// label restoration, confirming the normal early-exit path still works.
+    #[test]
+    fn test_no_terminal_label_allows_restoration() {
         use crate::github::{check_issue_eligibility, IssueLabel};
 
         let labels = vec![IssueLabel {
             name: "gru:todo".to_string(),
         }];
         let (eligible, _) = check_issue_eligibility("OPEN", &labels);
-        assert!(eligible, "Issue without gru:done should be eligible");
+        assert!(eligible, "Issue without terminal labels should be eligible");
     }
 
     /// Verifies that resumable minions can carry PR metadata,
