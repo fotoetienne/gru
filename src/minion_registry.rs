@@ -8,7 +8,9 @@ use std::path::{Path, PathBuf};
 
 use crate::agent::TokenUsage;
 use crate::file_lock::lock_with_timeout;
-use crate::github::{infer_github_host, is_pr_open_via_cli};
+use crate::github::{
+    infer_github_host, is_issue_closed_via_cli, is_pr_merged_via_cli, is_pr_open_via_cli,
+};
 use crate::workspace::Workspace;
 
 /// Async helper that loads the registry inside `spawn_blocking`, runs the
@@ -185,6 +187,127 @@ pub(crate) async fn prune_stale_entries() -> Result<usize> {
     Ok(count)
 }
 
+/// Auto-archive stopped minions whose PR is merged or issue is closed.
+///
+/// Uses the same three-phase approach as [`prune_stale_entries`] to minimize
+/// lock hold time:
+///
+/// 1. **Phase 1 (sync):** Collect stopped, non-archived minions as candidates.
+/// 2. **Phase 2 (async):** Check GitHub for PR merged / issue closed state.
+/// 3. **Phase 3 (sync):** Stamp `archived_at` on confirmed candidates.
+///
+/// Returns the number of entries archived.
+pub async fn auto_archive_completed_minions() -> Result<usize> {
+    // Phase 1: Collect candidates (sync, lock held briefly)
+    let candidates: Vec<(String, Option<String>, String, u64)> = with_registry(|registry| {
+        let minions = registry.list();
+        let candidates = minions
+            .iter()
+            .filter(|(_id, info)| info.mode == MinionMode::Stopped && info.archived_at.is_none())
+            .map(|(id, info)| (id.clone(), info.pr.clone(), info.repo.clone(), info.issue))
+            .collect();
+        Ok(candidates)
+    })
+    .await?;
+
+    if candidates.is_empty() {
+        return Ok(0);
+    }
+
+    // Phase 2: Check GitHub status (async, no lock)
+    let mut to_archive = Vec::new();
+    for (id, pr, repo, issue) in &candidates {
+        let parts: Vec<&str> = repo.splitn(2, '/').collect();
+        if parts.len() != 2 {
+            log::warn!(
+                "Minion {} has malformed repo '{}', skipping archive check",
+                id,
+                repo
+            );
+            continue;
+        }
+        let (owner, repo_name) = (parts[0], parts[1]);
+        let host = infer_github_host(owner);
+
+        let should_archive = match pr {
+            Some(pr_number_str) => {
+                // Minion has a PR: check if merged
+                let pr_number: u64 = match pr_number_str.parse() {
+                    Ok(n) => n,
+                    Err(_) => {
+                        log::warn!(
+                            "Minion {} has malformed PR number '{}', skipping",
+                            id,
+                            pr_number_str
+                        );
+                        continue;
+                    }
+                };
+                match is_pr_merged_via_cli(owner, repo_name, &host, pr_number).await {
+                    Ok(merged) => merged,
+                    Err(e) => {
+                        log::warn!(
+                            "Failed to check PR #{} merge status for Minion {}: {}",
+                            pr_number,
+                            id,
+                            e
+                        );
+                        false
+                    }
+                }
+            }
+            None => {
+                // No PR: check if issue is closed
+                match is_issue_closed_via_cli(owner, repo_name, &host, *issue).await {
+                    Ok(closed) => closed,
+                    Err(e) => {
+                        log::warn!(
+                            "Failed to check issue #{} status for Minion {}: {}",
+                            issue,
+                            id,
+                            e
+                        );
+                        false
+                    }
+                }
+            }
+        };
+
+        if should_archive {
+            to_archive.push(id.clone());
+        }
+    }
+
+    if to_archive.is_empty() {
+        return Ok(0);
+    }
+
+    // Phase 3: Stamp archived_at on confirmed entries (sync, lock held briefly)
+    let now = Utc::now();
+    let count = with_registry(move |registry| {
+        let mut archived = 0usize;
+        for id in &to_archive {
+            // Re-verify the minion is still stopped and not archived
+            if let Some(info) = registry.get(id) {
+                if info.mode == MinionMode::Stopped && info.archived_at.is_none() {
+                    registry.update(id, |info| {
+                        info.archived_at = Some(now);
+                    })?;
+                    archived += 1;
+                }
+            }
+        }
+        Ok(archived)
+    })
+    .await?;
+
+    if count > 0 {
+        log::info!("📦 Auto-archived {} completed Minion(s)", count);
+    }
+
+    Ok(count)
+}
+
 /// The execution mode of a Minion session
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
@@ -341,6 +464,10 @@ pub(crate) struct MinionInfo {
     /// would take effect for any non-MonitoringPr resume that happens to have wake_reason set.
     #[serde(default)]
     pub(crate) wake_reason: Option<String>,
+    /// Timestamp when this minion was auto-archived (PR merged or issue closed while stopped).
+    /// Archived minions are hidden from `gru status` by default; use `--all` to show them.
+    #[serde(default)]
+    pub(crate) archived_at: Option<DateTime<Utc>>,
 }
 
 /// Default agent name for backwards compatibility with existing registry entries
@@ -886,6 +1013,7 @@ mod tests {
             no_watch: false,
             last_review_check_time: None,
             wake_reason: None,
+            archived_at: None,
         }
     }
 

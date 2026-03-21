@@ -293,6 +293,9 @@ enum Commands {
 
         #[arg(short, long, help = "Show session ID, PID, and worktree path details")]
         verbose: bool,
+
+        #[arg(short, long, help = "Show all entries including archived")]
+        all: bool,
     },
     #[command(about = "Stop a running Minion")]
     Stop {
@@ -483,7 +486,7 @@ async fn main() {
             force,
             base_branch,
         } => clean::handle_clean(dry_run, force, &base_branch).await,
-        Commands::Status { id, verbose } => status::handle_status(id, verbose).await,
+        Commands::Status { id, verbose, all } => status::handle_status(id, verbose, all).await,
         Commands::Stop { id, force } => stop::handle_stop(id, force).await,
         Commands::Prompt {
             prompt,

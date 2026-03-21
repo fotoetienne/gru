@@ -1891,6 +1891,7 @@ mod tests {
             no_watch: false,
             last_review_check_time: None,
             wake_reason: None,
+            archived_at: None,
         }
     }
 
@@ -2039,6 +2040,7 @@ mod tests {
                 no_watch: false,
                 last_review_check_time: None,
                 wake_reason: None,
+                archived_at: None,
             },
         }
     }
