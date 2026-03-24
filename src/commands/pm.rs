@@ -25,9 +25,9 @@ pub async fn handle_tpm(verbose: bool) -> Result<i32> {
 ///
 /// Requires being inside a git repo — returns an error otherwise.
 async fn launch_skill_session(role_name: &str, skill_content: &str, verbose: bool) -> Result<i32> {
-    let repo_root = git::detect_git_repo()
-        .await
-        .context("Not inside a git repository. Run this command from within a project.")?;
+    let repo_root = git::detect_git_repo().await.map_err(|_| {
+        anyhow::anyhow!("Not inside a git repository. Run `gru {role_name}` from within a project.")
+    })?;
 
     if verbose {
         eprintln!("Working directory: {}", repo_root.display());
