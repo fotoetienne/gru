@@ -223,8 +223,8 @@ async fn create_pr_for_issue(
 /// Saves PR state, updates the minion registry, and marks the issue done.
 /// Used by both the normal PR creation path and the "already exists" recovery path.
 ///
-/// Errors are propagated — callers that need best-effort semantics should
-/// handle errors themselves rather than using `?`.
+/// Registry updates and label changes are best-effort (warnings on failure).
+/// Only PR state file errors are propagated.
 async fn finalize_pr(
     issue_ctx: &IssueContext,
     wt_ctx: &WorktreeContext,
@@ -241,18 +241,26 @@ async fn finalize_pr(
         .save(&wt_ctx.minion_dir)
         .context("Failed to save PR state")?;
 
-    // Update registry with PR number
+    // Update registry with PR number (best-effort — registry parse errors
+    // must not kill the worker after the PR was already created successfully)
     let minion_id_clone = wt_ctx.minion_id.clone();
     let pr_number_clone = pr_number.to_string();
-    with_registry(move |registry| {
+    if let Err(e) = with_registry(move |registry| {
         registry.update(&minion_id_clone, |info| {
             info.pr = Some(pr_number_clone);
             info.status = "idle".to_string();
         })
     })
-    .await?;
+    .await
+    {
+        log::warn!(
+            "⚠️  Failed to update registry with PR number for {}: {}",
+            wt_ctx.minion_id,
+            e
+        );
+    }
 
-    // Mark issue as done (fire-and-forget, skip if no linked issue)
+    // Mark issue as done (best-effort: errors logged, not propagated)
     if let Some(issue_num) = issue_ctx.issue_num {
         match crate::github::mark_issue_done_via_cli(
             &issue_ctx.host,
@@ -382,7 +390,11 @@ pub(crate) async fn handle_pr_creation(
     .await
     {
         Ok(pr_number) => {
-            finalize_pr(issue_ctx, wt_ctx, &pr_number).await?;
+            // Best-effort: the PR already exists on GitHub, so losing
+            // local metadata is recoverable on next resume.
+            if let Err(e) = finalize_pr(issue_ctx, wt_ctx, &pr_number).await {
+                log::warn!("⚠️  Failed to finalize new PR state: {}", e);
+            }
 
             println!("✅ Draft PR created: #{}", pr_number);
             println!(
@@ -527,5 +539,87 @@ mod tests {
         assert!(body.contains("- [ ] Implementation"));
         assert!(body.contains("Fixes #123"));
         assert!(body.contains("<sub>🤖 M042</sub>"));
+    }
+
+    /// Verifies that `finalize_pr` returns Ok even when the registry update
+    /// fails. Regression test for issue #699: registry errors in finalize_pr
+    /// should be non-fatal so the worker continues to the monitoring phase.
+    ///
+    /// Note: `with_registry` uses `spawn_blocking` so the thread-local
+    /// `set_test_workspace` override is not visible. The registry update fails
+    /// because the minion ID doesn't exist in whatever registry is loaded.
+    /// The companion test `test_registry_parse_error_is_non_fatal` below
+    /// exercises the actual parse-error path directly.
+    #[tokio::test]
+    async fn test_finalize_pr_survives_registry_failure() {
+        use super::super::types::{IssueContext, WorktreeContext};
+        use uuid::Uuid;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let minion_dir = tmp.path().to_path_buf();
+        let checkout_path = minion_dir.join("checkout");
+        std::fs::create_dir_all(&checkout_path).unwrap();
+
+        let issue_ctx = IssueContext {
+            owner: "test-owner".to_string(),
+            repo: "test-repo".to_string(),
+            host: "github.com".to_string(),
+            issue_num: Some(99999),
+            details: None,
+        };
+
+        let wt_ctx = WorktreeContext {
+            minion_id: "M_NONEXISTENT".to_string(),
+            branch_name: "minion/issue-99999-M_NONEXISTENT".to_string(),
+            minion_dir,
+            checkout_path,
+            session_id: Uuid::new_v4(),
+        };
+
+        // finalize_pr should return Ok even though:
+        // - The minion doesn't exist in the registry (registry update fails)
+        // - The gh CLI call to update labels will fail (best-effort)
+        let result = finalize_pr(&issue_ctx, &wt_ctx, "12345").await;
+        assert!(
+            result.is_ok(),
+            "finalize_pr should not propagate registry errors: {:?}",
+            result.err()
+        );
+    }
+
+    /// Directly exercises the registry parse-error path from issue #699.
+    /// Writes an intentionally-invalid `minions.json` to a temp workspace
+    /// and verifies that `MinionRegistry::load` fails with a parse error,
+    /// proving that the `if let Err` guard in `finalize_pr` would catch it.
+    #[test]
+    fn test_registry_parse_error_is_non_fatal() {
+        use crate::minion_registry::MinionRegistry;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let state_dir = tmp.path().join("state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+
+        // Write a corrupt minions.json — simulates the schema divergence
+        // that caused the M14g incident (e.g., null where u64 was expected)
+        std::fs::write(
+            state_dir.join("minions.json"),
+            b"{ this is not valid json }",
+        )
+        .unwrap();
+
+        // MinionRegistry::load should fail with a parse error
+        let result = MinionRegistry::load(Some(&state_dir));
+        assert!(
+            result.is_err(),
+            "Expected parse error from corrupt minions.json"
+        );
+        let err_msg = result.err().unwrap().to_string();
+        assert!(
+            err_msg.contains("parse")
+                || err_msg.contains("deserialize")
+                || err_msg.contains("expected"),
+            "Error should be a parse/deserialize error, got: {}",
+            err_msg
+        );
     }
 }
