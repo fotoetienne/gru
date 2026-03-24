@@ -564,7 +564,7 @@ mod tests {
             owner: "test-owner".to_string(),
             repo: "test-repo".to_string(),
             host: "github.com".to_string(),
-            issue_num: 99999,
+            issue_num: Some(99999),
             details: None,
         };
 
