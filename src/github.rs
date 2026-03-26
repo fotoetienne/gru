@@ -1,4 +1,5 @@
 use anyhow::{anyhow, Context, Result};
+use serde::Deserialize;
 use std::process::Output;
 use tokio::process::Command;
 use tokio::time::{sleep, Duration};
@@ -106,7 +107,10 @@ pub(crate) async fn run_gh(host: &str, args: &[&str]) -> Result<String> {
 }
 
 /// Check if an error message indicates a transient failure that should be retried.
-/// Transient failures include network issues, rate limiting, and temporary server errors.
+///
+/// Transient failures include network issues and temporary server errors.
+/// Rate limit errors are **excluded** — they are handled separately via
+/// [`is_rate_limit_error`] and [`sleep_until_rate_limit_reset`].
 pub(crate) fn is_retryable_error(stderr: &str) -> bool {
     // All patterns must be lowercase for case-insensitive matching
     let retryable_patterns = [
@@ -114,7 +118,6 @@ pub(crate) fn is_retryable_error(stderr: &str) -> bool {
         "502",
         "503",
         "504",
-        "429",
         // Network errors
         "timeout",
         "timed out",
@@ -128,10 +131,6 @@ pub(crate) fn is_retryable_error(stderr: &str) -> bool {
         // DNS errors
         "resolve host",
         "name resolution",
-        // Rate limiting
-        "rate limit",
-        "rate-limit",
-        "too many requests",
         // Server errors
         "internal server error",
         "service unavailable",
@@ -143,6 +142,12 @@ pub(crate) fn is_retryable_error(stderr: &str) -> bool {
     ];
 
     let lower_stderr = stderr.to_lowercase();
+
+    // Exclude rate limit errors — they get separate handling
+    if is_rate_limit_error(&lower_stderr) {
+        return false;
+    }
+
     retryable_patterns
         .iter()
         .any(|pattern| lower_stderr.contains(pattern))
@@ -158,7 +163,10 @@ fn calculate_retry_delay(attempt: u32) -> u64 {
 
 /// Execute a gh API command with retry logic and exponential backoff.
 ///
-/// Retries on transient errors (network issues, rate limits, 5xx) up to `max_retries` times.
+/// Rate limit errors are handled separately: instead of exponential backoff,
+/// the function sleeps until the GitHub rate limit reset window and retries once.
+/// Transient errors use exponential backoff up to `max_retries` times.
+///
 /// Returns the raw [`Output`] regardless of exit status — both successful
 /// responses and non-retryable failures are returned as `Ok(Output)`.
 /// Callers **must** check `output.status.success()` to distinguish the two.
@@ -166,13 +174,14 @@ fn calculate_retry_delay(attempt: u32) -> u64 {
 /// # Arguments
 /// * `host` - GitHub hostname (e.g., "github.com" or "ghe.example.com")
 /// * `args` - The arguments to pass to the gh command
-/// * `max_retries` - Maximum number of retry attempts
+/// * `max_retries` - Maximum number of retry attempts for transient errors
 pub(crate) async fn gh_api_with_retry(
     host: &str,
     args: &[&str],
     max_retries: u32,
 ) -> Result<Output> {
     let mut attempts = 0;
+    let mut rate_limit_retried = false;
     let args_str = args.join(" ");
 
     loop {
@@ -183,10 +192,9 @@ pub(crate) async fn gh_api_with_retry(
             .with_context(|| format!("Failed to execute: gh {}", args_str))?;
 
         if output.status.success() {
-            if attempts > 0 {
+            if attempts > 0 || rate_limit_retried {
                 log::info!(
-                    "GitHub API call succeeded after {} retries: gh {}",
-                    attempts,
+                    "GitHub API call succeeded after retries: gh {}",
                     args_str
                 );
             }
@@ -195,7 +203,17 @@ pub(crate) async fn gh_api_with_retry(
 
         let stderr = String::from_utf8_lossy(&output.stderr);
 
-        // Check if this is a retryable error
+        // Rate limit errors: sleep until reset, retry once
+        if is_rate_limit_error(&stderr) {
+            if rate_limit_retried {
+                return Ok(output);
+            }
+            rate_limit_retried = true;
+            sleep_until_rate_limit_reset(host).await;
+            continue;
+        }
+
+        // Transient errors: exponential backoff
         if attempts < max_retries && is_retryable_error(&stderr) {
             attempts += 1;
             let delay_secs = calculate_retry_delay(attempts);
@@ -230,6 +248,106 @@ pub(crate) async fn get_default_branch(host: &str, owner: &str, repo: &str) -> R
         );
     }
     Ok(branch)
+}
+
+// ============================================================================
+// Rate Limit Handling
+// ============================================================================
+
+/// Default fallback sleep duration (seconds) when the rate limit reset time
+/// cannot be determined (e.g., `gh api rate_limit` itself is rate-limited).
+const RATE_LIMIT_FALLBACK_SLEEP_SECS: u64 = 60;
+
+/// Small jitter added after the reset timestamp to avoid thundering herd.
+const RATE_LIMIT_JITTER_SECS: u64 = 5;
+
+/// Check if a `gh` CLI error indicates a GitHub rate limit (as opposed to a
+/// transient server error).  Rate limit errors are never worth retrying with
+/// exponential backoff — the caller should sleep until the reset window.
+pub(crate) fn is_rate_limit_error(stderr: &str) -> bool {
+    let lower = stderr.to_lowercase();
+    lower.contains("rate limit")
+        || lower.contains("rate-limit")
+        || lower.contains("too many requests")
+}
+
+#[derive(Debug, Deserialize)]
+struct RateLimitRate {
+    reset: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct RateLimitResponse {
+    rate: RateLimitRate,
+}
+
+/// Query the GitHub rate limit API and return the core-rate reset epoch.
+///
+/// Returns `None` if the API call fails (chicken-and-egg: we may already be
+/// rate-limited) or the response cannot be parsed.
+pub(crate) async fn get_rate_limit_reset(host: &str) -> Option<u64> {
+    let output = gh_cli_command(host)
+        .args(["api", "rate_limit"])
+        .output()
+        .await
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let body = String::from_utf8_lossy(&output.stdout);
+    let parsed: RateLimitResponse = serde_json::from_str(&body).ok()?;
+    Some(parsed.rate.reset)
+}
+
+/// Handle a rate limit error by sleeping until the reset window.
+///
+/// 1. Queries `gh api rate_limit` for the reset epoch.
+/// 2. If available, sleeps until `reset + jitter`.
+/// 3. If the rate limit API itself fails, falls back to a fixed 60 s sleep.
+///
+/// Returns the duration slept (useful for logging by callers).
+pub(crate) async fn sleep_until_rate_limit_reset(host: &str) -> std::time::Duration {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    if let Some(reset_epoch) = get_rate_limit_reset(host).await {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        if reset_epoch > now {
+            let sleep_secs = reset_epoch - now + RATE_LIMIT_JITTER_SECS;
+            let reset_time = chrono::DateTime::from_timestamp(reset_epoch as i64, 0)
+                .map(|dt| {
+                    dt.with_timezone(&chrono::Local)
+                        .format("%l:%M %p")
+                        .to_string()
+                })
+                .unwrap_or_else(|| "unknown".to_string());
+            let dur_min = sleep_secs / 60;
+            let dur_sec = sleep_secs % 60;
+            log::warn!(
+                "Rate limited. Pausing until {} ({}m {}s)",
+                reset_time.trim(),
+                dur_min,
+                dur_sec,
+            );
+            let duration = std::time::Duration::from_secs(sleep_secs);
+            tokio::time::sleep(duration).await;
+            return duration;
+        }
+    }
+
+    // Fallback: rate_limit API failed or reset is in the past
+    log::warn!(
+        "Rate limited (could not determine reset time). Sleeping {}s as fallback.",
+        RATE_LIMIT_FALLBACK_SLEEP_SECS,
+    );
+    let duration = std::time::Duration::from_secs(RATE_LIMIT_FALLBACK_SLEEP_SECS);
+    tokio::time::sleep(duration).await;
+    duration
 }
 
 /// Build a full GitHub issue URL for a repo in "owner/repo" format, with an explicit host.
@@ -1729,6 +1847,68 @@ mod tests {
         assert!(found.is_none());
     }
 
+    // --- is_rate_limit_error tests ---
+
+    #[test]
+    fn test_is_rate_limit_error_matches() {
+        assert!(is_rate_limit_error("API rate limit exceeded"));
+        assert!(is_rate_limit_error("rate limit exceeded for user"));
+        assert!(is_rate_limit_error("secondary rate-limit hit"));
+        assert!(is_rate_limit_error("HTTP 429 Too Many Requests"));
+        assert!(is_rate_limit_error("too many requests"));
+    }
+
+    #[test]
+    fn test_is_rate_limit_error_case_insensitive() {
+        assert!(is_rate_limit_error("RATE LIMIT exceeded"));
+        assert!(is_rate_limit_error("Rate Limit"));
+        assert!(is_rate_limit_error("TOO MANY REQUESTS"));
+    }
+
+    #[test]
+    fn test_is_rate_limit_error_non_matching() {
+        assert!(!is_rate_limit_error("HTTP 502 Bad Gateway"));
+        assert!(!is_rate_limit_error("connection timed out"));
+        assert!(!is_rate_limit_error("not found"));
+        assert!(!is_rate_limit_error("unauthorized"));
+        assert!(!is_rate_limit_error(""));
+    }
+
+    // --- is_retryable_error excludes rate limits ---
+
+    #[test]
+    fn test_is_retryable_error_excludes_rate_limits() {
+        assert!(!is_retryable_error("rate limit exceeded"));
+        assert!(!is_retryable_error("rate-limit"));
+        assert!(!is_retryable_error("too many requests"));
+        assert!(!is_retryable_error("HTTP 429 Too Many Requests"));
+    }
+
+    #[test]
+    fn test_is_retryable_error_matches_transient() {
+        assert!(is_retryable_error("HTTP 502 Bad Gateway"));
+        assert!(is_retryable_error("503 Service Unavailable"));
+        assert!(is_retryable_error("connection timed out"));
+        assert!(is_retryable_error("temporary failure"));
+    }
+
+    #[test]
+    fn test_is_retryable_error_non_retryable() {
+        assert!(!is_retryable_error("not found"));
+        assert!(!is_retryable_error("unauthorized"));
+        assert!(!is_retryable_error("HTTP 404"));
+        assert!(!is_retryable_error(""));
+    }
+
+    // --- RateLimitResponse deserialization test ---
+
+    #[test]
+    fn test_rate_limit_response_deserialize() {
+        let json = r#"{"rate": {"limit": 5000, "remaining": 0, "reset": 1700000000}}"#;
+        let parsed: RateLimitResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.rate.reset, 1700000000);
+    }
+
     #[tokio::test]
     #[ignore]
     async fn test_create_label_via_cli() {
@@ -1756,7 +1936,8 @@ mod tests {
         assert!(is_retryable_error("HTTP 502 Bad Gateway"));
         assert!(is_retryable_error("error: 503 Service Unavailable"));
         assert!(is_retryable_error("status: 504 Gateway Timeout"));
-        assert!(is_retryable_error("HTTP 429 Too Many Requests"));
+        // 429 is a rate limit error, handled separately
+        assert!(!is_retryable_error("HTTP 429 Too Many Requests"));
     }
 
     #[test]
@@ -1788,8 +1969,9 @@ mod tests {
     fn test_is_retryable_error_generic_transient() {
         assert!(is_retryable_error("temporary failure"));
         assert!(is_retryable_error("please try again later"));
-        assert!(is_retryable_error("rate limit exceeded"));
-        assert!(is_retryable_error("rate-limit"));
+        // Rate limit errors are handled separately, not retryable via backoff
+        assert!(!is_retryable_error("rate limit exceeded"));
+        assert!(!is_retryable_error("rate-limit"));
     }
 
     #[test]
@@ -1810,8 +1992,6 @@ mod tests {
     fn test_is_retryable_error_case_insensitive() {
         assert!(is_retryable_error("TIMEOUT"));
         assert!(is_retryable_error("Timeout"));
-        assert!(is_retryable_error("RATE LIMIT"));
-        assert!(is_retryable_error("Rate Limit"));
         assert!(is_retryable_error("SERVICE UNAVAILABLE"));
     }
 
