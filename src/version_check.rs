@@ -1,11 +1,15 @@
 use crate::github::gh_cli_command;
 use tokio::sync::oneshot;
+use tokio::time::{timeout, Duration};
 
-/// The repository to check for new releases.
+/// The repository to check for new releases (must match github.com host below).
 const RELEASE_REPO: &str = "fotoetienne/gru";
 
 /// Current version from Cargo.toml.
 const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Maximum time to wait for the GitHub API before giving up.
+const CHECK_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Spawns a non-blocking version check that runs in the background.
 /// Returns a receiver that will eventually contain the upgrade message (if any).
@@ -25,45 +29,46 @@ pub fn spawn_version_check() -> oneshot::Receiver<Option<String>> {
 /// Silently does nothing if the check failed or no update is available.
 pub async fn print_if_newer(rx: oneshot::Receiver<Option<String>>) {
     if let Ok(Some(msg)) = rx.await {
-        eprintln!("{}", msg);
+        println!("{}", msg);
     }
 }
 
 /// Checks GitHub releases for a newer version.
 /// Returns `Some(message)` if an upgrade is available, `None` otherwise.
-/// Returns `None` on any error (offline, API failure, parse failure).
+/// Returns `None` on any error (offline, API failure, parse failure, timeout).
 async fn check_latest_version() -> Option<String> {
-    let output = gh_cli_command("github.com")
-        .args([
-            "release",
-            "list",
-            "--repo",
-            RELEASE_REPO,
-            "--limit",
-            "1",
-            "--json",
-            "tagName,isLatest",
-        ])
-        .output()
-        .await
-        .ok()?;
+    let output = timeout(
+        CHECK_TIMEOUT,
+        gh_cli_command("github.com")
+            .args([
+                "release",
+                "view",
+                "--repo",
+                RELEASE_REPO,
+                "--json",
+                "tagName",
+            ])
+            .output(),
+    )
+    .await
+    .ok()?
+    .ok()?;
 
     if !output.status.success() {
         return None;
     }
 
     let stdout = String::from_utf8(output.stdout).ok()?;
-    let releases: Vec<ReleaseInfo> = serde_json::from_str(&stdout).ok()?;
-    let latest = releases.first()?;
+    let release: ReleaseInfo = serde_json::from_str(&stdout).ok()?;
 
-    let latest_version = latest
+    let latest_version = release
         .tag_name
         .strip_prefix('v')
-        .unwrap_or(&latest.tag_name);
+        .unwrap_or(&release.tag_name);
 
     if is_newer(latest_version, CURRENT_VERSION) {
         Some(format!(
-            "gru v{} available (current: v{}) — run \"gru upgrade\" to update",
+            "gru v{} available (current: v{}) — see GitHub releases to update",
             latest_version, CURRENT_VERSION
         ))
     } else {
@@ -71,7 +76,7 @@ async fn check_latest_version() -> Option<String> {
     }
 }
 
-/// Minimal release info from `gh release list --json`.
+/// Minimal release info from `gh release view --json`.
 #[derive(serde::Deserialize)]
 struct ReleaseInfo {
     #[serde(rename = "tagName")]
@@ -80,9 +85,12 @@ struct ReleaseInfo {
 
 /// Compares two semver-like version strings (major.minor.patch).
 /// Returns true if `latest` is strictly newer than `current`.
+/// Strips pre-release suffixes (e.g., `1.0.0-rc.1` → `1.0.0`) before comparing.
 /// Falls back to false on parse errors.
 fn is_newer(latest: &str, current: &str) -> bool {
     let parse = |v: &str| -> Option<(u64, u64, u64)> {
+        // Strip pre-release suffix (e.g., "1.0.0-rc.1" → "1.0.0")
+        let v = v.split('-').next().unwrap_or(v);
         let parts: Vec<&str> = v.split('.').collect();
         if parts.len() != 3 {
             return None;
@@ -138,5 +146,25 @@ mod tests {
     #[test]
     fn test_is_newer_two_part_version() {
         assert!(!is_newer("0.1", "0.1.0"));
+    }
+
+    #[test]
+    fn test_is_newer_prerelease_stripped() {
+        assert!(is_newer("0.2.0-rc.1", "0.1.0"));
+    }
+
+    #[test]
+    fn test_is_newer_same_base_with_prerelease() {
+        // 0.1.0-rc.1 is not newer than 0.1.0 (same base version)
+        assert!(!is_newer("0.1.0-rc.1", "0.1.0"));
+    }
+
+    #[test]
+    fn test_is_newer_current_is_prerelease() {
+        // Stable 0.2.0 is newer than pre-release 0.2.0-beta.1 (same base, but
+        // the stable release existing means an upgrade is available)
+        assert!(!is_newer("0.2.0", "0.2.0-beta.1"));
+        // But a higher stable version is newer
+        assert!(is_newer("0.3.0", "0.2.0-beta.1"));
     }
 }

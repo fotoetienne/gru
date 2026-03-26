@@ -287,6 +287,10 @@ pub(crate) async fn handle_status(
     .await
     .context("Failed to complete status checks for minions")?;
 
+    // Print version notification if a newer release is available.
+    // Done here (before early returns) so the notification is always shown.
+    crate::version_check::print_if_newer(version_rx).await;
+
     // Filter by ID if provided
     if let Some(filter_id) = id {
         // Try as issue/PR number first (most common case)
@@ -431,9 +435,6 @@ pub(crate) async fn handle_status(
             footer_parts.join(", ")
         );
     }
-
-    // Print version notification if a newer release is available
-    crate::version_check::print_if_newer(version_rx).await;
 
     Ok(0)
 }
