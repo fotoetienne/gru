@@ -497,7 +497,7 @@ fn load_prompts_internal(
                     prompts.insert(name, prompt);
                 }
                 Err(e) => {
-                    log::warn!("Warning: Failed to load global prompt '{}': {}", name, e);
+                    log::warn!("Warning: Failed to load global prompt '{}': {:#}", name, e);
                 }
             }
         }
@@ -522,7 +522,7 @@ fn load_prompts_internal(
                     prompts.insert(name, prompt);
                 }
                 Err(e) => {
-                    log::warn!("Warning: Failed to load repo prompt '{}': {}", name, e);
+                    log::warn!("Warning: Failed to load repo prompt '{}': {:#}", name, e);
                 }
             }
         }
@@ -663,7 +663,7 @@ pub(crate) fn list_prompts_by_source_internal(
         for (name, path) in sorted_files {
             match load_prompt_file(&path, &name, PromptSource::Repo(path.clone())) {
                 Ok(prompt) => repo_prompts.push(prompt),
-                Err(e) => log::warn!("Warning: Failed to load repo prompt '{}': {}", name, e),
+                Err(e) => log::warn!("Warning: Failed to load repo prompt '{}': {:#}", name, e),
             }
         }
     }
@@ -680,7 +680,7 @@ pub(crate) fn list_prompts_by_source_internal(
         for (name, path) in sorted_files {
             match load_prompt_file(&path, &name, PromptSource::Global(path.clone())) {
                 Ok(prompt) => global_prompts.push(prompt),
-                Err(e) => log::warn!("Warning: Failed to load global prompt '{}': {}", name, e),
+                Err(e) => log::warn!("Warning: Failed to load global prompt '{}': {:#}", name, e),
             }
         }
     }

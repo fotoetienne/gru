@@ -461,7 +461,7 @@ async fn scan_worktrees(
             // Git status says "active" but the minion process is stopped.
             // Before marking as cleanable, check if there's an open PR under review.
             let has_open_pr = wt.check_has_open_pr().await.unwrap_or_else(|e| {
-                log::warn!("Failed to check for open PRs: {}", e);
+                log::warn!("Failed to check for open PRs: {:#}", e);
                 // Conservative default: assume an open PR exists so we don't
                 // accidentally clean a worktree under review.
                 true
@@ -698,7 +698,7 @@ async fn remove_worktrees(
             Ok(result) => result,
             Err(e) => {
                 println!("✗");
-                log::error!("  Error checking worktree status: {}", e);
+                log::error!("  Error checking worktree status: {:#}", e);
                 failed += 1;
                 continue;
             }
@@ -911,7 +911,7 @@ async fn remove_worktrees(
         })
         .await
         {
-            log::warn!("Warning: Failed to update registry after cleanup: {}", e);
+            log::warn!("Warning: Failed to update registry after cleanup: {:#}", e);
         }
     }
 

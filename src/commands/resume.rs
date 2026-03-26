@@ -423,7 +423,7 @@ async fn discover_pr_by_branch(
         }
         Ok(None) => None,
         Err(e) => {
-            log::warn!("Failed to discover PR by branch: {}", e);
+            log::warn!("Failed to discover PR by branch: {:#}", e);
             None
         }
     }

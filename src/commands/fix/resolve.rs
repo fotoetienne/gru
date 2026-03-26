@@ -143,7 +143,7 @@ pub(super) async fn claim_issue(host: &str, owner: &str, repo: &str, issue_num: 
             }
         }
         Err(e) => {
-            log::warn!("⚠️  Failed to check issue labels: {}", e);
+            log::warn!("⚠️  Failed to check issue labels: {:#}", e);
             log::warn!("   Proceeding with claim attempt anyway...");
         }
     }
@@ -159,7 +159,7 @@ pub(super) async fn claim_issue(host: &str, owner: &str, repo: &str, issue_num: 
             );
         }
         Err(e) => {
-            log::warn!("⚠️  Failed to add label to issue: {}", e);
+            log::warn!("⚠️  Failed to add label to issue: {:#}", e);
             log::warn!("   Continuing anyway...");
         }
     }

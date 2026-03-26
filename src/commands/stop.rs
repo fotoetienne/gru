@@ -113,7 +113,7 @@ pub(crate) async fn handle_stop(id: String, force: bool) -> Result<i32> {
             println!("📝 Updated registry: status = stopped");
         }
         Err(e) => {
-            log::warn!("⚠️  Could not update registry: {}", e);
+            log::warn!("⚠️  Could not update registry: {:#}", e);
         }
     }
 

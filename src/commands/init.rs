@@ -199,7 +199,7 @@ pub(crate) async fn handle_init(repo_arg: String, host_override: Option<String>)
             println!("  • Config exists: {}", config_path.display());
         }
         Err(e) => {
-            log::warn!("  ⚠️  Could not create config file: {}", e);
+            log::warn!("  ⚠️  Could not create config file: {:#}", e);
         }
     }
 
@@ -271,7 +271,7 @@ pub(crate) async fn handle_init(repo_arg: String, host_override: Option<String>)
             }
             Err(e) => {
                 labels_failed.push(name.to_string());
-                log::error!("  ✗ Failed to create {}: {}", name, e);
+                log::error!("  ✗ Failed to create {}: {:#}", name, e);
             }
         }
     }
@@ -298,7 +298,7 @@ pub(crate) async fn handle_init(repo_arg: String, host_override: Option<String>)
             }
         }
         Err(e) => {
-            log::warn!("  ⚠️  Could not check for issues: {}", e);
+            log::warn!("  ⚠️  Could not check for issues: {:#}", e);
         }
     }
 
