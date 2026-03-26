@@ -102,15 +102,15 @@ impl RetryQueue {
         }
 
         let delay = backoff_delay(attempt, self.max_backoff_secs);
-        let key = entry_key(owner, repo, issue_number);
+        let key = entry_key(host, owner, repo, issue_number);
 
         log::info!(
-            "🔄 Enqueuing failure retry #{} for {}/{}#{} (backoff {:.0}s): {}",
+            "🔄 Enqueuing failure retry #{} for {}/{}#{} (backoff {}s): {}",
             attempt,
             owner,
             repo,
             issue_number,
-            delay.as_secs_f64(),
+            delay.as_secs(),
             reason
         );
 
@@ -151,7 +151,7 @@ impl RetryQueue {
         workspace_path: PathBuf,
         reason: &str,
     ) {
-        let key = entry_key(owner, repo, issue_number);
+        let key = entry_key(host, owner, repo, issue_number);
 
         log::info!(
             "🔄 Enqueuing continuation retry for {}/{}#{}: {}",
@@ -209,14 +209,14 @@ impl RetryQueue {
     ///
     /// Preserves the original `due_at` so the backoff timer isn't reset.
     pub fn reinsert(&mut self, entry: RetryEntry) {
-        let key = entry_key(&entry.owner, &entry.repo, entry.issue_number);
+        let key = entry_key(&entry.host, &entry.owner, &entry.repo, entry.issue_number);
         self.entries.insert(key, entry);
     }
 
     /// Cancel a retry for a specific issue (e.g., issue was closed or re-dispatched).
     #[allow(dead_code)] // Used in tests; will be called from lab when issues are re-dispatched
-    pub fn cancel(&mut self, owner: &str, repo: &str, issue_number: u64) {
-        let key = entry_key(owner, repo, issue_number);
+    pub fn cancel(&mut self, host: &str, owner: &str, repo: &str, issue_number: u64) {
+        let key = entry_key(host, owner, repo, issue_number);
         if self.entries.remove(&key).is_some() {
             log::info!("🚫 Cancelled retry for {}/{}#{}", owner, repo, issue_number);
         }
@@ -224,8 +224,8 @@ impl RetryQueue {
 
     /// Check if an issue has a pending retry.
     #[allow(dead_code)] // Used in tests; useful for callers to check before enqueuing
-    pub fn has_pending(&self, owner: &str, repo: &str, issue_number: u64) -> bool {
-        let key = entry_key(owner, repo, issue_number);
+    pub fn has_pending(&self, host: &str, owner: &str, repo: &str, issue_number: u64) -> bool {
+        let key = entry_key(host, owner, repo, issue_number);
         self.entries.contains_key(&key)
     }
 
@@ -249,17 +249,24 @@ impl RetryQueue {
 }
 
 /// Compute the key for deduplication.
-fn entry_key(owner: &str, repo: &str, issue_number: u64) -> String {
-    format!("{}/{}#{}", owner, repo, issue_number)
+///
+/// Includes `host` to avoid collisions when the same `owner/repo#issue`
+/// exists on different GitHub hosts (e.g., github.com vs GHE).
+fn entry_key(host: &str, owner: &str, repo: &str, issue_number: u64) -> String {
+    format!("{}:{}/{}#{}", host, owner, repo, issue_number)
 }
 
 /// Compute exponential backoff delay: `min(10s × 2^(attempt-1), max_backoff)`.
+///
+/// Uses integer arithmetic to avoid floating-point precision artifacts.
 fn backoff_delay(attempt: u32, max_backoff_secs: u64) -> Duration {
-    let base = DEFAULT_BASE_DELAY_SECS as f64;
-    let exponent = (attempt.saturating_sub(1)) as f64;
-    let delay_secs = base * 2f64.powf(exponent);
-    let capped = delay_secs.min(max_backoff_secs as f64);
-    Duration::from_secs_f64(capped)
+    let exponent = attempt.saturating_sub(1);
+    // checked_shl returns None on overflow (exponent >= 64), which we cap to max_backoff
+    let delay_secs = 1u64
+        .checked_shl(exponent)
+        .and_then(|multiplier| DEFAULT_BASE_DELAY_SECS.checked_mul(multiplier))
+        .unwrap_or(max_backoff_secs);
+    Duration::from_secs(delay_secs.min(max_backoff_secs))
 }
 
 #[cfg(test)]
@@ -356,7 +363,7 @@ mod tests {
         let mut queue = RetryQueue::new(3, 300);
 
         // Insert an entry that's already due
-        let key = entry_key("owner", "repo", 42);
+        let key = entry_key("github.com", "owner", "repo", 42);
         queue.entries.insert(
             key,
             RetryEntry {
@@ -384,7 +391,7 @@ mod tests {
     fn test_take_due_skips_future_entries() {
         let mut queue = RetryQueue::new(3, 300);
 
-        let key = entry_key("owner", "repo", 42);
+        let key = entry_key("github.com", "owner", "repo", 42);
         queue.entries.insert(
             key,
             RetryEntry {
@@ -414,7 +421,7 @@ mod tests {
 
         // Insert failure first
         queue.entries.insert(
-            entry_key("owner", "repo", 1),
+            entry_key("github.com", "owner", "repo", 1),
             RetryEntry {
                 owner: "owner".to_string(),
                 repo: "repo".to_string(),
@@ -432,7 +439,7 @@ mod tests {
 
         // Then continuation
         queue.entries.insert(
-            entry_key("owner", "repo", 2),
+            entry_key("github.com", "owner", "repo", 2),
             RetryEntry {
                 owner: "owner".to_string(),
                 repo: "repo".to_string(),
@@ -460,17 +467,17 @@ mod tests {
         queue.enqueue_failure("github.com", "owner", "repo", 42, 0, "timeout", None, None);
         assert_eq!(queue.len(), 1);
 
-        queue.cancel("owner", "repo", 42);
+        queue.cancel("github.com", "owner", "repo", 42);
         assert!(queue.is_empty());
     }
 
     #[test]
     fn test_has_pending() {
         let mut queue = RetryQueue::new(3, 300);
-        assert!(!queue.has_pending("owner", "repo", 42));
+        assert!(!queue.has_pending("github.com", "owner", "repo", 42));
 
         queue.enqueue_failure("github.com", "owner", "repo", 42, 0, "timeout", None, None);
-        assert!(queue.has_pending("owner", "repo", 42));
+        assert!(queue.has_pending("github.com", "owner", "repo", 42));
     }
 
     #[test]

@@ -369,9 +369,8 @@ async fn reap_children(children: &mut Vec<SpawnedChild>, retry_queue: &mut Retry
                                 None,
                             ) {
                                 log::warn!(
-                                    "⚠️  Issue #{} exceeded max retry attempts ({}) — not retrying",
+                                    "⚠️  Issue #{} exceeded max retry attempts — not retrying",
                                     meta.issue_number,
-                                    meta.retry_attempt
                                 );
                             }
                         }
@@ -1583,6 +1582,10 @@ async fn poll_and_spawn(
 /// 1. Validate the issue is still eligible (open, not already claimed)
 /// 2. Spawn a new Minion process (failure retries get fresh sessions)
 ///
+/// Note: Currently only failure retries are dispatched. Continuation retries
+/// (which would reuse session-id/worktree via `spawn_resume`) are infrastructure
+/// for #618 and are not yet enqueued or dispatched. When #618 lands, this function
+/// should branch on `entry.kind` and call `spawn_resume` for continuations.
 /// Returns the number of retries dispatched.
 async fn dispatch_due_retries(
     retry_queue: &mut RetryQueue,
@@ -1661,10 +1664,12 @@ async fn dispatch_due_retries(
             }
             Err(e) => {
                 log::warn!(
-                    "⚠️  Failed to spawn retry for issue #{}: {}",
+                    "⚠️  Failed to spawn retry for issue #{}: {} — re-enqueuing",
                     entry.issue_number,
                     e
                 );
+                // Reinsert so a transient spawn failure doesn't permanently drop retry state.
+                retry_queue.reinsert(entry);
             }
         }
     }
