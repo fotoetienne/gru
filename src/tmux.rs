@@ -144,15 +144,23 @@ fn is_tmux_env(val: Option<&OsStr>) -> bool {
     val.is_some_and(|v| !v.is_empty())
 }
 
-/// Get the current tmux window ID (e.g. `@0`). Returns `None` if not in tmux.
+/// Get the tmux window ID (e.g. `@0`) for the window this process lives in.
+///
+/// Uses `$TMUX_PANE` (set by tmux at process start, never changes) to pin the
+/// query to the correct pane, even if the user has switched focus. Falls back
+/// to the active window when `$TMUX_PANE` is unset.
 fn current_window_id() -> Option<String> {
     if !is_tmux_env(std::env::var_os("TMUX").as_deref()) {
         return None;
     }
-    let output = Command::new("tmux")
-        .args(["display-message", "-p", "#{window_id}"])
-        .output()
-        .ok()?;
+    let mut cmd = Command::new("tmux");
+    cmd.args(["display-message", "-p", "#{window_id}"]);
+    if let Ok(pane) = std::env::var("TMUX_PANE") {
+        if !pane.is_empty() {
+            cmd.args(["-t", &pane]);
+        }
+    }
+    let output = cmd.output().ok()?;
     if output.status.success() {
         let id = String::from_utf8_lossy(&output.stdout).trim().to_string();
         if id.is_empty() {
