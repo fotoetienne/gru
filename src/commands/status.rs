@@ -2,6 +2,7 @@ use crate::agent::TokenUsage;
 use crate::minion_registry::{is_process_alive_with_start_time, with_registry, MinionMode};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
+use std::cmp::{max, min};
 
 /// Combined Minion information from registry and filesystem scanning
 #[derive(Debug, Clone)]
@@ -114,6 +115,126 @@ fn format_mode_display(
             (true, display)
         }
         _ => (false, "stopped".to_string()),
+    }
+}
+
+/// Maximum column width before truncation with ellipsis.
+const MAX_COL_WIDTH: usize = 40;
+
+/// Truncates a string to `max_width`, appending `…` if it exceeds the limit.
+fn truncate(s: &str, max_width: usize) -> String {
+    if s.len() <= max_width {
+        s.to_string()
+    } else if max_width <= 1 {
+        "\u{2026}".to_string()
+    } else {
+        format!("{}\u{2026}", &s[..max_width - 1])
+    }
+}
+
+/// Returns the display width for a column: at least `min_width`, at most `MAX_COL_WIDTH`,
+/// and wide enough to fit the header and all values.
+fn col_width(header: &str, values: impl Iterator<Item = usize>, min_width: usize) -> usize {
+    let data_max = values.fold(header.len(), max);
+    min(max(data_max, min_width), MAX_COL_WIDTH)
+}
+
+/// Prints the normal (non-verbose) status table with dynamic column widths.
+fn print_normal_table(minions: &[EnhancedMinionInfo]) {
+    // Pre-compute display strings for columns that need formatting
+    let issue_displays: Vec<String> = minions.iter().map(|m| format!("#{}", m.issue)).collect();
+    let pr_displays: Vec<String> = minions
+        .iter()
+        .map(|m| {
+            m.pr.as_ref()
+                .map(|pr| format!("#{}", pr))
+                .unwrap_or_else(|| "-".to_string())
+        })
+        .collect();
+    let tokens_displays: Vec<String> = minions
+        .iter()
+        .map(|m| {
+            m.token_usage
+                .as_ref()
+                .map(|u| u.display_compact())
+                .unwrap_or_else(|| "-".to_string())
+        })
+        .collect();
+
+    // Calculate column widths dynamically
+    let w_minion = col_width("MINION", minions.iter().map(|m| m.minion_id.len()), 6);
+    let w_agent = col_width("AGENT", minions.iter().map(|m| m.agent_name.len()), 5);
+    let w_repo = col_width("REPO", minions.iter().map(|m| m.repo.len()), 4);
+    let w_issue = col_width("ISSUE", issue_displays.iter().map(|s| s.len()), 5);
+    let w_task = col_width("TASK", minions.iter().map(|m| m.task.len()), 4);
+    let w_pr = col_width("PR", pr_displays.iter().map(|s| s.len()), 2);
+    let w_branch = col_width("BRANCH", minions.iter().map(|m| m.branch.len()), 6);
+    let w_mode = col_width("MODE", minions.iter().map(|m| m.mode_display.len()), 4);
+    let w_uptime = col_width("UPTIME", minions.iter().map(|m| m.uptime.len()), 6);
+
+    // Print header
+    println!(
+        "{:<w_minion$} {:<w_agent$} {:<w_repo$} {:<w_issue$} {:<w_task$} {:<w_pr$} {:<w_branch$} {:<w_mode$} {:<w_uptime$} TOKENS",
+        "MINION", "AGENT", "REPO", "ISSUE", "TASK", "PR", "BRANCH", "MODE", "UPTIME",
+    );
+
+    // Print rows
+    for (i, minion) in minions.iter().enumerate() {
+        println!(
+            "{:<w_minion$} {:<w_agent$} {:<w_repo$} {:<w_issue$} {:<w_task$} {:<w_pr$} {:<w_branch$} {:<w_mode$} {:<w_uptime$} {}",
+            truncate(&minion.minion_id, w_minion),
+            truncate(&minion.agent_name, w_agent),
+            truncate(&minion.repo, w_repo),
+            truncate(&issue_displays[i], w_issue),
+            truncate(&minion.task, w_task),
+            truncate(&pr_displays[i], w_pr),
+            truncate(&minion.branch, w_branch),
+            truncate(&minion.mode_display, w_mode),
+            truncate(&minion.uptime, w_uptime),
+            tokens_displays[i],
+        );
+    }
+}
+
+/// Prints the verbose status table with dynamic column widths.
+fn print_verbose_table(minions: &[EnhancedMinionInfo]) {
+    // Pre-compute display strings
+    let issue_displays: Vec<String> = minions.iter().map(|m| format!("#{}", m.issue)).collect();
+    let pid_displays: Vec<String> = minions
+        .iter()
+        .map(|m| {
+            m.pid
+                .map(|p| p.to_string())
+                .unwrap_or_else(|| "-".to_string())
+        })
+        .collect();
+
+    // Calculate column widths dynamically
+    let w_id = col_width("ID", minions.iter().map(|m| m.minion_id.len()), 2);
+    let w_issue = col_width("ISSUE", issue_displays.iter().map(|s| s.len()), 5);
+    let w_agent = col_width("AGENT", minions.iter().map(|m| m.agent_name.len()), 5);
+    let w_mode = col_width("MODE", minions.iter().map(|m| m.mode_display.len()), 4);
+    let w_session = col_width("SESSION ID", minions.iter().map(|m| m.session_id.len()), 10);
+    let w_pid = col_width("PID", pid_displays.iter().map(|s| s.len()), 3);
+
+    // Print header
+    println!(
+        "{:<w_id$} {:<w_issue$} {:<w_agent$} {:<w_mode$} {:<w_session$} {:<w_pid$} PATH",
+        "ID", "ISSUE", "AGENT", "MODE", "SESSION ID", "PID",
+    );
+
+    // Print rows
+    for (i, minion) in minions.iter().enumerate() {
+        println!(
+            "{:<w_id$} {:<w_issue$} {:<w_agent$} {:<w_mode$} {:<w_session$} {:<w_pid$} {}",
+            truncate(&minion.minion_id, w_id),
+            truncate(&issue_displays[i], w_issue),
+            truncate(&minion.agent_name, w_agent),
+            truncate(&minion.mode_display, w_mode),
+            truncate(&minion.session_id, w_session),
+            truncate(&pid_displays[i], w_pid),
+            minion.worktree_path,
+        );
     }
 }
 
@@ -343,65 +464,11 @@ pub(crate) async fn handle_status(
         },
     });
 
-    // Print table header
+    // Print table with dynamic column widths
     if verbose {
-        println!(
-            "{:<8} {:<8} {:<8} {:<22} {:<38} {:<8} PATH",
-            "ID", "ISSUE", "AGENT", "MODE", "SESSION ID", "PID"
-        );
+        print_verbose_table(&minions);
     } else {
-        println!(
-            "{:<8} {:<8} {:<20} {:<8} {:<10} {:<8} {:<30} {:<22} {:<8} TOKENS",
-            "MINION", "AGENT", "REPO", "ISSUE", "TASK", "PR", "BRANCH", "MODE", "UPTIME"
-        );
-    }
-
-    // Print each minion
-    for minion in &minions {
-        if verbose {
-            let issue_display = minion.issue.map_or("-".to_string(), |n| format!("#{}", n));
-            let pid_display = minion
-                .pid
-                .map(|p| p.to_string())
-                .unwrap_or_else(|| "-".to_string());
-
-            println!(
-                "{:<8} {:<8} {:<8} {:<22} {:<38} {:<8} {}",
-                minion.minion_id,
-                issue_display,
-                minion.agent_name,
-                minion.mode_display,
-                minion.session_id,
-                pid_display,
-                minion.worktree_path
-            );
-        } else {
-            let issue_display = minion.issue.map_or("-".to_string(), |n| format!("#{}", n));
-            let pr_display = minion
-                .pr
-                .as_ref()
-                .map(|pr| format!("#{}", pr))
-                .unwrap_or_else(|| "-".to_string());
-            let tokens_display = minion
-                .token_usage
-                .as_ref()
-                .map(|u| u.display_compact())
-                .unwrap_or_else(|| "-".to_string());
-
-            println!(
-                "{:<8} {:<8} {:<20} {:<8} {:<10} {:<8} {:<30} {:<22} {:<8} {}",
-                minion.minion_id,
-                minion.agent_name,
-                minion.repo,
-                issue_display,
-                minion.task,
-                pr_display,
-                minion.branch,
-                minion.mode_display,
-                minion.uptime,
-                tokens_display
-            );
-        }
+        print_normal_table(&minions);
     }
 
     println!();
@@ -552,5 +619,61 @@ mod tests {
         let (is_running, display) = format_mode_display(Some(pid), None, &MinionMode::Stopped);
         assert!(is_running);
         assert_eq!(display, "running (unknown)");
+    }
+
+    // --- truncate tests ---
+
+    #[test]
+    fn test_truncate_short_string() {
+        assert_eq!(truncate("hello", 10), "hello");
+    }
+
+    #[test]
+    fn test_truncate_exact_width() {
+        assert_eq!(truncate("hello", 5), "hello");
+    }
+
+    #[test]
+    fn test_truncate_over_width() {
+        assert_eq!(
+            truncate("fotoetienne/jeapi-cli", 20),
+            "fotoetienne/jeapi-c\u{2026}"
+        );
+    }
+
+    #[test]
+    fn test_truncate_width_one() {
+        assert_eq!(truncate("hello", 1), "\u{2026}");
+    }
+
+    #[test]
+    fn test_truncate_empty_string() {
+        assert_eq!(truncate("", 10), "");
+    }
+
+    // --- col_width tests ---
+
+    #[test]
+    fn test_col_width_uses_header_when_wider() {
+        let w = col_width("BRANCH", vec![3_usize, 4].into_iter(), 4);
+        assert_eq!(w, 6); // "BRANCH".len() == 6
+    }
+
+    #[test]
+    fn test_col_width_uses_data_when_wider() {
+        let w = col_width("ID", vec![10_usize, 15].into_iter(), 2);
+        assert_eq!(w, 15);
+    }
+
+    #[test]
+    fn test_col_width_capped_at_max() {
+        let w = col_width("X", vec![100_usize].into_iter(), 2);
+        assert_eq!(w, MAX_COL_WIDTH);
+    }
+
+    #[test]
+    fn test_col_width_respects_min_width() {
+        let w = col_width("X", vec![1_usize].into_iter(), 8);
+        assert_eq!(w, 8);
     }
 }
