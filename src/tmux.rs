@@ -144,6 +144,11 @@ fn is_tmux_env(val: Option<&OsStr>) -> bool {
     val.is_some_and(|v| !v.is_empty())
 }
 
+/// Validate that a `$TMUX_PANE` value looks like a real tmux pane ID (`%<digits>`).
+fn is_valid_tmux_pane(val: &str) -> bool {
+    val.starts_with('%') && val.len() > 1 && val[1..].bytes().all(|b| b.is_ascii_digit())
+}
+
 /// Get the tmux window ID (e.g. `@0`) for the window this process lives in.
 ///
 /// Uses `$TMUX_PANE` (set by tmux at process start, never changes) to pin the
@@ -156,7 +161,7 @@ fn current_window_id() -> Option<String> {
     let mut cmd = Command::new("tmux");
     cmd.args(["display-message", "-p", "#{window_id}"]);
     if let Ok(pane) = std::env::var("TMUX_PANE") {
-        if !pane.is_empty() {
+        if is_valid_tmux_pane(&pane) {
             cmd.args(["-t", &pane]);
         }
     }
@@ -224,6 +229,18 @@ mod tests {
         assert!(is_tmux_env(Some(OsStr::new(
             "/tmp/tmux-1000/default,12345,0"
         ))));
+    }
+
+    #[test]
+    fn test_is_valid_tmux_pane() {
+        assert!(is_valid_tmux_pane("%0"));
+        assert!(is_valid_tmux_pane("%5"));
+        assert!(is_valid_tmux_pane("%123"));
+        assert!(!is_valid_tmux_pane(""));
+        assert!(!is_valid_tmux_pane("%"));
+        assert!(!is_valid_tmux_pane("5"));
+        assert!(!is_valid_tmux_pane("%abc"));
+        assert!(!is_valid_tmux_pane("session:window"));
     }
 
     #[test]
