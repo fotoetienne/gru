@@ -107,6 +107,15 @@ pub(crate) struct DaemonConfig {
     /// Maximum resume attempts before marking a Minion as failed (default: 3)
     #[serde(default = "default_max_resume_attempts")]
     pub(crate) max_resume_attempts: u32,
+
+    /// Maximum failure retry attempts before giving up (default: 3, 0 = no failure retries).
+    /// Continuation retries are always enabled regardless of this setting.
+    #[serde(default = "default_max_retry_attempts")]
+    pub(crate) max_retry_attempts: u32,
+
+    /// Maximum backoff delay in seconds for failure retries (default: 300 = 5 minutes).
+    #[serde(default = "default_max_retry_backoff_secs")]
+    pub(crate) max_retry_backoff_secs: u64,
 }
 
 impl Default for DaemonConfig {
@@ -117,6 +126,8 @@ impl Default for DaemonConfig {
             max_slots: default_max_slots(),
             label: default_label(),
             max_resume_attempts: default_max_resume_attempts(),
+            max_retry_attempts: default_max_retry_attempts(),
+            max_retry_backoff_secs: default_max_retry_backoff_secs(),
         }
     }
 }
@@ -207,6 +218,14 @@ pub(crate) const DEFAULT_MAX_RESUME_ATTEMPTS: u32 = 3;
 
 fn default_max_resume_attempts() -> u32 {
     DEFAULT_MAX_RESUME_ATTEMPTS
+}
+
+fn default_max_retry_attempts() -> u32 {
+    3
+}
+
+fn default_max_retry_backoff_secs() -> u64 {
+    300
 }
 
 /// Parse a repo entry from the config into `(host, owner, repo)`.

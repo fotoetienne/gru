@@ -56,6 +56,15 @@
 # How many times to resume a stuck Minion before marking it failed.
 # max_resume_attempts = 3
 
+# Maximum failure retry attempts before giving up (0 = no failure retries).
+# Continuation retries (re-launching when an agent exits but work remains)
+# are always enabled regardless of this setting.
+# max_retry_attempts = 3
+
+# Maximum backoff delay in seconds for failure retries.
+# Backoff formula: min(10s × 2^(attempt-1), max_retry_backoff_secs)
+# max_retry_backoff_secs = 300
+
 # ─────────────────────────────────────────────────────────────────────
 # Agent backend
 # ─────────────────────────────────────────────────────────────────────

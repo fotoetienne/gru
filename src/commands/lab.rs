@@ -3,6 +3,7 @@ use crate::github::{self, list_ready_issues_via_cli};
 use crate::labels;
 use crate::minion_registry::{with_registry, MinionInfo, MinionMode, OrchestrationPhase};
 use crate::pr_monitor;
+use crate::retry_queue::{RetryKind, RetryQueue};
 use crate::tmux::TmuxGuard;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Local, Utc};
@@ -37,11 +38,14 @@ struct SpawnedChild {
     spawn_meta: Option<SpawnMeta>,
 }
 
-/// Metadata needed to restore labels when a spawned process exits early.
+/// Metadata needed to restore labels when a spawned process exits early
+/// and to enqueue retries for non-early failures.
 struct SpawnMeta {
     host: String,
     owner: String,
     repo: String,
+    /// Full `owner/repo` string for registry lookups.
+    full_repo: String,
     issue_number: u64,
     ready_label: String,
     spawned_at: Instant,
@@ -113,6 +117,12 @@ pub(crate) async fn handle_lab(
     // Track child processes for graceful shutdown
     let mut children: Vec<SpawnedChild> = Vec::new();
 
+    // In-memory retry queue for failed/incomplete Minion runs
+    let mut retry_queue = RetryQueue::new(
+        config.daemon.max_retry_attempts,
+        config.daemon.max_retry_backoff_secs,
+    );
+
     // Safety net: track Minion IDs we've already attempted to resume this session
     // to prevent resume loops even if phase updates are missed.
     let mut resumed_this_session: HashSet<String> = HashSet::new();
@@ -175,6 +185,7 @@ pub(crate) async fn handle_lab(
     if let Err(e) = poll_and_spawn(
         &config,
         &mut children,
+        &mut retry_queue,
         no_resume,
         &mut resumed_this_session,
         &mut wake_check_times,
@@ -203,8 +214,8 @@ pub(crate) async fn handle_lab(
                 continue;
             }
             _ = sleep(config.poll_interval()) => {
-                // Clean up finished child processes
-                reap_children(&mut children).await;
+                // Clean up finished child processes and enqueue retries for failures
+                reap_children(&mut children, &mut retry_queue).await;
 
                 // Phase 2: Run poll_and_spawn with cooperative cancellation.
                 // Instead of racing the future against signals (which would hard-cancel
@@ -213,6 +224,7 @@ pub(crate) async fn handle_lab(
                 if let Err(e) = poll_and_spawn(
                     &config,
                     &mut children,
+                    &mut retry_queue,
                     no_resume,
                     &mut resumed_this_session,
                     &mut wake_check_times,
@@ -222,6 +234,11 @@ pub(crate) async fn handle_lab(
                 {
                     log::warn!("⚠️  Polling error: {}", e);
                     log::warn!("   Continuing to poll...");
+                }
+
+                // Log retry queue status when non-empty
+                if !retry_queue.is_empty() {
+                    log_retry_queue_status(&retry_queue);
                 }
 
                 // Check if a signal arrived during poll_and_spawn
@@ -245,17 +262,17 @@ pub(crate) async fn handle_lab(
 /// is `EARLY_EXIT_THRESHOLD` minus any delay before the next reap cycle. With typical
 /// poll intervals (≤30s) this is fine, but very long poll intervals could cause
 /// early exits to be detected after the threshold has passed.
-async fn reap_children(children: &mut Vec<SpawnedChild>) {
+async fn reap_children(children: &mut Vec<SpawnedChild>, retry_queue: &mut RetryQueue) {
     let mut i = 0;
     while i < children.len() {
         match children[i].child.try_wait() {
             Ok(Some(status)) => {
                 log::info!("Minion process exited with status: {}", status);
 
-                // If the process failed quickly, restore the issue label
-                if !status.success() {
-                    if let Some(meta) = &children[i].spawn_meta {
-                        let elapsed = meta.spawned_at.elapsed();
+                if let Some(meta) = &children[i].spawn_meta {
+                    let elapsed = meta.spawned_at.elapsed();
+
+                    if !status.success() {
                         if should_restore_label(meta.spawned_at) {
                             // Check if the issue already has a terminal label before
                             // restoring gru:todo — the minion may have finished
@@ -334,14 +351,30 @@ async fn reap_children(children: &mut Vec<SpawnedChild>) {
                                 }
                             }
                         } else {
-                            log::warn!(
-                                "⚠️  Spawned gru do for issue #{} exited with {} (after {:.1}s) — \
-                                 not restoring label (exceeded early-exit threshold of {}s)",
-                                meta.issue_number,
+                            // Non-early failure: enqueue for retry with backoff
+                            let attempt =
+                                lookup_attempt_count(&meta.full_repo, meta.issue_number).await;
+                            let reason = format!(
+                                "exited with {} after {:.0}s",
                                 status,
-                                elapsed.as_secs_f64(),
-                                EARLY_EXIT_THRESHOLD.as_secs()
+                                elapsed.as_secs_f64()
                             );
+                            if !retry_queue.enqueue_failure(
+                                &meta.host,
+                                &meta.owner,
+                                &meta.repo,
+                                meta.issue_number,
+                                attempt,
+                                &reason,
+                                None,
+                                None,
+                            ) {
+                                log::warn!(
+                                    "⚠️  Issue #{} exceeded max retry attempts ({}) — not retrying",
+                                    meta.issue_number,
+                                    attempt
+                                );
+                            }
                         }
                     }
                 }
@@ -357,6 +390,23 @@ async fn reap_children(children: &mut Vec<SpawnedChild>) {
             }
         }
     }
+}
+
+/// Look up the current attempt count for the most recent Minion on an issue.
+async fn lookup_attempt_count(repo: &str, issue_number: u64) -> u32 {
+    let repo = repo.to_string();
+    with_registry(move |registry| {
+        let entries = registry.find_by_issue(&repo, issue_number);
+        // Use the highest attempt count among minions for this issue
+        let max_attempt = entries
+            .iter()
+            .map(|(_, info)| info.attempt_count)
+            .max()
+            .unwrap_or(0);
+        Ok(max_attempt)
+    })
+    .await
+    .unwrap_or(0)
 }
 
 /// Handle child processes on lab shutdown.
@@ -1298,6 +1348,7 @@ async fn try_spawn_for_issue(
                     host: ctx.host.clone(),
                     owner: ctx.owner.clone(),
                     repo: ctx.repo.clone(),
+                    full_repo: ctx.full.clone(),
                     issue_number,
                     ready_label: label.to_string(),
                     spawned_at: Instant::now(),
@@ -1439,12 +1490,15 @@ async fn spawn_for_candidate_issues(
 
 /// Poll GitHub for ready issues and spawn Minions if slots are available.
 ///
-/// Checks  between major phases for cooperative cancellation.
+/// Dispatch order: due retries (continuation first) → resumed minions → new issues.
+///
+/// Checks between major phases for cooperative cancellation.
 /// When the flag is set (signal received), returns early at the next safe checkpoint
 /// instead of continuing to the next API call.
 async fn poll_and_spawn(
     config: &LabConfig,
     children: &mut Vec<SpawnedChild>,
+    retry_queue: &mut RetryQueue,
     no_resume: bool,
     resumed_this_session: &mut HashSet<String>,
     wake_check_times: &mut HashMap<String, DateTime<Utc>>,
@@ -1487,7 +1541,17 @@ async fn poll_and_spawn(
         return Ok(());
     }
 
-    // Resume interrupted minions first, before claiming new issues
+    // Dispatch due retries first (continuation retries get priority over failure retries)
+    let mut spawned = dispatch_due_retries(retry_queue, children, &mut available).await?;
+
+    if available == 0 {
+        if spawned > 0 {
+            tprintln!();
+        }
+        return Ok(());
+    }
+
+    // Resume interrupted minions, before claiming new issues
     let resumed = if no_resume {
         0
     } else {
@@ -1500,7 +1564,7 @@ async fn poll_and_spawn(
         )
         .await?
     };
-    let mut spawned = resumed;
+    spawned += resumed;
 
     if shutdown_flag.load(Ordering::Acquire) {
         return Ok(());
@@ -1528,6 +1592,154 @@ async fn poll_and_spawn(
     }
 
     Ok(())
+}
+
+/// Dispatch retry entries whose backoff has elapsed.
+///
+/// For each due retry:
+/// 1. Validate the issue is still eligible (open, not already claimed)
+/// 2. Spawn a new Minion process (failure retries get fresh sessions)
+///
+/// Returns the number of retries dispatched.
+async fn dispatch_due_retries(
+    retry_queue: &mut RetryQueue,
+    children: &mut Vec<SpawnedChild>,
+    available: &mut usize,
+) -> Result<usize> {
+    let due = retry_queue.take_due();
+    if due.is_empty() {
+        return Ok(0);
+    }
+
+    let mut dispatched = 0usize;
+
+    for entry in due {
+        if *available == 0 {
+            // No slots left — re-enqueue remaining retries (they'll be picked up next cycle).
+            // We re-enqueue with the same parameters since the due_at is already past.
+            match entry.kind {
+                RetryKind::Continuation => {
+                    if let (Some(session_id), Some(minion_id), Some(workspace_path)) =
+                        (&entry.session_id, &entry.minion_id, &entry.workspace_path)
+                    {
+                        retry_queue.enqueue_continuation(
+                            &entry.host,
+                            &entry.owner,
+                            &entry.repo,
+                            entry.issue_number,
+                            session_id,
+                            minion_id,
+                            workspace_path.clone(),
+                            &entry.reason,
+                        );
+                    }
+                }
+                RetryKind::Failure => {
+                    // Re-enqueue at same attempt count (subtract 1 since enqueue_failure increments)
+                    retry_queue.enqueue_failure(
+                        &entry.host,
+                        &entry.owner,
+                        &entry.repo,
+                        entry.issue_number,
+                        entry.attempt.saturating_sub(1),
+                        &entry.reason,
+                        entry.minion_id.as_deref(),
+                        entry.workspace_path.clone(),
+                    );
+                }
+            }
+            continue;
+        }
+
+        let full_repo = format!("{}/{}", entry.owner, entry.repo);
+
+        // Skip if issue is already being worked on by a live process
+        if is_issue_claimed(&full_repo, Some(entry.issue_number)).await? {
+            log::info!(
+                "⏭️  Skipping retry for issue #{}: already claimed by live process",
+                entry.issue_number
+            );
+            continue;
+        }
+
+        // Validate issue is still open and eligible
+        if !github::is_issue_still_eligible(
+            &entry.owner,
+            &entry.repo,
+            &entry.host,
+            entry.issue_number,
+        )
+        .await
+        {
+            log::info!(
+                "⏭️  Skipping retry for issue #{}: no longer eligible (closed or label changed)",
+                entry.issue_number
+            );
+            continue;
+        }
+
+        tprintln!(
+            "🔄 Retrying issue {}/{}#{} ({} retry, attempt {}): {}",
+            entry.owner,
+            entry.repo,
+            entry.issue_number,
+            entry.kind,
+            entry.attempt,
+            entry.reason
+        );
+
+        match spawn_minion(&full_repo, &entry.host, entry.issue_number).await {
+            Ok(child) => {
+                children.push(SpawnedChild {
+                    child,
+                    spawn_meta: Some(SpawnMeta {
+                        host: entry.host.clone(),
+                        owner: entry.owner.clone(),
+                        repo: entry.repo.clone(),
+                        full_repo: full_repo.clone(),
+                        issue_number: entry.issue_number,
+                        ready_label: labels::TODO.to_string(),
+                        spawned_at: Instant::now(),
+                    }),
+                });
+                dispatched += 1;
+                *available -= 1;
+            }
+            Err(e) => {
+                log::warn!(
+                    "⚠️  Failed to spawn retry for issue #{}: {}",
+                    entry.issue_number,
+                    e
+                );
+            }
+        }
+    }
+
+    Ok(dispatched)
+}
+
+/// Log a summary of pending retry queue entries.
+fn log_retry_queue_status(retry_queue: &RetryQueue) {
+    let entries = retry_queue.pending_entries();
+    let now = Instant::now();
+    tprintln!("🔄 Retry queue: {} pending", entries.len());
+    for entry in entries {
+        let remaining = if entry.due_at > now {
+            let secs = (entry.due_at - now).as_secs();
+            format!("due in {}s", secs)
+        } else {
+            "due now".to_string()
+        };
+        tprintln!(
+            "   • {}/{}#{} ({} retry, attempt {}) — {}",
+            entry.owner,
+            entry.repo,
+            entry.issue_number,
+            entry.kind,
+            entry.attempt,
+            remaining
+        );
+    }
 }
 
 /// Prune stale registry entries where worktrees no longer exist.
@@ -1801,7 +2013,8 @@ mod tests {
     #[tokio::test]
     async fn test_reap_children_empty() {
         let mut children: Vec<SpawnedChild> = Vec::new();
-        reap_children(&mut children).await;
+        let mut retry_queue = RetryQueue::new(3, 300);
+        reap_children(&mut children, &mut retry_queue).await;
         assert!(children.is_empty());
     }
 
@@ -1945,7 +2158,8 @@ mod tests {
         }
         assert!(exited, "child process did not exit within 1s timeout");
 
-        reap_children(&mut children).await;
+        let mut retry_queue = RetryQueue::new(3, 300);
+        reap_children(&mut children, &mut retry_queue).await;
         assert!(children.is_empty(), "Exited child should be reaped");
     }
 
@@ -1965,7 +2179,8 @@ mod tests {
             spawn_meta: None,
         }];
 
-        reap_children(&mut children).await;
+        let mut retry_queue = RetryQueue::new(3, 300);
+        reap_children(&mut children, &mut retry_queue).await;
         assert_eq!(children.len(), 1, "Running child should not be reaped");
 
         // Clean up
@@ -1979,6 +2194,7 @@ mod tests {
             host: "github.com".to_string(),
             owner: "test-owner".to_string(),
             repo: "test-repo".to_string(),
+            full_repo: "test-owner/test-repo".to_string(),
             issue_number: 42,
             ready_label: "gru:todo".to_string(),
             spawned_at: Instant::now(),
