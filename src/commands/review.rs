@@ -477,7 +477,7 @@ async fn find_issue_for_pr(
         .map(Some)
         .context("Failed to parse issue number from PR")
         .or_else(|e| {
-            log::warn!("Warning: {}", e);
+            log::warn!("Warning: {:#}", e);
             Ok(None)
         })
 }

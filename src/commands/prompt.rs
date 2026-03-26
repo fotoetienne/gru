@@ -479,7 +479,7 @@ async fn resolve_prompt_text(
     let trimmed = prompt.trim();
     let repo_root = git::detect_git_repo().await.ok();
     let loaded_prompts = prompt_loader::load_prompts(repo_root.as_deref()).unwrap_or_else(|e| {
-        log::warn!("Failed to load prompt files: {}", e);
+        log::warn!("Failed to load prompt files: {:#}", e);
         HashMap::new()
     });
     if let Some(file_prompt) = loaded_prompts.get(trimmed) {

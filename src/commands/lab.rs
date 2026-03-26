@@ -182,7 +182,7 @@ pub(crate) async fn handle_lab(
     )
     .await
     {
-        log::warn!("⚠️  Initial polling error: {}", e);
+        log::warn!("⚠️  Initial polling error: {:#}", e);
         log::warn!("   Continuing to poll...");
     }
 
@@ -220,7 +220,7 @@ pub(crate) async fn handle_lab(
                 )
                 .await
                 {
-                    log::warn!("⚠️  Polling error: {}", e);
+                    log::warn!("⚠️  Polling error: {:#}", e);
                     log::warn!("   Continuing to poll...");
                 }
 
@@ -810,7 +810,7 @@ async fn mark_minion_completed(minion_id: &str) {
     })
     .await
     {
-        log::warn!("Failed to mark {} as completed: {}", minion_id, e);
+        log::warn!("Failed to mark {} as completed: {:#}", minion_id, e);
     }
 }
 
@@ -1214,7 +1214,7 @@ async fn fetch_candidate_issues(
             match fallback_list_issues(owner, repo, host, label).await {
                 Ok(issues) => Some(issues),
                 Err(e) => {
-                    log::warn!("⚠️  Fallback also failed for {}: {}", repo_spec, e);
+                    log::warn!("⚠️  Fallback also failed for {}: {:#}", repo_spec, e);
                     None
                 }
             }
@@ -1471,7 +1471,7 @@ async fn poll_and_spawn(
         )
         .await
         {
-            log::warn!("⚠️  Review wake scan error: {}", e);
+            log::warn!("⚠️  Review wake scan error: {:#}", e);
         }
     }
 

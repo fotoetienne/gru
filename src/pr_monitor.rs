@@ -308,7 +308,7 @@ async fn update_readiness_label(
         match merge_readiness::check_merge_readiness(host, owner, repo, pr_number_u64).await {
             Ok(r) => r,
             Err(e) => {
-                log::warn!("Failed to check merge readiness: {}", e);
+                log::warn!("Failed to check merge readiness: {:#}", e);
                 return None;
             }
         };
@@ -319,7 +319,7 @@ async fn update_readiness_label(
         // Transition: not ready → ready
         match add_ready_to_merge_label(host, owner, repo, pr_number).await {
             Ok(()) => println!("✅ PR #{} is ready to merge", pr_number),
-            Err(e) => log::warn!("Failed to add ready-to-merge label: {}", e),
+            Err(e) => log::warn!("Failed to add ready-to-merge label: {:#}", e),
         }
     } else if !is_ready && *was_ready {
         // Transition: ready → not ready
@@ -329,7 +329,7 @@ async fn update_readiness_label(
                 "⚠️  PR #{} is no longer ready to merge ({})",
                 pr_number, reason
             ),
-            Err(e) => log::warn!("Failed to remove ready-to-merge label: {}", e),
+            Err(e) => log::warn!("Failed to remove ready-to-merge label: {:#}", e),
         }
     }
 

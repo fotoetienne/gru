@@ -119,7 +119,7 @@ async fn spawn_worker(
     })
     .await
     {
-        log::warn!("Failed to record worker PID in registry: {}", e);
+        log::warn!("Failed to record worker PID in registry: {:#}", e);
     }
 
     Ok(pid)

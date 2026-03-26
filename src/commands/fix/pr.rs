@@ -202,7 +202,7 @@ async fn create_pr_for_issue(
                 println!("✅ PR #{} marked ready for review", pr_number);
             }
             Err(e) => {
-                log::warn!("⚠️  Warning: Failed to mark PR ready: {}", e);
+                log::warn!("⚠️  Warning: Failed to mark PR ready: {:#}", e);
                 log::warn!(
                     "   PR #{} created as draft - you can mark it ready manually",
                     pr_number
@@ -254,7 +254,7 @@ async fn finalize_pr(
     .await
     {
         log::warn!(
-            "⚠️  Failed to update registry with PR number for {}: {}",
+            "⚠️  Failed to update registry with PR number for {}: {:#}",
             wt_ctx.minion_id,
             e
         );
@@ -274,7 +274,7 @@ async fn finalize_pr(
                 println!("🏷️  Updated issue label to '{}'", crate::labels::DONE);
             }
             Err(e) => {
-                log::warn!("⚠️  Failed to update issue label: {}", e);
+                log::warn!("⚠️  Failed to update issue label: {:#}", e);
             }
         }
     }
@@ -309,14 +309,14 @@ async fn recover_existing_pr(
             // since losing the recovered PR number would be worse than
             // missing metadata (which can be recovered on next resume).
             if let Err(e) = finalize_pr(issue_ctx, wt_ctx, &pr_number).await {
-                log::warn!("⚠️  Failed to finalize recovered PR state: {}", e);
+                log::warn!("⚠️  Failed to finalize recovered PR state: {:#}", e);
             }
 
             Ok(Some(pr_number))
         }
         Ok(None) => Ok(None),
         Err(lookup_err) => {
-            log::warn!("⚠️  Failed to look up existing PR: {}", lookup_err);
+            log::warn!("⚠️  Failed to look up existing PR: {:#}", lookup_err);
             Ok(None)
         }
     }
@@ -366,7 +366,7 @@ pub(crate) async fn handle_pr_creation(
         );
 
         if let Err(e) = finalize_pr(issue_ctx, wt_ctx, &pr_number).await {
-            log::warn!("⚠️  Failed to finalize existing PR state: {}", e);
+            log::warn!("⚠️  Failed to finalize existing PR state: {:#}", e);
         }
 
         return Ok(Some(pr_number));
@@ -440,7 +440,7 @@ pub(crate) async fn handle_pr_creation(
                     wt_ctx.branch_name
                 ))
             } else {
-                log::warn!("⚠️  Failed to create PR: {}", e);
+                log::warn!("⚠️  Failed to create PR: {:#}", e);
 
                 // Fallback: a PR may already exist from a previous attempt or
                 // manual creation.  Try to recover it the same way the

@@ -29,7 +29,7 @@ pub(crate) async fn try_mark_issue_blocked(host: &str, owner: &str, repo: &str, 
             println!("🏷️  Updated issue label to '{}'", crate::labels::BLOCKED);
         }
         Err(e) => {
-            log::warn!("⚠️  Failed to update issue label: {}", e);
+            log::warn!("⚠️  Failed to update issue label: {:#}", e);
         }
     }
 }
@@ -49,7 +49,7 @@ pub(crate) async fn try_remove_blocked_label(
             println!("🏷️  Removed '{}' label", crate::labels::BLOCKED);
         }
         Err(e) => {
-            log::warn!("⚠️  Failed to remove blocked label: {}", e);
+            log::warn!("⚠️  Failed to remove blocked label: {:#}", e);
         }
     }
 }
@@ -62,7 +62,7 @@ pub(crate) async fn try_mark_issue_failed(host: &str, owner: &str, repo: &str, i
             println!("🏷️  Updated issue label to '{}'", crate::labels::FAILED);
         }
         Err(e) => {
-            log::warn!("⚠️  Failed to update issue label: {}", e);
+            log::warn!("⚠️  Failed to update issue label: {:#}", e);
         }
     }
 }
@@ -105,7 +105,7 @@ pub(super) async fn try_post_progress_comment(
     match crate::github::post_comment_via_cli(host, owner, repo, issue_num, body).await {
         Ok(()) => true,
         Err(e) => {
-            log::warn!("⚠️  Failed to post progress comment: {}", e);
+            log::warn!("⚠️  Failed to post progress comment: {:#}", e);
             false
         }
     }

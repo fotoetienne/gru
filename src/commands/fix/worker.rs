@@ -172,7 +172,7 @@ pub(crate) async fn create_pr_phase(
             )
             .await
             {
-                log::warn!("⚠️  Failed to ensure gru:auto-merge label: {}", e);
+                log::warn!("⚠️  Failed to ensure gru:auto-merge label: {:#}", e);
             }
             match pr_monitor::add_auto_merge_label(
                 &issue_ctx.host,
@@ -183,7 +183,7 @@ pub(crate) async fn create_pr_phase(
             .await
             {
                 Ok(()) => println!("🏷️  Added gru:auto-merge label to PR #{}", pr_num),
-                Err(e) => log::warn!("⚠️  Failed to add gru:auto-merge label: {}", e),
+                Err(e) => log::warn!("⚠️  Failed to add gru:auto-merge label: {:#}", e),
             }
         }
     }
@@ -252,7 +252,7 @@ pub(crate) async fn monitor_pr_phase(
                 }
                 return Err(anyhow::anyhow!("CI checks failed"));
             }
-            Err(e) => log::warn!("⚠️  CI monitoring error (non-fatal): {}", e),
+            Err(e) => log::warn!("⚠️  CI monitoring error (non-fatal): {:#}", e),
         }
     }
 

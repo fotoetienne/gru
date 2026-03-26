@@ -244,7 +244,7 @@ impl Worktree {
             .check_merged(base_branch)
             .await
             .map_err(|e| {
-                log::warn!("Warning: Failed to check if branch is merged: {}", e);
+                log::warn!("Warning: Failed to check if branch is merged: {:#}", e);
                 e
             })
             .unwrap_or(false)
@@ -264,7 +264,10 @@ impl Worktree {
             .check_pr_merged_on_github()
             .await
             .map_err(|e| {
-                log::warn!("Warning: Failed to check PR merge status on GitHub: {}", e);
+                log::warn!(
+                    "Warning: Failed to check PR merge status on GitHub: {:#}",
+                    e
+                );
                 e
             })
             .unwrap_or(false)
@@ -277,7 +280,7 @@ impl Worktree {
             .check_issue_closed()
             .await
             .map_err(|e| {
-                log::warn!("Warning: Failed to check issue status: {}", e);
+                log::warn!("Warning: Failed to check issue status: {:#}", e);
                 e
             })
             .unwrap_or(None)
@@ -290,7 +293,7 @@ impl Worktree {
             .check_remote_deleted()
             .await
             .map_err(|e| {
-                log::warn!("Warning: Failed to check remote status: {}", e);
+                log::warn!("Warning: Failed to check remote status: {:#}", e);
                 e
             })
             .unwrap_or(false)

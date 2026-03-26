@@ -38,7 +38,7 @@ async fn save_review_check_time(minion_id: &str, ts: DateTime<Utc>) {
     })
     .await
     {
-        log::warn!("⚠️  Failed to save last_review_check_time: {}", e);
+        log::warn!("⚠️  Failed to save last_review_check_time: {:#}", e);
     }
 }
 
@@ -55,7 +55,7 @@ async fn reset_attempt_count(minion_id: &str) {
     })
     .await
     {
-        log::warn!("⚠️  Failed to reset attempt_count: {}", e);
+        log::warn!("⚠️  Failed to reset attempt_count: {:#}", e);
     }
 }
 
@@ -154,7 +154,10 @@ async fn post_exit_notification_if_needed(
         match pr_monitor::get_pr_info_for_exit_notification(host, owner, repo, pr_number).await {
             Ok(info) => info,
             Err(e) => {
-                log::warn!("⚠️  Could not check PR state for exit notification: {}", e);
+                log::warn!(
+                    "⚠️  Could not check PR state for exit notification: {:#}",
+                    e
+                );
                 return;
             }
         };
@@ -166,7 +169,7 @@ async fn post_exit_notification_if_needed(
     let reviews = match pr_monitor::get_all_reviews(host, owner, repo, pr_number).await {
         Ok(r) => r,
         Err(e) => {
-            log::warn!("⚠️  Could not fetch reviews for exit notification: {}", e);
+            log::warn!("⚠️  Could not fetch reviews for exit notification: {:#}", e);
             return;
         }
     };
@@ -435,7 +438,7 @@ async fn handle_ready_to_merge(
         )
         .await
         {
-            log::warn!("⚠️  Failed to ensure gru:needs-human-review label: {}", e);
+            log::warn!("⚠️  Failed to ensure gru:needs-human-review label: {:#}", e);
         }
         state.judge_label_ensured = true;
     }
@@ -557,7 +560,7 @@ async fn handle_ready_to_merge(
                 {
                     Ok(()) => state.judge_state.mark_label_applied(),
                     Err(e) => {
-                        log::warn!("Failed to add needs-human-review label: {}", e);
+                        log::warn!("Failed to add needs-human-review label: {:#}", e);
                     }
                 }
                 merge_judge::post_judge_escalation_comment(
@@ -576,7 +579,7 @@ async fn handle_ready_to_merge(
             log::debug!("Judge invocation skipped — PR state unchanged");
         }
         Err(e) => {
-            log::warn!("⚠️  Merge judge failed: {}", e);
+            log::warn!("⚠️  Merge judge failed: {:#}", e);
             println!("🔄 Will retry on next poll cycle...");
         }
     }
@@ -647,7 +650,7 @@ async fn handle_new_reviews(
             LoopAction::Continue
         }
         Err(e) => {
-            log::warn!("⚠️  Failed to address review comments: {}", e);
+            log::warn!("⚠️  Failed to address review comments: {:#}", e);
             log::warn!("   You can address them manually");
             LoopAction::Break
         }
@@ -992,7 +995,7 @@ pub(crate) async fn monitor_pr_lifecycle(
                 }
             }
             Err(e) => {
-                log::warn!("⚠️  Failed to run PR review: {}", e);
+                log::warn!("⚠️  Failed to run PR review: {:#}", e);
                 log::warn!("   You can review manually with: gru review {}", pr_number);
             }
         }
@@ -1189,7 +1192,7 @@ pub(crate) async fn monitor_ci_after_fix(
         })
         .await
         {
-            log::warn!("⚠️  Failed to backfill PR in registry: {}", e);
+            log::warn!("⚠️  Failed to backfill PR in registry: {:#}", e);
         }
     }
 
