@@ -148,7 +148,7 @@ enum Commands {
         )]
         worker: Option<String>,
     },
-    #[command(about = "View logs from a Minion's event stream")]
+    #[command(about = "View logs from a Minion's event stream", alias = "lg")]
     Logs {
         #[arg(help = "Minion ID, issue number, or PR number (e.g., M001, 42)")]
         id: String,
@@ -245,7 +245,7 @@ enum Commands {
         #[arg(help = "Minion ID, issue number, or PR number (e.g., M42, 42)")]
         id: String,
     },
-    #[command(about = "Attach to a Minion's Claude session")]
+    #[command(about = "Attach to a Minion's Claude session", alias = "at")]
     Attach {
         #[arg(help = "Minion ID, issue number, or PR number (e.g., M0tk, 42)")]
         id: String,
@@ -286,7 +286,7 @@ enum Commands {
         #[arg(long, default_value = "main", help = "Base branch to check for merges")]
         base_branch: String,
     },
-    #[command(about = "List active Minions")]
+    #[command(about = "List active Minions", alias = "st")]
     Status {
         #[arg(help = "Optional ID to filter by (minion ID, issue number, or PR number)")]
         id: Option<String>,
