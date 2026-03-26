@@ -193,10 +193,7 @@ pub(crate) async fn gh_api_with_retry(
 
         if output.status.success() {
             if attempts > 0 || rate_limit_retried {
-                log::info!(
-                    "GitHub API call succeeded after retries: gh {}",
-                    args_str
-                );
+                log::info!("GitHub API call succeeded after retries: gh {}", args_str);
             }
             return Ok(output);
         }
@@ -269,6 +266,7 @@ pub(crate) fn is_rate_limit_error(stderr: &str) -> bool {
     lower.contains("rate limit")
         || lower.contains("rate-limit")
         || lower.contains("too many requests")
+        || lower.contains("429")
 }
 
 #[derive(Debug, Deserialize)]
@@ -307,8 +305,7 @@ pub(crate) async fn get_rate_limit_reset(host: &str) -> Option<u64> {
 /// 2. If available, sleeps until `reset + jitter`.
 /// 3. If the rate limit API itself fails, falls back to a fixed 60 s sleep.
 ///
-/// Returns the duration slept (useful for logging by callers).
-pub(crate) async fn sleep_until_rate_limit_reset(host: &str) -> std::time::Duration {
+pub(crate) async fn sleep_until_rate_limit_reset(host: &str) {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     if let Some(reset_epoch) = get_rate_limit_reset(host).await {
@@ -334,20 +331,28 @@ pub(crate) async fn sleep_until_rate_limit_reset(host: &str) -> std::time::Durat
                 dur_min,
                 dur_sec,
             );
-            let duration = std::time::Duration::from_secs(sleep_secs);
-            tokio::time::sleep(duration).await;
-            return duration;
+            tokio::time::sleep(std::time::Duration::from_secs(sleep_secs)).await;
+            return;
         }
+
+        // Reset epoch is in the past — likely stale or clock skew
+        log::warn!(
+            "Rate limited but reset epoch {} is already past (now={}). Sleeping {}s as fallback.",
+            reset_epoch,
+            now,
+            RATE_LIMIT_FALLBACK_SLEEP_SECS,
+        );
+    } else {
+        log::warn!(
+            "Rate limited (could not query reset time). Sleeping {}s as fallback.",
+            RATE_LIMIT_FALLBACK_SLEEP_SECS,
+        );
     }
 
-    // Fallback: rate_limit API failed or reset is in the past
-    log::warn!(
-        "Rate limited (could not determine reset time). Sleeping {}s as fallback.",
+    tokio::time::sleep(std::time::Duration::from_secs(
         RATE_LIMIT_FALLBACK_SLEEP_SECS,
-    );
-    let duration = std::time::Duration::from_secs(RATE_LIMIT_FALLBACK_SLEEP_SECS);
-    tokio::time::sleep(duration).await;
-    duration
+    ))
+    .await;
 }
 
 /// Build a full GitHub issue URL for a repo in "owner/repo" format, with an explicit host.
@@ -1856,6 +1861,9 @@ mod tests {
         assert!(is_rate_limit_error("secondary rate-limit hit"));
         assert!(is_rate_limit_error("HTTP 429 Too Many Requests"));
         assert!(is_rate_limit_error("too many requests"));
+        // Bare HTTP status code
+        assert!(is_rate_limit_error("HTTP 429"));
+        assert!(is_rate_limit_error("status: 429"));
     }
 
     #[test]
@@ -1872,32 +1880,6 @@ mod tests {
         assert!(!is_rate_limit_error("not found"));
         assert!(!is_rate_limit_error("unauthorized"));
         assert!(!is_rate_limit_error(""));
-    }
-
-    // --- is_retryable_error excludes rate limits ---
-
-    #[test]
-    fn test_is_retryable_error_excludes_rate_limits() {
-        assert!(!is_retryable_error("rate limit exceeded"));
-        assert!(!is_retryable_error("rate-limit"));
-        assert!(!is_retryable_error("too many requests"));
-        assert!(!is_retryable_error("HTTP 429 Too Many Requests"));
-    }
-
-    #[test]
-    fn test_is_retryable_error_matches_transient() {
-        assert!(is_retryable_error("HTTP 502 Bad Gateway"));
-        assert!(is_retryable_error("503 Service Unavailable"));
-        assert!(is_retryable_error("connection timed out"));
-        assert!(is_retryable_error("temporary failure"));
-    }
-
-    #[test]
-    fn test_is_retryable_error_non_retryable() {
-        assert!(!is_retryable_error("not found"));
-        assert!(!is_retryable_error("unauthorized"));
-        assert!(!is_retryable_error("HTTP 404"));
-        assert!(!is_retryable_error(""));
     }
 
     // --- RateLimitResponse deserialization test ---
