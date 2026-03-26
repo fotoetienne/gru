@@ -32,6 +32,7 @@ mod stream;
 mod text_buffer;
 mod tmux;
 mod url_utils;
+mod version_check;
 mod workspace;
 mod worktree_scanner;
 

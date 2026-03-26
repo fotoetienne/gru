@@ -141,6 +141,9 @@ pub(crate) async fn handle_status(
     verbose: bool,
     show_all: bool,
 ) -> Result<i32> {
+    // Spawn non-blocking version check in background (runs while we do real work)
+    let version_rx = crate::version_check::spawn_version_check();
+
     // Prune stale entries using the shared three-phase approach that checks
     // GitHub PR status before removing entries with open PRs.
     // Non-fatal: a transient GitHub API error should not prevent status display.
@@ -428,6 +431,9 @@ pub(crate) async fn handle_status(
             footer_parts.join(", ")
         );
     }
+
+    // Print version notification if a newer release is available
+    crate::version_check::print_if_newer(version_rx).await;
 
     Ok(0)
 }
