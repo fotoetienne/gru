@@ -121,7 +121,7 @@ pub(crate) async fn handle_review(pr_arg: Option<String>, agent_name: &str) -> R
     let pr_details = match fetch_pr_details(&owner, &repo, &host, pr_num_u64).await {
         Ok(details) => Some(details),
         Err(e) => {
-            log::warn!("Failed to fetch PR details: {e}. Using fallback prompt.");
+            log::warn!("Failed to fetch PR details: {e:#}. Using fallback prompt.");
             None
         }
     };
@@ -131,7 +131,7 @@ pub(crate) async fn handle_review(pr_arg: Option<String>, agent_name: &str) -> R
         .await
         .unwrap_or_else(|e| {
             log::warn!(
-                "Warning: Failed to fetch linked issue for PR #{}: {}",
+                "Warning: Failed to fetch linked issue for PR #{}: {:#}",
                 pr_num,
                 e
             );
@@ -519,7 +519,7 @@ fn build_review_prompt(
     let prompt_template = match prompt_loader::resolve_prompt("review", Some(worktree_path)) {
         Ok(p) => p,
         Err(e) => {
-            log::warn!("Failed to load review prompt: {e}, using /pr_review fallback");
+            log::warn!("Failed to load review prompt: {e:#}, using /pr_review fallback");
             None
         }
     };
