@@ -3,7 +3,7 @@ use crate::github::{self, list_ready_issues_via_cli};
 use crate::labels;
 use crate::minion_registry::{with_registry, MinionInfo, MinionMode, OrchestrationPhase};
 use crate::pr_monitor;
-use crate::retry_queue::{RetryKind, RetryQueue};
+use crate::retry_queue::RetryQueue;
 use crate::tmux::TmuxGuard;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Local, Utc};
@@ -44,11 +44,12 @@ struct SpawnMeta {
     host: String,
     owner: String,
     repo: String,
-    /// Full `owner/repo` string for registry lookups.
-    full_repo: String,
     issue_number: u64,
     ready_label: String,
     spawned_at: Instant,
+    /// Retry attempt counter — carried through from RetryEntry so the retry
+    /// queue can track attempts without depending on the registry.
+    retry_attempt: u32,
 }
 
 /// Determines whether a failed spawn qualifies for label restoration.
@@ -352,8 +353,6 @@ async fn reap_children(children: &mut Vec<SpawnedChild>, retry_queue: &mut Retry
                             }
                         } else {
                             // Non-early failure: enqueue for retry with backoff
-                            let attempt =
-                                lookup_attempt_count(&meta.full_repo, meta.issue_number).await;
                             let reason = format!(
                                 "exited with {} after {:.0}s",
                                 status,
@@ -364,7 +363,7 @@ async fn reap_children(children: &mut Vec<SpawnedChild>, retry_queue: &mut Retry
                                 &meta.owner,
                                 &meta.repo,
                                 meta.issue_number,
-                                attempt,
+                                meta.retry_attempt,
                                 &reason,
                                 None,
                                 None,
@@ -372,7 +371,7 @@ async fn reap_children(children: &mut Vec<SpawnedChild>, retry_queue: &mut Retry
                                 log::warn!(
                                     "⚠️  Issue #{} exceeded max retry attempts ({}) — not retrying",
                                     meta.issue_number,
-                                    attempt
+                                    meta.retry_attempt
                                 );
                             }
                         }
@@ -390,23 +389,6 @@ async fn reap_children(children: &mut Vec<SpawnedChild>, retry_queue: &mut Retry
             }
         }
     }
-}
-
-/// Look up the current attempt count for the most recent Minion on an issue.
-async fn lookup_attempt_count(repo: &str, issue_number: u64) -> u32 {
-    let repo = repo.to_string();
-    with_registry(move |registry| {
-        let entries = registry.find_by_issue(&repo, issue_number);
-        // Use the highest attempt count among minions for this issue
-        let max_attempt = entries
-            .iter()
-            .map(|(_, info)| info.attempt_count)
-            .max()
-            .unwrap_or(0);
-        Ok(max_attempt)
-    })
-    .await
-    .unwrap_or(0)
 }
 
 /// Handle child processes on lab shutdown.
@@ -1348,10 +1330,11 @@ async fn try_spawn_for_issue(
                     host: ctx.host.clone(),
                     owner: ctx.owner.clone(),
                     repo: ctx.repo.clone(),
-                    full_repo: ctx.full.clone(),
+
                     issue_number,
                     ready_label: label.to_string(),
                     spawned_at: Instant::now(),
+                    retry_attempt: 0, // first attempt, not a retry
                 }),
             });
             tprintln!("✨ Spawned Minion for {}/issues/{}", ctx.spec, issue_number);
@@ -1615,39 +1598,9 @@ async fn dispatch_due_retries(
 
     for entry in due {
         if *available == 0 {
-            // No slots left — re-enqueue remaining retries (they'll be picked up next cycle).
-            // We re-enqueue with the same parameters since the due_at is already past.
-            match entry.kind {
-                RetryKind::Continuation => {
-                    if let (Some(session_id), Some(minion_id), Some(workspace_path)) =
-                        (&entry.session_id, &entry.minion_id, &entry.workspace_path)
-                    {
-                        retry_queue.enqueue_continuation(
-                            &entry.host,
-                            &entry.owner,
-                            &entry.repo,
-                            entry.issue_number,
-                            session_id,
-                            minion_id,
-                            workspace_path.clone(),
-                            &entry.reason,
-                        );
-                    }
-                }
-                RetryKind::Failure => {
-                    // Re-enqueue at same attempt count (subtract 1 since enqueue_failure increments)
-                    retry_queue.enqueue_failure(
-                        &entry.host,
-                        &entry.owner,
-                        &entry.repo,
-                        entry.issue_number,
-                        entry.attempt.saturating_sub(1),
-                        &entry.reason,
-                        entry.minion_id.as_deref(),
-                        entry.workspace_path.clone(),
-                    );
-                }
-            }
+            // No slots left — re-insert with original due_at preserved
+            // so the backoff timer isn't reset on every slot-full poll cycle.
+            retry_queue.reinsert(entry);
             continue;
         }
 
@@ -1696,10 +1649,11 @@ async fn dispatch_due_retries(
                         host: entry.host.clone(),
                         owner: entry.owner.clone(),
                         repo: entry.repo.clone(),
-                        full_repo: full_repo.clone(),
+
                         issue_number: entry.issue_number,
                         ready_label: labels::TODO.to_string(),
                         spawned_at: Instant::now(),
+                        retry_attempt: entry.attempt, // carry through for next failure
                     }),
                 });
                 dispatched += 1;
@@ -2194,10 +2148,11 @@ mod tests {
             host: "github.com".to_string(),
             owner: "test-owner".to_string(),
             repo: "test-repo".to_string(),
-            full_repo: "test-owner/test-repo".to_string(),
+
             issue_number: 42,
             ready_label: "gru:todo".to_string(),
             spawned_at: Instant::now(),
+            retry_attempt: 0,
         };
         assert_eq!(meta.issue_number, 42);
         assert!(meta.spawned_at.elapsed() <= EARLY_EXIT_THRESHOLD);

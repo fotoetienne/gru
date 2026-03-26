@@ -6,12 +6,16 @@ use std::time::{Duration, Instant};
 const DEFAULT_BASE_DELAY_SECS: u64 = 10;
 
 /// Fixed delay for continuation retries (1 second).
+/// Used by `enqueue_continuation`, which is infrastructure for #618.
+#[allow(dead_code)]
 const CONTINUATION_DELAY: Duration = Duration::from_secs(1);
 
 /// Distinguishes between the two retry paths.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RetryKind {
     /// Agent finished normally but issue still needs work. Fast retry, reuse session.
+    /// Infrastructure for #618 (multi-turn session reuse).
+    #[allow(dead_code)]
     Continuation,
     /// Agent crashed, timed out, or stalled. Backoff retry, fresh session.
     Failure,
@@ -40,14 +44,15 @@ pub struct RetryEntry {
     /// Human-readable reason for the retry.
     pub reason: String,
     /// For continuation retries: reuse the same session-id.
+    /// Infrastructure for #618 (multi-turn session reuse).
+    #[allow(dead_code)]
     pub session_id: Option<String>,
     /// Minion ID to resume (if reusing worktree).
+    #[allow(dead_code)]
     pub minion_id: Option<String>,
     /// Path to the existing worktree checkout.
+    #[allow(dead_code)]
     pub workspace_path: Option<PathBuf>,
-    /// Generation counter — prevents stale retry timers from firing.
-    #[allow(dead_code)] // Part of the stale-retry detection protocol
-    pub generation: u64,
     /// GitHub host for this issue.
     pub host: String,
 }
@@ -60,8 +65,6 @@ pub struct RetryEntry {
 pub struct RetryQueue {
     /// Keyed by `"{owner}/{repo}#{issue_number}"` for dedup.
     entries: HashMap<String, RetryEntry>,
-    /// Monotonically increasing generation counter.
-    next_generation: u64,
     /// Maximum failure retry attempts (0 = no failure retries).
     max_attempts: u32,
     /// Maximum backoff delay in seconds.
@@ -73,7 +76,6 @@ impl RetryQueue {
     pub fn new(max_attempts: u32, max_backoff_secs: u64) -> Self {
         Self {
             entries: HashMap::new(),
-            next_generation: 1,
             max_attempts,
             max_backoff_secs,
         }
@@ -101,8 +103,6 @@ impl RetryQueue {
 
         let delay = backoff_delay(attempt, self.max_backoff_secs);
         let key = entry_key(owner, repo, issue_number);
-        let generation = self.next_generation;
-        self.next_generation += 1;
 
         log::info!(
             "🔄 Enqueuing failure retry #{} for {}/{}#{} (backoff {:.0}s): {}",
@@ -127,7 +127,6 @@ impl RetryQueue {
                 session_id: None,
                 minion_id: minion_id.map(String::from),
                 workspace_path,
-                generation,
                 host: host.to_string(),
             },
         );
@@ -136,6 +135,10 @@ impl RetryQueue {
     }
 
     /// Enqueue a continuation retry with fixed 1-second delay.
+    ///
+    /// Infrastructure for #618 (multi-turn session reuse). The trigger — detecting
+    /// a clean exit where the issue is still open — will be wired up in that issue.
+    #[allow(dead_code)]
     #[allow(clippy::too_many_arguments)]
     pub fn enqueue_continuation(
         &mut self,
@@ -149,8 +152,6 @@ impl RetryQueue {
         reason: &str,
     ) {
         let key = entry_key(owner, repo, issue_number);
-        let generation = self.next_generation;
-        self.next_generation += 1;
 
         log::info!(
             "🔄 Enqueuing continuation retry for {}/{}#{}: {}",
@@ -173,7 +174,6 @@ impl RetryQueue {
                 session_id: Some(session_id.to_string()),
                 minion_id: Some(minion_id.to_string()),
                 workspace_path: Some(workspace_path),
-                generation,
                 host: host.to_string(),
             },
         );
@@ -205,9 +205,15 @@ impl RetryQueue {
         due
     }
 
-    /// Cancel a retry for a specific issue (e.g., issue was closed or re-dispatched).
+    /// Re-insert an entry that was taken but couldn't be dispatched (e.g., no slots).
     ///
-    /// Bumps the generation counter so any stale references are invalidated.
+    /// Preserves the original `due_at` so the backoff timer isn't reset.
+    pub fn reinsert(&mut self, entry: RetryEntry) {
+        let key = entry_key(&entry.owner, &entry.repo, entry.issue_number);
+        self.entries.insert(key, entry);
+    }
+
+    /// Cancel a retry for a specific issue (e.g., issue was closed or re-dispatched).
     #[allow(dead_code)] // Used in tests; will be called from lab when issues are re-dispatched
     pub fn cancel(&mut self, owner: &str, repo: &str, issue_number: u64) {
         let key = entry_key(owner, repo, issue_number);
@@ -364,7 +370,6 @@ mod tests {
                 session_id: None,
                 minion_id: None,
                 workspace_path: None,
-                generation: 1,
                 host: "github.com".to_string(),
             },
         );
@@ -393,7 +398,6 @@ mod tests {
                 session_id: None,
                 minion_id: None,
                 workspace_path: None,
-                generation: 1,
                 host: "github.com".to_string(),
             },
         );
@@ -422,7 +426,6 @@ mod tests {
                 session_id: None,
                 minion_id: None,
                 workspace_path: None,
-                generation: 1,
                 host: "github.com".to_string(),
             },
         );
@@ -441,7 +444,6 @@ mod tests {
                 session_id: Some("sess".to_string()),
                 minion_id: Some("M001".to_string()),
                 workspace_path: Some(PathBuf::from("/tmp")),
-                generation: 2,
                 host: "github.com".to_string(),
             },
         );
@@ -487,5 +489,32 @@ mod tests {
     fn test_retry_kind_display() {
         assert_eq!(format!("{}", RetryKind::Continuation), "continuation");
         assert_eq!(format!("{}", RetryKind::Failure), "failure");
+    }
+
+    #[test]
+    fn test_reinsert_preserves_due_at() {
+        let mut queue = RetryQueue::new(3, 300);
+        let original_due = Instant::now() - Duration::from_secs(5);
+
+        let entry = RetryEntry {
+            owner: "owner".to_string(),
+            repo: "repo".to_string(),
+            issue_number: 42,
+            kind: RetryKind::Failure,
+            attempt: 2,
+            due_at: original_due,
+            reason: "crash".to_string(),
+            session_id: None,
+            minion_id: None,
+            workspace_path: None,
+            host: "github.com".to_string(),
+        };
+
+        queue.reinsert(entry);
+        assert_eq!(queue.len(), 1);
+
+        let entries = queue.pending_entries();
+        assert_eq!(entries[0].due_at, original_due);
+        assert_eq!(entries[0].attempt, 2);
     }
 }
