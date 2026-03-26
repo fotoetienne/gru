@@ -121,14 +121,16 @@ fn format_mode_display(
 /// Maximum column width before truncation with ellipsis.
 const MAX_COL_WIDTH: usize = 40;
 
-/// Truncates a string to `max_width`, appending `…` if it exceeds the limit.
+/// Truncates a string to `max_width` characters, appending `…` if it exceeds the limit.
 fn truncate(s: &str, max_width: usize) -> String {
-    if s.len() <= max_width {
+    let char_count = s.chars().count();
+    if char_count <= max_width {
         s.to_string()
     } else if max_width <= 1 {
         "\u{2026}".to_string()
     } else {
-        format!("{}\u{2026}", &s[..max_width - 1])
+        let cut: String = s.chars().take(max_width - 1).collect();
+        format!("{cut}\u{2026}")
     }
 }
 
@@ -142,7 +144,10 @@ fn col_width(header: &str, values: impl Iterator<Item = usize>, min_width: usize
 /// Prints the normal (non-verbose) status table with dynamic column widths.
 fn print_normal_table(minions: &[EnhancedMinionInfo]) {
     // Pre-compute display strings for columns that need formatting
-    let issue_displays: Vec<String> = minions.iter().map(|m| format!("#{}", m.issue)).collect();
+    let issue_displays: Vec<String> = minions
+        .iter()
+        .map(|m| m.issue.map_or("-".to_string(), |n| format!("#{}", n)))
+        .collect();
     let pr_displays: Vec<String> = minions
         .iter()
         .map(|m| {
@@ -161,16 +166,36 @@ fn print_normal_table(minions: &[EnhancedMinionInfo]) {
         })
         .collect();
 
-    // Calculate column widths dynamically
-    let w_minion = col_width("MINION", minions.iter().map(|m| m.minion_id.len()), 6);
-    let w_agent = col_width("AGENT", minions.iter().map(|m| m.agent_name.len()), 5);
-    let w_repo = col_width("REPO", minions.iter().map(|m| m.repo.len()), 4);
-    let w_issue = col_width("ISSUE", issue_displays.iter().map(|s| s.len()), 5);
-    let w_task = col_width("TASK", minions.iter().map(|m| m.task.len()), 4);
-    let w_pr = col_width("PR", pr_displays.iter().map(|s| s.len()), 2);
-    let w_branch = col_width("BRANCH", minions.iter().map(|m| m.branch.len()), 6);
-    let w_mode = col_width("MODE", minions.iter().map(|m| m.mode_display.len()), 4);
-    let w_uptime = col_width("UPTIME", minions.iter().map(|m| m.uptime.len()), 6);
+    // Calculate column widths dynamically (use chars().count() for correct Unicode widths)
+    let w_minion = col_width(
+        "MINION",
+        minions.iter().map(|m| m.minion_id.chars().count()),
+        6,
+    );
+    let w_agent = col_width(
+        "AGENT",
+        minions.iter().map(|m| m.agent_name.chars().count()),
+        5,
+    );
+    let w_repo = col_width("REPO", minions.iter().map(|m| m.repo.chars().count()), 4);
+    let w_issue = col_width("ISSUE", issue_displays.iter().map(|s| s.chars().count()), 5);
+    let w_task = col_width("TASK", minions.iter().map(|m| m.task.chars().count()), 4);
+    let w_pr = col_width("PR", pr_displays.iter().map(|s| s.chars().count()), 2);
+    let w_branch = col_width(
+        "BRANCH",
+        minions.iter().map(|m| m.branch.chars().count()),
+        6,
+    );
+    let w_mode = col_width(
+        "MODE",
+        minions.iter().map(|m| m.mode_display.chars().count()),
+        4,
+    );
+    let w_uptime = col_width(
+        "UPTIME",
+        minions.iter().map(|m| m.uptime.chars().count()),
+        6,
+    );
 
     // Print header
     println!(
@@ -199,7 +224,10 @@ fn print_normal_table(minions: &[EnhancedMinionInfo]) {
 /// Prints the verbose status table with dynamic column widths.
 fn print_verbose_table(minions: &[EnhancedMinionInfo]) {
     // Pre-compute display strings
-    let issue_displays: Vec<String> = minions.iter().map(|m| format!("#{}", m.issue)).collect();
+    let issue_displays: Vec<String> = minions
+        .iter()
+        .map(|m| m.issue.map_or("-".to_string(), |n| format!("#{}", n)))
+        .collect();
     let pid_displays: Vec<String> = minions
         .iter()
         .map(|m| {
@@ -209,13 +237,25 @@ fn print_verbose_table(minions: &[EnhancedMinionInfo]) {
         })
         .collect();
 
-    // Calculate column widths dynamically
-    let w_id = col_width("ID", minions.iter().map(|m| m.minion_id.len()), 2);
-    let w_issue = col_width("ISSUE", issue_displays.iter().map(|s| s.len()), 5);
-    let w_agent = col_width("AGENT", minions.iter().map(|m| m.agent_name.len()), 5);
-    let w_mode = col_width("MODE", minions.iter().map(|m| m.mode_display.len()), 4);
-    let w_session = col_width("SESSION ID", minions.iter().map(|m| m.session_id.len()), 10);
-    let w_pid = col_width("PID", pid_displays.iter().map(|s| s.len()), 3);
+    // Calculate column widths dynamically (use chars().count() for correct Unicode widths)
+    let w_id = col_width("ID", minions.iter().map(|m| m.minion_id.chars().count()), 2);
+    let w_issue = col_width("ISSUE", issue_displays.iter().map(|s| s.chars().count()), 5);
+    let w_agent = col_width(
+        "AGENT",
+        minions.iter().map(|m| m.agent_name.chars().count()),
+        5,
+    );
+    let w_mode = col_width(
+        "MODE",
+        minions.iter().map(|m| m.mode_display.chars().count()),
+        4,
+    );
+    let w_session = col_width(
+        "SESSION ID",
+        minions.iter().map(|m| m.session_id.chars().count()),
+        10,
+    );
+    let w_pid = col_width("PID", pid_displays.iter().map(|s| s.chars().count()), 3);
 
     // Print header
     println!(
@@ -649,6 +689,12 @@ mod tests {
     #[test]
     fn test_truncate_empty_string() {
         assert_eq!(truncate("", 10), "");
+    }
+
+    #[test]
+    fn test_truncate_multibyte_chars() {
+        // Should not panic on multi-byte UTF-8 characters
+        assert_eq!(truncate("org/repoé-name", 10), "org/repoé\u{2026}");
     }
 
     // --- col_width tests ---
