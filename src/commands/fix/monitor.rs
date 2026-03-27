@@ -59,11 +59,18 @@ async fn reset_attempt_count(minion_id: &str) {
     }
 }
 
+/// Outcome of an automatic rebase attempt.
+enum AutoRebaseResult {
+    /// Branch was already up-to-date; no rebase or force-push occurred.
+    AlreadyUpToDate,
+    /// Rebase succeeded and branch was force-pushed.
+    RebasedAndPushed,
+    /// Conflicts could not be resolved automatically.
+    ConflictUnresolved,
+}
+
 /// Attempts to auto-rebase the worktree branch onto its base branch.
-///
-/// Returns `Ok(true)` if the rebase succeeded (clean or Claude resolved conflicts),
-/// `Ok(false)` if Claude couldn't resolve conflicts, or `Err` on unexpected failures.
-async fn auto_rebase_pr(worktree_path: &Path) -> Result<bool> {
+async fn auto_rebase_pr(worktree_path: &Path) -> Result<AutoRebaseResult> {
     use super::super::rebase::{
         abort_rebase, attempt_rebase, check_clean_worktree, detect_base_branch, fetch_origin,
         force_push, is_up_to_date, run_agent_rebase, RebaseOutcome,
@@ -88,7 +95,7 @@ async fn auto_rebase_pr(worktree_path: &Path) -> Result<bool> {
             "✅ Already up-to-date with origin/{}, skipping rebase",
             base_branch
         );
-        return Ok(true);
+        return Ok(AutoRebaseResult::AlreadyUpToDate);
     }
 
     println!("🔄 Rebasing onto origin/{}...", base_branch);
@@ -104,7 +111,7 @@ async fn auto_rebase_pr(worktree_path: &Path) -> Result<bool> {
             log::info!("Auto force-pushing rebased branch (autonomous mode, --force-with-lease)");
             force_push(worktree_path).await?;
             println!("🚀 Force-pushed rebased branch");
-            Ok(true)
+            Ok(AutoRebaseResult::RebasedAndPushed)
         }
         RebaseOutcome::Conflicts => {
             println!("⚠️  Conflicts detected, launching agent to resolve...");
@@ -117,10 +124,10 @@ async fn auto_rebase_pr(worktree_path: &Path) -> Result<bool> {
                 log::info!("Auto force-pushing after conflict resolution (autonomous mode, --force-with-lease)");
                 force_push(worktree_path).await?;
                 println!("🚀 Force-pushed rebased branch");
-                Ok(true)
+                Ok(AutoRebaseResult::RebasedAndPushed)
             } else {
                 log::warn!("Agent rebase exited with code {}", exit_code);
-                Ok(false)
+                Ok(AutoRebaseResult::ConflictUnresolved)
             }
         }
     }
@@ -768,7 +775,7 @@ async fn handle_merge_conflict(
     );
 
     match auto_rebase_pr(&ctx.wt_ctx.checkout_path).await {
-        Ok(true) => {
+        Ok(AutoRebaseResult::RebasedAndPushed) => {
             // Reset counter on success — GitHub may still report
             // mergeable: false for a few poll cycles after force-push
             // while it recomputes. We don't want stale signals to
@@ -787,7 +794,16 @@ async fn handle_merge_conflict(
             println!("✅ Rebase succeeded, continuing to monitor PR...\n");
             LoopAction::Continue
         }
-        Ok(false) => {
+        Ok(AutoRebaseResult::AlreadyUpToDate) => {
+            // Branch is already up-to-date — no force-push happened, so no
+            // need for a cooldown. The mergeable:false signal may be a real
+            // conflict from a content-level merge issue rather than cache lag.
+            state.rebase_attempts = 0;
+            state.review_baseline = Some(check_time);
+            println!("✅ Branch already up-to-date, continuing to monitor PR...\n");
+            LoopAction::Continue
+        }
+        Ok(AutoRebaseResult::ConflictUnresolved) => {
             // Agent couldn't resolve conflicts
             println!("❌ Could not resolve merge conflicts automatically");
             post_escalation_comment(
