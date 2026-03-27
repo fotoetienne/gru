@@ -112,6 +112,13 @@ pub(crate) async fn run_gh(host: &str, args: &[&str]) -> Result<String> {
 /// Rate limit errors are **excluded** — they are handled separately via
 /// [`is_rate_limit_error`] and [`sleep_until_rate_limit_reset`].
 pub(crate) fn is_retryable_error(stderr: &str) -> bool {
+    // Exclude rate limit errors first — they get separate handling.
+    // Pass the original stderr so it is only lowercased once inside
+    // is_rate_limit_error, avoiding a redundant allocation here.
+    if is_rate_limit_error(stderr) {
+        return false;
+    }
+
     // All patterns must be lowercase for case-insensitive matching
     let retryable_patterns = [
         // HTTP status codes
@@ -142,12 +149,6 @@ pub(crate) fn is_retryable_error(stderr: &str) -> bool {
     ];
 
     let lower_stderr = stderr.to_lowercase();
-
-    // Exclude rate limit errors — they get separate handling
-    if is_rate_limit_error(&lower_stderr) {
-        return false;
-    }
-
     retryable_patterns
         .iter()
         .any(|pattern| lower_stderr.contains(pattern))
@@ -266,11 +267,33 @@ pub(crate) fn is_rate_limit_error(stderr: &str) -> bool {
     lower.contains("rate limit")
         || lower.contains("rate-limit")
         || lower.contains("too many requests")
-        || lower.contains("429")
+        || contains_standalone_429(&lower)
+}
+
+/// Return true if the string contains "429" that is not part of a larger
+/// number (i.e., not immediately preceded or followed by a digit). This
+/// avoids matching timestamps or request IDs that happen to contain "429".
+fn contains_standalone_429(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    let len = bytes.len();
+    if len < 3 {
+        return false;
+    }
+    for i in 0..=len - 3 {
+        if &bytes[i..i + 3] == b"429" {
+            let prev_is_digit = i > 0 && bytes[i - 1].is_ascii_digit();
+            let next_is_digit = i + 3 < len && bytes[i + 3].is_ascii_digit();
+            if !prev_is_digit && !next_is_digit {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 #[derive(Debug, Deserialize)]
 struct RateLimitRate {
+    remaining: u64,
     reset: u64,
 }
 
@@ -279,16 +302,30 @@ struct RateLimitResponse {
     rate: RateLimitRate,
 }
 
-/// Query the GitHub rate limit API and return the core-rate reset epoch.
+/// Info extracted from the GitHub rate limit API.
+#[derive(Debug)]
+struct RateLimitInfo {
+    /// Remaining requests in the current window.
+    remaining: u64,
+    /// Unix epoch when the current window resets.
+    reset: u64,
+}
+
+/// Query the GitHub rate limit API and return the core-rate reset epoch and
+/// remaining quota.
 ///
 /// Returns `None` if the API call fails (chicken-and-egg: we may already be
-/// rate-limited) or the response cannot be parsed.
-pub(crate) async fn get_rate_limit_reset(host: &str) -> Option<u64> {
-    let output = gh_cli_command(host)
+/// rate-limited), times out, or the response cannot be parsed.
+async fn get_rate_limit_reset(host: &str) -> Option<RateLimitInfo> {
+    let child = gh_cli_command(host)
         .args(["api", "rate_limit"])
-        .output()
+        .kill_on_drop(true)
+        .output();
+
+    let output = tokio::time::timeout(Duration::from_secs(GH_TIMEOUT_SECS), child)
         .await
-        .ok()?;
+        .ok()? // timeout elapsed
+        .ok()?; // spawn/IO error
 
     if !output.status.success() {
         return None;
@@ -296,52 +333,83 @@ pub(crate) async fn get_rate_limit_reset(host: &str) -> Option<u64> {
 
     let body = String::from_utf8_lossy(&output.stdout);
     let parsed: RateLimitResponse = serde_json::from_str(&body).ok()?;
-    Some(parsed.rate.reset)
+    Some(RateLimitInfo {
+        remaining: parsed.rate.remaining,
+        reset: parsed.rate.reset,
+    })
 }
 
 /// Handle a rate limit error by sleeping until the reset window.
 ///
 /// 1. Queries `gh api rate_limit` for the reset epoch.
-/// 2. If available, sleeps until `reset + jitter`.
-/// 3. If the rate limit API itself fails, falls back to a fixed 60 s sleep.
-///
+/// 2. If the reset is within [`RATE_LIMIT_FALLBACK_SLEEP_SECS`] of now,
+///    sleeps until `reset + jitter`.
+/// 3. If the reset is far in the future (likely a secondary/concurrency
+///    rate limit where the core quota is still available), falls back to
+///    a fixed 60 s sleep to avoid oversleeping.
+/// 4. If the rate limit API itself fails, falls back to a fixed 60 s sleep.
 pub(crate) async fn sleep_until_rate_limit_reset(host: &str) {
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    if let Some(reset_epoch) = get_rate_limit_reset(host).await {
+    if let Some(info) = get_rate_limit_reset(host).await {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
 
-        if reset_epoch > now {
-            let sleep_secs = reset_epoch - now + RATE_LIMIT_JITTER_SECS;
-            let reset_time = chrono::DateTime::from_timestamp(reset_epoch as i64, 0)
-                .map(|dt| {
-                    dt.with_timezone(&chrono::Local)
-                        .format("%l:%M %p")
-                        .to_string()
-                })
-                .unwrap_or_else(|| "unknown".to_string());
-            let dur_min = sleep_secs / 60;
-            let dur_sec = sleep_secs % 60;
+        // If core quota still has remaining requests, this is likely a
+        // secondary (concurrency) rate limit — use the short fallback.
+        if info.remaining > 0 {
             log::warn!(
-                "Rate limited. Pausing until {} ({}m {}s)",
-                reset_time.trim(),
-                dur_min,
-                dur_sec,
+                "Rate limited but core quota has {} remaining (secondary/concurrency limit). \
+                 Sleeping {}s as fallback.",
+                info.remaining,
+                RATE_LIMIT_FALLBACK_SLEEP_SECS,
             );
-            tokio::time::sleep(std::time::Duration::from_secs(sleep_secs)).await;
-            return;
-        }
+        } else if info.reset > now {
+            let diff_secs = info.reset - now;
 
-        // Reset epoch is in the past — likely stale or clock skew
-        log::warn!(
-            "Rate limited but reset epoch {} is already past (now={}). Sleeping {}s as fallback.",
-            reset_epoch,
-            now,
-            RATE_LIMIT_FALLBACK_SLEEP_SECS,
-        );
+            // Only trust the reset epoch for reasonably short waits. When the
+            // reset is far in the future, sleeping until reset could cause
+            // us to oversleep by a large margin.
+            if diff_secs <= RATE_LIMIT_FALLBACK_SLEEP_SECS {
+                let sleep_secs = diff_secs + RATE_LIMIT_JITTER_SECS;
+                let reset_time = chrono::DateTime::from_timestamp(info.reset as i64, 0)
+                    .map(|dt| {
+                        dt.with_timezone(&chrono::Local)
+                            .format("%l:%M %p")
+                            .to_string()
+                    })
+                    .unwrap_or_else(|| "unknown".to_string());
+                let dur_min = sleep_secs / 60;
+                let dur_sec = sleep_secs % 60;
+                log::warn!(
+                    "Rate limited (remaining=0). Pausing until {} ({}m {}s)",
+                    reset_time.trim(),
+                    dur_min,
+                    dur_sec,
+                );
+                tokio::time::sleep(std::time::Duration::from_secs(sleep_secs)).await;
+                return;
+            }
+
+            log::warn!(
+                "Rate limited. Reset is {}s in the future (> {}s cap). \
+                 Sleeping {}s as fallback to avoid oversleeping.",
+                diff_secs,
+                RATE_LIMIT_FALLBACK_SLEEP_SECS,
+                RATE_LIMIT_FALLBACK_SLEEP_SECS,
+            );
+        } else {
+            // Reset epoch is in the past — likely stale or clock skew
+            log::warn!(
+                "Rate limited but reset epoch {} is already past (now={}). \
+                 Sleeping {}s as fallback.",
+                info.reset,
+                now,
+                RATE_LIMIT_FALLBACK_SLEEP_SECS,
+            );
+        }
     } else {
         log::warn!(
             "Rate limited (could not query reset time). Sleeping {}s as fallback.",
@@ -1880,6 +1948,61 @@ mod tests {
         assert!(!is_rate_limit_error("not found"));
         assert!(!is_rate_limit_error("unauthorized"));
         assert!(!is_rate_limit_error(""));
+        // Digits embedded in larger numbers should not match
+        assert!(!is_rate_limit_error("request_id=142938"));
+        assert!(!is_rate_limit_error("timestamp: 14291234"));
+    }
+
+    // --- contains_standalone_429 tests ---
+
+    #[test]
+    fn test_contains_standalone_429_matches() {
+        assert!(contains_standalone_429("429"));
+        assert!(contains_standalone_429("HTTP 429"));
+        assert!(contains_standalone_429("status: 429"));
+        assert!(contains_standalone_429("error 429 rate"));
+        assert!(contains_standalone_429("429 Too Many"));
+    }
+
+    #[test]
+    fn test_contains_standalone_429_rejects_embedded_digits() {
+        assert!(!contains_standalone_429("14291234"));
+        assert!(!contains_standalone_429("id=142938"));
+        assert!(!contains_standalone_429("4290"));
+        assert!(!contains_standalone_429("1429"));
+    }
+
+    #[test]
+    fn test_contains_standalone_429_edge_cases() {
+        assert!(!contains_standalone_429(""));
+        assert!(!contains_standalone_429("42"));
+        assert!(contains_standalone_429("x429x"));
+        assert!(!contains_standalone_429("x4290"));
+    }
+
+    #[test]
+    fn test_is_rate_limit_error_429_not_embedded_in_numbers() {
+        // "429" embedded in a larger number should NOT match
+        assert!(!is_rate_limit_error("request-id: 14291"));
+        assert!(!is_rate_limit_error("timestamp 1714290000"));
+        assert!(!is_rate_limit_error("error code 5429"));
+        // But standalone 429 should match
+        assert!(is_rate_limit_error("error 429"));
+        assert!(is_rate_limit_error("429 rate limited"));
+        assert!(is_rate_limit_error("status=429;"));
+    }
+
+    #[test]
+    fn test_contains_standalone_429() {
+        assert!(contains_standalone_429("429"));
+        assert!(contains_standalone_429("HTTP 429"));
+        assert!(contains_standalone_429("429 error"));
+        assert!(contains_standalone_429("status:429"));
+        assert!(!contains_standalone_429("1429"));
+        assert!(!contains_standalone_429("4290"));
+        assert!(!contains_standalone_429("14290"));
+        assert!(!contains_standalone_429("42"));
+        assert!(!contains_standalone_429(""));
     }
 
     // --- RateLimitResponse deserialization test ---
@@ -1889,6 +2012,15 @@ mod tests {
         let json = r#"{"rate": {"limit": 5000, "remaining": 0, "reset": 1700000000}}"#;
         let parsed: RateLimitResponse = serde_json::from_str(json).unwrap();
         assert_eq!(parsed.rate.reset, 1700000000);
+        assert_eq!(parsed.rate.remaining, 0);
+    }
+
+    #[test]
+    fn test_rate_limit_response_deserialize_with_remaining() {
+        let json = r#"{"rate": {"limit": 5000, "remaining": 4200, "reset": 1700003600}}"#;
+        let parsed: RateLimitResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.rate.remaining, 4200);
+        assert_eq!(parsed.rate.reset, 1700003600);
     }
 
     #[tokio::test]
