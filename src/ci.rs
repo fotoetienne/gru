@@ -112,8 +112,48 @@ pub(crate) struct CheckRun {
     pub(crate) conclusion: Option<CheckConclusion>,
     /// Duration string from GitHub (e.g., "2m 34s")
     pub(crate) duration: Option<String>,
-    /// Failure output/logs if available
+    /// Failure output/logs if available.
+    ///
+    /// In the raw GitHub API response `output` is an object with fields like
+    /// `title`, `summary`, `text`, and `annotations_count`. When this struct is
+    /// constructed from the `--jq`-transformed path in `fetch_check_runs`, the
+    /// field is set to a pre-built `String`. The custom deserializer accepts
+    /// both forms: strings pass through unchanged, while objects have their
+    /// `title`/`summary`/`text` fields extracted and concatenated into a single
+    /// string (if any are present). Only `null` or other unsupported types
+    /// become `None`.
+    #[serde(default, deserialize_with = "deserialize_output_field")]
     pub(crate) output: Option<String>,
+}
+
+/// Deserializes the `output` field accepting either a JSON string or an object
+/// with `title`, `summary`, and `text` subfields (the raw GitHub API shape).
+/// Strings pass through directly. Objects have their text fields extracted and
+/// concatenated — matching what `fetch_check_runs` produces via its jq filter.
+/// Null or other types become `None`.
+fn deserialize_output_field<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde_json::Value;
+    let v = Option::<Value>::deserialize(deserializer)?;
+    match v {
+        Some(Value::String(s)) => Ok(Some(s)),
+        Some(Value::Object(map)) => {
+            let parts: Vec<String> = ["title", "summary", "text"]
+                .iter()
+                .filter_map(|k| map.get(*k)?.as_str())
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+                .collect();
+            Ok(if parts.is_empty() {
+                None
+            } else {
+                Some(parts.join("\n\n"))
+            })
+        }
+        _ => Ok(None),
+    }
 }
 
 /// The type of CI failure for classification
