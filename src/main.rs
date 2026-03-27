@@ -27,6 +27,7 @@ mod progress_comments;
 mod prompt_loader;
 mod prompt_renderer;
 mod prompt_utils;
+mod retry_queue;
 mod session_claim;
 mod stream;
 mod text_buffer;
