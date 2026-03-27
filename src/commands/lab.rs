@@ -1145,6 +1145,22 @@ async fn try_resume_candidate(
     }
 }
 
+/// Returns `true` if the session-level guard should block this minion from being
+/// re-resumed. MonitoringPr minions are exempted because they are long-lived and
+/// expected to be re-entered across poll cycles (e.g. review agent exits or crashes).
+/// CreatingPr and RunningAgent are transient phases that should complete in a single
+/// session; re-entering them suggests a persistent failure the guard should contain.
+/// The `attempt_count > max_attempts` check in `should_resume_candidate` is the
+/// ultimate circuit breaker — `attempt_count` is incremented by `resume.rs` on every
+/// re-entry, so crash-looping MonitoringPr minions still get terminated.
+fn is_blocked_by_session_guard(
+    minion_id: &str,
+    phase: &OrchestrationPhase,
+    resumed_this_session: &HashSet<String>,
+) -> bool {
+    resumed_this_session.contains(minion_id) && *phase != OrchestrationPhase::MonitoringPr
+}
+
 /// Resume interrupted minions, filling available slots before new issue claims.
 ///
 /// Returns the number of minions successfully resumed.
@@ -1163,31 +1179,20 @@ async fn resume_interrupted_minions(
         .await?
         .into_iter()
         .filter(|c| {
-            if resumed_this_session.contains(&c.minion_id) {
-                // MonitoringPr minions are long-lived and expected to be re-entered
-                // across poll cycles (e.g. review agent exits). Allow them through;
-                // the attempt_count > max_attempts check in should_resume_candidate
-                // is the proper circuit breaker for preventing infinite loops.
-                if c.info.orchestration_phase == OrchestrationPhase::MonitoringPr {
-                    log::debug!(
-                        "Allowing re-resume of {} (issue #{}, {}): MonitoringPr phase",
-                        c.minion_id,
-                        c.info.issue.map_or("?".to_string(), |n| n.to_string()),
-                        c.info.repo,
-                    );
-                    true
-                } else {
-                    log::debug!(
-                        "Skipping {} (issue #{}, {}): already resumed this session",
-                        c.minion_id,
-                        c.info.issue.map_or("?".to_string(), |n| n.to_string()),
-                        c.info.repo,
-                    );
-                    false
-                }
-            } else {
-                true
+            let dominated = is_blocked_by_session_guard(
+                &c.minion_id,
+                &c.info.orchestration_phase,
+                resumed_this_session,
+            );
+            if dominated {
+                log::debug!(
+                    "Skipping {} (issue #{}, {}): already resumed this session",
+                    c.minion_id,
+                    c.info.issue.map_or("?".to_string(), |n| n.to_string()),
+                    c.info.repo,
+                );
             }
+            !dominated
         })
         .collect();
     if resumable.is_empty() {
@@ -2675,8 +2680,11 @@ mod tests {
         let filtered: Vec<_> = candidates
             .into_iter()
             .filter(|c| {
-                !resumed_this_session.contains(&c.minion_id)
-                    || c.info.orchestration_phase == OrchestrationPhase::MonitoringPr
+                !is_blocked_by_session_guard(
+                    &c.minion_id,
+                    &c.info.orchestration_phase,
+                    &resumed_this_session,
+                )
             })
             .collect();
 
