@@ -112,8 +112,29 @@ pub(crate) struct CheckRun {
     pub(crate) conclusion: Option<CheckConclusion>,
     /// Duration string from GitHub (e.g., "2m 34s")
     pub(crate) duration: Option<String>,
-    /// Failure output/logs if available
+    /// Failure output/logs if available.
+    ///
+    /// In the raw GitHub API response `output` is an object with fields like
+    /// `title`, `summary`, `text`, and `annotations_count`. When this struct is
+    /// constructed from the `--jq`-transformed path in `fetch_check_runs`, the
+    /// field is set to a pre-built `String`. The custom deserializer accepts
+    /// both forms: strings pass through, objects/other types become `None`.
+    #[serde(default, deserialize_with = "deserialize_output_field")]
     pub(crate) output: Option<String>,
+}
+
+/// Deserializes the `output` field accepting either a JSON string or silently
+/// discarding non-string values (objects, null, etc.) as `None`.
+fn deserialize_output_field<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde_json::Value;
+    let v = Option::<Value>::deserialize(deserializer)?;
+    match v {
+        Some(Value::String(s)) => Ok(Some(s)),
+        _ => Ok(None),
+    }
 }
 
 /// The type of CI failure for classification
