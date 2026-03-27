@@ -1074,6 +1074,10 @@ mod tests {
 
     /// Helper to evaluate merge readiness from pre-fetched data synchronously
     /// (skips the combined_status API call by testing the pure evaluation functions).
+    ///
+    /// NOTE: This mirrors the logic in `check_merge_readiness_with_data` minus the
+    /// async `get_combined_status` call. If that function's evaluation logic changes,
+    /// update this helper to match.
     fn evaluate_from_prefetched(data: &PreFetchedData) -> MergeReadiness {
         if data.pr.draft {
             return MergeReadiness {

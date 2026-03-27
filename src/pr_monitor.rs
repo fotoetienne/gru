@@ -536,19 +536,16 @@ async fn poll_once(
             })
             .collect(),
         // Convert ci::CheckRun to PreFetchedCheckRun strings matching the raw
-        // GitHub API format that evaluate_ci expects. Unknown conclusions become
-        // "unknown" (rejected by evaluate_ci), Unknown status becomes None
-        // (also rejected, since evaluate_ci requires status == "completed").
+        // GitHub API format that evaluate_ci expects. Uses Display impls on
+        // CheckConclusion/CheckStatus to stay in sync with serde rename_all.
+        // Unknown conclusions become "unknown" (rejected by evaluate_ci).
+        // Unknown status becomes "unknown" (also rejected, since evaluate_ci
+        // requires status == "completed").
         check_runs: check_runs
             .iter()
             .map(|cr| merge_readiness::PreFetchedCheckRun {
                 conclusion: cr.conclusion.as_ref().map(|c| c.to_string()),
-                status: match &cr.status {
-                    crate::ci::CheckStatus::Completed => Some("completed".to_string()),
-                    crate::ci::CheckStatus::InProgress => Some("in_progress".to_string()),
-                    crate::ci::CheckStatus::Queued => Some("queued".to_string()),
-                    crate::ci::CheckStatus::Unknown => None,
-                },
+                status: Some(cr.status.to_string()),
             })
             .collect(),
     };
@@ -676,7 +673,11 @@ async fn get_review_feedback(
         // Collect review body text (non-empty bodies that aren't just whitespace).
         // Skip DISMISSED reviews — their body is the dismissal reason, not
         // actionable feedback for the implementer.
-        let state = if review.state.is_empty() { "COMMENTED" } else { &review.state };
+        let state = if review.state.is_empty() {
+            "COMMENTED"
+        } else {
+            &review.state
+        };
         if state != "DISMISSED" {
             if let Some(ref body) = review.body {
                 let trimmed = body.trim();

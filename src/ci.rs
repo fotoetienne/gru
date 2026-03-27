@@ -40,6 +40,17 @@ pub(crate) enum CheckStatus {
     Unknown,
 }
 
+impl fmt::Display for CheckStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            CheckStatus::Queued => write!(f, "queued"),
+            CheckStatus::InProgress => write!(f, "in_progress"),
+            CheckStatus::Completed => write!(f, "completed"),
+            CheckStatus::Unknown => write!(f, "unknown"),
+        }
+    }
+}
+
 /// The conclusion of a completed check run
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
