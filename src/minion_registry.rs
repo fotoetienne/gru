@@ -335,7 +335,7 @@ struct TtlArchiveCandidate {
     last_activity: DateTime<Utc>,
 }
 
-/// Auto-archive stopped Minions that have no actionable signal after a TTL.
+/// Auto-archive stopped Minions once there is no remaining actionable signal on GitHub.
 ///
 /// This is a fallback for Minions not covered by [`auto_archive_completed_minions`]:
 /// prompt-mode Minions (no issue, no PR), failed `gru do` runs (no PR created),
@@ -344,9 +344,11 @@ struct TtlArchiveCandidate {
 /// Uses the same three-phase approach as [`prune_stale_entries`]:
 ///
 /// 1. **Phase 1 (sync):** Collect stopped, non-archived Minions with no PR.
-/// 2. **Phase 2 (async):** For candidates with an issue, check if closed (archive
-///    immediately as a definitive signal). Otherwise, apply the TTL.
-/// 3. **Phase 3 (sync):** Stamp `archived_at` on qualifying entries.
+/// 2. **Phase 2 (async):** For candidates with an associated issue, check if the
+///    issue is closed — if so, mark it for immediate archiving (issue-closed fast
+///    path). Otherwise, apply the TTL-based fallback using `last_activity`.
+/// 3. **Phase 3 (sync):** Re-acquire lock and stamp `archived_at` on qualifying
+///    entries, whether selected via the issue-closed fast path or via TTL.
 ///
 /// Returns the number of Minions archived.
 pub async fn auto_archive_stopped_minions(ttl_hours: u64) -> Result<usize> {
@@ -354,7 +356,9 @@ pub async fn auto_archive_stopped_minions(ttl_hours: u64) -> Result<usize> {
     if ttl_hours == 0 {
         return Ok(0);
     }
-    let ttl = chrono::Duration::hours(ttl_hours as i64);
+    // Clamp to avoid overflow when casting u64 → i64 for chrono::Duration
+    let clamped = ttl_hours.min(i64::MAX as u64);
+    let ttl = chrono::Duration::hours(clamped as i64);
 
     // Phase 1: Collect candidates — stopped, non-archived, no PR (sync, lock held briefly)
     let candidates: Vec<TtlArchiveCandidate> = with_registry(|registry| {
@@ -429,9 +433,16 @@ pub async fn auto_archive_stopped_minions(ttl_hours: u64) -> Result<usize> {
     }
 
     // Phase 3: Stamp archived_at on qualifying entries (sync, lock held briefly).
+    // Re-filter: a minion may have gained a PR between Phase 1 and now.
     let archive_now = Utc::now();
-    let count =
-        with_registry(move |registry| registry.archive_batch(&to_archive, archive_now)).await?;
+    let count = with_registry(move |registry| {
+        let still_eligible: Vec<String> = to_archive
+            .into_iter()
+            .filter(|id| registry.get(id).is_some_and(|info| info.pr.is_none()))
+            .collect();
+        registry.archive_batch(&still_eligible, archive_now)
+    })
+    .await?;
 
     if count > 0 {
         log::info!("📦 Auto-archived {} stopped Minion(s) (TTL)", count);
