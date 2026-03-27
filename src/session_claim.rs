@@ -7,8 +7,6 @@ use chrono::Utc;
 pub enum SessionClaimError {
     /// The minion has a live process — user must stop it first.
     AlreadyRunning { minion_id: String, mode: MinionMode },
-    /// Registry shows a non-Stopped mode but no PID is recorded.
-    InconsistentState { minion_id: String, mode: MinionMode },
 }
 
 impl std::fmt::Display for SessionClaimError {
@@ -18,14 +16,6 @@ impl std::fmt::Display for SessionClaimError {
                 write!(
                     f,
                     "Minion {} is already running (mode: {}). Stop it first with: gru stop {}",
-                    minion_id, mode, minion_id
-                )
-            }
-            SessionClaimError::InconsistentState { minion_id, mode } => {
-                write!(
-                    f,
-                    "Minion {} is currently in {} mode without an associated process. \
-                     Please wait or run 'gru status' / 'gru stop {}' to recover.",
                     minion_id, mode, minion_id
                 )
             }
@@ -75,12 +65,18 @@ fn claim_session_in_registry(
                 })?;
             }
             None => {
-                // Do not wrap with .context() — see AlreadyRunning above.
-                return Err(SessionClaimError::InconsistentState {
-                    minion_id: id,
-                    mode: info.mode.clone(),
-                }
-                .into());
+                // Stale entry: mode is non-Stopped but no PID was recorded
+                // (e.g., process crashed before PID could be saved).
+                // Treat the same as a dead-PID entry: reset to Stopped.
+                log::warn!(
+                    "Minion {} has mode {} but no PID recorded — resetting stale entry to Stopped",
+                    id,
+                    info.mode
+                );
+                reg.update(&id, |i| {
+                    i.mode = MinionMode::Stopped;
+                    i.last_activity = Utc::now();
+                })?;
             }
         }
     }
@@ -131,8 +127,6 @@ fn handle_claim_result(
 /// # Errors
 ///
 /// - [`SessionClaimError::AlreadyRunning`] if the minion has a live process.
-/// - [`SessionClaimError::InconsistentState`] if mode is non-Stopped but no PID
-///   is recorded.
 ///
 /// # Graceful degradation
 ///
@@ -224,18 +218,6 @@ mod tests {
     }
 
     #[test]
-    fn test_session_claim_error_display_inconsistent_state() {
-        let err = SessionClaimError::InconsistentState {
-            minion_id: "M002".to_string(),
-            mode: MinionMode::Interactive,
-        };
-        let msg = format!("{}", err);
-        assert!(msg.contains("interactive mode"));
-        assert!(msg.contains("without an associated process"));
-        assert!(msg.contains("gru stop M002"));
-    }
-
-    #[test]
     fn test_session_claim_error_is_downcastable() {
         let err: anyhow::Error = SessionClaimError::AlreadyRunning {
             minion_id: "M001".to_string(),
@@ -298,13 +280,9 @@ mod tests {
                 .unwrap_err();
 
         let claim_err = err.downcast_ref::<SessionClaimError>().unwrap();
-        match claim_err {
-            SessionClaimError::AlreadyRunning { minion_id, mode } => {
-                assert_eq!(minion_id, "M001");
-                assert_eq!(*mode, MinionMode::Autonomous);
-            }
-            _ => panic!("expected AlreadyRunning, got {:?}", claim_err),
-        }
+        let SessionClaimError::AlreadyRunning { minion_id, mode } = claim_err;
+        assert_eq!(minion_id, "M001");
+        assert_eq!(*mode, MinionMode::Autonomous);
 
         // Registry should be unchanged
         let unchanged = read_minion(tmp.path(), "M001").unwrap();
@@ -344,28 +322,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_inconsistent_state_no_pid() {
+    async fn test_stale_no_pid_resets_and_claims() {
         let tmp = tempdir().unwrap();
         let info = MinionInfo {
             mode: MinionMode::Autonomous,
-            pid: None, // Non-Stopped mode but no PID — inconsistent
+            pid: None, // Non-Stopped mode but no PID — stale entry
             ..test_minion_info()
         };
         register_minion(tmp.path(), "M001", info);
 
-        let err =
+        let result =
             check_and_claim_session_with_dir(tmp.path(), "M001", MinionMode::Interactive, false)
                 .await
-                .unwrap_err();
+                .unwrap();
 
-        let claim_err = err.downcast_ref::<SessionClaimError>().unwrap();
-        match claim_err {
-            SessionClaimError::InconsistentState { minion_id, mode } => {
-                assert_eq!(minion_id, "M001");
-                assert_eq!(*mode, MinionMode::Autonomous);
-            }
-            _ => panic!("expected InconsistentState, got {:?}", claim_err),
-        }
+        // Should succeed — the stale entry was detected and reset
+        let snapshot = result.expect("should return Some after stale-entry reset");
+        // Snapshot is from *before* the reset, so it still shows Autonomous
+        assert_eq!(snapshot.mode, MinionMode::Autonomous);
+        assert_eq!(snapshot.pid, None);
+
+        // Registry should now show Interactive mode
+        let updated = read_minion(tmp.path(), "M001").unwrap();
+        assert_eq!(updated.mode, MinionMode::Interactive);
     }
 
     #[tokio::test]
