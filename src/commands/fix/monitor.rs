@@ -66,7 +66,7 @@ async fn reset_attempt_count(minion_id: &str) {
 async fn auto_rebase_pr(worktree_path: &Path) -> Result<bool> {
     use super::super::rebase::{
         abort_rebase, attempt_rebase, check_clean_worktree, detect_base_branch, fetch_origin,
-        force_push, run_agent_rebase, RebaseOutcome,
+        force_push, is_up_to_date, run_agent_rebase, RebaseOutcome,
     };
 
     // Bail early if worktree has uncommitted changes (e.g., agent crashed mid-edit)
@@ -80,6 +80,17 @@ async fn auto_rebase_pr(worktree_path: &Path) -> Result<bool> {
 
     // Detect the base branch
     let base_branch = detect_base_branch(worktree_path).await?;
+
+    // Short-circuit if already up-to-date (avoids no-op rebase + force-push
+    // that would reset GitHub's mergeable cache timer)
+    if is_up_to_date(worktree_path, &base_branch).await? {
+        println!(
+            "✅ Already up-to-date with origin/{}, skipping rebase",
+            base_branch
+        );
+        return Ok(true);
+    }
+
     println!("🔄 Rebasing onto origin/{}...", base_branch);
 
     // Attempt the rebase
@@ -361,7 +372,16 @@ struct MonitorLoopState {
     review_baseline: Option<DateTime<Utc>>,
     monitor_start: tokio::time::Instant,
     confidence_threshold: u8,
+    /// Number of poll cycles to skip merge-conflict detection after a successful
+    /// rebase + force-push. GitHub takes time to recompute the `mergeable` field,
+    /// so stale `mergeable: false` would otherwise trigger redundant rebase cycles.
+    rebase_cooldown_cycles: u32,
 }
+
+/// How many poll cycles to suppress merge-conflict detection after a successful
+/// rebase + force-push. At 30s per poll, 4 cycles ≈ 2 minutes — enough for
+/// GitHub to recompute the `mergeable` field.
+const REBASE_COOLDOWN_CYCLES: u32 = 4;
 
 /// 10 consecutive monitor_pr invocation failures before giving up.
 const MAX_CONSECUTIVE_ERRORS: u32 = 10;
@@ -380,6 +400,7 @@ impl MonitorLoopState {
             review_baseline: Some(initial_baseline),
             monitor_start: tokio::time::Instant::now(),
             confidence_threshold,
+            rebase_cooldown_cycles: 0,
         }
     }
 }
@@ -753,6 +774,9 @@ async fn handle_merge_conflict(
             // while it recomputes. We don't want stale signals to
             // exhaust the attempt budget.
             state.rebase_attempts = 0;
+            // Suppress merge-conflict detection for a few poll cycles
+            // to let GitHub recompute the mergeable field after force-push.
+            state.rebase_cooldown_cycles = REBASE_COOLDOWN_CYCLES;
             // Use the check_time from just before the conflict was
             // detected. Reviews posted during the rebase will have
             // submitted_at > check_time and be caught on the next poll.
@@ -887,7 +911,16 @@ async fn handle_pr_event(
             handle_failed_checks(state, ctx, count).await
         }
         Ok((MonitorResult::MergeConflict, check_time)) => {
-            handle_merge_conflict(state, ctx, check_time).await
+            if state.rebase_cooldown_cycles > 0 {
+                state.rebase_cooldown_cycles -= 1;
+                log::info!(
+                    "Ignoring stale mergeable:false during post-rebase cooldown ({} cycles remaining)",
+                    state.rebase_cooldown_cycles
+                );
+                LoopAction::Continue
+            } else {
+                handle_merge_conflict(state, ctx, check_time).await
+            }
         }
         Ok((MonitorResult::Timeout, _)) => handle_timeout(state, ctx),
         Ok((MonitorResult::Interrupted, _)) => handle_interrupted(ctx),
@@ -1172,6 +1205,12 @@ mod tests {
     fn test_format_duration_hours() {
         assert_eq!(format_duration(3600), "1h0m");
         assert_eq!(format_duration(5 * 3600 + 15 * 60 + 30), "5h15m"); // seconds truncated
+    }
+
+    #[test]
+    fn test_rebase_cooldown_initial_state() {
+        let state = MonitorLoopState::new(Utc::now(), 80);
+        assert_eq!(state.rebase_cooldown_cycles, 0);
     }
 
     #[test]

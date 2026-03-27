@@ -295,7 +295,7 @@ async fn get_pr_base_branch(worktree_path: &Path, branch: &str) -> Result<Option
 }
 
 /// Checks if the current branch is already up-to-date with the base branch.
-async fn is_up_to_date(worktree_path: &Path, base_branch: &str) -> Result<bool> {
+pub(crate) async fn is_up_to_date(worktree_path: &Path, base_branch: &str) -> Result<bool> {
     let remote_ref = format!("origin/{}", base_branch);
     let output = Command::new("git")
         .arg("-C")
