@@ -27,6 +27,7 @@ struct PullRequest {
     state: String,
     merged: bool,
     head: Head,
+    #[allow(dead_code)] // deserialized from GitHub API; used in tests
     user: User,
     /// GitHub's mergeable field: true, false, or null (still computing).
     mergeable: Option<bool>,
@@ -56,9 +57,10 @@ struct Head {
 pub(crate) struct Review {
     id: u64,
     pub(crate) submitted_at: DateTime<Utc>,
+    #[allow(dead_code)] // deserialized from GitHub API; used in tests
     pub(crate) user: User,
     #[serde(default)]
-    body: Option<String>,
+    pub(crate) body: Option<String>,
     /// Review state (APPROVED, CHANGES_REQUESTED, COMMENTED, DISMISSED, PENDING).
     /// Used by merge-readiness evaluation to avoid re-fetching reviews.
     #[serde(default)]
@@ -407,11 +409,6 @@ pub(crate) async fn monitor_pr(
 
     let mut last_check_time = baseline.unwrap_or_else(Utc::now);
 
-    // Resolve the authenticated GitHub user once up front. This identity is
-    // stable for the lifetime of the process and is used to exclude the
-    // minion's own reviews from the feedback loop. See issue #701.
-    let gh_user = github::get_authenticated_user(host).await?;
-
     // Track merge-readiness state across polls to detect transitions.
     // Seed from the current label state so we don't add/remove on first poll.
     // Uses get_pr (which has retry logic) rather than a separate labels endpoint;
@@ -437,7 +434,7 @@ pub(crate) async fn monitor_pr(
 
         // Race the polling iteration against Ctrl+C
         tokio::select! {
-            result = poll_once(host, owner, repo, pr_number, &gh_user, &mut last_check_time, &mut was_ready) => {
+            result = poll_once(host, owner, repo, pr_number, &mut last_check_time, &mut was_ready) => {
                 if let Some(monitor_result) = result? {
                     return Ok((monitor_result, last_check_time));
                 }
@@ -493,22 +490,28 @@ pub(crate) fn determine_pr_terminal_state(state: &str, merged: bool) -> Option<M
     }
 }
 
-/// Filter reviews to only include those submitted at or after `since` by users
-/// other than the `excluded_user` (typically the authenticated GitHub user running
-/// gru, i.e. the minion identity).
+/// Filter reviews to only include those submitted at or after `since` by
+/// non-Minion authors.
 ///
 /// This excludes the minion's own reviews (to prevent feedback loops) and old
 /// reviews (already processed in a previous poll cycle). Uses inclusive `>=` so
 /// that a review landing exactly at `since` is captured; contrast with
 /// `count_unaddressed_reviews` which uses exclusive `>` for a different purpose.
-pub(crate) fn filter_new_external_reviews(
-    reviews: &[Review],
-    since: DateTime<Utc>,
-    excluded_user: &str,
-) -> Vec<Review> {
+///
+/// Excludes Minion-authored reviews by checking for the Minion signature
+/// (`<sub>🤖`) in the review body, rather than matching by username. This
+/// correctly handles the common case where the Minion and the human share
+/// the same GitHub account.
+pub(crate) fn filter_new_external_reviews(reviews: &[Review], since: DateTime<Utc>) -> Vec<Review> {
     reviews
         .iter()
-        .filter(|r| r.submitted_at >= since && r.user.login != excluded_user)
+        .filter(|r| {
+            r.submitted_at >= since
+                && !r
+                    .body
+                    .as_deref()
+                    .is_some_and(crate::progress_comments::has_minion_signature)
+        })
         .cloned()
         .collect()
 }
@@ -522,7 +525,6 @@ async fn poll_once(
     owner: &str,
     repo: &str,
     pr_number: &str,
-    gh_user: &str,
     last_check_time: &mut DateTime<Utc>,
     was_ready: &mut bool,
 ) -> Result<Option<MonitorResult>> {
@@ -540,10 +542,7 @@ async fn poll_once(
     // Check for new reviews BEFORE merge conflicts so that reviewer feedback
     // is never silently dropped when conflicts and reviews overlap.
     let all_reviews = get_all_reviews(host, owner, repo, pr_number).await?;
-    // Filter out the minion's own reviews (the authenticated `gh` user) rather
-    // than the PR author's reviews. The PR author may be a human whose reviews
-    // are legitimate feedback that should be processed. See issue #701.
-    let new_reviews = filter_new_external_reviews(&all_reviews, *last_check_time, gh_user);
+    let new_reviews = filter_new_external_reviews(&all_reviews, *last_check_time);
     if !new_reviews.is_empty() {
         let feedback = get_review_feedback(host, owner, repo, pr_number, &new_reviews).await?;
         // Only advance the baseline when we successfully fetched all reviews.
@@ -796,8 +795,11 @@ async fn get_review_feedback(
         let api_comments: Vec<ApiReviewComment> = serde_json::from_slice(&output.stdout)
             .context("Failed to parse review comments JSON response")?;
 
-        // Convert API comments to our format
+        // Convert API comments to our format, skipping Minion-authored ones
         for comment in api_comments {
+            if crate::progress_comments::has_minion_signature(&comment.body) {
+                continue;
+            }
             all_comments.push(ReviewComment {
                 file: comment.path,
                 line: comment.line,
@@ -929,18 +931,21 @@ async fn get_check_runs(host: &str, owner: &str, repo: &str, sha: &str) -> Resul
     Ok(check_runs)
 }
 
-/// Returns the count of external (non-author) reviews submitted after `since`.
+/// Returns the count of non-Minion reviews submitted after `since`.
 ///
-/// "Unaddressed" means: submitted after the baseline and not from the PR author.
+/// "Unaddressed" means: submitted after the baseline and not authored by a
+/// Minion (identified by the `<sub>🤖` signature in the review body).
 /// Used to decide whether to post a monitoring-paused notification on exit.
-pub(crate) fn has_unaddressed_reviews(
-    reviews: &[Review],
-    pr_author: &str,
-    since: DateTime<Utc>,
-) -> usize {
+pub(crate) fn count_unaddressed_reviews(reviews: &[Review], since: DateTime<Utc>) -> usize {
     reviews
         .iter()
-        .filter(|r| r.submitted_at > since && r.user.login != pr_author)
+        .filter(|r| {
+            r.submitted_at > since
+                && !r
+                    .body
+                    .as_deref()
+                    .is_some_and(crate::progress_comments::has_minion_signature)
+        })
         .count()
 }
 
@@ -955,18 +960,17 @@ pub(crate) fn should_post_exit_notification(pr_open: bool, unaddressed_count: us
 /// Fetch just the fields needed for exit-notification decisions without
 /// exposing internal types to callers.
 ///
-/// Returns `(is_open, pr_author_login)`.
+/// Returns `true` if the PR is still open.
 pub(crate) async fn get_pr_info_for_exit_notification(
     host: &str,
     owner: &str,
     repo: &str,
     pr_number: &str,
-) -> Result<(bool, String)> {
+) -> Result<bool> {
     let pr = get_pr(host, owner, repo, pr_number).await?;
     // A merged PR has state="closed" AND merged=true. Check both to guard
     // against the narrow race where state hasn't propagated yet.
-    let is_open = pr.state != "closed" && !pr.merged;
-    Ok((is_open, pr.user.login))
+    Ok(pr.state != "closed" && !pr.merged)
 }
 
 /// Fetch PR info needed for the lab daemon's wake-up scan.
@@ -1946,17 +1950,13 @@ mod tests {
     // Review Timestamp Filtering Tests
     // ========================================================================
     // These tests exercise the production filter_new_external_reviews function.
-    // Tests that focus on timestamp logic use pr_author="not-reviewer" so the
-    // author filter is a no-op and the timestamp behavior is isolated.
+    // Reviews without a Minion signature (body=None) represent human reviews.
 
     fn make_review(id: u64, timestamp: &str) -> Review {
         Review {
             id,
             submitted_at: timestamp.parse().unwrap(),
             user: User {
-                // Timestamp-only tests pass pr_author="not-reviewer" so this
-                // login must differ from that sentinel to keep the author
-                // filter a no-op.
                 login: "reviewer".to_string(),
             },
             body: None,
@@ -1972,7 +1972,7 @@ mod tests {
             make_review(2, "2024-06-15T11:00:00Z"), // After - included
         ];
 
-        let filtered = filter_new_external_reviews(&reviews, since, "not-reviewer");
+        let filtered = filter_new_external_reviews(&reviews, since);
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].id, 2);
     }
@@ -1983,7 +1983,7 @@ mod tests {
         let since: DateTime<Utc> = "2024-06-15T10:00:00Z".parse().unwrap();
         let reviews = vec![make_review(1, "2024-06-15T10:00:00Z")];
 
-        let filtered = filter_new_external_reviews(&reviews, since, "not-reviewer");
+        let filtered = filter_new_external_reviews(&reviews, since);
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].id, 1);
     }
@@ -1996,7 +1996,7 @@ mod tests {
             make_review(2, "2024-06-15T09:59:59Z"),
         ];
 
-        let filtered = filter_new_external_reviews(&reviews, since, "not-reviewer");
+        let filtered = filter_new_external_reviews(&reviews, since);
         assert!(filtered.is_empty());
     }
 
@@ -2005,7 +2005,7 @@ mod tests {
         let since: DateTime<Utc> = "2024-06-15T10:00:00Z".parse().unwrap();
         let reviews: Vec<Review> = vec![];
 
-        let filtered = filter_new_external_reviews(&reviews, since, "not-reviewer");
+        let filtered = filter_new_external_reviews(&reviews, since);
         assert!(filtered.is_empty());
     }
 
@@ -2018,70 +2018,118 @@ mod tests {
             make_review(3, "2024-06-16T10:00:00Z"),
         ];
 
-        let filtered = filter_new_external_reviews(&reviews, since, "not-reviewer");
+        let filtered = filter_new_external_reviews(&reviews, since);
         assert_eq!(filtered.len(), 3);
     }
 
     // ========================================================================
-    // Minion User Filtering Tests
+    // Minion Signature Filtering Tests
     // ========================================================================
     // The excluded_user parameter represents the authenticated GitHub user
     // (the minion identity), NOT the PR author. Reviews from the minion are
     // excluded to prevent feedback loops. Reviews from the PR author (who may
     // be a human) should pass through. See issue #701.
 
-    fn make_review_by(id: u64, timestamp: &str, login: &str) -> Review {
+    fn make_review_with_body(id: u64, timestamp: &str, login: &str, body: Option<&str>) -> Review {
         Review {
             id,
             submitted_at: timestamp.parse().unwrap(),
             user: User {
                 login: login.to_string(),
             },
-            body: None,
+            body: body.map(|s| s.to_string()),
             state: String::new(),
         }
     }
 
     #[test]
-    fn test_minion_review_excluded_from_new_reviews() {
+    fn test_minion_review_excluded_by_signature() {
         let since: DateTime<Utc> = "2024-06-15T10:00:00Z".parse().unwrap();
         let reviews = vec![
-            make_review_by(1, "2024-06-15T11:00:00Z", "gru-bot"),
-            make_review_by(2, "2024-06-15T11:00:00Z", "external-reviewer"),
+            make_review_with_body(
+                1,
+                "2024-06-15T11:00:00Z",
+                "fotoetienne",
+                Some("Looks good!\n\n<sub>🤖 M001</sub>"),
+            ),
+            make_review_with_body(
+                2,
+                "2024-06-15T11:00:00Z",
+                "fotoetienne",
+                Some("Please fix the error handling here."),
+            ),
         ];
 
-        // "gru-bot" is the authenticated minion user — its reviews are excluded
-        let filtered = filter_new_external_reviews(&reviews, since, "gru-bot");
+        let filtered = filter_new_external_reviews(&reviews, since);
         assert_eq!(filtered.len(), 1);
-        assert_eq!(filtered[0].user.login, "external-reviewer");
+        assert_eq!(filtered[0].id, 2);
+    }
+
+    #[test]
+    fn test_same_user_human_review_kept() {
+        // Core scenario from issue #751: human and Minion share the same account
+        let since: DateTime<Utc> = "2024-06-15T10:00:00Z".parse().unwrap();
+        let reviews = vec![make_review_with_body(
+            1,
+            "2024-06-15T11:00:00Z",
+            "fotoetienne",
+            Some("Three nits on the error handling."),
+        )];
+
+        let filtered = filter_new_external_reviews(&reviews, since);
+        assert_eq!(filtered.len(), 1);
+    }
+
+    #[test]
+    fn test_review_with_no_body_kept() {
+        // Reviews with no body (just inline comments) should be kept
+        let since: DateTime<Utc> = "2024-06-15T10:00:00Z".parse().unwrap();
+        let reviews = vec![make_review_with_body(
+            1,
+            "2024-06-15T11:00:00Z",
+            "fotoetienne",
+            None,
+        )];
+
+        let filtered = filter_new_external_reviews(&reviews, since);
+        assert_eq!(filtered.len(), 1);
     }
 
     #[test]
     fn test_only_minion_reviews_returns_empty() {
         let since: DateTime<Utc> = "2024-06-15T10:00:00Z".parse().unwrap();
         let reviews = vec![
-            make_review_by(1, "2024-06-15T11:00:00Z", "gru-bot"),
-            make_review_by(2, "2024-06-15T12:00:00Z", "gru-bot"),
+            make_review_with_body(
+                1,
+                "2024-06-15T11:00:00Z",
+                "fotoetienne",
+                Some("LGTM\n\n<sub>🤖 M001</sub>"),
+            ),
+            make_review_with_body(
+                2,
+                "2024-06-15T12:00:00Z",
+                "fotoetienne",
+                Some("Fixed.\n\n<sub>🤖 M002</sub>"),
+            ),
         ];
 
-        let filtered = filter_new_external_reviews(&reviews, since, "gru-bot");
+        let filtered = filter_new_external_reviews(&reviews, since);
         assert!(filtered.is_empty());
     }
 
     #[test]
-    fn test_pr_author_reviews_not_excluded() {
-        // Regression test for issue #701: PR author reviews should NOT be
-        // filtered out — only the minion's own reviews are excluded.
+    fn test_external_reviewer_always_kept() {
+        // Reviews from other users (e.g. Copilot) are never filtered
         let since: DateTime<Utc> = "2024-06-15T10:00:00Z".parse().unwrap();
-        let reviews = vec![
-            make_review_by(1, "2024-06-15T11:00:00Z", "pr-author"),
-            make_review_by(2, "2024-06-15T11:00:00Z", "gru-bot"),
-        ];
+        let reviews = vec![make_review_with_body(
+            1,
+            "2024-06-15T11:00:00Z",
+            "copilot-pull-request-reviewer",
+            Some("Consider using a constant here."),
+        )];
 
-        // "gru-bot" is the minion; "pr-author" is a human whose reviews should pass
-        let filtered = filter_new_external_reviews(&reviews, since, "gru-bot");
+        let filtered = filter_new_external_reviews(&reviews, since);
         assert_eq!(filtered.len(), 1);
-        assert_eq!(filtered[0].user.login, "pr-author");
     }
 
     // ========================================================================
@@ -2299,42 +2347,42 @@ mod tests {
     // Exit Notification Tests
     // ========================================================================
 
-    fn make_review_with_login(login: &str, submitted_at: &str) -> Review {
+    fn make_review_for_exit(submitted_at: &str, body: Option<&str>) -> Review {
         Review {
             id: 1,
             submitted_at: submitted_at.parse().unwrap(),
             user: User {
-                login: login.to_string(),
+                login: "reviewer".to_string(),
             },
-            body: None,
+            body: body.map(|s| s.to_string()),
             state: String::new(),
         }
     }
 
     #[test]
-    fn test_has_unaddressed_reviews_filters_pr_author() {
+    fn test_count_unaddressed_reviews_excludes_minion_reviews() {
         let since = "2024-01-01T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
         let reviews = vec![
-            make_review_with_login("minion-bot", "2024-01-02T00:00:00Z"), // PR author — excluded
-            make_review_with_login("alice", "2024-01-02T00:00:00Z"),      // external reviewer
+            make_review_for_exit("2024-01-02T00:00:00Z", Some("Done.\n\n<sub>🤖 M001</sub>")), // Minion — excluded
+            make_review_for_exit("2024-01-02T00:00:00Z", Some("Please fix this.")), // human
         ];
-        assert_eq!(has_unaddressed_reviews(&reviews, "minion-bot", since), 1);
+        assert_eq!(count_unaddressed_reviews(&reviews, since), 1);
     }
 
     #[test]
-    fn test_has_unaddressed_reviews_returns_zero_before_baseline() {
+    fn test_count_unaddressed_reviews_returns_zero_before_baseline() {
         let since = "2024-01-10T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
         let reviews = vec![
-            make_review_with_login("alice", "2024-01-05T00:00:00Z"), // before baseline
-            make_review_with_login("alice", "2024-01-10T00:00:00Z"), // equal to baseline — excluded (uses >)
+            make_review_for_exit("2024-01-05T00:00:00Z", None), // before baseline
+            make_review_for_exit("2024-01-10T00:00:00Z", None), // equal to baseline — excluded (uses >)
         ];
-        assert_eq!(has_unaddressed_reviews(&reviews, "bot", since), 0);
+        assert_eq!(count_unaddressed_reviews(&reviews, since), 0);
     }
 
     #[test]
-    fn test_has_unaddressed_reviews_empty_list() {
+    fn test_count_unaddressed_reviews_empty_list() {
         let since = "2024-01-01T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
-        assert_eq!(has_unaddressed_reviews(&[], "bot", since), 0);
+        assert_eq!(count_unaddressed_reviews(&[], since), 0);
     }
 
     #[test]
