@@ -92,7 +92,8 @@ pub(crate) async fn run_agent_phase(
 /// Runs the PR creation phase (Phase 4).
 ///
 /// Creates the PR (or looks it up if already created) and optionally applies
-/// the `gru:auto-merge` label. Returns the PR number if one was created.
+/// the `gru:auto-merge` label when either the CLI flag is set or the source
+/// issue carries the label. Returns the PR number if one was created.
 pub(crate) async fn create_pr_phase(
     issue_ctx: &IssueContext,
     wt_ctx: &WorktreeContext,
@@ -162,8 +163,21 @@ pub(crate) async fn create_pr_phase(
         }
     };
 
-    // Add gru:auto-merge label if --auto-merge flag was set
-    if auto_merge {
+    // Add gru:auto-merge label if --auto-merge flag was set or issue has the label
+    let issue_has_auto_merge = issue_ctx
+        .details
+        .as_ref()
+        .map(|d| crate::labels::has_label(&d.labels, crate::labels::AUTO_MERGE))
+        .unwrap_or(false);
+    if auto_merge || issue_has_auto_merge {
+        if !auto_merge && issue_has_auto_merge {
+            println!(
+                "🏷️  Issue #{} has gru:auto-merge label — propagating to PR",
+                issue_ctx
+                    .issue_num
+                    .map_or("?".to_string(), |n| n.to_string())
+            );
+        }
         if let Some(ref pr_num) = pr_number {
             if let Err(e) = pr_monitor::ensure_auto_merge_label(
                 &issue_ctx.host,
