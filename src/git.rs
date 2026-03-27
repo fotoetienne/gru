@@ -510,6 +510,12 @@ impl GitRepo {
                         .join(", ")
                 );
             }
+
+            // Set origin/HEAD if not already present (initial clone sets it;
+            // subsequent fetches skip the extra network round-trip).
+            if !self.has_origin_head().await {
+                self.update_origin_head(token.as_deref()).await;
+            }
         } else {
             // Clone as bare repository
             let url = format!("https://{}/{}/{}.git", self.host, self.owner, self.repo);
@@ -563,9 +569,69 @@ impl GitRepo {
                     stderr
                 );
             }
+
+            // Set origin/HEAD so default branch detection works in worktrees
+            // via `git symbolic-ref refs/remotes/origin/HEAD`
+            self.update_origin_head(token.as_deref()).await;
         }
 
         Ok(())
+    }
+
+    /// Returns `true` if `refs/remotes/origin/HEAD` is already set in the bare repo.
+    async fn has_origin_head(&self) -> bool {
+        Command::new("git")
+            .arg("-C")
+            .arg(&self.bare_path)
+            .args(["symbolic-ref", "refs/remotes/origin/HEAD"])
+            .output()
+            .await
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    /// Updates `refs/remotes/origin/HEAD` so that worktrees can detect the
+    /// default branch via `git symbolic-ref refs/remotes/origin/HEAD` without
+    /// needing an API call.
+    ///
+    /// Failures are logged but not propagated — this is a best-effort
+    /// optimisation that doesn't block clone or fetch.
+    async fn update_origin_head(&self, token: Option<&str>) {
+        let result: Result<()> = async {
+            let auth = git_command_with_auth(token)?;
+            let AuthenticatedGitCommand {
+                mut cmd,
+                _askpass_file,
+            } = auth;
+            let output = cmd
+                .arg("-C")
+                .arg(&self.bare_path)
+                .args(["remote", "set-head", "origin", "--auto"])
+                .output()
+                .await
+                .context("Failed to execute git remote set-head")?;
+
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                log::warn!(
+                    "{}/{}: git remote set-head origin --auto failed: {}",
+                    self.owner,
+                    self.repo,
+                    stderr.trim()
+                );
+            }
+            Ok(())
+        }
+        .await;
+
+        if let Err(e) = result {
+            log::warn!(
+                "{}/{}: could not update origin/HEAD: {}",
+                self.owner,
+                self.repo,
+                e
+            );
+        }
     }
 
     /// Determines the default branch to use as base for new worktrees
