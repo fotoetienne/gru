@@ -26,6 +26,9 @@ pub(crate) const DEFAULT_CONFIDENCE_THRESHOLD: u8 = 8;
 /// Maximum consecutive wait responses before the judge must decide merge or escalate.
 const MAX_CONSECUTIVE_WAITS: u32 = 3;
 
+/// Maximum consecutive parse/invocation failures before escalating.
+pub(crate) const MAX_CONSECUTIVE_FAILURES: u32 = 3;
+
 /// Maximum wait duration the LLM can request (in minutes).
 const MAX_WAIT_MINUTES: u64 = 120;
 
@@ -75,6 +78,8 @@ pub(crate) struct JudgeState {
     last_fingerprint: Option<PrStateFingerprint>,
     /// Number of consecutive "wait" responses with no state change.
     consecutive_waits: u32,
+    /// Number of consecutive failures (parse errors, CLI errors) on the same fingerprint.
+    consecutive_failures: u32,
     /// When the current wait expires (if any).
     wait_until: Option<DateTime<Utc>>,
     /// Whether the judge has escalated and the label was confirmed applied.
@@ -86,6 +91,7 @@ impl JudgeState {
         Self {
             last_fingerprint: None,
             consecutive_waits: 0,
+            consecutive_failures: 0,
             wait_until: None,
             label_applied: false,
         }
@@ -107,6 +113,28 @@ impl JudgeState {
         false
     }
 
+    /// Record a failure (parse error, CLI error) for the given fingerprint.
+    /// Updates the fingerprint so `should_invoke` won't re-trigger on the
+    /// same PR state, and increments the failure counter.
+    pub(crate) fn record_failure(&mut self, fingerprint: PrStateFingerprint) {
+        let state_changed = self.last_fingerprint.as_ref() != Some(&fingerprint);
+        if state_changed {
+            self.consecutive_failures = 0;
+        }
+        self.consecutive_failures += 1;
+        self.last_fingerprint = Some(fingerprint);
+    }
+
+    /// Returns the number of consecutive failures on the current fingerprint.
+    pub(crate) fn consecutive_failures(&self) -> u32 {
+        self.consecutive_failures
+    }
+
+    /// Returns true if the failure cap has been reached.
+    pub(crate) fn should_escalate_on_failure(&self) -> bool {
+        self.consecutive_failures >= MAX_CONSECUTIVE_FAILURES
+    }
+
     /// Record the judge's response and update internal state.
     pub(crate) fn record_response(
         &mut self,
@@ -119,6 +147,7 @@ impl JudgeState {
             self.consecutive_waits = 0;
         }
 
+        self.consecutive_failures = 0;
         self.last_fingerprint = Some(fingerprint);
 
         match &response.action {
@@ -477,11 +506,12 @@ fn truncate_if_needed(s: &str, max_bytes: usize) -> String {
 }
 
 /// Invoke the LLM judge via the agent backend, passing the prompt via stdin.
-async fn invoke_judge_cli(
+/// Returns the raw response text on success (even if not parseable as JSON).
+async fn invoke_judge_cli_raw(
     backend: &dyn AgentBackend,
     worktree_path: &std::path::Path,
     prompt: &str,
-) -> Result<JudgeResponse> {
+) -> Result<String> {
     let mut cmd = backend.build_oneshot_command(worktree_path, "-");
     cmd.stdin(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
@@ -516,8 +546,7 @@ async fn invoke_judge_cli(
         );
     }
 
-    let response_text = String::from_utf8_lossy(&output.stdout);
-    parse_judge_response(&response_text)
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 /// Parse the judge's JSON response from potentially noisy LLM output.
@@ -622,7 +651,37 @@ pub(crate) async fn evaluate(
         confidence_threshold,
     );
 
-    let mut response = invoke_judge_cli(backend, worktree_path, &prompt).await?;
+    let raw_response = match invoke_judge_cli_raw(backend, worktree_path, &prompt).await {
+        Ok(text) => text,
+        Err(e) => {
+            log::warn!("Judge CLI invocation failed: {}", e);
+            state.record_failure(fingerprint);
+            return Err(e);
+        }
+    };
+
+    let mut response = match parse_judge_response(&raw_response) {
+        Ok(r) => r,
+        Err(e) => {
+            // Log the raw response for diagnostics — truncate to avoid log spam.
+            let preview = if raw_response.len() > 500 {
+                format!(
+                    "{}... [truncated, {} bytes total]",
+                    &raw_response[..500],
+                    raw_response.len()
+                )
+            } else {
+                raw_response.clone()
+            };
+            log::warn!(
+                "Judge response parse failed: {}. Raw response: {}",
+                e,
+                preview
+            );
+            state.record_failure(fingerprint);
+            return Err(e);
+        }
+    };
 
     // Hard guard: if we've hit max consecutive waits and the LLM still says
     // "wait", coerce to "escalate" to prevent infinite wait loops.
@@ -1005,6 +1064,103 @@ That's my verdict."#;
         // Clearing without label_applied should be a no-op.
         state.mark_escalation_cleared();
         assert!(!state.should_invoke(&fp)); // Fingerprint NOT reset.
+    }
+
+    #[test]
+    fn test_judge_state_record_failure_updates_fingerprint() {
+        let mut state = JudgeState::new();
+        let fp = PrStateFingerprint {
+            head_sha: "abc123".to_string(),
+            comment_count: 5,
+        };
+        state.record_failure(fp.clone());
+        assert_eq!(state.consecutive_failures(), 1);
+        // Same fingerprint should NOT trigger re-invocation.
+        assert!(!state.should_invoke(&fp));
+    }
+
+    #[test]
+    fn test_judge_state_failure_counter_increments() {
+        let mut state = JudgeState::new();
+        let fp = PrStateFingerprint {
+            head_sha: "abc123".to_string(),
+            comment_count: 5,
+        };
+        state.record_failure(fp.clone());
+        assert_eq!(state.consecutive_failures(), 1);
+        assert!(!state.should_escalate_on_failure());
+
+        state.record_failure(fp.clone());
+        assert_eq!(state.consecutive_failures(), 2);
+        assert!(!state.should_escalate_on_failure());
+
+        state.record_failure(fp.clone());
+        assert_eq!(state.consecutive_failures(), 3);
+        assert!(state.should_escalate_on_failure());
+    }
+
+    #[test]
+    fn test_judge_state_failure_counter_resets_on_state_change() {
+        let mut state = JudgeState::new();
+        let fp1 = PrStateFingerprint {
+            head_sha: "abc".to_string(),
+            comment_count: 1,
+        };
+        state.record_failure(fp1);
+        state.record_failure(PrStateFingerprint {
+            head_sha: "abc".to_string(),
+            comment_count: 1,
+        });
+        assert_eq!(state.consecutive_failures(), 2);
+
+        // Different fingerprint resets the counter.
+        let fp2 = PrStateFingerprint {
+            head_sha: "def".to_string(),
+            comment_count: 2,
+        };
+        state.record_failure(fp2);
+        assert_eq!(state.consecutive_failures(), 1);
+    }
+
+    #[test]
+    fn test_judge_state_success_resets_failure_counter() {
+        let mut state = JudgeState::new();
+        let fp = PrStateFingerprint {
+            head_sha: "abc".to_string(),
+            comment_count: 1,
+        };
+        state.record_failure(fp.clone());
+        state.record_failure(fp.clone());
+        assert_eq!(state.consecutive_failures(), 2);
+
+        // A successful response resets failures.
+        let resp = JudgeResponse {
+            confidence: 9,
+            action: JudgeAction::Merge,
+            reasoning: "ok".to_string(),
+        };
+        state.record_response(fp, &resp);
+        assert_eq!(state.consecutive_failures(), 0);
+    }
+
+    #[test]
+    fn test_judge_state_failure_does_not_reinvoke_same_fingerprint() {
+        let mut state = JudgeState::new();
+        let fp = PrStateFingerprint {
+            head_sha: "abc123".to_string(),
+            comment_count: 5,
+        };
+
+        // After recording a failure, should_invoke returns false for same state.
+        state.record_failure(fp.clone());
+        assert!(!state.should_invoke(&fp));
+
+        // But a new fingerprint should trigger invocation.
+        let fp2 = PrStateFingerprint {
+            head_sha: "def456".to_string(),
+            comment_count: 5,
+        };
+        assert!(state.should_invoke(&fp2));
     }
 
     #[test]
