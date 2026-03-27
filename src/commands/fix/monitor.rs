@@ -836,6 +836,29 @@ fn handle_interrupted(ctx: &MonitorContext<'_>) -> LoopAction {
     LoopAction::Break
 }
 
+/// Sleep for `backoff` (capped at the remaining monitor timeout), aborting on
+/// Ctrl+C. Returns `Some(LoopAction::Break)` if interrupted, `None` otherwise.
+async fn sleep_with_timeout(
+    backoff: Duration,
+    state: &MonitorLoopState,
+    ctx: &MonitorContext<'_>,
+) -> Option<LoopAction> {
+    let remaining = ctx
+        .monitor_timeout
+        .checked_sub(state.monitor_start.elapsed());
+    match remaining {
+        Some(r) if r > Duration::ZERO => {
+            tokio::select! {
+                _ = tokio::time::sleep(backoff.min(r)) => None,
+                _ = tokio::signal::ctrl_c() => {
+                    Some(handle_interrupted(ctx))
+                }
+            }
+        }
+        _ => None,
+    }
+}
+
 async fn handle_monitor_error(
     state: &mut MonitorLoopState,
     ctx: &MonitorContext<'_>,
@@ -849,23 +872,12 @@ async fn handle_monitor_error(
     if pr_monitor::is_rate_limit_error(&error_msg) {
         let backoff = Duration::from_secs(RATE_LIMIT_BACKOFF_SECS);
         log::info!(
-            "ℹ️  GitHub API rate limited, backing off for {}: {}",
+            "ℹ️  GitHub API rate limited, backing off for {}: {:#}",
             format_duration(backoff.as_secs()),
             error
         );
-        let remaining = ctx
-            .monitor_timeout
-            .checked_sub(state.monitor_start.elapsed());
-        match remaining {
-            Some(r) if r > Duration::ZERO => {
-                tokio::select! {
-                    _ = tokio::time::sleep(backoff.min(r)) => {}
-                    _ = tokio::signal::ctrl_c() => {
-                        return handle_interrupted(ctx);
-                    }
-                }
-            }
-            _ => {}
+        if let Some(action) = sleep_with_timeout(backoff, state, ctx).await {
+            return action;
         }
         return LoopAction::Continue;
     }
@@ -895,26 +907,8 @@ async fn handle_monitor_error(
     // fails before its internal poll sleep. Cap at remaining timeout
     // so we don't overshoot the configured monitor_timeout.
     let backoff = Duration::from_secs(30);
-    let remaining = ctx
-        .monitor_timeout
-        .checked_sub(state.monitor_start.elapsed());
-    match remaining {
-        Some(r) if r > Duration::ZERO => {
-            tokio::select! {
-                _ = tokio::time::sleep(backoff.min(r)) => {}
-                _ = tokio::signal::ctrl_c() => {
-                    println!("\n⚠️  Monitoring interrupted by user");
-                    println!(
-                        "   PR is still open: https://github.com/{}/{}/pull/{}",
-                        ctx.issue_ctx.owner, ctx.issue_ctx.repo, ctx.pr_number
-                    );
-                    return LoopAction::Break;
-                }
-            }
-        }
-        _ => {
-            // Timeout already expired, let the loop's timeout check handle it.
-        }
+    if let Some(action) = sleep_with_timeout(backoff, state, ctx).await {
+        return action;
     }
     LoopAction::Continue
 }
