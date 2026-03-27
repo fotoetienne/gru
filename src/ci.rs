@@ -343,7 +343,11 @@ pub(crate) async fn fetch_check_runs(
 
     let endpoint = format!("repos/{}/commits/{}/check-runs", repo_full, git_ref);
     let jq_filter = ".check_runs[] | {name: .name, status: .status, conclusion: .conclusion, started_at: .started_at, completed_at: .completed_at, output_title: .output.title, output_summary: .output.summary, output_text: .output.text}";
-    let stdout = github::run_gh(host, &["api", &endpoint, "--jq", jq_filter]).await?;
+    let stdout = github::run_gh(
+        host,
+        &["api", &endpoint, "--cache", "20s", "--jq", jq_filter],
+    )
+    .await?;
     let mut checks = Vec::new();
 
     for line in stdout.lines() {

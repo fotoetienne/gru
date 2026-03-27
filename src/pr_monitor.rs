@@ -599,7 +599,12 @@ pub(crate) enum MonitorResult {
 async fn get_pr(host: &str, owner: &str, repo: &str, pr_number: &str) -> Result<PullRequest> {
     let repo_full = github::repo_slug(owner, repo);
     let endpoint = format!("repos/{repo_full}/pulls/{pr_number}");
-    let output = gh_api_with_retry(host, &["api", &endpoint], DEFAULT_MAX_RETRIES).await?;
+    let output = gh_api_with_retry(
+        host,
+        &["api", &endpoint, "--cache", "20s"],
+        DEFAULT_MAX_RETRIES,
+    )
+    .await?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -696,7 +701,12 @@ async fn get_review_feedback(
             "repos/{repo_full}/pulls/{pr_number}/reviews/{}/comments",
             review.id
         );
-        let output = gh_api_with_retry(host, &["api", &endpoint], DEFAULT_MAX_RETRIES).await?;
+        let output = gh_api_with_retry(
+            host,
+            &["api", &endpoint, "--cache", "20s"],
+            DEFAULT_MAX_RETRIES,
+        )
+        .await?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);

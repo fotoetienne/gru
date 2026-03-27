@@ -165,6 +165,8 @@ pub(crate) async fn get_blockers_via_api(
         .args([
             "api",
             &endpoint,
+            "--cache",
+            "60s",
             "--jq",
             "[.[] | select(.state == \"open\") | .number]",
         ])

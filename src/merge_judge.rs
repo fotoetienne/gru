@@ -222,10 +222,17 @@ pub(crate) async fn get_pr_fingerprint(
     let results = run_gh_parallel(
         host,
         vec![
-            vec!["api".into(), format!("repos/{repo_full}/pulls/{pr_number}")],
+            vec![
+                "api".into(),
+                format!("repos/{repo_full}/pulls/{pr_number}"),
+                "--cache".into(),
+                "20s".into(),
+            ],
             vec![
                 "api".into(),
                 format!("repos/{repo_full}/issues/{pr_number}/comments"),
+                "--cache".into(),
+                "20s".into(),
                 "--paginate".into(),
                 "--jq".into(),
                 "length".into(),
@@ -233,6 +240,8 @@ pub(crate) async fn get_pr_fingerprint(
             vec![
                 "api".into(),
                 format!("repos/{repo_full}/pulls/{pr_number}/reviews"),
+                "--cache".into(),
+                "20s".into(),
                 "--paginate".into(),
                 "--jq".into(),
                 "length".into(),
@@ -240,6 +249,8 @@ pub(crate) async fn get_pr_fingerprint(
             vec![
                 "api".into(),
                 format!("repos/{repo_full}/pulls/{pr_number}/comments"),
+                "--cache".into(),
+                "20s".into(),
                 "--paginate".into(),
                 "--jq".into(),
                 "length".into(),
@@ -303,6 +314,8 @@ async fn fetch_pr_context(
             vec![
                 "api".into(),
                 format!("repos/{repo_full}/issues/{pr_number}/comments"),
+                "--cache".into(),
+                "20s".into(),
                 "--paginate".into(),
                 "--jq".into(),
                 ".[]".into(),
@@ -310,6 +323,8 @@ async fn fetch_pr_context(
             vec![
                 "api".into(),
                 format!("repos/{repo_full}/pulls/{pr_number}/reviews"),
+                "--cache".into(),
+                "20s".into(),
                 "--paginate".into(),
                 "--jq".into(),
                 ".[]".into(),
@@ -317,6 +332,8 @@ async fn fetch_pr_context(
             vec![
                 "api".into(),
                 format!("repos/{repo_full}/pulls/{pr_number}/comments"),
+                "--cache".into(),
+                "20s".into(),
                 "--paginate".into(),
                 "--jq".into(),
                 ".[]".into(),
@@ -723,7 +740,7 @@ pub(crate) async fn has_needs_human_review_label(
     let repo_full = github::repo_slug(owner, repo);
     let endpoint = format!("repos/{repo_full}/issues/{pr_number}/labels");
 
-    let stdout = github::run_gh(host, &["api", &endpoint]).await?;
+    let stdout = github::run_gh(host, &["api", &endpoint, "--cache", "20s"]).await?;
 
     #[derive(Deserialize)]
     struct Label {
