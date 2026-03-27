@@ -369,6 +369,11 @@ struct MonitorLoopState {
 /// 10 consecutive monitor_pr invocation failures before giving up.
 const MAX_CONSECUTIVE_ERRORS: u32 = 10;
 
+/// Backoff duration (in seconds) when rate-limited by the GitHub API.
+/// 5 minutes is long enough to avoid hammering the API during a rate-limit
+/// window while short enough to resume monitoring promptly.
+const RATE_LIMIT_BACKOFF_SECS: u64 = 300;
+
 impl MonitorLoopState {
     fn new(initial_baseline: DateTime<Utc>, confidence_threshold: u8) -> Self {
         Self {
@@ -836,7 +841,7 @@ async fn handle_monitor_error(
     ctx: &MonitorContext<'_>,
     error: anyhow::Error,
 ) -> LoopAction {
-    let error_msg = format!("{}", error);
+    let error_msg = format!("{:#}", error);
 
     // Rate-limit errors are expected and should not count toward the bailout
     // threshold. Use a longer backoff (5 minutes) to wait out the rate-limit
@@ -846,7 +851,7 @@ async fn handle_monitor_error(
             "ℹ️  GitHub API rate limited, backing off for 5 minutes: {}",
             error
         );
-        let backoff = Duration::from_secs(300);
+        let backoff = Duration::from_secs(RATE_LIMIT_BACKOFF_SECS);
         let remaining = ctx
             .monitor_timeout
             .checked_sub(state.monitor_start.elapsed());
@@ -855,12 +860,7 @@ async fn handle_monitor_error(
                 tokio::select! {
                     _ = tokio::time::sleep(backoff.min(r)) => {}
                     _ = tokio::signal::ctrl_c() => {
-                        println!("\n⚠️  Monitoring interrupted by user");
-                        println!(
-                            "   PR is still open: https://github.com/{}/{}/pull/{}",
-                            ctx.issue_ctx.owner, ctx.issue_ctx.repo, ctx.pr_number
-                        );
-                        return LoopAction::Break;
+                        return handle_interrupted(ctx);
                     }
                 }
             }
