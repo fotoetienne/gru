@@ -4,6 +4,7 @@ use tokio::process::Command;
 
 use crate::commands::child_process;
 use crate::git;
+use crate::tmux::TmuxGuard;
 
 /// Product manager skill content, embedded at compile time.
 const PM_SKILL: &str = include_str!("../../.claude/skills/product-manager/SKILL.md");
@@ -31,6 +32,8 @@ async fn launch_skill_session(
     prompt: Option<String>,
     verbose: bool,
 ) -> Result<i32> {
+    let _tmux_guard = TmuxGuard::new(&format!("gru:{role_name}"));
+
     let repo_root = git::detect_git_repo().await.map_err(|_| {
         anyhow::anyhow!("Not inside a git repository. Run `gru {role_name}` from within a project.")
     })?;
