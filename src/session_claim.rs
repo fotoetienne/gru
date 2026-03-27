@@ -75,6 +75,7 @@ fn claim_session_in_registry(
                 );
                 reg.update(&id, |i| {
                     i.mode = MinionMode::Stopped;
+                    i.clear_pid();
                     i.last_activity = Utc::now();
                 })?;
             }
@@ -342,9 +343,11 @@ mod tests {
         assert_eq!(snapshot.mode, MinionMode::Autonomous);
         assert_eq!(snapshot.pid, None);
 
-        // Registry should now show Interactive mode
+        // Registry should now show Interactive mode with PID fields cleared
         let updated = read_minion(tmp.path(), "M001").unwrap();
         assert_eq!(updated.mode, MinionMode::Interactive);
+        assert_eq!(updated.pid, None);
+        assert_eq!(updated.pid_start_time, None);
     }
 
     #[tokio::test]
