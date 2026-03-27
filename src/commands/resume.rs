@@ -112,6 +112,7 @@ async fn check_resumption_preconditions(
     let command = info.command;
     let timeout_deadline: Option<DateTime<Utc>> = info.timeout_deadline;
     let no_watch = info.no_watch;
+    let command = info.command.clone();
     let start_phase = info.orchestration_phase.clone();
     let wake_reason = info.wake_reason.clone();
 
@@ -319,13 +320,13 @@ async fn run_resume_pipeline(ctx: ResumeContext, quiet: bool) -> Result<i32> {
         }
     }
 
-    // For agent-only commands (prompt, review, etc.), skip PR creation and monitoring.
-    // Only transition to Completed if the agent actually ran in this invocation;
-    // otherwise preserve the existing phase (e.g., a prior Failed state).
-    if agent_only {
-        if agent_result.is_some() {
-            update_orchestration_phase(&wt_ctx.minion_id, OrchestrationPhase::Completed).await;
-        }
+    // Agent-only commands (review, prompt) have no post-agent phases.
+    // If the agent already ran in a prior invocation (start_phase past RunningAgent)
+    // or just completed, mark as done and exit.
+    if agent_only
+        && (agent_result.is_some() || start_phase > OrchestrationPhase::RunningAgent)
+    {
+        update_orchestration_phase(&wt_ctx.minion_id, OrchestrationPhase::Completed).await;
         cleanup_registry(&wt_ctx.minion_id).await;
         println!("✅ Resume completed for Minion {}", wt_ctx.minion_id);
         return Ok(agent_exit_code(&agent_result));
@@ -557,12 +558,17 @@ mod tests {
     }
 
     #[test]
+    fn test_is_agent_only_command_review() {
+        assert!(is_agent_only_command("review"));
+    }
+
+    #[test]
     fn test_is_agent_only_command_prompt() {
         assert!(is_agent_only_command("prompt"));
     }
 
     #[test]
-    fn test_is_agent_only_command_review() {
-        assert!(is_agent_only_command("review"));
+    fn test_is_agent_only_command_empty_is_not_agent_only() {
+        assert!(!is_agent_only_command(""));
     }
 }
