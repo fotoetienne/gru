@@ -376,6 +376,7 @@ impl From<RawCheckRun> for CheckRun {
     }
 }
 
+#[cfg(test)]
 #[derive(Debug, Deserialize)]
 struct CheckRunsResponse {
     check_runs: Vec<RawCheckRun>,
