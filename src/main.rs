@@ -271,6 +271,7 @@ enum Commands {
         id: String,
 
         #[arg(
+            short = 'y',
             long,
             help = "Skip permission prompts (adds --dangerously-skip-permissions)"
         )]
