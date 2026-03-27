@@ -150,7 +150,7 @@ async fn post_exit_notification_if_needed(
     review_baseline: DateTime<Utc>,
 ) {
     // Check PR state and author in one API call.
-    let (is_open, pr_author) =
+    let (is_open, _pr_author) =
         match pr_monitor::get_pr_info_for_exit_notification(host, owner, repo, pr_number).await {
             Ok(info) => info,
             Err(e) => {
@@ -174,7 +174,7 @@ async fn post_exit_notification_if_needed(
         }
     };
 
-    let count = pr_monitor::has_unaddressed_reviews(&reviews, &pr_author, review_baseline);
+    let count = pr_monitor::has_unaddressed_reviews(&reviews, review_baseline);
 
     if !pr_monitor::should_post_exit_notification(is_open, count) {
         return;

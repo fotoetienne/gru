@@ -722,7 +722,7 @@ async fn find_minions_needing_wake(
                     continue;
                 }
             };
-        let (pr_open, pr_author, mergeable) = pr_info;
+        let (pr_open, _pr_author, mergeable) = pr_info;
 
         // Skip closed/merged PRs early to avoid unnecessary review API calls.
         if !pr_open {
@@ -751,7 +751,7 @@ async fn find_minions_needing_wake(
         };
 
         let since = info.last_review_check_time.unwrap_or(info.started_at);
-        let unaddressed = pr_monitor::has_unaddressed_reviews(&reviews, &pr_author, since);
+        let unaddressed = pr_monitor::has_unaddressed_reviews(&reviews, since);
 
         if !should_wake_minion(pr_open, unaddressed, has_merge_conflict) {
             log::debug!(
