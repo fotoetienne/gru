@@ -1158,7 +1158,7 @@ fn is_blocked_by_session_guard(
     phase: &OrchestrationPhase,
     resumed_this_session: &HashSet<String>,
 ) -> bool {
-    resumed_this_session.contains(minion_id) && *phase != OrchestrationPhase::MonitoringPr
+    resumed_this_session.contains(minion_id) && phase != &OrchestrationPhase::MonitoringPr
 }
 
 /// Resume interrupted minions, filling available slots before new issue claims.
@@ -1179,12 +1179,12 @@ async fn resume_interrupted_minions(
         .await?
         .into_iter()
         .filter(|c| {
-            let dominated = is_blocked_by_session_guard(
+            let blocked = is_blocked_by_session_guard(
                 &c.minion_id,
                 &c.info.orchestration_phase,
                 resumed_this_session,
             );
-            if dominated {
+            if blocked {
                 log::debug!(
                     "Skipping {} (issue #{}, {}): already resumed this session",
                     c.minion_id,
@@ -1192,7 +1192,7 @@ async fn resume_interrupted_minions(
                     c.info.repo,
                 );
             }
-            !dominated
+            !blocked
         })
         .collect();
     if resumable.is_empty() {
