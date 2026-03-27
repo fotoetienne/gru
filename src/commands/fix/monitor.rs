@@ -386,9 +386,14 @@ struct MonitorLoopState {
 }
 
 /// How many poll cycles to suppress merge-conflict detection after a successful
-/// rebase + force-push. At 30s per poll, 4 cycles ≈ 2 minutes — enough for
+/// rebase + force-push. At 30s per cycle, 4 cycles ≈ 2 minutes — enough for
 /// GitHub to recompute the `mergeable` field.
 const REBASE_COOLDOWN_CYCLES: u32 = 4;
+
+/// Sleep duration (seconds) when suppressing a stale MergeConflict during
+/// cooldown. Matches the pr_monitor poll interval so suppressed cycles don't
+/// spin hot and hammer the GitHub API.
+const REBASE_COOLDOWN_SLEEP_SECS: u64 = 30;
 
 /// 10 consecutive monitor_pr invocation failures before giving up.
 const MAX_CONSECUTIVE_ERRORS: u32 = 10;
@@ -795,10 +800,13 @@ async fn handle_merge_conflict(
             LoopAction::Continue
         }
         Ok(AutoRebaseResult::AlreadyUpToDate) => {
-            // Branch is already up-to-date — no force-push happened, so no
-            // need for a cooldown. The mergeable:false signal may be a real
-            // conflict from a content-level merge issue rather than cache lag.
+            // Branch is already up-to-date — origin/<base> is an ancestor of
+            // HEAD, so a real merge conflict is impossible. The mergeable:false
+            // signal must be stale. Apply cooldown to avoid a tight loop of
+            // redundant MergeConflict → already-up-to-date cycles that would
+            // never reach the attempt cap (since attempts reset on success).
             state.rebase_attempts = 0;
+            state.rebase_cooldown_cycles = REBASE_COOLDOWN_CYCLES;
             state.review_baseline = Some(check_time);
             println!("✅ Branch already up-to-date, continuing to monitor PR...\n");
             LoopAction::Continue
@@ -933,6 +941,11 @@ async fn handle_pr_event(
                     "Ignoring stale mergeable:false during post-rebase cooldown ({} cycles remaining)",
                     state.rebase_cooldown_cycles
                 );
+                // Sleep for the poll interval so we don't spin hot and hammer
+                // the GitHub API. monitor_pr returns MergeConflict immediately
+                // (no internal sleep), so without this the outer loop would
+                // burn through all cooldown cycles in seconds.
+                tokio::time::sleep(Duration::from_secs(REBASE_COOLDOWN_SLEEP_SECS)).await;
                 LoopAction::Continue
             } else {
                 handle_merge_conflict(state, ctx, check_time).await
