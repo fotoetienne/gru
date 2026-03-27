@@ -836,6 +836,39 @@ async fn handle_monitor_error(
     ctx: &MonitorContext<'_>,
     error: anyhow::Error,
 ) -> LoopAction {
+    let error_msg = format!("{}", error);
+
+    // Rate-limit errors are expected and should not count toward the bailout
+    // threshold. Use a longer backoff (5 minutes) to wait out the rate-limit
+    // window instead of hammering the API every 30 seconds.
+    if pr_monitor::is_rate_limit_error(&error_msg) {
+        log::info!(
+            "ℹ️  GitHub API rate limited, backing off for 5 minutes: {}",
+            error
+        );
+        let backoff = Duration::from_secs(300);
+        let remaining = ctx
+            .monitor_timeout
+            .checked_sub(state.monitor_start.elapsed());
+        match remaining {
+            Some(r) if r > Duration::ZERO => {
+                tokio::select! {
+                    _ = tokio::time::sleep(backoff.min(r)) => {}
+                    _ = tokio::signal::ctrl_c() => {
+                        println!("\n⚠️  Monitoring interrupted by user");
+                        println!(
+                            "   PR is still open: https://github.com/{}/{}/pull/{}",
+                            ctx.issue_ctx.owner, ctx.issue_ctx.repo, ctx.pr_number
+                        );
+                        return LoopAction::Break;
+                    }
+                }
+            }
+            _ => {}
+        }
+        return LoopAction::Continue;
+    }
+
     state.consecutive_errors += 1;
     if state.consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
         log::warn!(

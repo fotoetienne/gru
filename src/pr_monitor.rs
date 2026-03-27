@@ -12,6 +12,10 @@ use tokio::time::{sleep, Duration, Instant};
 const POLL_INTERVAL_SECS: u64 = 30;
 const MAX_POLL_INTERVAL_SECS: u64 = 300; // 5 minutes
 
+/// Re-export from `github.rs` so callers (e.g. `monitor.rs`) can use
+/// `pr_monitor::is_rate_limit_error` without reaching into `github` directly.
+pub(crate) use crate::github::is_rate_limit_error;
+
 /// Alias for the shared retry helper in `github.rs`.
 async fn gh_api_with_retry(host: &str, args: &[&str], max_retries: u32) -> Result<Output> {
     github::gh_api_with_retry(host, args, max_retries).await
