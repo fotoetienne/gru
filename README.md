@@ -196,4 +196,4 @@ Contributions are welcome! See [CONTRIBUTING.md](CONTRIBUTING.md) for dev setup,
 
 ---
 
-<p align="center">Made with love by <a href="https://github.com/fotoetienne/gru">Gru</a></p>
+<p align="center">made with love by <a href="https://github.com/fotoetienne/gru">gru</a></p>
