@@ -310,10 +310,10 @@ async fn get_reviews(
         host,
         &[
             "api",
-            "--paginate",
             &endpoint,
             "--cache",
             "20s",
+            "--paginate",
             "--jq",
             ".[]",
         ],
@@ -346,10 +346,10 @@ async fn get_check_runs(host: &str, owner: &str, repo: &str, sha: &str) -> Resul
         host,
         &[
             "api",
-            "--paginate",
             &endpoint,
             "--cache",
             "20s",
+            "--paginate",
             "--jq",
             ".check_runs[]",
         ],
