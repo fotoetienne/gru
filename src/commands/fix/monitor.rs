@@ -4,7 +4,7 @@ use crate::agent::AgentBackend;
 use crate::ci;
 use crate::config::LabConfig;
 use crate::github;
-use crate::merge_judge::{self, JudgeAction, JudgeState};
+use crate::merge_judge::{self, JudgeAction, JudgeResponse, JudgeState};
 use crate::minion_registry;
 use crate::pr_monitor::{self, MonitorResult};
 use anyhow::{Context, Result};
@@ -483,6 +483,30 @@ async fn handle_ready_to_merge(
         }
     }
 
+    // If a previous failure escalation failed to apply the label, retry now
+    // before invoking the judge (which would skip at the failure cap).
+    if state.judge_state.should_escalate_on_failure() && !state.judge_state.label_was_applied() {
+        log::info!("Retrying failed escalation label application...");
+        match merge_judge::add_needs_human_review_label(
+            &ctx.issue_ctx.host,
+            &ctx.issue_ctx.owner,
+            &ctx.issue_ctx.repo,
+            ctx.pr_number,
+        )
+        .await
+        {
+            Ok(()) => {
+                state.judge_state.mark_label_applied();
+                state.judge_state.mark_failure_escalated();
+                log::info!("Successfully applied needs-human-review label on retry");
+            }
+            Err(e) => {
+                log::warn!("Retry of needs-human-review label failed: {}", e);
+            }
+        }
+        return LoopAction::Continue;
+    }
+
     // Invoke the merge-readiness judge.
     match merge_judge::evaluate(
         ctx.backend,
@@ -585,7 +609,61 @@ async fn handle_ready_to_merge(
         }
         Err(e) => {
             log::warn!("⚠️  Merge judge failed: {:#}", e);
-            println!("🔄 Will retry on next poll cycle...");
+            if state.judge_state.should_escalate_on_failure() {
+                log::warn!(
+                    "Judge failed {} consecutive times — escalating for human review",
+                    state.judge_state.consecutive_failures()
+                );
+                println!(
+                    "🚨 Judge failed {} times on same PR state — escalating for human review",
+                    state.judge_state.consecutive_failures()
+                );
+                match merge_judge::add_needs_human_review_label(
+                    &ctx.issue_ctx.host,
+                    &ctx.issue_ctx.owner,
+                    &ctx.issue_ctx.repo,
+                    ctx.pr_number,
+                )
+                .await
+                {
+                    Ok(()) => state.judge_state.mark_label_applied(),
+                    Err(label_err) => {
+                        log::warn!("Failed to add needs-human-review label: {}", label_err);
+                    }
+                }
+                merge_judge::post_judge_escalation_comment(
+                    &ctx.issue_ctx.host,
+                    &ctx.issue_ctx.owner,
+                    &ctx.issue_ctx.repo,
+                    ctx.pr_number,
+                    &JudgeResponse {
+                        confidence: 0,
+                        action: JudgeAction::Escalate,
+                        reasoning: format!(
+                            "Merge judge failed {} consecutive times (last error: {}). \
+                             Unable to evaluate merge readiness automatically.",
+                            state.judge_state.consecutive_failures(),
+                            e
+                        ),
+                    },
+                )
+                .await;
+                // Only mark escalation complete if the label was applied.
+                // If the label add failed, leave unmarked so we retry on
+                // the next cycle (should_invoke returns false at cap, but
+                // next fingerprint change or label retry will re-attempt).
+                if state.judge_state.label_was_applied() {
+                    state.judge_state.mark_failure_escalated();
+                }
+            } else {
+                let backoff = state.judge_state.retry_backoff_minutes();
+                println!(
+                    "🔄 Will retry after ~{}m backoff (failure {}/{})...",
+                    backoff,
+                    state.judge_state.consecutive_failures(),
+                    merge_judge::MAX_CONSECUTIVE_FAILURES
+                );
+            }
         }
     }
     LoopAction::Continue

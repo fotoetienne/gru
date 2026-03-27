@@ -26,6 +26,9 @@ pub(crate) const DEFAULT_CONFIDENCE_THRESHOLD: u8 = 8;
 /// Maximum consecutive wait responses before the judge must decide merge or escalate.
 const MAX_CONSECUTIVE_WAITS: u32 = 3;
 
+/// Maximum consecutive parse/invocation failures before escalating.
+pub(crate) const MAX_CONSECUTIVE_FAILURES: u32 = 3;
+
 /// Maximum wait duration the LLM can request (in minutes).
 const MAX_WAIT_MINUTES: u64 = 120;
 
@@ -75,10 +78,17 @@ pub(crate) struct JudgeState {
     last_fingerprint: Option<PrStateFingerprint>,
     /// Number of consecutive "wait" responses with no state change.
     consecutive_waits: u32,
+    /// Number of consecutive failures (parse errors, CLI errors) on the same fingerprint.
+    consecutive_failures: u32,
     /// When the current wait expires (if any).
     wait_until: Option<DateTime<Utc>>,
+    /// When the next failure retry is allowed (exponential backoff).
+    retry_after: Option<DateTime<Utc>>,
     /// Whether the judge has escalated and the label was confirmed applied.
     label_applied: bool,
+    /// Whether a failure-triggered escalation has already been performed
+    /// for the current fingerprint (prevents repeated label/comment spam).
+    failure_escalated: bool,
 }
 
 impl JudgeState {
@@ -86,8 +96,11 @@ impl JudgeState {
         Self {
             last_fingerprint: None,
             consecutive_waits: 0,
+            consecutive_failures: 0,
             wait_until: None,
+            retry_after: None,
             label_applied: false,
+            failure_escalated: false,
         }
     }
 
@@ -98,6 +111,19 @@ impl JudgeState {
             return true;
         }
 
+        // If we've hit the failure cap, stop retrying until state changes.
+        if self.consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
+            return false;
+        }
+
+        // If we have failures below the cap, retry after backoff expires.
+        if self.consecutive_failures > 0 {
+            return match self.retry_after {
+                Some(until) => Utc::now() >= until,
+                None => true,
+            };
+        }
+
         // Same state — only invoke if a wait timer expired.
         if let Some(until) = self.wait_until {
             return Utc::now() >= until;
@@ -105,6 +131,55 @@ impl JudgeState {
 
         // Same state, no wait timer — don't re-invoke.
         false
+    }
+
+    /// Record a failure (parse error, CLI error) for the given fingerprint.
+    /// Updates the fingerprint and sets a backoff timer so `should_invoke`
+    /// will allow retries up to `MAX_CONSECUTIVE_FAILURES`.
+    pub(crate) fn record_failure(&mut self, fingerprint: PrStateFingerprint) {
+        let state_changed = self.last_fingerprint.as_ref() != Some(&fingerprint);
+        if state_changed {
+            self.consecutive_failures = 0;
+            // Reset stale wait state from previous fingerprint to avoid
+            // leaking wait_until/consecutive_waits into the new state.
+            self.consecutive_waits = 0;
+            self.wait_until = None;
+            self.failure_escalated = false;
+        }
+        self.consecutive_failures += 1;
+        // Exponential backoff: 2min, 4min, 8min (capped at 10min).
+        let backoff_mins = (2u64.saturating_pow(self.consecutive_failures)).min(10);
+        self.retry_after = Some(Utc::now() + chrono::Duration::minutes(backoff_mins as i64));
+        self.last_fingerprint = Some(fingerprint);
+    }
+
+    /// Returns the number of consecutive failures on the current fingerprint.
+    pub(crate) fn consecutive_failures(&self) -> u32 {
+        self.consecutive_failures
+    }
+
+    /// Returns the retry backoff remaining in minutes (rounded up), or 0
+    /// if no backoff is active.
+    pub(crate) fn retry_backoff_minutes(&self) -> i64 {
+        match self.retry_after {
+            Some(until) => {
+                let remaining = until - Utc::now();
+                (remaining.num_seconds() + 59).max(0) / 60 // round up
+            }
+            None => 0,
+        }
+    }
+
+    /// Returns true if the failure cap has been reached and escalation
+    /// has not yet been performed for this fingerprint.
+    pub(crate) fn should_escalate_on_failure(&self) -> bool {
+        self.consecutive_failures >= MAX_CONSECUTIVE_FAILURES && !self.failure_escalated
+    }
+
+    /// Mark that a failure-triggered escalation has been performed,
+    /// preventing repeated label/comment spam on subsequent poll cycles.
+    pub(crate) fn mark_failure_escalated(&mut self) {
+        self.failure_escalated = true;
     }
 
     /// Record the judge's response and update internal state.
@@ -119,6 +194,9 @@ impl JudgeState {
             self.consecutive_waits = 0;
         }
 
+        self.consecutive_failures = 0;
+        self.retry_after = None;
+        self.failure_escalated = false;
         self.last_fingerprint = Some(fingerprint);
 
         match &response.action {
@@ -163,8 +241,12 @@ impl JudgeState {
     pub(crate) fn mark_escalation_cleared(&mut self) {
         if self.label_applied {
             self.label_applied = false;
-            // Reset fingerprint so the judge re-evaluates on next check.
+            // Reset fingerprint and failure counter so the judge re-evaluates
+            // on next check with a fresh retry budget.
             self.last_fingerprint = None;
+            self.consecutive_failures = 0;
+            self.retry_after = None;
+            self.failure_escalated = false;
         }
     }
 }
@@ -477,11 +559,12 @@ fn truncate_if_needed(s: &str, max_bytes: usize) -> String {
 }
 
 /// Invoke the LLM judge via the agent backend, passing the prompt via stdin.
-async fn invoke_judge_cli(
+/// Returns the raw response text on success (even if not parseable as JSON).
+async fn invoke_judge_cli_raw(
     backend: &dyn AgentBackend,
     worktree_path: &std::path::Path,
     prompt: &str,
-) -> Result<JudgeResponse> {
+) -> Result<String> {
     let mut cmd = backend.build_oneshot_command(worktree_path, "-");
     cmd.stdin(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
@@ -516,8 +599,7 @@ async fn invoke_judge_cli(
         );
     }
 
-    let response_text = String::from_utf8_lossy(&output.stdout);
-    parse_judge_response(&response_text)
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 /// Parse the judge's JSON response from potentially noisy LLM output.
@@ -622,7 +704,29 @@ pub(crate) async fn evaluate(
         confidence_threshold,
     );
 
-    let mut response = invoke_judge_cli(backend, worktree_path, &prompt).await?;
+    let raw_response = match invoke_judge_cli_raw(backend, worktree_path, &prompt).await {
+        Ok(text) => text,
+        Err(e) => {
+            log::warn!("Judge CLI invocation failed: {}", e);
+            state.record_failure(fingerprint);
+            return Err(e);
+        }
+    };
+
+    let mut response = match parse_judge_response(&raw_response) {
+        Ok(r) => r,
+        Err(e) => {
+            // Log the raw response for diagnostics — truncate to avoid log spam.
+            let preview = truncate_if_needed(&raw_response, 500);
+            log::warn!(
+                "Judge response parse failed: {}. Raw response: {}",
+                e,
+                preview
+            );
+            state.record_failure(fingerprint);
+            return Err(e);
+        }
+    };
 
     // Hard guard: if we've hit max consecutive waits and the LLM still says
     // "wait", coerce to "escalate" to prevent infinite wait loops.
@@ -1005,6 +1109,196 @@ That's my verdict."#;
         // Clearing without label_applied should be a no-op.
         state.mark_escalation_cleared();
         assert!(!state.should_invoke(&fp)); // Fingerprint NOT reset.
+    }
+
+    #[test]
+    fn test_judge_state_record_failure_sets_backoff() {
+        let mut state = JudgeState::new();
+        let fp = PrStateFingerprint {
+            head_sha: "abc123".to_string(),
+            comment_count: 5,
+        };
+        state.record_failure(fp.clone());
+        assert_eq!(state.consecutive_failures(), 1);
+        // Backoff timer is set, so should_invoke returns false immediately.
+        assert!(!state.should_invoke(&fp));
+        // But retry_after is set (not None), so it will eventually retry.
+        assert!(state.retry_after.is_some());
+    }
+
+    #[test]
+    fn test_judge_state_failure_counter_increments() {
+        let mut state = JudgeState::new();
+        let fp = PrStateFingerprint {
+            head_sha: "abc123".to_string(),
+            comment_count: 5,
+        };
+        state.record_failure(fp.clone());
+        assert_eq!(state.consecutive_failures(), 1);
+        assert!(!state.should_escalate_on_failure());
+
+        state.record_failure(fp.clone());
+        assert_eq!(state.consecutive_failures(), 2);
+        assert!(!state.should_escalate_on_failure());
+
+        state.record_failure(fp.clone());
+        assert_eq!(state.consecutive_failures(), 3);
+        assert!(state.should_escalate_on_failure());
+    }
+
+    #[test]
+    fn test_judge_state_failure_counter_resets_on_state_change() {
+        let mut state = JudgeState::new();
+        let fp1 = PrStateFingerprint {
+            head_sha: "abc".to_string(),
+            comment_count: 1,
+        };
+        state.record_failure(fp1);
+        state.record_failure(PrStateFingerprint {
+            head_sha: "abc".to_string(),
+            comment_count: 1,
+        });
+        assert_eq!(state.consecutive_failures(), 2);
+
+        // Different fingerprint resets the counter.
+        let fp2 = PrStateFingerprint {
+            head_sha: "def".to_string(),
+            comment_count: 2,
+        };
+        state.record_failure(fp2);
+        assert_eq!(state.consecutive_failures(), 1);
+    }
+
+    #[test]
+    fn test_judge_state_success_resets_failure_counter() {
+        let mut state = JudgeState::new();
+        let fp = PrStateFingerprint {
+            head_sha: "abc".to_string(),
+            comment_count: 1,
+        };
+        state.record_failure(fp.clone());
+        state.record_failure(fp.clone());
+        assert_eq!(state.consecutive_failures(), 2);
+
+        // A successful response resets failures.
+        let resp = JudgeResponse {
+            confidence: 9,
+            action: JudgeAction::Merge,
+            reasoning: "ok".to_string(),
+        };
+        state.record_response(fp, &resp);
+        assert_eq!(state.consecutive_failures(), 0);
+    }
+
+    #[test]
+    fn test_judge_state_failure_at_cap_blocks_reinvocation() {
+        let mut state = JudgeState::new();
+        let fp = PrStateFingerprint {
+            head_sha: "abc123".to_string(),
+            comment_count: 5,
+        };
+
+        // Hit the failure cap.
+        for _ in 0..MAX_CONSECUTIVE_FAILURES {
+            state.record_failure(fp.clone());
+        }
+        assert_eq!(state.consecutive_failures(), MAX_CONSECUTIVE_FAILURES);
+        // At cap, should_invoke returns false even if backoff expired.
+        state.retry_after = None;
+        assert!(!state.should_invoke(&fp));
+
+        // But a new fingerprint should trigger invocation.
+        let fp2 = PrStateFingerprint {
+            head_sha: "def456".to_string(),
+            comment_count: 5,
+        };
+        assert!(state.should_invoke(&fp2));
+    }
+
+    #[test]
+    fn test_judge_state_failure_retry_allowed_after_backoff() {
+        let mut state = JudgeState::new();
+        let fp = PrStateFingerprint {
+            head_sha: "abc123".to_string(),
+            comment_count: 5,
+        };
+        state.record_failure(fp.clone());
+        assert_eq!(state.consecutive_failures(), 1);
+
+        // Backoff hasn't expired — should not invoke.
+        assert!(!state.should_invoke(&fp));
+
+        // Simulate backoff expiring.
+        state.retry_after = Some(Utc::now() - chrono::Duration::seconds(1));
+        assert!(state.should_invoke(&fp));
+    }
+
+    #[test]
+    fn test_judge_state_failure_escalated_guard() {
+        let mut state = JudgeState::new();
+        let fp = PrStateFingerprint {
+            head_sha: "abc".to_string(),
+            comment_count: 1,
+        };
+        for _ in 0..MAX_CONSECUTIVE_FAILURES {
+            state.record_failure(fp.clone());
+        }
+        assert!(state.should_escalate_on_failure());
+
+        // After marking escalated, should_escalate_on_failure returns false.
+        state.mark_failure_escalated();
+        assert!(!state.should_escalate_on_failure());
+    }
+
+    #[test]
+    fn test_judge_state_failure_resets_stale_wait_on_state_change() {
+        let mut state = JudgeState::new();
+        let fp1 = PrStateFingerprint {
+            head_sha: "abc".to_string(),
+            comment_count: 1,
+        };
+        let wait_resp = JudgeResponse {
+            confidence: 5,
+            action: JudgeAction::Wait(Duration::from_secs(60)),
+            reasoning: "waiting".to_string(),
+        };
+        state.record_response(fp1, &wait_resp);
+        assert_eq!(state.consecutive_waits(), 1);
+        assert!(state.wait_until.is_some());
+
+        // Failure on a new fingerprint should reset wait state.
+        let fp2 = PrStateFingerprint {
+            head_sha: "def".to_string(),
+            comment_count: 2,
+        };
+        state.record_failure(fp2);
+        assert_eq!(state.consecutive_waits(), 0);
+        assert!(state.wait_until.is_none());
+    }
+
+    #[test]
+    fn test_judge_state_escalation_cleared_resets_failure_counter() {
+        let mut state = JudgeState::new();
+        let fp = PrStateFingerprint {
+            head_sha: "abc".to_string(),
+            comment_count: 1,
+        };
+
+        // Accumulate failures up to the escalation threshold.
+        state.record_failure(fp.clone());
+        state.record_failure(fp.clone());
+        state.record_failure(fp.clone());
+        assert!(state.should_escalate_on_failure());
+
+        // Simulate label being applied after failure escalation.
+        state.mark_label_applied();
+
+        // Human clears the label — should reset failure counter and fingerprint.
+        state.mark_escalation_cleared();
+        assert_eq!(state.consecutive_failures(), 0);
+        assert!(!state.should_escalate_on_failure());
+        // Fingerprint is cleared, so should_invoke returns true.
+        assert!(state.should_invoke(&fp));
     }
 
     #[test]
