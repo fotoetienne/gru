@@ -118,7 +118,10 @@ pub(crate) struct CheckRun {
     /// `title`, `summary`, `text`, and `annotations_count`. When this struct is
     /// constructed from the `--jq`-transformed path in `fetch_check_runs`, the
     /// field is set to a pre-built `String`. The custom deserializer accepts
-    /// both forms: strings pass through, objects/other types become `None`.
+    /// both forms: strings pass through unchanged, while objects have their
+    /// `title`/`summary`/`text` fields extracted and concatenated into a single
+    /// string (if any are present). Only `null` or other unsupported types
+    /// become `None`.
     #[serde(default, deserialize_with = "deserialize_output_field")]
     pub(crate) output: Option<String>,
 }

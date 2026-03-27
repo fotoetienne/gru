@@ -1651,8 +1651,15 @@ mod tests {
 
         assert_eq!(response.check_runs.len(), 2);
 
+        // Convert RawCheckRun → CheckRun to test the full deserialization pipeline
+        let checks: Vec<CheckRun> = response
+            .check_runs
+            .into_iter()
+            .map(CheckRun::from)
+            .collect();
+
         // First check run: success — output object has title + summary (text is null)
-        let check = &response.check_runs[0];
+        let check = &checks[0];
         assert_eq!(check.name, "Check");
         assert_eq!(check.status, CheckStatus::Completed);
         assert_eq!(check.conclusion, Some(CheckConclusion::Success));
@@ -1662,7 +1669,7 @@ mod tests {
         );
 
         // Second check run: failure — output object has title + summary + text
-        let check = &response.check_runs[1];
+        let check = &checks[1];
         assert_eq!(check.name, "Lint");
         assert_eq!(check.status, CheckStatus::Completed);
         assert_eq!(check.conclusion, Some(CheckConclusion::Failure));
@@ -1676,7 +1683,9 @@ mod tests {
     fn test_check_run_raw_api_object_deserialize() {
         use crate::ci::{CheckConclusion, CheckStatus};
 
-        let check: CheckRun = serde_json::from_str(REAL_CHECK_RUN_RAW_API_OBJECT).unwrap();
+        // Deserialize as RawCheckRun then convert, matching the production code path
+        let raw: RawCheckRun = serde_json::from_str(REAL_CHECK_RUN_RAW_API_OBJECT).unwrap();
+        let check = CheckRun::from(raw);
 
         assert_eq!(check.name, "Check");
         assert_eq!(check.status, CheckStatus::Completed);
