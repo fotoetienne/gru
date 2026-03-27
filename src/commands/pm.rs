@@ -12,19 +12,25 @@ const PM_SKILL: &str = include_str!("../../.claude/skills/product-manager/SKILL.
 const TPM_SKILL: &str = include_str!("../../.claude/skills/project-manager/SKILL.md");
 
 /// Handles the `gru pm` command — interactive PM session.
-pub async fn handle_pm(verbose: bool) -> Result<i32> {
-    launch_skill_session("product manager", PM_SKILL, verbose).await
+pub async fn handle_pm(prompt: Option<String>, verbose: bool) -> Result<i32> {
+    launch_skill_session("product manager", PM_SKILL, prompt, verbose).await
 }
 
 /// Handles the `gru tpm` command — interactive TPM session.
-pub async fn handle_tpm(verbose: bool) -> Result<i32> {
-    launch_skill_session("technical project manager", TPM_SKILL, verbose).await
+pub async fn handle_tpm(prompt: Option<String>, verbose: bool) -> Result<i32> {
+    launch_skill_session("technical project manager", TPM_SKILL, prompt, verbose).await
 }
 
 /// Launches an interactive Claude session with the given skill as the system prompt.
 ///
-/// Requires being inside a git repo — returns an error otherwise.
-async fn launch_skill_session(role_name: &str, skill_content: &str, verbose: bool) -> Result<i32> {
+/// When `prompt` is `Some`, passes it as a positional argument to claude so it
+/// becomes the first message in the interactive session.
+async fn launch_skill_session(
+    role_name: &str,
+    skill_content: &str,
+    prompt: Option<String>,
+    verbose: bool,
+) -> Result<i32> {
     let repo_root = git::detect_git_repo().await.map_err(|_| {
         anyhow::anyhow!("Not inside a git repository. Run `gru {role_name}` from within a project.")
     })?;
@@ -39,6 +45,11 @@ async fn launch_skill_session(role_name: &str, skill_content: &str, verbose: boo
 
     let mut cmd = Command::new("claude");
     cmd.arg("--system-prompt").arg(system_prompt);
+
+    if let Some(ref p) = prompt {
+        cmd.arg(p);
+    }
+
     cmd.current_dir(&repo_root)
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
