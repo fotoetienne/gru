@@ -624,6 +624,8 @@ async fn handle_ready_to_merge(
                     },
                 )
                 .await;
+                // Mark escalation as done so subsequent cycles don't re-post.
+                state.judge_state.mark_failure_escalated();
             } else {
                 println!(
                     "🔄 Will retry on next poll cycle (failure {}/{})...",

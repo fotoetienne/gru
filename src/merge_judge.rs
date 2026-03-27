@@ -82,8 +82,13 @@ pub(crate) struct JudgeState {
     consecutive_failures: u32,
     /// When the current wait expires (if any).
     wait_until: Option<DateTime<Utc>>,
+    /// When the next failure retry is allowed (exponential backoff).
+    retry_after: Option<DateTime<Utc>>,
     /// Whether the judge has escalated and the label was confirmed applied.
     label_applied: bool,
+    /// Whether a failure-triggered escalation has already been performed
+    /// for the current fingerprint (prevents repeated label/comment spam).
+    failure_escalated: bool,
 }
 
 impl JudgeState {
@@ -93,7 +98,9 @@ impl JudgeState {
             consecutive_waits: 0,
             consecutive_failures: 0,
             wait_until: None,
+            retry_after: None,
             label_applied: false,
+            failure_escalated: false,
         }
     }
 
@@ -102,6 +109,19 @@ impl JudgeState {
         // If PR state changed, always re-invoke.
         if self.last_fingerprint.as_ref() != Some(fingerprint) {
             return true;
+        }
+
+        // If we've hit the failure cap, stop retrying until state changes.
+        if self.consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
+            return false;
+        }
+
+        // If we have failures below the cap, retry after backoff expires.
+        if self.consecutive_failures > 0 {
+            return match self.retry_after {
+                Some(until) => Utc::now() >= until,
+                None => true,
+            };
         }
 
         // Same state — only invoke if a wait timer expired.
@@ -114,14 +134,22 @@ impl JudgeState {
     }
 
     /// Record a failure (parse error, CLI error) for the given fingerprint.
-    /// Updates the fingerprint so `should_invoke` won't re-trigger on the
-    /// same PR state, and increments the failure counter.
+    /// Updates the fingerprint and sets a backoff timer so `should_invoke`
+    /// will allow retries up to `MAX_CONSECUTIVE_FAILURES`.
     pub(crate) fn record_failure(&mut self, fingerprint: PrStateFingerprint) {
         let state_changed = self.last_fingerprint.as_ref() != Some(&fingerprint);
         if state_changed {
             self.consecutive_failures = 0;
+            // Reset stale wait state from previous fingerprint to avoid
+            // leaking wait_until/consecutive_waits into the new state.
+            self.consecutive_waits = 0;
+            self.wait_until = None;
+            self.failure_escalated = false;
         }
         self.consecutive_failures += 1;
+        // Exponential backoff: 2min, 4min, 8min (capped at 10min).
+        let backoff_mins = (2u64.saturating_pow(self.consecutive_failures)).min(10);
+        self.retry_after = Some(Utc::now() + chrono::Duration::minutes(backoff_mins as i64));
         self.last_fingerprint = Some(fingerprint);
     }
 
@@ -130,9 +158,16 @@ impl JudgeState {
         self.consecutive_failures
     }
 
-    /// Returns true if the failure cap has been reached.
+    /// Returns true if the failure cap has been reached and escalation
+    /// has not yet been performed for this fingerprint.
     pub(crate) fn should_escalate_on_failure(&self) -> bool {
-        self.consecutive_failures >= MAX_CONSECUTIVE_FAILURES
+        self.consecutive_failures >= MAX_CONSECUTIVE_FAILURES && !self.failure_escalated
+    }
+
+    /// Mark that a failure-triggered escalation has been performed,
+    /// preventing repeated label/comment spam on subsequent poll cycles.
+    pub(crate) fn mark_failure_escalated(&mut self) {
+        self.failure_escalated = true;
     }
 
     /// Record the judge's response and update internal state.
@@ -148,6 +183,8 @@ impl JudgeState {
         }
 
         self.consecutive_failures = 0;
+        self.retry_after = None;
+        self.failure_escalated = false;
         self.last_fingerprint = Some(fingerprint);
 
         match &response.action {
@@ -196,6 +233,8 @@ impl JudgeState {
             // on next check with a fresh retry budget.
             self.last_fingerprint = None;
             self.consecutive_failures = 0;
+            self.retry_after = None;
+            self.failure_escalated = false;
         }
     }
 }
@@ -1061,7 +1100,7 @@ That's my verdict."#;
     }
 
     #[test]
-    fn test_judge_state_record_failure_updates_fingerprint() {
+    fn test_judge_state_record_failure_sets_backoff() {
         let mut state = JudgeState::new();
         let fp = PrStateFingerprint {
             head_sha: "abc123".to_string(),
@@ -1069,8 +1108,10 @@ That's my verdict."#;
         };
         state.record_failure(fp.clone());
         assert_eq!(state.consecutive_failures(), 1);
-        // Same fingerprint should NOT trigger re-invocation.
+        // Backoff timer is set, so should_invoke returns false immediately.
         assert!(!state.should_invoke(&fp));
+        // But retry_after is set (not None), so it will eventually retry.
+        assert!(state.retry_after.is_some());
     }
 
     #[test]
@@ -1138,15 +1179,20 @@ That's my verdict."#;
     }
 
     #[test]
-    fn test_judge_state_failure_does_not_reinvoke_same_fingerprint() {
+    fn test_judge_state_failure_at_cap_blocks_reinvocation() {
         let mut state = JudgeState::new();
         let fp = PrStateFingerprint {
             head_sha: "abc123".to_string(),
             comment_count: 5,
         };
 
-        // After recording a failure, should_invoke returns false for same state.
-        state.record_failure(fp.clone());
+        // Hit the failure cap.
+        for _ in 0..MAX_CONSECUTIVE_FAILURES {
+            state.record_failure(fp.clone());
+        }
+        assert_eq!(state.consecutive_failures(), MAX_CONSECUTIVE_FAILURES);
+        // At cap, should_invoke returns false even if backoff expired.
+        state.retry_after = None;
         assert!(!state.should_invoke(&fp));
 
         // But a new fingerprint should trigger invocation.
@@ -1155,6 +1201,67 @@ That's my verdict."#;
             comment_count: 5,
         };
         assert!(state.should_invoke(&fp2));
+    }
+
+    #[test]
+    fn test_judge_state_failure_retry_allowed_after_backoff() {
+        let mut state = JudgeState::new();
+        let fp = PrStateFingerprint {
+            head_sha: "abc123".to_string(),
+            comment_count: 5,
+        };
+        state.record_failure(fp.clone());
+        assert_eq!(state.consecutive_failures(), 1);
+
+        // Backoff hasn't expired — should not invoke.
+        assert!(!state.should_invoke(&fp));
+
+        // Simulate backoff expiring.
+        state.retry_after = Some(Utc::now() - chrono::Duration::seconds(1));
+        assert!(state.should_invoke(&fp));
+    }
+
+    #[test]
+    fn test_judge_state_failure_escalated_guard() {
+        let mut state = JudgeState::new();
+        let fp = PrStateFingerprint {
+            head_sha: "abc".to_string(),
+            comment_count: 1,
+        };
+        for _ in 0..MAX_CONSECUTIVE_FAILURES {
+            state.record_failure(fp.clone());
+        }
+        assert!(state.should_escalate_on_failure());
+
+        // After marking escalated, should_escalate_on_failure returns false.
+        state.mark_failure_escalated();
+        assert!(!state.should_escalate_on_failure());
+    }
+
+    #[test]
+    fn test_judge_state_failure_resets_stale_wait_on_state_change() {
+        let mut state = JudgeState::new();
+        let fp1 = PrStateFingerprint {
+            head_sha: "abc".to_string(),
+            comment_count: 1,
+        };
+        let wait_resp = JudgeResponse {
+            confidence: 5,
+            action: JudgeAction::Wait(Duration::from_secs(60)),
+            reasoning: "waiting".to_string(),
+        };
+        state.record_response(fp1, &wait_resp);
+        assert_eq!(state.consecutive_waits(), 1);
+        assert!(state.wait_until.is_some());
+
+        // Failure on a new fingerprint should reset wait state.
+        let fp2 = PrStateFingerprint {
+            head_sha: "def".to_string(),
+            comment_count: 2,
+        };
+        state.record_failure(fp2);
+        assert_eq!(state.consecutive_waits(), 0);
+        assert!(state.wait_until.is_none());
     }
 
     #[test]
