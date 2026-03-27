@@ -3,9 +3,9 @@
 [![CI](https://github.com/fotoetienne/gru/actions/workflows/ci.yml/badge.svg)](https://github.com/fotoetienne/gru/actions/workflows/ci.yml)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 
-**Local-first LLM agent orchestrator for GitHub issues.**
+**Gru turns GitHub issues into merged PRs — autonomously, locally, with the AI coding agent of your choice.**
 
-Point Gru at an issue. It creates an isolated worktree, spawns an AI coding agent, implements the fix, opens a PR, reviews, monitors CI, responds to reviews, rebases, fixes conflicts, and iterates until done — all without touching your working directory.
+Point it at an issue and it handles the rest: implementation, PR, code review, CI fixes, rebases — all in an isolated worktree that never touches your working directory.
 
 Gru is **agent-agnostic**. It ships with backends for [Claude Code](https://github.com/anthropics/claude-code) and [OpenAI Codex](https://github.com/openai/codex), and its pluggable architecture makes it straightforward to add more.
 
@@ -22,8 +22,6 @@ gru init owner/repo
 # Fix an issue — Gru handles the rest
 gru do 42
 ```
-
-Gru creates an isolated worktree, spawns the agent, opens a PR, and monitors CI and reviews autonomously.
 
 ## Installation
 
