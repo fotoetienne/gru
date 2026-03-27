@@ -123,10 +123,13 @@ const MAX_COL_WIDTH: usize = 40;
 
 /// Truncates a string to `max_width` characters, appending `…` if it exceeds the limit.
 fn truncate(s: &str, max_width: usize) -> String {
+    if max_width == 0 {
+        return String::new();
+    }
     let char_count = s.chars().count();
     if char_count <= max_width {
         s.to_string()
-    } else if max_width <= 1 {
+    } else if max_width == 1 {
         "\u{2026}".to_string()
     } else {
         let cut: String = s.chars().take(max_width - 1).collect();
@@ -134,10 +137,10 @@ fn truncate(s: &str, max_width: usize) -> String {
     }
 }
 
-/// Returns the display width for a column: at least `min_width`, at most `MAX_COL_WIDTH`,
-/// and wide enough to fit the header and all values.
+/// Returns the character width for a column: at least `min_width`, at most `MAX_COL_WIDTH`,
+/// and wide enough to fit the header and all values (measured in characters).
 fn col_width(header: &str, values: impl Iterator<Item = usize>, min_width: usize) -> usize {
-    let data_max = values.fold(header.len(), max);
+    let data_max = values.fold(header.chars().count(), max);
     min(max(data_max, min_width), MAX_COL_WIDTH)
 }
 
@@ -684,6 +687,11 @@ mod tests {
     #[test]
     fn test_truncate_width_one() {
         assert_eq!(truncate("hello", 1), "\u{2026}");
+    }
+
+    #[test]
+    fn test_truncate_width_zero() {
+        assert_eq!(truncate("hello", 0), "");
     }
 
     #[test]
