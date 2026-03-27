@@ -1164,13 +1164,27 @@ async fn resume_interrupted_minions(
         .into_iter()
         .filter(|c| {
             if resumed_this_session.contains(&c.minion_id) {
-                log::debug!(
-                    "Skipping {} (issue #{}, {}): already resumed this session",
-                    c.minion_id,
-                    c.info.issue.map_or("?".to_string(), |n| n.to_string()),
-                    c.info.repo,
-                );
-                false
+                // MonitoringPr minions are long-lived and expected to be re-entered
+                // across poll cycles (e.g. review agent exits). Allow them through;
+                // the attempt_count > max_attempts check in should_resume_candidate
+                // is the proper circuit breaker for preventing infinite loops.
+                if c.info.orchestration_phase == OrchestrationPhase::MonitoringPr {
+                    log::debug!(
+                        "Allowing re-resume of {} (issue #{}, {}): MonitoringPr phase",
+                        c.minion_id,
+                        c.info.issue.map_or("?".to_string(), |n| n.to_string()),
+                        c.info.repo,
+                    );
+                    true
+                } else {
+                    log::debug!(
+                        "Skipping {} (issue #{}, {}): already resumed this session",
+                        c.minion_id,
+                        c.info.issue.map_or("?".to_string(), |n| n.to_string()),
+                        c.info.repo,
+                    );
+                    false
+                }
             } else {
                 true
             }
@@ -2630,6 +2644,48 @@ mod tests {
         }];
         let (eligible, _) = check_issue_eligibility("OPEN", &labels);
         assert!(eligible, "Issue without terminal labels should be eligible");
+    }
+
+    /// MonitoringPr minions that die after being resumed should be re-resumed
+    /// on the next poll cycle (not blocked by resumed_this_session).
+    #[test]
+    fn test_monitoring_pr_minion_bypasses_resumed_this_session() {
+        use crate::minion_registry::OrchestrationPhase;
+
+        let mut resumed_this_session: HashSet<String> = HashSet::new();
+        resumed_this_session.insert("M001".to_string());
+        resumed_this_session.insert("M002".to_string());
+
+        // M001 is MonitoringPr — should pass through the filter
+        let mut monitoring = make_resumable("M001", "owner/repo", Some(42));
+        monitoring.info.orchestration_phase = OrchestrationPhase::MonitoringPr;
+
+        // M002 is RunningAgent — should be blocked by resumed_this_session
+        let running = make_resumable("M002", "owner/repo", Some(43));
+        assert_eq!(
+            running.info.orchestration_phase,
+            OrchestrationPhase::RunningAgent
+        );
+
+        // M003 is MonitoringPr but NOT in resumed_this_session — should pass
+        let mut fresh = make_resumable("M003", "owner/repo", Some(44));
+        fresh.info.orchestration_phase = OrchestrationPhase::MonitoringPr;
+
+        let candidates = vec![monitoring, running, fresh];
+        let filtered: Vec<_> = candidates
+            .into_iter()
+            .filter(|c| {
+                !resumed_this_session.contains(&c.minion_id)
+                    || c.info.orchestration_phase == OrchestrationPhase::MonitoringPr
+            })
+            .collect();
+
+        let ids: Vec<&str> = filtered.iter().map(|r| r.minion_id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["M001", "M003"],
+            "MonitoringPr minions must bypass resumed_this_session; RunningAgent must not"
+        );
     }
 
     /// Verifies that resumable minions can carry PR metadata,
