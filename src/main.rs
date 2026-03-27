@@ -86,11 +86,17 @@ enum Commands {
     },
     #[command(about = "Start an interactive product manager session")]
     Pm {
+        #[arg(help = "Optional prompt to start the session with")]
+        prompt: Option<String>,
+
         #[arg(short, long, help = "Show additional context information")]
         verbose: bool,
     },
     #[command(about = "Start an interactive technical project manager session")]
     Tpm {
+        #[arg(help = "Optional prompt to start the session with")]
+        prompt: Option<String>,
+
         #[arg(short, long, help = "Show additional context information")]
         verbose: bool,
     },
@@ -450,8 +456,8 @@ async fn main() {
             init::handle_init(repo.unwrap_or_else(|| ".".to_string()), host).await
         }
         Commands::Chat { repo, verbose } => chat::handle_chat(repo, verbose).await,
-        Commands::Pm { verbose } => pm::handle_pm(verbose).await,
-        Commands::Tpm { verbose } => pm::handle_tpm(verbose).await,
+        Commands::Pm { prompt, verbose } => pm::handle_pm(prompt, verbose).await,
+        Commands::Tpm { prompt, verbose } => pm::handle_tpm(prompt, verbose).await,
         Commands::Do {
             issue,
             timeout,
