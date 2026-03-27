@@ -192,8 +192,10 @@ impl JudgeState {
     pub(crate) fn mark_escalation_cleared(&mut self) {
         if self.label_applied {
             self.label_applied = false;
-            // Reset fingerprint so the judge re-evaluates on next check.
+            // Reset fingerprint and failure counter so the judge re-evaluates
+            // on next check with a fresh retry budget.
             self.last_fingerprint = None;
+            self.consecutive_failures = 0;
         }
     }
 }
@@ -664,15 +666,7 @@ pub(crate) async fn evaluate(
         Ok(r) => r,
         Err(e) => {
             // Log the raw response for diagnostics — truncate to avoid log spam.
-            let preview = if raw_response.len() > 500 {
-                format!(
-                    "{}... [truncated, {} bytes total]",
-                    &raw_response[..500],
-                    raw_response.len()
-                )
-            } else {
-                raw_response.clone()
-            };
+            let preview = truncate_if_needed(&raw_response, 500);
             log::warn!(
                 "Judge response parse failed: {}. Raw response: {}",
                 e,
@@ -1161,6 +1155,31 @@ That's my verdict."#;
             comment_count: 5,
         };
         assert!(state.should_invoke(&fp2));
+    }
+
+    #[test]
+    fn test_judge_state_escalation_cleared_resets_failure_counter() {
+        let mut state = JudgeState::new();
+        let fp = PrStateFingerprint {
+            head_sha: "abc".to_string(),
+            comment_count: 1,
+        };
+
+        // Accumulate failures up to the escalation threshold.
+        state.record_failure(fp.clone());
+        state.record_failure(fp.clone());
+        state.record_failure(fp.clone());
+        assert!(state.should_escalate_on_failure());
+
+        // Simulate label being applied after failure escalation.
+        state.mark_label_applied();
+
+        // Human clears the label — should reset failure counter and fingerprint.
+        state.mark_escalation_cleared();
+        assert_eq!(state.consecutive_failures(), 0);
+        assert!(!state.should_escalate_on_failure());
+        // Fingerprint is cleared, so should_invoke returns true.
+        assert!(state.should_invoke(&fp));
     }
 
     #[test]
