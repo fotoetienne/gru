@@ -36,6 +36,7 @@ schemars = "1.0"
 
 [dev-dependencies]
 serde_ignored = "0.1"
+tokio = { version = "1.49", features = ["test-util"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
