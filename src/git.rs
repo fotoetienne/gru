@@ -511,11 +511,9 @@ impl GitRepo {
                 );
             }
 
-            // Set origin/HEAD if not already present (initial clone sets it;
-            // subsequent fetches skip the extra network round-trip).
-            if !self.has_origin_head().await {
-                self.update_origin_head(token.as_deref()).await;
-            }
+            // Refresh origin/HEAD after fetch so default branch changes on the
+            // remote (e.g., master → main) are reflected locally.
+            self.update_origin_head(token.as_deref()).await;
         } else {
             // Clone as bare repository
             let url = format!("https://{}/{}/{}.git", self.host, self.owner, self.repo);
@@ -578,18 +576,6 @@ impl GitRepo {
         Ok(())
     }
 
-    /// Returns `true` if `refs/remotes/origin/HEAD` is already set in the bare repo.
-    async fn has_origin_head(&self) -> bool {
-        Command::new("git")
-            .arg("-C")
-            .arg(&self.bare_path)
-            .args(["symbolic-ref", "refs/remotes/origin/HEAD"])
-            .output()
-            .await
-            .map(|o| o.status.success())
-            .unwrap_or(false)
-    }
-
     /// Updates `refs/remotes/origin/HEAD` so that worktrees can detect the
     /// default branch via `git symbolic-ref refs/remotes/origin/HEAD` without
     /// needing an API call.
@@ -613,11 +599,12 @@ impl GitRepo {
 
             if !output.status.success() {
                 let stderr = String::from_utf8_lossy(&output.stderr);
+                let stderr = redact_credentials(stderr.trim());
                 log::warn!(
                     "{}/{}: git remote set-head origin --auto failed: {}",
                     self.owner,
                     self.repo,
-                    stderr.trim()
+                    stderr
                 );
             }
             Ok(())
@@ -1522,6 +1509,25 @@ mod tests {
             result
         );
         assert!(bare_path.exists(), "Bare repository was not created");
+
+        // Verify origin/HEAD was set during clone
+        let origin_head = Command::new("git")
+            .arg("-C")
+            .arg(&bare_path)
+            .args(["symbolic-ref", "refs/remotes/origin/HEAD"])
+            .output()
+            .await
+            .expect("Failed to check origin/HEAD");
+        assert!(
+            origin_head.status.success(),
+            "refs/remotes/origin/HEAD should be set after bare clone"
+        );
+        let origin_head_ref = String::from_utf8_lossy(&origin_head.stdout);
+        assert!(
+            origin_head_ref.trim().starts_with("refs/remotes/origin/"),
+            "origin/HEAD should point to a valid remote ref, got: {}",
+            origin_head_ref.trim()
+        );
 
         // Test ensure_bare_clone (second time - should fetch)
         let result = repo.ensure_bare_clone().await;
