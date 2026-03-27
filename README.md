@@ -5,7 +5,7 @@
 
 **Local-first LLM agent orchestrator for GitHub issues.**
 
-Point Gru at an issue. It creates an isolated worktree, spawns an AI coding agent, implements the fix, opens a PR, monitors CI, responds to reviews, rebases, fixes conflicts, and iterates until done — all without touching your working directory.
+Point Gru at an issue. It creates an isolated worktree, spawns an AI coding agent, implements the fix, opens a PR, reviews, monitors CI, responds to reviews, rebases, fixes conflicts, and iterates until done — all without touching your working directory.
 
 Gru is **agent-agnostic**. It ships with backends for [Claude Code](https://github.com/anthropics/claude-code) and [OpenAI Codex](https://github.com/openai/codex), and its pluggable architecture makes it straightforward to add more.
 
