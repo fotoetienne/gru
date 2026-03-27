@@ -279,7 +279,12 @@ async fn gh_api_with_retry(
 async fn get_pr_details(host: &str, owner: &str, repo: &str, pr_number: &str) -> Result<PrDetails> {
     let repo_full = github::repo_slug(owner, repo);
     let endpoint = format!("repos/{repo_full}/pulls/{pr_number}");
-    let output = gh_api_with_retry(host, &["api", &endpoint], DEFAULT_MAX_RETRIES).await?;
+    let output = gh_api_with_retry(
+        host,
+        &["api", &endpoint, "--cache", "20s"],
+        DEFAULT_MAX_RETRIES,
+    )
+    .await?;
 
     let pr: PrApiResponse =
         serde_json::from_slice(&output.stdout).context("Failed to parse PR JSON")?;
@@ -303,7 +308,15 @@ async fn get_reviews(
     // --paginate with --jq '.[]' streams one JSON object per line across pages
     let output = gh_api_with_retry(
         host,
-        &["api", "--paginate", &endpoint, "--jq", ".[]"],
+        &[
+            "api",
+            "--paginate",
+            &endpoint,
+            "--cache",
+            "20s",
+            "--jq",
+            ".[]",
+        ],
         DEFAULT_MAX_RETRIES,
     )
     .await?;
@@ -331,7 +344,15 @@ async fn get_check_runs(host: &str, owner: &str, repo: &str, sha: &str) -> Resul
     // --paginate with --jq streams individual check run objects, one per line
     let output = gh_api_with_retry(
         host,
-        &["api", "--paginate", &endpoint, "--jq", ".check_runs[]"],
+        &[
+            "api",
+            "--paginate",
+            &endpoint,
+            "--cache",
+            "20s",
+            "--jq",
+            ".check_runs[]",
+        ],
         DEFAULT_MAX_RETRIES,
     )
     .await?;
@@ -362,7 +383,12 @@ async fn get_combined_status(
 ) -> Result<CombinedStatus> {
     let repo_full = github::repo_slug(owner, repo);
     let endpoint = format!("repos/{repo_full}/commits/{sha}/status");
-    let output = gh_api_with_retry(host, &["api", &endpoint], DEFAULT_MAX_RETRIES).await?;
+    let output = gh_api_with_retry(
+        host,
+        &["api", &endpoint, "--cache", "20s"],
+        DEFAULT_MAX_RETRIES,
+    )
+    .await?;
 
     let status: CombinedStatus =
         serde_json::from_slice(&output.stdout).context("Failed to parse combined status JSON")?;

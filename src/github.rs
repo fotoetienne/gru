@@ -1275,7 +1275,7 @@ pub(crate) struct ReviewUser {
 /// Uses `gh api user` to fetch the authenticated account. Returns an error
 /// if `gh` is not authenticated or the API call fails.
 pub(crate) async fn get_authenticated_user(host: &str) -> Result<String> {
-    let stdout = run_gh(host, &["api", "user", "--jq", ".login"]).await?;
+    let stdout = run_gh(host, &["api", "user", "--cache", "60s", "--jq", ".login"]).await?;
 
     let login = stdout.trim().to_string();
     if login.is_empty() {
@@ -1295,7 +1295,19 @@ pub(crate) async fn list_pr_reviews(
     pr_number: &str,
 ) -> Result<Vec<PrReview>> {
     let endpoint = format!("repos/{}/{}/pulls/{}/reviews", owner, repo, pr_number);
-    let stdout = run_gh(host, &["api", &endpoint, "--paginate", "--jq", ".[]"]).await?;
+    let stdout = run_gh(
+        host,
+        &[
+            "api",
+            &endpoint,
+            "--cache",
+            "60s",
+            "--paginate",
+            "--jq",
+            ".[]",
+        ],
+    )
+    .await?;
 
     // --paginate --jq '.[]' outputs one JSON object per line (NDJSON).
     parse_pr_reviews_ndjson(&stdout)
