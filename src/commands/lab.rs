@@ -1427,11 +1427,14 @@ async fn spawn_for_candidate_issues(
             spec: repo_spec,
         };
 
-        let candidates =
+        let mut candidates =
             match fetch_candidate_issues(&ctx.owner, &ctx.repo, &ctx.host, label, ctx.spec).await {
                 Some(c) => c,
                 None => continue,
             };
+
+        // Sort candidates by priority label (stable sort preserves GitHub's default order within tiers)
+        candidates.sort_by_key(|c| github::priority_sort_key(&c.labels));
 
         let candidate_count = candidates.len();
         let mut blocked_count = 0usize;
@@ -1982,7 +1985,23 @@ async fn fallback_list_issues(
         .filter_map(|issue| {
             let number = issue["number"].as_u64()?;
             let body = issue["body"].as_str().map(String::from);
-            Some(github::CandidateIssue { number, body })
+            let labels = issue["labels"]
+                .as_array()
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|l| {
+                            l["name"].as_str().map(|n| github::IssueLabel {
+                                name: n.to_string(),
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            Some(github::CandidateIssue {
+                number,
+                body,
+                labels,
+            })
         })
         .collect();
 
