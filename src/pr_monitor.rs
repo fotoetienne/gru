@@ -397,13 +397,15 @@ pub(crate) async fn monitor_pr(
             }
         }
 
-        // Adaptive backoff: double interval for each idle cycle, capped at max
+        // Adaptive backoff: double interval for each idle cycle, capped at max.
+        // Increment first so the first idle sleep is 2x base (the initial poll
+        // already ran without delay, so the base interval is "free").
+        consecutive_idle_cycles = consecutive_idle_cycles.saturating_add(1);
         let multiplier = 2u64.saturating_pow(consecutive_idle_cycles);
         let current_interval = std::cmp::min(
             POLL_INTERVAL_SECS.saturating_mul(multiplier),
             MAX_POLL_INTERVAL_SECS,
         );
-        consecutive_idle_cycles = consecutive_idle_cycles.saturating_add(1);
         log::debug!(
             "PR poll interval: {}s (idle for {} cycles)",
             current_interval,

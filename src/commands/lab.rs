@@ -256,11 +256,14 @@ pub(crate) async fn handle_lab(
                         );
                     }
                     Ok(result) if result.slots_full => {
-                        // All slots occupied — don't back off since work may
-                        // finish soon and we want to pick up new issues promptly.
+                        // All slots occupied — reset to base interval so we
+                        // pick up new issues promptly when a slot frees up.
+                        let prev = current_interval.as_secs();
+                        consecutive_idle_cycles = 0;
                         log::debug!(
-                            "Lab poll interval: {}s (slots full, not backing off)",
-                            current_interval.as_secs(),
+                            "Lab poll interval: {}s → {}s (slots full, reset backoff)",
+                            prev,
+                            base_interval.as_secs(),
                         );
                     }
                     Ok(_) => {

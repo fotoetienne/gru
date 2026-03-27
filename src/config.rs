@@ -641,6 +641,10 @@ impl LabConfig {
 
         if let Some(interval) = poll_interval_secs {
             self.daemon.poll_interval_secs = interval;
+            // Ensure max stays >= base so validation won't reject the override
+            if self.daemon.poll_interval_max_secs < interval {
+                self.daemon.poll_interval_max_secs = interval;
+            }
         }
 
         if let Some(slots) = max_slots {
@@ -743,6 +747,38 @@ max_resume_attempts = 5
         config.daemon.max_slots = 0;
 
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_validate_poll_interval_max_less_than_base() {
+        let mut config = LabConfig::default();
+        config.daemon.repos = vec!["owner/repo".to_string()];
+        config.daemon.poll_interval_secs = 60;
+        config.daemon.poll_interval_max_secs = 30;
+
+        let err = config.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("poll_interval_max_secs"),
+            "expected validation error about poll_interval_max_secs, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_default_poll_interval_max() {
+        let config = DaemonConfig::default();
+        assert_eq!(config.poll_interval_max_secs, 300);
+    }
+
+    #[test]
+    fn test_with_overrides_bumps_max_when_base_exceeds_it() {
+        let mut config = LabConfig::default();
+        config.daemon.repos = vec!["owner/repo".to_string()];
+        config.daemon.poll_interval_max_secs = 300;
+
+        // CLI sets base higher than max — max should be bumped automatically
+        let config = config.with_overrides(None, Some(600), None);
+        assert_eq!(config.daemon.poll_interval_secs, 600);
+        assert_eq!(config.daemon.poll_interval_max_secs, 600);
     }
 
     #[test]
