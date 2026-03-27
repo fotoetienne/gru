@@ -509,7 +509,7 @@ pub(crate) async fn list_ready_issues_via_cli(
             "--state",
             "open",
             "--json",
-            "number,body",
+            "number,body,labels",
             "--limit",
             "100",
         ],
@@ -528,6 +528,25 @@ pub(crate) struct CandidateIssue {
     pub(crate) number: u64,
     #[serde(default)]
     pub(crate) body: Option<String>,
+    #[serde(default)]
+    pub(crate) labels: Vec<IssueLabel>,
+}
+
+/// Returns a sort key for priority labels on a candidate issue.
+///
+/// Lower values are higher priority:
+///   0 = critical, 1 = high, 2 = medium, 3 = unlabeled, 4 = low
+pub(crate) fn priority_sort_key(labels: &[IssueLabel]) -> u8 {
+    for label in labels {
+        match label.name.as_str() {
+            "priority:critical" => return 0,
+            "priority:high" => return 1,
+            "priority:medium" => return 2,
+            "priority:low" => return 4,
+            _ => {}
+        }
+    }
+    3 // unlabeled = neutral, between medium and low
 }
 
 /// Fetch issue details using gh CLI
@@ -803,7 +822,7 @@ pub(crate) struct IssueInfo {
 }
 
 /// Label info returned by `gh issue view --json labels`
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize)]
 pub(crate) struct IssueLabel {
     pub(crate) name: String,
 }
@@ -2125,5 +2144,112 @@ mod tests {
         assert_eq!(calculate_retry_delay(6), MAX_DELAY_SECS);
         assert_eq!(calculate_retry_delay(7), MAX_DELAY_SECS);
         assert_eq!(calculate_retry_delay(10), MAX_DELAY_SECS);
+    }
+
+    // --- priority_sort_key tests ---
+
+    #[test]
+    fn test_priority_sort_key_critical() {
+        assert_eq!(priority_sort_key(&make_labels(&["priority:critical"])), 0);
+    }
+
+    #[test]
+    fn test_priority_sort_key_high() {
+        assert_eq!(priority_sort_key(&make_labels(&["priority:high"])), 1);
+    }
+
+    #[test]
+    fn test_priority_sort_key_medium() {
+        assert_eq!(priority_sort_key(&make_labels(&["priority:medium"])), 2);
+    }
+
+    #[test]
+    fn test_priority_sort_key_unlabeled() {
+        assert_eq!(priority_sort_key(&[]), 3);
+    }
+
+    #[test]
+    fn test_priority_sort_key_low() {
+        assert_eq!(priority_sort_key(&make_labels(&["priority:low"])), 4);
+    }
+
+    #[test]
+    fn test_priority_sort_key_non_priority_labels_treated_as_unlabeled() {
+        assert_eq!(priority_sort_key(&make_labels(&["bug", "enhancement"])), 3);
+    }
+
+    #[test]
+    fn test_priority_sort_key_mixed_labels_picks_priority() {
+        assert_eq!(
+            priority_sort_key(&make_labels(&["bug", "priority:high", "enhancement"])),
+            1
+        );
+    }
+
+    #[test]
+    fn test_priority_sort_key_first_priority_wins() {
+        // If multiple priority labels exist, the first one encountered wins
+        assert_eq!(
+            priority_sort_key(&make_labels(&["priority:low", "priority:critical"])),
+            4
+        );
+    }
+
+    #[test]
+    fn test_candidate_issues_sort_by_priority() {
+        let mut candidates = [
+            CandidateIssue {
+                number: 1,
+                body: None,
+                labels: make_labels(&["priority:low"]),
+            },
+            CandidateIssue {
+                number: 2,
+                body: None,
+                labels: vec![],
+            },
+            CandidateIssue {
+                number: 3,
+                body: None,
+                labels: make_labels(&["priority:critical"]),
+            },
+            CandidateIssue {
+                number: 4,
+                body: None,
+                labels: make_labels(&["priority:high"]),
+            },
+        ];
+
+        candidates.sort_by_key(|c| priority_sort_key(&c.labels));
+
+        let order: Vec<u64> = candidates.iter().map(|c| c.number).collect();
+        assert_eq!(order, vec![3, 4, 2, 1]);
+    }
+
+    #[test]
+    fn test_stable_sort_preserves_order_within_tier() {
+        let mut candidates = [
+            CandidateIssue {
+                number: 10,
+                body: None,
+                labels: make_labels(&["priority:high"]),
+            },
+            CandidateIssue {
+                number: 20,
+                body: None,
+                labels: make_labels(&["priority:high"]),
+            },
+            CandidateIssue {
+                number: 30,
+                body: None,
+                labels: make_labels(&["priority:high"]),
+            },
+        ];
+
+        candidates.sort_by_key(|c| priority_sort_key(&c.labels));
+
+        let order: Vec<u64> = candidates.iter().map(|c| c.number).collect();
+        // Stable sort preserves original order within same priority tier
+        assert_eq!(order, vec![10, 20, 30]);
     }
 }
