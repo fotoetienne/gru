@@ -34,6 +34,9 @@ struct PullRequest {
     /// Labels attached to this PR (included in GitHub's PR API response).
     #[serde(default)]
     labels: Vec<PrLabel>,
+    /// Whether the PR is a draft.
+    #[serde(default)]
+    draft: bool,
 }
 
 impl PullRequest {
@@ -55,8 +58,10 @@ pub(crate) struct Review {
     pub(crate) user: User,
     #[serde(default)]
     body: Option<String>,
+    /// Review state (APPROVED, CHANGES_REQUESTED, COMMENTED, DISMISSED, PENDING).
+    /// Used by merge-readiness evaluation to avoid re-fetching reviews.
     #[serde(default)]
-    state: Option<String>,
+    pub(crate) state: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -264,6 +269,9 @@ async fn remove_ready_to_merge_label(
 /// Tracks transitions: adds label when becoming ready, removes when regressing.
 /// Returns `Some(readiness)` if all readiness checks pass, or `None` if not ready
 /// or if the readiness check failed. The `was_ready` bool is updated in place.
+///
+/// When `prefetched` is provided, uses pre-fetched data from the poll cycle to
+/// avoid duplicate API calls. Falls back to fetching everything when `None`.
 async fn update_readiness_label(
     host: &str,
     owner: &str,
@@ -271,15 +279,28 @@ async fn update_readiness_label(
     pr_number: &str,
     pr_number_u64: u64,
     was_ready: &mut bool,
+    prefetched: Option<&merge_readiness::PreFetchedData>,
 ) -> Option<merge_readiness::MergeReadiness> {
-    let readiness =
-        match merge_readiness::check_merge_readiness(host, owner, repo, pr_number_u64).await {
-            Ok(r) => r,
-            Err(e) => {
-                log::warn!("Failed to check merge readiness: {:#}", e);
-                return None;
+    let readiness = match prefetched {
+        Some(data) => {
+            match merge_readiness::check_merge_readiness_with_data(host, owner, repo, data).await {
+                Ok(r) => r,
+                Err(e) => {
+                    log::warn!("Failed to check merge readiness: {:#}", e);
+                    return None;
+                }
             }
-        };
+        }
+        None => {
+            match merge_readiness::check_merge_readiness(host, owner, repo, pr_number_u64).await {
+                Ok(r) => r,
+                Err(e) => {
+                    log::warn!("Failed to check merge readiness: {}", e);
+                    return None;
+                }
+            }
+        }
+    };
 
     let is_ready = readiness.is_ready();
 
@@ -484,6 +505,8 @@ async fn poll_once(
     }
 
     // Check merge readiness (via unified module) and update label on transitions.
+    // Build PreFetchedData from the PR, reviews, and check runs already fetched above
+    // to avoid duplicate API calls in check_merge_readiness.
     let pr_number_u64: u64 = match pr_number.parse() {
         Ok(n) => n,
         Err(_) => {
@@ -495,9 +518,49 @@ async fn poll_once(
             return Ok(None);
         }
     };
-    if update_readiness_label(host, owner, repo, pr_number, pr_number_u64, was_ready)
-        .await
-        .is_some()
+
+    let prefetched = merge_readiness::PreFetchedData {
+        pr: merge_readiness::PreFetchedPr {
+            head_sha: pr.head.sha.clone(),
+            draft: pr.draft,
+            mergeable: pr.mergeable,
+            author_login: pr.user.login.clone(),
+        },
+        reviews: all_reviews
+            .iter()
+            .map(|r| merge_readiness::ReviewApiResponse {
+                state: r.state.clone(),
+                user: github::ReviewUser {
+                    login: r.user.login.clone(),
+                },
+            })
+            .collect(),
+        // Convert ci::CheckRun to PreFetchedCheckRun strings matching the raw
+        // GitHub API format that evaluate_ci expects. Uses Display impls on
+        // CheckConclusion/CheckStatus to stay in sync with serde rename_all.
+        // Unknown conclusions become "unknown" (rejected by evaluate_ci).
+        // Unknown status becomes "unknown" (also rejected, since evaluate_ci
+        // requires status == "completed").
+        check_runs: check_runs
+            .iter()
+            .map(|cr| merge_readiness::PreFetchedCheckRun {
+                conclusion: cr.conclusion.as_ref().map(|c| c.to_string()),
+                status: Some(cr.status.to_string()),
+            })
+            .collect(),
+    };
+
+    if update_readiness_label(
+        host,
+        owner,
+        repo,
+        pr_number,
+        pr_number_u64,
+        was_ready,
+        Some(&prefetched),
+    )
+    .await
+    .is_some()
     {
         // PR is ready — check if gru:auto-merge label is present (from PR data already fetched)
         if pr.has_label(AUTO_MERGE_LABEL) {
@@ -610,7 +673,11 @@ async fn get_review_feedback(
         // Collect review body text (non-empty bodies that aren't just whitespace).
         // Skip DISMISSED reviews — their body is the dismissal reason, not
         // actionable feedback for the implementer.
-        let state = review.state.as_deref().unwrap_or("COMMENTED");
+        let state = if review.state.is_empty() {
+            "COMMENTED"
+        } else {
+            &review.state
+        };
         if state != "DISMISSED" {
             if let Some(ref body) = review.body {
                 let trimmed = body.trim();
@@ -1505,7 +1572,7 @@ mod tests {
                 login: "reviewer".to_string(),
             },
             body: None,
-            state: None,
+            state: String::new(),
         }
     }
 
@@ -1583,7 +1650,7 @@ mod tests {
                 login: login.to_string(),
             },
             body: None,
-            state: None,
+            state: String::new(),
         }
     }
 
@@ -1852,7 +1919,7 @@ mod tests {
                 login: login.to_string(),
             },
             body: None,
-            state: None,
+            state: String::new(),
         }
     }
 
