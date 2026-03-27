@@ -2,7 +2,7 @@ use crate::agent::AgentBackend;
 use crate::agent_registry;
 use crate::agent_runner::{is_stuck_or_timeout_error, EXIT_CODE_SIGNAL_TERMINATED};
 use crate::commands::fix::{
-    agent_exit_code, create_pr_phase, monitor_pr_phase, run_agent_phase,
+    agent_exit_code, create_pr_phase, fetch_issue_details, monitor_pr_phase, run_agent_phase,
     update_orchestration_phase, IssueContext, WorktreeContext,
 };
 use crate::minion_registry::{
@@ -236,12 +236,13 @@ async fn check_resumption_preconditions(
         session_id: session_uuid,
     };
 
+    let details = fetch_issue_details(&owner, &repo_name, &host, issue_num).await;
     let issue_ctx = IssueContext {
         owner,
         repo: repo_name,
         host,
         issue_num,
-        details: None,
+        details,
     };
 
     Ok(ResumeContext {

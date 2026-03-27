@@ -9,6 +9,7 @@ mod worktree;
 
 // Re-export public API used by other modules (e.g., resume.rs)
 pub(crate) use helpers::update_orchestration_phase;
+pub(crate) use resolve::fetch_issue_details;
 use resolve::{check_existing_minions, claim_issue, resolve_issue};
 use types::ExistingMinionCheck;
 pub use types::FixOptions;
@@ -574,7 +575,7 @@ mod tests {
             details: Some(IssueDetails {
                 title: "Fix the widget".to_string(),
                 body: "The widget is broken".to_string(),
-                labels: "bug, priority:high".to_string(),
+                labels: vec!["bug".to_string(), "priority:high".to_string()],
             }),
         };
 
@@ -616,7 +617,7 @@ mod tests {
             details: Some(IssueDetails {
                 title: "Add feature".to_string(),
                 body: "Please add this feature".to_string(),
-                labels: String::new(),
+                labels: vec![],
             }),
         };
 
@@ -638,7 +639,7 @@ mod tests {
             details: Some(IssueDetails {
                 title: "Template test".to_string(),
                 body: "Body content here".to_string(),
-                labels: "enhancement".to_string(),
+                labels: vec!["enhancement".to_string()],
             }),
         };
 
@@ -688,7 +689,7 @@ CUSTOM: Fix #{{ issue_number }} - {{ issue_title }}"#,
             details: Some(IssueDetails {
                 title: "Custom test".to_string(),
                 body: "Custom body".to_string(),
-                labels: String::new(),
+                labels: vec![],
             }),
         };
 

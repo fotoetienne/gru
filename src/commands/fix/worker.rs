@@ -167,7 +167,7 @@ pub(crate) async fn create_pr_phase(
     let issue_has_auto_merge = issue_ctx
         .details
         .as_ref()
-        .map(|d| d.labels.split(", ").any(|l| l == crate::labels::AUTO_MERGE))
+        .map(|d| crate::labels::has_label(&d.labels, crate::labels::AUTO_MERGE))
         .unwrap_or(false);
     if auto_merge || issue_has_auto_merge {
         if !auto_merge && issue_has_auto_merge {

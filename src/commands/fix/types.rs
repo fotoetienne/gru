@@ -49,9 +49,9 @@ pub(crate) struct IssueContext {
 
 /// Fetched issue metadata from GitHub.
 pub(crate) struct IssueDetails {
-    pub(crate) title: String,
-    pub(crate) body: String,
-    pub(crate) labels: String,
+    pub title: String,
+    pub body: String,
+    pub labels: Vec<String>,
 }
 
 /// Result of setting up a worktree for a minion.

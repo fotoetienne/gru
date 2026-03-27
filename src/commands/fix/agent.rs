@@ -54,7 +54,7 @@ pub(super) fn build_fix_prompt(ctx: &IssueContext, wt_ctx: &WorktreeContext) -> 
     let labels_value = if details.labels.is_empty() {
         String::new()
     } else {
-        format!("Labels: {}", details.labels)
+        format!("Labels: {}", details.labels.join(", "))
     };
 
     let mut prompt_ctx = PromptContext::new();

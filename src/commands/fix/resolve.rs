@@ -166,7 +166,7 @@ pub(super) async fn claim_issue(host: &str, owner: &str, repo: &str, issue_num: 
 }
 
 /// Fetches issue details from GitHub using the gh CLI.
-async fn fetch_issue_details(
+pub(crate) async fn fetch_issue_details(
     owner: &str,
     repo: &str,
     host: &str,
@@ -174,12 +174,7 @@ async fn fetch_issue_details(
 ) -> Option<IssueDetails> {
     match crate::github::get_issue_via_cli(owner, repo, host, issue_num).await {
         Ok(info) => {
-            let labels = info
-                .labels
-                .iter()
-                .map(|l| l.name.as_str())
-                .collect::<Vec<_>>()
-                .join(", ");
+            let labels = info.labels.into_iter().map(|l| l.name).collect();
             Some(IssueDetails {
                 title: info.title,
                 body: info.body.unwrap_or_default(),
