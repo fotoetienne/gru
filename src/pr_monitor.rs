@@ -1590,9 +1590,9 @@ mod tests {
         ]
     }"#;
 
-    /// Real payload line from `gh api repos/OWNER/REPO/commits/SHA/check-runs --jq '.check_runs[]'`
-    /// This is a single check run object as it appears when streamed line-by-line.
-    const REAL_CHECK_RUN_JQ_LINE: &str = r#"{"id":38771234567,"name":"Check","node_id":"CR_kwDOExample","head_sha":"abc123def456789","external_id":"","url":"https://api.github.com/repos/owner/repo/check-runs/38771234567","html_url":"https://github.com/owner/repo/runs/38771234567","details_url":"https://github.com/owner/repo/actions/runs/987654321/job/38771234567","status":"completed","conclusion":"success","started_at":"2025-06-15T10:00:00Z","completed_at":"2025-06-15T10:05:34Z","output":{"title":"Build passed","summary":"All 42 checks passed","text":null,"annotations_count":0,"annotations_url":"https://api.github.com/repos/owner/repo/check-runs/38771234567/annotations"},"app":{"id":15368,"slug":"github-actions","node_id":"MDM6QXBwMTUzNjg=","owner":{"login":"github","id":9919,"type":"Organization"},"name":"GitHub Actions","description":"Automate your workflow from idea to production","external_url":"https://help.github.com/en/actions","html_url":"https://github.com/apps/github-actions","created_at":"2018-07-30T09:30:17Z","updated_at":"2019-12-10T19:04:12Z"},"check_suite":{"id":33344455566,"node_id":"CS_kwDOExample","head_branch":"feature/new-thing","head_sha":"abc123def456789","status":"completed","conclusion":"success"},"pull_requests":[{"url":"https://api.github.com/repos/owner/repo/pulls/123","id":2012345678,"number":123,"head":{"ref":"feature/new-thing","sha":"abc123def456789"},"base":{"ref":"main","sha":"000111222333444"}}]}"#;
+    /// A single raw check run object from the GitHub API (not jq-filtered).
+    /// Exercises deserialization of the full API shape including nested `output` object.
+    const REAL_CHECK_RUN_RAW_API_OBJECT: &str = r#"{"id":38771234567,"name":"Check","node_id":"CR_kwDOExample","head_sha":"abc123def456789","external_id":"","url":"https://api.github.com/repos/owner/repo/check-runs/38771234567","html_url":"https://github.com/owner/repo/runs/38771234567","details_url":"https://github.com/owner/repo/actions/runs/987654321/job/38771234567","status":"completed","conclusion":"success","started_at":"2025-06-15T10:00:00Z","completed_at":"2025-06-15T10:05:34Z","output":{"title":"Build passed","summary":"All 42 checks passed","text":null,"annotations_count":0,"annotations_url":"https://api.github.com/repos/owner/repo/check-runs/38771234567/annotations"},"app":{"id":15368,"slug":"github-actions","node_id":"MDM6QXBwMTUzNjg=","owner":{"login":"github","id":9919,"type":"Organization"},"name":"GitHub Actions","description":"Automate your workflow from idea to production","external_url":"https://help.github.com/en/actions","html_url":"https://github.com/apps/github-actions","created_at":"2018-07-30T09:30:17Z","updated_at":"2019-12-10T19:04:12Z"},"check_suite":{"id":33344455566,"node_id":"CS_kwDOExample","head_branch":"feature/new-thing","head_sha":"abc123def456789","status":"completed","conclusion":"success"},"pull_requests":[{"url":"https://api.github.com/repos/owner/repo/pulls/123","id":2012345678,"number":123,"head":{"ref":"feature/new-thing","sha":"abc123def456789"},"base":{"ref":"main","sha":"000111222333444"}}]}"#;
 
     /// Real payload from `gh api repos/OWNER/REPO/pulls/NUMBER/reviews`
     const REAL_REVIEWS_API_RESPONSE: &str = r#"[
@@ -1651,34 +1651,41 @@ mod tests {
 
         assert_eq!(response.check_runs.len(), 2);
 
-        // First check run: success
+        // First check run: success — output object has title + summary (text is null)
         let check = &response.check_runs[0];
         assert_eq!(check.name, "Check");
         assert_eq!(check.status, CheckStatus::Completed);
         assert_eq!(check.conclusion, Some(CheckConclusion::Success));
-        // output is an object in the raw API — custom deserializer should yield None
-        assert!(check.output.is_none());
+        assert_eq!(
+            check.output,
+            Some("Build passed\n\nAll 42 checks passed".to_string())
+        );
 
-        // Second check run: failure
+        // Second check run: failure — output object has title + summary + text
         let check = &response.check_runs[1];
         assert_eq!(check.name, "Lint");
         assert_eq!(check.status, CheckStatus::Completed);
         assert_eq!(check.conclusion, Some(CheckConclusion::Failure));
-        assert!(check.output.is_none());
+        assert_eq!(
+            check.output,
+            Some("Lint check failed\n\nFound 3 warnings\n\nsrc/main.rs:10: unused variable `x`\nsrc/lib.rs:20: missing docs".to_string())
+        );
     }
 
     #[test]
-    fn test_check_run_real_jq_line_deserialize() {
+    fn test_check_run_raw_api_object_deserialize() {
         use crate::ci::{CheckConclusion, CheckStatus};
 
-        // This is what `--jq '.check_runs[]'` produces: one JSON object per line
-        let check: CheckRun = serde_json::from_str(REAL_CHECK_RUN_JQ_LINE).unwrap();
+        let check: CheckRun = serde_json::from_str(REAL_CHECK_RUN_RAW_API_OBJECT).unwrap();
 
         assert_eq!(check.name, "Check");
         assert_eq!(check.status, CheckStatus::Completed);
         assert_eq!(check.conclusion, Some(CheckConclusion::Success));
-        // output is an object — should be deserialized as None
-        assert!(check.output.is_none());
+        // output object's title + summary extracted (text is null, so excluded)
+        assert_eq!(
+            check.output,
+            Some("Build passed\n\nAll 42 checks passed".to_string())
+        );
     }
 
     #[test]

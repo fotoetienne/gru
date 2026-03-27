@@ -123,8 +123,11 @@ pub(crate) struct CheckRun {
     pub(crate) output: Option<String>,
 }
 
-/// Deserializes the `output` field accepting either a JSON string or silently
-/// discarding non-string values (objects, null, etc.) as `None`.
+/// Deserializes the `output` field accepting either a JSON string or an object
+/// with `title`, `summary`, and `text` subfields (the raw GitHub API shape).
+/// Strings pass through directly. Objects have their text fields extracted and
+/// concatenated — matching what `fetch_check_runs` produces via its jq filter.
+/// Null or other types become `None`.
 fn deserialize_output_field<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -133,6 +136,19 @@ where
     let v = Option::<Value>::deserialize(deserializer)?;
     match v {
         Some(Value::String(s)) => Ok(Some(s)),
+        Some(Value::Object(map)) => {
+            let parts: Vec<String> = ["title", "summary", "text"]
+                .iter()
+                .filter_map(|k| map.get(*k)?.as_str())
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+                .collect();
+            Ok(if parts.is_empty() {
+                None
+            } else {
+                Some(parts.join("\n\n"))
+            })
+        }
         _ => Ok(None),
     }
 }
