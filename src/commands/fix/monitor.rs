@@ -847,11 +847,12 @@ async fn handle_monitor_error(
     // threshold. Use a longer backoff (5 minutes) to wait out the rate-limit
     // window instead of hammering the API every 30 seconds.
     if pr_monitor::is_rate_limit_error(&error_msg) {
+        let backoff = Duration::from_secs(RATE_LIMIT_BACKOFF_SECS);
         log::info!(
-            "ℹ️  GitHub API rate limited, backing off for 5 minutes: {}",
+            "ℹ️  GitHub API rate limited, backing off for {}: {}",
+            format_duration(backoff.as_secs()),
             error
         );
-        let backoff = Duration::from_secs(RATE_LIMIT_BACKOFF_SECS);
         let remaining = ctx
             .monitor_timeout
             .checked_sub(state.monitor_start.elapsed());
@@ -1246,6 +1247,167 @@ pub(crate) async fn monitor_ci_after_fix(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::{AgentBackend, AgentEvent};
+    use std::path::PathBuf;
+    use uuid::Uuid;
+
+    /// Minimal AgentBackend stub for tests that never invoke the backend.
+    struct DummyBackend;
+
+    impl AgentBackend for DummyBackend {
+        fn name(&self) -> &str {
+            "dummy"
+        }
+
+        fn build_command(
+            &self,
+            _worktree_path: &Path,
+            _session_id: &Uuid,
+            _prompt: &str,
+            _github_host: &str,
+        ) -> tokio::process::Command {
+            tokio::process::Command::new("true")
+        }
+
+        fn parse_events(&self, _line: &str) -> Vec<AgentEvent> {
+            vec![]
+        }
+
+        fn build_resume_command(
+            &self,
+            _worktree_path: &Path,
+            _session_id: &Uuid,
+            _prompt: &str,
+            _github_host: &str,
+        ) -> Option<tokio::process::Command> {
+            None
+        }
+
+        fn build_interactive_resume_command(
+            &self,
+            _worktree_path: &Path,
+            _session_id: &Uuid,
+            _github_host: &str,
+        ) -> Option<tokio::process::Command> {
+            None
+        }
+
+        fn build_oneshot_command(
+            &self,
+            _worktree_path: &Path,
+            _prompt_arg: &str,
+        ) -> tokio::process::Command {
+            tokio::process::Command::new("true")
+        }
+    }
+
+    /// Build test fixtures for handle_monitor_error tests.
+    fn make_test_fixtures() -> (IssueContext, WorktreeContext) {
+        let issue_ctx = IssueContext {
+            owner: "test-owner".to_string(),
+            repo: "test-repo".to_string(),
+            host: "github.com".to_string(),
+            issue_num: Some(42),
+            details: None,
+        };
+        let wt_ctx = WorktreeContext {
+            minion_id: "M001".to_string(),
+            branch_name: "minion/issue-42-M001".to_string(),
+            minion_dir: PathBuf::from("/tmp/test"),
+            checkout_path: PathBuf::from("/tmp/test/checkout"),
+            session_id: Uuid::new_v4(),
+        };
+        (issue_ctx, wt_ctx)
+    }
+
+    #[tokio::test]
+    async fn test_rate_limit_error_does_not_increment_consecutive_errors() {
+        tokio::time::pause();
+
+        let backend = DummyBackend;
+        let (issue_ctx, wt_ctx) = make_test_fixtures();
+        let ctx = MonitorContext {
+            backend: &backend,
+            issue_ctx: &issue_ctx,
+            wt_ctx: &wt_ctx,
+            pr_number: "123",
+            timeout_opt: None,
+            monitor_timeout: Duration::from_secs(7200),
+        };
+        let mut state = MonitorLoopState::new(Utc::now(), 0);
+
+        // Simulate 15 consecutive rate-limit errors (more than MAX_CONSECUTIVE_ERRORS)
+        for _ in 0..15 {
+            let error = anyhow::anyhow!(
+                "Failed to fetch PR: gh: API rate limit exceeded for user ID 693596"
+            );
+            let action = handle_monitor_error(&mut state, &ctx, error).await;
+            assert!(
+                matches!(action, LoopAction::Continue),
+                "rate-limit error must return Continue, not Break"
+            );
+        }
+
+        assert_eq!(
+            state.consecutive_errors, 0,
+            "rate-limit errors must not increment consecutive_errors"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_non_rate_limit_error_increments_consecutive_errors() {
+        tokio::time::pause();
+
+        let backend = DummyBackend;
+        let (issue_ctx, wt_ctx) = make_test_fixtures();
+        let ctx = MonitorContext {
+            backend: &backend,
+            issue_ctx: &issue_ctx,
+            wt_ctx: &wt_ctx,
+            pr_number: "123",
+            timeout_opt: None,
+            monitor_timeout: Duration::from_secs(7200),
+        };
+        let mut state = MonitorLoopState::new(Utc::now(), 0);
+
+        let error = anyhow::anyhow!("Failed to fetch PR: connection refused");
+        let action = handle_monitor_error(&mut state, &ctx, error).await;
+
+        assert!(matches!(action, LoopAction::Continue));
+        assert_eq!(state.consecutive_errors, 1);
+    }
+
+    #[tokio::test]
+    async fn test_max_non_rate_limit_errors_causes_bailout() {
+        tokio::time::pause();
+
+        let backend = DummyBackend;
+        let (issue_ctx, wt_ctx) = make_test_fixtures();
+        let ctx = MonitorContext {
+            backend: &backend,
+            issue_ctx: &issue_ctx,
+            wt_ctx: &wt_ctx,
+            pr_number: "123",
+            timeout_opt: None,
+            monitor_timeout: Duration::from_secs(7200),
+        };
+        let mut state = MonitorLoopState::new(Utc::now(), 0);
+
+        for i in 0..MAX_CONSECUTIVE_ERRORS {
+            let error = anyhow::anyhow!("Failed to fetch PR: server error");
+            let action = handle_monitor_error(&mut state, &ctx, error).await;
+            if i < MAX_CONSECUTIVE_ERRORS - 1 {
+                assert!(matches!(action, LoopAction::Continue));
+            } else {
+                assert!(
+                    matches!(action, LoopAction::Break),
+                    "must bail after MAX_CONSECUTIVE_ERRORS non-rate-limit errors"
+                );
+            }
+        }
+
+        assert_eq!(state.consecutive_errors, MAX_CONSECUTIVE_ERRORS);
+    }
 
     #[test]
     fn test_format_duration_seconds() {
