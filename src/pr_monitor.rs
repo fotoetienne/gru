@@ -936,7 +936,7 @@ async fn get_check_runs(host: &str, owner: &str, repo: &str, sha: &str) -> Resul
 /// "Unaddressed" means: submitted after the baseline and not authored by a
 /// Minion (identified by the `<sub>🤖` signature in the review body).
 /// Used to decide whether to post a monitoring-paused notification on exit.
-pub(crate) fn has_unaddressed_reviews(reviews: &[Review], since: DateTime<Utc>) -> usize {
+pub(crate) fn count_unaddressed_reviews(reviews: &[Review], since: DateTime<Utc>) -> usize {
     reviews
         .iter()
         .filter(|r| {
@@ -2096,29 +2096,29 @@ mod tests {
     }
 
     #[test]
-    fn test_has_unaddressed_reviews_excludes_minion_reviews() {
+    fn test_count_unaddressed_reviews_excludes_minion_reviews() {
         let since = "2024-01-01T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
         let reviews = vec![
             make_review_for_exit("2024-01-02T00:00:00Z", Some("Done.\n\n<sub>🤖 M001</sub>")), // Minion — excluded
             make_review_for_exit("2024-01-02T00:00:00Z", Some("Please fix this.")), // human
         ];
-        assert_eq!(has_unaddressed_reviews(&reviews, since), 1);
+        assert_eq!(count_unaddressed_reviews(&reviews, since), 1);
     }
 
     #[test]
-    fn test_has_unaddressed_reviews_returns_zero_before_baseline() {
+    fn test_count_unaddressed_reviews_returns_zero_before_baseline() {
         let since = "2024-01-10T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
         let reviews = vec![
             make_review_for_exit("2024-01-05T00:00:00Z", None), // before baseline
             make_review_for_exit("2024-01-10T00:00:00Z", None), // equal to baseline — excluded (uses >)
         ];
-        assert_eq!(has_unaddressed_reviews(&reviews, since), 0);
+        assert_eq!(count_unaddressed_reviews(&reviews, since), 0);
     }
 
     #[test]
-    fn test_has_unaddressed_reviews_empty_list() {
+    fn test_count_unaddressed_reviews_empty_list() {
         let since = "2024-01-01T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
-        assert_eq!(has_unaddressed_reviews(&[], since), 0);
+        assert_eq!(count_unaddressed_reviews(&[], since), 0);
     }
 
     #[test]
