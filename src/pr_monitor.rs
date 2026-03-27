@@ -858,6 +858,7 @@ mod tests {
         let json = r#"{
             "state": "open", "merged": false,
             "head": {"sha": "abc123"}, "user": {"login": "octocat"},
+            "created_at": "2024-01-01T00:00:00Z",
             "labels": [{"name": "gru:auto-merge"}, {"name": "bug"}]
         }"#;
         let pr: PullRequest = serde_json::from_str(json).unwrap();
@@ -870,7 +871,8 @@ mod tests {
     fn test_pull_request_labels_default_empty() {
         let json = r#"{
             "state": "open", "merged": false,
-            "head": {"sha": "abc123"}, "user": {"login": "octocat"}
+            "head": {"sha": "abc123"}, "user": {"login": "octocat"},
+            "created_at": "2024-01-01T00:00:00Z"
         }"#;
         let pr: PullRequest = serde_json::from_str(json).unwrap();
         assert!(pr.labels.is_empty());
