@@ -173,7 +173,9 @@ pub(crate) async fn create_pr_phase(
         if !auto_merge && issue_has_auto_merge {
             println!(
                 "🏷️  Issue #{} has gru:auto-merge label — propagating to PR",
-                issue_ctx.issue_num
+                issue_ctx
+                    .issue_num
+                    .map_or("?".to_string(), |n| n.to_string())
             );
         }
         if let Some(ref pr_num) = pr_number {

@@ -236,7 +236,10 @@ async fn check_resumption_preconditions(
         session_id: session_uuid,
     };
 
-    let details = fetch_issue_details(&owner, &repo_name, &host, issue_num).await;
+    let details = match issue_num {
+        Some(num) => fetch_issue_details(&owner, &repo_name, &host, num).await,
+        None => None,
+    };
     let issue_ctx = IssueContext {
         owner,
         repo: repo_name,

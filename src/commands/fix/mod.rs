@@ -743,7 +743,7 @@ CUSTOM: Fix #{{ issue_number }} - {{ issue_title }}"#,
             details: Some(IssueDetails {
                 title: "Fix the widget".to_string(),
                 body: "The widget is broken".to_string(),
-                labels: "bug".to_string(),
+                labels: vec!["bug".to_string()],
             }),
         };
 
@@ -771,7 +771,7 @@ CUSTOM: Fix #{{ issue_number }} - {{ issue_title }}"#,
             details: Some(IssueDetails {
                 title: "Fix the widget".to_string(),
                 body: "The widget is broken".to_string(),
-                labels: String::new(),
+                labels: vec![],
             }),
         };
 
@@ -796,7 +796,7 @@ CUSTOM: Fix #{{ issue_number }} - {{ issue_title }}"#,
             details: Some(IssueDetails {
                 title: "Fix the widget".to_string(),
                 body: "The widget is broken".to_string(),
-                labels: String::new(),
+                labels: vec![],
             }),
         };
 
