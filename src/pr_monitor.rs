@@ -1,4 +1,4 @@
-use crate::ci::CheckRun;
+use crate::ci::{self, CheckRun};
 use crate::github;
 use crate::github::DEFAULT_MAX_RETRIES;
 use crate::labels;
@@ -331,6 +331,56 @@ async fn update_readiness_label(
     }
 }
 
+/// Local check-run struct for raw GitHub API responses.
+///
+/// The raw API returns `output` as a JSON object with `title`, `summary`,
+/// and `text` sub-fields. This struct deserializes it as `serde_json::Value`
+/// and extracts those sub-fields when converting to `ci::CheckRun`.
+#[derive(Debug, Deserialize)]
+struct RawCheckRun {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    status: ci::CheckStatus,
+    conclusion: Option<ci::CheckConclusion>,
+    duration: Option<String>,
+    output: Option<serde_json::Value>,
+}
+
+impl From<RawCheckRun> for CheckRun {
+    fn from(raw: RawCheckRun) -> Self {
+        let output = raw.output.and_then(|v| {
+            // Extract title/summary/text from the API object, mirroring
+            // the --jq filter in ci::fetch_check_runs.
+            let mut parts = Vec::new();
+            for key in &["title", "summary", "text"] {
+                if let Some(s) = v.get(key).and_then(|t| t.as_str()) {
+                    if !s.is_empty() {
+                        parts.push(s.to_string());
+                    }
+                }
+            }
+            if parts.is_empty() {
+                None
+            } else {
+                Some(parts.join("\n\n"))
+            }
+        });
+        CheckRun {
+            name: raw.name,
+            status: raw.status,
+            conclusion: raw.conclusion,
+            duration: raw.duration,
+            output,
+        }
+    }
+}
+
+#[cfg(test)]
+#[derive(Debug, Deserialize)]
+struct CheckRunsResponse {
+    check_runs: Vec<RawCheckRun>,
+}
 /// Monitor a PR for actionable events (reviews, CI failures, merge conflicts, etc.).
 ///
 /// `baseline` optionally provides a timestamp to seed the review tracker.
@@ -848,9 +898,9 @@ async fn get_check_runs(host: &str, owner: &str, repo: &str, sha: &str) -> Resul
         if line.is_empty() {
             continue;
         }
-        let check_run: CheckRun =
+        let raw: RawCheckRun =
             serde_json::from_str(line).context("Failed to parse check run JSON line")?;
-        check_runs.push(check_run);
+        check_runs.push(CheckRun::from(raw));
     }
 
     Ok(check_runs)
@@ -1374,6 +1424,47 @@ mod tests {
             .collect();
 
         assert!(check_runs.is_empty());
+    }
+
+    #[test]
+    fn test_check_runs_response_with_output_object() {
+        let json = r#"{
+            "total_count": 1,
+            "check_runs": [{
+                "name": "build",
+                "status": "completed",
+                "conclusion": "failure",
+                "output": {
+                    "title": "Build failed",
+                    "summary": "error[E0433]: failed to resolve",
+                    "text": null,
+                    "annotations_count": 1,
+                    "annotations_url": "https://api.github.com/repos/o/r/check-runs/1/annotations"
+                }
+            }]
+        }"#;
+
+        let response: CheckRunsResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(response.check_runs.len(), 1);
+        let check: CheckRun = response.check_runs.into_iter().next().unwrap().into();
+        assert_eq!(check.name, "build");
+        assert_eq!(check.conclusion, Some(crate::ci::CheckConclusion::Failure));
+        assert_eq!(
+            check.output.as_deref(),
+            Some("Build failed\n\nerror[E0433]: failed to resolve")
+        );
+    }
+
+    #[test]
+    fn test_check_runs_response_with_null_output() {
+        let json = r#"{
+            "total_count": 1,
+            "check_runs": [{"conclusion": "success", "output": null}]
+        }"#;
+
+        let response: CheckRunsResponse = serde_json::from_str(json).unwrap();
+        let check: CheckRun = response.check_runs.into_iter().next().unwrap().into();
+        assert!(check.output.is_none());
     }
 
     #[test]
