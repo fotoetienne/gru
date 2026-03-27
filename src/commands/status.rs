@@ -1,4 +1,5 @@
 use crate::agent::TokenUsage;
+use crate::config;
 use crate::minion_registry::{is_process_alive_with_start_time, with_registry, MinionMode};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -319,6 +320,15 @@ pub(crate) async fn handle_status(
     // Non-fatal: a transient GitHub API error should not prevent status display.
     if let Err(e) = crate::minion_registry::auto_archive_completed_minions().await {
         log::warn!("Failed to auto-archive completed minions: {:#}", e);
+    }
+
+    // Auto-archive stopped Minions with no archivable signal after TTL.
+    // Non-fatal: transient errors should not prevent status display.
+    let ttl_hours = config::try_load_config()
+        .map(|c| c.daemon.archive_ttl_hours)
+        .unwrap_or(config::DEFAULT_ARCHIVE_TTL_HOURS);
+    if let Err(e) = crate::minion_registry::auto_archive_stopped_minions(ttl_hours).await {
+        log::warn!("Failed to auto-archive stopped Minions: {:#}", e);
     }
 
     // Phase 1: Load registry and perform remaining cleanup (with lock held)

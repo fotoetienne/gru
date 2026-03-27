@@ -70,6 +70,11 @@
 # Backoff formula: min(10s × 2^(attempt-1), max_retry_backoff_secs)
 # max_retry_backoff_secs = 300
 
+# Hours before a stopped Minion with no archivable signal (no PR, issue
+# still open) is auto-archived and hidden from `gru status`. Set to 0
+# to disable TTL-based archiving.
+# archive_ttl_hours = 24
+
 # ─────────────────────────────────────────────────────────────────────
 # Agent backend
 # ─────────────────────────────────────────────────────────────────────
@@ -116,6 +121,7 @@
 # poll_interval_max_secs = 300
 # max_slots = 4
 # max_resume_attempts = 5
+# archive_ttl_hours = 48
 #
 # [agent]
 # default = "claude"
