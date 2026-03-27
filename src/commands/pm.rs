@@ -13,12 +13,12 @@ const TPM_SKILL: &str = include_str!("../../.claude/skills/project-manager/SKILL
 
 /// Handles the `gru pm` command — interactive PM session.
 pub async fn handle_pm(prompt: Option<String>, verbose: bool) -> Result<i32> {
-    launch_skill_session("product manager", PM_SKILL, prompt, verbose).await
+    launch_skill_session("pm", PM_SKILL, prompt, verbose).await
 }
 
 /// Handles the `gru tpm` command — interactive TPM session.
 pub async fn handle_tpm(prompt: Option<String>, verbose: bool) -> Result<i32> {
-    launch_skill_session("technical project manager", TPM_SKILL, prompt, verbose).await
+    launch_skill_session("tpm", TPM_SKILL, prompt, verbose).await
 }
 
 /// Launches an interactive Claude session with the given skill as the system prompt.
@@ -65,36 +65,26 @@ async fn launch_skill_session(
     Ok(if status.success() { 0 } else { 1 })
 }
 
-/// Strips YAML frontmatter (delimited by `---` lines) from skill content.
+/// Strips YAML frontmatter (delimited by `---`) from the beginning of a string.
+///
+/// The closing `---` must appear on its own line (nothing after it except a newline
+/// or end-of-string). This prevents horizontal rules or dashes embedded in values
+/// from being misinterpreted as the closing delimiter.
 fn strip_frontmatter(content: &str) -> &str {
     // Frontmatter must start at the very beginning with "---"
     if !content.starts_with("---") {
         return content;
     }
-    // Find the closing "---" on its own line (after the first line)
-    let rest = &content[3..];
-    let closing = rest
-        .find("\n---\n")
-        .map(|i| (i, 5)) // skip "\n---\n"
-        .or_else(|| {
-            // Handle "---" as the very last line (no trailing newline)
-            if rest.ends_with("\n---") {
-                Some((rest.len() - 4, rest.len() - rest.rfind('\n').unwrap_or(0)))
-            } else {
-                None
-            }
-        });
-    if let Some((end, skip)) = closing {
-        let after_frontmatter = 3 + end + skip;
-        if after_frontmatter < content.len() {
-            content[after_frontmatter..].trim_start_matches('\n')
-        } else {
-            // Frontmatter only, no content after it
-            ""
+
+    let after_opening = &content[3..];
+    // Find the closing "---" on its own line
+    for (pos, _) in after_opening.match_indices("\n---") {
+        let rest = &after_opening[pos + 4..]; // skip "\n---"
+        if rest.is_empty() || rest.starts_with('\n') {
+            return rest.strip_prefix('\n').unwrap_or(rest);
         }
-    } else {
-        content
     }
+    content // No valid closing delimiter found
 }
 
 #[cfg(test)]
@@ -117,7 +107,7 @@ mod tests {
     fn test_strip_frontmatter_with_yaml() {
         let content = "---\nname: test\ntype: skill\n---\n\nActual content here.";
         let result = strip_frontmatter(content);
-        assert_eq!(result, "Actual content here.");
+        assert_eq!(result, "\nActual content here.");
     }
 
     #[test]
@@ -133,6 +123,13 @@ mod tests {
         let content = "---\nname: test\n--- extra\n\nContent.";
         let result = strip_frontmatter(content);
         assert_eq!(result, content);
+    }
+
+    #[test]
+    fn test_strip_frontmatter_closing_with_trailing_content() {
+        // "--- extra" must NOT be treated as closing delimiter
+        let input = "---\nkey: val\n--- extra\n---\nBody";
+        assert_eq!(strip_frontmatter(input), "Body");
     }
 
     #[test]
