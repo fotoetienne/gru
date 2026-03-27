@@ -1295,19 +1295,9 @@ pub(crate) async fn list_pr_reviews(
     pr_number: &str,
 ) -> Result<Vec<PrReview>> {
     let endpoint = format!("repos/{}/{}/pulls/{}/reviews", owner, repo, pr_number);
-    let stdout = run_gh(
-        host,
-        &[
-            "api",
-            &endpoint,
-            "--cache",
-            "60s",
-            "--paginate",
-            "--jq",
-            ".[]",
-        ],
-    )
-    .await?;
+    // No --cache: this is called by has_gru_review_for_sha as a pre-write
+    // dedup guard, so it must see the latest reviews to avoid duplicates.
+    let stdout = run_gh(host, &["api", &endpoint, "--paginate", "--jq", ".[]"]).await?;
 
     // --paginate --jq '.[]' outputs one JSON object per line (NDJSON).
     parse_pr_reviews_ndjson(&stdout)
