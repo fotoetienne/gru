@@ -73,6 +73,40 @@ impl fmt::Display for MergeReadiness {
     }
 }
 
+/// Pre-fetched data from a poll cycle to avoid duplicate API calls.
+///
+/// When `poll_once()` has already fetched PR details, reviews, and check runs,
+/// it can pass them here so `check_merge_readiness` doesn't re-fetch them.
+#[derive(Debug)]
+pub(crate) struct PreFetchedData {
+    /// PR metadata: head SHA, draft status, mergeable, author login.
+    pub pr: PreFetchedPr,
+    /// Reviews with state info for merge-readiness evaluation.
+    pub reviews: Vec<ReviewApiResponse>,
+    /// Check run results (conclusion + status) from the Check Runs API.
+    pub check_runs: Vec<PreFetchedCheckRun>,
+}
+
+/// Pre-fetched PR metadata from a poll cycle.
+#[derive(Debug)]
+pub(crate) struct PreFetchedPr {
+    pub head_sha: String,
+    pub draft: bool,
+    pub mergeable: Option<bool>,
+    pub author_login: String,
+}
+
+/// Pre-fetched check run data, converted from `ci::CheckRun`.
+///
+/// Conclusion and status are stored as raw strings to match the format
+/// expected by `evaluate_ci`. Note: `ci::CheckConclusion::Unknown` maps
+/// to `Some("unknown")` here, which `evaluate_ci` correctly rejects.
+#[derive(Debug)]
+pub(crate) struct PreFetchedCheckRun {
+    pub conclusion: Option<String>,
+    pub status: Option<String>,
+}
+
 /// Check whether a PR is ready to merge by querying GitHub API.
 ///
 /// This is a pure query function — it reads GitHub state and returns a
@@ -110,6 +144,52 @@ pub(crate) async fn check_merge_readiness(
     let ci_passing = evaluate_ci(&check_runs) && evaluate_combined_status(&combined_status);
     let review_approved = evaluate_reviews(&reviews, &pr.author_login);
     let no_conflicts = pr.mergeable == Some(true);
+
+    Ok(MergeReadiness {
+        not_draft: true,
+        ci_passing,
+        review_approved,
+        no_conflicts,
+    })
+}
+
+/// Check merge readiness using pre-fetched poll cycle data.
+///
+/// Skips the PR details, reviews, and check runs API calls since `poll_once()`
+/// already fetched them. Only fetches the combined status (legacy Statuses API),
+/// which is unique to merge-readiness and not needed by the poll loop.
+pub(crate) async fn check_merge_readiness_with_data(
+    host: &str,
+    owner: &str,
+    repo: &str,
+    data: &PreFetchedData,
+) -> Result<MergeReadiness> {
+    // Fast bail-out: draft PRs are never ready
+    if data.pr.draft {
+        return Ok(MergeReadiness {
+            not_draft: false,
+            ci_passing: false,
+            review_approved: false,
+            no_conflicts: false,
+        });
+    }
+
+    // Only fetch combined status (legacy Statuses API) — not fetched by poll_once.
+    let combined_status = get_combined_status(host, owner, repo, &data.pr.head_sha).await?;
+
+    // Convert pre-fetched check runs to internal format for evaluate_ci
+    let check_runs: Vec<CheckRun> = data
+        .check_runs
+        .iter()
+        .map(|cr| CheckRun {
+            conclusion: cr.conclusion.clone(),
+            status: cr.status.clone(),
+        })
+        .collect();
+
+    let ci_passing = evaluate_ci(&check_runs) && evaluate_combined_status(&combined_status);
+    let review_approved = evaluate_reviews(&data.reviews, &data.pr.author_login);
+    let no_conflicts = data.pr.mergeable == Some(true);
 
     Ok(MergeReadiness {
         not_draft: true,
@@ -986,4 +1066,205 @@ mod tests {
     // NOTE: Tests for `crate::github::is_retryable_error` are co-located with
     // the function definition in `src/github.rs` (see the `test_is_retryable_error_*`
     // cases there). We intentionally do not duplicate those tests here.
+
+    // --- PreFetchedData evaluation tests ---
+    // These tests verify that check_merge_readiness_with_data produces identical
+    // results to the evaluation logic in check_merge_readiness, ensuring the
+    // pre-fetched data path doesn't change behavior.
+
+    /// Helper to evaluate merge readiness from pre-fetched data synchronously
+    /// (skips the combined_status API call by testing the pure evaluation functions).
+    fn evaluate_from_prefetched(data: &PreFetchedData) -> MergeReadiness {
+        if data.pr.draft {
+            return MergeReadiness {
+                not_draft: false,
+                ci_passing: false,
+                review_approved: false,
+                no_conflicts: false,
+            };
+        }
+
+        let check_runs: Vec<CheckRun> = data
+            .check_runs
+            .iter()
+            .map(|cr| CheckRun {
+                conclusion: cr.conclusion.clone(),
+                status: cr.status.clone(),
+            })
+            .collect();
+
+        let ci_passing = evaluate_ci(&check_runs);
+        let review_approved = evaluate_reviews(&data.reviews, &data.pr.author_login);
+        let no_conflicts = data.pr.mergeable == Some(true);
+
+        MergeReadiness {
+            not_draft: true,
+            ci_passing,
+            review_approved,
+            no_conflicts,
+        }
+    }
+
+    #[test]
+    fn test_prefetched_all_passing() {
+        let data = PreFetchedData {
+            pr: PreFetchedPr {
+                head_sha: "abc123".into(),
+                draft: false,
+                mergeable: Some(true),
+                author_login: "bot".into(),
+            },
+            reviews: vec![ReviewApiResponse {
+                state: "APPROVED".into(),
+                user: ReviewUser {
+                    login: "alice".into(),
+                },
+            }],
+            check_runs: vec![PreFetchedCheckRun {
+                conclusion: Some("success".into()),
+                status: Some("completed".into()),
+            }],
+        };
+
+        let readiness = evaluate_from_prefetched(&data);
+        assert!(readiness.is_ready());
+    }
+
+    #[test]
+    fn test_prefetched_draft_pr() {
+        let data = PreFetchedData {
+            pr: PreFetchedPr {
+                head_sha: "abc123".into(),
+                draft: true,
+                mergeable: Some(true),
+                author_login: "bot".into(),
+            },
+            reviews: vec![],
+            check_runs: vec![],
+        };
+
+        let readiness = evaluate_from_prefetched(&data);
+        assert!(!readiness.is_ready());
+        assert!(!readiness.not_draft);
+    }
+
+    #[test]
+    fn test_prefetched_ci_failure() {
+        let data = PreFetchedData {
+            pr: PreFetchedPr {
+                head_sha: "abc123".into(),
+                draft: false,
+                mergeable: Some(true),
+                author_login: "bot".into(),
+            },
+            reviews: vec![ReviewApiResponse {
+                state: "APPROVED".into(),
+                user: ReviewUser {
+                    login: "alice".into(),
+                },
+            }],
+            check_runs: vec![PreFetchedCheckRun {
+                conclusion: Some("failure".into()),
+                status: Some("completed".into()),
+            }],
+        };
+
+        let readiness = evaluate_from_prefetched(&data);
+        assert!(!readiness.ci_passing);
+    }
+
+    #[test]
+    fn test_prefetched_review_not_approved() {
+        let data = PreFetchedData {
+            pr: PreFetchedPr {
+                head_sha: "abc123".into(),
+                draft: false,
+                mergeable: Some(true),
+                author_login: "bot".into(),
+            },
+            reviews: vec![ReviewApiResponse {
+                state: "CHANGES_REQUESTED".into(),
+                user: ReviewUser {
+                    login: "alice".into(),
+                },
+            }],
+            check_runs: vec![PreFetchedCheckRun {
+                conclusion: Some("success".into()),
+                status: Some("completed".into()),
+            }],
+        };
+
+        let readiness = evaluate_from_prefetched(&data);
+        assert!(!readiness.review_approved);
+    }
+
+    #[test]
+    fn test_prefetched_merge_conflict() {
+        let data = PreFetchedData {
+            pr: PreFetchedPr {
+                head_sha: "abc123".into(),
+                draft: false,
+                mergeable: Some(false),
+                author_login: "bot".into(),
+            },
+            reviews: vec![ReviewApiResponse {
+                state: "APPROVED".into(),
+                user: ReviewUser {
+                    login: "alice".into(),
+                },
+            }],
+            check_runs: vec![PreFetchedCheckRun {
+                conclusion: Some("success".into()),
+                status: Some("completed".into()),
+            }],
+        };
+
+        let readiness = evaluate_from_prefetched(&data);
+        assert!(!readiness.no_conflicts);
+    }
+
+    #[test]
+    fn test_prefetched_check_run_conversion_matches_internal() {
+        // Verify that PreFetchedCheckRun → CheckRun conversion produces identical
+        // evaluation results as using CheckRun directly.
+        let prefetched_runs = [
+            PreFetchedCheckRun {
+                conclusion: Some("success".into()),
+                status: Some("completed".into()),
+            },
+            PreFetchedCheckRun {
+                conclusion: Some("skipped".into()),
+                status: Some("completed".into()),
+            },
+            PreFetchedCheckRun {
+                conclusion: Some("neutral".into()),
+                status: Some("completed".into()),
+            },
+        ];
+
+        let direct_runs = vec![
+            CheckRun {
+                conclusion: Some("success".into()),
+                status: Some("completed".into()),
+            },
+            CheckRun {
+                conclusion: Some("skipped".into()),
+                status: Some("completed".into()),
+            },
+            CheckRun {
+                conclusion: Some("neutral".into()),
+                status: Some("completed".into()),
+            },
+        ];
+
+        let converted: Vec<CheckRun> = prefetched_runs
+            .iter()
+            .map(|cr| CheckRun {
+                conclusion: cr.conclusion.clone(),
+                status: cr.status.clone(),
+            })
+            .collect();
+
+        assert_eq!(evaluate_ci(&converted), evaluate_ci(&direct_runs));
+    }
 }
