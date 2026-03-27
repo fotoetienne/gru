@@ -193,3 +193,7 @@ Contributions are welcome! See [CONTRIBUTING.md](CONTRIBUTING.md) for dev setup,
 - [Worktree CLI](https://github.com/agenttools/worktree) — Git worktree management for coding agents
 - [Vibe Kanban](https://www.vibekanban.com/) — Local orchestration with kanban-style task management
 - [Cowork](https://support.claude.com/en/articles/13345190-getting-started-with-cowork) — Claude Desktop autonomous task execution
+
+---
+
+<p align="center">Made with 💛 by <a href="https://github.com/fotoetienne/gru">Gru</a></p>
