@@ -158,6 +158,18 @@ impl JudgeState {
         self.consecutive_failures
     }
 
+    /// Returns the retry backoff remaining in minutes (rounded up), or 0
+    /// if no backoff is active.
+    pub(crate) fn retry_backoff_minutes(&self) -> i64 {
+        match self.retry_after {
+            Some(until) => {
+                let remaining = until - Utc::now();
+                (remaining.num_seconds() + 59).max(0) / 60 // round up
+            }
+            None => 0,
+        }
+    }
+
     /// Returns true if the failure cap has been reached and escalation
     /// has not yet been performed for this fingerprint.
     pub(crate) fn should_escalate_on_failure(&self) -> bool {
