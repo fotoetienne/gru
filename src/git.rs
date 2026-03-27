@@ -513,6 +513,10 @@ impl GitRepo {
                         .join(", ")
                 );
             }
+
+            // Refresh origin/HEAD after fetch so default branch changes on the
+            // remote (e.g., master → main) are reflected locally.
+            self.update_origin_head(token.as_deref()).await;
         } else {
             // Clone as bare repository
             let url = format!("https://{}/{}/{}.git", self.host, self.owner, self.repo);
@@ -566,9 +570,58 @@ impl GitRepo {
                     stderr
                 );
             }
+
+            // Set origin/HEAD so default branch detection works in worktrees
+            // via `git symbolic-ref refs/remotes/origin/HEAD`
+            self.update_origin_head(token.as_deref()).await;
         }
 
         Ok(())
+    }
+
+    /// Updates `refs/remotes/origin/HEAD` so that worktrees can detect the
+    /// default branch via `git symbolic-ref refs/remotes/origin/HEAD` without
+    /// needing an API call.
+    ///
+    /// Failures are logged but not propagated — this is a best-effort
+    /// optimisation that doesn't block clone or fetch.
+    async fn update_origin_head(&self, token: Option<&str>) {
+        let result: Result<()> = async {
+            let auth = git_command_with_auth(token)?;
+            let AuthenticatedGitCommand {
+                mut cmd,
+                _askpass_file,
+            } = auth;
+            let output = cmd
+                .arg("-C")
+                .arg(&self.bare_path)
+                .args(["remote", "set-head", "origin", "--auto"])
+                .output()
+                .await
+                .context("Failed to execute git remote set-head")?;
+
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                let stderr = redact_credentials(stderr.trim());
+                log::warn!(
+                    "{}/{}: git remote set-head origin --auto failed: {}",
+                    self.owner,
+                    self.repo,
+                    stderr
+                );
+            }
+            Ok(())
+        }
+        .await;
+
+        if let Err(e) = result {
+            log::warn!(
+                "{}/{}: could not update origin/HEAD: {}",
+                self.owner,
+                self.repo,
+                e
+            );
+        }
     }
 
     /// Determines the default branch to use as base for new worktrees
@@ -1470,6 +1523,25 @@ mod tests {
             result
         );
         assert!(bare_path.exists(), "Bare repository was not created");
+
+        // Verify origin/HEAD was set during clone
+        let origin_head = Command::new("git")
+            .arg("-C")
+            .arg(&bare_path)
+            .args(["symbolic-ref", "refs/remotes/origin/HEAD"])
+            .output()
+            .await
+            .expect("Failed to check origin/HEAD");
+        assert!(
+            origin_head.status.success(),
+            "refs/remotes/origin/HEAD should be set after bare clone"
+        );
+        let origin_head_ref = String::from_utf8_lossy(&origin_head.stdout);
+        assert!(
+            origin_head_ref.trim().starts_with("refs/remotes/origin/"),
+            "origin/HEAD should point to a valid remote ref, got: {}",
+            origin_head_ref.trim()
+        );
 
         // Test ensure_bare_clone (second time - should fetch)
         let result = repo.ensure_bare_clone().await;
