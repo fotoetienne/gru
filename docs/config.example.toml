@@ -45,7 +45,12 @@
 # ]
 
 # How often to poll for new issues, in seconds.
+# When idle, the interval doubles each cycle up to poll_interval_max_secs.
 # poll_interval_secs = 30
+
+# Maximum poll interval in seconds for adaptive backoff (default: 300 = 5 min).
+# The poll interval backs off exponentially when idle and resets on activity.
+# poll_interval_max_secs = 300
 
 # Maximum Minions running at the same time.
 # max_slots = 2
@@ -108,6 +113,7 @@
 #     "corp:platform/web-ui",
 # ]
 # poll_interval_secs = 60
+# poll_interval_max_secs = 300
 # max_slots = 4
 # max_resume_attempts = 5
 #

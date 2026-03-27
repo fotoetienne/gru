@@ -10,6 +10,7 @@ use std::process::Output;
 use tokio::time::{sleep, Duration, Instant};
 
 const POLL_INTERVAL_SECS: u64 = 30;
+const MAX_POLL_INTERVAL_SECS: u64 = 300; // 5 minutes
 
 /// Alias for the shared retry helper in `github.rs`.
 async fn gh_api_with_retry(host: &str, args: &[&str], max_retries: u32) -> Result<Output> {
@@ -423,6 +424,8 @@ pub(crate) async fn monitor_pr(
     let ctrl_c = tokio::signal::ctrl_c();
     tokio::pin!(ctrl_c);
 
+    let mut consecutive_idle_cycles: u32 = 0;
+
     loop {
         // Check if we've exceeded the maximum duration
         if let Some(max) = max_duration {
@@ -444,9 +447,29 @@ pub(crate) async fn monitor_pr(
             }
         }
 
+        // Adaptive backoff: double interval for each idle cycle, capped at max.
+        // Increment first so the first idle sleep is 2x base (the initial poll
+        // already ran without delay, so the base interval is "free").
+        consecutive_idle_cycles = consecutive_idle_cycles.saturating_add(1);
+        let multiplier = 2u64.saturating_pow(consecutive_idle_cycles);
+        let current_interval = std::cmp::min(
+            POLL_INTERVAL_SECS.saturating_mul(multiplier),
+            MAX_POLL_INTERVAL_SECS,
+        );
+        log::debug!(
+            "PR poll interval: {}s (idle for {} cycle{})",
+            current_interval,
+            consecutive_idle_cycles,
+            if consecutive_idle_cycles == 1 {
+                ""
+            } else {
+                "s"
+            },
+        );
+
         // Sleep between polls, still responding to Ctrl+C
         tokio::select! {
-            _ = sleep(Duration::from_secs(POLL_INTERVAL_SECS)) => {}
+            _ = sleep(Duration::from_secs(current_interval)) => {}
             _ = &mut ctrl_c => {
                 return Ok((MonitorResult::Interrupted, last_check_time));
             }
