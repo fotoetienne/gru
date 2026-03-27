@@ -47,7 +47,8 @@ async fn launch_skill_session(
     cmd.arg("--system-prompt").arg(system_prompt);
 
     if let Some(ref p) = prompt {
-        cmd.arg(p);
+        // Use argument terminator so prompts like "-h" are not treated as CLI flags
+        cmd.arg("--").arg(p);
     }
 
     cmd.current_dir(&repo_root)
@@ -67,21 +68,27 @@ async fn launch_skill_session(
 
 /// Strips YAML frontmatter (delimited by `---`) from the beginning of a string.
 ///
-/// The closing `---` must appear on its own line (nothing after it except a newline
-/// or end-of-string). This prevents horizontal rules or dashes embedded in values
-/// from being misinterpreted as the closing delimiter.
+/// Both the opening and closing `---` must appear on their own lines. Handles
+/// both LF (`\n`) and CRLF (`\r\n`) line endings. This prevents horizontal rules
+/// or dashes embedded in values from being misinterpreted as frontmatter delimiters.
 fn strip_frontmatter(content: &str) -> &str {
-    // Frontmatter must start at the very beginning with "---"
-    if !content.starts_with("---") {
+    // Opening delimiter must be exactly "---" followed by a newline
+    let after_opening = if let Some(rest) = content.strip_prefix("---\n") {
+        rest
+    } else if let Some(rest) = content.strip_prefix("---\r\n") {
+        rest
+    } else {
         return content;
-    }
+    };
 
-    let after_opening = &content[3..];
     // Find the closing "---" on its own line
     for (pos, _) in after_opening.match_indices("\n---") {
         let rest = &after_opening[pos + 4..]; // skip "\n---"
         if rest.is_empty() || rest.starts_with('\n') {
             return rest.strip_prefix('\n').unwrap_or(rest);
+        }
+        if let Some(after_crlf) = rest.strip_prefix("\r\n") {
+            return after_crlf;
         }
     }
     content // No valid closing delimiter found
@@ -144,5 +151,18 @@ mod tests {
         let content = "---\nno closing delimiter\nstill going";
         let result = strip_frontmatter(content);
         assert_eq!(result, content);
+    }
+
+    #[test]
+    fn test_strip_frontmatter_opening_not_own_line() {
+        // "--- something" at the start is NOT valid opening frontmatter
+        let content = "--- something\nname: test\n---\nBody";
+        assert_eq!(strip_frontmatter(content), content);
+    }
+
+    #[test]
+    fn test_strip_frontmatter_crlf() {
+        let content = "---\r\nname: test\r\n---\r\nBody here.";
+        assert_eq!(strip_frontmatter(content), "Body here.");
     }
 }
