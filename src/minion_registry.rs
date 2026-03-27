@@ -357,6 +357,10 @@ impl std::fmt::Display for MinionMode {
 /// less than later ones (e.g., `Setup < RunningAgent < CreatingPr`).
 /// Note: `running_claude` is accepted as a legacy alias for `running_agent`.
 /// `Failed` sorts last since it is a terminal state.
+///
+/// **Important:** The derived `Ord` is load-bearing — `resume.rs` uses
+/// `start_phase > RunningAgent` to detect phases past the agent session.
+/// Reordering variants will silently break that logic.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum OrchestrationPhase {
@@ -416,7 +420,9 @@ pub(crate) struct MinionInfo {
     /// Issue number the Minion is addressing (None for ad-hoc prompts or PRs without linked issues)
     #[serde(default, deserialize_with = "deserialize_issue")]
     pub(crate) issue: Option<u64>,
-    /// Command that started the Minion (e.g., "do", "review", "respond", "rebase")
+    /// Command that started the Minion (e.g., "do", "review", "respond", "rebase").
+    /// See `resume::is_agent_only_command` — commands other than "do"/"fix" skip
+    /// post-agent orchestration (PR creation, monitoring) on resume.
     pub(crate) command: String,
     /// The prompt that was given to the Minion
     pub(crate) prompt: String,
