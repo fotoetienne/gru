@@ -6,6 +6,7 @@ use tokio::process::Command;
 
 use crate::commands::child_process;
 use crate::git;
+use crate::tmux::TmuxGuard;
 
 /// Maximum bytes to read from CLAUDE.md. We read slightly more than the
 /// truncation limit so we can detect whether truncation is needed and still
@@ -18,6 +19,8 @@ const CLAUDE_MD_READ_LIMIT: usize = 8192;
 /// When run inside a git repo, includes project context (CLAUDE.md, Gru tool descriptions).
 /// When run outside a repo, spawns a general Gru onboarding assistant.
 pub(crate) async fn handle_chat(repo_flag: Option<String>, verbose: bool) -> Result<i32> {
+    let _tmux_guard = TmuxGuard::new("gru:chat");
+
     let (work_dir, system_prompt) = match detect_project_context(repo_flag).await {
         Some((repo_root, owner, repo_name)) => {
             let prompt = build_in_repo_prompt(&repo_root, &owner, &repo_name).await;
