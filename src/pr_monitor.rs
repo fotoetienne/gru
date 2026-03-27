@@ -407,9 +407,14 @@ pub(crate) async fn monitor_pr(
             MAX_POLL_INTERVAL_SECS,
         );
         log::debug!(
-            "PR poll interval: {}s (idle for {} cycles)",
+            "PR poll interval: {}s (idle for {} cycle{})",
             current_interval,
             consecutive_idle_cycles,
+            if consecutive_idle_cycles == 1 {
+                ""
+            } else {
+                "s"
+            },
         );
 
         // Sleep between polls, still responding to Ctrl+C

@@ -209,6 +209,12 @@ pub(crate) async fn handle_lab(
     let max_interval = config.poll_interval_max();
     let mut consecutive_idle_cycles: u32 = 0;
 
+    // Compute backoff interval: base * 2^idle_cycles, capped at max.
+    let backoff_interval = |cycles: u32| -> Duration {
+        let multiplier = 2u32.saturating_pow(cycles);
+        std::cmp::min(base_interval.saturating_mul(multiplier), max_interval)
+    };
+
     // Main polling loop
     loop {
         if shutdown_flag.load(Ordering::Acquire) {
@@ -218,10 +224,7 @@ pub(crate) async fn handle_lab(
             break;
         }
 
-        // Adaptive backoff: double interval for each idle cycle, capped at max
-        let multiplier = 2u32.saturating_pow(consecutive_idle_cycles);
-        let current_interval =
-            std::cmp::min(base_interval.saturating_mul(multiplier), max_interval);
+        let current_interval = backoff_interval(consecutive_idle_cycles);
 
         tokio::select! {
             biased;
@@ -269,16 +272,13 @@ pub(crate) async fn handle_lab(
                     Ok(_) => {
                         let prev = current_interval.as_secs();
                         consecutive_idle_cycles = consecutive_idle_cycles.saturating_add(1);
-                        let next_multiplier = 2u32.saturating_pow(consecutive_idle_cycles);
-                        let next = std::cmp::min(
-                            base_interval.saturating_mul(next_multiplier),
-                            max_interval,
-                        );
+                        let next = backoff_interval(consecutive_idle_cycles);
                         log::debug!(
-                            "Lab poll interval: {}s → {}s (idle for {} cycles)",
+                            "Lab poll interval: {}s → {}s (idle for {} cycle{})",
                             prev,
                             next.as_secs(),
                             consecutive_idle_cycles,
+                            if consecutive_idle_cycles == 1 { "" } else { "s" },
                         );
                     }
                     Err(e) => {
