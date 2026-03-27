@@ -204,6 +204,11 @@ pub(crate) async fn handle_lab(
         log::warn!("   Continuing to poll...");
     }
 
+    // Adaptive backoff state
+    let base_interval = config.poll_interval();
+    let max_interval = config.poll_interval_max();
+    let mut consecutive_idle_cycles: u32 = 0;
+
     // Main polling loop
     loop {
         if shutdown_flag.load(Ordering::Acquire) {
@@ -213,6 +218,11 @@ pub(crate) async fn handle_lab(
             break;
         }
 
+        // Adaptive backoff: double interval for each idle cycle, capped at max
+        let multiplier = 2u32.saturating_pow(consecutive_idle_cycles);
+        let current_interval =
+            std::cmp::min(base_interval.saturating_mul(multiplier), max_interval);
+
         tokio::select! {
             biased;
             _ = shutdown_notify.notified() => {
@@ -220,15 +230,11 @@ pub(crate) async fn handle_lab(
                 // to the top-of-loop check which prints the message and breaks.
                 continue;
             }
-            _ = sleep(config.poll_interval()) => {
+            _ = sleep(current_interval) => {
                 // Clean up finished child processes and enqueue retries for failures
                 reap_children(&mut children, &mut retry_queue).await;
 
-                // Phase 2: Run poll_and_spawn with cooperative cancellation.
-                // Instead of racing the future against signals (which would hard-cancel
-                // it and could leave issue labels inconsistent mid-claim), we pass a
-                // shutdown flag that is checked between operations for a clean early exit.
-                if let Err(e) = poll_and_spawn(
+                match poll_and_spawn(
                     &config,
                     &mut children,
                     &mut retry_queue,
@@ -239,8 +245,43 @@ pub(crate) async fn handle_lab(
                 )
                 .await
                 {
-                    log::warn!("⚠️  Polling error: {:#}", e);
-                    log::warn!("   Continuing to poll...");
+                    Ok(result) if result.spawned > 0 => {
+                        let prev = current_interval.as_secs();
+                        consecutive_idle_cycles = 0;
+                        log::debug!(
+                            "Lab poll interval: {}s → {}s (activity detected, spawned {})",
+                            prev,
+                            base_interval.as_secs(),
+                            result.spawned,
+                        );
+                    }
+                    Ok(result) if result.slots_full => {
+                        // All slots occupied — don't back off since work may
+                        // finish soon and we want to pick up new issues promptly.
+                        log::debug!(
+                            "Lab poll interval: {}s (slots full, not backing off)",
+                            current_interval.as_secs(),
+                        );
+                    }
+                    Ok(_) => {
+                        let prev = current_interval.as_secs();
+                        consecutive_idle_cycles = consecutive_idle_cycles.saturating_add(1);
+                        let next_multiplier = 2u32.saturating_pow(consecutive_idle_cycles);
+                        let next = std::cmp::min(
+                            base_interval.saturating_mul(next_multiplier),
+                            max_interval,
+                        );
+                        log::debug!(
+                            "Lab poll interval: {}s → {}s (idle for {} cycles)",
+                            prev,
+                            next.as_secs(),
+                            consecutive_idle_cycles,
+                        );
+                    }
+                    Err(e) => {
+                        log::warn!("⚠️  Polling error: {:#}", e);
+                        log::warn!("   Continuing to poll...");
+                    }
                 }
 
                 // Log retry queue status when non-empty
@@ -1498,6 +1539,14 @@ async fn spawn_for_candidate_issues(
     Ok(spawned)
 }
 
+/// Result of a poll cycle.
+struct PollResult {
+    /// Number of Minions spawned or resumed.
+    spawned: usize,
+    /// True when no slots were available and issue polling was skipped.
+    slots_full: bool,
+}
+
 /// Poll GitHub for ready issues and spawn Minions if slots are available.
 ///
 /// Dispatch order: due retries (continuation first) → resumed minions → new issues.
@@ -1513,12 +1562,15 @@ async fn poll_and_spawn(
     resumed_this_session: &mut HashSet<String>,
     wake_check_times: &mut HashMap<String, DateTime<Utc>>,
     shutdown_flag: &AtomicBool,
-) -> Result<()> {
+) -> Result<PollResult> {
     // Prune stale registry entries (worktrees that no longer exist, checking PR status)
     prune_stale_entries().await?;
 
     if shutdown_flag.load(Ordering::Acquire) {
-        return Ok(());
+        return Ok(PollResult {
+            spawned: 0,
+            slots_full: false,
+        });
     }
 
     let max_attempts = config.daemon.max_resume_attempts;
@@ -1540,15 +1592,21 @@ async fn poll_and_spawn(
     }
 
     if shutdown_flag.load(Ordering::Acquire) {
-        return Ok(());
+        return Ok(PollResult {
+            spawned: 0,
+            slots_full: false,
+        });
     }
 
     // Calculate available slots using PID liveness (not registry status string)
     let mut available = available_slots(config.daemon.max_slots).await?;
 
     if available == 0 {
-        // All slots occupied, skip this poll
-        return Ok(());
+        // All slots occupied, skip issue polling
+        return Ok(PollResult {
+            spawned: 0,
+            slots_full: true,
+        });
     }
 
     // Dispatch due retries first (continuation retries get priority over failure retries)
@@ -1558,7 +1616,10 @@ async fn poll_and_spawn(
         if spawned > 0 {
             tprintln!();
         }
-        return Ok(());
+        return Ok(PollResult {
+            spawned,
+            slots_full: false,
+        });
     }
 
     // Resume interrupted minions, before claiming new issues
@@ -1577,14 +1638,20 @@ async fn poll_and_spawn(
     spawned += resumed;
 
     if shutdown_flag.load(Ordering::Acquire) {
-        return Ok(());
+        return Ok(PollResult {
+            spawned,
+            slots_full: false,
+        });
     }
 
     if available == 0 {
         if spawned > 0 {
             tprintln!();
         }
-        return Ok(());
+        return Ok(PollResult {
+            spawned,
+            slots_full: false,
+        });
     }
 
     // Poll each configured repository and spawn minions for ready issues
@@ -1601,7 +1668,10 @@ async fn poll_and_spawn(
         tprintln!();
     }
 
-    Ok(())
+    Ok(PollResult {
+        spawned,
+        slots_full: false,
+    })
 }
 
 /// Dispatch retry entries whose backoff has elapsed.

@@ -116,6 +116,10 @@ pub(crate) struct DaemonConfig {
     /// Maximum backoff delay in seconds for failure retries (default: 300 = 5 minutes).
     #[serde(default = "default_max_retry_backoff_secs")]
     pub(crate) max_retry_backoff_secs: u64,
+
+    /// Maximum poll interval in seconds for adaptive backoff (default: 300 = 5 minutes)
+    #[serde(default = "default_poll_interval_max")]
+    pub(crate) poll_interval_max_secs: u64,
 }
 
 impl Default for DaemonConfig {
@@ -128,6 +132,7 @@ impl Default for DaemonConfig {
             max_resume_attempts: default_max_resume_attempts(),
             max_retry_attempts: default_max_retry_attempts(),
             max_retry_backoff_secs: default_max_retry_backoff_secs(),
+            poll_interval_max_secs: default_poll_interval_max(),
         }
     }
 }
@@ -225,6 +230,10 @@ fn default_max_retry_attempts() -> u32 {
 }
 
 fn default_max_retry_backoff_secs() -> u64 {
+    300
+}
+
+fn default_poll_interval_max() -> u64 {
     300
 }
 
@@ -538,6 +547,14 @@ impl LabConfig {
             anyhow::bail!("poll_interval_secs must be at least 1");
         }
 
+        if self.daemon.poll_interval_max_secs < self.daemon.poll_interval_secs {
+            anyhow::bail!(
+                "poll_interval_max_secs ({}) must be >= poll_interval_secs ({})",
+                self.daemon.poll_interval_max_secs,
+                self.daemon.poll_interval_secs,
+            );
+        }
+
         if self.daemon.max_resume_attempts == 0 {
             anyhow::bail!("max_resume_attempts must be at least 1");
         }
@@ -604,6 +621,11 @@ impl LabConfig {
     /// Get poll interval as Duration
     pub(crate) fn poll_interval(&self) -> Duration {
         Duration::from_secs(self.daemon.poll_interval_secs)
+    }
+
+    /// Get maximum poll interval as Duration for adaptive backoff
+    pub fn poll_interval_max(&self) -> Duration {
+        Duration::from_secs(self.daemon.poll_interval_max_secs)
     }
 
     /// Merge with CLI overrides
