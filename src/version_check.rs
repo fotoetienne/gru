@@ -24,12 +24,13 @@ pub fn spawn_version_check() -> oneshot::Receiver<Option<String>> {
     rx
 }
 
-/// Prints a version notification if a newer version is available.
-/// Non-blocking: awaits the result from a previously spawned check.
-/// Silently does nothing if the check failed or no update is available.
-pub async fn print_if_newer(rx: oneshot::Receiver<Option<String>>) {
-    if let Ok(Some(msg)) = rx.await {
-        println!("{}", msg);
+/// Prints a version notification if one is already available, without waiting.
+/// Uses `try_recv` so the caller is never blocked — if the background check
+/// hasn't completed yet, the notification is silently skipped.
+/// Output goes to stderr so it doesn't interfere with stdout parsing/scripting.
+pub fn print_if_ready(rx: &mut oneshot::Receiver<Option<String>>) {
+    if let Ok(Some(msg)) = rx.try_recv() {
+        eprintln!("{}", msg);
     }
 }
 
@@ -161,8 +162,9 @@ mod tests {
 
     #[test]
     fn test_is_newer_current_is_prerelease() {
-        // Stable 0.2.0 is newer than pre-release 0.2.0-beta.1 (same base, but
-        // the stable release existing means an upgrade is available)
+        // Same base version after stripping pre-release suffix — not treated as newer.
+        // Conscious trade-off: a pre-release user won't be nagged to "upgrade" to the
+        // same base version; they'll get notified on the next actual bump.
         assert!(!is_newer("0.2.0", "0.2.0-beta.1"));
         // But a higher stable version is newer
         assert!(is_newer("0.3.0", "0.2.0-beta.1"));

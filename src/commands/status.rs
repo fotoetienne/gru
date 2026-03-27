@@ -142,7 +142,7 @@ pub(crate) async fn handle_status(
     show_all: bool,
 ) -> Result<i32> {
     // Spawn non-blocking version check in background (runs while we do real work)
-    let version_rx = crate::version_check::spawn_version_check();
+    let mut version_rx = crate::version_check::spawn_version_check();
 
     // Prune stale entries using the shared three-phase approach that checks
     // GitHub PR status before removing entries with open PRs.
@@ -287,9 +287,9 @@ pub(crate) async fn handle_status(
     .await
     .context("Failed to complete status checks for minions")?;
 
-    // Print version notification if a newer release is available.
-    // Done here (before early returns) so the notification is always shown.
-    crate::version_check::print_if_newer(version_rx).await;
+    // Print version notification if already available — never waits.
+    // Placed here (before early returns) so the notification is shown even with no minions.
+    crate::version_check::print_if_ready(&mut version_rx);
 
     // Filter by ID if provided
     if let Some(filter_id) = id {

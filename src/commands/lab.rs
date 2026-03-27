@@ -93,7 +93,7 @@ pub(crate) async fn handle_lab(
     let _tmux_guard = TmuxGuard::new("gru:lab");
 
     // Spawn non-blocking version check in background
-    let version_rx = crate::version_check::spawn_version_check();
+    let mut version_rx = crate::version_check::spawn_version_check();
 
     tprintln!("🚀 Starting Gru Lab daemon");
     tprintln!(
@@ -109,8 +109,8 @@ pub(crate) async fn handle_lab(
         tprintln!("  • {}", repo);
     }
 
-    // Print version notification if a newer release is available (non-blocking)
-    crate::version_check::print_if_newer(version_rx).await;
+    // Print version notification if already available — never waits.
+    crate::version_check::print_if_ready(&mut version_rx);
 
     tprintln!();
     tprintln!("Press Ctrl-C to stop...");
