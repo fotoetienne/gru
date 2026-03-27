@@ -537,16 +537,17 @@ pub(crate) struct CandidateIssue {
 /// Lower values are higher priority:
 ///   0 = critical, 1 = high, 2 = medium, 3 = unlabeled, 4 = low
 pub(crate) fn priority_sort_key(labels: &[IssueLabel]) -> u8 {
-    for label in labels {
-        match label.name.as_str() {
-            "priority:critical" => return 0,
-            "priority:high" => return 1,
-            "priority:medium" => return 2,
-            "priority:low" => return 4,
-            _ => {}
-        }
-    }
-    3 // unlabeled = neutral, between medium and low
+    labels
+        .iter()
+        .filter_map(|l| match l.name.as_str() {
+            "priority:critical" => Some(0u8),
+            "priority:high" => Some(1),
+            "priority:medium" => Some(2),
+            "priority:low" => Some(4),
+            _ => None,
+        })
+        .min()
+        .unwrap_or(3) // unlabeled = neutral, between medium and low
 }
 
 /// Fetch issue details using gh CLI
@@ -2187,11 +2188,11 @@ mod tests {
     }
 
     #[test]
-    fn test_priority_sort_key_first_priority_wins() {
-        // If multiple priority labels exist, the first one encountered wins
+    fn test_priority_sort_key_multiple_labels_highest_wins() {
+        // If multiple priority labels exist, the highest priority wins
         assert_eq!(
             priority_sort_key(&make_labels(&["priority:low", "priority:critical"])),
-            4
+            0
         );
     }
 
