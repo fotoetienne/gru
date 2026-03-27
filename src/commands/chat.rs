@@ -6,6 +6,7 @@ use tokio::process::Command;
 
 use crate::commands::child_process;
 use crate::git;
+use crate::tmux::TmuxGuard;
 
 /// Maximum bytes to read from CLAUDE.md. We read slightly more than the
 /// truncation limit so we can detect whether truncation is needed and still
@@ -29,6 +30,8 @@ pub(crate) async fn handle_chat(repo_flag: Option<String>, verbose: bool) -> Res
             (cwd, prompt)
         }
     };
+
+    let _tmux_guard = TmuxGuard::new("gru:chat");
 
     if verbose {
         eprintln!("Working directory: {}", work_dir.display());

@@ -4,6 +4,7 @@ use crate::agent_runner::{run_agent_with_stream_monitoring, EXIT_CODE_SIGNAL_TER
 use crate::git;
 use crate::github;
 use crate::minion_resolver;
+use crate::tmux::TmuxGuard;
 use anyhow::{Context, Result};
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
@@ -23,6 +24,8 @@ pub(crate) async fn handle_rebase(
     yes: bool,
     timeout: Option<&str>,
 ) -> Result<i32> {
+    let _tmux_guard = TmuxGuard::new("gru:rebase");
+
     let worktree_path = match target {
         Some(ref arg) => resolve_worktree_from_arg(arg).await?,
         None => resolve_worktree_from_cwd().await?,
