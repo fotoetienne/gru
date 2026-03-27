@@ -1573,6 +1573,13 @@ async fn poll_and_spawn(
     // Prune stale registry entries (worktrees that no longer exist, checking PR status)
     prune_stale_entries().await?;
 
+    // Auto-archive stopped Minions with no signal after TTL
+    if let Err(e) =
+        crate::minion_registry::auto_archive_stopped_minions(config.daemon.archive_ttl_hours).await
+    {
+        log::warn!("Failed to auto-archive stopped Minions: {:#}", e);
+    }
+
     if shutdown_flag.load(Ordering::Acquire) {
         return Ok(PollResult {
             spawned: 0,
