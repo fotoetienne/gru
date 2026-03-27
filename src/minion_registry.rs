@@ -421,8 +421,8 @@ pub(crate) struct MinionInfo {
     #[serde(default, deserialize_with = "deserialize_issue")]
     pub(crate) issue: Option<u64>,
     /// Command that started the Minion (e.g., "do", "review", "respond", "rebase").
-    /// See `resume::is_agent_only_command` — commands other than "do"/"fix" skip
-    /// post-agent orchestration (PR creation, monitoring) on resume.
+    /// See [`is_pr_monitoring_command`] — only "do"/"fix" have a PR monitoring
+    /// lifecycle; other commands skip post-agent orchestration on resume.
     pub(crate) command: String,
     /// The prompt that was given to the Minion
     pub(crate) prompt: String,
@@ -532,6 +532,16 @@ impl MinionInfo {
         self.pid_start_time = None;
     }
 
+    /// Returns `true` if this minion's command has a PR monitoring lifecycle
+    /// (i.e., it creates PRs and should be woken for reviews/conflicts).
+    ///
+    /// Only `"do"` and the legacy `"fix"` alias qualify. One-shot commands
+    /// like `"review"` and `"prompt"` exit immediately when resumed past the
+    /// agent phase.
+    pub(crate) fn has_pr_monitoring_lifecycle(&self) -> bool {
+        is_pr_monitoring_command(&self.command)
+    }
+
     /// Checks whether this minion's process is still alive, accounting for PID reuse.
     ///
     /// Returns `true` only if:
@@ -546,6 +556,16 @@ impl MinionInfo {
             None => false,
         }
     }
+}
+
+/// Returns `true` if the given command has a PR monitoring lifecycle
+/// (creates PRs and should be woken for reviews/conflicts).
+///
+/// Only `"do"` and the legacy `"fix"` alias qualify. One-shot commands
+/// like `"review"` and `"prompt"` exit immediately when resumed past the
+/// agent phase.
+pub(crate) fn is_pr_monitoring_command(command: &str) -> bool {
+    command == "do" || command == "fix"
 }
 
 /// Checks whether a process with the given PID is still alive.

@@ -573,7 +573,8 @@ const WAKE_COOLDOWN: Duration = Duration::from_secs(5 * 60);
 ///   already flipped to `MonitoringPr` will no longer match `== Completed`)
 /// - Have a PR number (no point polling if there's no PR)
 /// - Not exceed `max_attempts` (bounded autonomy)
-/// - Be a "do" or "fix" command (review/prompt minions are one-shot and lack a PR monitoring lifecycle)
+/// - Have a PR monitoring lifecycle (only "do"/"fix" commands; see `MinionInfo::has_pr_monitoring_lifecycle`)
+/// - Not be a `--no-watch` minion (fire-and-forget minions skip PR monitoring on resume)
 pub(crate) fn find_wake_candidates(
     minions: &[(String, MinionInfo)],
     max_attempts: u32,
@@ -584,7 +585,8 @@ pub(crate) fn find_wake_candidates(
             info.orchestration_phase == OrchestrationPhase::Completed
                 && info.pr.is_some()
                 && info.attempt_count < max_attempts
-                && (info.command == "do" || info.command == "fix")
+                && info.has_pr_monitoring_lifecycle()
+                && !info.no_watch
         })
         .map(|(id, _info)| id.clone())
         .collect()
@@ -2509,6 +2511,18 @@ mod tests {
         assert!(
             candidates.is_empty(),
             "Unknown commands must not be wake candidates until explicitly allowed"
+        );
+    }
+
+    #[test]
+    fn test_find_wake_candidates_skips_no_watch_minions() {
+        let mut info = make_completed_minion(Some("10"), 0);
+        info.no_watch = true;
+        let minions = vec![("M001".to_string(), info)];
+        let candidates = find_wake_candidates(&minions, 3);
+        assert!(
+            candidates.is_empty(),
+            "Fire-and-forget (--no-watch) minions must not be wake candidates"
         );
     }
 
