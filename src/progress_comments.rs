@@ -5,10 +5,10 @@ use chrono::{DateTime, Utc};
 /// All Minion posts (PR bodies, review replies, escalation comments) include a
 /// signature like `<sub>🤖 M001</sub>`. This prefix is used to distinguish
 /// Minion-authored reviews from human reviews on the same GitHub account.
-pub const MINION_SIGNATURE_PREFIX: &str = "<sub>🤖";
+pub(crate) const MINION_SIGNATURE_PREFIX: &str = "<sub>🤖";
 
 /// Returns true if the text contains a Minion signature.
-pub fn has_minion_signature(text: &str) -> bool {
+pub(crate) fn has_minion_signature(text: &str) -> bool {
     text.contains(MINION_SIGNATURE_PREFIX)
 }
 

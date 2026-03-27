@@ -27,6 +27,7 @@ struct PullRequest {
     state: String,
     merged: bool,
     head: Head,
+    #[allow(dead_code)] // deserialized from GitHub API; used in tests
     user: User,
     /// GitHub's mergeable field: true, false, or null (still computing).
     mergeable: Option<bool>,
@@ -408,11 +409,6 @@ pub(crate) async fn monitor_pr(
 
     let mut last_check_time = baseline.unwrap_or_else(Utc::now);
 
-    // Resolve the authenticated GitHub user once up front. This identity is
-    // stable for the lifetime of the process and is used to exclude the
-    // minion's own reviews from the feedback loop. See issue #701.
-    let gh_user = github::get_authenticated_user(host).await?;
-
     // Track merge-readiness state across polls to detect transitions.
     // Seed from the current label state so we don't add/remove on first poll.
     // Uses get_pr (which has retry logic) rather than a separate labels endpoint;
@@ -438,7 +434,7 @@ pub(crate) async fn monitor_pr(
 
         // Race the polling iteration against Ctrl+C
         tokio::select! {
-            result = poll_once(host, owner, repo, pr_number, &gh_user, &mut last_check_time, &mut was_ready) => {
+            result = poll_once(host, owner, repo, pr_number, &mut last_check_time, &mut was_ready) => {
                 if let Some(monitor_result) = result? {
                     return Ok((monitor_result, last_check_time));
                 }
@@ -494,9 +490,8 @@ pub(crate) fn determine_pr_terminal_state(state: &str, merged: bool) -> Option<M
     }
 }
 
-/// Filter reviews to only include those submitted at or after `since` by users
-/// other than the `excluded_user` (typically the authenticated GitHub user running
-/// gru, i.e. the minion identity).
+/// Filter reviews to only include those submitted at or after `since` by
+/// non-Minion authors.
 ///
 /// This excludes the minion's own reviews (to prevent feedback loops) and old
 /// reviews (already processed in a previous poll cycle). Uses inclusive `>=` so
@@ -530,7 +525,6 @@ async fn poll_once(
     owner: &str,
     repo: &str,
     pr_number: &str,
-    gh_user: &str,
     last_check_time: &mut DateTime<Utc>,
     was_ready: &mut bool,
 ) -> Result<Option<MonitorResult>> {
@@ -966,18 +960,17 @@ pub(crate) fn should_post_exit_notification(pr_open: bool, unaddressed_count: us
 /// Fetch just the fields needed for exit-notification decisions without
 /// exposing internal types to callers.
 ///
-/// Returns `(is_open, pr_author_login)`.
+/// Returns `true` if the PR is still open.
 pub(crate) async fn get_pr_info_for_exit_notification(
     host: &str,
     owner: &str,
     repo: &str,
     pr_number: &str,
-) -> Result<(bool, String)> {
+) -> Result<bool> {
     let pr = get_pr(host, owner, repo, pr_number).await?;
     // A merged PR has state="closed" AND merged=true. Check both to guard
     // against the narrow race where state hasn't propagated yet.
-    let is_open = pr.state != "closed" && !pr.merged;
-    Ok((is_open, pr.user.login))
+    Ok(pr.state != "closed" && !pr.merged)
 }
 
 /// Fetch PR info needed for the lab daemon's wake-up scan.
