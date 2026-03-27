@@ -2501,6 +2501,17 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_find_wake_candidates_skips_unknown_command() {
+        let info = make_completed_minion_with_command(Some("10"), 0, "respond");
+        let minions = vec![("M001".to_string(), info)];
+        let candidates = find_wake_candidates(&minions, 3);
+        assert!(
+            candidates.is_empty(),
+            "Unknown commands must not be wake candidates until explicitly allowed"
+        );
+    }
+
     // --- within_wake_cooldown tests ---
 
     #[test]
