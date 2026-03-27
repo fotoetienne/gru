@@ -159,12 +159,13 @@ fn current_window_id() -> Option<String> {
         return None;
     }
     let mut cmd = Command::new("tmux");
-    cmd.args(["display-message", "-p", "#{window_id}"]);
+    cmd.args(["display-message", "-p"]);
     if let Ok(pane) = std::env::var("TMUX_PANE") {
         if is_valid_tmux_pane(&pane) {
             cmd.args(["-t", &pane]);
         }
     }
+    cmd.arg("#{window_id}");
     let output = cmd.output().ok()?;
     if output.status.success() {
         let id = String::from_utf8_lossy(&output.stdout).trim().to_string();
