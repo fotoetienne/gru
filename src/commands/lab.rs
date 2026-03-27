@@ -573,6 +573,7 @@ const WAKE_COOLDOWN: Duration = Duration::from_secs(5 * 60);
 ///   already flipped to `MonitoringPr` will no longer match `== Completed`)
 /// - Have a PR number (no point polling if there's no PR)
 /// - Not exceed `max_attempts` (bounded autonomy)
+/// - Be a "do" or "fix" command (review/prompt minions are one-shot and lack a PR monitoring lifecycle)
 pub(crate) fn find_wake_candidates(
     minions: &[(String, MinionInfo)],
     max_attempts: u32,
@@ -583,6 +584,7 @@ pub(crate) fn find_wake_candidates(
             info.orchestration_phase == OrchestrationPhase::Completed
                 && info.pr.is_some()
                 && info.attempt_count < max_attempts
+                && (info.command == "do" || info.command == "fix")
         })
         .map(|(id, _info)| id.clone())
         .collect()
@@ -2376,12 +2378,20 @@ mod tests {
     // --- find_wake_candidates tests ---
 
     fn make_completed_minion(pr: Option<&str>, attempt_count: u32) -> MinionInfo {
+        make_completed_minion_with_command(pr, attempt_count, "do")
+    }
+
+    fn make_completed_minion_with_command(
+        pr: Option<&str>,
+        attempt_count: u32,
+        command: &str,
+    ) -> MinionInfo {
         use crate::minion_registry::{MinionMode, OrchestrationPhase};
         use std::path::PathBuf;
         MinionInfo {
             repo: "owner/repo".to_string(),
             issue: Some(42),
-            command: "do".to_string(),
+            command: command.to_string(),
             prompt: "test".to_string(),
             started_at: chrono::Utc::now(),
             branch: "minion/issue-42-M001".to_string(),
@@ -2455,6 +2465,40 @@ mod tests {
         let minions = vec![("M001".to_string(), info)];
         let candidates = find_wake_candidates(&minions, 3);
         assert_eq!(candidates, vec!["M001"]);
+    }
+
+    #[test]
+    fn test_find_wake_candidates_skips_review_minions() {
+        let info = make_completed_minion_with_command(Some("10"), 0, "review");
+        let minions = vec![("M001".to_string(), info)];
+        let candidates = find_wake_candidates(&minions, 3);
+        assert!(
+            candidates.is_empty(),
+            "Review minions are one-shot and must not be wake candidates"
+        );
+    }
+
+    #[test]
+    fn test_find_wake_candidates_skips_prompt_minions() {
+        let info = make_completed_minion_with_command(Some("10"), 0, "prompt");
+        let minions = vec![("M001".to_string(), info)];
+        let candidates = find_wake_candidates(&minions, 3);
+        assert!(
+            candidates.is_empty(),
+            "Prompt minions are one-shot and must not be wake candidates"
+        );
+    }
+
+    #[test]
+    fn test_find_wake_candidates_allows_fix_minions() {
+        let info = make_completed_minion_with_command(Some("10"), 0, "fix");
+        let minions = vec![("M001".to_string(), info)];
+        let candidates = find_wake_candidates(&minions, 3);
+        assert_eq!(
+            candidates,
+            vec!["M001"],
+            "Fix minions should be wake candidates"
+        );
     }
 
     // --- within_wake_cooldown tests ---
