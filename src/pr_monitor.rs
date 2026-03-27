@@ -17,6 +17,11 @@ async fn gh_api_with_retry(host: &str, args: &[&str], max_retries: u32) -> Resul
 }
 
 #[derive(Debug, Deserialize)]
+struct PrLabel {
+    name: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct PullRequest {
     state: String,
     merged: bool,
@@ -26,6 +31,16 @@ struct PullRequest {
     mergeable: Option<bool>,
     /// When the PR was created on GitHub.
     created_at: DateTime<Utc>,
+    /// Labels attached to this PR (included in GitHub's PR API response).
+    #[serde(default)]
+    labels: Vec<PrLabel>,
+}
+
+impl PullRequest {
+    /// Check whether the PR carries a label with the given name.
+    fn has_label(&self, name: &str) -> bool {
+        self.labels.iter().any(|l| l.name == name)
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -144,53 +159,6 @@ async fn ensure_label_exists(host: &str, owner: &str, repo: &str, label_name: &s
 /// Ensure the `gru:ready-to-merge` label exists in the repository, creating it if needed.
 pub(crate) async fn ensure_ready_to_merge_label(host: &str, owner: &str, repo: &str) -> Result<()> {
     ensure_label_exists(host, owner, repo, READY_TO_MERGE_LABEL).await
-}
-
-/// Check if a PR currently has a specific label.
-async fn has_label(
-    host: &str,
-    owner: &str,
-    repo: &str,
-    pr_number: &str,
-    label_name: &str,
-) -> Result<bool> {
-    let repo_full = github::repo_slug(owner, repo);
-    let endpoint = format!("repos/{repo_full}/issues/{pr_number}/labels");
-    let output = gh_api_with_retry(host, &["api", &endpoint], DEFAULT_MAX_RETRIES).await?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("Failed to fetch labels for PR #{}: {}", pr_number, stderr);
-    }
-
-    #[derive(Deserialize)]
-    struct Label {
-        name: String,
-    }
-
-    let fetched_labels: Vec<Label> =
-        serde_json::from_slice(&output.stdout).context("Failed to parse labels JSON")?;
-    Ok(fetched_labels.iter().any(|l| l.name == label_name))
-}
-
-/// Check if a PR currently has the `ready-to-merge` label.
-async fn has_ready_to_merge_label(
-    host: &str,
-    owner: &str,
-    repo: &str,
-    pr_number: &str,
-) -> Result<bool> {
-    has_label(host, owner, repo, pr_number, READY_TO_MERGE_LABEL).await
-}
-
-/// Check if a PR currently has the `gru:auto-merge` label.
-async fn has_auto_merge_label(
-    host: &str,
-    owner: &str,
-    repo: &str,
-    pr_number: &str,
-) -> Result<bool> {
-    has_label(host, owner, repo, pr_number, AUTO_MERGE_LABEL).await
 }
 
 /// Ensure the `gru:auto-merge` label exists in the repository, creating it if needed.
@@ -374,9 +342,11 @@ pub(crate) async fn monitor_pr(
 
     // Track merge-readiness state across polls to detect transitions.
     // Seed from the current label state so we don't add/remove on first poll.
-    let mut was_ready = has_ready_to_merge_label(host, owner, repo, pr_number)
-        .await
-        .unwrap_or(false);
+    // Uses get_pr (which has retry logic) rather than a separate labels endpoint;
+    // poll_once will re-fetch the PR on its first iteration, but the one-time
+    // startup cost is negligible compared to simplifying poll_once's interface.
+    let seed_pr = get_pr(host, owner, repo, pr_number).await?;
+    let mut was_ready = seed_pr.has_label(READY_TO_MERGE_LABEL);
 
     // Register the Ctrl+C listener once to avoid signal loss between iterations
     let ctrl_c = tokio::signal::ctrl_c();
@@ -529,20 +499,10 @@ async fn poll_once(
         .await
         .is_some()
     {
-        // PR is ready — check if gru:auto-merge label is present
-        match has_auto_merge_label(host, owner, repo, pr_number).await {
-            Ok(true) => {
-                *last_check_time = Utc::now();
-                return Ok(Some(MonitorResult::ReadyToMerge));
-            }
-            Ok(false) => {}
-            Err(e) => {
-                log::warn!(
-                    "Failed to check gru:auto-merge label on PR #{}: {}",
-                    pr_number,
-                    e
-                );
-            }
+        // PR is ready — check if gru:auto-merge label is present (from PR data already fetched)
+        if pr.has_label(AUTO_MERGE_LABEL) {
+            *last_check_time = Utc::now();
+            return Ok(Some(MonitorResult::ReadyToMerge));
         }
     }
 
@@ -892,6 +852,30 @@ pub(crate) async fn get_pr_created_at(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_pull_request_has_label() {
+        let json = r#"{
+            "state": "open", "merged": false,
+            "head": {"sha": "abc123"}, "user": {"login": "octocat"},
+            "labels": [{"name": "gru:auto-merge"}, {"name": "bug"}]
+        }"#;
+        let pr: PullRequest = serde_json::from_str(json).unwrap();
+        assert!(pr.has_label("gru:auto-merge"));
+        assert!(pr.has_label("bug"));
+        assert!(!pr.has_label("gru:ready-to-merge"));
+    }
+
+    #[test]
+    fn test_pull_request_labels_default_empty() {
+        let json = r#"{
+            "state": "open", "merged": false,
+            "head": {"sha": "abc123"}, "user": {"login": "octocat"}
+        }"#;
+        let pr: PullRequest = serde_json::from_str(json).unwrap();
+        assert!(pr.labels.is_empty());
+        assert!(!pr.has_label("anything"));
+    }
 
     #[test]
     fn test_format_review_prompt_single_comment() {
