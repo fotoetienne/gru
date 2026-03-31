@@ -327,6 +327,130 @@ pub async fn auto_archive_completed_minions() -> Result<usize> {
     Ok(count)
 }
 
+/// Data collected in Phase 1 for a TTL archive candidate.
+struct TtlArchiveCandidate {
+    id: String,
+    repo: String,
+    issue: Option<u64>,
+    last_activity: DateTime<Utc>,
+}
+
+/// Auto-archive stopped Minions once there is no remaining actionable signal on GitHub.
+///
+/// This is a fallback for Minions not covered by [`auto_archive_completed_minions`]:
+/// prompt-mode Minions (no issue, no PR), failed `gru do` runs (no PR created),
+/// and Minions on ephemeral branches.
+///
+/// Uses the same three-phase approach as [`prune_stale_entries`]:
+///
+/// 1. **Phase 1 (sync):** Collect stopped, non-archived Minions with no PR.
+/// 2. **Phase 2 (async):** For candidates with an associated issue, check if the
+///    issue is closed — if so, mark it for immediate archiving (issue-closed fast
+///    path). Otherwise, apply the TTL-based fallback using `last_activity`.
+/// 3. **Phase 3 (sync):** Re-acquire lock and stamp `archived_at` on qualifying
+///    entries, whether selected via the issue-closed fast path or via TTL.
+///
+/// Returns the number of Minions archived.
+pub async fn auto_archive_stopped_minions(ttl_hours: u64) -> Result<usize> {
+    // TTL=0 disables archiving entirely
+    if ttl_hours == 0 {
+        return Ok(0);
+    }
+    // Clamp to avoid overflow when casting u64 → i64 for chrono::Duration
+    let clamped = ttl_hours.min(i64::MAX as u64);
+    let ttl = chrono::Duration::hours(clamped as i64);
+
+    // Phase 1: Collect candidates — stopped, non-archived, no PR (sync, lock held briefly)
+    let candidates: Vec<TtlArchiveCandidate> = with_registry(|registry| {
+        let minions = registry.list();
+        let candidates = minions
+            .iter()
+            .filter(|(_id, info)| {
+                info.mode == MinionMode::Stopped && info.archived_at.is_none() && info.pr.is_none()
+            })
+            .map(|(id, info)| TtlArchiveCandidate {
+                id: id.clone(),
+                repo: info.repo.clone(),
+                issue: info.issue,
+                last_activity: info.last_activity,
+            })
+            .collect();
+        Ok(candidates)
+    })
+    .await?;
+
+    if candidates.is_empty() {
+        return Ok(0);
+    }
+
+    // Phase 2: Determine which candidates should be archived (async, no lock)
+    let now = Utc::now();
+    let mut to_archive = Vec::new();
+    for candidate in &candidates {
+        // For candidates with an issue, check if the issue is closed
+        if let Some(issue_num) = candidate.issue {
+            let parts: Vec<&str> = candidate.repo.splitn(2, '/').collect();
+            if parts.len() == 2 {
+                let (owner, repo_name) = (parts[0], parts[1]);
+                let host = infer_github_host(owner, None);
+                match is_issue_closed_via_cli(owner, repo_name, &host, issue_num).await {
+                    Ok(true) => {
+                        // Issue is closed — archive immediately (definitive signal)
+                        to_archive.push(candidate.id.clone());
+                        continue;
+                    }
+                    Ok(false) => {
+                        // Issue still open — fall through to TTL check
+                    }
+                    Err(e) => {
+                        // API error — be conservative, fall through to TTL check
+                        log::warn!(
+                            "Failed to check issue #{} status for {}: {}",
+                            issue_num,
+                            candidate.id,
+                            e
+                        );
+                    }
+                }
+            } else {
+                log::warn!(
+                    "Minion {} has malformed repo '{}', skipping issue check",
+                    candidate.id,
+                    candidate.repo
+                );
+            }
+        }
+
+        // TTL check: archive if stopped longer than the configured TTL
+        let age = now.signed_duration_since(candidate.last_activity);
+        if age >= ttl {
+            to_archive.push(candidate.id.clone());
+        }
+    }
+
+    if to_archive.is_empty() {
+        return Ok(0);
+    }
+
+    // Phase 3: Stamp archived_at on qualifying entries (sync, lock held briefly).
+    // Re-filter: a minion may have gained a PR between Phase 1 and now.
+    let archive_now = Utc::now();
+    let count = with_registry(move |registry| {
+        let still_eligible: Vec<String> = to_archive
+            .into_iter()
+            .filter(|id| registry.get(id).is_some_and(|info| info.pr.is_none()))
+            .collect();
+        registry.archive_batch(&still_eligible, archive_now)
+    })
+    .await?;
+
+    if count > 0 {
+        log::info!("📦 Auto-archived {} stopped Minion(s) (TTL)", count);
+    }
+
+    Ok(count)
+}
+
 /// The execution mode of a Minion session
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
@@ -490,7 +614,7 @@ pub(crate) struct MinionInfo {
     /// would take effect for any non-MonitoringPr resume that happens to have wake_reason set.
     #[serde(default)]
     pub(crate) wake_reason: Option<String>,
-    /// Timestamp when this minion was auto-archived (PR merged or issue closed while stopped).
+    /// Timestamp when this minion was auto-archived (PR merged, issue closed, or TTL expired).
     /// Archived minions are hidden from `gru status` by default; use `--all` to show them.
     #[serde(default)]
     pub(crate) archived_at: Option<DateTime<Utc>>,
@@ -1919,5 +2043,85 @@ mod tests {
         // Calling again should be a no-op (already archived)
         let count2 = registry.archive_batch(&ids, now).unwrap();
         assert_eq!(count2, 0);
+    }
+
+    #[test]
+    fn test_archived_at_defaults_to_none() {
+        let info = test_minion_info();
+        assert!(info.archived_at.is_none());
+    }
+
+    #[test]
+    fn test_archived_at_persisted() {
+        let temp_dir = tempdir().unwrap();
+        let archived_time = Utc::now();
+
+        let info = MinionInfo {
+            archived_at: Some(archived_time),
+            ..test_minion_info()
+        };
+
+        {
+            let mut registry = MinionRegistry::load(Some(temp_dir.path())).unwrap();
+            registry.register("M001".to_string(), info).unwrap();
+        }
+
+        // Reload and verify
+        {
+            let registry = MinionRegistry::load(Some(temp_dir.path())).unwrap();
+            let retrieved = registry.get("M001").unwrap();
+            assert_eq!(retrieved.archived_at.unwrap(), archived_time);
+        }
+    }
+
+    #[test]
+    fn test_archived_at_backwards_compat() {
+        let temp_dir = tempdir().unwrap();
+        let registry_path = temp_dir.path().join("minions.json");
+
+        // Write a registry JSON without archived_at (simulating old format)
+        let old_json = r#"{
+            "minions": {
+                "M001": {
+                    "repo": "owner/repo",
+                    "issue": 42,
+                    "command": "do",
+                    "prompt": "Fix issue",
+                    "started_at": "2024-01-01T00:00:00Z",
+                    "branch": "minion/issue-42-M001",
+                    "worktree": "/tmp/test",
+                    "status": "active",
+                    "session_id": "abc-123",
+                    "mode": "stopped"
+                }
+            }
+        }"#;
+        fs::write(&registry_path, old_json).unwrap();
+
+        let registry = MinionRegistry::load(Some(temp_dir.path())).unwrap();
+        let info = registry.get("M001").unwrap();
+        assert!(info.archived_at.is_none());
+    }
+
+    #[test]
+    fn test_archived_at_set_via_update() {
+        let temp_dir = tempdir().unwrap();
+        let mut registry = MinionRegistry::load(Some(temp_dir.path())).unwrap();
+
+        let info = MinionInfo {
+            mode: MinionMode::Stopped,
+            ..test_minion_info()
+        };
+        registry.register("M001".to_string(), info).unwrap();
+
+        // Archive the minion
+        registry
+            .update("M001", |info| {
+                info.archived_at = Some(Utc::now());
+            })
+            .unwrap();
+
+        let updated = registry.get("M001").unwrap();
+        assert!(updated.archived_at.is_some());
     }
 }

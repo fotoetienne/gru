@@ -120,6 +120,12 @@ pub(crate) struct DaemonConfig {
     /// Maximum poll interval in seconds for adaptive backoff (default: 300 = 5 minutes)
     #[serde(default = "default_poll_interval_max")]
     pub(crate) poll_interval_max_secs: u64,
+
+    /// Hours before a stopped Minion with no archivable signal is auto-archived (default: 24).
+    /// Applies to stopped Minions that have no PR and whose issue is still open (or has no issue).
+    /// Set to 0 to disable TTL-based archiving.
+    #[serde(default = "default_archive_ttl_hours")]
+    pub(crate) archive_ttl_hours: u64,
 }
 
 impl Default for DaemonConfig {
@@ -133,6 +139,7 @@ impl Default for DaemonConfig {
             max_retry_attempts: default_max_retry_attempts(),
             max_retry_backoff_secs: default_max_retry_backoff_secs(),
             poll_interval_max_secs: default_poll_interval_max(),
+            archive_ttl_hours: default_archive_ttl_hours(),
         }
     }
 }
@@ -235,6 +242,13 @@ fn default_max_retry_backoff_secs() -> u64 {
 
 fn default_poll_interval_max() -> u64 {
     300
+}
+
+/// Default TTL (in hours) before a stopped Minion with no signal is auto-archived.
+pub(crate) const DEFAULT_ARCHIVE_TTL_HOURS: u64 = 24;
+
+fn default_archive_ttl_hours() -> u64 {
+    DEFAULT_ARCHIVE_TTL_HOURS
 }
 
 /// Parse a repo entry from the config into `(host, owner, repo)`.
@@ -378,6 +392,9 @@ impl LabConfig {
 #
 # # Maximum resume attempts before marking a Minion as failed (default: 3)
 # max_resume_attempts = 3
+#
+# # Hours before a stopped Minion with no signal is auto-archived (default: 24)
+# archive_ttl_hours = 24
 
 # [agent]
 # # Which agent backend to use (default: "claude")
@@ -700,6 +717,7 @@ repos = ["owner/repo"]
         assert_eq!(config.daemon.max_slots, 2);
         assert_eq!(config.daemon.label, "gru:todo");
         assert_eq!(config.daemon.max_resume_attempts, 3);
+        assert_eq!(config.daemon.archive_ttl_hours, 24);
     }
 
     #[test]
@@ -715,6 +733,40 @@ max_resume_attempts = 5
 
         let config = LabConfig::load(temp_file.path()).unwrap();
         assert_eq!(config.daemon.max_resume_attempts, 5);
+    }
+
+    #[test]
+    fn test_default_archive_ttl_hours_constant() {
+        assert_eq!(DEFAULT_ARCHIVE_TTL_HOURS, 24);
+    }
+
+    #[test]
+    fn test_archive_ttl_hours_default() {
+        let config_toml = r#"
+[daemon]
+repos = ["owner/repo"]
+"#;
+        let mut temp_file = NamedTempFile::new().unwrap();
+        temp_file.write_all(config_toml.as_bytes()).unwrap();
+        temp_file.flush().unwrap();
+
+        let config = LabConfig::load(temp_file.path()).unwrap();
+        assert_eq!(config.daemon.archive_ttl_hours, 24);
+    }
+
+    #[test]
+    fn test_archive_ttl_hours_custom() {
+        let config_toml = r#"
+[daemon]
+repos = ["owner/repo"]
+archive_ttl_hours = 48
+"#;
+        let mut temp_file = NamedTempFile::new().unwrap();
+        temp_file.write_all(config_toml.as_bytes()).unwrap();
+        temp_file.flush().unwrap();
+
+        let config = LabConfig::load(temp_file.path()).unwrap();
+        assert_eq!(config.daemon.archive_ttl_hours, 48);
     }
 
     #[test]
