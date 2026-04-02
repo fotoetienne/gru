@@ -55,11 +55,13 @@ Your token needs the following scopes:
 
 If you authenticate interactively with `gh auth login`, the default scopes are usually sufficient. If you're using a personal access token, make sure it includes the scopes above.
 
-To check your token's scopes:
+To inspect your token (for manual scope verification against your GHES settings):
 
 ```bash
 gh auth status --hostname ghe.example.com --show-token
 ```
+
+This prints the token value. To check which scopes it has, paste it into your GHES Settings → Developer settings → Personal access tokens.
 
 ## Step 2: Configure `~/.gru/config.toml`
 
@@ -104,17 +106,19 @@ This tells Gru that `myteam/myapp` lives on the host defined in `[github_hosts.n
 |--------|---------|-------------|
 | `owner/repo` | `myorg/app` | `github.com/myorg/app` |
 | `name:owner/repo` | `netflix:myteam/myapp` | Uses `[github_hosts.netflix]` |
-| `host/owner/repo` | `ghe.example.com/org/svc` | Legacy explicit-host format |
+| `host/owner/repo` | `ghe.example.com/org/svc` | Legacy — use `name:owner/repo` instead |
 
 The `name:owner/repo` format is recommended for GHES.
 
 ## Step 4: Initialize and run
 
-Initialize your GHES repo using `--host` to specify the GHES hostname:
+Initialize your GHES repo. If you're passing `owner/repo` explicitly, use `--host`:
 
 ```bash
 gru init myteam/myapp --host github.netflix.com
 ```
+
+Alternatively, if you run `gru init` from inside an already-cloned GHES repository, Gru can infer the host from the git remote automatically — no `--host` flag needed in that case.
 
 Then use Gru normally:
 
@@ -191,14 +195,22 @@ Or generate a new personal access token in your GHES settings with the scopes li
 
 ### SSL/TLS certificate errors
 
-If your GHES instance uses a self-signed or internal CA certificate:
+If your GHES instance uses a self-signed or internal CA certificate, the most reliable fix is to add the certificate to your system trust store. The `gh` CLI uses Go's standard TLS stack, which defers to the OS trust store.
+
+On macOS:
 
 ```bash
-# Tell gh to trust your corporate CA bundle
-export GH_CACERT=/path/to/ca-bundle.crt
+sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain /path/to/ca-cert.crt
 ```
 
-Or configure git:
+On Linux (Debian/Ubuntu):
+
+```bash
+sudo cp /path/to/ca-cert.crt /usr/local/share/ca-certificates/
+sudo update-ca-certificates
+```
+
+For git operations only (does not affect `gh` API calls):
 
 ```bash
 git config --global http.https://ghe.example.com/.sslCAInfo /path/to/ca-bundle.crt
