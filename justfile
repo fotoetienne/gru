@@ -65,6 +65,18 @@ changelog:
 changelog-preview:
     git-cliff --github-repo fotoetienne/gru
 
+# Tag and push a release (usage: just release 0.2.0)
+release version:
+    @echo "Releasing v{{version}}..."
+    @grep -q 'version = "{{version}}"' Cargo.toml || (echo "ERROR: Cargo.toml version doesn't match {{version}}" && exit 1)
+    cargo check
+    GITHUB_TOKEN=$(gh auth token) git-cliff --github-repo fotoetienne/gru --tag v{{version}} -o CHANGELOG.md
+    git add Cargo.toml Cargo.lock CHANGELOG.md
+    git commit -m "Release v{{version}}"
+    git tag v{{version}}
+    git push origin main --tags
+    @echo "✓ v{{version}} tagged and pushed — release workflow will build binaries"
+
 # Show project information
 info:
     @echo "Gru - Local-First LLM Agent Orchestrator"
