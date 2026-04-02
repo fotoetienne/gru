@@ -11,7 +11,7 @@ Complete the basic [Getting Started](GETTING_STARTED.md) prerequisites first (Ru
 Gru delegates all GitHub API calls to the `gh` CLI, so you need `gh` authenticated against your GHES instance.
 
 ```bash
-gh auth login --hostname ghe.example.com
+gh auth login --hostname github.netflix.com
 ```
 
 Follow the prompts to authenticate. When asked about protocol, HTTPS is recommended for GHES.
@@ -19,14 +19,14 @@ Follow the prompts to authenticate. When asked about protocol, HTTPS is recommen
 Verify it worked:
 
 ```bash
-gh auth status --hostname ghe.example.com
+gh auth status --hostname github.netflix.com
 ```
 
 You should see output like:
 
 ```
-ghe.example.com
-  ✓ Logged in to ghe.example.com account yourname
+github.netflix.com
+  ✓ Logged in to github.netflix.com account yourname
 ```
 
 ### Multi-host authentication
@@ -36,7 +36,7 @@ The `gh` CLI supports being logged into multiple hosts simultaneously. If you us
 ```bash
 # Authenticate to both
 gh auth login                                  # github.com
-gh auth login --hostname ghe.example.com       # GHES
+gh auth login --hostname github.netflix.com       # GHES
 
 # Verify both
 gh auth status
@@ -55,13 +55,13 @@ Your token needs the following scopes:
 
 If you authenticate interactively with `gh auth login`, the default scopes are usually sufficient. If you're using a personal access token, make sure it includes the scopes above.
 
-To inspect your token (for manual scope verification against your GHES settings):
+To verify your token's scopes without exposing the token value, use the GitHub API — the response headers include `X-OAuth-Scopes`:
 
 ```bash
-gh auth status --hostname ghe.example.com --show-token
+gh api --hostname github.netflix.com /user --include 2>&1 | grep -i x-oauth-scopes
 ```
 
-This prints the token value. To check which scopes it has, paste it into your GHES Settings → Developer settings → Personal access tokens.
+Alternatively, navigate to your GHES instance → Settings → Developer settings → Personal access tokens to view scopes in the UI.
 
 ## Step 2: Configure `~/.gru/config.toml`
 
@@ -106,7 +106,7 @@ This tells Gru that `myteam/myapp` lives on the host defined in `[github_hosts.n
 |--------|---------|-------------|
 | `owner/repo` | `myorg/app` | `github.com/myorg/app` |
 | `name:owner/repo` | `netflix:myteam/myapp` | Uses `[github_hosts.netflix]` |
-| `host/owner/repo` | `ghe.example.com/org/svc` | Legacy — use `name:owner/repo` instead |
+| `host/owner/repo` | `github.netflix.com/org/svc` | Legacy — use `name:owner/repo` instead |
 
 The `name:owner/repo` format is recommended for GHES.
 
@@ -163,11 +163,11 @@ See [config.example.toml](config.example.toml) for all available options with ex
 ### `gh auth status` fails for GHES host
 
 ```
-ghe.example.com
-  X Not logged in to ghe.example.com
+github.netflix.com
+  X Not logged in to github.netflix.com
 ```
 
-**Fix:** Run `gh auth login --hostname ghe.example.com` and authenticate.
+**Fix:** Run `gh auth login --hostname github.netflix.com` and authenticate.
 
 ### "Unknown host name" error
 
@@ -188,7 +188,7 @@ host = "github.netflix.com"
 Your token likely lacks required scopes. Re-authenticate with appropriate scopes:
 
 ```bash
-gh auth login --hostname ghe.example.com --scopes repo,read:org
+gh auth login --hostname github.netflix.com --scopes repo,read:org
 ```
 
 Or generate a new personal access token in your GHES settings with the scopes listed in [Step 1](#token-scope-requirements).
@@ -213,7 +213,7 @@ sudo update-ca-certificates
 For git operations only (does not affect `gh` API calls):
 
 ```bash
-git config --global http.https://ghe.example.com/.sslCAInfo /path/to/ca-bundle.crt
+git config --global http.https://github.netflix.com/.sslCAInfo /path/to/ca-bundle.crt
 ```
 
 ### `gru init` hangs or times out
@@ -221,7 +221,7 @@ git config --global http.https://ghe.example.com/.sslCAInfo /path/to/ca-bundle.c
 Check network connectivity to your GHES host:
 
 ```bash
-gh api --hostname ghe.example.com /meta
+gh api --hostname github.netflix.com /meta
 ```
 
 If this fails, the issue is network-level (VPN, firewall, DNS).
@@ -231,7 +231,7 @@ If this fails, the issue is network-level (VPN, firewall, DNS).
 Verify your token has `repo` scope and that you have write access to the repository:
 
 ```bash
-gh api --hostname ghe.example.com repos/myteam/myapp
+gh api --hostname github.netflix.com repos/myteam/myapp
 ```
 
 If you get a 404, you either don't have access or the repo path is wrong.
