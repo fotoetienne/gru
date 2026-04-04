@@ -9,19 +9,22 @@ Gru uses [Semantic Versioning](https://semver.org/) with a `0.x.y` scheme until 
 
 ## Prerequisites
 
-Install git-cliff for changelog generation:
+- [GitHub CLI](https://cli.github.com/) (`gh`), authenticated — used for changelog generation
+- [git-cliff](https://git-cliff.org/) — `cargo install git-cliff`
+
+Alternatively, set `GITHUB_TOKEN` manually instead of using `gh`.
+
+## Quick Release
+
+Bump the version in `Cargo.toml`, then:
 
 ```bash
-cargo install git-cliff
+just release 0.2.0
 ```
 
-Set a GitHub token for PR metadata lookups (avoids rate limiting):
+This runs `cargo check`, generates the changelog, commits, tags, and pushes. The CI workflow builds binaries and creates the GitHub Release automatically.
 
-```bash
-export GITHUB_TOKEN=$(gh auth token)
-```
-
-## Release Steps
+## Manual Steps (if you prefer)
 
 1. **Bump version** in `Cargo.toml`:
    ```toml
@@ -35,7 +38,7 @@ export GITHUB_TOKEN=$(gh auth token)
 
 3. **Generate the changelog** (use `--tag` so git-cliff knows the version before tagging):
    ```bash
-   git-cliff --github-repo fotoetienne/gru --tag v0.2.0 -o CHANGELOG.md
+   GITHUB_TOKEN=$(gh auth token) git-cliff --github-repo fotoetienne/gru --tag v0.2.0 -o CHANGELOG.md
    ```
    Review the output in `CHANGELOG.md` and edit if needed.
 
@@ -65,6 +68,6 @@ gru --version
 # => gru 0.2.0 (abc1234)
 ```
 
-## Future Automation
+## What Happens on Push
 
-GitHub Actions will automate binary builds on tag push (see #524).
+The `release.yml` workflow automatically builds binaries for macOS (ARM, x86) and Linux (x86), generates checksums, and creates a GitHub Release with all artifacts attached.
