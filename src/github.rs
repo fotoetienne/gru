@@ -758,6 +758,8 @@ pub async fn is_issue_closed_via_cli(
             "state",
             "--jq",
             ".state",
+            "--cache",
+            "300s",
         ],
     )
     .await?;
@@ -796,6 +798,8 @@ pub async fn is_pr_merged_via_cli(
             "state",
             "--jq",
             ".state",
+            "--cache",
+            "300s",
         ],
     )
     .await?;
