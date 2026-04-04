@@ -681,98 +681,53 @@ pub(crate) fn check_issue_eligibility(
     (true, None)
 }
 
-/// Fetch the state of a GitHub issue or PR via the `gh` CLI.
+/// Check if a GitHub issue is closed.
 ///
-/// # Arguments
-/// * `host` - GitHub hostname
-/// * `owner` - Repository owner
-/// * `repo` - Repository name
-/// * `kind` - Item kind: `"issue"` or `"pr"`
-/// * `number` - Issue or PR number
-///
-/// # Returns
-/// The state string (e.g., `"OPEN"`, `"CLOSED"`, `"MERGED"`) or an error
-/// if the API call fails or returns an empty state.
-pub(crate) async fn get_item_state_via_cli(
-    host: &str,
-    owner: &str,
-    repo: &str,
-    kind: &str,
-    number: u64,
-) -> Result<String> {
-    let repo_full = repo_slug(owner, repo);
-    let number_str = number.to_string();
-    let stdout = run_gh(
-        host,
-        &[
-            kind,
-            "view",
-            &number_str,
-            "--repo",
-            &repo_full,
-            "--json",
-            "state",
-            "--jq",
-            ".state",
-        ],
-    )
-    .await?;
-
-    let state = stdout.trim().to_string();
-    if state.is_empty() {
-        return Err(anyhow!(
-            "gh {} view returned empty state for #{} in {}/{}",
-            kind,
-            number,
-            owner,
-            repo
-        ));
-    }
-    Ok(state)
-}
-
-/// Check if a GitHub issue is closed (or has a merged/closed PR).
-///
-/// Returns `true` if the issue state is `CLOSED` (the GraphQL enum value
-/// returned by `gh issue view --json state`).
-/// Returns `Ok(false)` if the state is empty (preserving pre-existing behavior).
+/// Returns `true` if the issue state is `"closed"` (the REST API value).
 pub async fn is_issue_closed_via_cli(
     owner: &str,
     repo: &str,
     host: &str,
     number: u64,
 ) -> Result<bool> {
-    // Use run_gh directly (not get_item_state_via_cli) to preserve the original
-    // behavior of returning Ok(false) on empty state rather than Err.
-    let repo_full = repo_slug(owner, repo);
-    let number_str = number.to_string();
+    let endpoint = format!("repos/{owner}/{repo}/issues/{number}");
     let stdout = run_gh(
         host,
-        &[
-            "issue",
-            "view",
-            &number_str,
-            "--repo",
-            &repo_full,
-            "--json",
-            "state",
-            "--jq",
-            ".state",
-            "--cache",
-            "300s",
-        ],
+        &["api", &endpoint, "--cache", "300s", "--jq", ".state"],
     )
     .await?;
 
-    Ok(stdout.trim() == "CLOSED")
+    let state = stdout.trim().to_string();
+    Ok(state == "closed")
 }
 
 /// Check whether a PR is still open (i.e., not merged or closed).
 ///
-/// Returns `true` if the PR state is "OPEN", `false` otherwise.
+/// Returns `true` if the PR state is `"open"` (the REST API value), `false` otherwise.
+///
+/// # Arguments
+/// * `owner` - Repository owner (user or organization)
+/// * `repo` - Repository name
+/// * `host` - GitHub hostname
+/// * `number` - PR number
 pub async fn is_pr_open_via_cli(owner: &str, repo: &str, host: &str, number: u64) -> Result<bool> {
-    let state = get_item_state_via_cli(host, owner, repo, "pr", number).await?;
-    Ok(state == "OPEN")
+    let endpoint = format!("repos/{owner}/{repo}/pulls/{number}");
+    let stdout = run_gh(
+        host,
+        &["api", &endpoint, "--cache", "300s", "--jq", ".state"],
+    )
+    .await?;
+
+    let state = stdout.trim().to_string();
+    if state.is_empty() {
+        return Err(anyhow!(
+            "gh api returned empty state for PR #{} in {}/{}",
+            number,
+            owner,
+            repo
+        ));
+    }
+    Ok(state == "open")
 }
 
 /// Check whether a PR has been merged.
@@ -798,8 +753,6 @@ pub async fn is_pr_merged_via_cli(
             "state",
             "--jq",
             ".state",
-            "--cache",
-            "300s",
         ],
     )
     .await?;
