@@ -846,18 +846,24 @@ async fn handle_failed_checks(
         Ok(false) => {
             state.ci_escalated = true;
             state.issue_was_blocked = true;
-            super::helpers::try_mark_issue_blocked(
-                &ctx.issue_ctx.host,
-                &ctx.issue_ctx.owner,
-                &ctx.issue_ctx.repo,
-                ctx.issue_ctx.issue_num,
-                &format!(
-                    "CI auto-fix failed after {} attempts. See PR #{} for details. Human intervention required.",
-                    ci::MAX_CI_FIX_ATTEMPTS,
-                    ctx.pr_number
-                ),
-            )
-            .await;
+            // Note: on minion restart ci_escalated starts false, so this arm
+            // may run again. The label application is idempotent; a second
+            // comment is an acceptable trade-off until escalation state is
+            // persisted in the registry.
+            if let Some(issue_num) = ctx.issue_ctx.issue_num {
+                super::helpers::try_mark_issue_blocked(
+                    &ctx.issue_ctx.host,
+                    &ctx.issue_ctx.owner,
+                    &ctx.issue_ctx.repo,
+                    issue_num,
+                    &format!(
+                        "CI auto-fix failed after {} attempts. See PR #{} for details. Human intervention required.",
+                        ci::MAX_CI_FIX_ATTEMPTS,
+                        ctx.pr_number
+                    ),
+                )
+                .await;
+            }
             println!("⚠️  CI auto-fix escalated to human after max attempts");
             println!(
                 "   Review the checks at: https://github.com/{}/{}/pull/{}/checks",

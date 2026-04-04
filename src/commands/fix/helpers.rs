@@ -138,6 +138,9 @@ pub(super) async fn try_post_progress_comment(
 
 #[cfg(test)]
 mod tests {
+    // These tests verify the shape of comment messages produced at each call site.
+    // They are format-string snapshot tests, not behavioral tests of the async helpers.
+
     #[test]
     fn test_blocked_reason_timeout_contains_minion_id() {
         let minion_id = "M042";

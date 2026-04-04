@@ -265,7 +265,7 @@ pub(crate) async fn monitor_pr_phase(
                         &issue_ctx.owner,
                         &issue_ctx.repo,
                         issue_num,
-                        "CI checks failed. Human intervention required.",
+                        "CI checks failed and could not be auto-fixed. Human intervention required.",
                     )
                     .await;
                 }
