@@ -634,17 +634,19 @@ async fn handle_ready_to_merge(
                 )
                 .await;
                 // Also post an explanatory comment on the issue.
-                super::helpers::try_post_issue_comment(
-                    &ctx.issue_ctx.host,
-                    &ctx.issue_ctx.owner,
-                    &ctx.issue_ctx.repo,
-                    ctx.issue_ctx.issue_num,
-                    &format!(
-                        "Merge judge escalated PR #{} for human review. See PR for details.",
-                        ctx.pr_number
-                    ),
-                )
-                .await;
+                if let Some(issue_num) = ctx.issue_ctx.issue_num {
+                    super::helpers::try_post_issue_comment(
+                        &ctx.issue_ctx.host,
+                        &ctx.issue_ctx.owner,
+                        &ctx.issue_ctx.repo,
+                        issue_num,
+                        &format!(
+                            "Merge judge escalated PR #{} for human review. See PR for details.",
+                            ctx.pr_number
+                        ),
+                    )
+                    .await;
+                }
                 println!("🔄 Continuing to monitor PR...\n");
             }
         },
