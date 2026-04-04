@@ -21,9 +21,8 @@ pub(crate) async fn update_orchestration_phase(minion_id: &str, phase: Orchestra
     }
 }
 
-/// Attempts to mark an issue as blocked via CLI (fire-and-forget).
-/// Posts a comment on the issue with the reason before applying the label.
-/// The label is still applied even if the comment fails.
+/// Posts a comment on an issue and attempts to mark it as blocked via CLI (fire-and-forget).
+/// The comment is posted before the label; the label is still applied even if the comment fails.
 pub(crate) async fn try_mark_issue_blocked(
     host: &str,
     owner: &str,
@@ -138,42 +137,80 @@ pub(super) async fn try_post_progress_comment(
 
 #[cfg(test)]
 mod tests {
-    // These tests verify the shape of comment messages produced at each call site.
+    // These tests verify the exact message strings produced at each blocked/escalation call site.
     // They are format-string snapshot tests, not behavioral tests of the async helpers.
+    use crate::agent_runner::AgentRunnerError;
+    use std::time::Duration;
 
     #[test]
-    fn test_blocked_reason_timeout_contains_minion_id() {
+    fn test_blocked_reason_inactivity_stuck() {
         let minion_id = "M042";
+        let err = AgentRunnerError::InactivityStuck { minutes: 15 };
         let reason = format!(
-            "Minion `{}` stopped responding (no output for 5 minutes). Human intervention required.",
-            minion_id
+            "Minion `{}` stopped: {}. Human intervention required.",
+            minion_id, err
         );
-        assert!(reason.contains("M042"));
-        assert!(reason.contains("stopped responding"));
-        assert!(reason.contains("Human intervention required"));
+        assert_eq!(
+            reason,
+            "Minion `M042` stopped: No activity for 15 minutes - task appears stuck. Human intervention required."
+        );
     }
 
     #[test]
-    fn test_blocked_reason_ci_exhausted_contains_pr_and_attempts() {
+    fn test_blocked_reason_stream_timeout() {
+        let minion_id = "M042";
+        let err = AgentRunnerError::StreamTimeout { seconds: 300 };
+        let reason = format!(
+            "Minion `{}` stopped: {}. Human intervention required.",
+            minion_id, err
+        );
+        assert_eq!(
+            reason,
+            "Minion `M042` stopped: Timeout: agent process hasn't produced output in 300 seconds. Human intervention required."
+        );
+    }
+
+    #[test]
+    fn test_blocked_reason_max_timeout() {
+        let minion_id = "M042";
+        let err = AgentRunnerError::MaxTimeout(Duration::from_secs(600));
+        let reason = format!(
+            "Minion `{}` stopped: {}. Human intervention required.",
+            minion_id, err
+        );
+        assert_eq!(
+            reason,
+            "Minion `M042` stopped: Task exceeded maximum timeout of 600s. Human intervention required."
+        );
+    }
+
+    #[test]
+    fn test_blocked_reason_ci_exhausted() {
         let pr_number = "123";
-        let attempts = crate::ci::MAX_CI_FIX_ATTEMPTS;
         let reason = format!(
             "CI auto-fix failed after {} attempts. See PR #{} for details. Human intervention required.",
-            attempts, pr_number
+            crate::ci::MAX_CI_FIX_ATTEMPTS,
+            pr_number
         );
-        assert!(reason.contains(&attempts.to_string()));
-        assert!(reason.contains("PR #123"));
-        assert!(reason.contains("Human intervention required"));
+        assert_eq!(
+            reason,
+            format!(
+                "CI auto-fix failed after {} attempts. See PR #123 for details. Human intervention required.",
+                crate::ci::MAX_CI_FIX_ATTEMPTS
+            )
+        );
     }
 
     #[test]
-    fn test_blocked_reason_judge_escalated_contains_pr() {
+    fn test_blocked_reason_judge_escalated() {
         let pr_number = "456";
         let reason = format!(
             "Merge judge escalated PR #{} for human review. See PR for details.",
             pr_number
         );
-        assert!(reason.contains("PR #456"));
-        assert!(reason.contains("human review"));
+        assert_eq!(
+            reason,
+            "Merge judge escalated PR #456 for human review. See PR for details."
+        );
     }
 }
