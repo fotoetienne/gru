@@ -103,60 +103,85 @@ pub async fn prune_stale_entries() -> Result<usize> {
         return Ok(0);
     }
 
-    // Phase 2: Check PR status for candidates that have an open PR (async, no lock)
+    // Phase 2: Check PR status for candidates that have an open PR (async, no lock).
+    // Use JoinSet to run all checks concurrently instead of sequentially,
+    // reducing worst-case latency from N×30s to ~30s (one timeout).
     let mut to_remove = Vec::new();
-    for (id, pr, repo) in &candidates {
+
+    // Candidates without a PR are immediately prunable.
+    let mut pr_candidates: Vec<(String, String, String)> = Vec::new();
+    for (id, pr, repo) in candidates {
         match pr {
             None => {
-                // No PR associated — safe to prune
-                to_remove.push(id.clone());
+                to_remove.push(id);
             }
             Some(pr_number_str) => {
-                let pr_number: u64 = match pr_number_str.parse() {
-                    Ok(n) => n,
-                    Err(_) => {
-                        // Malformed PR number — prune the entry
-                        log::warn!(
-                            "Minion {} has malformed PR number '{}', pruning",
-                            id,
-                            pr_number_str
-                        );
-                        to_remove.push(id.clone());
-                        continue;
-                    }
-                };
-                // Parse owner/repo
-                let parts: Vec<&str> = repo.splitn(2, '/').collect();
-                if parts.len() != 2 {
-                    log::warn!("Minion {} has malformed repo '{}', pruning", id, repo);
-                    to_remove.push(id.clone());
+                pr_candidates.push((id, pr_number_str, repo));
+            }
+        }
+    }
+
+    if !pr_candidates.is_empty() {
+        // Spawn concurrent tasks for all PR-open checks.
+        // Each task returns (minion_id, should_prune: bool).
+        let mut join_set: tokio::task::JoinSet<(String, bool)> = tokio::task::JoinSet::new();
+
+        for (id, pr_number_str, repo) in pr_candidates {
+            let pr_number: u64 = match pr_number_str.parse() {
+                Ok(n) => n,
+                Err(_) => {
+                    log::warn!(
+                        "Minion {} has malformed PR number '{}', pruning",
+                        id,
+                        pr_number_str
+                    );
+                    to_remove.push(id);
                     continue;
                 }
-                let (owner, repo_name) = (parts[0], parts[1]);
-                let host = infer_github_host(owner, None);
+            };
+            let parts: Vec<&str> = repo.splitn(2, '/').collect();
+            if parts.len() != 2 {
+                log::warn!("Minion {} has malformed repo '{}', pruning", id, repo);
+                to_remove.push(id);
+                continue;
+            }
+            let owner = parts[0].to_string();
+            let repo_name = parts[1].to_string();
+            let host = infer_github_host(&owner, None);
 
-                match is_pr_open_via_cli(owner, repo_name, &host, pr_number).await {
+            join_set.spawn(async move {
+                match is_pr_open_via_cli(&owner, &repo_name, &host, pr_number).await {
                     Ok(true) => {
-                        // PR is still open — do NOT prune
                         log::info!(
                             "Minion {} has open PR #{}, keeping registry entry",
                             id,
                             pr_number
                         );
+                        (id, false) // keep
                     }
-                    Ok(false) => {
-                        // PR is merged or closed — safe to prune
-                        to_remove.push(id.clone());
-                    }
+                    Ok(false) => (id, true), // prune
                     Err(e) => {
-                        // API error — be conservative, don't prune
                         log::warn!(
                             "Failed to check PR #{} status for Minion {}: {}. Keeping entry.",
                             pr_number,
                             id,
                             e
                         );
+                        (id, false) // keep on error
                     }
+                }
+            });
+        }
+
+        while let Some(result) = join_set.join_next().await {
+            match result {
+                Ok((id, should_prune)) => {
+                    if should_prune {
+                        to_remove.push(id);
+                    }
+                }
+                Err(e) => {
+                    log::warn!("PR check task panicked: {}", e);
                 }
             }
         }
