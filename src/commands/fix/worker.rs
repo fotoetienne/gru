@@ -72,11 +72,19 @@ pub(crate) async fn run_agent_phase(
             update_orchestration_phase(&wt_ctx.minion_id, OrchestrationPhase::Failed).await;
             log::error!("🚨 {:#}", e);
             if let Some(issue_num) = issue_ctx.issue_num {
+                let description = e
+                    .downcast_ref::<crate::agent_runner::AgentRunnerError>()
+                    .map(|err| err.to_string())
+                    .unwrap_or_else(|| "stopped responding".to_string());
                 try_mark_issue_blocked(
                     &issue_ctx.host,
                     &issue_ctx.owner,
                     &issue_ctx.repo,
                     issue_num,
+                    &format!(
+                        "Minion `{}` stopped: {}. Human intervention required.",
+                        wt_ctx.minion_id, description
+                    ),
                 )
                 .await;
             }
@@ -261,6 +269,7 @@ pub(crate) async fn monitor_pr_phase(
                         &issue_ctx.owner,
                         &issue_ctx.repo,
                         issue_num,
+                        "CI checks failed and could not be auto-fixed. Human intervention required.",
                     )
                     .await;
                 }

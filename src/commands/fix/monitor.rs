@@ -611,7 +611,7 @@ async fn handle_ready_to_merge(
                     "🚨 Judge escalated PR #{} for human review (confidence: {}/10)",
                     ctx.pr_number, response.confidence
                 );
-                // Apply label and post comment.
+                // Apply label and post comment on PR.
                 match merge_judge::add_needs_human_review_label(
                     &ctx.issue_ctx.host,
                     &ctx.issue_ctx.owner,
@@ -633,6 +633,20 @@ async fn handle_ready_to_merge(
                     &response,
                 )
                 .await;
+                // Also post an explanatory comment on the issue.
+                if let Some(issue_num) = ctx.issue_ctx.issue_num {
+                    super::helpers::try_post_issue_comment(
+                        &ctx.issue_ctx.host,
+                        &ctx.issue_ctx.owner,
+                        &ctx.issue_ctx.repo,
+                        issue_num,
+                        &format!(
+                            "Merge judge escalated PR #{} for human review. See PR for details.",
+                            ctx.pr_number
+                        ),
+                    )
+                    .await;
+                }
                 println!("🔄 Continuing to monitor PR...\n");
             }
         },
@@ -834,6 +848,24 @@ async fn handle_failed_checks(
         Ok(false) => {
             state.ci_escalated = true;
             state.issue_was_blocked = true;
+            // Note: on minion restart ci_escalated starts false, so this arm
+            // may run again. The label application is idempotent; a second
+            // comment is an acceptable trade-off until escalation state is
+            // persisted in the registry.
+            if let Some(issue_num) = ctx.issue_ctx.issue_num {
+                super::helpers::try_mark_issue_blocked(
+                    &ctx.issue_ctx.host,
+                    &ctx.issue_ctx.owner,
+                    &ctx.issue_ctx.repo,
+                    issue_num,
+                    &format!(
+                        "CI auto-fix failed after {} attempts. See PR #{} for details. Human intervention required.",
+                        ci::MAX_CI_FIX_ATTEMPTS,
+                        ctx.pr_number
+                    ),
+                )
+                .await;
+            }
             println!("⚠️  CI auto-fix escalated to human after max attempts");
             println!(
                 "   Review the checks at: https://github.com/{}/{}/pull/{}/checks",

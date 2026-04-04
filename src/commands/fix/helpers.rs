@@ -21,9 +21,19 @@ pub(crate) async fn update_orchestration_phase(minion_id: &str, phase: Orchestra
     }
 }
 
-/// Attempts to mark an issue as blocked via CLI (fire-and-forget).
-/// Logs success/failure but does not propagate errors.
-pub(crate) async fn try_mark_issue_blocked(host: &str, owner: &str, repo: &str, issue_num: u64) {
+/// Posts a comment on an issue and attempts to mark it as blocked via CLI (fire-and-forget).
+/// The comment is posted before the label; the label is still applied even if the comment fails.
+pub(crate) async fn try_mark_issue_blocked(
+    host: &str,
+    owner: &str,
+    repo: &str,
+    issue_num: u64,
+    reason: &str,
+) {
+    if let Err(e) = crate::github::post_comment_via_cli(host, owner, repo, issue_num, reason).await
+    {
+        log::warn!("⚠️  Failed to post blocked comment on issue: {}", e);
+    }
     match crate::github::mark_issue_blocked_via_cli(host, owner, repo, issue_num).await {
         Ok(()) => {
             println!("🏷️  Updated issue label to '{}'", crate::labels::BLOCKED);
@@ -94,6 +104,20 @@ pub(super) async fn try_unclaim_issue(host: &str, owner: &str, repo: &str, issue
     }
 }
 
+/// Posts an explanatory comment on an issue (fire-and-forget).
+/// Logs a warning if posting fails but does not propagate the error.
+pub(crate) async fn try_post_issue_comment(
+    host: &str,
+    owner: &str,
+    repo: &str,
+    issue_num: u64,
+    body: &str,
+) {
+    if let Err(e) = crate::github::post_comment_via_cli(host, owner, repo, issue_num, body).await {
+        log::warn!("⚠️  Failed to post comment on issue: {}", e);
+    }
+}
+
 /// Posts a progress comment to the issue via CLI (fire-and-forget).
 pub(super) async fn try_post_progress_comment(
     host: &str,
@@ -108,5 +132,85 @@ pub(super) async fn try_post_progress_comment(
             log::warn!("⚠️  Failed to post progress comment: {:#}", e);
             false
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    // These tests verify the exact message strings produced at each blocked/escalation call site.
+    // They are format-string snapshot tests, not behavioral tests of the async helpers.
+    use crate::agent_runner::AgentRunnerError;
+    use std::time::Duration;
+
+    #[test]
+    fn test_blocked_reason_inactivity_stuck() {
+        let minion_id = "M042";
+        let err = AgentRunnerError::InactivityStuck { minutes: 15 };
+        let reason = format!(
+            "Minion `{}` stopped: {}. Human intervention required.",
+            minion_id, err
+        );
+        assert_eq!(
+            reason,
+            "Minion `M042` stopped: No activity for 15 minutes - task appears stuck. Human intervention required."
+        );
+    }
+
+    #[test]
+    fn test_blocked_reason_stream_timeout() {
+        let minion_id = "M042";
+        let err = AgentRunnerError::StreamTimeout { seconds: 300 };
+        let reason = format!(
+            "Minion `{}` stopped: {}. Human intervention required.",
+            minion_id, err
+        );
+        assert_eq!(
+            reason,
+            "Minion `M042` stopped: Timeout: agent process hasn't produced output in 300 seconds. Human intervention required."
+        );
+    }
+
+    #[test]
+    fn test_blocked_reason_max_timeout() {
+        let minion_id = "M042";
+        let err = AgentRunnerError::MaxTimeout(Duration::from_secs(600));
+        let reason = format!(
+            "Minion `{}` stopped: {}. Human intervention required.",
+            minion_id, err
+        );
+        assert_eq!(
+            reason,
+            "Minion `M042` stopped: Task exceeded maximum timeout of 600s. Human intervention required."
+        );
+    }
+
+    #[test]
+    fn test_blocked_reason_ci_exhausted() {
+        let pr_number = "123";
+        let reason = format!(
+            "CI auto-fix failed after {} attempts. See PR #{} for details. Human intervention required.",
+            crate::ci::MAX_CI_FIX_ATTEMPTS,
+            pr_number
+        );
+        assert_eq!(
+            reason,
+            format!(
+                "CI auto-fix failed after {} attempts. See PR #123 for details. Human intervention required.",
+                crate::ci::MAX_CI_FIX_ATTEMPTS
+            )
+        );
+    }
+
+    #[test]
+    fn test_blocked_reason_judge_escalated() {
+        let pr_number = "456";
+        let reason = format!(
+            "Merge judge escalated PR #{} for human review. See PR for details.",
+            pr_number
+        );
+        assert_eq!(
+            reason,
+            "Merge judge escalated PR #456 for human review. See PR for details."
+        );
     }
 }
