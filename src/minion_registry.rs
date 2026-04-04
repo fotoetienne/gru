@@ -181,7 +181,10 @@ pub async fn prune_stale_entries() -> Result<usize> {
                     }
                 }
                 Err(e) => {
-                    log::warn!("PR check task panicked: {}", e);
+                    log::warn!(
+                        "PR check task panicked (one minion's check skipped, entry kept): {}",
+                        e
+                    );
                 }
             }
         }

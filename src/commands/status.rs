@@ -88,7 +88,9 @@ fn get_current_branch(worktree_path: &std::path::Path, registry_branch: &str) ->
                         let gitdir_path = if std::path::Path::new(gitdir).is_absolute() {
                             std::path::PathBuf::from(gitdir)
                         } else {
-                            worktree_path.join(gitdir)
+                            // Per the git spec, relative gitdir paths are resolved
+                            // relative to the directory containing the .git file.
+                            dot_git.parent().unwrap_or(worktree_path).join(gitdir)
                         };
                         gitdir_path.join("HEAD")
                     }
@@ -117,7 +119,8 @@ fn get_current_branch(worktree_path: &std::path::Path, registry_branch: &str) ->
             } else if trimmed.is_empty() {
                 "(error)".to_string()
             } else {
-                // Bare commit hash → detached HEAD.
+                // Not a branch ref (tag checkout, remote ref, or bare commit hash) →
+                // treat as detached HEAD.
                 "(detached)".to_string()
             }
         }
@@ -580,6 +583,21 @@ mod tests {
             get_current_branch(tmp.path(), "minion/issue-42-M001"),
             "minion/issue-42-M001"
         );
+    }
+
+    #[test]
+    fn test_get_current_branch_worktree_relative_gitdir() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Create a sibling "gitdir" directory relative to the worktree root.
+        let gitdir = tmp.path().join("actual_gitdir");
+        std::fs::create_dir(&gitdir).unwrap();
+        std::fs::write(gitdir.join("HEAD"), "ref: refs/heads/feature/foo\n").unwrap();
+
+        // Write a .git file with a relative path (relative to checkout/, which is tmp.path()).
+        // The relative path "actual_gitdir" resolves to tmp.path()/actual_gitdir.
+        std::fs::write(tmp.path().join(".git"), "gitdir: actual_gitdir\n").unwrap();
+
+        assert_eq!(get_current_branch(tmp.path(), "feature/foo"), "feature/foo");
     }
 
     #[test]
