@@ -77,6 +77,10 @@ pub(crate) async fn run_agent_phase(
                     &issue_ctx.owner,
                     &issue_ctx.repo,
                     issue_num,
+                    &format!(
+                        "Minion `{}` stopped responding (no output for 5 minutes). Human intervention required.",
+                        wt_ctx.minion_id
+                    ),
                 )
                 .await;
             }
@@ -261,6 +265,7 @@ pub(crate) async fn monitor_pr_phase(
                         &issue_ctx.owner,
                         &issue_ctx.repo,
                         issue_num,
+                        "CI checks failed. Human intervention required.",
                     )
                     .await;
                 }

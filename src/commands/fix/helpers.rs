@@ -22,8 +22,19 @@ pub(crate) async fn update_orchestration_phase(minion_id: &str, phase: Orchestra
 }
 
 /// Attempts to mark an issue as blocked via CLI (fire-and-forget).
-/// Logs success/failure but does not propagate errors.
-pub(crate) async fn try_mark_issue_blocked(host: &str, owner: &str, repo: &str, issue_num: u64) {
+/// Posts a comment on the issue with the reason before applying the label.
+/// The label is still applied even if the comment fails.
+pub(crate) async fn try_mark_issue_blocked(
+    host: &str,
+    owner: &str,
+    repo: &str,
+    issue_num: u64,
+    reason: &str,
+) {
+    if let Err(e) = crate::github::post_comment_via_cli(host, owner, repo, issue_num, reason).await
+    {
+        log::warn!("⚠️  Failed to post blocked comment on issue: {}", e);
+    }
     match crate::github::mark_issue_blocked_via_cli(host, owner, repo, issue_num).await {
         Ok(()) => {
             println!("🏷️  Updated issue label to '{}'", crate::labels::BLOCKED);
@@ -94,6 +105,20 @@ pub(super) async fn try_unclaim_issue(host: &str, owner: &str, repo: &str, issue
     }
 }
 
+/// Posts an explanatory comment on an issue (fire-and-forget).
+/// Logs a warning if posting fails but does not propagate the error.
+pub(crate) async fn try_post_issue_comment(
+    host: &str,
+    owner: &str,
+    repo: &str,
+    issue_num: u64,
+    body: &str,
+) {
+    if let Err(e) = crate::github::post_comment_via_cli(host, owner, repo, issue_num, body).await {
+        log::warn!("⚠️  Failed to post comment on issue: {}", e);
+    }
+}
+
 /// Posts a progress comment to the issue via CLI (fire-and-forget).
 pub(super) async fn try_post_progress_comment(
     host: &str,
@@ -108,5 +133,44 @@ pub(super) async fn try_post_progress_comment(
             log::warn!("⚠️  Failed to post progress comment: {:#}", e);
             false
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn test_blocked_reason_timeout_contains_minion_id() {
+        let minion_id = "M042";
+        let reason = format!(
+            "Minion `{}` stopped responding (no output for 5 minutes). Human intervention required.",
+            minion_id
+        );
+        assert!(reason.contains("M042"));
+        assert!(reason.contains("stopped responding"));
+        assert!(reason.contains("Human intervention required"));
+    }
+
+    #[test]
+    fn test_blocked_reason_ci_exhausted_contains_pr_and_attempts() {
+        let pr_number = "123";
+        let attempts = crate::ci::MAX_CI_FIX_ATTEMPTS;
+        let reason = format!(
+            "CI auto-fix failed after {} attempts. See PR #{} for details. Human intervention required.",
+            attempts, pr_number
+        );
+        assert!(reason.contains(&attempts.to_string()));
+        assert!(reason.contains("PR #123"));
+        assert!(reason.contains("Human intervention required"));
+    }
+
+    #[test]
+    fn test_blocked_reason_judge_escalated_contains_pr() {
+        let pr_number = "456";
+        let reason = format!(
+            "Merge judge escalated PR #{} for human review. See PR for details.",
+            pr_number
+        );
+        assert!(reason.contains("PR #456"));
+        assert!(reason.contains("human review"));
     }
 }
