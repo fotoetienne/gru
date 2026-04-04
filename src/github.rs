@@ -698,6 +698,14 @@ pub async fn is_issue_closed_via_cli(
     .await?;
 
     let state = stdout.trim().to_string();
+    if state.is_empty() {
+        return Err(anyhow!(
+            "gh api returned empty state for issue #{} in {}/{}",
+            number,
+            owner,
+            repo
+        ));
+    }
     Ok(state == "closed")
 }
 
