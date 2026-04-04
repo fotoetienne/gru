@@ -105,7 +105,7 @@ pub async fn prune_stale_entries() -> Result<usize> {
 
     // Phase 2: Check PR status for candidates that have an open PR (async, no lock).
     // Use JoinSet to run all checks concurrently instead of sequentially,
-    // reducing worst-case latency from N×30s to ~30s (one timeout).
+    // reducing overall latency, though total runtime still depends on each CLI call.
     let mut to_remove = Vec::new();
 
     // Candidates without a PR are immediately prunable.
