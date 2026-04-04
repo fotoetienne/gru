@@ -9,11 +9,10 @@ Gru uses [Semantic Versioning](https://semver.org/) with a `0.x.y` scheme until 
 
 ## Prerequisites
 
-Install git-cliff for changelog generation:
+- [GitHub CLI](https://cli.github.com/) (`gh`), authenticated — used for changelog generation
+- [git-cliff](https://git-cliff.org/) — `cargo install git-cliff`
 
-```bash
-cargo install git-cliff
-```
+Alternatively, set `GITHUB_TOKEN` manually instead of using `gh`.
 
 ## Quick Release
 
