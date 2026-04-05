@@ -1,15 +1,30 @@
 use chrono::{DateTime, Utc};
 
-/// Prefix used in Minion-generated GitHub content to identify bot-authored posts.
+/// Returns true if the comment body ends with a Minion signature.
 ///
-/// All Minion posts (PR bodies, review replies, escalation comments) include a
-/// signature like `<sub>🤖 M001</sub>`. This prefix is used to distinguish
-/// Minion-authored reviews from human reviews on the same GitHub account.
-pub(crate) const MINION_SIGNATURE_PREFIX: &str = "<sub>🤖";
+/// The signature format is `\n\n<sub>🤖 {id}</sub>` (always at the tail).
+/// Validates that the final `<sub>🤖 …</sub>` fragment contains a non-empty
+/// ID with no embedded HTML or newline characters, preventing false positives
+/// from comments that happen to end with an unrelated `</sub>` tag.
+pub(crate) fn has_minion_signature(body: &str) -> bool {
+    let trimmed = body.trim_end();
+    if !trimmed.ends_with("</sub>") {
+        return false;
+    }
 
-/// Returns true if the text contains a Minion signature.
-pub(crate) fn has_minion_signature(text: &str) -> bool {
-    text.contains(MINION_SIGNATURE_PREFIX)
+    let Some(start) = trimmed.rfind("<sub>🤖 ") else {
+        return false;
+    };
+
+    let suffix = &trimmed[start..];
+    let Some(id) = suffix
+        .strip_prefix("<sub>🤖 ")
+        .and_then(|s| s.strip_suffix("</sub>"))
+    else {
+        return false;
+    };
+
+    !id.is_empty() && !id.contains(['<', '>', '\n', '\r'])
 }
 
 /// Represents the phase of Minion execution
@@ -165,6 +180,24 @@ mod tests {
     fn test_minion_signature() {
         assert_eq!(minion_signature("M042"), "\n\n<sub>🤖 M042</sub>");
         assert_eq!(minion_signature("M0ug"), "\n\n<sub>🤖 M0ug</sub>");
+    }
+
+    #[test]
+    fn test_has_minion_signature() {
+        assert!(has_minion_signature("Done!\n\n<sub>🤖 M001</sub>"));
+        assert!(has_minion_signature("Done!\n\n<sub>🤖 M001</sub>  \n")); // trailing whitespace
+        assert!(!has_minion_signature("Please fix this."));
+        assert!(!has_minion_signature(""));
+        // Minion signature mid-body, not at the end → should NOT match.
+        assert!(!has_minion_signature(
+            "As noted in <sub>🤖 M001</sub>, please fix the typo."
+        ));
+        // Different </sub> at the end, Minion marker mid-body → should NOT match.
+        assert!(!has_minion_signature(
+            "See <sub>🤖 M001</sub> for context. <sub>note</sub>"
+        ));
+        // Empty ID → should NOT match.
+        assert!(!has_minion_signature("Done!\n\n<sub>🤖 </sub>"));
     }
 
     #[test]
