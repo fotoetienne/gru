@@ -67,9 +67,13 @@ impl ProgressUpdate {
     }
 }
 
-/// Returns true if the comment body contains a Minion signature.
+/// Returns true if the comment body ends with a Minion signature.
+///
+/// The signature format is `\n\n<sub>🤖 {id}</sub>` (always at the tail).
+/// Anchoring to `</sub>` at the end reduces false positives when a reviewer
+/// quotes a previous Minion reply in their own comment.
 pub fn has_minion_signature(body: &str) -> bool {
-    body.contains("<sub>🤖")
+    body.contains("<sub>🤖") && body.trim_end().ends_with("</sub>")
 }
 
 /// Returns an attribution footer for Minion-generated GitHub posts.
@@ -177,6 +181,11 @@ mod tests {
         assert!(has_minion_signature("Done!\n\n<sub>🤖 M001</sub>"));
         assert!(!has_minion_signature("Please fix this."));
         assert!(!has_minion_signature(""));
+        // A reviewer quoting a Minion reply mid-body should NOT match,
+        // because the body doesn't end with </sub>.
+        assert!(!has_minion_signature(
+            "As noted in <sub>🤖 M001</sub>, please fix the typo."
+        ));
     }
 
     #[test]

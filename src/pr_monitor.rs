@@ -740,9 +740,16 @@ pub(crate) async fn get_all_reviews(
 
 /// Convert a list of raw API review comments into `ReviewComment`s, skipping:
 /// - Minion reply comments (identified by the Minion signature in their body)
-/// - Root comments that already have a Minion reply
+/// - Comments that a Minion has already directly replied to
+///   (identified by appearing as `in_reply_to_id` on a Minion reply comment)
+///
+/// Note: the GitHub `reviews/{id}/comments` endpoint returns all comments in
+/// the thread, including reply comments posted outside of a formal review
+/// submission. This means Minion reply comments appear in the same batch as
+/// the original reviewer comments, making the `already_answered` check
+/// effective.
 fn filter_unanswered_comments(api_comments: Vec<ApiReviewComment>) -> Vec<ReviewComment> {
-    // Collect root comment IDs that have already received a Minion reply.
+    // Collect IDs of comments that a Minion has already directly replied to.
     let already_answered: std::collections::HashSet<u64> = api_comments
         .iter()
         .filter_map(|c| {
@@ -1883,6 +1890,24 @@ mod tests {
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].comment_id, 2);
         assert_eq!(result[0].body, "Add error handling.");
+    }
+
+    #[test]
+    fn test_filter_unanswered_comments_empty_input() {
+        let result = filter_unanswered_comments(vec![]);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_filter_unanswered_comments_minion_reply_without_in_reply_to_id() {
+        // A Minion-signed comment with no in_reply_to_id should be filtered out
+        // but should not cause anything to be added to already_answered.
+        let orphan_minion = make_api_comment(1, "Done!\n\n<sub>🤖 M001</sub>", None);
+        let unrelated = make_api_comment(2, "Please fix this.", None);
+
+        let result = filter_unanswered_comments(vec![orphan_minion, unrelated]);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].comment_id, 2);
     }
 
     // ========================================================================
