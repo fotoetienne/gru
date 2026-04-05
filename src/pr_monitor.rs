@@ -550,7 +550,7 @@ async fn poll_once(
     let all_reviews = get_all_reviews(host, owner, repo, pr_number).await?;
     let new_reviews = filter_new_external_reviews(&all_reviews, *last_check_time);
     if !new_reviews.is_empty() {
-        let feedback = get_review_comments(host, owner, repo, pr_number, &new_reviews).await?;
+        let feedback = get_review_feedback(host, owner, repo, pr_number, &new_reviews).await?;
         // Only advance the baseline when we successfully fetched all reviews.
         // If some fetches failed we leave last_check_time unchanged so the
         // reviews are retried on the next poll cycle.
@@ -777,8 +777,8 @@ fn filter_unanswered_comments(api_comments: Vec<ApiReviewComment>) -> Vec<Review
         .collect()
 }
 
-/// Fetch review comments for specific reviews with retry logic for transient failures
-async fn get_review_comments(
+/// Fetch review bodies and inline comments for specific reviews with retry logic
+async fn get_review_feedback(
     host: &str,
     owner: &str,
     repo: &str,
