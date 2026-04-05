@@ -67,6 +67,11 @@ impl ProgressUpdate {
     }
 }
 
+/// Returns true if the comment body contains a Minion signature.
+pub fn has_minion_signature(body: &str) -> bool {
+    body.contains("<sub>🤖")
+}
+
 /// Returns an attribution footer for Minion-generated GitHub posts.
 ///
 /// Renders as small subscript text on GitHub. A blank line before prevents
@@ -165,6 +170,13 @@ mod tests {
     fn test_minion_signature() {
         assert_eq!(minion_signature("M042"), "\n\n<sub>🤖 M042</sub>");
         assert_eq!(minion_signature("M0ug"), "\n\n<sub>🤖 M0ug</sub>");
+    }
+
+    #[test]
+    fn test_has_minion_signature() {
+        assert!(has_minion_signature("Done!\n\n<sub>🤖 M001</sub>"));
+        assert!(!has_minion_signature("Please fix this."));
+        assert!(!has_minion_signature(""));
     }
 
     #[test]

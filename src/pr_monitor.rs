@@ -118,6 +118,8 @@ struct ApiReviewComment {
     line: Option<u64>,
     body: String,
     user: User,
+    #[serde(default)]
+    in_reply_to_id: Option<u64>,
 }
 
 /// Check if a CI check run conclusion indicates a failure.
@@ -548,7 +550,7 @@ async fn poll_once(
     let all_reviews = get_all_reviews(host, owner, repo, pr_number).await?;
     let new_reviews = filter_new_external_reviews(&all_reviews, *last_check_time);
     if !new_reviews.is_empty() {
-        let feedback = get_review_feedback(host, owner, repo, pr_number, &new_reviews).await?;
+        let feedback = get_review_comments(host, owner, repo, pr_number, &new_reviews).await?;
         // Only advance the baseline when we successfully fetched all reviews.
         // If some fetches failed we leave last_check_time unchanged so the
         // reviews are retried on the next poll cycle.
@@ -736,9 +738,40 @@ pub(crate) async fn get_all_reviews(
     Ok(reviews)
 }
 
-/// Fetch review feedback (inline comments + review bodies) for specific reviews
-/// with retry logic for transient failures.
-async fn get_review_feedback(
+/// Convert a list of raw API review comments into `ReviewComment`s, skipping:
+/// - Minion reply comments (identified by the Minion signature in their body)
+/// - Root comments that already have a Minion reply
+fn filter_unanswered_comments(api_comments: Vec<ApiReviewComment>) -> Vec<ReviewComment> {
+    // Collect root comment IDs that have already received a Minion reply.
+    let already_answered: std::collections::HashSet<u64> = api_comments
+        .iter()
+        .filter_map(|c| {
+            if crate::progress_comments::has_minion_signature(&c.body) {
+                c.in_reply_to_id
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    api_comments
+        .into_iter()
+        .filter(|c| {
+            !crate::progress_comments::has_minion_signature(&c.body)
+                && !already_answered.contains(&c.id)
+        })
+        .map(|c| ReviewComment {
+            file: c.path,
+            line: c.line,
+            body: c.body,
+            reviewer: c.user.login,
+            comment_id: c.id,
+        })
+        .collect()
+}
+
+/// Fetch review comments for specific reviews with retry logic for transient failures
+async fn get_review_comments(
     host: &str,
     owner: &str,
     repo: &str,
@@ -799,19 +832,7 @@ async fn get_review_feedback(
         let api_comments: Vec<ApiReviewComment> = serde_json::from_slice(&output.stdout)
             .context("Failed to parse review comments JSON response")?;
 
-        // Convert API comments to our format, skipping Minion-authored ones
-        for comment in api_comments {
-            if crate::progress_comments::has_minion_signature(&comment.body) {
-                continue;
-            }
-            all_comments.push(ReviewComment {
-                file: comment.path,
-                line: comment.line,
-                body: comment.body,
-                reviewer: comment.user.login,
-                comment_id: comment.id,
-            });
-        }
+        all_comments.extend(filter_unanswered_comments(api_comments));
     }
 
     // Log summary if any reviews failed to fetch
@@ -1793,6 +1814,75 @@ mod tests {
         let comment: ApiReviewComment = serde_json::from_str(json).unwrap();
         assert_eq!(comment.path, "README.md");
         assert!(comment.line.is_none());
+    }
+
+    #[test]
+    fn test_api_review_comment_deserialize_with_in_reply_to_id() {
+        let json = r#"{
+            "id": 300,
+            "path": "src/lib.rs",
+            "line": 10,
+            "body": "Great point",
+            "user": {"login": "reviewer"},
+            "in_reply_to_id": 100
+        }"#;
+
+        let comment: ApiReviewComment = serde_json::from_str(json).unwrap();
+        assert_eq!(comment.in_reply_to_id, Some(100));
+    }
+
+    #[test]
+    fn test_api_review_comment_deserialize_without_in_reply_to_id() {
+        // Root comments don't have in_reply_to_id; field should default to None
+        let json = r#"{
+            "id": 100,
+            "path": "src/lib.rs",
+            "line": 10,
+            "body": "Please fix this",
+            "user": {"login": "reviewer"}
+        }"#;
+
+        let comment: ApiReviewComment = serde_json::from_str(json).unwrap();
+        assert!(comment.in_reply_to_id.is_none());
+    }
+
+    fn make_api_comment(id: u64, body: &str, in_reply_to_id: Option<u64>) -> ApiReviewComment {
+        ApiReviewComment {
+            id,
+            path: "src/main.rs".to_string(),
+            line: Some(1),
+            body: body.to_string(),
+            user: User {
+                login: "reviewer".to_string(),
+            },
+            in_reply_to_id,
+        }
+    }
+
+    #[test]
+    fn test_filter_unanswered_comments_thread_fully_answered() {
+        // Root comment + Minion reply → nothing returned
+        let original = make_api_comment(1, "Please fix this.", None);
+        let minion_reply = make_api_comment(2, "Done!\n\n<sub>🤖 M001</sub>", Some(1));
+
+        let result = filter_unanswered_comments(vec![original, minion_reply]);
+        assert!(
+            result.is_empty(),
+            "Already-answered comment should be filtered out"
+        );
+    }
+
+    #[test]
+    fn test_filter_unanswered_comments_one_answered_one_not() {
+        // Two root comments; only one has a Minion reply → only the unanswered one returned
+        let answered_root = make_api_comment(1, "Fix the typo.", None);
+        let unanswered_root = make_api_comment(2, "Add error handling.", None);
+        let minion_reply = make_api_comment(3, "Fixed!\n\n<sub>🤖 M001</sub>", Some(1));
+
+        let result = filter_unanswered_comments(vec![answered_root, unanswered_root, minion_reply]);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].comment_id, 2);
+        assert_eq!(result[0].body, "Add error handling.");
     }
 
     // ========================================================================
