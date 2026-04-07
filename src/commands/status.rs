@@ -67,33 +67,69 @@ fn calculate_uptime(started_at: chrono::DateTime<chrono::Utc>) -> String {
     }
 }
 
-/// Gets the current branch name from a worktree
+/// Gets the current branch name from a worktree by reading `.git/HEAD` directly.
+///
+/// This avoids spawning a git subprocess (~100ms each), reducing Phase 2 time
+/// from O(N × 100ms) to O(N × file_read_time) for N minions.
+///
 /// Returns the actual branch name, or a placeholder for special cases:
-/// - "(detached)" if HEAD is detached
-/// - "{branch} (!)" if the branch differs from what was registered (e.g., changed or registry is stale)
-/// - "(error)" if git command fails
+/// - "(detached)" if HEAD is detached (commit hash instead of ref)
+/// - "{branch} (!)" if the branch differs from what was registered
+/// - "(error)" if the HEAD file cannot be read or parsed
 fn get_current_branch(worktree_path: &std::path::Path, registry_branch: &str) -> String {
-    let output = std::process::Command::new("git")
-        .arg("-C")
-        .arg(worktree_path)
-        .arg("branch")
-        .arg("--show-current")
-        .output();
+    let dot_git = worktree_path.join(".git");
 
-    match output {
-        Ok(out) if out.status.success() => {
-            let branch = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            if branch.is_empty() {
-                // Empty output means detached HEAD
-                "(detached)".to_string()
-            } else if branch != registry_branch {
-                // Branch changed from what was registered
-                format!("{} (!)", branch)
+    // Determine the path to the HEAD file.
+    // In a git worktree (which all Minions use), `.git` is a file containing
+    // "gitdir: /path/to/.git/worktrees/branch-name". The actual HEAD lives
+    // inside that gitdir directory.
+    let head_path = if dot_git.is_file() {
+        // Linked worktree: resolve the gitdir pointer.
+        match std::fs::read_to_string(&dot_git) {
+            Ok(content) => {
+                let trimmed = content.trim();
+                match trimmed.strip_prefix("gitdir: ") {
+                    Some(gitdir) => {
+                        let gitdir_path = if std::path::Path::new(gitdir).is_absolute() {
+                            std::path::PathBuf::from(gitdir)
+                        } else {
+                            // Per the git spec, relative gitdir paths are resolved
+                            // relative to the directory containing the .git file.
+                            dot_git.parent().unwrap_or(worktree_path).join(gitdir)
+                        };
+                        gitdir_path.join("HEAD")
+                    }
+                    None => return "(error)".to_string(),
+                }
+            }
+            Err(_) => return "(error)".to_string(),
+        }
+    } else if dot_git.is_dir() {
+        // Root repository (non-worktree checkout).
+        dot_git.join("HEAD")
+    } else {
+        return "(error)".to_string();
+    };
+
+    // Parse HEAD: "ref: refs/heads/<branch>" or a bare commit hash (detached).
+    match std::fs::read_to_string(&head_path) {
+        Ok(content) => {
+            let trimmed = content.trim();
+            if let Some(branch) = trimmed.strip_prefix("ref: refs/heads/") {
+                if branch == registry_branch {
+                    branch.to_string()
+                } else {
+                    format!("{} (!)", branch)
+                }
+            } else if trimmed.is_empty() {
+                "(error)".to_string()
             } else {
-                branch
+                // Not a branch ref (tag checkout, remote ref, or bare commit hash) →
+                // treat as detached HEAD.
+                "(detached)".to_string()
             }
         }
-        _ => "(error)".to_string(),
+        Err(_) => "(error)".to_string(),
     }
 }
 
@@ -679,6 +715,88 @@ mod tests {
         let (is_running, display) = format_mode_display(Some(pid), None, &MinionMode::Stopped);
         assert!(is_running);
         assert_eq!(display, "running (unknown)");
+    }
+
+    // --- get_current_branch tests ---
+
+    #[test]
+    fn test_get_current_branch_regular_repo() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dot_git = tmp.path().join(".git");
+        std::fs::create_dir(&dot_git).unwrap();
+        std::fs::write(dot_git.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+
+        assert_eq!(get_current_branch(tmp.path(), "main"), "main");
+        assert_eq!(get_current_branch(tmp.path(), "other"), "main (!)");
+    }
+
+    #[test]
+    fn test_get_current_branch_detached_head() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dot_git = tmp.path().join(".git");
+        std::fs::create_dir(&dot_git).unwrap();
+        std::fs::write(
+            dot_git.join("HEAD"),
+            "abc123def456abc123def456abc123def456abc1\n",
+        )
+        .unwrap();
+
+        assert_eq!(get_current_branch(tmp.path(), "main"), "(detached)");
+    }
+
+    #[test]
+    fn test_get_current_branch_worktree_gitdir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let gitdir = tempfile::tempdir().unwrap();
+
+        // Write HEAD to the gitdir location (simulates a bare repo worktree entry)
+        std::fs::write(
+            gitdir.path().join("HEAD"),
+            "ref: refs/heads/minion/issue-42-M001\n",
+        )
+        .unwrap();
+
+        // .git in the worktree is a file pointing to the gitdir
+        std::fs::write(
+            tmp.path().join(".git"),
+            format!("gitdir: {}\n", gitdir.path().display()),
+        )
+        .unwrap();
+
+        assert_eq!(
+            get_current_branch(tmp.path(), "minion/issue-42-M001"),
+            "minion/issue-42-M001"
+        );
+    }
+
+    #[test]
+    fn test_get_current_branch_worktree_relative_gitdir() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Create a sibling "gitdir" directory relative to the worktree root.
+        let gitdir = tmp.path().join("actual_gitdir");
+        std::fs::create_dir(&gitdir).unwrap();
+        std::fs::write(gitdir.join("HEAD"), "ref: refs/heads/feature/foo\n").unwrap();
+
+        // Write a .git file with a relative path (relative to checkout/, which is tmp.path()).
+        // The relative path "actual_gitdir" resolves to tmp.path()/actual_gitdir.
+        std::fs::write(tmp.path().join(".git"), "gitdir: actual_gitdir\n").unwrap();
+
+        assert_eq!(get_current_branch(tmp.path(), "feature/foo"), "feature/foo");
+    }
+
+    #[test]
+    fn test_get_current_branch_missing_dot_git() {
+        let tmp = tempfile::tempdir().unwrap();
+        // No .git file or directory
+        assert_eq!(get_current_branch(tmp.path(), "main"), "(error)");
+    }
+
+    #[test]
+    fn test_get_current_branch_bad_gitdir_pointer() {
+        let tmp = tempfile::tempdir().unwrap();
+        // .git file with malformed content (no "gitdir: " prefix)
+        std::fs::write(tmp.path().join(".git"), "not a valid gitdir pointer\n").unwrap();
+        assert_eq!(get_current_branch(tmp.path(), "main"), "(error)");
     }
 
     // --- truncate tests ---
