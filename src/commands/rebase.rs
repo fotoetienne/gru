@@ -408,15 +408,14 @@ pub(crate) fn is_rebase_in_progress(worktree_path: &Path) -> bool {
             Ok(c) => c,
             Err(_) => return false,
         };
-        let path_str = match content.trim().strip_prefix("gitdir: ") {
-            Some(p) => p.trim().to_string(),
+        let git_dir_path = match content.trim().strip_prefix("gitdir: ") {
+            Some(p) => PathBuf::from(p.trim()),
             None => return false,
         };
-        let p = PathBuf::from(&path_str);
-        if p.is_absolute() {
-            p
+        if git_dir_path.is_absolute() {
+            git_dir_path
         } else {
-            worktree_path.join(p)
+            worktree_path.join(git_dir_path)
         }
     } else {
         return false;
@@ -437,7 +436,7 @@ pub(crate) async fn abort_rebase(worktree_path: &Path) -> Result<()> {
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        log::warn!("git rebase --abort warning: {}", stderr.trim());
+        anyhow::bail!("git rebase --abort failed: {}", stderr.trim());
     }
 
     Ok(())
@@ -638,5 +637,26 @@ mod tests {
 
         fs::remove_dir_all(&worktree).ok();
         fs::remove_dir_all(&real_git_dir).ok();
+    }
+
+    #[test]
+    fn test_is_rebase_in_progress_worktree_gitdir_relative_path() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let worktree = std::env::temp_dir().join(format!("gru-rebase-wt-rel-{}", nanos));
+        // The "real" git dir is a subdirectory of the worktree (relative path).
+        let real_git_dir = worktree.join("fake-gitdir");
+        fs::create_dir_all(&real_git_dir).unwrap();
+        // Write a relative gitdir pointer
+        fs::write(worktree.join(".git"), "gitdir: fake-gitdir\n").unwrap();
+
+        assert!(!is_rebase_in_progress(&worktree));
+
+        fs::create_dir_all(real_git_dir.join("rebase-merge")).unwrap();
+        assert!(is_rebase_in_progress(&worktree));
+
+        fs::remove_dir_all(&worktree).ok();
     }
 }
