@@ -408,9 +408,13 @@ pub(crate) fn is_rebase_in_progress(worktree_path: &Path) -> bool {
             Ok(c) => c,
             Err(_) => return false,
         };
-        let git_dir_path = match content.trim().strip_prefix("gitdir: ") {
-            Some(p) => PathBuf::from(p.trim()),
-            None => return false,
+        // Parse "gitdir: <path>" tolerantly: split on the first ':' and trim
+        // both sides so leading/trailing whitespace variations are handled.
+        let git_dir_path = match content.splitn(2, ':').collect::<Vec<_>>().as_slice() {
+            [key, value] if key.trim().eq_ignore_ascii_case("gitdir") => {
+                PathBuf::from(value.trim())
+            }
+            _ => return false,
         };
         if git_dir_path.is_absolute() {
             git_dir_path
@@ -435,8 +439,15 @@ pub(crate) async fn abort_rebase(worktree_path: &Path) -> Result<()> {
         .context("Failed to abort rebase")?;
 
     if !output.status.success() {
+        let code = output.status.code().unwrap_or(-1);
         let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("git rebase --abort failed: {}", stderr.trim());
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        anyhow::bail!(
+            "git rebase --abort failed (exit {}): stderr={} stdout={}",
+            code,
+            stderr.trim(),
+            stdout.trim()
+        );
     }
 
     Ok(())
@@ -559,104 +570,97 @@ pub(crate) async fn run_agent_rebase(worktree_path: &Path, timeout: Option<&str>
 mod tests {
     use super::*;
     use std::fs;
+    use tempfile::TempDir;
 
-    /// Creates a unique temp directory with a fake `.git/` for testing.
-    fn make_fake_git_dir(suffix: &str) -> PathBuf {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("gru-rebase-test-{}-{}", suffix, nanos));
-        fs::create_dir_all(dir.join(".git")).expect("create .git dir");
+    /// Creates a temp dir with a fake `.git/` directory for testing.
+    fn make_fake_git_dir() -> TempDir {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        fs::create_dir_all(dir.path().join(".git")).expect("create .git dir");
         dir
     }
 
     #[test]
     fn test_is_rebase_in_progress_clean_worktree() {
-        let dir = make_fake_git_dir("clean");
+        let dir = make_fake_git_dir();
         assert!(
-            !is_rebase_in_progress(&dir),
+            !is_rebase_in_progress(dir.path()),
             "clean worktree should not report rebase in progress"
         );
-        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn test_is_rebase_in_progress_with_rebase_merge_dir() {
-        let dir = make_fake_git_dir("merge");
-        fs::create_dir_all(dir.join(".git").join("rebase-merge")).expect("create rebase-merge");
+        let dir = make_fake_git_dir();
+        fs::create_dir_all(dir.path().join(".git").join("rebase-merge"))
+            .expect("create rebase-merge");
         assert!(
-            is_rebase_in_progress(&dir),
+            is_rebase_in_progress(dir.path()),
             "should detect rebase-merge directory"
         );
-        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn test_is_rebase_in_progress_with_rebase_apply_dir() {
-        let dir = make_fake_git_dir("apply");
-        fs::create_dir_all(dir.join(".git").join("rebase-apply")).expect("create rebase-apply");
+        let dir = make_fake_git_dir();
+        fs::create_dir_all(dir.path().join(".git").join("rebase-apply"))
+            .expect("create rebase-apply");
         assert!(
-            is_rebase_in_progress(&dir),
+            is_rebase_in_progress(dir.path()),
             "should detect rebase-apply directory"
         );
-        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn test_is_rebase_in_progress_nonexistent_path() {
-        let dir = PathBuf::from("/tmp/gru-nonexistent-repo-xyz-9999");
+        // Use a child of a tempdir that is guaranteed not to exist yet.
+        let base = tempfile::tempdir().expect("create temp dir");
+        let nonexistent = base.path().join("does-not-exist");
         assert!(
-            !is_rebase_in_progress(&dir),
+            !is_rebase_in_progress(&nonexistent),
             "nonexistent path should return false"
         );
     }
 
     #[test]
     fn test_is_rebase_in_progress_worktree_gitdir_file() {
-        // Simulate a git worktree where .git is a file pointing to the real git dir.
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        let worktree = std::env::temp_dir().join(format!("gru-rebase-wt-{}", nanos));
-        let real_git_dir = std::env::temp_dir().join(format!("gru-rebase-realdir-{}", nanos));
-        fs::create_dir_all(&worktree).unwrap();
-        fs::create_dir_all(&real_git_dir).unwrap();
+        // Simulate a git worktree where .git is a file pointing to the real git dir
+        // (absolute path).
+        let worktree = tempfile::tempdir().expect("create worktree dir");
+        let real_git_dir = tempfile::tempdir().expect("create real git dir");
+        let gitdir_content = format!("gitdir: {}\n", real_git_dir.path().display());
+        fs::write(worktree.path().join(".git"), &gitdir_content).unwrap();
 
-        // Write the gitdir pointer file (absolute path)
-        let gitdir_content = format!("gitdir: {}\n", real_git_dir.display());
-        fs::write(worktree.join(".git"), &gitdir_content).unwrap();
+        assert!(!is_rebase_in_progress(worktree.path()));
 
-        // No rebase state yet
-        assert!(!is_rebase_in_progress(&worktree));
-
-        // Add rebase-merge to the real git dir
-        fs::create_dir_all(real_git_dir.join("rebase-merge")).unwrap();
-        assert!(is_rebase_in_progress(&worktree));
-
-        fs::remove_dir_all(&worktree).ok();
-        fs::remove_dir_all(&real_git_dir).ok();
+        fs::create_dir_all(real_git_dir.path().join("rebase-merge")).unwrap();
+        assert!(is_rebase_in_progress(worktree.path()));
     }
 
     #[test]
     fn test_is_rebase_in_progress_worktree_gitdir_relative_path() {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        let worktree = std::env::temp_dir().join(format!("gru-rebase-wt-rel-{}", nanos));
-        // The "real" git dir is a subdirectory of the worktree (relative path).
-        let real_git_dir = worktree.join("fake-gitdir");
+        // Simulate a git worktree with a relative gitdir pointer.
+        let worktree = tempfile::tempdir().expect("create worktree dir");
+        let real_git_dir = worktree.path().join("fake-gitdir");
         fs::create_dir_all(&real_git_dir).unwrap();
-        // Write a relative gitdir pointer
-        fs::write(worktree.join(".git"), "gitdir: fake-gitdir\n").unwrap();
+        fs::write(worktree.path().join(".git"), "gitdir: fake-gitdir\n").unwrap();
 
-        assert!(!is_rebase_in_progress(&worktree));
+        assert!(!is_rebase_in_progress(worktree.path()));
 
         fs::create_dir_all(real_git_dir.join("rebase-merge")).unwrap();
-        assert!(is_rebase_in_progress(&worktree));
+        assert!(is_rebase_in_progress(worktree.path()));
+    }
 
-        fs::remove_dir_all(&worktree).ok();
+    #[test]
+    fn test_is_rebase_in_progress_gitdir_extra_whitespace() {
+        // Verify the parser tolerates extra whitespace after "gitdir:" (e.g. "gitdir:  /path").
+        let worktree = tempfile::tempdir().expect("create worktree dir");
+        let real_git_dir = tempfile::tempdir().expect("create real git dir");
+        let gitdir_content = format!("gitdir:  {}\n", real_git_dir.path().display());
+        fs::write(worktree.path().join(".git"), &gitdir_content).unwrap();
+        fs::create_dir_all(real_git_dir.path().join("rebase-merge")).unwrap();
+        assert!(
+            is_rebase_in_progress(worktree.path()),
+            "should handle extra whitespace after 'gitdir:'"
+        );
     }
 }
