@@ -209,9 +209,10 @@ Key options: default agent backend, polling intervals, concurrency slots, merge 
 1. `gru init owner/repo` creates a bare git mirror at `~/.gru/repos/`
 2. `gru do 42` creates an isolated worktree under `~/.gru/work/`, spawns the agent, and monitors its progress via streaming JSON
 3. The agent reads the issue, explores the code, makes changes, and runs tests
-4. Gru opens a PR, watches CI, and feeds failures back to the agent for auto-fix (up to 2 attempts before escalating)
-5. Review comments are forwarded to the agent for responses
-6. Labels (`gru:todo` → `gru:in-progress` → `gru:done` / `gru:failed`) track state on GitHub
+4. After committing, the agent spawns a `code-reviewer` subagent to review changes for correctness, security, conventions, and test coverage — issues found are addressed before the PR is created
+5. Gru opens a PR, watches CI, and feeds failures back to the agent for auto-fix (up to 2 attempts before escalating)
+6. Review comments are forwarded to the agent for responses
+7. Labels (`gru:todo` → `gru:in-progress` → `gru:done` / `gru:failed`) track state on GitHub
 
 ## Roadmap
 
