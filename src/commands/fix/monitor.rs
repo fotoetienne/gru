@@ -73,8 +73,17 @@ enum AutoRebaseResult {
 async fn auto_rebase_pr(worktree_path: &Path) -> Result<AutoRebaseResult> {
     use super::super::rebase::{
         abort_rebase, attempt_rebase, check_clean_worktree, detect_base_branch, fetch_origin,
-        force_push, is_up_to_date, run_agent_rebase, RebaseOutcome,
+        force_push, is_rebase_in_progress, is_up_to_date, run_agent_rebase, RebaseOutcome,
     };
+
+    // Abort any stale in-progress rebase left by a previous crashed attempt.
+    // This must happen before check_clean_worktree because UU files from a
+    // stale rebase would otherwise cause a false "uncommitted changes" error.
+    if is_rebase_in_progress(worktree_path) {
+        log::warn!("⚠️  Stale in-progress rebase detected; aborting before retrying");
+        println!("⚠️  Aborting stale in-progress rebase...");
+        abort_rebase(worktree_path).await?;
+    }
 
     // Bail early if worktree has uncommitted changes (e.g., agent crashed mid-edit)
     check_clean_worktree(worktree_path)
