@@ -989,7 +989,19 @@ async fn implement(&mut self, plan: Plan) -> Result<(), MinionError> {
 }
 ```
 
-### 4. Review Phase
+### 4. Pre-PR Self-Review Phase
+
+Before pushing and marking the PR ready for human review, the Minion spawns a `code-reviewer` subagent to act as an adversarial reviewer with no access to the implementer's reasoning. The subagent examines the diff for:
+
+- Code correctness and logic errors
+- Security vulnerabilities
+- Error handling gaps and edge cases
+- Adherence to project conventions
+- Test coverage
+
+Any issues identified are addressed before the PR is created. This step acts as a quality gate that catches problems before they reach human reviewers or CI.
+
+### 5. Review Phase
 
 ```rust
 use tokio::time::{sleep, Duration};
@@ -1039,7 +1051,7 @@ async fn handle_review(&mut self) -> Result<(), MinionError> {
 }
 ```
 
-### 5. Completion Phase
+### 6. Completion Phase
 
 ```rust
 async fn complete(&mut self) -> Result<(), MinionError> {
