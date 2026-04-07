@@ -991,7 +991,7 @@ async fn implement(&mut self, plan: Plan) -> Result<(), MinionError> {
 
 ### 4. Pre-PR Self-Review Phase
 
-Before pushing and marking the PR ready for human review, the Minion spawns a `code-reviewer` subagent to act as an adversarial reviewer with no access to the implementer's reasoning. The subagent examines the diff for:
+After committing the implementation and before pushing, the Minion spawns a `code-reviewer` subagent to act as an independent reviewer. The subagent examines the diff for:
 
 - Code correctness and logic errors
 - Security vulnerabilities
@@ -999,7 +999,7 @@ Before pushing and marking the PR ready for human review, the Minion spawns a `c
 - Adherence to project conventions
 - Test coverage
 
-Any issues identified are addressed before the PR is created. This step acts as a quality gate that catches problems before they reach human reviewers or CI.
+Any issues identified are addressed before the PR is created, which may involve additional commits. This step acts as a quality gate that catches problems before they reach human reviewers or CI.
 
 ### 5. Review Phase
 
