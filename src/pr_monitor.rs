@@ -513,7 +513,7 @@ pub(crate) fn determine_pr_terminal_state(state: &str, merged: bool) -> Option<M
 /// comments are subsequently filtered by `get_review_feedback`.
 ///
 /// Uses inclusive `>=` so that a review landing exactly at `since` is captured;
-/// contrast with `has_unaddressed_reviews` which uses exclusive `>`.
+/// contrast with `count_unaddressed_reviews` which uses exclusive `>`.
 pub(crate) fn filter_new_external_reviews(
     reviews: &[Review],
     since: DateTime<Utc>,
@@ -590,7 +590,7 @@ async fn poll_once(
     if let Some(failed_checks) = count_completed_failures(&check_runs) {
         // Advance the review baseline so reviews are not missed when monitor_pr
         // is re-entered after CI handling in the lifecycle loop.
-        *last_check_time = Utc::now();
+        *last_check_time = review_poll_time;
         return Ok(Some(MonitorResult::FailedChecks(failed_checks)));
     }
 
@@ -604,7 +604,7 @@ async fn poll_once(
                 "Could not parse PR number '{}', skipping readiness check",
                 pr_number
             );
-            *last_check_time = Utc::now();
+            *last_check_time = review_poll_time;
             return Ok(None);
         }
     };
@@ -654,13 +654,13 @@ async fn poll_once(
     {
         // PR is ready — check if gru:auto-merge label is present (from PR data already fetched)
         if pr.has_label(AUTO_MERGE_LABEL) {
-            *last_check_time = Utc::now();
+            *last_check_time = review_poll_time;
             return Ok(Some(MonitorResult::ReadyToMerge));
         }
     }
 
     // Update last check time
-    *last_check_time = Utc::now();
+    *last_check_time = review_poll_time;
     Ok(None)
 }
 
@@ -993,7 +993,7 @@ async fn get_check_runs(host: &str, owner: &str, repo: &str, sha: &str) -> Resul
 /// Uses exclusive `>` (vs. `filter_new_external_reviews`'s inclusive `>=`) because
 /// this function is called against a baseline that was set *at* the last check,
 /// and reviews at exactly that timestamp were already processed.
-pub(crate) fn has_unaddressed_reviews(
+pub(crate) fn count_unaddressed_reviews(
     reviews: &[Review],
     minion_id: &str,
     since: DateTime<Utc>,
@@ -1375,22 +1375,22 @@ mod tests {
 
     #[test]
     fn test_review_list_deserialize() {
-        let json = r#"[
-            {
-                "id": 1,
-                "submitted_at": "2024-06-15T10:30:00Z",
-                "user": {"login": "alice"},
-                "body": "first review"
-            },
-            {
-                "id": 2,
-                "submitted_at": "2024-06-15T11:30:00Z",
-                "user": {"login": "bob"},
-                "body": "second review"
-            }
-        ]"#;
+        // Simulates `gh api --paginate ... --jq ".[]"` output: one JSON object
+        // per line, with surrounding whitespace and blank lines that should be
+        // ignored — matching the actual parsing logic in get_all_reviews.
+        let lines = "
+            {\"id\": 1, \"submitted_at\": \"2024-06-15T10:30:00Z\", \"user\": {\"login\": \"alice\"}, \"body\": \"first review\"}
 
-        let reviews: Vec<Review> = serde_json::from_str(json).unwrap();
+              {\"id\": 2, \"submitted_at\": \"2024-06-15T11:30:00Z\", \"user\": {\"login\": \"bob\"}, \"body\": \"second review\"}
+        ";
+
+        let reviews: Vec<Review> = lines
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+
         assert_eq!(reviews.len(), 2);
         assert_eq!(reviews[0].id, 1);
         assert_eq!(reviews[0].body, "first review");
@@ -2546,7 +2546,7 @@ mod tests {
     // ========================================================================
 
     #[test]
-    fn test_has_unaddressed_reviews_filters_own_minion() {
+    fn test_count_unaddressed_reviews_filters_own_minion() {
         // Reviews signed by the current Minion are excluded; external reviews
         // (whether by a human or a sibling Minion) are counted as unaddressed.
         let since = "2024-01-01T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
@@ -2566,11 +2566,11 @@ mod tests {
                 Some("Please fix the typo"),
             ),
         ];
-        assert_eq!(has_unaddressed_reviews(&reviews, "M1by", since), 1);
+        assert_eq!(count_unaddressed_reviews(&reviews, "M1by", since), 1);
     }
 
     #[test]
-    fn test_has_unaddressed_reviews_sibling_minion_counted() {
+    fn test_count_unaddressed_reviews_sibling_minion_counted() {
         // A review by a sibling Minion (M1bz) carries a different signature and
         // must be counted as unaddressed feedback for M1by.
         let since = "2024-01-01T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
@@ -2580,23 +2580,23 @@ mod tests {
             "reviewer",
             Some("Minor issue\n\n<sub>🤖 M1bz</sub>"),
         )];
-        assert_eq!(has_unaddressed_reviews(&reviews, "M1by", since), 1);
+        assert_eq!(count_unaddressed_reviews(&reviews, "M1by", since), 1);
     }
 
     #[test]
-    fn test_has_unaddressed_reviews_returns_zero_before_baseline() {
+    fn test_count_unaddressed_reviews_returns_zero_before_baseline() {
         let since = "2024-01-10T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
         let reviews = vec![
             make_review_with_body(1, "2024-01-05T00:00:00Z", "reviewer", Some("old comment")), // before baseline
             make_review_with_body(2, "2024-01-10T00:00:00Z", "reviewer", Some("at baseline")), // equal — excluded (uses >)
         ];
-        assert_eq!(has_unaddressed_reviews(&reviews, "M1by", since), 0);
+        assert_eq!(count_unaddressed_reviews(&reviews, "M1by", since), 0);
     }
 
     #[test]
-    fn test_has_unaddressed_reviews_empty_list() {
+    fn test_count_unaddressed_reviews_empty_list() {
         let since = "2024-01-01T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
-        assert_eq!(has_unaddressed_reviews(&[], "M1by", since), 0);
+        assert_eq!(count_unaddressed_reviews(&[], "M1by", since), 0);
     }
 
     #[test]
