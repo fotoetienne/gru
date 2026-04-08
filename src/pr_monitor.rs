@@ -3,6 +3,7 @@ use crate::github;
 use crate::github::DEFAULT_MAX_RETRIES;
 use crate::labels;
 use crate::merge_readiness;
+use crate::progress_comments::minion_signature_tag;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
@@ -518,7 +519,7 @@ pub(crate) fn filter_new_external_reviews(
     since: DateTime<Utc>,
     minion_id: &str,
 ) -> Vec<Review> {
-    let own_signature = format!("<sub>🤖 {}</sub>", minion_id);
+    let own_signature = minion_signature_tag(minion_id);
     reviews
         .iter()
         .filter(|r| r.submitted_at >= since && !r.body.contains(&own_signature))
@@ -548,6 +549,11 @@ async fn poll_once(
         return Ok(Some(result));
     }
 
+    // Capture the poll time before any API calls so that any review submitted
+    // while `get_all_reviews` is in flight is not silently dropped: its
+    // `submitted_at` will be >= `review_poll_time` and will therefore be
+    // visible on the next poll cycle.
+    let review_poll_time = Utc::now();
     // Fetch all reviews once, then filter for new ones to avoid a double API call.
     // The full list is reused below for merge-readiness evaluation.
     // Check for new reviews BEFORE merge conflicts so that reviewer feedback
@@ -561,7 +567,7 @@ async fn poll_once(
         // If some fetches failed we leave last_check_time unchanged so the
         // reviews are retried on the next poll cycle.
         if !feedback.had_fetch_failures {
-            *last_check_time = Utc::now();
+            *last_check_time = review_poll_time;
         }
         // Only emit NewReviews if there is actual feedback to act on.
         // DISMISSED reviews or reviews with empty bodies and no inline
@@ -758,7 +764,7 @@ fn filter_unanswered_comments(
     api_comments: Vec<ApiReviewComment>,
     minion_id: &str,
 ) -> Vec<ReviewComment> {
-    let own_signature = format!("<sub>🤖 {}</sub>", minion_id);
+    let own_signature = minion_signature_tag(minion_id);
     // Collect IDs of comments that this Minion has already directly replied to.
     let already_answered: std::collections::HashSet<u64> = api_comments
         .iter()
@@ -992,7 +998,7 @@ pub(crate) fn has_unaddressed_reviews(
     minion_id: &str,
     since: DateTime<Utc>,
 ) -> usize {
-    let own_signature = format!("<sub>🤖 {}</sub>", minion_id);
+    let own_signature = minion_signature_tag(minion_id);
     reviews
         .iter()
         .filter(|r| r.submitted_at > since && !r.body.contains(&own_signature))
