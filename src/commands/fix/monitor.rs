@@ -201,7 +201,7 @@ async fn post_exit_notification_if_needed(
         }
     };
 
-    let count = pr_monitor::count_unaddressed_reviews(&reviews, review_baseline);
+    let count = pr_monitor::has_unaddressed_reviews(&reviews, minion_id, review_baseline);
 
     if !pr_monitor::should_post_exit_notification(is_open, count) {
         return;

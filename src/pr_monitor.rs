@@ -64,7 +64,7 @@ pub(crate) struct Review {
     #[allow(dead_code)] // deserialized from GitHub API; used in tests
     pub(crate) user: User,
     #[serde(default)]
-    pub(crate) body: Option<String>,
+    pub(crate) body: String,
     /// Review state (APPROVED, CHANGES_REQUESTED, COMMENTED, DISMISSED, PENDING).
     /// Used by merge-readiness evaluation to avoid re-fetching reviews.
     #[serde(default)]
@@ -512,7 +512,7 @@ pub(crate) fn determine_pr_terminal_state(state: &str, merged: bool) -> Option<M
 /// comments are subsequently filtered by `get_review_feedback`.
 ///
 /// Uses inclusive `>=` so that a review landing exactly at `since` is captured;
-/// contrast with `count_unaddressed_reviews` which uses exclusive `>`.
+/// contrast with `has_unaddressed_reviews` which uses exclusive `>`.
 pub(crate) fn filter_new_external_reviews(
     reviews: &[Review],
     since: DateTime<Utc>,
@@ -521,10 +521,7 @@ pub(crate) fn filter_new_external_reviews(
     let own_signature = format!("<sub>🤖 {}</sub>", minion_id);
     reviews
         .iter()
-        .filter(|r| {
-            r.submitted_at >= since
-                && !r.body.as_deref().unwrap_or("").contains(&own_signature)
-        })
+        .filter(|r| r.submitted_at >= since && !r.body.contains(&own_signature))
         .cloned()
         .collect()
 }
@@ -814,15 +811,13 @@ async fn get_review_feedback(
             &review.state
         };
         if state != "DISMISSED" {
-            if let Some(ref body) = review.body {
-                let trimmed = body.trim();
-                if !trimmed.is_empty() {
-                    all_bodies.push(ReviewBody {
-                        body: trimmed.to_string(),
-                        reviewer: review.user.login.clone(),
-                        state: state.to_string(),
-                    });
-                }
+            let trimmed = review.body.trim();
+            if !trimmed.is_empty() {
+                all_bodies.push(ReviewBody {
+                    body: trimmed.to_string(),
+                    reviewer: review.user.login.clone(),
+                    state: state.to_string(),
+                });
             }
         }
 
@@ -980,21 +975,27 @@ async fn get_check_runs(host: &str, owner: &str, repo: &str, sha: &str) -> Resul
     Ok(check_runs)
 }
 
-/// Returns the count of non-Minion reviews submitted after `since`.
+/// Returns the count of external reviews submitted after `since` that are not
+/// authored by the current Minion.
 ///
-/// "Unaddressed" means: submitted after the baseline and not authored by a
-/// Minion (identified by the `<sub>🤖` signature in the review body).
-/// Used to decide whether to post a monitoring-paused notification on exit.
-pub(crate) fn count_unaddressed_reviews(reviews: &[Review], since: DateTime<Utc>) -> usize {
+/// Uses the same signature-based identity check as `filter_new_external_reviews`:
+/// a review is considered authored by the current Minion when its body contains
+/// `<sub>🤖 {minion_id}</sub>`.  This ensures that reviews by a sibling Minion
+/// (which shares the same `user.login`) are counted as unaddressed feedback,
+/// matching the wake-up semantics in the lab scanner.
+///
+/// Uses exclusive `>` (vs. `filter_new_external_reviews`'s inclusive `>=`) because
+/// this function is called against a baseline that was set *at* the last check,
+/// and reviews at exactly that timestamp were already processed.
+pub(crate) fn has_unaddressed_reviews(
+    reviews: &[Review],
+    minion_id: &str,
+    since: DateTime<Utc>,
+) -> usize {
+    let own_signature = format!("<sub>🤖 {}</sub>", minion_id);
     reviews
         .iter()
-        .filter(|r| {
-            r.submitted_at > since
-                && !r
-                    .body
-                    .as_deref()
-                    .is_some_and(crate::progress_comments::has_minion_signature)
-        })
+        .filter(|r| r.submitted_at > since && !r.body.contains(&own_signature))
         .count()
 }
 
@@ -1343,7 +1344,7 @@ mod tests {
 
         let review: Review = serde_json::from_str(json).unwrap();
         assert_eq!(review.id, 12345);
-        assert_eq!(review.user.login, "reviewer");
+        assert_eq!(review.body, "");
     }
 
     #[test]
@@ -1363,26 +1364,32 @@ mod tests {
 
         let review: Review = serde_json::from_str(json).unwrap();
         assert_eq!(review.id, 12345);
-        assert_eq!(review.user.login, "reviewer");
+        assert_eq!(review.body, "Please fix this");
     }
 
     #[test]
-    fn test_review_line_by_line_deserialize() {
-        // Simulates --jq ".[]" output: one JSON object per line
-        let lines = r#"{"id": 1, "submitted_at": "2024-06-15T10:30:00Z", "user": {"login": "alice"}}
-{"id": 2, "submitted_at": "2024-06-15T11:30:00Z", "user": {"login": "bob"}}"#;
+    fn test_review_list_deserialize() {
+        let json = r#"[
+            {
+                "id": 1,
+                "submitted_at": "2024-06-15T10:30:00Z",
+                "user": {"login": "alice"},
+                "body": "first review"
+            },
+            {
+                "id": 2,
+                "submitted_at": "2024-06-15T11:30:00Z",
+                "user": {"login": "bob"},
+                "body": "second review"
+            }
+        ]"#;
 
-        let reviews: Vec<Review> = lines
-            .lines()
-            .filter(|l| !l.trim().is_empty())
-            .map(|l| serde_json::from_str(l).unwrap())
-            .collect();
-
+        let reviews: Vec<Review> = serde_json::from_str(json).unwrap();
         assert_eq!(reviews.len(), 2);
         assert_eq!(reviews[0].id, 1);
-        assert_eq!(reviews[0].user.login, "alice");
+        assert_eq!(reviews[0].body, "first review");
         assert_eq!(reviews[1].id, 2);
-        assert_eq!(reviews[1].user.login, "bob");
+        assert_eq!(reviews[1].body, "second review");
     }
 
     #[test]
@@ -1889,7 +1896,7 @@ mod tests {
         let original = make_api_comment(1, "Please fix this.", None);
         let minion_reply = make_api_comment(2, "Done!\n\n<sub>🤖 M001</sub>", Some(1));
 
-        let result = filter_unanswered_comments(vec![original, minion_reply]);
+        let result = filter_unanswered_comments(vec![original, minion_reply], "M001");
         assert!(
             result.is_empty(),
             "Already-answered comment should be filtered out"
@@ -1903,7 +1910,8 @@ mod tests {
         let unanswered_root = make_api_comment(2, "Add error handling.", None);
         let minion_reply = make_api_comment(3, "Fixed!\n\n<sub>🤖 M001</sub>", Some(1));
 
-        let result = filter_unanswered_comments(vec![answered_root, unanswered_root, minion_reply]);
+        let result =
+            filter_unanswered_comments(vec![answered_root, unanswered_root, minion_reply], "M001");
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].comment_id, 2);
         assert_eq!(result[0].body, "Add error handling.");
@@ -1911,7 +1919,7 @@ mod tests {
 
     #[test]
     fn test_filter_unanswered_comments_empty_input() {
-        let result = filter_unanswered_comments(vec![]);
+        let result = filter_unanswered_comments(vec![], "M001");
         assert!(result.is_empty());
     }
 
@@ -1922,7 +1930,7 @@ mod tests {
         let orphan_minion = make_api_comment(1, "Done!\n\n<sub>🤖 M001</sub>", None);
         let unrelated = make_api_comment(2, "Please fix this.", None);
 
-        let result = filter_unanswered_comments(vec![orphan_minion, unrelated]);
+        let result = filter_unanswered_comments(vec![orphan_minion, unrelated], "M001");
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].comment_id, 2);
     }
@@ -2095,7 +2103,7 @@ mod tests {
             user: User {
                 login: "reviewer".to_string(),
             },
-            body: None,
+            body: String::new(),
             state: String::new(),
         }
     }
@@ -2173,7 +2181,7 @@ mod tests {
             user: User {
                 login: login.to_string(),
             },
-            body: body.map(|s| s.to_string()),
+            body: body.unwrap_or("").to_string(),
             state: String::new(),
         }
     }
@@ -2185,7 +2193,7 @@ mod tests {
             user: User {
                 login: login.to_string(),
             },
-            body: None,
+            body: String::new(),
             state: String::new(),
         }
     }
@@ -2201,7 +2209,7 @@ mod tests {
                 "fotoetienne",
                 Some("Looks good\n\n<sub>🤖 M1by</sub>"),
             ),
-            make_review_by(2, "2024-06-15T11:00:00Z", "external-reviewer"),
+            make_review(2, "2024-06-15T11:00:00Z"),
         ];
 
         let filtered = filter_new_external_reviews(&reviews, since, "M1by");
@@ -2531,42 +2539,58 @@ mod tests {
     // Exit Notification Tests
     // ========================================================================
 
-    fn make_review_for_exit(submitted_at: &str, body: Option<&str>) -> Review {
-        Review {
-            id: 1,
-            submitted_at: submitted_at.parse().unwrap(),
-            user: User {
-                login: "reviewer".to_string(),
-            },
-            body: body.map(|s| s.to_string()),
-            state: String::new(),
-        }
-    }
-
     #[test]
-    fn test_count_unaddressed_reviews_excludes_minion_reviews() {
+    fn test_has_unaddressed_reviews_filters_own_minion() {
+        // Reviews signed by the current Minion are excluded; external reviews
+        // (whether by a human or a sibling Minion) are counted as unaddressed.
         let since = "2024-01-01T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
         let reviews = vec![
-            make_review_for_exit("2024-01-02T00:00:00Z", Some("Done.\n\n<sub>🤖 M001</sub>")), // Minion — excluded
-            make_review_for_exit("2024-01-02T00:00:00Z", Some("Please fix this.")), // human
+            // M1by's own review (e.g. self-review) — excluded
+            make_review_with_body(
+                1,
+                "2024-01-02T00:00:00Z",
+                "reviewer",
+                Some("LGTM\n\n<sub>🤖 M1by</sub>"),
+            ),
+            // External reviewer (no Minion signature) — counted
+            make_review_with_body(
+                2,
+                "2024-01-02T00:00:00Z",
+                "reviewer",
+                Some("Please fix the typo"),
+            ),
         ];
-        assert_eq!(count_unaddressed_reviews(&reviews, since), 1);
+        assert_eq!(has_unaddressed_reviews(&reviews, "M1by", since), 1);
     }
 
     #[test]
-    fn test_count_unaddressed_reviews_returns_zero_before_baseline() {
+    fn test_has_unaddressed_reviews_sibling_minion_counted() {
+        // A review by a sibling Minion (M1bz) carries a different signature and
+        // must be counted as unaddressed feedback for M1by.
+        let since = "2024-01-01T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        let reviews = vec![make_review_with_body(
+            1,
+            "2024-01-02T00:00:00Z",
+            "reviewer",
+            Some("Minor issue\n\n<sub>🤖 M1bz</sub>"),
+        )];
+        assert_eq!(has_unaddressed_reviews(&reviews, "M1by", since), 1);
+    }
+
+    #[test]
+    fn test_has_unaddressed_reviews_returns_zero_before_baseline() {
         let since = "2024-01-10T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
         let reviews = vec![
-            make_review_for_exit("2024-01-05T00:00:00Z", None), // before baseline
-            make_review_for_exit("2024-01-10T00:00:00Z", None), // equal to baseline — excluded (uses >)
+            make_review_with_body(1, "2024-01-05T00:00:00Z", "reviewer", Some("old comment")), // before baseline
+            make_review_with_body(2, "2024-01-10T00:00:00Z", "reviewer", Some("at baseline")), // equal — excluded (uses >)
         ];
-        assert_eq!(count_unaddressed_reviews(&reviews, since), 0);
+        assert_eq!(has_unaddressed_reviews(&reviews, "M1by", since), 0);
     }
 
     #[test]
-    fn test_count_unaddressed_reviews_empty_list() {
+    fn test_has_unaddressed_reviews_empty_list() {
         let since = "2024-01-01T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
-        assert_eq!(count_unaddressed_reviews(&[], since), 0);
+        assert_eq!(has_unaddressed_reviews(&[], "M1by", since), 0);
     }
 
     #[test]

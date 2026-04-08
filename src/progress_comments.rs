@@ -6,6 +6,7 @@ use chrono::{DateTime, Utc};
 /// Validates that the final `<sub>🤖 …</sub>` fragment contains a non-empty
 /// ID with no embedded HTML or newline characters, preventing false positives
 /// from comments that happen to end with an unrelated `</sub>` tag.
+#[allow(dead_code)] // used in tests; may be used for general signature detection in future callers
 pub(crate) fn has_minion_signature(body: &str) -> bool {
     let trimmed = body.trim_end();
     if !trimmed.ends_with("</sub>") {
@@ -88,6 +89,16 @@ impl ProgressUpdate {
 /// it from blending into the last line of content.
 pub(crate) fn minion_signature(id: &str) -> String {
     format!("\n\n<sub>🤖 {}</sub>", id)
+}
+
+/// Returns the bare HTML tag used to identify a Minion-authored comment body.
+///
+/// Use this for `contains()` matching when detecting whether a review or
+/// comment body was authored by a specific Minion.  Unlike `minion_signature`,
+/// this does not include leading newlines, so it matches the tag regardless of
+/// position within the body string.
+pub(crate) fn minion_signature_tag(id: &str) -> String {
+    format!("<sub>🤖 {}</sub>", id)
 }
 
 /// Format an escalation comment with a consistent structure.
