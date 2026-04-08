@@ -410,6 +410,7 @@ pub(crate) async fn monitor_pr(
     pr_number: &str,
     max_duration: Option<Duration>,
     baseline: Option<DateTime<Utc>>,
+    minion_id: &str,
 ) -> Result<(MonitorResult, DateTime<Utc>)> {
     let start_time = Instant::now();
 
@@ -440,7 +441,7 @@ pub(crate) async fn monitor_pr(
 
         // Race the polling iteration against Ctrl+C
         tokio::select! {
-            result = poll_once(host, owner, repo, pr_number, &mut last_check_time, &mut was_ready) => {
+            result = poll_once(host, owner, repo, pr_number, &mut last_check_time, &mut was_ready, minion_id) => {
                 if let Some(monitor_result) = result? {
                     return Ok((monitor_result, last_check_time));
                 }
@@ -496,27 +497,33 @@ pub(crate) fn determine_pr_terminal_state(state: &str, merged: bool) -> Option<M
     }
 }
 
-/// Filter reviews to only include those submitted at or after `since` by
-/// non-Minion authors.
+/// Filter reviews to only include those submitted at or after `since` that were
+/// not authored by the current Minion.
 ///
-/// This excludes the minion's own reviews (to prevent feedback loops) and old
-/// reviews (already processed in a previous poll cycle). Uses inclusive `>=` so
-/// that a review landing exactly at `since` is captured; contrast with
-/// `count_unaddressed_reviews` which uses exclusive `>` for a different purpose.
+/// A review is considered authored by the current Minion when its body contains
+/// the Minion's own signature (`<sub>🤖 {minion_id}</sub>`).  Using the
+/// signature rather than `user.login` correctly handles the case where multiple
+/// Minions operate as the same GitHub user: a review posted by Minion M1bz will
+/// carry M1bz's signature and must pass through as external feedback for M1by,
+/// even though both share the same `user.login`.
 ///
-/// Excludes Minion-authored reviews by checking for the Minion signature
-/// (`<sub>🤖`) in the review body, rather than matching by username. This
-/// correctly handles the common case where the Minion and the human share
-/// the same GitHub account.
-pub(crate) fn filter_new_external_reviews(reviews: &[Review], since: DateTime<Utc>) -> Vec<Review> {
+/// Reviews with an empty body (e.g. GitHub's implicit review objects created
+/// when a Minion posts inline reply comments) also pass through; their inline
+/// comments are subsequently filtered by `get_review_feedback`.
+///
+/// Uses inclusive `>=` so that a review landing exactly at `since` is captured;
+/// contrast with `count_unaddressed_reviews` which uses exclusive `>`.
+pub(crate) fn filter_new_external_reviews(
+    reviews: &[Review],
+    since: DateTime<Utc>,
+    minion_id: &str,
+) -> Vec<Review> {
+    let own_signature = format!("<sub>🤖 {}</sub>", minion_id);
     reviews
         .iter()
         .filter(|r| {
             r.submitted_at >= since
-                && !r
-                    .body
-                    .as_deref()
-                    .is_some_and(crate::progress_comments::has_minion_signature)
+                && !r.body.as_deref().unwrap_or("").contains(&own_signature)
         })
         .cloned()
         .collect()
@@ -533,6 +540,7 @@ async fn poll_once(
     pr_number: &str,
     last_check_time: &mut DateTime<Utc>,
     was_ready: &mut bool,
+    minion_id: &str,
 ) -> Result<Option<MonitorResult>> {
     // Fetch PR state
     let pr = get_pr(host, owner, repo, pr_number).await?;
@@ -548,9 +556,10 @@ async fn poll_once(
     // Check for new reviews BEFORE merge conflicts so that reviewer feedback
     // is never silently dropped when conflicts and reviews overlap.
     let all_reviews = get_all_reviews(host, owner, repo, pr_number).await?;
-    let new_reviews = filter_new_external_reviews(&all_reviews, *last_check_time);
+    let new_reviews = filter_new_external_reviews(&all_reviews, *last_check_time, minion_id);
     if !new_reviews.is_empty() {
-        let feedback = get_review_feedback(host, owner, repo, pr_number, &new_reviews).await?;
+        let feedback =
+            get_review_feedback(host, owner, repo, pr_number, &new_reviews, minion_id).await?;
         // Only advance the baseline when we successfully fetched all reviews.
         // If some fetches failed we leave last_check_time unchanged so the
         // reviews are retried on the next poll cycle.
@@ -739,21 +748,25 @@ pub(crate) async fn get_all_reviews(
 }
 
 /// Convert a list of raw API review comments into `ReviewComment`s, skipping:
-/// - Minion reply comments (identified by the Minion signature in their body)
-/// - Comments that a Minion has already directly replied to
+/// - The current Minion's own reply comments (identified by its specific signature)
+/// - Comments that the current Minion has already directly replied to
 ///   (identified by appearing as `in_reply_to_id` on a Minion reply comment)
 ///
-/// Note: the GitHub `reviews/{id}/comments` endpoint returns all comments in
-/// the thread, including reply comments posted outside of a formal review
-/// submission. This means Minion reply comments appear in the same batch as
-/// the original reviewer comments, making the `already_answered` check
-/// effective.
-fn filter_unanswered_comments(api_comments: Vec<ApiReviewComment>) -> Vec<ReviewComment> {
-    // Collect IDs of comments that a Minion has already directly replied to.
+/// This function is called once on the full set of comments accumulated across
+/// all reviews in the batch (Bug 2 fix).  Because GitHub stores a Minion's reply
+/// comments in implicit review objects (with empty bodies), accumulating across
+/// all reviews makes those prior replies visible when building `already_answered`,
+/// preventing duplicate replies after a session restart.
+fn filter_unanswered_comments(
+    api_comments: Vec<ApiReviewComment>,
+    minion_id: &str,
+) -> Vec<ReviewComment> {
+    let own_signature = format!("<sub>🤖 {}</sub>", minion_id);
+    // Collect IDs of comments that this Minion has already directly replied to.
     let already_answered: std::collections::HashSet<u64> = api_comments
         .iter()
         .filter_map(|c| {
-            if crate::progress_comments::has_minion_signature(&c.body) {
+            if c.body.contains(&own_signature) {
                 c.in_reply_to_id
             } else {
                 None
@@ -763,10 +776,7 @@ fn filter_unanswered_comments(api_comments: Vec<ApiReviewComment>) -> Vec<Review
 
     api_comments
         .into_iter()
-        .filter(|c| {
-            !crate::progress_comments::has_minion_signature(&c.body)
-                && !already_answered.contains(&c.id)
-        })
+        .filter(|c| !c.body.contains(&own_signature) && !already_answered.contains(&c.id))
         .map(|c| ReviewComment {
             file: c.path,
             line: c.line,
@@ -777,16 +787,20 @@ fn filter_unanswered_comments(api_comments: Vec<ApiReviewComment>) -> Vec<Review
         .collect()
 }
 
-/// Fetch review bodies and inline comments for specific reviews with retry logic
+/// Fetch review bodies and inline comments for specific reviews with retry logic.
+///
+/// Raw inline comments are accumulated from *all* reviews first, then
+/// `filter_unanswered_comments` is called once on the full set (Bug 2 fix).
 async fn get_review_feedback(
     host: &str,
     owner: &str,
     repo: &str,
     pr_number: &str,
     reviews: &[Review],
+    minion_id: &str,
 ) -> Result<ReviewFeedback> {
     let repo_full = github::repo_slug(owner, repo);
-    let mut all_comments = Vec::new();
+    let mut raw_comments: Vec<ApiReviewComment> = Vec::new();
     let mut all_bodies = Vec::new();
     let mut failed_reviews = 0;
 
@@ -839,7 +853,7 @@ async fn get_review_feedback(
         let api_comments: Vec<ApiReviewComment> = serde_json::from_slice(&output.stdout)
             .context("Failed to parse review comments JSON response")?;
 
-        all_comments.extend(filter_unanswered_comments(api_comments));
+        raw_comments.extend(api_comments);
     }
 
     // Log summary if any reviews failed to fetch
@@ -850,6 +864,9 @@ async fn get_review_feedback(
             reviews.len()
         );
     }
+
+    // Filter all accumulated comments at once (Bug 2 fix: cross-review dedup)
+    let all_comments = filter_unanswered_comments(raw_comments, minion_id);
 
     Ok(ReviewFeedback {
         comments: all_comments,
@@ -2091,7 +2108,7 @@ mod tests {
             make_review(2, "2024-06-15T11:00:00Z"), // After - included
         ];
 
-        let filtered = filter_new_external_reviews(&reviews, since);
+        let filtered = filter_new_external_reviews(&reviews, since, "M001");
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].id, 2);
     }
@@ -2102,7 +2119,7 @@ mod tests {
         let since: DateTime<Utc> = "2024-06-15T10:00:00Z".parse().unwrap();
         let reviews = vec![make_review(1, "2024-06-15T10:00:00Z")];
 
-        let filtered = filter_new_external_reviews(&reviews, since);
+        let filtered = filter_new_external_reviews(&reviews, since, "M001");
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].id, 1);
     }
@@ -2115,7 +2132,7 @@ mod tests {
             make_review(2, "2024-06-15T09:59:59Z"),
         ];
 
-        let filtered = filter_new_external_reviews(&reviews, since);
+        let filtered = filter_new_external_reviews(&reviews, since, "M001");
         assert!(filtered.is_empty());
     }
 
@@ -2124,7 +2141,7 @@ mod tests {
         let since: DateTime<Utc> = "2024-06-15T10:00:00Z".parse().unwrap();
         let reviews: Vec<Review> = vec![];
 
-        let filtered = filter_new_external_reviews(&reviews, since);
+        let filtered = filter_new_external_reviews(&reviews, since, "M001");
         assert!(filtered.is_empty());
     }
 
@@ -2137,7 +2154,7 @@ mod tests {
             make_review(3, "2024-06-16T10:00:00Z"),
         ];
 
-        let filtered = filter_new_external_reviews(&reviews, since);
+        let filtered = filter_new_external_reviews(&reviews, since, "M001");
         assert_eq!(filtered.len(), 3);
     }
 
@@ -2161,32 +2178,41 @@ mod tests {
         }
     }
 
+    fn make_review_by(id: u64, timestamp: &str, login: &str) -> Review {
+        Review {
+            id,
+            submitted_at: timestamp.parse().unwrap(),
+            user: User {
+                login: login.to_string(),
+            },
+            body: None,
+            state: String::new(),
+        }
+    }
+
     #[test]
-    fn test_minion_review_excluded_by_signature() {
+    fn test_self_review_excluded_from_new_reviews() {
+        // A review signed by the current Minion is excluded; other reviews pass.
         let since: DateTime<Utc> = "2024-06-15T10:00:00Z".parse().unwrap();
         let reviews = vec![
             make_review_with_body(
                 1,
                 "2024-06-15T11:00:00Z",
                 "fotoetienne",
-                Some("Looks good!\n\n<sub>🤖 M001</sub>"),
+                Some("Looks good\n\n<sub>🤖 M1by</sub>"),
             ),
-            make_review_with_body(
-                2,
-                "2024-06-15T11:00:00Z",
-                "fotoetienne",
-                Some("Please fix the error handling here."),
-            ),
+            make_review_by(2, "2024-06-15T11:00:00Z", "external-reviewer"),
         ];
 
-        let filtered = filter_new_external_reviews(&reviews, since);
+        let filtered = filter_new_external_reviews(&reviews, since, "M1by");
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].id, 2);
     }
 
     #[test]
     fn test_same_user_human_review_kept() {
-        // Core scenario from issue #751: human and Minion share the same account
+        // Core scenario from issue #751: human and Minion share the same account.
+        // A review with no Minion signature passes through regardless of login.
         let since: DateTime<Utc> = "2024-06-15T10:00:00Z".parse().unwrap();
         let reviews = vec![make_review_with_body(
             1,
@@ -2195,7 +2221,7 @@ mod tests {
             Some("Three nits on the error handling."),
         )];
 
-        let filtered = filter_new_external_reviews(&reviews, since);
+        let filtered = filter_new_external_reviews(&reviews, since, "M1by");
         assert_eq!(filtered.len(), 1);
     }
 
@@ -2210,30 +2236,69 @@ mod tests {
             None,
         )];
 
-        let filtered = filter_new_external_reviews(&reviews, since);
+        let filtered = filter_new_external_reviews(&reviews, since, "M1by");
         assert_eq!(filtered.len(), 1);
     }
 
     #[test]
-    fn test_only_minion_reviews_returns_empty() {
+    fn test_only_self_reviews_returns_empty() {
+        // All reviews signed by the current Minion → empty result.
         let since: DateTime<Utc> = "2024-06-15T10:00:00Z".parse().unwrap();
         let reviews = vec![
             make_review_with_body(
                 1,
                 "2024-06-15T11:00:00Z",
                 "fotoetienne",
-                Some("LGTM\n\n<sub>🤖 M001</sub>"),
+                Some("LGTM\n\n<sub>🤖 M1by</sub>"),
             ),
             make_review_with_body(
                 2,
                 "2024-06-15T12:00:00Z",
                 "fotoetienne",
-                Some("Fixed.\n\n<sub>🤖 M002</sub>"),
+                Some("Fixed.\n\n<sub>🤖 M1by</sub>"),
             ),
         ];
 
-        let filtered = filter_new_external_reviews(&reviews, since);
+        let filtered = filter_new_external_reviews(&reviews, since, "M1by");
         assert!(filtered.is_empty());
+    }
+
+    #[test]
+    fn test_other_minion_review_is_included() {
+        // Bug 1: A review by a different Minion (M1bz) on the same GitHub user
+        // must be treated as external feedback for M1by, even though both share
+        // the same user.login.
+        let since: DateTime<Utc> = "2024-06-15T10:00:00Z".parse().unwrap();
+        let reviews = vec![
+            // M1bz posts a review — different signature, same GitHub user
+            make_review_with_body(
+                1,
+                "2024-06-15T11:00:00Z",
+                "fotoetienne",
+                Some("Minor observation\n\n<sub>🤖 M1bz</sub>"),
+            ),
+            // M1by's own implicit reply review (empty body)
+            make_review_by(2, "2024-06-15T11:30:00Z", "fotoetienne"),
+        ];
+
+        let filtered = filter_new_external_reviews(&reviews, since, "M1by");
+        // M1bz's review passes (different signature)
+        // M1by's empty-body reply review also passes (no own signature)
+        assert_eq!(filtered.len(), 2);
+        assert!(filtered.iter().any(|r| r.id == 1)); // M1bz's review included
+    }
+
+    #[test]
+    fn test_empty_body_review_passes_filter() {
+        // GitHub creates implicit review objects with empty bodies when a Minion
+        // posts inline reply comments.  These must pass the filter so that
+        // get_review_feedback can inspect their inline comments for the
+        // already_answered set.
+        let since: DateTime<Utc> = "2024-06-15T10:00:00Z".parse().unwrap();
+        let reviews = vec![make_review_by(1, "2024-06-15T11:00:00Z", "fotoetienne")];
+
+        let filtered = filter_new_external_reviews(&reviews, since, "M1by");
+        assert_eq!(filtered.len(), 1);
     }
 
     #[test]
@@ -2247,7 +2312,7 @@ mod tests {
             Some("Consider using a constant here."),
         )];
 
-        let filtered = filter_new_external_reviews(&reviews, since);
+        let filtered = filter_new_external_reviews(&reviews, since, "M1by");
         assert_eq!(filtered.len(), 1);
     }
 

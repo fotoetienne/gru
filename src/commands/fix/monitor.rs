@@ -1323,6 +1323,7 @@ pub(crate) async fn monitor_pr_lifecycle(
             ctx.pr_number,
             remaining,
             state.review_baseline,
+            &ctx.wt_ctx.minion_id,
         )
         .await;
 
