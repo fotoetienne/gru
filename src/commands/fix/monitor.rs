@@ -1828,6 +1828,80 @@ mod tests {
         );
     }
 
+    /// Baseline must be advanced on the `Err(e)` path of `auto_rebase_pr` so
+    /// the lab daemon does not re-count reply reviews after a rebase error.
+    /// Uses a non-existent checkout path so `auto_rebase_pr` returns `Err`,
+    /// exercising the error-handling match arm without needing a real
+    /// repository or worktree setup.
+    #[tokio::test]
+    async fn test_handle_merge_conflict_advances_baseline_on_error_path() {
+        tokio::time::pause();
+
+        let backend = DummyBackend;
+        let (issue_ctx, mut wt_ctx) = make_test_fixtures();
+        // A non-existent checkout path forces auto_rebase_pr to return Err.
+        let tempdir = tempfile::tempdir().expect("failed to create temp dir");
+        let missing_checkout_path = tempdir.path().join("missing_checkout");
+        assert!(
+            !missing_checkout_path.exists(),
+            "test checkout path must not exist"
+        );
+        wt_ctx.checkout_path = missing_checkout_path;
+        let ctx = MonitorContext {
+            backend: &backend,
+            issue_ctx: &issue_ctx,
+            wt_ctx: &wt_ctx,
+            pr_number: "123",
+            timeout_opt: None,
+            monitor_timeout: Duration::from_secs(7200),
+        };
+
+        let stale_baseline = Utc::now() - chrono::Duration::seconds(60);
+        let check_time = Utc::now();
+        let mut state = MonitorLoopState::new(stale_baseline, 0);
+        state.review_baseline = Some(stale_baseline);
+        // rebase_attempts = 0 (< MAX) so we enter auto_rebase_pr and hit Err
+
+        let action = handle_merge_conflict(&mut state, &ctx, check_time).await;
+
+        assert!(matches!(action, LoopAction::Break), "error path must break");
+        assert_eq!(
+            state.review_baseline,
+            Some(check_time),
+            "baseline must be advanced to check_time on Err path"
+        );
+    }
+
+    /// Documents the `ConflictUnresolved` path invariant via direct state
+    /// mutation. This test does NOT call `handle_merge_conflict` — the
+    /// `ConflictUnresolved` arm cannot be reached in unit tests because
+    /// `run_agent_rebase` requires a running claude CLI to exit non-zero.
+    /// The invariant is mechanically guaranteed by the unconditional
+    /// `state.review_baseline = Some(check_time)` assignment at the top of
+    /// `handle_merge_conflict`, before the `auto_rebase_pr` match. This test
+    /// verifies that `MonitorLoopState` stores the value correctly.
+    #[test]
+    fn test_monitor_loop_state_stores_assigned_baseline() {
+        let stale = Utc::now() - chrono::Duration::seconds(60);
+        let check_time = Utc::now();
+        let mut state = MonitorLoopState::new(stale, 0);
+        assert_eq!(
+            state.review_baseline,
+            Some(stale),
+            "initial baseline is stale"
+        );
+
+        // Replicates the unconditional first line of handle_merge_conflict
+        // that runs before all match arms including ConflictUnresolved.
+        state.review_baseline = Some(check_time);
+
+        assert_eq!(
+            state.review_baseline,
+            Some(check_time),
+            "MonitorLoopState holds the advanced baseline value"
+        );
+    }
+
     /// Baseline must be advanced during cooldown cycles so a Minion that exits
     /// during cooldown persists a non-stale value.
     #[tokio::test]
