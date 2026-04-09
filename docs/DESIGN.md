@@ -390,9 +390,10 @@ The **Scheduler** assigns issues to available Minion slots.
 1. Issues with `priority:critical` label
 2. Issues with `priority:high` label
 3. Issues with `priority:medium` label
-4. Unlabeled issues (treated as between medium and low)
+4. Unlabeled issues (falls between medium and low)
 5. Issues with `priority:low` label
-6. Within the same priority tier, oldest issues first (FIFO)
+
+Within the same tier, oldest issues first (FIFO).
 
 **Slot Management:**
 ```rust
