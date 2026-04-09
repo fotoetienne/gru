@@ -1193,6 +1193,25 @@ When addressing a reviewer in any reply, use the name shown in backticks in the 
 **Reviewer:** line (e.g., write `Alice Johnson,` or `M0ab,` — never `@login`).\n\n",
     );
 
+    // Instruct the agent to reply to top-level review bodies
+    if !feedback.bodies.is_empty() {
+        prompt.push_str(&format!(
+            "After committing your changes, post a reply to the PR thread for each review body \
+above to explain what you changed. Post EXACTLY ONE reply per review — do not post duplicate \
+replies. Post each reply in a separate sequential step — do not batch reply API calls with each \
+other or with git operations such as push.\n\n\
+For each review body, post a PR comment using the GitHub API:\n\n\
+```\n\
+gh api --method POST repos/{owner}/{repo}/issues/{pr_number}/comments \\\n  \
+-f body=$'<reply text>\\n\\n<sub>🤖 {minion_id}</sub>'\n\
+```\n\n\
+Each reply must:\n\
+- Open by addressing the reviewer by the name shown in backticks in the **Reviewer:** line (e.g., `Alice Johnson,` or `alice-dev,`)\n\
+- Summarize what was changed to address the feedback\n\
+- End with the signature: `\\n\\n<sub>🤖 {minion_id}</sub>`\n\n"
+        ));
+    }
+
     // Instruct the agent to reply to each inline review comment thread
     if !feedback.comments.is_empty() {
         prompt.push_str(&format!(
@@ -1540,11 +1559,11 @@ mod tests {
         assert!(prompt.contains("**Reviewer:** `dave` (@dave)"));
         assert!(prompt.contains("Consider refactoring the error handling"));
         assert!(prompt.contains("Please make the requested changes"));
-        // No inline comments, so no in_reply_to instructions or anti-duplication block
+        // Review body present: should include signature instruction and PR comment API
+        assert!(prompt.contains("<sub>🤖 M001</sub>"));
+        assert!(prompt.contains("repos/octocat/hello-world/issues/99/comments"));
+        // No inline comments, so no in_reply_to instructions
         assert!(!prompt.contains("in_reply_to"));
-        assert!(!prompt.contains("EXACTLY ONE reply per comment ID"));
-        assert!(!prompt.contains("in a separate sequential step"));
-        assert!(!prompt.contains("do not batch reply API calls"));
     }
 
     #[test]
