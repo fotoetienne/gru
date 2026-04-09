@@ -175,7 +175,10 @@ pub(crate) async fn fetch_base_branch(worktree_path: &Path, base_branch: &str) -
         .args(["fetch", "origin", base_branch])
         .output()
         .await
-        .context("Failed to execute git fetch origin")?;
+        .context(format!(
+            "Failed to execute git fetch origin {}",
+            base_branch
+        ))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -538,7 +541,7 @@ pub(crate) async fn force_push(worktree_path: &Path) -> Result<()> {
     anyhow::bail!(
         "git push --force-with-lease failed: {}\n\
          The remote branch may have been updated since your last fetch.\n\
-         Run `git fetch origin` and try again.",
+         Run `git fetch origin <base_branch>` and try again.",
         stderr.trim()
     );
 }
