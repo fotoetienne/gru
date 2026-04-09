@@ -430,8 +430,7 @@ enum Commands {
         )]
         stop_minions: bool,
     },
-    /// Generate shell completions
-    #[command(hide = true)]
+    #[command(about = "Generate shell completions", hide = true)]
     Completions { shell: clap_complete::Shell },
 }
 
