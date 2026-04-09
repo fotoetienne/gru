@@ -67,6 +67,12 @@ URL: https://github.com/{{ repo_owner }}/{{ repo_name }}/issues/{{ issue_number 
 - Check CLAUDE.md for project-specific build/test commands
 - Run tests to verify the fix
 
+**Embedding file URLs (screenshots, images, diagrams):** If you commit a file and reference it in a PR description or comment, use the commit SHA — not the branch name — as the ref:
+```
+https://raw.githubusercontent.com/{{ repo_owner }}/{{ repo_name }}/<sha>/path/to/file.png
+```
+After committing, get the SHA with `git rev-parse HEAD`. Branch names are deleted after merge; commit SHAs are permanent.
+
 ## 4. Code Review
 - Make a commit with the changes, prefixing the commit message with your Minion ID, e.g. `[{{ minion_id }}] Fix null pointer in parser`
 - Use the Task tool with `subagent_type='code-reviewer'` to perform an autonomous code review
