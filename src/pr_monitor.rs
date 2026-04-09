@@ -1213,10 +1213,13 @@ mod tests {
             had_fetch_failures: false,
         };
 
-        let prompt = format_review_prompt(Some(786), "42", &feedback, "octocat", "hello-world", "M001");
+        let prompt =
+            format_review_prompt(Some(786), "42", &feedback, "octocat", "hello-world", "M001");
 
         // Display name wrapped in backticks with login in parens
         assert!(prompt.contains("**Reviewer:** `Stephen Spalding` (@sspalding)"));
+        // Login-only rendering should NOT appear when a distinct display name is available
+        assert!(!prompt.contains("**Reviewer:** `sspalding` (@sspalding)"));
         // Reply instruction should tell Claude to address by display name
         assert!(prompt.contains("Open by addressing the reviewer"));
     }
@@ -1956,7 +1959,8 @@ mod tests {
         let original = make_api_comment(1, "Please fix this.", None);
         let minion_reply = make_api_comment(2, "Done!\n\n<sub>🤖 M001</sub>", Some(1));
 
-        let result = filter_unanswered_comments(vec![original, minion_reply], "M001");
+        let result =
+            filter_unanswered_comments(vec![original, minion_reply], "M001", &Default::default());
         assert!(
             result.is_empty(),
             "Already-answered comment should be filtered out"
@@ -1970,8 +1974,11 @@ mod tests {
         let unanswered_root = make_api_comment(2, "Add error handling.", None);
         let minion_reply = make_api_comment(3, "Fixed!\n\n<sub>🤖 M001</sub>", Some(1));
 
-        let result =
-            filter_unanswered_comments(vec![answered_root, unanswered_root, minion_reply], "M001");
+        let result = filter_unanswered_comments(
+            vec![answered_root, unanswered_root, minion_reply],
+            "M001",
+            &Default::default(),
+        );
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].comment_id, 2);
         assert_eq!(result[0].body, "Add error handling.");
@@ -1979,7 +1986,7 @@ mod tests {
 
     #[test]
     fn test_filter_unanswered_comments_empty_input() {
-        let result = filter_unanswered_comments(vec![], "M001");
+        let result = filter_unanswered_comments(vec![], "M001", &Default::default());
         assert!(result.is_empty());
     }
 
@@ -1990,7 +1997,8 @@ mod tests {
         let orphan_minion = make_api_comment(1, "Done!\n\n<sub>🤖 M001</sub>", None);
         let unrelated = make_api_comment(2, "Please fix this.", None);
 
-        let result = filter_unanswered_comments(vec![orphan_minion, unrelated], "M001");
+        let result =
+            filter_unanswered_comments(vec![orphan_minion, unrelated], "M001", &Default::default());
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].comment_id, 2);
     }

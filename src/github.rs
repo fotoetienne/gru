@@ -1284,13 +1284,19 @@ pub(crate) fn sanitize_display_name(name: &str, login: &str) -> String {
 pub(crate) async fn get_user_display_name(host: &str, login: &str) -> String {
     let endpoint = format!("users/{login}");
     match run_gh(host, &["api", &endpoint]).await {
-        Ok(raw) => {
-            let name = serde_json::from_str::<serde_json::Value>(&raw)
-                .ok()
-                .and_then(|v| v["name"].as_str().map(str::to_string))
-                .unwrap_or_default();
-            sanitize_display_name(&name, login)
-        }
+        Ok(raw) => match serde_json::from_str::<serde_json::Value>(&raw) {
+            Ok(value) => {
+                let name = value["name"]
+                    .as_str()
+                    .map(str::to_string)
+                    .unwrap_or_default();
+                sanitize_display_name(&name, login)
+            }
+            Err(e) => {
+                log::warn!("Failed to parse display name response for {}: {}", login, e);
+                login.to_string()
+            }
+        },
         Err(e) => {
             log::warn!("Failed to fetch display name for {}: {}", login, e);
             login.to_string()
