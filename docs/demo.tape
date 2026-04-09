@@ -1,3 +1,8 @@
+# Gru demo recording
+# Run with: just demo (from repo root)
+# Requires: vhs (brew install vhs)
+# Regenerates docs/demo.gif showing `gru do <issue>` → agent works → PR opened
+
 Output docs/demo.gif
 
 Set Shell "bash"
@@ -14,7 +19,7 @@ Set Framerate 30
 
 Hide
 Type "PS1='\033[32m\033[1m~/projects/myapp\033[0m \033[90m$\033[0m '" Enter
-Type "alias gru='/tmp/gru-demo-script.sh'" Enter
+Type "alias gru='./docs/demo-script.sh'" Enter
 Type "clear" Enter
 Show
 
