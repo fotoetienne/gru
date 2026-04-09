@@ -361,6 +361,61 @@ pub(crate) async fn ensure_on_branch(worktree_path: &Path, expected_branch: &str
     }
 
     if current.is_empty() {
+        // Capture the detached HEAD SHA before switching so the operator
+        // can see (and potentially recover) commits the agent made while
+        // detached, which will become unreachable after `git checkout`.
+        let head_sha = {
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(worktree_path)
+                .args(["rev-parse", "HEAD"])
+                .env_remove("GIT_DIR")
+                .env_remove("GIT_WORK_TREE")
+                .env_remove("GIT_INDEX_FILE")
+                .output()
+                .await;
+            match out {
+                Ok(o) if o.status.success() => {
+                    String::from_utf8_lossy(&o.stdout).trim().to_string()
+                }
+                _ => String::new(),
+            }
+        };
+
+        // Warn when the detached HEAD has commits not yet present on
+        // the expected branch — those commits will be orphaned.
+        if !head_sha.is_empty() {
+            let is_ancestor = Command::new("git")
+                .arg("-C")
+                .arg(worktree_path)
+                .args(["merge-base", "--is-ancestor", &head_sha, expected_branch])
+                .env_remove("GIT_DIR")
+                .env_remove("GIT_WORK_TREE")
+                .env_remove("GIT_INDEX_FILE")
+                .status()
+                .await
+                .map(|s| s.success())
+                .unwrap_or(false);
+
+            if !is_ancestor {
+                let short = &head_sha[..head_sha.len().min(8)];
+                log::warn!(
+                    "⚠️  Detached HEAD at {} has commits not present on '{}'; \
+                     they will be unreachable after checkout. \
+                     To recover: git -C <worktree> branch recover-{} {}",
+                    short,
+                    expected_branch,
+                    short,
+                    short
+                );
+                println!(
+                    "⚠️  Detached HEAD at {} has commits not on '{}' — \
+                     they will be unreachable after checkout.",
+                    short, expected_branch
+                );
+            }
+        }
+
         log::warn!(
             "⚠️  Worktree is in detached HEAD state; checking out local branch '{}'",
             expected_branch
@@ -858,6 +913,12 @@ mod tests {
             .output()
             .await
             .expect("git rev-parse failed");
+        assert!(
+            sha_out.status.success(),
+            "git rev-parse HEAD exited with {:?}: {}",
+            sha_out.status.code(),
+            String::from_utf8_lossy(&sha_out.stderr)
+        );
         let sha = String::from_utf8_lossy(&sha_out.stdout).trim().to_string();
 
         let status = TokioCmd::new("git")
