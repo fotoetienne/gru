@@ -23,8 +23,11 @@ pub struct FixOptions {
     pub worker: Option<String>,
 }
 
-/// Maximum number of review rounds to handle automatically
-/// After this limit, the user must handle additional reviews manually
+/// Maximum number of agent re-invocation rounds per feedback type (reviews and issue comments).
+/// Each feedback type tracks its own counter independently, so the effective cap per session
+/// is `MAX_REVIEW_ROUNDS` rounds of formal reviews PLUS `MAX_REVIEW_ROUNDS` rounds of issue
+/// comments. After the limit is reached for a type, additional feedback of that type requires
+/// manual handling.
 pub(crate) const MAX_REVIEW_ROUNDS: usize = 5;
 
 /// Maximum number of auto-rebase attempts per monitoring session
