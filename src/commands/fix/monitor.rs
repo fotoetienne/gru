@@ -1305,6 +1305,8 @@ pub(crate) async fn monitor_pr_lifecycle(
     //    posted.  Used as the primary guard when no pending flag is set.  Fails open:
     //    if the API is unreachable we allow the review to proceed (a duplicate is less
     //    harmful than a missing review).
+    //
+    // If HEAD is unavailable, both guards are inactive and the review proceeds.
     let head_sha = ci::get_head_sha(&wt_ctx.checkout_path).await.ok();
     if head_sha.is_none() {
         log::debug!("HEAD SHA unavailable; pending_review_sha guard inactive for this session");
