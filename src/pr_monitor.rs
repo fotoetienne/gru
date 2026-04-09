@@ -947,8 +947,8 @@ pub(crate) fn format_issue_comments_prompt(
         "repos/{owner}/{repo}/issues/{pr_number}/comments \\\n  \
         -f body=$'<reply text>\\n\\n<sub>🤖 {minion_id}</sub>'\n\
         ```\n\n\
-        Open by addressing the commenter by their username shown above — write `username,` not `@username` \
-        (using `@` creates a GitHub mention notification). \
+        Open by addressing the commenter using their display name shown above \
+        (e.g., write `Alice Johnson,` or `M1ab,` — never `@login`). \
         End with the signature: `\\n\\n<sub>🤖 {minion_id}</sub>`"
     ));
 
@@ -1206,7 +1206,7 @@ gh api --method POST repos/{owner}/{repo}/issues/{pr_number}/comments \\\n  \
 -f body=$'<reply text>\\n\\n<sub>🤖 {minion_id}</sub>'\n\
 ```\n\n\
 Each reply must:\n\
-- Open by addressing the reviewer by the name shown in backticks in the **Reviewer:** line (e.g., `Alice Johnson,` or `alice-dev,`)\n\
+- Open by addressing the reviewer by the name shown in backticks in the **Reviewer:** line (e.g., `alice-dev,` — never `@alice-dev`)\n\
 - Summarize what was changed to address the feedback\n\
 - End with the signature: `\\n\\n<sub>🤖 {minion_id}</sub>`\n"
         ));
@@ -3183,67 +3183,26 @@ mod tests {
     }
 
     #[test]
-    fn test_format_issue_comments_prompt_with_display_name() {
-        // When a commenter has a display name different from their login,
-        // the prompt should show the display name so the Minion addresses them by name.
-        let since: DateTime<Utc> = "2024-06-15T10:00:00Z".parse().unwrap();
-        let comments = vec![IssueComment {
-            id: 1,
-            body: "Please add a screenshot.".to_string(),
-            user: User {
-                login: "sspalding".to_string(),
-            },
-            created_at: since,
-            display_name: "Stephen Spalding".to_string(),
-        }];
-
-        let prompt =
-            format_issue_comments_prompt(Some(10), "20", &comments, "owner", "repo", "M1e3");
-
-        assert!(prompt.contains("**Author:** `Stephen Spalding` (@sspalding)"));
-        assert!(prompt.contains("display name shown above"));
-    }
-
-    #[test]
     fn test_format_issue_comments_prompt_minion_commenter() {
-        // When a sibling Minion posted the comment (has a Minion signature),
-        // display_name is the Minion ID and the prompt should use it.
+        // A comment posted by a sibling Minion (its body contains a Minion signature).
+        // The author is shown by login — no special Minion-ID extraction in this path.
         let since: DateTime<Utc> = "2024-06-15T10:00:00Z".parse().unwrap();
-        let body = "Could you also update the docs?\n\n<sub>🤖 M1ab</sub>".to_string();
         let comments = vec![IssueComment {
-            id: 2,
-            body: body.clone(),
+            id: 10,
+            body: "Looks good to me.\n\n<sub>🤖 M1ab</sub>".to_string(),
             user: User {
                 login: "fotoetienne".to_string(),
-            },
-            created_at: since,
-            display_name: "M1ab".to_string(),
-        }];
-
-        let prompt =
-            format_issue_comments_prompt(Some(5), "15", &comments, "owner", "repo", "M1e3");
-
-        assert!(prompt.contains("**Author:** `M1ab` (@fotoetienne)"));
-    }
-
-    #[test]
-    fn test_format_issue_comments_prompt_empty_display_name_falls_back_to_login() {
-        // If display_name is somehow empty (e.g., comment not enriched),
-        // the prompt should fall back to user.login rather than showing an empty backtick span.
-        let since: DateTime<Utc> = "2024-06-15T10:00:00Z".parse().unwrap();
-        let comments = vec![IssueComment {
-            id: 1,
-            body: "LGTM".to_string(),
-            user: User {
-                login: "alice".to_string(),
             },
             created_at: since,
             display_name: String::new(),
         }];
 
-        let prompt = format_issue_comments_prompt(Some(1), "2", &comments, "owner", "repo", "M001");
+        let prompt = format_issue_comments_prompt(Some(5), "7", &comments, "owner", "repo", "M1ec");
 
-        assert!(prompt.contains("**Author:** `alice` (@alice)"));
-        assert!(!prompt.contains("**Author:** `` (@alice)"));
+        assert!(prompt.contains("**Author:** `fotoetienne` (@fotoetienne)"));
+        assert!(prompt.contains("Looks good to me."));
+        assert!(prompt.contains("<sub>🤖 M1ec</sub>"));
+        // The body passes through unchanged, including any sibling Minion signature
+        assert!(prompt.contains("<sub>🤖 M1ab</sub>"));
     }
 }
