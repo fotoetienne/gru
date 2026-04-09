@@ -711,6 +711,102 @@ impl GitRepo {
         )
     }
 
+    /// Fetches the default branch from origin immediately before creating a new worktree.
+    ///
+    /// In a bare repository, `git fetch +refs/heads/main:refs/heads/main` fails because
+    /// git considers the bare repo HEAD to be "checked out" on that branch and refuses
+    /// to update it. Using `--update-head-ok` bypasses this restriction, ensuring the
+    /// local `main` ref is always up-to-date before we branch off it.
+    ///
+    /// Any failure (network blip, missing git binary, disk full for askpass temp file)
+    /// logs a warning and returns `Ok(())` — a slightly stale base is acceptable, but
+    /// Minion startup must not be blocked.
+    async fn fetch_default_branch_for_worktree(&self) -> Result<()> {
+        let token = std::env::var("GRU_GITHUB_TOKEN")
+            .ok()
+            .filter(|t| !t.is_empty());
+
+        for branch in DEFAULT_BRANCHES {
+            if branch.starts_with("origin/") {
+                continue;
+            }
+
+            // `git_command_with_auth` creates a NamedTempFile for the askpass script.
+            // It must be constructed inside the loop so the file outlives the command.
+            let auth = match git_command_with_auth(token.as_deref()) {
+                Ok(a) => a,
+                Err(e) => {
+                    log::warn!(
+                        "Failed to build auth for fetch before worktree creation: {} \
+                         — proceeding with possibly stale base",
+                        e
+                    );
+                    return Ok(());
+                }
+            };
+            let AuthenticatedGitCommand {
+                mut cmd,
+                _askpass_file,
+            } = auth;
+            let output = match cmd
+                .arg("-C")
+                .arg(&self.bare_path)
+                .arg("fetch")
+                .arg("--update-head-ok")
+                .arg("origin")
+                .arg(format!("+refs/heads/{}:refs/heads/{}", branch, branch))
+                .output()
+                .await
+            {
+                Ok(o) => o,
+                Err(e) => {
+                    log::warn!(
+                        "Failed to spawn git fetch before worktree creation: {} \
+                         — proceeding with possibly stale base",
+                        e
+                    );
+                    return Ok(());
+                }
+            };
+
+            if output.status.success() {
+                log::debug!(
+                    "Fetched default branch '{}' before worktree creation",
+                    branch
+                );
+                return Ok(());
+            }
+
+            let stderr = String::from_utf8_lossy(&output.stderr);
+
+            // If this branch doesn't exist on the remote, try the next candidate.
+            let is_missing_ref = stderr.contains("couldn't find remote ref")
+                || stderr.contains("could not find remote ref")
+                || stderr.contains("no such ref")
+                || stderr.contains("unknown revision");
+
+            if is_missing_ref {
+                continue;
+            }
+
+            // For other errors (auth, network, etc.), warn and return — don't block startup.
+            log::warn!(
+                "Failed to fetch '{}' before worktree creation (exit code {:?}): {} \
+                 — proceeding with possibly stale base",
+                branch,
+                output.status.code(),
+                redact_credentials(stderr.trim())
+            );
+            return Ok(());
+        }
+
+        log::warn!(
+            "Could not find a default branch to fetch before worktree creation \
+             — proceeding with possibly stale base"
+        );
+        Ok(())
+    }
+
     /// Creates a new worktree from the bare repository
     /// The worktree will have a new branch checked out
     ///
@@ -769,7 +865,17 @@ impl GitRepo {
             // Branch exists, just check it out
             cmd.arg(branch_name);
         } else {
-            // Branch doesn't exist, create it based on the default branch
+            // Branch doesn't exist, create it based on the default branch.
+            // Fetch the default branch first so the new worktree branches off the
+            // latest commit and not a stale snapshot from when the bare repo was cloned.
+            if let Err(e) = self.fetch_default_branch_for_worktree().await {
+                log::warn!(
+                    "Failed to fetch default branch before creating worktree '{}': {} \
+                     — proceeding with possibly stale base",
+                    branch_name,
+                    e
+                );
+            }
             let base_branch = self.get_base_branch().await?;
             cmd.arg("-b").arg(branch_name).arg(base_branch);
         }
@@ -1317,6 +1423,24 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("Bare repository does not exist"));
+    }
+
+    /// Verify that fetch_default_branch_for_worktree() never returns Err, even when
+    /// the underlying git fetch fails. A fetch failure should warn but not block
+    /// Minion startup (the acceptance criterion from issue #790).
+    #[tokio::test]
+    async fn test_fetch_default_branch_for_worktree_is_not_fatal_on_failure() {
+        // Point at a temp dir that is not a git repo — git fetch will fail
+        let temp_dir = tempfile::tempdir().unwrap();
+        let repo = GitRepo::new("owner", "repo", "github.com", temp_dir.path().to_path_buf());
+
+        // Must succeed (Ok) even though git fetch will fail in a non-repo directory
+        let result = repo.fetch_default_branch_for_worktree().await;
+        assert!(
+            result.is_ok(),
+            "fetch_default_branch_for_worktree should never return Err — got: {:?}",
+            result
+        );
     }
 
     /// Creates a git Command with GIT_DIR/GIT_WORK_TREE/GIT_INDEX_FILE cleared
