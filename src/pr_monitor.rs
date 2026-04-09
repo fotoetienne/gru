@@ -629,6 +629,14 @@ async fn poll_once(
     // Check merge conflict status.
     // mergeable == Some(false) means GitHub detected conflicts.
     // mergeable == None means GitHub is still computing — skip and re-check next cycle.
+    //
+    // ORDERING NOTE: reviews are checked before merge conflicts (above).
+    // When review fetching succeeded, handle_merge_conflict in monitor.rs can rely on
+    // last_check_time having already been advanced past any reviews (including empty-body
+    // reply reviews) seen in this poll iteration before MergeConflict is returned.
+    // If review fetching failed, poll_once intentionally leaves last_check_time unchanged
+    // so review events are retried on the next cycle; in that case this advance is not
+    // guaranteed before returning MergeConflict.
     if pr.mergeable == Some(false) {
         return Ok(Some(MonitorResult::MergeConflict));
     }
