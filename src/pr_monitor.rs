@@ -571,6 +571,11 @@ async fn poll_once(
     // is never silently dropped when conflicts and reviews overlap.
     let all_reviews = get_all_reviews(host, owner, repo, pr_number).await?;
     let new_reviews = filter_new_external_reviews(&all_reviews, *last_check_time, minion_id);
+    // Track whether review feedback fetch had partial failures. When true, the
+    // baseline must not advance — otherwise the unfetched inline comments in this
+    // window would be permanently lost (same intent as the issue_comments_fetch_failed
+    // guard below).
+    let mut review_fetch_failed = false;
     if !new_reviews.is_empty() {
         let feedback =
             get_review_feedback(host, owner, repo, pr_number, &new_reviews, minion_id).await?;
@@ -579,6 +584,8 @@ async fn poll_once(
         // reviews are retried on the next poll cycle.
         if !feedback.had_fetch_failures {
             *last_check_time = poll_time;
+        } else {
+            review_fetch_failed = true;
         }
         // Only emit NewReviews if there is actual feedback to act on.
         // DISMISSED reviews or reviews with empty bodies and no inline
@@ -608,7 +615,11 @@ async fn poll_once(
     let new_issue_comments =
         filter_new_issue_comments(&all_issue_comments, *last_check_time, minion_id);
     if !new_issue_comments.is_empty() {
-        *last_check_time = poll_time;
+        // Only advance if review fetches also succeeded: if review_fetch_failed is true,
+        // the review inline-comment window must not be skipped by this advance.
+        if !review_fetch_failed {
+            *last_check_time = poll_time;
+        }
         return Ok(Some(MonitorResult::NewIssueComments(new_issue_comments)));
     }
 
@@ -694,11 +705,11 @@ async fn poll_once(
         }
     }
 
-    // Only advance the baseline when issue comment fetch succeeded.
-    // If it failed, leave last_check_time unchanged so comments in this window
-    // are retried on the next cycle (same intent as the had_fetch_failures guard
-    // for review inline comments above).
-    if !issue_comments_fetch_failed {
+    // Only advance the baseline when all fetches succeeded.
+    // If either issue comment fetching or review inline-comment fetching failed,
+    // leave last_check_time unchanged so this window is retried on the next cycle
+    // instead of being permanently skipped.
+    if !issue_comments_fetch_failed && !review_fetch_failed {
         *last_check_time = poll_time;
     }
     Ok(None)
