@@ -17,4 +17,9 @@
 
 - [Design Architecture](DESIGN.md)
 - [Architecture Decisions](DECISIONS.md)
+
+---
+
+# Community
+
 - [Competitive Landscape](COMPETITIVE_LANDSCAPE.md)

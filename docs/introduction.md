@@ -18,8 +18,8 @@ Gru is **agent-agnostic**. It ships with backends for [Claude Code](https://gith
 curl -fL https://github.com/fotoetienne/gru/releases/latest/download/gru-aarch64-apple-darwin.tar.gz | tar xz
 sudo mv gru /usr/local/bin/
 
-# Or build from source (requires Rust 1.73+)
-cargo install --git https://github.com/fotoetienne/gru
+# Or install from crates.io (all platforms, requires Rust 1.73+)
+cargo install gru
 
 # Initialize a repo
 gru init owner/repo
@@ -27,6 +27,8 @@ gru init owner/repo
 # Fix an issue — Gru handles the rest
 gru do 42
 ```
+
+Prebuilt binaries for macOS x86_64 and Linux are on the [Releases page](https://github.com/fotoetienne/gru/releases/latest).
 
 For a full walkthrough, see [Getting Started](GETTING_STARTED.md).
 
