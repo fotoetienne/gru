@@ -1255,6 +1255,58 @@ pub(crate) struct ReviewUser {
     pub(crate) login: String,
 }
 
+/// Sanitize a GitHub display name for safe embedding in a prompt.
+///
+/// Strips control characters and backticks (to prevent code-span breakage),
+/// caps the result at 100 characters, and returns the login if the name
+/// is empty after sanitization.
+pub(crate) fn sanitize_display_name(name: &str, login: &str) -> String {
+    let sanitized: String = name
+        .trim()
+        .chars()
+        .filter(|c| !c.is_control() && *c != '`')
+        .take(100)
+        .collect();
+    if sanitized.is_empty() {
+        login.to_string()
+    } else {
+        sanitized
+    }
+}
+
+/// Fetch the display name for a GitHub user, falling back to their login.
+///
+/// Fetches the full user JSON from `gh api /users/{login}` and extracts the
+/// `name` field. A JSON-null `name` is treated as absent (falls back to the
+/// login); a non-null string value (including a literal "null" display name)
+/// is used as-is after sanitization. On API error or parse failure, logs a
+/// warning and returns the login.
+///
+/// Results are cached by the `gh` CLI for 5 minutes to reduce rate-limit
+/// pressure during PR monitoring cycles.
+pub(crate) async fn get_user_display_name(host: &str, login: &str) -> String {
+    let endpoint = format!("users/{login}");
+    match run_gh(host, &["api", &endpoint, "--cache", "300s"]).await {
+        Ok(raw) => match serde_json::from_str::<serde_json::Value>(&raw) {
+            Ok(value) => {
+                let name = value["name"]
+                    .as_str()
+                    .map(str::to_string)
+                    .unwrap_or_default();
+                sanitize_display_name(&name, login)
+            }
+            Err(e) => {
+                log::warn!("Failed to parse display name response for {}: {}", login, e);
+                login.to_string()
+            }
+        },
+        Err(e) => {
+            log::warn!("Failed to fetch display name for {}: {}", login, e);
+            login.to_string()
+        }
+    }
+}
+
 /// Returns the login of the currently authenticated `gh` CLI user.
 ///
 /// Uses `gh api user` to fetch the authenticated account. Returns an error
@@ -1836,6 +1888,51 @@ mod tests {
         let (eligible, reason) = check_issue_eligibility("CLOSED", &labels);
         assert!(!eligible);
         assert!(reason.unwrap().contains("no longer open"));
+    }
+
+    #[test]
+    fn test_sanitize_display_name_normal() {
+        assert_eq!(
+            sanitize_display_name("Alice Johnson", "alicej"),
+            "Alice Johnson"
+        );
+    }
+
+    #[test]
+    fn test_sanitize_display_name_empty_falls_back_to_login() {
+        // JSON null from the API becomes an empty string before reaching this function
+        assert_eq!(sanitize_display_name("", "alicej"), "alicej");
+    }
+
+    #[test]
+    fn test_sanitize_display_name_literal_null_string_is_valid() {
+        // A user whose display name really is "null" should not be mistaken for absent
+        assert_eq!(sanitize_display_name("null", "alicej"), "null");
+    }
+
+    #[test]
+    fn test_sanitize_display_name_strips_control_chars() {
+        // Embedded control characters (e.g., newlines) should be removed
+        assert_eq!(
+            sanitize_display_name("Evil\nInjection", "bad-actor"),
+            "EvilInjection"
+        );
+    }
+
+    #[test]
+    fn test_sanitize_display_name_strips_backticks() {
+        // Backticks would break the code-span used in the prompt
+        assert_eq!(
+            sanitize_display_name("Alice`s Name", "alicej"),
+            "Alices Name"
+        );
+    }
+
+    #[test]
+    fn test_sanitize_display_name_truncates_at_100() {
+        let long_name = "A".repeat(200);
+        let result = sanitize_display_name(&long_name, "u");
+        assert_eq!(result.len(), 100);
     }
 
     #[test]

@@ -83,7 +83,10 @@ pub(crate) struct ReviewComment {
     pub(crate) file: String,
     pub(crate) line: Option<u64>,
     pub(crate) body: String,
+    /// The commenter's GitHub login (username).
     pub(crate) reviewer: String,
+    /// The commenter's display name, or their login if no display name is set.
+    pub(crate) reviewer_display_name: String,
     pub(crate) comment_id: u64,
 }
 
@@ -749,7 +752,8 @@ pub(crate) async fn get_all_reviews(
     Ok(reviews)
 }
 
-/// Convert a list of raw API review comments into `ReviewComment`s, skipping:
+/// Filter a list of raw API review comments down to only those that need a
+/// Minion reply, skipping:
 /// - The current Minion's own reply comments (identified by its specific signature)
 /// - Comments that the current Minion has already directly replied to
 ///   (identified by appearing as `in_reply_to_id` on a Minion reply comment)
@@ -759,10 +763,14 @@ pub(crate) async fn get_all_reviews(
 /// comments in implicit review objects (with empty bodies), accumulating across
 /// all reviews makes those prior replies visible when building `already_answered`,
 /// preventing duplicate replies after a session restart.
+///
+/// Returns raw `ApiReviewComment`s so that display-name lookups can be
+/// deferred until after filtering (avoiding API calls for already-answered or
+/// Minion-authored threads).
 fn filter_unanswered_comments(
     api_comments: Vec<ApiReviewComment>,
     minion_id: &str,
-) -> Vec<ReviewComment> {
+) -> Vec<ApiReviewComment> {
     // Collect IDs of comments that this Minion has already directly replied to.
     let already_answered: std::collections::HashSet<u64> = api_comments
         .iter()
@@ -779,13 +787,6 @@ fn filter_unanswered_comments(
         .into_iter()
         .filter(|c| {
             !has_minion_signature_for(&c.body, minion_id) && !already_answered.contains(&c.id)
-        })
-        .map(|c| ReviewComment {
-            file: c.path,
-            line: c.line,
-            body: c.body,
-            reviewer: c.user.login,
-            comment_id: c.id,
         })
         .collect()
 }
@@ -866,8 +867,42 @@ async fn get_review_feedback(
         );
     }
 
-    // Filter all accumulated comments at once (Bug 2 fix: cross-review dedup)
-    let all_comments = filter_unanswered_comments(raw_comments, minion_id);
+    // Filter all accumulated comments at once (Bug 2 fix: cross-review dedup).
+    // Filtering happens before display-name lookup so we only call the API for
+    // authors of comments that will actually be replied to.
+    let unanswered_raw = filter_unanswered_comments(raw_comments, minion_id);
+
+    // Fetch display names only for unique authors of unanswered comments.
+    let mut display_names: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    for comment in &unanswered_raw {
+        let login = &comment.user.login;
+        if !display_names.contains_key(login) {
+            let name = github::get_user_display_name(host, login).await;
+            display_names.insert(login.clone(), name);
+        }
+    }
+
+    // Convert filtered raw comments to ReviewComment with display names.
+    let all_comments: Vec<ReviewComment> = unanswered_raw
+        .into_iter()
+        .map(|c| {
+            // Every login in unanswered_raw was inserted into display_names above;
+            // the fallback is a defensive guard.
+            let display_name = display_names
+                .get(&c.user.login)
+                .cloned()
+                .unwrap_or_else(|| c.user.login.clone());
+            ReviewComment {
+                file: c.path,
+                line: c.line,
+                body: c.body,
+                reviewer: c.user.login,
+                reviewer_display_name: display_name,
+                comment_id: c.id,
+            }
+        })
+        .collect();
 
     Ok(ReviewFeedback {
         comments: all_comments,
@@ -914,7 +949,10 @@ pub(crate) fn format_review_prompt(
                 prompt.push_str(&format!(":{}", line));
             }
             prompt.push('\n');
-            prompt.push_str(&format!("**Reviewer:** @{}\n", comment.reviewer));
+            prompt.push_str(&format!(
+                "**Reviewer:** `{}` (@{})\n",
+                comment.reviewer_display_name, comment.reviewer
+            ));
             prompt.push_str(&format!("**Comment ID:** {}\n", comment.comment_id));
             prompt.push_str(&format!("**Comment:** {}\n\n", comment.body));
         }
@@ -934,6 +972,7 @@ gh api --method POST repos/{owner}/{repo}/pulls/{pr_number}/comments \\\n  \
 ```\n\n\
 Where `<comment_id>` is the Comment ID listed above for each inline review comment. \
 Each reply must:\n\
+- Open by addressing the reviewer by the name shown in backticks in the **Reviewer:** line (e.g., `Alice Johnson,` or `alice-dev,`)\n\
 - Summarize what was changed to address the feedback\n\
 - End with the signature: `\\n\\n<sub>🤖 {minion_id}</sub>`\n"
         ));
@@ -1096,6 +1135,7 @@ mod tests {
                 line: Some(45),
                 body: "This function needs error handling for null inputs.".to_string(),
                 reviewer: "alice".to_string(),
+                reviewer_display_name: "alice".to_string(),
                 comment_id: 1001,
             }],
             bodies: vec![],
@@ -1115,13 +1155,14 @@ mod tests {
         assert!(prompt.contains("PR #456"));
         assert!(prompt.contains("## Inline Comment 1"));
         assert!(prompt.contains("**File:** src/main.rs:45"));
-        assert!(prompt.contains("**Reviewer:** @alice"));
+        assert!(prompt.contains("**Reviewer:** `alice` (@alice)"));
         assert!(prompt.contains("**Comment ID:** 1001"));
         assert!(prompt.contains("This function needs error handling for null inputs."));
         assert!(prompt.contains("Please make the requested changes, run tests, and commit."));
         assert!(prompt.contains("in_reply_to"));
         assert!(prompt.contains("repos/octocat/hello-world/pulls/456/comments"));
         assert!(prompt.contains("<sub>🤖 M042</sub>"));
+        assert!(prompt.contains("Open by addressing the reviewer"));
     }
 
     #[test]
@@ -1133,6 +1174,7 @@ mod tests {
                     line: Some(45),
                     body: "Add error handling.".to_string(),
                     reviewer: "alice".to_string(),
+                    reviewer_display_name: "alice".to_string(),
                     comment_id: 2001,
                 },
                 ReviewComment {
@@ -1140,6 +1182,7 @@ mod tests {
                     line: Some(12),
                     body: "Add a test case for the edge case.".to_string(),
                     reviewer: "bob".to_string(),
+                    reviewer_display_name: "bob".to_string(),
                     comment_id: 2002,
                 },
             ],
@@ -1160,12 +1203,38 @@ mod tests {
         assert!(prompt.contains("## Inline Comment 2"));
         assert!(prompt.contains("**File:** src/main.rs:45"));
         assert!(prompt.contains("**File:** tests/test_main.rs:12"));
-        assert!(prompt.contains("@alice"));
-        assert!(prompt.contains("@bob"));
+        assert!(prompt.contains("`alice` (@alice)"));
+        assert!(prompt.contains("`bob` (@bob)"));
         assert!(prompt.contains("**Comment ID:** 2001"));
         assert!(prompt.contains("**Comment ID:** 2002"));
         assert!(prompt.contains("in_reply_to"));
         assert!(prompt.contains("End with the signature"));
+    }
+
+    #[test]
+    fn test_format_review_prompt_with_display_name() {
+        let feedback = ReviewFeedback {
+            comments: vec![ReviewComment {
+                file: "src/lib.rs".to_string(),
+                line: Some(10),
+                body: "Please add a screenshot.".to_string(),
+                reviewer: "sspalding".to_string(),
+                reviewer_display_name: "Stephen Spalding".to_string(),
+                comment_id: 4001,
+            }],
+            bodies: vec![],
+            had_fetch_failures: false,
+        };
+
+        let prompt =
+            format_review_prompt(Some(786), "42", &feedback, "octocat", "hello-world", "M001");
+
+        // Display name wrapped in backticks with login in parens
+        assert!(prompt.contains("**Reviewer:** `Stephen Spalding` (@sspalding)"));
+        // Login-only rendering should NOT appear when a distinct display name is available
+        assert!(!prompt.contains("**Reviewer:** `sspalding` (@sspalding)"));
+        // Reply instruction should tell Claude to address by display name
+        assert!(prompt.contains("Open by addressing the reviewer"));
     }
 
     #[test]
@@ -1176,6 +1245,7 @@ mod tests {
                 line: None,
                 body: "Update the documentation.".to_string(),
                 reviewer: "charlie".to_string(),
+                reviewer_display_name: "charlie".to_string(),
                 comment_id: 3001,
             }],
             bodies: vec![],
@@ -1229,6 +1299,7 @@ mod tests {
                 line: Some(10),
                 body: "Fix this line.".to_string(),
                 reviewer: "eve".to_string(),
+                reviewer_display_name: "eve".to_string(),
                 comment_id: 6001,
             }],
             bodies: vec![ReviewBody {
@@ -1918,7 +1989,7 @@ mod tests {
         let result =
             filter_unanswered_comments(vec![answered_root, unanswered_root, minion_reply], "M001");
         assert_eq!(result.len(), 1);
-        assert_eq!(result[0].comment_id, 2);
+        assert_eq!(result[0].id, 2);
         assert_eq!(result[0].body, "Add error handling.");
     }
 
@@ -1937,7 +2008,7 @@ mod tests {
 
         let result = filter_unanswered_comments(vec![orphan_minion, unrelated], "M001");
         assert_eq!(result.len(), 1);
-        assert_eq!(result[0].comment_id, 2);
+        assert_eq!(result[0].id, 2);
     }
 
     // ========================================================================
