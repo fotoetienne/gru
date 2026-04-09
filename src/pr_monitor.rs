@@ -947,8 +947,8 @@ pub(crate) fn format_issue_comments_prompt(
         "repos/{owner}/{repo}/issues/{pr_number}/comments \\\n  \
         -f body=$'<reply text>\\n\\n<sub>🤖 {minion_id}</sub>'\n\
         ```\n\n\
-        Open by addressing the commenter using their display name shown above \
-        (e.g., write `Alice Johnson,` or `M1ab,` — never `@login`). \
+        Open by addressing the commenter by their username shown above — write `username,` not `@username` \
+        (using `@` creates a GitHub mention notification). \
         End with the signature: `\\n\\n<sub>🤖 {minion_id}</sub>`"
     ));
 
