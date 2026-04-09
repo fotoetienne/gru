@@ -5,7 +5,6 @@ DIM='\033[2m'
 BOLD='\033[1m'
 GREEN='\033[0;32m'
 BLUE='\033[0;34m'
-CYAN='\033[0;36m'
 RESET='\033[0m'
 
 echo ""
