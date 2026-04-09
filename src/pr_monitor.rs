@@ -963,7 +963,7 @@ gh api --method POST repos/{owner}/{repo}/pulls/{pr_number}/comments \\\n  \
 ```\n\n\
 Where `<comment_id>` is the Comment ID listed above for each inline review comment. \
 Each reply must:\n\
-- Open by addressing the reviewer by their display name (the name shown in **Reviewer:** before the @login, e.g. \"Alice,\" or \"alice-dev,\")\n\
+- Open by addressing the reviewer: when shown as \"Alice Johnson (@alice-dev)\", use \"Alice Johnson,\"; when shown as \"@alice-dev\" only, use \"alice-dev,\"\n\
 - Summarize what was changed to address the feedback\n\
 - End with the signature: `\\n\\n<sub>🤖 {minion_id}</sub>`\n"
         ));
@@ -1153,7 +1153,7 @@ mod tests {
         assert!(prompt.contains("in_reply_to"));
         assert!(prompt.contains("repos/octocat/hello-world/pulls/456/comments"));
         assert!(prompt.contains("<sub>🤖 M042</sub>"));
-        assert!(prompt.contains("addressing the reviewer by their display name"));
+        assert!(prompt.contains("Open by addressing the reviewer"));
     }
 
     #[test]
@@ -1224,7 +1224,7 @@ mod tests {
         // Login-only format should NOT appear
         assert!(!prompt.contains("**Reviewer:** @sspalding"));
         // Reply instruction should tell Claude to address by display name
-        assert!(prompt.contains("addressing the reviewer by their display name"));
+        assert!(prompt.contains("Open by addressing the reviewer"));
     }
 
     #[test]
