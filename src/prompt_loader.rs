@@ -67,15 +67,17 @@ URL: https://github.com/{{ repo_owner }}/{{ repo_name }}/issues/{{ issue_number 
 - Check CLAUDE.md for project-specific build/test commands
 - Run tests to verify the fix
 
-**Embedding file URLs (screenshots, images, diagrams):** If you commit a file and reference it in a PR description or comment, use the commit SHA — not the branch name — as the ref. Immediately after committing the file (before any further commits), capture the SHA:
+**Embedding file URLs (screenshots, images, diagrams):** Never use a branch name as the ref — branches are deleted after merge, immediately breaking the URL. For a fully permanent link, upload the file as a GitHub attachment (drag-and-drop into any GitHub comment box, or via the upload API) to get a `github.com/user-attachments/assets/...` CDN URL that survives branch cleanup entirely.
+
+If you cannot upload as an attachment, use the commit SHA as a fallback. Immediately after committing the file (before any further commits), capture the SHA:
 ```
 git rev-parse HEAD   # capture this before making more commits
 ```
-Then construct the URL using that SHA:
+Then construct the URL:
 ```
 https://raw.githubusercontent.com/{{ repo_owner }}/{{ repo_name }}/<sha>/path/to/file.png
 ```
-Branch names are deleted after merge; commit SHAs are permanent. (For GitHub Enterprise Server, the raw URL format is `https://<ghes-host>/{{ repo_owner }}/{{ repo_name }}/raw/<sha>/path/to/file.png` instead.)
+Note: if the repo uses squash merges, the pre-merge SHA may become unreachable after branch deletion, so SHA-based URLs are more durable than branch-name URLs but not fully permanent. (For GHES: `https://<ghes-host>/{{ repo_owner }}/{{ repo_name }}/raw/<sha>/path/to/file.png`)
 
 ## 4. Code Review
 - Make a commit with the changes, prefixing the commit message with your Minion ID, e.g. `[{{ minion_id }}] Fix null pointer in parser`
