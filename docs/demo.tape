@@ -26,5 +26,5 @@ Sleep 800ms
 Type "gru do 47"
 Sleep 600ms
 Enter
-# demo-script.sh accumulates ~12.3s of sleep; 20s gives ~7.7s buffer for slow machines
-Sleep 20s
+# demo-script.sh accumulates ~12.3s of sleep; total GIF is ~16s (0.8s + 0.6s + 15s)
+Sleep 15s
