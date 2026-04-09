@@ -1430,6 +1430,10 @@ mod tests {
         assert!(!prompt.contains("**Reviewer:** `sspalding` (@sspalding)"));
         // Reply instruction should tell Claude to address by display name
         assert!(prompt.contains("Open by addressing the reviewer"));
+        // Anti-duplication instructions must be present for inline comments
+        assert!(prompt.contains("EXACTLY ONE reply per comment ID"));
+        assert!(prompt.contains("in a separate sequential step"));
+        assert!(prompt.contains("do not batch reply API calls"));
     }
 
     #[test]
@@ -1483,8 +1487,11 @@ mod tests {
         assert!(prompt.contains("**Reviewer:** `dave` (@dave)"));
         assert!(prompt.contains("Consider refactoring the error handling"));
         assert!(prompt.contains("Please make the requested changes"));
-        // No inline comments, so no in_reply_to instructions
+        // No inline comments, so no in_reply_to instructions or anti-duplication block
         assert!(!prompt.contains("in_reply_to"));
+        assert!(!prompt.contains("EXACTLY ONE reply per comment ID"));
+        assert!(!prompt.contains("in a separate sequential step"));
+        assert!(!prompt.contains("do not batch reply API calls"));
     }
 
     #[test]
