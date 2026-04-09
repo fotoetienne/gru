@@ -33,10 +33,9 @@ pub(crate) fn extract_minion_id_from_signature(body: &str) -> Option<&str> {
     // Find the last "<sub>🤖 " prefix.
     let prefix_pos = without_closing.rfind(prefix)?;
     let id = &without_closing[prefix_pos + prefix.len()..];
-    // If the extracted ID itself contains "</sub>", the prefix we found was
-    // mid-body (the real closing tag belongs to some other </sub>), not a tail
-    // signature.  Reject it.
-    if id.contains("</sub>") {
+    // Reject if the extracted segment is empty or contains "</sub>" (the latter
+    // means the prefix we found was mid-body, not the tail signature).
+    if id.is_empty() || id.contains("</sub>") {
         return None;
     }
     Some(id)
@@ -217,6 +216,8 @@ mod tests {
         // No signature → None
         assert_eq!(extract_minion_id_from_signature("Please fix this."), None);
         assert_eq!(extract_minion_id_from_signature(""), None);
+        // Empty ID (malformed signature) → None
+        assert_eq!(extract_minion_id_from_signature("<sub>🤖 </sub>"), None);
         // Signature mid-body (quoted), not at the end → None
         assert_eq!(
             extract_minion_id_from_signature(

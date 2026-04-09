@@ -823,6 +823,10 @@ async fn get_review_feedback(
         if state != "DISMISSED" {
             let trimmed = review.body.trim();
             if !trimmed.is_empty() {
+                // TODO: for human reviewers, call get_user_display_name here so
+                // that review-body replies use the full display name (e.g.
+                // "Alice Johnson") rather than the login, matching the inline
+                // comment path.
                 let reviewer_display_name = extract_minion_id_from_signature(trimmed)
                     .map(str::to_owned)
                     .unwrap_or_else(|| review.user.login.clone());
@@ -978,7 +982,7 @@ pub(crate) fn format_review_prompt(
     prompt.push_str(
         "Please make the requested changes, run tests, and commit.\n\n\
 When addressing a reviewer in any reply, use the name shown in backticks in the \
-**Reviewer:** line (e.g., write `Alice Johnson,` or `M1cu,` — never `@login`).\n\n",
+**Reviewer:** line (e.g., write `Alice Johnson,` or `M0ab,` — never `@login`).\n\n",
     );
 
     // Instruct the agent to reply to each inline review comment thread
