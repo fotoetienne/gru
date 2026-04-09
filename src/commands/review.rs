@@ -572,6 +572,11 @@ mod tests {
         assert!(prompt.contains("octocat/hello-world/pull/456"));
         assert!(prompt.contains("This PR fixes the broken widget"));
         assert!(prompt.contains("## 1. Fetch PR Details"));
+        // Anti-duplication instruction must be present
+        assert!(prompt.contains("EXACTLY ONE review"));
+        assert!(prompt.contains("do not post duplicate reviews"));
+        // Check for existing Minion review instruction must be present
+        assert!(prompt.contains("🤖"));
     }
 
     #[test]
