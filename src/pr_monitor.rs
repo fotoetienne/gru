@@ -96,7 +96,8 @@ pub(crate) struct ReviewBody {
     pub body: String,
     pub reviewer: String,
     /// Display name used when addressing the reviewer: Minion ID when the body
-    /// carries a Minion signature, otherwise the reviewer's GitHub login.
+    /// carries a Minion signature, otherwise the reviewer's GitHub display name
+    /// (or login fallback when no display name is set).
     pub reviewer_display_name: String,
     pub state: String,
 }
@@ -920,10 +921,15 @@ pub(crate) fn format_issue_comments_prompt(
     let mut prompt = format!("{} Please read and respond to the following:\n\n", preamble);
 
     for (i, comment) in comments.iter().enumerate() {
+        let display = if comment.display_name.is_empty() {
+            &comment.user.login
+        } else {
+            &comment.display_name
+        };
         prompt.push_str(&format!("## Comment {}\n", i + 1));
         prompt.push_str(&format!(
             "**Author:** `{}` (@{})\n",
-            comment.display_name, comment.user.login
+            display, comment.user.login
         ));
         prompt.push_str(&format!("**Comment:** {}\n\n", comment.body));
     }
@@ -940,7 +946,7 @@ pub(crate) fn format_issue_comments_prompt(
         -f body=$'<reply text>\\n\\n<sub>🤖 {minion_id}</sub>'\n\
         ```\n\n\
         Open by addressing the commenter using their display name shown above \
-        (e.g., \"Thanks for the comment, Alice!\"). \
+        (e.g., write `Alice Johnson,` or `M1ab,` — never `@login`). \
         End with the signature: `\\n\\n<sub>🤖 {minion_id}</sub>`"
     ));
 
@@ -3185,5 +3191,26 @@ mod tests {
             format_issue_comments_prompt(Some(5), "15", &comments, "owner", "repo", "M1e3");
 
         assert!(prompt.contains("**Author:** `M1ab` (@fotoetienne)"));
+    }
+
+    #[test]
+    fn test_format_issue_comments_prompt_empty_display_name_falls_back_to_login() {
+        // If display_name is somehow empty (e.g., comment not enriched),
+        // the prompt should fall back to user.login rather than showing an empty backtick span.
+        let since: DateTime<Utc> = "2024-06-15T10:00:00Z".parse().unwrap();
+        let comments = vec![IssueComment {
+            id: 1,
+            body: "LGTM".to_string(),
+            user: User {
+                login: "alice".to_string(),
+            },
+            created_at: since,
+            display_name: String::new(),
+        }];
+
+        let prompt = format_issue_comments_prompt(Some(1), "2", &comments, "owner", "repo", "M001");
+
+        assert!(prompt.contains("**Author:** `alice` (@alice)"));
+        assert!(!prompt.contains("**Author:** `` (@alice)"));
     }
 }
