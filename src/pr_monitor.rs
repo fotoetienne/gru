@@ -126,6 +126,14 @@ struct ApiReviewComment {
     in_reply_to_id: Option<u64>,
 }
 
+/// A general PR conversation comment (issue comment, not a formal review)
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct IssueComment {
+    pub(crate) body: String,
+    pub(crate) user: User,
+    pub(crate) created_at: DateTime<Utc>,
+}
+
 /// Check if a CI check run conclusion indicates a failure.
 ///
 /// Failed states include: failure, cancelled, timed_out, action_required.
@@ -579,6 +587,16 @@ async fn poll_once(
         }
     }
 
+    // Check for new general PR conversation comments (issue comments).
+    // These are distinct from formal reviews and are invisible to the review polling path.
+    let all_issue_comments = fetch_issue_comments(host, owner, repo, pr_number).await?;
+    let new_issue_comments =
+        filter_new_issue_comments(&all_issue_comments, *last_check_time, minion_id);
+    if !new_issue_comments.is_empty() {
+        *last_check_time = review_poll_time;
+        return Ok(Some(MonitorResult::NewIssueComments(new_issue_comments)));
+    }
+
     // Check merge conflict status.
     // mergeable == Some(false) means GitHub detected conflicts.
     // mergeable == None means GitHub is still computing — skip and re-check next cycle.
@@ -681,6 +699,8 @@ pub(crate) enum MonitorResult {
     MergeConflict,
     /// All readiness checks pass and `gru:auto-merge` label is present
     ReadyToMerge,
+    /// New general PR conversation comments (issue comments) detected
+    NewIssueComments(Vec<IssueComment>),
     /// Monitoring timed out after the configured duration
     Timeout,
     /// Monitoring was interrupted by the user (e.g., Ctrl+C)
@@ -750,6 +770,106 @@ pub(crate) async fn get_all_reviews(
     }
 
     Ok(reviews)
+}
+
+/// Fetch all general PR conversation comments (issue comments) for a PR.
+///
+/// Uses `--paginate` with `--jq ".[]"` to stream individual comment objects.
+async fn fetch_issue_comments(
+    host: &str,
+    owner: &str,
+    repo: &str,
+    pr_number: &str,
+) -> Result<Vec<IssueComment>> {
+    let repo_full = github::repo_slug(owner, repo);
+    let endpoint = format!("repos/{repo_full}/issues/{pr_number}/comments");
+    let output = gh_api_with_retry(
+        host,
+        &["api", "--paginate", &endpoint, "--jq", ".[]"],
+        DEFAULT_MAX_RETRIES,
+    )
+    .await?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!(
+            "Failed to fetch issue comments for PR #{}: {}",
+            pr_number,
+            stderr
+        );
+    }
+
+    let stdout = std::str::from_utf8(&output.stdout)
+        .context("Failed to decode issue comments stdout as UTF-8")?;
+
+    let mut comments = Vec::new();
+    for line in stdout.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let comment: IssueComment =
+            serde_json::from_str(line).context("Failed to parse issue comment JSON")?;
+        comments.push(comment);
+    }
+
+    Ok(comments)
+}
+
+/// Filter issue comments to only those newer than `since` and not authored by this Minion.
+fn filter_new_issue_comments(
+    comments: &[IssueComment],
+    since: DateTime<Utc>,
+    minion_id: &str,
+) -> Vec<IssueComment> {
+    comments
+        .iter()
+        .filter(|c| c.created_at >= since && !has_minion_signature_for(&c.body, minion_id))
+        .cloned()
+        .collect()
+}
+
+/// Format new issue comments into a prompt for the Minion to respond to.
+pub(crate) fn format_issue_comments_prompt(
+    issue_num: Option<u64>,
+    pr_number: &str,
+    comments: &[IssueComment],
+    owner: &str,
+    repo: &str,
+    minion_id: &str,
+) -> String {
+    let preamble = match issue_num {
+        Some(n) => format!(
+            "You previously implemented a fix for issue #{}. New comment(s) have been posted \
+            on PR #{}.",
+            n, pr_number
+        ),
+        None => format!("New comment(s) have been posted on PR #{}.", pr_number),
+    };
+    let mut prompt = format!("{} Please read and respond to the following:\n\n", preamble);
+
+    for (i, comment) in comments.iter().enumerate() {
+        prompt.push_str(&format!("## Comment {}\n", i + 1));
+        prompt.push_str(&format!("**Author:** @{}\n", comment.user.login));
+        prompt.push_str(&format!("**Comment:** {}\n\n", comment.body));
+    }
+
+    prompt.push_str(
+        "Please address any questions or requests in these comments. \
+        If code changes are needed, make them, run tests, and commit. \
+        Post a reply on the PR thread using the GitHub API:\n\n\
+        ```\n\
+        gh api --method POST ",
+    );
+    prompt.push_str(&format!(
+        "repos/{owner}/{repo}/issues/{pr_number}/comments \\\n  \
+        -f body=$'<reply text>\\n\\n<sub>🤖 {minion_id}</sub>'\n\
+        ```\n\n\
+        Open by addressing the commenter by name (e.g., \"Thanks for the comment, @username! ...\"). \
+        End with the signature: `\\n\\n<sub>🤖 {minion_id}</sub>`"
+    ));
+
+    prompt
 }
 
 /// Filter a list of raw API review comments down to only those that need a
@@ -2682,5 +2802,120 @@ mod tests {
     #[test]
     fn test_should_post_exit_notification_true_when_open_and_unaddressed() {
         assert!(should_post_exit_notification(true, 2));
+    }
+
+    #[test]
+    fn test_filter_new_issue_comments_returns_new_non_minion_comments() {
+        let since: DateTime<Utc> = "2024-06-15T10:00:00Z".parse().unwrap();
+        let comments = vec![
+            IssueComment {
+                body: "Old comment".to_string(),
+                user: User {
+                    login: "alice".to_string(),
+                },
+                created_at: "2024-06-15T09:00:00Z".parse().unwrap(),
+            },
+            IssueComment {
+                body: "New comment from human".to_string(),
+                user: User {
+                    login: "alice".to_string(),
+                },
+                created_at: "2024-06-15T11:00:00Z".parse().unwrap(),
+            },
+            IssueComment {
+                body: "New comment from minion\n\n<sub>🤖 M001</sub>".to_string(),
+                user: User {
+                    login: "bot".to_string(),
+                },
+                created_at: "2024-06-15T11:30:00Z".parse().unwrap(),
+            },
+        ];
+
+        let new = filter_new_issue_comments(&comments, since, "M001");
+        assert_eq!(new.len(), 1);
+        assert_eq!(new[0].body, "New comment from human");
+    }
+
+    #[test]
+    fn test_filter_new_issue_comments_inclusive_boundary() {
+        let since: DateTime<Utc> = "2024-06-15T10:00:00Z".parse().unwrap();
+        let comment = IssueComment {
+            body: "Exactly at boundary".to_string(),
+            user: User {
+                login: "alice".to_string(),
+            },
+            created_at: since,
+        };
+        let new = filter_new_issue_comments(&[comment], since, "M001");
+        assert_eq!(new.len(), 1);
+    }
+
+    #[test]
+    fn test_filter_new_issue_comments_empty() {
+        let since: DateTime<Utc> = "2024-06-15T10:00:00Z".parse().unwrap();
+        let new = filter_new_issue_comments(&[], since, "M001");
+        assert!(new.is_empty());
+    }
+
+    #[test]
+    fn test_issue_comment_deserialize() {
+        let json = r#"{
+            "id": 123,
+            "body": "Hello world",
+            "user": {"login": "alice"},
+            "created_at": "2024-06-15T10:30:00Z",
+            "html_url": "https://github.com/example/repo/issues/42#issuecomment-123"
+        }"#;
+        let comment: IssueComment = serde_json::from_str(json).unwrap();
+        assert_eq!(comment.body, "Hello world");
+        assert_eq!(comment.user.login, "alice");
+    }
+
+    #[test]
+    fn test_format_issue_comments_prompt_single() {
+        let since: DateTime<Utc> = "2024-06-15T10:00:00Z".parse().unwrap();
+        let comments = vec![IssueComment {
+            body: "Can you add more tests?".to_string(),
+            user: User {
+                login: "alice".to_string(),
+            },
+            created_at: since,
+        }];
+
+        let prompt = format_issue_comments_prompt(
+            Some(42),
+            "99",
+            &comments,
+            "octocat",
+            "hello-world",
+            "M001",
+        );
+
+        assert!(prompt.contains("issue #42"));
+        assert!(prompt.contains("PR #99"));
+        assert!(prompt.contains("## Comment 1"));
+        assert!(prompt.contains("**Author:** @alice"));
+        assert!(prompt.contains("Can you add more tests?"));
+        assert!(prompt.contains("repos/octocat/hello-world/issues/99/comments"));
+        assert!(prompt.contains("<sub>🤖 M001</sub>"));
+    }
+
+    #[test]
+    fn test_format_issue_comments_prompt_no_issue_num() {
+        let since: DateTime<Utc> = "2024-06-15T10:00:00Z".parse().unwrap();
+        let comments = vec![IssueComment {
+            body: "LGTM".to_string(),
+            user: User {
+                login: "bob".to_string(),
+            },
+            created_at: since,
+        }];
+
+        let prompt = format_issue_comments_prompt(None, "5", &comments, "owner", "repo", "M002");
+
+        assert!(!prompt.contains("issue #"));
+        assert!(prompt.contains("PR #5"));
+        assert!(prompt.contains("**Author:** @bob"));
+        assert!(prompt.contains("LGTM"));
     }
 }

@@ -381,6 +381,7 @@ struct MonitorContext<'a> {
 /// Mutable state tracked across monitoring loop iterations.
 struct MonitorLoopState {
     review_round: usize,
+    issue_comment_round: usize,
     ci_escalated: bool,
     issue_was_blocked: bool,
     rebase_attempts: usize,
@@ -419,6 +420,7 @@ impl MonitorLoopState {
     fn new(initial_baseline: DateTime<Utc>, confidence_threshold: u8) -> Self {
         Self {
             review_round: 0,
+            issue_comment_round: 0,
             ci_escalated: false,
             issue_was_blocked: false,
             rebase_attempts: 0,
@@ -796,6 +798,72 @@ async fn handle_new_reviews(
     }
 }
 
+async fn handle_new_issue_comments(
+    state: &mut MonitorLoopState,
+    ctx: &MonitorContext<'_>,
+    comments: Vec<pr_monitor::IssueComment>,
+    check_time: DateTime<Utc>,
+) -> LoopAction {
+    state.issue_comment_round += 1;
+    println!(
+        "💬 Detected {} new PR comment(s) on PR #{} (round {}/{})",
+        comments.len(),
+        ctx.pr_number,
+        state.issue_comment_round,
+        MAX_REVIEW_ROUNDS
+    );
+
+    if state.issue_comment_round > MAX_REVIEW_ROUNDS {
+        println!(
+            "⚠️  Reached maximum comment rounds limit ({})",
+            MAX_REVIEW_ROUNDS
+        );
+        println!("   Additional comments will need manual handling");
+        println!(
+            "   View PR: https://github.com/{}/{}/pull/{}",
+            ctx.issue_ctx.owner, ctx.issue_ctx.repo, ctx.pr_number
+        );
+        return LoopAction::Break;
+    }
+
+    let prompt = pr_monitor::format_issue_comments_prompt(
+        ctx.issue_ctx.issue_num,
+        ctx.pr_number,
+        &comments,
+        &ctx.issue_ctx.owner,
+        &ctx.issue_ctx.repo,
+        &ctx.wt_ctx.minion_id,
+    );
+
+    println!("🔄 Re-invoking to address PR comments...\n");
+
+    match invoke_agent_for_reviews(
+        ctx.backend,
+        &ctx.wt_ctx.checkout_path,
+        &ctx.wt_ctx.minion_dir,
+        &ctx.wt_ctx.session_id,
+        &prompt,
+        ctx.timeout_opt,
+        &ctx.issue_ctx.host,
+    )
+    .await
+    {
+        Ok(()) => {
+            println!("\n✅ Finished addressing PR comments");
+            println!("🔄 Continuing to monitor PR...\n");
+            state.review_baseline = Some(check_time);
+            save_review_check_time(&ctx.wt_ctx.minion_id, check_time).await;
+            reset_attempt_count(&ctx.wt_ctx.minion_id).await;
+            LoopAction::Continue
+        }
+        Err(e) => {
+            log::warn!("⚠️  Failed to address PR comments: {:#}", e);
+            log::warn!("   You can address them manually");
+            LoopAction::Break
+        }
+    }
+}
+
 async fn handle_failed_checks(
     state: &mut MonitorLoopState,
     ctx: &MonitorContext<'_>,
@@ -1096,6 +1164,9 @@ async fn handle_pr_event(
         Ok((MonitorResult::ReadyToMerge, _)) => handle_ready_to_merge(state, ctx).await,
         Ok((MonitorResult::NewReviews(feedback), check_time)) => {
             handle_new_reviews(state, ctx, feedback, check_time).await
+        }
+        Ok((MonitorResult::NewIssueComments(comments), check_time)) => {
+            handle_new_issue_comments(state, ctx, comments, check_time).await
         }
         Ok((MonitorResult::FailedChecks(count), _)) => {
             handle_failed_checks(state, ctx, count).await
