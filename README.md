@@ -7,6 +7,8 @@
 
 Point it at an issue and it handles the rest: implementation, PR, code review, CI fixes, rebases — all in an isolated worktree that never touches your working directory.
 
+![Gru demo: gru do 47 → agent works → PR opened](docs/demo.gif)
+
 Gru is **agent-agnostic**. It ships with backends for [Claude Code](https://github.com/anthropics/claude-code) and [OpenAI Codex](https://github.com/openai/codex), and its pluggable architecture makes it straightforward to add more.
 
 ## Quick Start
