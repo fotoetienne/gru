@@ -618,6 +618,14 @@ pub(crate) struct MinionInfo {
     /// Archived minions are hidden from `gru status` by default; use `--all` to show them.
     #[serde(default)]
     pub(crate) archived_at: Option<DateTime<Utc>>,
+    /// Commit SHA for which a self-review was spawned but may not have posted yet.
+    ///
+    /// Set immediately before calling `trigger_pr_review` so that if the monitoring
+    /// session crashes while the review subprocess is still running, a resumed session
+    /// can detect that a review was already triggered for this SHA and skip spawning
+    /// a duplicate.  Cleared after `trigger_pr_review` returns (success or error).
+    #[serde(default)]
+    pub(crate) pending_review_sha: Option<String>,
 }
 
 /// Default agent name for backwards compatibility with existing registry entries
@@ -1228,6 +1236,7 @@ mod tests {
             last_review_check_time: None,
             wake_reason: None,
             archived_at: None,
+            pending_review_sha: None,
         }
     }
 
@@ -2005,6 +2014,36 @@ mod tests {
         // Callers should fall back to started_at when this field is None
         let baseline = info.last_review_check_time.unwrap_or(info.started_at);
         assert_eq!(baseline, info.started_at);
+    }
+
+    #[test]
+    fn test_pending_review_sha_defaults_to_none_for_old_entries() {
+        let temp_dir = tempdir().unwrap();
+        let registry_path = temp_dir.path().join("minions.json");
+
+        // Write a registry JSON without pending_review_sha (simulating old format)
+        let old_json = r#"{
+            "minions": {
+                "M001": {
+                    "repo": "owner/repo",
+                    "issue": 42,
+                    "command": "do",
+                    "prompt": "Fix issue",
+                    "started_at": "2024-01-01T00:00:00Z",
+                    "branch": "minion/issue-42-M001",
+                    "worktree": "/tmp/test",
+                    "status": "active",
+                    "session_id": "abc-123",
+                    "mode": "autonomous"
+                }
+            }
+        }"#;
+        fs::write(&registry_path, old_json).unwrap();
+
+        let registry = MinionRegistry::load(Some(temp_dir.path())).unwrap();
+        let info = registry.get("M001").unwrap();
+        // pending_review_sha should default to None for old entries
+        assert_eq!(info.pending_review_sha, None);
     }
 
     #[test]

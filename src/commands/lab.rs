@@ -2421,6 +2421,7 @@ mod tests {
             last_review_check_time: None,
             wake_reason: None,
             archived_at: None,
+            pending_review_sha: None,
         }
     }
 
@@ -2655,6 +2656,7 @@ mod tests {
                 last_review_check_time: None,
                 wake_reason: None,
                 archived_at: None,
+                pending_review_sha: None,
             },
         }
     }

@@ -42,6 +42,57 @@ async fn save_review_check_time(minion_id: &str, ts: DateTime<Utc>) {
     }
 }
 
+/// Persists a pending-review SHA to the minion registry (best-effort).
+///
+/// Call this immediately before spawning the review subprocess so that if the
+/// monitoring session crashes while the review is running, a resumed session can
+/// detect the in-flight review and skip spawning a duplicate.
+async fn save_pending_review_sha(minion_id: &str, sha: &str) {
+    let mid = minion_id.to_string();
+    let sha = sha.to_string();
+    if let Err(e) = minion_registry::with_registry(move |registry| {
+        registry.update(&mid, |info| {
+            info.pending_review_sha = Some(sha);
+        })
+    })
+    .await
+    {
+        log::warn!("⚠️  Failed to save pending_review_sha: {:#}", e);
+    }
+}
+
+/// Clears the pending-review SHA in the minion registry (best-effort).
+///
+/// Call this after the review subprocess returns (success or error) to signal
+/// that the in-flight review guard is no longer needed.
+async fn clear_pending_review_sha(minion_id: &str) {
+    let mid = minion_id.to_string();
+    if let Err(e) = minion_registry::with_registry(move |registry| {
+        registry.update(&mid, |info| {
+            info.pending_review_sha = None;
+        })
+    })
+    .await
+    {
+        log::warn!("⚠️  Failed to clear pending_review_sha: {:#}", e);
+    }
+}
+
+/// Reads the pending-review SHA from the minion registry (best-effort).
+///
+/// Returns `None` on registry error or when no pending SHA is recorded.
+async fn get_pending_review_sha(minion_id: &str) -> Option<String> {
+    let mid = minion_id.to_string();
+    minion_registry::with_registry(move |registry| {
+        Ok(registry
+            .get(&mid)
+            .and_then(|info| info.pending_review_sha.clone()))
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
 /// Resets `attempt_count` to 0 after a successful review response (best-effort).
 ///
 /// The cap should only trigger on *consecutive* failures. Resetting here ensures a
@@ -1240,19 +1291,44 @@ pub(crate) async fn monitor_pr_lifecycle(
     // during the review are not missed when the monitoring loop starts.
     let pre_review_time = chrono::Utc::now();
 
-    // Guard: skip self-review if the authenticated gh user already posted a
-    // non-dismissed review for the current HEAD SHA on this PR.
+    // Guard: skip self-review if a review was already triggered or posted for the
+    // current HEAD SHA.
     //
-    // Uses the GitHub API so the check is cross-minion — a review posted by a
-    // previous minion session is visible here even though each minion has its
-    // own minion_dir.  Fails open: if the API is unreachable we allow the
-    // review to proceed (a duplicate is less harmful than a missing review).
+    // Two layers of detection:
     //
-    // Race condition: two minions entering simultaneously may both see false
-    // and both post a review.  This window is narrow and not worth a
-    // distributed lock for V1.
+    // 1. `pending_review_sha` (registry): set immediately before spawning the review
+    //    subprocess. If the monitoring session crashes while the subprocess is running,
+    //    a resumed session sees this flag and skips spawning a duplicate.  Cleared
+    //    after `trigger_pr_review` returns (success or error).
+    //
+    // 2. `has_gru_review_for_sha` (GitHub API): checks whether a review was actually
+    //    posted.  Used as the primary guard when no pending flag is set.  Fails open:
+    //    if the API is unreachable we allow the review to proceed (a duplicate is less
+    //    harmful than a missing review).
+    //
+    // If HEAD is unavailable, both guards are inactive and the review proceeds.
+    //
+    // This is still best-effort duplicate suppression, not a strict guarantee:
+    // concurrent monitor sessions can both observe no pending flag and no posted
+    // review for the current SHA before either session sets `pending_review_sha`,
+    // and both may then spawn a review subprocess.
     let head_sha = ci::get_head_sha(&wt_ctx.checkout_path).await.ok();
-    let already_reviewed = if let Some(ref sha) = head_sha {
+    if head_sha.is_none() {
+        log::debug!("HEAD SHA unavailable; pending_review_sha guard inactive for this session");
+    }
+
+    // Check the registry-persisted pending flag first (covers the crash-during-review case).
+    let pending_sha = get_pending_review_sha(&wt_ctx.minion_id).await;
+    let review_pending = head_sha
+        .as_deref()
+        .zip(pending_sha.as_deref())
+        .is_some_and(|(head, pending)| head == pending);
+
+    let already_reviewed = if review_pending {
+        // A review subprocess was already spawned for this SHA in a prior session
+        // that may still be running.  Skip to avoid a duplicate.
+        true
+    } else if let Some(ref sha) = head_sha {
         github::has_gru_review_for_sha(
             &issue_ctx.host,
             &issue_ctx.owner,
@@ -1266,10 +1342,17 @@ pub(crate) async fn monitor_pr_lifecycle(
     };
 
     if already_reviewed {
-        println!(
-            "\n⏭️  Skipping self-review: already posted for current HEAD ({})",
-            head_sha.as_deref().unwrap_or("unknown")
-        );
+        if review_pending {
+            println!(
+                "\n⏭️  Skipping self-review: review already spawned for current HEAD ({})",
+                head_sha.as_deref().unwrap_or("unknown")
+            );
+        } else {
+            println!(
+                "\n⏭️  Skipping self-review: already posted for current HEAD ({})",
+                head_sha.as_deref().unwrap_or("unknown")
+            );
+        }
     } else {
         // Auto-trigger review for Minion-created PRs
         println!("\n🔍 Starting automated PR review...");
@@ -1278,6 +1361,16 @@ pub(crate) async fn monitor_pr_lifecycle(
         // we don't overwrite a stored baseline with the current time, which would
         // cause reviews posted while the minion was stopped to be skipped.
         save_review_check_time(&wt_ctx.minion_id, pre_review_time).await;
+        // Persist the pending SHA *before* spawning the subprocess.  Setting it
+        // after spawn would miss the primary crash scenario (session dies while the
+        // child is running).  The trade-off: a crash in the narrow window *after*
+        // this write but *before* the child is actually started leaves the flag set
+        // with no subprocess running; the next resumed session will skip this review
+        // round.  That false-positive is far less likely and less harmful than the
+        // duplicate-review problem this flag exists to prevent.
+        if let Some(ref sha) = head_sha {
+            save_pending_review_sha(&wt_ctx.minion_id, sha).await;
+        }
         match trigger_pr_review(pr_number, &wt_ctx.checkout_path, review_timeout).await {
             Ok(review_exit_code) => {
                 if review_exit_code == 0 {
@@ -1294,6 +1387,8 @@ pub(crate) async fn monitor_pr_lifecycle(
                 log::warn!("   You can review manually with: gru review {}", pr_number);
             }
         }
+        // Clear the pending flag now that the subprocess has returned.
+        clear_pending_review_sha(&wt_ctx.minion_id).await;
     }
 
     // Start monitoring the PR for review comments, CI failures, and merge/close events
