@@ -662,8 +662,9 @@ impl GitRepo {
     /// to update it. Using `--update-head-ok` bypasses this restriction, ensuring the
     /// local `main` ref is always up-to-date before we branch off it.
     ///
-    /// A failed fetch (network blip, auth error) logs a warning and returns `Ok(())` —
-    /// a slightly stale base is acceptable, but Minion startup must not be blocked.
+    /// Any failure (network blip, missing git binary, disk full for askpass temp file)
+    /// logs a warning and returns `Ok(())` — a slightly stale base is acceptable, but
+    /// Minion startup must not be blocked.
     async fn fetch_default_branch_for_worktree(&self) -> Result<()> {
         let token = std::env::var("GRU_GITHUB_TOKEN")
             .ok()
@@ -674,12 +675,24 @@ impl GitRepo {
                 continue;
             }
 
-            let auth = git_command_with_auth(token.as_deref())?;
+            // `git_command_with_auth` creates a NamedTempFile for the askpass script.
+            // It must be constructed inside the loop so the file outlives the command.
+            let auth = match git_command_with_auth(token.as_deref()) {
+                Ok(a) => a,
+                Err(e) => {
+                    log::warn!(
+                        "Failed to build auth for fetch before worktree creation: {} \
+                         — proceeding with possibly stale base",
+                        e
+                    );
+                    return Ok(());
+                }
+            };
             let AuthenticatedGitCommand {
                 mut cmd,
                 _askpass_file,
             } = auth;
-            let output = cmd
+            let output = match cmd
                 .arg("-C")
                 .arg(&self.bare_path)
                 .arg("fetch")
@@ -688,7 +701,17 @@ impl GitRepo {
                 .arg(format!("+refs/heads/{}:refs/heads/{}", branch, branch))
                 .output()
                 .await
-                .context("Failed to execute git fetch")?;
+            {
+                Ok(o) => o,
+                Err(e) => {
+                    log::warn!(
+                        "Failed to spawn git fetch before worktree creation: {} \
+                         — proceeding with possibly stale base",
+                        e
+                    );
+                    return Ok(());
+                }
+            };
 
             if output.status.success() {
                 log::debug!(
