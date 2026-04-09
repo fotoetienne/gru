@@ -578,6 +578,8 @@ mod tests {
         assert!(prompt.contains("exit code 0"));
         // Existing Minion review check: SHA-aware, paginated, regex filter
         assert!(prompt.contains("gh api repos/octocat/hello-world/pulls/456/reviews --paginate"));
+        assert!(prompt.contains("jq -n --arg sha"));
+        assert!(prompt.contains("inputs[]"));
         assert!(prompt.contains(r#"test("<sub>🤖 [A-Za-z0-9]+</sub>\\s*$")"#));
         assert!(prompt.contains("commit_id == $sha"));
     }

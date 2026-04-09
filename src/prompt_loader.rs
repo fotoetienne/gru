@@ -177,8 +177,8 @@ URL: https://github.com/{{ repo_owner }}/{{ repo_name }}/pull/{{ pr_number }}
   ```
   HEAD_SHA=$(git rev-parse HEAD)
   gh api repos/{{ repo_owner }}/{{ repo_name }}/pulls/{{ pr_number }}/reviews --paginate | \
-    jq --arg sha "$HEAD_SHA" \
-      '[.[] | select((.body // "") | test("<sub>🤖 [A-Za-z0-9]+</sub>\\s*$")) | select(.commit_id == $sha)] | length'
+    jq -n --arg sha "$HEAD_SHA" \
+      '[inputs[] | select((.body // "") | test("<sub>🤖 [A-Za-z0-9]+</sub>\\s*$")) | select(.commit_id == $sha)] | length'
   ```
   If the result is 1 or more, skip posting — a Minion review was already submitted for this commit.
 - BEFORE submitting: Check if this is your own PR:
