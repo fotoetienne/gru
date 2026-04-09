@@ -976,9 +976,12 @@ async fn handle_merge_conflict(
     // while addressing earlier feedback. Their submitted_at is after the
     // pre-reply baseline, so without this advancement they are counted as
     // unaddressed external reviews by the lab daemon — causing an infinite
-    // wake-up + rebase-failure loop. check_time is guaranteed to be after
-    // all reply reviews because poll_once already advanced last_check_time
-    // past them before the conflict was detected.
+    // wake-up + rebase-failure loop. When poll_once successfully fetched
+    // reviews/comments, check_time should already be after those reply
+    // reviews because last_check_time was advanced before the conflict was
+    // detected. That ordering is not guaranteed on fetch-failure paths, so
+    // this baseline update is primarily to preserve the successful-fetch
+    // behavior and avoid reprocessing reply-review artifacts.
     state.review_baseline = Some(check_time);
 
     if state.rebase_attempts >= MAX_REBASE_ATTEMPTS {
@@ -1692,6 +1695,87 @@ mod tests {
     fn test_rebase_cooldown_initial_state() {
         let state = MonitorLoopState::new(Utc::now(), 80);
         assert_eq!(state.rebase_cooldown_cycles, 0);
+    }
+
+    /// Baseline must be advanced even on the MAX_REBASE_ATTEMPTS early-exit path
+    /// so the lab daemon does not re-count the Minion's own reply reviews.
+    #[tokio::test]
+    async fn test_handle_merge_conflict_advances_baseline_at_max_attempts() {
+        tokio::time::pause();
+
+        let backend = DummyBackend;
+        let (issue_ctx, wt_ctx) = make_test_fixtures();
+        let ctx = MonitorContext {
+            backend: &backend,
+            issue_ctx: &issue_ctx,
+            wt_ctx: &wt_ctx,
+            pr_number: "123",
+            timeout_opt: None,
+            monitor_timeout: Duration::from_secs(7200),
+        };
+
+        let stale_baseline = Utc::now() - chrono::Duration::seconds(60);
+        let check_time = Utc::now();
+        let mut state = MonitorLoopState::new(stale_baseline, 0);
+        state.review_baseline = Some(stale_baseline);
+        state.rebase_attempts = MAX_REBASE_ATTEMPTS; // trigger early-exit path
+
+        let action = handle_merge_conflict(&mut state, &ctx, check_time).await;
+
+        assert!(
+            matches!(action, LoopAction::Break),
+            "max-attempts path must break"
+        );
+        assert_eq!(
+            state.review_baseline,
+            Some(check_time),
+            "baseline must be advanced to check_time even on max-attempts exit"
+        );
+    }
+
+    /// Baseline must be advanced during cooldown cycles so a Minion that exits
+    /// during cooldown persists a non-stale value.
+    #[tokio::test]
+    async fn test_handle_pr_event_cooldown_advances_baseline() {
+        tokio::time::pause();
+
+        let backend = DummyBackend;
+        let (issue_ctx, wt_ctx) = make_test_fixtures();
+        let ctx = MonitorContext {
+            backend: &backend,
+            issue_ctx: &issue_ctx,
+            wt_ctx: &wt_ctx,
+            pr_number: "123",
+            timeout_opt: None,
+            monitor_timeout: Duration::from_secs(7200),
+        };
+
+        let stale_baseline = Utc::now() - chrono::Duration::seconds(60);
+        let check_time = Utc::now();
+        let mut state = MonitorLoopState::new(stale_baseline, 0);
+        state.review_baseline = Some(stale_baseline);
+        state.rebase_cooldown_cycles = 2; // active cooldown
+
+        let action = handle_pr_event(
+            Ok((MonitorResult::MergeConflict, check_time)),
+            &mut state,
+            &ctx,
+        )
+        .await;
+
+        assert!(
+            matches!(action, LoopAction::Continue),
+            "cooldown path must continue"
+        );
+        assert_eq!(
+            state.rebase_cooldown_cycles, 1,
+            "cooldown counter must decrement"
+        );
+        assert_eq!(
+            state.review_baseline,
+            Some(check_time),
+            "baseline must be advanced to check_time during cooldown"
+        );
     }
 
     #[test]
