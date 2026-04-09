@@ -139,7 +139,9 @@ pub(crate) struct IssueComment {
     pub(crate) user: User,
     pub(crate) created_at: DateTime<Utc>,
     /// The commenter's display name, or login fallback. Not from GitHub JSON;
-    /// populated after deserialization by enriching with `get_user_display_name`.
+    /// populated after deserialization during enrichment, either from a
+    /// Minion signature via `extract_minion_id_from_signature` or from
+    /// `get_user_display_name` (with login fallback).
     #[serde(skip)]
     pub(crate) display_name: String,
 }
@@ -1008,6 +1010,10 @@ async fn get_review_feedback(
     let mut raw_comments: Vec<ApiReviewComment> = Vec::new();
     let mut all_bodies = Vec::new();
     let mut failed_reviews = 0;
+    // Memoize display-name lookups per login so that repeated reviews from
+    // the same author don't each trigger a separate `gh` CLI invocation.
+    let mut body_display_names: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
 
     for review in reviews {
         // Collect review body text (non-empty bodies that aren't just whitespace).
@@ -1025,7 +1031,12 @@ async fn get_review_feedback(
                     if let Some(minion_id) = extract_minion_id_from_signature(trimmed) {
                         minion_id.to_owned()
                     } else {
-                        github::get_user_display_name(host, &review.user.login).await
+                        let login = &review.user.login;
+                        if !body_display_names.contains_key(login) {
+                            let name = github::get_user_display_name(host, login).await;
+                            body_display_names.insert(login.clone(), name);
+                        }
+                        body_display_names[login].clone()
                     };
                 all_bodies.push(ReviewBody {
                     body: trimmed.to_string(),
