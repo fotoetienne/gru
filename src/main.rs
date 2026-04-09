@@ -37,7 +37,7 @@ mod version_check;
 mod workspace;
 mod worktree_scanner;
 
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 use commands::{
     attach, chat, clean, fix, init, lab, logs, path, pm, prompt, prompts, rebase, resume, review,
     status, stop, tail,
@@ -340,7 +340,7 @@ enum Commands {
         #[arg(
             long,
             help = "Show detailed information about this prompt (description, parameters, source)",
-            conflicts_with_all = ["issue", "pr", "no_worktree", "worktree", "param", "timeout", "agent"]
+            conflicts_with_all = ["issue", "pr", "no_worktree", "worktree", "params", "timeout", "agent"]
         )]
         info: bool,
 
@@ -430,6 +430,9 @@ enum Commands {
         )]
         stop_minions: bool,
     },
+    /// Generate shell completions
+    #[command(hide = true)]
+    Completions { shell: clap_complete::Shell },
 }
 
 /// MCP server subcommands
@@ -578,6 +581,10 @@ async fn main() {
             no_resume,
             stop_minions,
         } => lab::handle_lab(config, repos, poll_interval, slots, no_resume, stop_minions).await,
+        Commands::Completions { shell } => {
+            clap_complete::generate(shell, &mut Cli::command(), "gru", &mut std::io::stdout());
+            Ok(0)
+        }
     };
 
     // Handle any errors that occurred
@@ -593,7 +600,6 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use clap::CommandFactory;
 
     #[test]
     fn readme_mentions_all_cli_subcommands() {
