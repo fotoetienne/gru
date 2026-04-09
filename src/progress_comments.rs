@@ -16,6 +16,32 @@ pub(crate) fn has_minion_signature_for(body: &str, minion_id: &str) -> bool {
         .is_some_and(|b| b.ends_with("<sub>🤖 "))
 }
 
+/// Extracts the Minion ID from a trailing Minion signature in `body`.
+///
+/// Returns `Some("M1cu")` when body ends with `<sub>🤖 M1cu</sub>` (after
+/// trimming trailing whitespace), `None` otherwise.
+///
+/// Mirrors `has_minion_signature_for` but extracts the ID rather than matching
+/// against a known ID.  Only matches when the tag is at the *tail* of the body;
+/// a signature quoted mid-body (e.g. `"as <sub>🤖 M1by</sub> noted..."`)
+/// returns `None`.
+pub(crate) fn extract_minion_id_from_signature(body: &str) -> Option<&str> {
+    let body = body.trim_end();
+    let prefix = "<sub>🤖 ";
+    // Strip "</sub>" from the end — if not present, body has no trailing signature.
+    let without_closing = body.strip_suffix("</sub>")?;
+    // Find the last "<sub>🤖 " prefix.
+    let prefix_pos = without_closing.rfind(prefix)?;
+    let id = &without_closing[prefix_pos + prefix.len()..];
+    // If the extracted ID itself contains "</sub>", the prefix we found was
+    // mid-body (the real closing tag belongs to some other </sub>), not a tail
+    // signature.  Reject it.
+    if id.contains("</sub>") {
+        return None;
+    }
+    Some(id)
+}
+
 /// Represents the phase of Minion execution
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MinionPhase {
@@ -169,6 +195,47 @@ mod tests {
     fn test_minion_signature() {
         assert_eq!(minion_signature("M042"), "\n\n<sub>🤖 M042</sub>");
         assert_eq!(minion_signature("M0ug"), "\n\n<sub>🤖 M0ug</sub>");
+    }
+
+    #[test]
+    fn test_extract_minion_id_from_signature() {
+        // Basic match
+        assert_eq!(
+            extract_minion_id_from_signature("Done!\n\n<sub>🤖 M001</sub>"),
+            Some("M001")
+        );
+        // Trailing whitespace is trimmed
+        assert_eq!(
+            extract_minion_id_from_signature("Done!\n\n<sub>🤖 M1cu</sub>  \n"),
+            Some("M1cu")
+        );
+        // Multi-character IDs
+        assert_eq!(
+            extract_minion_id_from_signature("Work done.\n\n<sub>🤖 M1cx</sub>"),
+            Some("M1cx")
+        );
+        // No signature → None
+        assert_eq!(extract_minion_id_from_signature("Please fix this."), None);
+        assert_eq!(extract_minion_id_from_signature(""), None);
+        // Signature mid-body (quoted), not at the end → None
+        assert_eq!(
+            extract_minion_id_from_signature(
+                "As noted in <sub>🤖 M001</sub>, please fix the typo."
+            ),
+            None
+        );
+        // Different </sub> at end but Minion marker mid-body → None
+        assert_eq!(
+            extract_minion_id_from_signature("See <sub>🤖 M001</sub> for context. <sub>note</sub>"),
+            None
+        );
+        // Two Minion signatures: only the tail one is returned
+        assert_eq!(
+            extract_minion_id_from_signature(
+                "Reply to <sub>🤖 M001</sub> and then <sub>🤖 M002</sub>"
+            ),
+            Some("M002")
+        );
     }
 
     #[test]

@@ -3,7 +3,7 @@ use crate::github;
 use crate::github::DEFAULT_MAX_RETRIES;
 use crate::labels;
 use crate::merge_readiness;
-use crate::progress_comments::has_minion_signature_for;
+use crate::progress_comments::{extract_minion_id_from_signature, has_minion_signature_for};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
@@ -95,6 +95,9 @@ pub(crate) struct ReviewComment {
 pub(crate) struct ReviewBody {
     pub body: String,
     pub reviewer: String,
+    /// Display name used when addressing the reviewer: Minion ID when the body
+    /// carries a Minion signature, otherwise the reviewer's GitHub login.
+    pub reviewer_display_name: String,
     pub state: String,
 }
 
@@ -820,9 +823,13 @@ async fn get_review_feedback(
         if state != "DISMISSED" {
             let trimmed = review.body.trim();
             if !trimmed.is_empty() {
+                let reviewer_display_name = extract_minion_id_from_signature(trimmed)
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| review.user.login.clone());
                 all_bodies.push(ReviewBody {
                     body: trimmed.to_string(),
                     reviewer: review.user.login.clone(),
+                    reviewer_display_name,
                     state: state.to_string(),
                 });
             }
@@ -887,12 +894,19 @@ async fn get_review_feedback(
     let all_comments: Vec<ReviewComment> = unanswered_raw
         .into_iter()
         .map(|c| {
-            // Every login in unanswered_raw was inserted into display_names above;
-            // the fallback is a defensive guard.
-            let display_name = display_names
-                .get(&c.user.login)
-                .cloned()
-                .unwrap_or_else(|| c.user.login.clone());
+            // If the comment body carries a Minion signature, use that Minion ID
+            // as the display name so sibling-Minion reviewers are addressed by
+            // their Minion ID rather than their GitHub login.
+            let display_name = extract_minion_id_from_signature(&c.body)
+                .map(str::to_owned)
+                .unwrap_or_else(|| {
+                    // Every login in unanswered_raw was inserted into display_names
+                    // above; the fallback is a defensive guard.
+                    display_names
+                        .get(&c.user.login)
+                        .cloned()
+                        .unwrap_or_else(|| c.user.login.clone())
+                });
             ReviewComment {
                 file: c.path,
                 line: c.line,
@@ -933,7 +947,10 @@ pub(crate) fn format_review_prompt(
     // Include review bodies (top-level review feedback not tied to specific lines)
     for (i, review_body) in feedback.bodies.iter().enumerate() {
         prompt.push_str(&format!("## Review {} ({})\n", i + 1, review_body.state));
-        prompt.push_str(&format!("**Reviewer:** @{}\n", review_body.reviewer));
+        prompt.push_str(&format!(
+            "**Reviewer:** `{}` (@{})\n",
+            review_body.reviewer_display_name, review_body.reviewer
+        ));
         prompt.push_str(&format!("**Feedback:**\n{}\n\n", review_body.body));
     }
 
@@ -958,7 +975,11 @@ pub(crate) fn format_review_prompt(
         }
     }
 
-    prompt.push_str("Please make the requested changes, run tests, and commit.\n\n");
+    prompt.push_str(
+        "Please make the requested changes, run tests, and commit.\n\n\
+When addressing a reviewer in any reply, use the name shown in backticks in the \
+**Reviewer:** line (e.g., write `Alice Johnson,` or `M1cu,` — never `@login`).\n\n",
+    );
 
     // Instruct the agent to reply to each inline review comment thread
     if !feedback.comments.is_empty() {
@@ -1273,6 +1294,7 @@ mod tests {
             bodies: vec![ReviewBody {
                 body: "Consider refactoring the error handling to use Result types.".to_string(),
                 reviewer: "dave".to_string(),
+                reviewer_display_name: "dave".to_string(),
                 state: "COMMENTED".to_string(),
             }],
             had_fetch_failures: false,
@@ -1284,7 +1306,7 @@ mod tests {
         assert!(prompt.contains("issue #42"));
         assert!(prompt.contains("PR #99"));
         assert!(prompt.contains("## Review 1 (COMMENTED)"));
-        assert!(prompt.contains("**Reviewer:** @dave"));
+        assert!(prompt.contains("**Reviewer:** `dave` (@dave)"));
         assert!(prompt.contains("Consider refactoring the error handling"));
         assert!(prompt.contains("Please make the requested changes"));
         // No inline comments, so no in_reply_to instructions
@@ -1305,6 +1327,7 @@ mod tests {
             bodies: vec![ReviewBody {
                 body: "Overall looks good but needs some tweaks.".to_string(),
                 reviewer: "eve".to_string(),
+                reviewer_display_name: "eve".to_string(),
                 state: "CHANGES_REQUESTED".to_string(),
             }],
             had_fetch_failures: false,
@@ -1322,6 +1345,54 @@ mod tests {
         assert!(prompt.contains("Fix this line."));
         // Reply instructions present for inline comments
         assert!(prompt.contains("in_reply_to"));
+    }
+
+    #[test]
+    fn test_format_review_prompt_minion_reviewer_in_body() {
+        // When a review body carries a Minion signature, the reviewer_display_name
+        // should be the Minion ID and the prompt should address it without `@`.
+        let feedback = ReviewFeedback {
+            comments: vec![],
+            bodies: vec![ReviewBody {
+                body: "Looks good overall.\n\n<sub>🤖 M1cu</sub>".to_string(),
+                reviewer: "fotoetienne".to_string(),
+                reviewer_display_name: "M1cu".to_string(),
+                state: "APPROVED".to_string(),
+            }],
+            had_fetch_failures: false,
+        };
+
+        let prompt = format_review_prompt(Some(10), "20", &feedback, "owner", "repo", "M1cx");
+
+        // Minion ID appears in backticks, not preceded by @
+        assert!(prompt.contains("**Reviewer:** `M1cu` (@fotoetienne)"));
+        // The login should not appear as the sole name
+        assert!(!prompt.contains("**Reviewer:** @fotoetienne"));
+        // Addressing instruction should guide Claude to use M1cu, not @login
+        assert!(prompt.contains("use the name shown in backticks"));
+    }
+
+    #[test]
+    fn test_format_review_prompt_minion_reviewer_in_inline_comment() {
+        // When an inline comment body carries a Minion signature, reviewer_display_name
+        // should be the Minion ID.
+        let feedback = ReviewFeedback {
+            comments: vec![ReviewComment {
+                file: "src/main.rs".to_string(),
+                line: Some(5),
+                body: "Please rename this variable.\n\n<sub>🤖 M1ab</sub>".to_string(),
+                reviewer: "fotoetienne".to_string(),
+                reviewer_display_name: "M1ab".to_string(),
+                comment_id: 9001,
+            }],
+            bodies: vec![],
+            had_fetch_failures: false,
+        };
+
+        let prompt = format_review_prompt(Some(10), "20", &feedback, "owner", "repo", "M1cx");
+
+        assert!(prompt.contains("**Reviewer:** `M1ab` (@fotoetienne)"));
+        assert!(!prompt.contains("**Reviewer:** `fotoetienne`"));
     }
 
     // ========================================================================
