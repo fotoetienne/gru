@@ -387,8 +387,13 @@ async fn run(&self, mut shutdown: tokio::sync::watch::Receiver<bool>) {
 The **Scheduler** assigns issues to available Minion slots.
 
 **Prioritization (V1 - simple):**
-1. Issues with `priority:high` label
-2. Oldest issues first (FIFO)
+1. Issues with `priority:critical` label
+2. Issues with `priority:high` label
+3. Issues with `priority:medium` label
+4. Unlabeled issues (fall between medium and low)
+5. Issues with `priority:low` label
+
+Within the same tier, oldest issues first (FIFO).
 
 **Slot Management:**
 ```rust

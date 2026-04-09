@@ -1122,7 +1122,7 @@ When multi-Lab or advanced tracking needed:
 
 ### Issue Claim
 1. Poll GitHub for issues with `gru:todo` label
-2. Select highest priority (manual priority label or oldest)
+2. Select highest priority — four labeled tiers (`priority:critical` > `priority:high` > `priority:medium` > `priority:low`; unlabeled falls between medium and low); ties broken by oldest-first (FIFO)
 3. Add `gru:in-progress` label, remove `gru:todo`
 4. Post structured claim comment with Minion ID, timestamp
 5. Create branch `minion/issue-123-M42`
