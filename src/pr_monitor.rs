@@ -936,14 +936,10 @@ pub(crate) fn format_review_prompt(
                 prompt.push_str(&format!(":{}", line));
             }
             prompt.push('\n');
-            if comment.reviewer_display_name != comment.reviewer {
-                prompt.push_str(&format!(
-                    "**Reviewer:** {} (@{})\n",
-                    comment.reviewer_display_name, comment.reviewer
-                ));
-            } else {
-                prompt.push_str(&format!("**Reviewer:** @{}\n", comment.reviewer));
-            }
+            prompt.push_str(&format!(
+                "**Reviewer:** `{}` (@{})\n",
+                comment.reviewer_display_name, comment.reviewer
+            ));
             prompt.push_str(&format!("**Comment ID:** {}\n", comment.comment_id));
             prompt.push_str(&format!("**Comment:** {}\n\n", comment.body));
         }
@@ -963,7 +959,7 @@ gh api --method POST repos/{owner}/{repo}/pulls/{pr_number}/comments \\\n  \
 ```\n\n\
 Where `<comment_id>` is the Comment ID listed above for each inline review comment. \
 Each reply must:\n\
-- Open by addressing the reviewer: when shown as \"Alice Johnson (@alice-dev)\", use \"Alice Johnson,\"; when shown as \"@alice-dev\" only, use \"alice-dev,\"\n\
+- Open by addressing the reviewer by the name shown in backticks in the **Reviewer:** line (e.g., `Alice Johnson,` or `alice-dev,`)\n\
 - Summarize what was changed to address the feedback\n\
 - End with the signature: `\\n\\n<sub>🤖 {minion_id}</sub>`\n"
         ));
@@ -1146,7 +1142,7 @@ mod tests {
         assert!(prompt.contains("PR #456"));
         assert!(prompt.contains("## Inline Comment 1"));
         assert!(prompt.contains("**File:** src/main.rs:45"));
-        assert!(prompt.contains("**Reviewer:** @alice"));
+        assert!(prompt.contains("**Reviewer:** `alice` (@alice)"));
         assert!(prompt.contains("**Comment ID:** 1001"));
         assert!(prompt.contains("This function needs error handling for null inputs."));
         assert!(prompt.contains("Please make the requested changes, run tests, and commit."));
@@ -1194,8 +1190,8 @@ mod tests {
         assert!(prompt.contains("## Inline Comment 2"));
         assert!(prompt.contains("**File:** src/main.rs:45"));
         assert!(prompt.contains("**File:** tests/test_main.rs:12"));
-        assert!(prompt.contains("@alice"));
-        assert!(prompt.contains("@bob"));
+        assert!(prompt.contains("`alice` (@alice)"));
+        assert!(prompt.contains("`bob` (@bob)"));
         assert!(prompt.contains("**Comment ID:** 2001"));
         assert!(prompt.contains("**Comment ID:** 2002"));
         assert!(prompt.contains("in_reply_to"));
@@ -1219,10 +1215,8 @@ mod tests {
 
         let prompt = format_review_prompt(Some(786), "42", &feedback, "octocat", "hello-world", "M001");
 
-        // Display name and login should both appear in the reviewer line
-        assert!(prompt.contains("**Reviewer:** Stephen Spalding (@sspalding)"));
-        // Login-only format should NOT appear
-        assert!(!prompt.contains("**Reviewer:** @sspalding"));
+        // Display name wrapped in backticks with login in parens
+        assert!(prompt.contains("**Reviewer:** `Stephen Spalding` (@sspalding)"));
         // Reply instruction should tell Claude to address by display name
         assert!(prompt.contains("Open by addressing the reviewer"));
     }
