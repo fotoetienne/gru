@@ -137,6 +137,10 @@ pub(crate) struct IssueComment {
     pub(crate) body: String,
     pub(crate) user: User,
     pub(crate) created_at: DateTime<Utc>,
+    /// The commenter's display name, or login fallback. Not from GitHub JSON;
+    /// populated after deserialization by enriching with `get_user_display_name`.
+    #[serde(skip)]
+    pub(crate) display_name: String,
 }
 
 /// Check if a CI check run conclusion indicates a failure.
@@ -615,9 +619,34 @@ async fn poll_once(
                 (vec![], true)
             }
         };
-    let new_issue_comments =
+    let mut new_issue_comments =
         filter_new_issue_comments(&all_issue_comments, *last_check_time, minion_id);
     if !new_issue_comments.is_empty() {
+        // Fetch display names for unique authors of new comments.
+        // Minion-signed comments use the Minion ID; human comments use the
+        // GitHub display name (or login fallback), matching the inline comment path.
+        let mut display_names: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        for comment in &new_issue_comments {
+            let login = &comment.user.login;
+            if !display_names.contains_key(login)
+                && extract_minion_id_from_signature(&comment.body).is_none()
+            {
+                let name = github::get_user_display_name(host, login).await;
+                display_names.insert(login.clone(), name);
+            }
+        }
+        for comment in &mut new_issue_comments {
+            comment.display_name = extract_minion_id_from_signature(&comment.body)
+                .map(str::to_owned)
+                .unwrap_or_else(|| {
+                    display_names
+                        .get(&comment.user.login)
+                        .cloned()
+                        .unwrap_or_else(|| comment.user.login.clone())
+                });
+        }
+
         // Only advance if review fetches also succeeded: if review_fetch_failed is true,
         // the review inline-comment window must not be skipped by this advance.
         if !review_fetch_failed {
@@ -892,7 +921,10 @@ pub(crate) fn format_issue_comments_prompt(
 
     for (i, comment) in comments.iter().enumerate() {
         prompt.push_str(&format!("## Comment {}\n", i + 1));
-        prompt.push_str(&format!("**Author:** @{}\n", comment.user.login));
+        prompt.push_str(&format!(
+            "**Author:** `{}` (@{})\n",
+            comment.display_name, comment.user.login
+        ));
         prompt.push_str(&format!("**Comment:** {}\n\n", comment.body));
     }
 
@@ -907,7 +939,8 @@ pub(crate) fn format_issue_comments_prompt(
         "repos/{owner}/{repo}/issues/{pr_number}/comments \\\n  \
         -f body=$'<reply text>\\n\\n<sub>🤖 {minion_id}</sub>'\n\
         ```\n\n\
-        Open by addressing the commenter by name (e.g., \"Thanks for the comment, @username! ...\"). \
+        Open by addressing the commenter using their display name shown above \
+        (e.g., \"Thanks for the comment, Alice!\"). \
         End with the signature: `\\n\\n<sub>🤖 {minion_id}</sub>`"
     ));
 
@@ -982,13 +1015,12 @@ async fn get_review_feedback(
         if state != "DISMISSED" {
             let trimmed = review.body.trim();
             if !trimmed.is_empty() {
-                // TODO: for human reviewers, call get_user_display_name here so
-                // that review-body replies use the full display name (e.g.
-                // "Alice Johnson") rather than the login, matching the inline
-                // comment path.
-                let reviewer_display_name = extract_minion_id_from_signature(trimmed)
-                    .map(str::to_owned)
-                    .unwrap_or_else(|| review.user.login.clone());
+                let reviewer_display_name =
+                    if let Some(minion_id) = extract_minion_id_from_signature(trimmed) {
+                        minion_id.to_owned()
+                    } else {
+                        github::get_user_display_name(host, &review.user.login).await
+                    };
                 all_bodies.push(ReviewBody {
                     body: trimmed.to_string(),
                     reviewer: review.user.login.clone(),
@@ -1496,6 +1528,26 @@ mod tests {
         assert!(!prompt.contains("EXACTLY ONE reply per comment ID"));
         assert!(!prompt.contains("in a separate sequential step"));
         assert!(!prompt.contains("do not batch reply API calls"));
+    }
+
+    #[test]
+    fn test_format_review_prompt_body_with_display_name() {
+        // When a reviewer has a display name different from their login,
+        // review body replies should use the display name.
+        let feedback = ReviewFeedback {
+            comments: vec![],
+            bodies: vec![ReviewBody {
+                body: "Please add more error handling.".to_string(),
+                reviewer: "sspalding".to_string(),
+                reviewer_display_name: "Stephen Spalding".to_string(),
+                state: "CHANGES_REQUESTED".to_string(),
+            }],
+            had_fetch_failures: false,
+        };
+
+        let prompt = format_review_prompt(Some(10), "20", &feedback, "owner", "repo", "M1e3");
+
+        assert!(prompt.contains("**Reviewer:** `Stephen Spalding` (@sspalding)"));
     }
 
     #[test]
@@ -2959,6 +3011,7 @@ mod tests {
                     login: "alice".to_string(),
                 },
                 created_at: "2024-06-15T09:00:00Z".parse().unwrap(),
+                display_name: String::new(),
             },
             IssueComment {
                 id: 2,
@@ -2967,6 +3020,7 @@ mod tests {
                     login: "alice".to_string(),
                 },
                 created_at: "2024-06-15T11:00:00Z".parse().unwrap(),
+                display_name: String::new(),
             },
             IssueComment {
                 id: 3,
@@ -2975,6 +3029,7 @@ mod tests {
                     login: "bot".to_string(),
                 },
                 created_at: "2024-06-15T11:30:00Z".parse().unwrap(),
+                display_name: String::new(),
             },
         ];
 
@@ -2995,6 +3050,7 @@ mod tests {
                     login: "alice".to_string(),
                 },
                 created_at: since,
+                display_name: String::new(),
             },
             IssueComment {
                 id: 2,
@@ -3003,6 +3059,7 @@ mod tests {
                     login: "bob".to_string(),
                 },
                 created_at: before,
+                display_name: String::new(),
             },
         ];
         let new = filter_new_issue_comments(&comments, since, "M001");
@@ -3044,6 +3101,7 @@ mod tests {
                 login: "alice".to_string(),
             },
             created_at: since,
+            display_name: "alice".to_string(),
         }];
 
         let prompt = format_issue_comments_prompt(
@@ -3058,7 +3116,7 @@ mod tests {
         assert!(prompt.contains("issue #42"));
         assert!(prompt.contains("PR #99"));
         assert!(prompt.contains("## Comment 1"));
-        assert!(prompt.contains("**Author:** @alice"));
+        assert!(prompt.contains("**Author:** `alice` (@alice)"));
         assert!(prompt.contains("Can you add more tests?"));
         assert!(prompt.contains("repos/octocat/hello-world/issues/99/comments"));
         assert!(prompt.contains("<sub>🤖 M001</sub>"));
@@ -3074,13 +3132,58 @@ mod tests {
                 login: "bob".to_string(),
             },
             created_at: since,
+            display_name: "bob".to_string(),
         }];
 
         let prompt = format_issue_comments_prompt(None, "5", &comments, "owner", "repo", "M002");
 
         assert!(!prompt.contains("issue #"));
         assert!(prompt.contains("PR #5"));
-        assert!(prompt.contains("**Author:** @bob"));
+        assert!(prompt.contains("**Author:** `bob` (@bob)"));
         assert!(prompt.contains("LGTM"));
+    }
+
+    #[test]
+    fn test_format_issue_comments_prompt_with_display_name() {
+        // When a commenter has a display name different from their login,
+        // the prompt should show the display name so the Minion addresses them by name.
+        let since: DateTime<Utc> = "2024-06-15T10:00:00Z".parse().unwrap();
+        let comments = vec![IssueComment {
+            id: 1,
+            body: "Please add a screenshot.".to_string(),
+            user: User {
+                login: "sspalding".to_string(),
+            },
+            created_at: since,
+            display_name: "Stephen Spalding".to_string(),
+        }];
+
+        let prompt =
+            format_issue_comments_prompt(Some(10), "20", &comments, "owner", "repo", "M1e3");
+
+        assert!(prompt.contains("**Author:** `Stephen Spalding` (@sspalding)"));
+        assert!(prompt.contains("display name shown above"));
+    }
+
+    #[test]
+    fn test_format_issue_comments_prompt_minion_commenter() {
+        // When a sibling Minion posted the comment (has a Minion signature),
+        // display_name is the Minion ID and the prompt should use it.
+        let since: DateTime<Utc> = "2024-06-15T10:00:00Z".parse().unwrap();
+        let body = "Could you also update the docs?\n\n<sub>🤖 M1ab</sub>".to_string();
+        let comments = vec![IssueComment {
+            id: 2,
+            body: body.clone(),
+            user: User {
+                login: "fotoetienne".to_string(),
+            },
+            created_at: since,
+            display_name: "M1ab".to_string(),
+        }];
+
+        let prompt =
+            format_issue_comments_prompt(Some(5), "15", &comments, "owner", "repo", "M1e3");
+
+        assert!(prompt.contains("**Author:** `M1ab` (@fotoetienne)"));
     }
 }
