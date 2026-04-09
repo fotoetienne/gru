@@ -172,7 +172,7 @@ pub(crate) async fn fetch_base_branch(worktree_path: &Path, base_branch: &str) -
     let output = Command::new("git")
         .arg("-C")
         .arg(worktree_path)
-        .args(["fetch", "origin", base_branch])
+        .args(["fetch", "origin", "--", base_branch])
         .output()
         .await
         .with_context(|| format!("Failed to execute git fetch origin {}", base_branch))?;
