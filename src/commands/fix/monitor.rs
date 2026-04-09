@@ -1014,13 +1014,7 @@ async fn handle_merge_conflict(
             // Suppress merge-conflict detection for a few poll cycles
             // to let GitHub recompute the mergeable field after force-push.
             state.rebase_cooldown_cycles = REBASE_COOLDOWN_CYCLES;
-            // Use the check_time from just before the conflict was
-            // detected. Reviews posted during the rebase will have
-            // submitted_at > check_time and be caught on the next poll.
-            state.review_baseline = Some(check_time);
-            // Note: save_review_check_time is intentionally not called here.
-            // check_time marks the start of the conflict window, not a point
-            // where reviews were processed. The exit-time save will persist it.
+            // review_baseline already set unconditionally at function entry.
             println!("✅ Rebase succeeded, continuing to monitor PR...\n");
             LoopAction::Continue
         }
@@ -1032,7 +1026,7 @@ async fn handle_merge_conflict(
             // never reach the attempt cap (since attempts reset on success).
             state.rebase_attempts = 0;
             state.rebase_cooldown_cycles = REBASE_COOLDOWN_CYCLES;
-            state.review_baseline = Some(check_time);
+            // review_baseline already set unconditionally at function entry.
             println!("✅ Branch already up-to-date, continuing to monitor PR...\n");
             LoopAction::Continue
         }
@@ -1188,6 +1182,10 @@ async fn handle_pr_event(
         Ok((MonitorResult::MergeConflict, check_time)) => {
             if state.rebase_cooldown_cycles > 0 {
                 state.rebase_cooldown_cycles -= 1;
+                // Advance baseline here too so that if the Minion exits during
+                // the cooldown window the persisted baseline reflects this
+                // poll's check_time, not the pre-reply value.
+                state.review_baseline = Some(check_time);
                 log::info!(
                     "Ignoring stale mergeable:false during post-rebase cooldown ({} cycles remaining)",
                     state.rebase_cooldown_cycles
