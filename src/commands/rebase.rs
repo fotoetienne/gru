@@ -170,8 +170,16 @@ pub(crate) async fn check_clean_worktree(worktree_path: &Path) -> Result<()> {
 /// that occurs when another worktree has the base branch checked out — git
 /// refuses to update `refs/heads/*` for checked-out branches, but never
 /// checks `refs/remotes/*` refs against worktree state.
+/// Builds the refspec used by [`fetch_base_branch`].
+///
+/// Writes to `refs/remotes/origin/<branch>` instead of `refs/heads/<branch>`
+/// so that git's worktree-checkout safety check is never triggered.
+fn make_fetch_refspec(base_branch: &str) -> String {
+    format!("refs/heads/{base_branch}:refs/remotes/origin/{base_branch}")
+}
+
 pub(crate) async fn fetch_base_branch(worktree_path: &Path, base_branch: &str) -> Result<()> {
-    let refspec = format!("refs/heads/{base_branch}:refs/remotes/origin/{base_branch}");
+    let refspec = make_fetch_refspec(base_branch);
     let output = Command::new("git")
         .arg("-C")
         .arg(worktree_path)
@@ -182,7 +190,7 @@ pub(crate) async fn fetch_base_branch(worktree_path: &Path, base_branch: &str) -
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("git fetch origin {} failed: {}", base_branch, stderr.trim());
+        anyhow::bail!("git fetch origin {} failed: {}", refspec, stderr.trim());
     }
 
     Ok(())
@@ -589,19 +597,18 @@ mod tests {
 
     #[test]
     fn test_fetch_base_branch_refspec_format() {
-        // Verify the refspec used by fetch_base_branch writes to the remote-tracking ref,
-        // not the local branch ref.  This matters because git refuses to update
-        // refs/heads/<branch> when that branch is checked out in a linked worktree,
-        // whereas refs/remotes/* are never subject to that check.
-        let branch = "main";
-        let refspec = format!("refs/heads/{branch}:refs/remotes/origin/{branch}");
-        assert_eq!(refspec, "refs/heads/main:refs/remotes/origin/main");
+        // Verify that make_fetch_refspec (used by fetch_base_branch) writes to the
+        // remote-tracking ref, not the local branch ref.  This matters because git
+        // refuses to update refs/heads/<branch> when that branch is checked out in a
+        // linked worktree, whereas refs/remotes/* are never subject to that check.
+        assert_eq!(
+            make_fetch_refspec("main"),
+            "refs/heads/main:refs/remotes/origin/main"
+        );
 
         // Branch names with slashes are valid and handled correctly.
-        let branch = "release/1.0";
-        let refspec = format!("refs/heads/{branch}:refs/remotes/origin/{branch}");
         assert_eq!(
-            refspec,
+            make_fetch_refspec("release/1.0"),
             "refs/heads/release/1.0:refs/remotes/origin/release/1.0"
         );
     }
