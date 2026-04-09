@@ -172,13 +172,15 @@ URL: https://github.com/{{ repo_owner }}/{{ repo_name }}/pull/{{ pr_number }}
 - Your feedback should be your OWN independent review — do not duplicate or respond to points already raised by other reviewers
 
 ## 4. Submit Review
-- **Post EXACTLY ONE review — do not post duplicate reviews.** Once you receive a successful API response (the JSON output contains an `id` field), the review is done — do not rephrase or re-post.
-- BEFORE posting: Check whether a Minion review already exists for this PR (cross-session guard):
+- **Post EXACTLY ONE review — do not post duplicate reviews.** Once `gh pr review` exits successfully (exit code 0, no error output), the review is posted — do not rephrase or re-post.
+- BEFORE posting: Check whether a Minion review already exists for the **current HEAD commit** (cross-session guard):
   ```
-  gh api repos/{{ repo_owner }}/{{ repo_name }}/pulls/{{ pr_number }}/reviews \
-    --jq '[.[] | select((.body // "") | contains("<sub>🤖"))] | length'
+  HEAD_SHA=$(git rev-parse HEAD)
+  gh api repos/{{ repo_owner }}/{{ repo_name }}/pulls/{{ pr_number }}/reviews --paginate | \
+    jq --arg sha "$HEAD_SHA" \
+      '[.[] | select((.body // "") | test("<sub>🤖 [A-Za-z0-9]+</sub>\\s*$")) | select(.commit_id == $sha)] | length'
   ```
-  If the result is 1 or more, skip posting — a Minion review was already submitted.
+  If the result is 1 or more, skip posting — a Minion review was already submitted for this commit.
 - BEFORE submitting: Check if this is your own PR:
   - Use the PR author login from the Step 1 JSON response (`.author.login` field)
   - Use `gh api user --jq '.login'` to get your GitHub username

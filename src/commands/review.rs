@@ -572,12 +572,14 @@ mod tests {
         assert!(prompt.contains("octocat/hello-world/pull/456"));
         assert!(prompt.contains("This PR fixes the broken widget"));
         assert!(prompt.contains("## 1. Fetch PR Details"));
-        // Anti-duplication instruction must be present
+        // Anti-duplication instruction with exit-code success criteria
         assert!(prompt.contains("EXACTLY ONE review"));
         assert!(prompt.contains("do not post duplicate reviews"));
-        // Existing Minion review check with template variables substituted
-        assert!(prompt.contains("gh api repos/octocat/hello-world/pulls/456/reviews"));
-        assert!(prompt.contains(r#"contains("<sub>🤖")"#));
+        assert!(prompt.contains("exit code 0"));
+        // Existing Minion review check: SHA-aware, paginated, regex filter
+        assert!(prompt.contains("gh api repos/octocat/hello-world/pulls/456/reviews --paginate"));
+        assert!(prompt.contains(r#"test("<sub>🤖 [A-Za-z0-9]+</sub>\\s*$")"#));
+        assert!(prompt.contains("commit_id == $sha"));
     }
 
     #[test]
