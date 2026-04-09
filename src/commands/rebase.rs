@@ -163,23 +163,34 @@ pub(crate) async fn check_clean_worktree(worktree_path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Builds the refspec used by [`fetch_base_branch`].
+///
+/// Writes to `refs/remotes/origin/<branch>` instead of `refs/heads/<branch>`
+/// so that git's worktree-checkout safety check is never triggered.
+fn make_fetch_refspec(base_branch: &str) -> String {
+    format!("+refs/heads/{base_branch}:refs/remotes/origin/{base_branch}")
+}
+
 /// Fetches only the specified base branch from origin.
 ///
-/// Fetches `git fetch origin <base_branch>` instead of all refs to avoid the
-/// git safety error that occurs when another worktree has a different branch
-/// checked out that would otherwise be updated by a full fetch.
+/// Uses an explicit refspec that writes to `refs/remotes/origin/<base_branch>`
+/// rather than `refs/heads/<base_branch>`. This avoids the git safety error
+/// that occurs when another worktree has the base branch checked out — git
+/// refuses to update `refs/heads/*` for checked-out branches, but never
+/// checks `refs/remotes/*` refs against worktree state.
 pub(crate) async fn fetch_base_branch(worktree_path: &Path, base_branch: &str) -> Result<()> {
+    let refspec = make_fetch_refspec(base_branch);
     let output = Command::new("git")
         .arg("-C")
         .arg(worktree_path)
-        .args(["fetch", "origin", "--", base_branch])
+        .args(["fetch", "origin", &refspec])
         .output()
         .await
-        .with_context(|| format!("Failed to execute git fetch origin {}", base_branch))?;
+        .with_context(|| format!("Failed to execute git fetch origin {}", refspec))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("git fetch origin {} failed: {}", base_branch, stderr.trim());
+        anyhow::bail!("git fetch origin {} failed: {}", refspec, stderr.trim());
     }
 
     Ok(())
@@ -582,6 +593,27 @@ mod tests {
         let dir = tempfile::tempdir().expect("create temp dir");
         fs::create_dir_all(dir.path().join(".git")).expect("create .git dir");
         dir
+    }
+
+    #[test]
+    fn test_fetch_base_branch_refspec_format() {
+        // Verify that make_fetch_refspec (used by fetch_base_branch) writes to the
+        // remote-tracking ref, not the local branch ref.  This matters because git
+        // refuses to update refs/heads/<branch> when that branch is checked out in a
+        // linked worktree, whereas refs/remotes/* are never subject to that check.
+        // The leading '+' forces the update even for non-fast-forward changes
+        // (e.g. after a force-push of the base branch), matching the behavior of
+        // the configured remote refmap (+refs/heads/*:refs/heads/*).
+        assert_eq!(
+            make_fetch_refspec("main"),
+            "+refs/heads/main:refs/remotes/origin/main"
+        );
+
+        // Branch names with slashes are valid and handled correctly.
+        assert_eq!(
+            make_fetch_refspec("release/1.0"),
+            "+refs/heads/release/1.0:refs/remotes/origin/release/1.0"
+        );
     }
 
     #[test]
