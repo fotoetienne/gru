@@ -123,8 +123,9 @@ enum AutoRebaseResult {
 /// Attempts to auto-rebase the worktree branch onto its base branch.
 async fn auto_rebase_pr(worktree_path: &Path) -> Result<AutoRebaseResult> {
     use super::super::rebase::{
-        abort_rebase, attempt_rebase, check_clean_worktree, detect_base_branch, fetch_base_branch,
-        force_push, is_rebase_in_progress, is_up_to_date, run_agent_rebase, RebaseOutcome,
+        abort_rebase, attempt_rebase, check_clean_worktree, detect_base_branch, ensure_on_branch,
+        fetch_base_branch, force_push, get_current_branch, is_rebase_in_progress, is_up_to_date,
+        run_agent_rebase, RebaseOutcome,
     };
 
     // Abort any stale in-progress rebase left by a previous crashed attempt.
@@ -178,8 +179,17 @@ async fn auto_rebase_pr(worktree_path: &Path) -> Result<AutoRebaseResult> {
             println!("⚠️  Conflicts detected, launching agent to resolve...");
             abort_rebase(worktree_path).await?;
 
+            // Capture local branch name now (abort_rebase restores it) so we can
+            // recover if the agent leaves the worktree in detached HEAD state.
+            let local_branch = get_current_branch(worktree_path).await?;
+
             // None uses the 30m default inside run_agent_rebase
             let exit_code = run_agent_rebase(worktree_path, None).await?;
+
+            // Defensive check: agent may have checked out a remote tracking ref
+            // (e.g. `origin/<branch>`) leaving the worktree in detached HEAD.
+            ensure_on_branch(worktree_path, &local_branch).await?;
+
             if exit_code == 0 {
                 // Defensively force push in case the /rebase skill didn't push
                 log::info!("Auto force-pushing after conflict resolution (autonomous mode, --force-with-lease)");

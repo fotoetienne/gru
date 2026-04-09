@@ -78,8 +78,16 @@ pub(crate) async fn handle_rebase(
             // (the /rebase command will re-initiate the rebase itself)
             abort_rebase(&worktree_path).await?;
 
+            // Capture local branch name now (abort_rebase restores it) so we can
+            // recover if the agent leaves the worktree in detached HEAD state.
+            let local_branch = get_current_branch(&worktree_path).await?;
+
             // Spawn Claude Code with /rebase command
             let exit_code = run_agent_rebase(&worktree_path, timeout).await?;
+
+            // Defensive check: agent may have checked out a remote tracking ref
+            // (e.g. `origin/<branch>`) leaving the worktree in detached HEAD.
+            ensure_on_branch(&worktree_path, &local_branch).await?;
 
             if exit_code == 0 {
                 if push {
@@ -265,7 +273,7 @@ pub(crate) async fn detect_base_branch(worktree_path: &Path) -> Result<String> {
 }
 
 /// Gets the current branch name in a worktree.
-async fn get_current_branch(worktree_path: &Path) -> Result<String> {
+pub(crate) async fn get_current_branch(worktree_path: &Path) -> Result<String> {
     let output = Command::new("git")
         .arg("-C")
         .arg(worktree_path)
@@ -284,6 +292,69 @@ async fn get_current_branch(worktree_path: &Path) -> Result<String> {
     }
 
     Ok(branch)
+}
+
+/// Ensures the worktree is on the expected local branch.
+///
+/// After a conflict-resolution agent run the worktree can end up in detached
+/// HEAD state — for example when the agent checks out a remote tracking ref
+/// such as `origin/minion/issue-42-M001` instead of the local branch.  This
+/// function detects that condition and restores the local branch so that
+/// subsequent operations (force-push, further commits) work correctly.
+pub(crate) async fn ensure_on_branch(worktree_path: &Path, expected_branch: &str) -> Result<()> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(worktree_path)
+        .args(["branch", "--show-current"])
+        .output()
+        .await
+        .context("Failed to check current branch")?;
+
+    let current = String::from_utf8_lossy(&output.stdout).trim().to_string();
+
+    if current == expected_branch {
+        return Ok(());
+    }
+
+    if current.is_empty() {
+        log::warn!(
+            "⚠️  Worktree is in detached HEAD state after agent rebase; checking out local branch '{}'",
+            expected_branch
+        );
+        println!(
+            "⚠️  Recovering from detached HEAD: checking out '{}'...",
+            expected_branch
+        );
+    } else {
+        log::warn!(
+            "⚠️  Worktree is on unexpected branch '{}' instead of '{}'; switching",
+            current,
+            expected_branch
+        );
+        println!(
+            "⚠️  Unexpected branch '{}'; switching to '{}'...",
+            current, expected_branch
+        );
+    }
+
+    let checkout_output = Command::new("git")
+        .arg("-C")
+        .arg(worktree_path)
+        .args(["checkout", expected_branch])
+        .output()
+        .await
+        .with_context(|| format!("Failed to checkout branch '{}'", expected_branch))?;
+
+    if !checkout_output.status.success() {
+        let stderr = String::from_utf8_lossy(&checkout_output.stderr);
+        anyhow::bail!(
+            "git checkout '{}' failed: {}",
+            expected_branch,
+            stderr.trim()
+        );
+    }
+
+    Ok(())
 }
 
 /// Tries to get the base branch from an associated PR via GitHub CLI.
@@ -667,5 +738,108 @@ mod tests {
             is_rebase_in_progress(worktree.path()),
             "should handle extra whitespace after 'gitdir:'"
         );
+    }
+
+    /// Initialises a throwaway git repo with one commit and a named branch.
+    ///
+    /// Unsets git environment variables (`GIT_DIR`, `GIT_WORK_TREE`,
+    /// `GIT_INDEX_FILE`) inherited from the calling process (e.g. a pre-commit
+    /// hook) so that the commands operate on the fresh temp repo rather than the
+    /// outer repository.  This modification persists for the test process, which
+    /// is safe because cargo nextest runs each test in its own process.
+    ///
+    /// Returns the temp dir (must stay alive for the lifetime of the test).
+    async fn make_git_repo_with_branch(branch: &str) -> TempDir {
+        use tokio::process::Command as TokioCmd;
+
+        // Isolate from any git env vars set by a parent git hook.
+        for var in &["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE"] {
+            std::env::remove_var(var);
+        }
+
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let p = dir.path();
+
+        macro_rules! git {
+            ($($arg:expr),+) => {{
+                let status = TokioCmd::new("git")
+                    .args([$($arg),+])
+                    .current_dir(p)
+                    .status()
+                    .await
+                    .expect("git command failed");
+                assert!(status.success(), "git {} failed", stringify!($($arg),+));
+            }};
+        }
+
+        git!("init", "-b", branch);
+        git!("config", "user.email", "test@test.com");
+        git!("config", "user.name", "Test");
+        // Create an initial commit so the branch ref exists
+        fs::write(p.join("README"), "test").unwrap();
+        git!("add", "README");
+        git!("commit", "--no-gpg-sign", "-m", "init");
+
+        dir
+    }
+
+    #[tokio::test]
+    async fn test_ensure_on_branch_already_on_correct_branch() {
+        let dir = make_git_repo_with_branch("my-feature").await;
+        // Should be a no-op — already on the right branch.
+        ensure_on_branch(dir.path(), "my-feature")
+            .await
+            .expect("should succeed when already on correct branch");
+        // Verify still on my-feature
+        let branch = get_current_branch(dir.path()).await.unwrap();
+        assert_eq!(branch, "my-feature");
+    }
+
+    #[tokio::test]
+    async fn test_ensure_on_branch_detached_head_recovery() {
+        use tokio::process::Command as TokioCmd;
+        let dir = make_git_repo_with_branch("my-feature").await;
+        let p = dir.path();
+
+        // Put the worktree into detached HEAD by checking out the commit SHA directly.
+        let sha_out = TokioCmd::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(p)
+            .output()
+            .await
+            .expect("git rev-parse failed");
+        let sha = String::from_utf8_lossy(&sha_out.stdout).trim().to_string();
+
+        let status = TokioCmd::new("git")
+            .args(["checkout", "--detach", &sha])
+            .current_dir(p)
+            .status()
+            .await
+            .expect("git checkout --detach failed");
+        assert!(status.success());
+
+        // Confirm detached HEAD.
+        let branch_out = TokioCmd::new("git")
+            .args(["branch", "--show-current"])
+            .current_dir(p)
+            .output()
+            .await
+            .unwrap();
+        let current = String::from_utf8_lossy(&branch_out.stdout)
+            .trim()
+            .to_string();
+        assert!(
+            current.is_empty(),
+            "expected detached HEAD, got '{}'",
+            current
+        );
+
+        // ensure_on_branch should restore the local branch.
+        ensure_on_branch(p, "my-feature")
+            .await
+            .expect("should recover from detached HEAD");
+
+        let branch = get_current_branch(p).await.unwrap();
+        assert_eq!(branch, "my-feature", "should be back on my-feature");
     }
 }
