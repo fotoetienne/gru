@@ -33,13 +33,14 @@ pub(crate) async fn handle_rebase(
 
     println!("🔄 Rebasing worktree: {}", worktree_path.display());
 
-    // Pre-flight: fetch latest from origin
-    println!("📡 Fetching latest changes from origin...");
-    fetch_origin(&worktree_path).await?;
-
-    // Detect the base branch
+    // Detect the base branch first so we can fetch only what we need
     let base_branch = detect_base_branch(&worktree_path).await?;
     println!("🎯 Base branch: {}", base_branch);
+
+    // Pre-flight: fetch only the base branch to avoid conflicts with other
+    // worktrees that have different branches checked out
+    println!("📡 Fetching latest changes from origin...");
+    fetch_base_branch(&worktree_path, &base_branch).await?;
 
     // Pre-flight: check for uncommitted changes
     check_clean_worktree(&worktree_path).await?;
@@ -162,19 +163,23 @@ pub(crate) async fn check_clean_worktree(worktree_path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Fetches the latest changes from origin in a worktree.
-pub(crate) async fn fetch_origin(worktree_path: &Path) -> Result<()> {
+/// Fetches only the specified base branch from origin.
+///
+/// Fetches `git fetch origin <base_branch>` instead of all refs to avoid the
+/// git safety error that occurs when another worktree has a different branch
+/// checked out that would otherwise be updated by a full fetch.
+pub(crate) async fn fetch_base_branch(worktree_path: &Path, base_branch: &str) -> Result<()> {
     let output = Command::new("git")
         .arg("-C")
         .arg(worktree_path)
-        .args(["fetch", "origin"])
+        .args(["fetch", "origin", base_branch])
         .output()
         .await
         .context("Failed to execute git fetch origin")?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("git fetch origin failed: {}", stderr.trim());
+        anyhow::bail!("git fetch origin {} failed: {}", base_branch, stderr.trim());
     }
 
     Ok(())
