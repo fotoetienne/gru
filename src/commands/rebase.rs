@@ -311,6 +311,17 @@ pub(crate) async fn get_current_branch(worktree_path: &Path) -> Result<String> {
 /// such as `origin/minion/issue-42-M001` instead of the local branch.  This
 /// function detects that condition and restores the local branch so that
 /// subsequent operations (force-push, further commits) work correctly.
+///
+/// # Limitation: orphaned commits
+///
+/// This function restores the *branch pointer* by running `git checkout
+/// <expected_branch>`.  Any commits the agent made while in detached HEAD
+/// (e.g. conflict-resolution commits) are left unreachable and will
+/// eventually be garbage-collected.  In practice the autonomous monitor
+/// path force-pushes after this function returns, so if the agent did not
+/// push its work before control returned here, those commits are silently
+/// discarded.  Callers that need to preserve detached-HEAD commits should
+/// cherry-pick or reset before calling this function.
 pub(crate) async fn ensure_on_branch(worktree_path: &Path, expected_branch: &str) -> Result<()> {
     anyhow::ensure!(
         !expected_branch.is_empty(),
@@ -886,5 +897,37 @@ mod tests {
 
         let branch = get_current_branch(p).await.unwrap();
         assert_eq!(branch, "my-feature", "should be back on my-feature");
+    }
+
+    #[tokio::test]
+    async fn test_ensure_on_branch_wrong_named_branch() {
+        use tokio::process::Command as TokioCmd;
+        let dir = make_git_repo_with_branch("my-feature").await;
+        let p = dir.path();
+
+        // Create a second branch and switch to it so the worktree is on
+        // the "wrong" named branch (not detached HEAD).
+        let status = TokioCmd::new("git")
+            .args(["checkout", "-b", "wrong-branch"])
+            .current_dir(p)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
+            .status()
+            .await
+            .expect("git checkout -b failed");
+        assert!(status.success());
+
+        // Confirm we are on the wrong branch.
+        let current = get_current_branch(p).await.unwrap();
+        assert_eq!(current, "wrong-branch");
+
+        // ensure_on_branch should switch back to the expected branch.
+        ensure_on_branch(p, "my-feature")
+            .await
+            .expect("should switch from wrong-branch to my-feature");
+
+        let branch = get_current_branch(p).await.unwrap();
+        assert_eq!(branch, "my-feature", "should be on my-feature");
     }
 }
