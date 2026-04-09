@@ -612,7 +612,7 @@ async fn poll_once(
     // fetch would permanently lose any human comments posted in that window (they would
     // never be retried), undermining the monitor's ability to respond to PR conversation.
     let (all_issue_comments, issue_comments_fetch_failed) =
-        match fetch_issue_comments(host, owner, repo, pr_number).await {
+        match fetch_issue_comments(host, owner, repo, pr_number, *last_check_time).await {
             Ok(c) => (c, false),
             Err(e) => {
                 log::warn!(
@@ -846,20 +846,32 @@ pub(crate) async fn get_all_reviews(
     Ok(reviews)
 }
 
-/// Fetch all general PR conversation comments (issue comments) for a PR.
+/// Fetch general PR conversation comments (issue comments) for a PR.
 ///
 /// Uses `--paginate` with `--jq ".[]"` to stream individual comment objects.
+/// Passes `since` as a server-side filter (`?since=`) to reduce payload size on
+/// long-lived PRs with many comments.
 async fn fetch_issue_comments(
     host: &str,
     owner: &str,
     repo: &str,
     pr_number: &str,
+    since: DateTime<Utc>,
 ) -> Result<Vec<IssueComment>> {
     let repo_full = github::repo_slug(owner, repo);
     let endpoint = format!("repos/{repo_full}/issues/{pr_number}/comments");
+    let since_param = format!("since={}", since.to_rfc3339());
     let output = gh_api_with_retry(
         host,
-        &["api", "--paginate", &endpoint, "--jq", ".[]"],
+        &[
+            "api",
+            "--paginate",
+            &endpoint,
+            "--jq",
+            ".[]",
+            "-f",
+            &since_param,
+        ],
         DEFAULT_MAX_RETRIES,
     )
     .await?;
