@@ -1208,7 +1208,7 @@ gh api --method POST repos/{owner}/{repo}/issues/{pr_number}/comments \\\n  \
 Each reply must:\n\
 - Open by addressing the reviewer by the name shown in backticks in the **Reviewer:** line (e.g., `Alice Johnson,` or `alice-dev,`)\n\
 - Summarize what was changed to address the feedback\n\
-- End with the signature: `\\n\\n<sub>🤖 {minion_id}</sub>`\n\n"
+- End with the signature: `\\n\\n<sub>🤖 {minion_id}</sub>`\n"
         ));
     }
 
@@ -1562,8 +1562,9 @@ mod tests {
         // Review body present: should include signature instruction and PR comment API
         assert!(prompt.contains("<sub>🤖 M001</sub>"));
         assert!(prompt.contains("repos/octocat/hello-world/issues/99/comments"));
-        // No inline comments, so no in_reply_to instructions
+        // No inline comments, so no in_reply_to or inline-specific strings
         assert!(!prompt.contains("in_reply_to"));
+        assert!(!prompt.contains("EXACTLY ONE reply per comment ID"));
     }
 
     #[test]
@@ -1616,9 +1617,11 @@ mod tests {
         assert!(prompt.contains("## Inline Comment 1"));
         assert!(prompt.contains("**File:** src/lib.rs:10"));
         assert!(prompt.contains("Fix this line."));
-        // Reply instructions present for inline comments
+        // Body reply instructions present (issues endpoint, signature)
+        assert!(prompt.contains("repos/octocat/hello-world/issues/20/comments"));
+        assert!(prompt.contains("EXACTLY ONE reply per review"));
+        // Inline comment reply instructions present
         assert!(prompt.contains("in_reply_to"));
-        // Anti-duplication instructions must be present for inline comments
         assert!(prompt.contains("EXACTLY ONE reply per comment ID"));
         assert!(prompt.contains("in a separate sequential step"));
         assert!(prompt.contains("do not batch reply API calls"));
