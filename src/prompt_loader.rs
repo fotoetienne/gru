@@ -172,11 +172,11 @@ URL: https://github.com/{{ repo_owner }}/{{ repo_name }}/pull/{{ pr_number }}
 - Your feedback should be your OWN independent review — do not duplicate or respond to points already raised by other reviewers
 
 ## 4. Submit Review
-- **Post EXACTLY ONE review — do not post duplicate reviews.** Once you receive a successful API response (the JSON output contains an `id` field), the review is done. Do not rephrase or re-post.
-- BEFORE posting: Check whether a Minion review already exists for this PR:
+- **Post EXACTLY ONE review — do not post duplicate reviews.** Once you receive a successful API response (the JSON output contains an `id` field), the review is done — do not rephrase or re-post.
+- BEFORE posting: Check whether a Minion review already exists for this PR (cross-session guard):
   ```
   gh api repos/{{ repo_owner }}/{{ repo_name }}/pulls/{{ pr_number }}/reviews \
-    --jq '[.[] | select(.body | contains("🤖"))] | length'
+    --jq '[.[] | select((.body // "") | contains("<sub>🤖"))] | length'
   ```
   If the result is 1 or more, skip posting — a Minion review was already submitted.
 - BEFORE submitting: Check if this is your own PR:

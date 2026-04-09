@@ -575,8 +575,9 @@ mod tests {
         // Anti-duplication instruction must be present
         assert!(prompt.contains("EXACTLY ONE review"));
         assert!(prompt.contains("do not post duplicate reviews"));
-        // Check for existing Minion review instruction must be present
-        assert!(prompt.contains("🤖"));
+        // Existing Minion review check with template variables substituted
+        assert!(prompt.contains("gh api repos/octocat/hello-world/pulls/456/reviews"));
+        assert!(prompt.contains(r#"contains("<sub>🤖")"#));
     }
 
     #[test]
