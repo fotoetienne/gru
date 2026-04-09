@@ -1279,11 +1279,14 @@ pub(crate) fn sanitize_display_name(name: &str, login: &str) -> String {
 /// Fetches the full user JSON from `gh api /users/{login}` and extracts the
 /// `name` field. A JSON-null `name` is treated as absent (falls back to the
 /// login); a non-null string value (including a literal "null" display name)
-/// is used as-is after sanitization. On API error, logs a warning and
-/// returns the login.
+/// is used as-is after sanitization. On API error or parse failure, logs a
+/// warning and returns the login.
+///
+/// Results are cached by the `gh` CLI for 5 minutes to reduce rate-limit
+/// pressure during PR monitoring cycles.
 pub(crate) async fn get_user_display_name(host: &str, login: &str) -> String {
     let endpoint = format!("users/{login}");
-    match run_gh(host, &["api", &endpoint]).await {
+    match run_gh(host, &["api", &endpoint, "--cache", "300s"]).await {
         Ok(raw) => match serde_json::from_str::<serde_json::Value>(&raw) {
             Ok(value) => {
                 let name = value["name"]

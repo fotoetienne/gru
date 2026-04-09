@@ -752,7 +752,8 @@ pub(crate) async fn get_all_reviews(
     Ok(reviews)
 }
 
-/// Convert a list of raw API review comments into `ReviewComment`s, skipping:
+/// Filter a list of raw API review comments down to only those that need a
+/// Minion reply, skipping:
 /// - The current Minion's own reply comments (identified by its specific signature)
 /// - Comments that the current Minion has already directly replied to
 ///   (identified by appearing as `in_reply_to_id` on a Minion reply comment)
@@ -762,11 +763,14 @@ pub(crate) async fn get_all_reviews(
 /// comments in implicit review objects (with empty bodies), accumulating across
 /// all reviews makes those prior replies visible when building `already_answered`,
 /// preventing duplicate replies after a session restart.
+///
+/// Returns raw `ApiReviewComment`s so that display-name lookups can be
+/// deferred until after filtering (avoiding API calls for already-answered or
+/// Minion-authored threads).
 fn filter_unanswered_comments(
     api_comments: Vec<ApiReviewComment>,
     minion_id: &str,
-    display_names: &std::collections::HashMap<String, String>,
-) -> Vec<ReviewComment> {
+) -> Vec<ApiReviewComment> {
     // Collect IDs of comments that this Minion has already directly replied to.
     let already_answered: std::collections::HashSet<u64> = api_comments
         .iter()
@@ -783,20 +787,6 @@ fn filter_unanswered_comments(
         .into_iter()
         .filter(|c| {
             !has_minion_signature_for(&c.body, minion_id) && !already_answered.contains(&c.id)
-        })
-        .map(|c| {
-            let display_name = display_names
-                .get(&c.user.login)
-                .cloned()
-                .unwrap_or_else(|| c.user.login.clone());
-            ReviewComment {
-                file: c.path,
-                line: c.line,
-                body: c.body,
-                reviewer: c.user.login,
-                reviewer_display_name: display_name,
-                comment_id: c.id,
-            }
         })
         .collect()
 }
@@ -877,10 +867,15 @@ async fn get_review_feedback(
         );
     }
 
-    // Fetch display names for unique reviewers (deduplicated to minimize API calls)
+    // Filter all accumulated comments at once (Bug 2 fix: cross-review dedup).
+    // Filtering happens before display-name lookup so we only call the API for
+    // authors of comments that will actually be replied to.
+    let unanswered_raw = filter_unanswered_comments(raw_comments, minion_id);
+
+    // Fetch display names only for unique authors of unanswered comments.
     let mut display_names: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
-    for comment in &raw_comments {
+    for comment in &unanswered_raw {
         let login = &comment.user.login;
         if !display_names.contains_key(login) {
             let name = github::get_user_display_name(host, login).await;
@@ -888,8 +883,26 @@ async fn get_review_feedback(
         }
     }
 
-    // Filter all accumulated comments at once (Bug 2 fix: cross-review dedup)
-    let all_comments = filter_unanswered_comments(raw_comments, minion_id, &display_names);
+    // Convert filtered raw comments to ReviewComment with display names.
+    let all_comments: Vec<ReviewComment> = unanswered_raw
+        .into_iter()
+        .map(|c| {
+            // Every login in unanswered_raw was inserted into display_names above;
+            // the fallback is a defensive guard.
+            let display_name = display_names
+                .get(&c.user.login)
+                .cloned()
+                .unwrap_or_else(|| c.user.login.clone());
+            ReviewComment {
+                file: c.path,
+                line: c.line,
+                body: c.body,
+                reviewer: c.user.login,
+                reviewer_display_name: display_name,
+                comment_id: c.id,
+            }
+        })
+        .collect();
 
     Ok(ReviewFeedback {
         comments: all_comments,
@@ -1959,8 +1972,7 @@ mod tests {
         let original = make_api_comment(1, "Please fix this.", None);
         let minion_reply = make_api_comment(2, "Done!\n\n<sub>🤖 M001</sub>", Some(1));
 
-        let result =
-            filter_unanswered_comments(vec![original, minion_reply], "M001", &Default::default());
+        let result = filter_unanswered_comments(vec![original, minion_reply], "M001");
         assert!(
             result.is_empty(),
             "Already-answered comment should be filtered out"
@@ -1974,19 +1986,16 @@ mod tests {
         let unanswered_root = make_api_comment(2, "Add error handling.", None);
         let minion_reply = make_api_comment(3, "Fixed!\n\n<sub>🤖 M001</sub>", Some(1));
 
-        let result = filter_unanswered_comments(
-            vec![answered_root, unanswered_root, minion_reply],
-            "M001",
-            &Default::default(),
-        );
+        let result =
+            filter_unanswered_comments(vec![answered_root, unanswered_root, minion_reply], "M001");
         assert_eq!(result.len(), 1);
-        assert_eq!(result[0].comment_id, 2);
+        assert_eq!(result[0].id, 2);
         assert_eq!(result[0].body, "Add error handling.");
     }
 
     #[test]
     fn test_filter_unanswered_comments_empty_input() {
-        let result = filter_unanswered_comments(vec![], "M001", &Default::default());
+        let result = filter_unanswered_comments(vec![], "M001");
         assert!(result.is_empty());
     }
 
@@ -1997,10 +2006,9 @@ mod tests {
         let orphan_minion = make_api_comment(1, "Done!\n\n<sub>🤖 M001</sub>", None);
         let unrelated = make_api_comment(2, "Please fix this.", None);
 
-        let result =
-            filter_unanswered_comments(vec![orphan_minion, unrelated], "M001", &Default::default());
+        let result = filter_unanswered_comments(vec![orphan_minion, unrelated], "M001");
         assert_eq!(result.len(), 1);
-        assert_eq!(result[0].comment_id, 2);
+        assert_eq!(result[0].id, 2);
     }
 
     // ========================================================================
