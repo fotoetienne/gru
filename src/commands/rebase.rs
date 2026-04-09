@@ -175,10 +175,7 @@ pub(crate) async fn fetch_base_branch(worktree_path: &Path, base_branch: &str) -
         .args(["fetch", "origin", base_branch])
         .output()
         .await
-        .context(format!(
-            "Failed to execute git fetch origin {}",
-            base_branch
-        ))?;
+        .with_context(|| format!("Failed to execute git fetch origin {}", base_branch))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
