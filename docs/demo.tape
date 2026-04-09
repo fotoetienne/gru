@@ -12,7 +12,6 @@ Set Height 550
 Set Theme "Catppuccin Mocha"
 Set Padding 20
 Set TypingSpeed 70ms
-Set PlaybackSpeed 1
 Set WindowBar Rings
 Set BorderRadius 8
 Set Framerate 30
@@ -27,4 +26,5 @@ Sleep 800ms
 Type "gru do 47"
 Sleep 600ms
 Enter
-Sleep 17s
+# demo-script.sh accumulates ~12.3s of sleep; 20s gives ~7.7s buffer for slow machines
+Sleep 20s
