@@ -1307,6 +1307,11 @@ pub(crate) async fn monitor_pr_lifecycle(
     //    harmful than a missing review).
     //
     // If HEAD is unavailable, both guards are inactive and the review proceeds.
+    //
+    // This is still best-effort duplicate suppression, not a strict guarantee:
+    // concurrent monitor sessions can both observe no pending flag and no posted
+    // review for the current SHA before either session sets `pending_review_sha`,
+    // and both may then spawn a review subprocess.
     let head_sha = ci::get_head_sha(&wt_ctx.checkout_path).await.ok();
     if head_sha.is_none() {
         log::debug!("HEAD SHA unavailable; pending_review_sha guard inactive for this session");
@@ -1356,8 +1361,13 @@ pub(crate) async fn monitor_pr_lifecycle(
         // we don't overwrite a stored baseline with the current time, which would
         // cause reviews posted while the minion was stopped to be skipped.
         save_review_check_time(&wt_ctx.minion_id, pre_review_time).await;
-        // Persist the pending SHA before spawning so a crash-resumed session can
-        // detect the in-flight review and skip spawning a duplicate.
+        // Persist the pending SHA *before* spawning the subprocess.  Setting it
+        // after spawn would miss the primary crash scenario (session dies while the
+        // child is running).  The trade-off: a crash in the narrow window *after*
+        // this write but *before* the child is actually started leaves the flag set
+        // with no subprocess running; the next resumed session will skip this review
+        // round.  That false-positive is far less likely and less harmful than the
+        // duplicate-review problem this flag exists to prevent.
         if let Some(ref sha) = head_sha {
             save_pending_review_sha(&wt_ctx.minion_id, sha).await;
         }
