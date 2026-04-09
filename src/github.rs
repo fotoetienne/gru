@@ -1255,6 +1255,29 @@ pub(crate) struct ReviewUser {
     pub(crate) login: String,
 }
 
+/// Parse the raw jq output from `gh api /users/{login} --jq .name`.
+///
+/// jq outputs a bare string (no quotes) with a trailing newline, or the
+/// literal four-character string `"null"` when the field is JSON null.
+/// Returns the trimmed name when it is non-empty and non-null, otherwise
+/// returns the login unchanged.
+///
+/// Control characters are stripped and the result is capped at 100 characters
+/// to prevent prompt injection via attacker-controlled display names.
+pub(crate) fn parse_user_display_name_raw(raw: &str, login: &str) -> String {
+    let name: String = raw
+        .trim()
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(100)
+        .collect();
+    if name.is_empty() || name == "null" {
+        login.to_string()
+    } else {
+        name
+    }
+}
+
 /// Fetch the display name for a GitHub user, falling back to their login.
 ///
 /// Calls `gh api /users/{login} --jq .name`. Returns the display name if
@@ -1263,14 +1286,7 @@ pub(crate) struct ReviewUser {
 pub(crate) async fn get_user_display_name(host: &str, login: &str) -> String {
     let endpoint = format!("users/{login}");
     match run_gh(host, &["api", &endpoint, "--jq", ".name"]).await {
-        Ok(name) => {
-            let name = name.trim().to_string();
-            if name.is_empty() || name == "null" {
-                login.to_string()
-            } else {
-                name
-            }
-        }
+        Ok(raw) => parse_user_display_name_raw(&raw, login),
         Err(e) => {
             log::warn!("Failed to fetch display name for {}: {}", login, e);
             login.to_string()
@@ -1859,6 +1875,43 @@ mod tests {
         let (eligible, reason) = check_issue_eligibility("CLOSED", &labels);
         assert!(!eligible);
         assert!(reason.unwrap().contains("no longer open"));
+    }
+
+    #[test]
+    fn test_parse_user_display_name_raw_normal() {
+        // Typical case: jq outputs the name with a trailing newline
+        assert_eq!(
+            parse_user_display_name_raw("Alice Johnson\n", "alicej"),
+            "Alice Johnson"
+        );
+    }
+
+    #[test]
+    fn test_parse_user_display_name_raw_null() {
+        // jq outputs the four-character literal "null" when the name field is JSON null
+        assert_eq!(parse_user_display_name_raw("null\n", "alicej"), "alicej");
+    }
+
+    #[test]
+    fn test_parse_user_display_name_raw_empty() {
+        // Empty string (blank name): fall back to login
+        assert_eq!(parse_user_display_name_raw("\n", "alicej"), "alicej");
+    }
+
+    #[test]
+    fn test_parse_user_display_name_raw_strips_control_chars() {
+        // Embedded newlines and other control characters should be stripped
+        assert_eq!(
+            parse_user_display_name_raw("Evil\nInjection", "bad-actor"),
+            "EvilInjection"
+        );
+    }
+
+    #[test]
+    fn test_parse_user_display_name_raw_truncates_at_100() {
+        let long_name = "A".repeat(200);
+        let result = parse_user_display_name_raw(&long_name, "u");
+        assert_eq!(result.len(), 100);
     }
 
     #[test]

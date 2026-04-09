@@ -963,7 +963,7 @@ gh api --method POST repos/{owner}/{repo}/pulls/{pr_number}/comments \\\n  \
 ```\n\n\
 Where `<comment_id>` is the Comment ID listed above for each inline review comment. \
 Each reply must:\n\
-- Open by addressing the reviewer by their display name (the name shown in **Reviewer:** before the @login, e.g. \"Stephen,\" or \"sspalding,\")\n\
+- Open by addressing the reviewer by their display name (the name shown in **Reviewer:** before the @login, e.g. \"Alice,\" or \"alice-dev,\")\n\
 - Summarize what was changed to address the feedback\n\
 - End with the signature: `\\n\\n<sub>🤖 {minion_id}</sub>`\n"
         ));
