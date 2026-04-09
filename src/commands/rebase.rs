@@ -163,13 +163,6 @@ pub(crate) async fn check_clean_worktree(worktree_path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Fetches only the specified base branch from origin.
-///
-/// Uses an explicit refspec that writes to `refs/remotes/origin/<base_branch>`
-/// rather than `refs/heads/<base_branch>`. This avoids the git safety error
-/// that occurs when another worktree has the base branch checked out — git
-/// refuses to update `refs/heads/*` for checked-out branches, but never
-/// checks `refs/remotes/*` refs against worktree state.
 /// Builds the refspec used by [`fetch_base_branch`].
 ///
 /// Writes to `refs/remotes/origin/<branch>` instead of `refs/heads/<branch>`
@@ -178,6 +171,13 @@ fn make_fetch_refspec(base_branch: &str) -> String {
     format!("refs/heads/{base_branch}:refs/remotes/origin/{base_branch}")
 }
 
+/// Fetches only the specified base branch from origin.
+///
+/// Uses an explicit refspec that writes to `refs/remotes/origin/<base_branch>`
+/// rather than `refs/heads/<base_branch>`. This avoids the git safety error
+/// that occurs when another worktree has the base branch checked out — git
+/// refuses to update `refs/heads/*` for checked-out branches, but never
+/// checks `refs/remotes/*` refs against worktree state.
 pub(crate) async fn fetch_base_branch(worktree_path: &Path, base_branch: &str) -> Result<()> {
     let refspec = make_fetch_refspec(base_branch);
     let output = Command::new("git")
