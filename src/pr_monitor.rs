@@ -1149,9 +1149,8 @@ When addressing a reviewer in any reply, use the name shown in backticks in the 
         prompt.push_str(&format!(
             "After committing your changes, reply to EACH inline review comment thread to explain what you changed. \
 Post EXACTLY ONE reply per comment ID — do not post duplicate replies. \
-Reply to each comment in a separate sequential step — do not batch replies together with other \
-operations such as git push, and do not run reply API calls in parallel with each other or with \
-any other tool calls. Complete one reply at a time before starting the next.\n\n\
+Reply to each comment in a separate sequential step — do not batch reply API calls with each other \
+or with git operations such as push. Reply to them in the order they appear above.\n\n\
 For each comment, post an inline reply using the GitHub API:\n\n\
 ```\n\
 gh api --method POST repos/{owner}/{repo}/pulls/{pr_number}/comments \\\n  \
@@ -1351,6 +1350,10 @@ mod tests {
         assert!(prompt.contains("repos/octocat/hello-world/pulls/456/comments"));
         assert!(prompt.contains("<sub>🤖 M042</sub>"));
         assert!(prompt.contains("Open by addressing the reviewer"));
+        // Anti-duplication instructions must be present
+        assert!(prompt.contains("EXACTLY ONE reply per comment ID"));
+        assert!(prompt.contains("in a separate sequential step"));
+        assert!(prompt.contains("do not batch reply API calls"));
     }
 
     #[test]
@@ -1399,8 +1402,8 @@ mod tests {
         assert!(prompt.contains("End with the signature"));
         // Anti-duplication instructions must be present
         assert!(prompt.contains("EXACTLY ONE reply per comment ID"));
-        assert!(prompt.contains("sequential step"));
-        assert!(prompt.contains("do not batch replies together"));
+        assert!(prompt.contains("in a separate sequential step"));
+        assert!(prompt.contains("do not batch reply API calls"));
     }
 
     #[test]
