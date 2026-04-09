@@ -805,6 +805,22 @@ async fn handle_new_issue_comments(
     check_time: DateTime<Utc>,
 ) -> LoopAction {
     state.issue_comment_round += 1;
+
+    if state.issue_comment_round > MAX_REVIEW_ROUNDS {
+        println!(
+            "💬 Detected {} new PR comment(s) on PR #{} — reached maximum comment rounds limit ({})",
+            comments.len(),
+            ctx.pr_number,
+            MAX_REVIEW_ROUNDS
+        );
+        println!("   Additional comments will need manual handling");
+        println!(
+            "   View PR: https://{}/{}/{}/pull/{}",
+            ctx.issue_ctx.host, ctx.issue_ctx.owner, ctx.issue_ctx.repo, ctx.pr_number
+        );
+        return LoopAction::Break;
+    }
+
     println!(
         "💬 Detected {} new PR comment(s) on PR #{} (round {}/{})",
         comments.len(),
@@ -812,19 +828,6 @@ async fn handle_new_issue_comments(
         state.issue_comment_round,
         MAX_REVIEW_ROUNDS
     );
-
-    if state.issue_comment_round > MAX_REVIEW_ROUNDS {
-        println!(
-            "⚠️  Reached maximum comment rounds limit ({})",
-            MAX_REVIEW_ROUNDS
-        );
-        println!("   Additional comments will need manual handling");
-        println!(
-            "   View PR: https://github.com/{}/{}/pull/{}",
-            ctx.issue_ctx.owner, ctx.issue_ctx.repo, ctx.pr_number
-        );
-        return LoopAction::Break;
-    }
 
     let prompt = pr_monitor::format_issue_comments_prompt(
         ctx.issue_ctx.issue_num,

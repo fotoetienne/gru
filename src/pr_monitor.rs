@@ -129,6 +129,8 @@ struct ApiReviewComment {
 /// A general PR conversation comment (issue comment, not a formal review)
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct IssueComment {
+    #[allow(dead_code)] // deserialized from GitHub API; available for future deduplication
+    pub(crate) id: u64,
     pub(crate) body: String,
     pub(crate) user: User,
     pub(crate) created_at: DateTime<Utc>,
@@ -559,11 +561,10 @@ async fn poll_once(
         return Ok(Some(result));
     }
 
-    // Capture the poll time before any API calls so that any review submitted
-    // while `get_all_reviews` is in flight is not silently dropped: its
-    // `submitted_at` will be >= `review_poll_time` and will therefore be
-    // visible on the next poll cycle.
-    let review_poll_time = Utc::now();
+    // Capture the poll time before any API calls so that any event submitted
+    // while the API calls are in flight is not silently dropped: its timestamp
+    // will be >= `poll_time` and will therefore be visible on the next poll cycle.
+    let poll_time = Utc::now();
     // Fetch all reviews once, then filter for new ones to avoid a double API call.
     // The full list is reused below for merge-readiness evaluation.
     // Check for new reviews BEFORE merge conflicts so that reviewer feedback
@@ -577,7 +578,7 @@ async fn poll_once(
         // If some fetches failed we leave last_check_time unchanged so the
         // reviews are retried on the next poll cycle.
         if !feedback.had_fetch_failures {
-            *last_check_time = review_poll_time;
+            *last_check_time = poll_time;
         }
         // Only emit NewReviews if there is actual feedback to act on.
         // DISMISSED reviews or reviews with empty bodies and no inline
@@ -589,11 +590,21 @@ async fn poll_once(
 
     // Check for new general PR conversation comments (issue comments).
     // These are distinct from formal reviews and are invisible to the review polling path.
-    let all_issue_comments = fetch_issue_comments(host, owner, repo, pr_number).await?;
+    // Degrade gracefully on fetch failure — a secondary signal should not kill a healthy session.
+    let all_issue_comments = match fetch_issue_comments(host, owner, repo, pr_number).await {
+        Ok(c) => c,
+        Err(e) => {
+            log::warn!(
+                "Could not fetch issue comments (skipping this cycle): {:#}",
+                e
+            );
+            vec![]
+        }
+    };
     let new_issue_comments =
         filter_new_issue_comments(&all_issue_comments, *last_check_time, minion_id);
     if !new_issue_comments.is_empty() {
-        *last_check_time = review_poll_time;
+        *last_check_time = poll_time;
         return Ok(Some(MonitorResult::NewIssueComments(new_issue_comments)));
     }
 
@@ -608,9 +619,9 @@ async fn poll_once(
     // If any checks are still queued or in progress, skip and re-check next cycle.
     let check_runs = get_check_runs(host, owner, repo, &pr.head.sha).await?;
     if let Some(failed_checks) = count_completed_failures(&check_runs) {
-        // Advance the review baseline so reviews are not missed when monitor_pr
+        // Advance the baseline so reviews are not missed when monitor_pr
         // is re-entered after CI handling in the lifecycle loop.
-        *last_check_time = review_poll_time;
+        *last_check_time = poll_time;
         return Ok(Some(MonitorResult::FailedChecks(failed_checks)));
     }
 
@@ -624,7 +635,7 @@ async fn poll_once(
                 "Could not parse PR number '{}', skipping readiness check",
                 pr_number
             );
-            *last_check_time = review_poll_time;
+            *last_check_time = poll_time;
             return Ok(None);
         }
     };
@@ -674,13 +685,13 @@ async fn poll_once(
     {
         // PR is ready — check if gru:auto-merge label is present (from PR data already fetched)
         if pr.has_label(AUTO_MERGE_LABEL) {
-            *last_check_time = review_poll_time;
+            *last_check_time = poll_time;
             return Ok(Some(MonitorResult::ReadyToMerge));
         }
     }
 
     // Update last check time
-    *last_check_time = review_poll_time;
+    *last_check_time = poll_time;
     Ok(None)
 }
 
@@ -2809,6 +2820,7 @@ mod tests {
         let since: DateTime<Utc> = "2024-06-15T10:00:00Z".parse().unwrap();
         let comments = vec![
             IssueComment {
+                id: 1,
                 body: "Old comment".to_string(),
                 user: User {
                     login: "alice".to_string(),
@@ -2816,6 +2828,7 @@ mod tests {
                 created_at: "2024-06-15T09:00:00Z".parse().unwrap(),
             },
             IssueComment {
+                id: 2,
                 body: "New comment from human".to_string(),
                 user: User {
                     login: "alice".to_string(),
@@ -2823,6 +2836,7 @@ mod tests {
                 created_at: "2024-06-15T11:00:00Z".parse().unwrap(),
             },
             IssueComment {
+                id: 3,
                 body: "New comment from minion\n\n<sub>🤖 M001</sub>".to_string(),
                 user: User {
                     login: "bot".to_string(),
@@ -2839,15 +2853,28 @@ mod tests {
     #[test]
     fn test_filter_new_issue_comments_inclusive_boundary() {
         let since: DateTime<Utc> = "2024-06-15T10:00:00Z".parse().unwrap();
-        let comment = IssueComment {
-            body: "Exactly at boundary".to_string(),
-            user: User {
-                login: "alice".to_string(),
+        let before: DateTime<Utc> = "2024-06-15T09:59:59Z".parse().unwrap();
+        let comments = vec![
+            IssueComment {
+                id: 1,
+                body: "Exactly at boundary".to_string(),
+                user: User {
+                    login: "alice".to_string(),
+                },
+                created_at: since,
             },
-            created_at: since,
-        };
-        let new = filter_new_issue_comments(&[comment], since, "M001");
+            IssueComment {
+                id: 2,
+                body: "One second before — excluded".to_string(),
+                user: User {
+                    login: "bob".to_string(),
+                },
+                created_at: before,
+            },
+        ];
+        let new = filter_new_issue_comments(&comments, since, "M001");
         assert_eq!(new.len(), 1);
+        assert_eq!(new[0].id, 1);
     }
 
     #[test]
@@ -2867,14 +2894,18 @@ mod tests {
             "html_url": "https://github.com/example/repo/issues/42#issuecomment-123"
         }"#;
         let comment: IssueComment = serde_json::from_str(json).unwrap();
+        assert_eq!(comment.id, 123);
         assert_eq!(comment.body, "Hello world");
         assert_eq!(comment.user.login, "alice");
+        let expected_time: DateTime<Utc> = "2024-06-15T10:30:00Z".parse().unwrap();
+        assert_eq!(comment.created_at, expected_time);
     }
 
     #[test]
     fn test_format_issue_comments_prompt_single() {
         let since: DateTime<Utc> = "2024-06-15T10:00:00Z".parse().unwrap();
         let comments = vec![IssueComment {
+            id: 1,
             body: "Can you add more tests?".to_string(),
             user: User {
                 login: "alice".to_string(),
@@ -2904,6 +2935,7 @@ mod tests {
     fn test_format_issue_comments_prompt_no_issue_num() {
         let since: DateTime<Utc> = "2024-06-15T10:00:00Z".parse().unwrap();
         let comments = vec![IssueComment {
+            id: 1,
             body: "LGTM".to_string(),
             user: User {
                 login: "bob".to_string(),
