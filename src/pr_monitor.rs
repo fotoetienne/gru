@@ -501,7 +501,7 @@ pub(crate) fn determine_pr_terminal_state(state: &str, merged: bool) -> Option<M
 /// Filter reviews to only include those submitted at or after `since` that were
 /// not authored by the current Minion.
 ///
-/// A review is considered authored by the current Minion when its body contains
+/// A review is considered authored by the current Minion when its body ends with
 /// the Minion's own signature (`<sub>🤖 {minion_id}</sub>`).  Using the
 /// signature rather than `user.login` correctly handles the case where multiple
 /// Minions operate as the same GitHub user: a review posted by Minion M1bz will
@@ -985,7 +985,7 @@ async fn get_check_runs(host: &str, owner: &str, repo: &str, sha: &str) -> Resul
 /// authored by the current Minion.
 ///
 /// Uses the same signature-based identity check as `filter_new_external_reviews`:
-/// a review is considered authored by the current Minion when its body contains
+/// a review is considered authored by the current Minion when its body ends with
 /// `<sub>🤖 {minion_id}</sub>`.  This ensures that reviews by a sibling Minion
 /// (which shares the same `user.login`) are counted as unaddressed feedback,
 /// matching the wake-up semantics in the lab scanner.

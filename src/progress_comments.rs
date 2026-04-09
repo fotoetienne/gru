@@ -6,8 +6,14 @@ use chrono::{DateTime, Utc};
 /// matches `"M1by"`.  Only matches when the tag is at the *tail* of the body,
 /// preventing false positives when a reviewer quotes a Minion comment mid-body
 /// (e.g. `"as <sub>🤖 M1by</sub> noted above..."`).
+///
+/// Avoids heap allocation by stripping the constant prefix/suffix rather than
+/// constructing a temporary `String` to compare against.
 pub(crate) fn has_minion_signature_for(body: &str, minion_id: &str) -> bool {
-    body.trim_end().ends_with(&minion_signature_tag(minion_id))
+    let body = body.trim_end();
+    body.strip_suffix("</sub>")
+        .and_then(|b| b.strip_suffix(minion_id))
+        .is_some_and(|b| b.ends_with("<sub>🤖 "))
 }
 
 /// Represents the phase of Minion execution
@@ -71,16 +77,6 @@ impl ProgressUpdate {
 /// it from blending into the last line of content.
 pub(crate) fn minion_signature(id: &str) -> String {
     format!("\n\n<sub>🤖 {}</sub>", id)
-}
-
-/// Returns the bare `<sub>🤖 {id}</sub>` HTML tag.
-///
-/// Used as the building block for `has_minion_signature_for` and for
-/// constructing reply prompts.  Prefer `has_minion_signature_for` when
-/// testing whether a body was authored by a specific Minion, because it
-/// anchors the match to the end of the body.
-pub(crate) fn minion_signature_tag(id: &str) -> String {
-    format!("<sub>🤖 {}</sub>", id)
 }
 
 /// Format an escalation comment with a consistent structure.
