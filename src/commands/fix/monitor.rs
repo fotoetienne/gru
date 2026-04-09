@@ -1735,16 +1735,17 @@ mod tests {
 
     /// Baseline must be advanced on the `Err(e)` path of `auto_rebase_pr` so
     /// the lab daemon does not re-count reply reviews after a rebase error.
-    /// Uses a non-existent checkout path so `auto_rebase_pr` fails immediately
-    /// inside `get_current_branch` (non-zero git exit → Err), exercising the
-    /// `Err(e)` match arm without requiring real git infrastructure.
+    /// Uses a non-existent checkout path so `auto_rebase_pr` fails inside
+    /// `detect_base_branch` → `get_current_branch` (non-zero git exit → Err),
+    /// exercising the `Err(e)` match arm without requiring real git infrastructure.
     #[tokio::test]
     async fn test_handle_merge_conflict_advances_baseline_on_error_path() {
         tokio::time::pause();
 
         let backend = DummyBackend;
         let (issue_ctx, mut wt_ctx) = make_test_fixtures();
-        // Non-existent path causes auto_rebase_pr to return Err via get_current_branch.
+        // Non-existent path causes auto_rebase_pr to return Err via
+        // detect_base_branch → get_current_branch (non-zero git exit).
         wt_ctx.checkout_path = PathBuf::from("/tmp/nonexistent_gru_test_checkout_xyzzy");
         let ctx = MonitorContext {
             backend: &backend,
@@ -1780,7 +1781,7 @@ mod tests {
     /// `handle_merge_conflict`, before the `auto_rebase_pr` match. This test
     /// verifies that `MonitorLoopState` stores the value correctly.
     #[test]
-    fn test_monitor_loop_state_review_baseline_stores_advanced_value() {
+    fn test_monitor_loop_state_stores_assigned_baseline() {
         let stale = Utc::now() - chrono::Duration::seconds(60);
         let check_time = Utc::now();
         let mut state = MonitorLoopState::new(stale, 0);
