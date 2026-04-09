@@ -629,4 +629,19 @@ mod tests {
             missing
         );
     }
+
+    #[test]
+    fn completions_generates_nonempty_output() {
+        let mut buf = Vec::new();
+        clap_complete::generate(
+            clap_complete::Shell::Bash,
+            &mut Cli::command(),
+            "gru",
+            &mut buf,
+        );
+        assert!(
+            !buf.is_empty(),
+            "bash completions output should not be empty"
+        );
+    }
 }
