@@ -72,7 +72,7 @@ enum AutoRebaseResult {
 /// Attempts to auto-rebase the worktree branch onto its base branch.
 async fn auto_rebase_pr(worktree_path: &Path) -> Result<AutoRebaseResult> {
     use super::super::rebase::{
-        abort_rebase, attempt_rebase, check_clean_worktree, detect_base_branch, fetch_origin,
+        abort_rebase, attempt_rebase, check_clean_worktree, detect_base_branch, fetch_base_branch,
         force_push, is_rebase_in_progress, is_up_to_date, run_agent_rebase, RebaseOutcome,
     };
 
@@ -90,12 +90,13 @@ async fn auto_rebase_pr(worktree_path: &Path) -> Result<AutoRebaseResult> {
         .await
         .context("Cannot auto-rebase: worktree has uncommitted changes")?;
 
-    // Fetch latest from origin
-    println!("📡 Fetching latest changes from origin...");
-    fetch_origin(worktree_path).await?;
-
-    // Detect the base branch
+    // Detect the base branch first so we can fetch only what we need
     let base_branch = detect_base_branch(worktree_path).await?;
+
+    // Fetch only the base branch to avoid conflicts with other worktrees that
+    // have different branches checked out on the same repo
+    println!("📡 Fetching latest changes from origin...");
+    fetch_base_branch(worktree_path, &base_branch).await?;
 
     // Short-circuit if already up-to-date (avoids no-op rebase + force-push
     // that would reset GitHub's mergeable cache timer)
