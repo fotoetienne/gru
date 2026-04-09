@@ -1,5 +1,6 @@
 venv/
 target/
+book/
 .claude/settings.local.json
 
 # Ephemeral Minion files

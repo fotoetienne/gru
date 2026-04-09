@@ -1,0 +1,14 @@
+[book]
+title = "Gru"
+description = "Autonomous GitHub issue resolver — turns issues into merged PRs with AI"
+authors = ["fotoetienne"]
+language = "en"
+src = "docs"
+
+[build]
+build-dir = "book"
+
+[output.html]
+site-url = "/gru/"
+git-repository-url = "https://github.com/fotoetienne/gru"
+edit-url-template = "https://github.com/fotoetienne/gru/edit/main/docs/{path}"
