@@ -85,11 +85,10 @@ pub(crate) async fn handle_rebase(
             // Spawn Claude Code with /rebase command
             let exit_code = run_agent_rebase(&worktree_path, timeout).await?;
 
-            // Defensive check: agent may have checked out a remote tracking ref
-            // (e.g. `origin/<branch>`) leaving the worktree in detached HEAD.
-            ensure_on_branch(&worktree_path, &local_branch).await?;
-
             if exit_code == 0 {
+                // Agent succeeded: enforce branch recovery (any failure is a real error).
+                ensure_on_branch(&worktree_path, &local_branch).await?;
+
                 if push {
                     // Defensively force push in case the /rebase skill didn't push
                     if !maybe_force_push(&worktree_path, yes).await? {
@@ -100,6 +99,14 @@ pub(crate) async fn handle_rebase(
                 }
                 Ok(0)
             } else {
+                // Agent already failed; attempt recovery but don't let a branch-restore
+                // failure mask the primary non-zero exit code guidance.
+                if let Err(err) = ensure_on_branch(&worktree_path, &local_branch).await {
+                    log::warn!(
+                        "Branch recovery after failed agent rebase also failed: {}",
+                        err
+                    );
+                }
                 println!(
                     "❌ Claude Code exited with code {}. The previous rebase was aborted, so no rebase is currently in progress.\n\
                      You can retry with `gru rebase`, or perform the rebase manually with `git rebase origin/{}`.",
@@ -278,6 +285,9 @@ pub(crate) async fn get_current_branch(worktree_path: &Path) -> Result<String> {
         .arg("-C")
         .arg(worktree_path)
         .args(["branch", "--show-current"])
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
         .output()
         .await
         .context("Failed to get current branch")?;
@@ -310,10 +320,15 @@ pub(crate) async fn ensure_on_branch(worktree_path: &Path, expected_branch: &str
     // We don't call get_current_branch() here because that function returns
     // Err on detached HEAD (empty output), whereas we want to treat detached
     // HEAD as a recoverable condition rather than an error.
+    // Unset git env vars so that `-C worktree_path` is the authoritative
+    // way to target the repo (GIT_DIR would otherwise override it).
     let output = Command::new("git")
         .arg("-C")
         .arg(worktree_path)
         .args(["branch", "--show-current"])
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
         .output()
         .await
         .context("Failed to check current branch")?;
@@ -359,6 +374,9 @@ pub(crate) async fn ensure_on_branch(worktree_path: &Path, expected_branch: &str
         .arg("-C")
         .arg(worktree_path)
         .args(["checkout", expected_branch])
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
         .output()
         .await
         .with_context(|| format!("Failed to checkout branch '{}'", expected_branch))?;
@@ -762,20 +780,15 @@ mod tests {
 
     /// Initialises a throwaway git repo with one commit and a named branch.
     ///
-    /// Unsets git environment variables (`GIT_DIR`, `GIT_WORK_TREE`,
-    /// `GIT_INDEX_FILE`) inherited from the calling process (e.g. a pre-commit
-    /// hook) so that the commands operate on the fresh temp repo rather than the
-    /// outer repository.  This modification persists for the test process, which
-    /// is safe because cargo nextest runs each test in its own process.
+    /// Each git invocation explicitly removes `GIT_DIR`, `GIT_WORK_TREE`, and
+    /// `GIT_INDEX_FILE` so that the commands target the fresh temp repo even
+    /// when the test process was started from within a git hook (which sets
+    /// `GIT_DIR`).  Using per-invocation `env_remove` (rather than
+    /// `std::env::remove_var`) is safe under both nextest and `cargo test`.
     ///
     /// Returns the temp dir (must stay alive for the lifetime of the test).
     async fn make_git_repo_with_branch(branch: &str) -> TempDir {
         use tokio::process::Command as TokioCmd;
-
-        // Isolate from any git env vars set by a parent git hook.
-        for var in &["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE"] {
-            std::env::remove_var(var);
-        }
 
         let dir = tempfile::tempdir().expect("create temp dir");
         let p = dir.path();
@@ -785,6 +798,9 @@ mod tests {
                 let status = TokioCmd::new("git")
                     .args([$($arg),+])
                     .current_dir(p)
+                    .env_remove("GIT_DIR")
+                    .env_remove("GIT_WORK_TREE")
+                    .env_remove("GIT_INDEX_FILE")
                     .status()
                     .await
                     .expect("git command failed");
@@ -825,6 +841,9 @@ mod tests {
         let sha_out = TokioCmd::new("git")
             .args(["rev-parse", "HEAD"])
             .current_dir(p)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
             .output()
             .await
             .expect("git rev-parse failed");
@@ -833,6 +852,9 @@ mod tests {
         let status = TokioCmd::new("git")
             .args(["checkout", "--detach", &sha])
             .current_dir(p)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
             .status()
             .await
             .expect("git checkout --detach failed");
@@ -842,6 +864,9 @@ mod tests {
         let branch_out = TokioCmd::new("git")
             .args(["branch", "--show-current"])
             .current_dir(p)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
             .output()
             .await
             .unwrap();

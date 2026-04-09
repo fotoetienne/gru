@@ -188,7 +188,16 @@ async fn auto_rebase_pr(worktree_path: &Path) -> Result<AutoRebaseResult> {
 
             // Defensive check: agent may have checked out a remote tracking ref
             // (e.g. `origin/<branch>`) leaving the worktree in detached HEAD.
-            ensure_on_branch(worktree_path, &local_branch).await?;
+            // Treat a recovery failure as ConflictUnresolved rather than an
+            // unexpected error so the caller receives an actionable escalation.
+            if let Err(err) = ensure_on_branch(worktree_path, &local_branch).await {
+                log::warn!(
+                    "Agent rebase finished but failed to restore local branch '{}': {}",
+                    local_branch,
+                    err
+                );
+                return Ok(AutoRebaseResult::ConflictUnresolved);
+            }
 
             if exit_code == 0 {
                 // Defensively force push in case the /rebase skill didn't push
