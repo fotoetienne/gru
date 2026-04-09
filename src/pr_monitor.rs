@@ -3,7 +3,7 @@ use crate::github;
 use crate::github::DEFAULT_MAX_RETRIES;
 use crate::labels;
 use crate::merge_readiness;
-use crate::progress_comments::minion_signature_tag;
+use crate::progress_comments::has_minion_signature_for;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
@@ -519,10 +519,9 @@ pub(crate) fn filter_new_external_reviews(
     since: DateTime<Utc>,
     minion_id: &str,
 ) -> Vec<Review> {
-    let own_signature = minion_signature_tag(minion_id);
     reviews
         .iter()
-        .filter(|r| r.submitted_at >= since && !r.body.contains(&own_signature))
+        .filter(|r| r.submitted_at >= since && !has_minion_signature_for(&r.body, minion_id))
         .cloned()
         .collect()
 }
@@ -764,12 +763,11 @@ fn filter_unanswered_comments(
     api_comments: Vec<ApiReviewComment>,
     minion_id: &str,
 ) -> Vec<ReviewComment> {
-    let own_signature = minion_signature_tag(minion_id);
     // Collect IDs of comments that this Minion has already directly replied to.
     let already_answered: std::collections::HashSet<u64> = api_comments
         .iter()
         .filter_map(|c| {
-            if c.body.contains(&own_signature) {
+            if has_minion_signature_for(&c.body, minion_id) {
                 c.in_reply_to_id
             } else {
                 None
@@ -779,7 +777,9 @@ fn filter_unanswered_comments(
 
     api_comments
         .into_iter()
-        .filter(|c| !c.body.contains(&own_signature) && !already_answered.contains(&c.id))
+        .filter(|c| {
+            !has_minion_signature_for(&c.body, minion_id) && !already_answered.contains(&c.id)
+        })
         .map(|c| ReviewComment {
             file: c.path,
             line: c.line,
@@ -998,10 +998,9 @@ pub(crate) fn count_unaddressed_reviews(
     minion_id: &str,
     since: DateTime<Utc>,
 ) -> usize {
-    let own_signature = minion_signature_tag(minion_id);
     reviews
         .iter()
-        .filter(|r| r.submitted_at > since && !r.body.contains(&own_signature))
+        .filter(|r| r.submitted_at > since && !has_minion_signature_for(&r.body, minion_id))
         .count()
 }
 

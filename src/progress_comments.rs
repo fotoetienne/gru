@@ -1,31 +1,13 @@
 use chrono::{DateTime, Utc};
 
-/// Returns true if the comment body ends with a Minion signature.
+/// Returns true if `body` ends with the signature for `minion_id`.
 ///
-/// The signature format is `\n\n<sub>🤖 {id}</sub>` (always at the tail).
-/// Validates that the final `<sub>🤖 …</sub>` fragment contains a non-empty
-/// ID with no embedded HTML or newline characters, preventing false positives
-/// from comments that happen to end with an unrelated `</sub>` tag.
-#[allow(dead_code)] // used in tests; may be used for general signature detection in future callers
-pub(crate) fn has_minion_signature(body: &str) -> bool {
-    let trimmed = body.trim_end();
-    if !trimmed.ends_with("</sub>") {
-        return false;
-    }
-
-    let Some(start) = trimmed.rfind("<sub>🤖 ") else {
-        return false;
-    };
-
-    let suffix = &trimmed[start..];
-    let Some(id) = suffix
-        .strip_prefix("<sub>🤖 ")
-        .and_then(|s| s.strip_suffix("</sub>"))
-    else {
-        return false;
-    };
-
-    !id.is_empty() && !id.contains(['<', '>', '\n', '\r'])
+/// Trims trailing whitespace before checking, so `"Done!\n\n<sub>🤖 M1by</sub>  \n"`
+/// matches `"M1by"`.  Only matches when the tag is at the *tail* of the body,
+/// preventing false positives when a reviewer quotes a Minion comment mid-body
+/// (e.g. `"as <sub>🤖 M1by</sub> noted above..."`).
+pub(crate) fn has_minion_signature_for(body: &str, minion_id: &str) -> bool {
+    body.trim_end().ends_with(&minion_signature_tag(minion_id))
 }
 
 /// Represents the phase of Minion execution
@@ -91,12 +73,12 @@ pub(crate) fn minion_signature(id: &str) -> String {
     format!("\n\n<sub>🤖 {}</sub>", id)
 }
 
-/// Returns the bare HTML tag used to identify a Minion-authored comment body.
+/// Returns the bare `<sub>🤖 {id}</sub>` HTML tag.
 ///
-/// Use this for `contains()` matching when detecting whether a review or
-/// comment body was authored by a specific Minion.  Unlike `minion_signature`,
-/// this does not include leading newlines, so it matches the tag regardless of
-/// position within the body string.
+/// Used as the building block for `has_minion_signature_for` and for
+/// constructing reply prompts.  Prefer `has_minion_signature_for` when
+/// testing whether a body was authored by a specific Minion, because it
+/// anchors the match to the end of the body.
 pub(crate) fn minion_signature_tag(id: &str) -> String {
     format!("<sub>🤖 {}</sub>", id)
 }
@@ -194,21 +176,33 @@ mod tests {
     }
 
     #[test]
-    fn test_has_minion_signature() {
-        assert!(has_minion_signature("Done!\n\n<sub>🤖 M001</sub>"));
-        assert!(has_minion_signature("Done!\n\n<sub>🤖 M001</sub>  \n")); // trailing whitespace
-        assert!(!has_minion_signature("Please fix this."));
-        assert!(!has_minion_signature(""));
-        // Minion signature mid-body, not at the end → should NOT match.
-        assert!(!has_minion_signature(
-            "As noted in <sub>🤖 M001</sub>, please fix the typo."
+    fn test_has_minion_signature_for() {
+        assert!(has_minion_signature_for(
+            "Done!\n\n<sub>🤖 M001</sub>",
+            "M001"
         ));
-        // Different </sub> at the end, Minion marker mid-body → should NOT match.
-        assert!(!has_minion_signature(
-            "See <sub>🤖 M001</sub> for context. <sub>note</sub>"
+        // trailing whitespace is trimmed
+        assert!(has_minion_signature_for(
+            "Done!\n\n<sub>🤖 M001</sub>  \n",
+            "M001"
         ));
-        // Empty ID → should NOT match.
-        assert!(!has_minion_signature("Done!\n\n<sub>🤖 </sub>"));
+        // wrong ID → false even though a Minion signature is present
+        assert!(!has_minion_signature_for(
+            "Done!\n\n<sub>🤖 M001</sub>",
+            "M002"
+        ));
+        assert!(!has_minion_signature_for("Please fix this.", "M001"));
+        assert!(!has_minion_signature_for("", "M001"));
+        // Signature mid-body (quoted), not at the end → must NOT match.
+        assert!(!has_minion_signature_for(
+            "As noted in <sub>🤖 M001</sub>, please fix the typo.",
+            "M001"
+        ));
+        // Different </sub> at the end, Minion marker mid-body → must NOT match.
+        assert!(!has_minion_signature_for(
+            "See <sub>🤖 M001</sub> for context. <sub>note</sub>",
+            "M001"
+        ));
     }
 
     #[test]
