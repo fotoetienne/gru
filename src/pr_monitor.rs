@@ -591,16 +591,20 @@ async fn poll_once(
     // Check for new general PR conversation comments (issue comments).
     // These are distinct from formal reviews and are invisible to the review polling path.
     // Degrade gracefully on fetch failure — a secondary signal should not kill a healthy session.
-    let all_issue_comments = match fetch_issue_comments(host, owner, repo, pr_number).await {
-        Ok(c) => c,
-        Err(e) => {
-            log::warn!(
-                "Could not fetch issue comments (skipping this cycle): {:#}",
-                e
-            );
-            vec![]
-        }
-    };
+    // Track the failure so we can skip the baseline advance below: advancing past a failed
+    // fetch would permanently lose any human comments posted in that window (they would
+    // never be retried), undermining the monitor's ability to respond to PR conversation.
+    let (all_issue_comments, issue_comments_fetch_failed) =
+        match fetch_issue_comments(host, owner, repo, pr_number).await {
+            Ok(c) => (c, false),
+            Err(e) => {
+                log::warn!(
+                    "Could not fetch issue comments (will retry next cycle): {:#}",
+                    e
+                );
+                (vec![], true)
+            }
+        };
     let new_issue_comments =
         filter_new_issue_comments(&all_issue_comments, *last_check_time, minion_id);
     if !new_issue_comments.is_empty() {
@@ -690,8 +694,13 @@ async fn poll_once(
         }
     }
 
-    // Update last check time
-    *last_check_time = poll_time;
+    // Only advance the baseline when issue comment fetch succeeded.
+    // If it failed, leave last_check_time unchanged so comments in this window
+    // are retried on the next cycle (same intent as the had_fetch_failures guard
+    // for review inline comments above).
+    if !issue_comments_fetch_failed {
+        *last_check_time = poll_time;
+    }
     Ok(None)
 }
 
