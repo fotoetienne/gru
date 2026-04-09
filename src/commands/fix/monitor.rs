@@ -1771,18 +1771,16 @@ mod tests {
         );
     }
 
-    /// The `ConflictUnresolved` return path cannot be exercised in unit tests
-    /// without real git infrastructure and a running claude CLI (needed by
-    /// `run_agent_rebase`). The invariant is mechanically guaranteed by the
-    /// unconditional `state.review_baseline = Some(check_time)` assignment at
-    /// the very top of `handle_merge_conflict`, before the `auto_rebase_pr`
-    /// match that reaches the `ConflictUnresolved` arm.
-    ///
-    /// This test documents that `MonitorLoopState` correctly holds the advanced
-    /// value, mirroring what the unconditional first-line assignment produces
-    /// before any match arm (including `ConflictUnresolved`) is reached.
+    /// Documents the `ConflictUnresolved` path invariant via direct state
+    /// mutation. This test does NOT call `handle_merge_conflict` — the
+    /// `ConflictUnresolved` arm cannot be reached in unit tests because
+    /// `run_agent_rebase` requires a running claude CLI to exit non-zero.
+    /// The invariant is mechanically guaranteed by the unconditional
+    /// `state.review_baseline = Some(check_time)` assignment at the top of
+    /// `handle_merge_conflict`, before the `auto_rebase_pr` match. This test
+    /// verifies that `MonitorLoopState` stores the value correctly.
     #[test]
-    fn test_review_baseline_advanced_before_conflict_unresolved_arm() {
+    fn test_monitor_loop_state_review_baseline_stores_advanced_value() {
         let stale = Utc::now() - chrono::Duration::seconds(60);
         let check_time = Utc::now();
         let mut state = MonitorLoopState::new(stale, 0);
@@ -1792,14 +1790,14 @@ mod tests {
             "initial baseline is stale"
         );
 
-        // Replicates the first unconditional line of handle_merge_conflict.
-        // For the ConflictUnresolved arm this assignment runs before the match.
+        // Replicates the unconditional first line of handle_merge_conflict
+        // that runs before all match arms including ConflictUnresolved.
         state.review_baseline = Some(check_time);
 
         assert_eq!(
             state.review_baseline,
             Some(check_time),
-            "after unconditional pre-match assignment, baseline equals check_time"
+            "MonitorLoopState holds the advanced baseline value"
         );
     }
 
