@@ -1335,6 +1335,24 @@ mod tests {
             .contains("Bare repository does not exist"));
     }
 
+    /// Verify that fetch_default_branch_for_worktree() never returns Err, even when
+    /// the underlying git fetch fails. A fetch failure should warn but not block
+    /// Minion startup (the acceptance criterion from issue #790).
+    #[tokio::test]
+    async fn test_fetch_default_branch_for_worktree_is_not_fatal_on_failure() {
+        // Point at a temp dir that is not a git repo — git fetch will fail
+        let temp_dir = tempfile::tempdir().unwrap();
+        let repo = GitRepo::new("owner", "repo", "github.com", temp_dir.path().to_path_buf());
+
+        // Must succeed (Ok) even though git fetch will fail in a non-repo directory
+        let result = repo.fetch_default_branch_for_worktree().await;
+        assert!(
+            result.is_ok(),
+            "fetch_default_branch_for_worktree should never return Err — got: {:?}",
+            result
+        );
+    }
+
     /// Creates a git Command with GIT_DIR/GIT_WORK_TREE/GIT_INDEX_FILE cleared
     /// so tests work correctly even when run from a pre-commit hook.
     fn clean_git_cmd() -> Command {
