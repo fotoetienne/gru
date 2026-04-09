@@ -89,7 +89,8 @@ async fn get_pending_review_sha(minion_id: &str) -> Option<String> {
             .and_then(|info| info.pending_review_sha.clone()))
     })
     .await
-    .unwrap_or(None)
+    .ok()
+    .flatten()
 }
 
 /// Resets `attempt_count` to 0 after a successful review response (best-effort).
@@ -1305,6 +1306,9 @@ pub(crate) async fn monitor_pr_lifecycle(
     //    if the API is unreachable we allow the review to proceed (a duplicate is less
     //    harmful than a missing review).
     let head_sha = ci::get_head_sha(&wt_ctx.checkout_path).await.ok();
+    if head_sha.is_none() {
+        log::debug!("HEAD SHA unavailable; pending_review_sha guard inactive for this session");
+    }
 
     // Check the registry-persisted pending flag first (covers the crash-during-review case).
     let pending_sha = get_pending_review_sha(&wt_ctx.minion_id).await;
