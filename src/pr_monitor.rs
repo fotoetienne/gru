@@ -83,7 +83,10 @@ pub(crate) struct ReviewComment {
     pub(crate) file: String,
     pub(crate) line: Option<u64>,
     pub(crate) body: String,
+    /// The commenter's GitHub login (username).
     pub(crate) reviewer: String,
+    /// The commenter's display name, or their login if no display name is set.
+    pub(crate) reviewer_display_name: String,
     pub(crate) comment_id: u64,
 }
 
@@ -762,6 +765,7 @@ pub(crate) async fn get_all_reviews(
 fn filter_unanswered_comments(
     api_comments: Vec<ApiReviewComment>,
     minion_id: &str,
+    display_names: &std::collections::HashMap<String, String>,
 ) -> Vec<ReviewComment> {
     // Collect IDs of comments that this Minion has already directly replied to.
     let already_answered: std::collections::HashSet<u64> = api_comments
@@ -780,12 +784,19 @@ fn filter_unanswered_comments(
         .filter(|c| {
             !has_minion_signature_for(&c.body, minion_id) && !already_answered.contains(&c.id)
         })
-        .map(|c| ReviewComment {
-            file: c.path,
-            line: c.line,
-            body: c.body,
-            reviewer: c.user.login,
-            comment_id: c.id,
+        .map(|c| {
+            let display_name = display_names
+                .get(&c.user.login)
+                .cloned()
+                .unwrap_or_else(|| c.user.login.clone());
+            ReviewComment {
+                file: c.path,
+                line: c.line,
+                body: c.body,
+                reviewer: c.user.login,
+                reviewer_display_name: display_name,
+                comment_id: c.id,
+            }
         })
         .collect()
 }
@@ -866,8 +877,19 @@ async fn get_review_feedback(
         );
     }
 
+    // Fetch display names for unique reviewers (deduplicated to minimize API calls)
+    let mut display_names: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    for comment in &raw_comments {
+        let login = &comment.user.login;
+        if !display_names.contains_key(login) {
+            let name = github::get_user_display_name(host, login).await;
+            display_names.insert(login.clone(), name);
+        }
+    }
+
     // Filter all accumulated comments at once (Bug 2 fix: cross-review dedup)
-    let all_comments = filter_unanswered_comments(raw_comments, minion_id);
+    let all_comments = filter_unanswered_comments(raw_comments, minion_id, &display_names);
 
     Ok(ReviewFeedback {
         comments: all_comments,
@@ -914,7 +936,14 @@ pub(crate) fn format_review_prompt(
                 prompt.push_str(&format!(":{}", line));
             }
             prompt.push('\n');
-            prompt.push_str(&format!("**Reviewer:** @{}\n", comment.reviewer));
+            if comment.reviewer_display_name != comment.reviewer {
+                prompt.push_str(&format!(
+                    "**Reviewer:** {} (@{})\n",
+                    comment.reviewer_display_name, comment.reviewer
+                ));
+            } else {
+                prompt.push_str(&format!("**Reviewer:** @{}\n", comment.reviewer));
+            }
             prompt.push_str(&format!("**Comment ID:** {}\n", comment.comment_id));
             prompt.push_str(&format!("**Comment:** {}\n\n", comment.body));
         }
@@ -934,6 +963,7 @@ gh api --method POST repos/{owner}/{repo}/pulls/{pr_number}/comments \\\n  \
 ```\n\n\
 Where `<comment_id>` is the Comment ID listed above for each inline review comment. \
 Each reply must:\n\
+- Open by addressing the reviewer by their display name (the name shown in **Reviewer:** before the @login, e.g. \"Stephen,\" or \"sspalding,\")\n\
 - Summarize what was changed to address the feedback\n\
 - End with the signature: `\\n\\n<sub>🤖 {minion_id}</sub>`\n"
         ));
@@ -1096,6 +1126,7 @@ mod tests {
                 line: Some(45),
                 body: "This function needs error handling for null inputs.".to_string(),
                 reviewer: "alice".to_string(),
+                reviewer_display_name: "alice".to_string(),
                 comment_id: 1001,
             }],
             bodies: vec![],
@@ -1122,6 +1153,7 @@ mod tests {
         assert!(prompt.contains("in_reply_to"));
         assert!(prompt.contains("repos/octocat/hello-world/pulls/456/comments"));
         assert!(prompt.contains("<sub>🤖 M042</sub>"));
+        assert!(prompt.contains("addressing the reviewer by their display name"));
     }
 
     #[test]
@@ -1133,6 +1165,7 @@ mod tests {
                     line: Some(45),
                     body: "Add error handling.".to_string(),
                     reviewer: "alice".to_string(),
+                    reviewer_display_name: "alice".to_string(),
                     comment_id: 2001,
                 },
                 ReviewComment {
@@ -1140,6 +1173,7 @@ mod tests {
                     line: Some(12),
                     body: "Add a test case for the edge case.".to_string(),
                     reviewer: "bob".to_string(),
+                    reviewer_display_name: "bob".to_string(),
                     comment_id: 2002,
                 },
             ],
@@ -1169,6 +1203,31 @@ mod tests {
     }
 
     #[test]
+    fn test_format_review_prompt_with_display_name() {
+        let feedback = ReviewFeedback {
+            comments: vec![ReviewComment {
+                file: "src/lib.rs".to_string(),
+                line: Some(10),
+                body: "Please add a screenshot.".to_string(),
+                reviewer: "sspalding".to_string(),
+                reviewer_display_name: "Stephen Spalding".to_string(),
+                comment_id: 4001,
+            }],
+            bodies: vec![],
+            had_fetch_failures: false,
+        };
+
+        let prompt = format_review_prompt(Some(786), "42", &feedback, "octocat", "hello-world", "M001");
+
+        // Display name and login should both appear in the reviewer line
+        assert!(prompt.contains("**Reviewer:** Stephen Spalding (@sspalding)"));
+        // Login-only format should NOT appear
+        assert!(!prompt.contains("**Reviewer:** @sspalding"));
+        // Reply instruction should tell Claude to address by display name
+        assert!(prompt.contains("addressing the reviewer by their display name"));
+    }
+
+    #[test]
     fn test_format_review_prompt_no_line_number() {
         let feedback = ReviewFeedback {
             comments: vec![ReviewComment {
@@ -1176,6 +1235,7 @@ mod tests {
                 line: None,
                 body: "Update the documentation.".to_string(),
                 reviewer: "charlie".to_string(),
+                reviewer_display_name: "charlie".to_string(),
                 comment_id: 3001,
             }],
             bodies: vec![],
@@ -1229,6 +1289,7 @@ mod tests {
                 line: Some(10),
                 body: "Fix this line.".to_string(),
                 reviewer: "eve".to_string(),
+                reviewer_display_name: "eve".to_string(),
                 comment_id: 6001,
             }],
             bodies: vec![ReviewBody {

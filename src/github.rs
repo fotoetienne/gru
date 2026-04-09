@@ -1255,6 +1255,29 @@ pub(crate) struct ReviewUser {
     pub(crate) login: String,
 }
 
+/// Fetch the display name for a GitHub user, falling back to their login.
+///
+/// Calls `gh api /users/{login} --jq .name`. Returns the display name if
+/// non-empty and not `"null"`, otherwise returns the login unchanged.
+/// On API error, logs a warning and returns the login.
+pub(crate) async fn get_user_display_name(host: &str, login: &str) -> String {
+    let endpoint = format!("users/{login}");
+    match run_gh(host, &["api", &endpoint, "--jq", ".name"]).await {
+        Ok(name) => {
+            let name = name.trim().to_string();
+            if name.is_empty() || name == "null" {
+                login.to_string()
+            } else {
+                name
+            }
+        }
+        Err(e) => {
+            log::warn!("Failed to fetch display name for {}: {}", login, e);
+            login.to_string()
+        }
+    }
+}
+
 /// Returns the login of the currently authenticated `gh` CLI user.
 ///
 /// Uses `gh api user` to fetch the authenticated account. Returns an error
