@@ -79,6 +79,10 @@ release version:
     git push origin main --tags
     @echo "✓ v{{version}} tagged and pushed — release workflow will build binaries"
 
+# Generate demo GIF (requires vhs: brew install vhs)
+demo:
+    vhs docs/demo.tape
+
 # Show project information
 info:
     @echo "Gru - Local-First LLM Agent Orchestrator"
