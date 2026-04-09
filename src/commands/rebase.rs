@@ -302,6 +302,14 @@ pub(crate) async fn get_current_branch(worktree_path: &Path) -> Result<String> {
 /// function detects that condition and restores the local branch so that
 /// subsequent operations (force-push, further commits) work correctly.
 pub(crate) async fn ensure_on_branch(worktree_path: &Path, expected_branch: &str) -> Result<()> {
+    anyhow::ensure!(
+        !expected_branch.is_empty(),
+        "expected_branch must not be empty"
+    );
+
+    // We don't call get_current_branch() here because that function returns
+    // Err on detached HEAD (empty output), whereas we want to treat detached
+    // HEAD as a recoverable condition rather than an error.
     let output = Command::new("git")
         .arg("-C")
         .arg(worktree_path)
@@ -309,6 +317,16 @@ pub(crate) async fn ensure_on_branch(worktree_path: &Path, expected_branch: &str
         .output()
         .await
         .context("Failed to check current branch")?;
+
+    if !output.status.success() {
+        let code = output.status.code().unwrap_or(-1);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!(
+            "git branch --show-current failed (exit {}): {}",
+            code,
+            stderr.trim()
+        );
+    }
 
     let current = String::from_utf8_lossy(&output.stdout).trim().to_string();
 
@@ -318,7 +336,7 @@ pub(crate) async fn ensure_on_branch(worktree_path: &Path, expected_branch: &str
 
     if current.is_empty() {
         log::warn!(
-            "⚠️  Worktree is in detached HEAD state after agent rebase; checking out local branch '{}'",
+            "⚠️  Worktree is in detached HEAD state; checking out local branch '{}'",
             expected_branch
         );
         println!(
@@ -348,7 +366,9 @@ pub(crate) async fn ensure_on_branch(worktree_path: &Path, expected_branch: &str
     if !checkout_output.status.success() {
         let stderr = String::from_utf8_lossy(&checkout_output.stderr);
         anyhow::bail!(
-            "git checkout '{}' failed: {}",
+            "git checkout '{}' failed: {}\n\
+             The working tree may have uncommitted changes from the agent run. \
+             Inspect with `git -C <worktree> status` and stash or reset before retrying.",
             expected_branch,
             stderr.trim()
         );
