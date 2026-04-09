@@ -971,6 +971,16 @@ async fn handle_merge_conflict(
     ctx: &MonitorContext<'_>,
     check_time: DateTime<Utc>,
 ) -> LoopAction {
+    // Always advance the baseline before any branching. Empty-body review
+    // objects are created by GitHub for each inline reply the Minion posted
+    // while addressing earlier feedback. Their submitted_at is after the
+    // pre-reply baseline, so without this advancement they are counted as
+    // unaddressed external reviews by the lab daemon — causing an infinite
+    // wake-up + rebase-failure loop. check_time is guaranteed to be after
+    // all reply reviews because poll_once already advanced last_check_time
+    // past them before the conflict was detected.
+    state.review_baseline = Some(check_time);
+
     if state.rebase_attempts >= MAX_REBASE_ATTEMPTS {
         println!(
             "❌ Reached maximum rebase attempts ({}), escalating",
