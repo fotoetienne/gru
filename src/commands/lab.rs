@@ -755,7 +755,7 @@ async fn find_minions_needing_wake(
         };
 
         let since = info.last_review_check_time.unwrap_or(info.started_at);
-        let unaddressed = pr_monitor::count_unaddressed_reviews(&reviews, since);
+        let unaddressed = pr_monitor::count_unaddressed_reviews(&reviews, &minion_id, since);
 
         if !should_wake_minion(pr_open, unaddressed, has_merge_conflict) {
             log::debug!(

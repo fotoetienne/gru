@@ -201,7 +201,7 @@ async fn post_exit_notification_if_needed(
         }
     };
 
-    let count = pr_monitor::count_unaddressed_reviews(&reviews, review_baseline);
+    let count = pr_monitor::count_unaddressed_reviews(&reviews, minion_id, review_baseline);
 
     if !pr_monitor::should_post_exit_notification(is_open, count) {
         return;
@@ -1323,6 +1323,7 @@ pub(crate) async fn monitor_pr_lifecycle(
             ctx.pr_number,
             remaining,
             state.review_baseline,
+            &ctx.wt_ctx.minion_id,
         )
         .await;
 
