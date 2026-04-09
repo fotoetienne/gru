@@ -165,14 +165,17 @@ pub(crate) async fn check_clean_worktree(worktree_path: &Path) -> Result<()> {
 
 /// Fetches only the specified base branch from origin.
 ///
-/// Fetches `git fetch origin <base_branch>` instead of all refs to avoid the
-/// git safety error that occurs when another worktree has a different branch
-/// checked out that would otherwise be updated by a full fetch.
+/// Uses an explicit refspec that writes to `refs/remotes/origin/<base_branch>`
+/// rather than `refs/heads/<base_branch>`. This avoids the git safety error
+/// that occurs when another worktree has the base branch checked out — git
+/// refuses to update `refs/heads/*` for checked-out branches, but never
+/// checks `refs/remotes/*` refs against worktree state.
 pub(crate) async fn fetch_base_branch(worktree_path: &Path, base_branch: &str) -> Result<()> {
+    let refspec = format!("refs/heads/{base_branch}:refs/remotes/origin/{base_branch}");
     let output = Command::new("git")
         .arg("-C")
         .arg(worktree_path)
-        .args(["fetch", "origin", "--", base_branch])
+        .args(["fetch", "origin", &refspec])
         .output()
         .await
         .with_context(|| format!("Failed to execute git fetch origin {}", base_branch))?;
