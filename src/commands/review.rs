@@ -177,6 +177,7 @@ pub(crate) async fn handle_review(pr_arg: Option<String>, agent_name: &str) -> R
         last_review_check_time: None,
         wake_reason: None,
         archived_at: None,
+        pending_review_sha: None,
     };
 
     // Register the Minion (spawn_blocking to avoid holding lock during review)

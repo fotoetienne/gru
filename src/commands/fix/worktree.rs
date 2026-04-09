@@ -114,6 +114,7 @@ pub(super) async fn setup_worktree(
         last_review_check_time: None,
         wake_reason: None,
         archived_at: None,
+        pending_review_sha: None,
     };
 
     let minion_id_clone = minion_id.clone();

@@ -618,6 +618,14 @@ pub(crate) struct MinionInfo {
     /// Archived minions are hidden from `gru status` by default; use `--all` to show them.
     #[serde(default)]
     pub(crate) archived_at: Option<DateTime<Utc>>,
+    /// Commit SHA for which a self-review was spawned but may not have posted yet.
+    ///
+    /// Set immediately before calling `trigger_pr_review` so that if the monitoring
+    /// session crashes while the review subprocess is still running, a resumed session
+    /// can detect that a review was already triggered for this SHA and skip spawning
+    /// a duplicate.  Cleared after `trigger_pr_review` returns (success or error).
+    #[serde(default)]
+    pub(crate) pending_review_sha: Option<String>,
 }
 
 /// Default agent name for backwards compatibility with existing registry entries
@@ -1228,6 +1236,7 @@ mod tests {
             last_review_check_time: None,
             wake_reason: None,
             archived_at: None,
+            pending_review_sha: None,
         }
     }
 
