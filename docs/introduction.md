@@ -14,9 +14,12 @@ Gru is **agent-agnostic**. It ships with backends for [Claude Code](https://gith
 ## Quick Start
 
 ```bash
-# Install (macOS Apple Silicon — see Getting Started for other platforms)
+# Install prebuilt binary (macOS Apple Silicon)
 curl -fL https://github.com/fotoetienne/gru/releases/latest/download/gru-aarch64-apple-darwin.tar.gz | tar xz
 sudo mv gru /usr/local/bin/
+
+# Or build from source (requires Rust 1.73+)
+cargo install --git https://github.com/fotoetienne/gru
 
 # Initialize a repo
 gru init owner/repo

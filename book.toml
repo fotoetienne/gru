@@ -9,6 +9,8 @@ src = "docs"
 build-dir = "book"
 
 [output.html]
+# site-url must match the GitHub Pages path: /gru/ for a project repo named "gru"
+# Update this if the repo is renamed or deployed under a custom domain.
 site-url = "/gru/"
 git-repository-url = "https://github.com/fotoetienne/gru"
 edit-url-template = "https://github.com/fotoetienne/gru/edit/main/docs/{path}"
