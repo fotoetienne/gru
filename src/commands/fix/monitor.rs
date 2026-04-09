@@ -747,8 +747,8 @@ async fn handle_new_reviews(
         );
         println!("   Additional reviews will need manual handling");
         println!(
-            "   View PR: https://github.com/{}/{}/pull/{}",
-            ctx.issue_ctx.owner, ctx.issue_ctx.repo, ctx.pr_number
+            "   View PR: https://{}/{}/{}/pull/{}",
+            ctx.issue_ctx.host, ctx.issue_ctx.owner, ctx.issue_ctx.repo, ctx.pr_number
         );
         return LoopAction::Break;
     }
