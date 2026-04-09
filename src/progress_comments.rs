@@ -16,6 +16,18 @@ pub(crate) fn has_minion_signature_for(body: &str, minion_id: &str) -> bool {
         .is_some_and(|b| b.ends_with("<sub>🤖 "))
 }
 
+/// Returns true if `id` looks like a valid Minion ID.
+///
+/// A valid Minion ID starts with `M` followed by at least 3 ASCII alphanumeric
+/// characters (base36: `0-9` and `a-z`; legacy IDs may use uppercase `A-Z`).
+fn is_minion_id(id: &str) -> bool {
+    let mut chars = id.chars();
+    matches!(chars.next(), Some('M')) && {
+        let rest: &str = &id[1..];
+        rest.len() >= 3 && rest.chars().all(|c| c.is_ascii_alphanumeric())
+    }
+}
+
 /// Extracts the Minion ID from a trailing Minion signature in `body`.
 ///
 /// Returns `Some("M1cu")` when body ends with `<sub>🤖 M1cu</sub>` (after
@@ -24,7 +36,9 @@ pub(crate) fn has_minion_signature_for(body: &str, minion_id: &str) -> bool {
 /// Mirrors `has_minion_signature_for` but extracts the ID rather than matching
 /// against a known ID.  Only matches when the tag is at the *tail* of the body;
 /// a signature quoted mid-body (e.g. `"as <sub>🤖 M1by</sub> noted..."`)
-/// returns `None`.
+/// returns `None`.  The extracted string must also pass `is_minion_id` so that
+/// a reviewer cannot spoof the display name by ending a comment with an
+/// arbitrary `<sub>🤖 not-a-minion</sub>` tag.
 pub(crate) fn extract_minion_id_from_signature(body: &str) -> Option<&str> {
     let body = body.trim_end();
     let prefix = "<sub>🤖 ";
@@ -38,6 +52,11 @@ pub(crate) fn extract_minion_id_from_signature(body: &str) -> Option<&str> {
     // tag from an earlier opening tag, indicating the matched prefix was
     // mid-body rather than the tail signature.
     if id.is_empty() || id.contains("</sub>") {
+        return None;
+    }
+    // Reject if the extracted text doesn't look like a Minion ID — prevents
+    // spoofing via arbitrary <sub>🤖 some text</sub> tags.
+    if !is_minion_id(id) {
         return None;
     }
     Some(id)
@@ -238,6 +257,30 @@ mod tests {
                 "Reply to <sub>🤖 M001</sub> and then <sub>🤖 M002</sub>"
             ),
             Some("M002")
+        );
+        // Spoofed / non-Minion-ID text → None (prevents display-name spoofing)
+        assert_eq!(
+            extract_minion_id_from_signature("See details. <sub>🤖 not-a-minion</sub>"),
+            None
+        );
+        assert_eq!(
+            extract_minion_id_from_signature("Great work! <sub>🤖 @fotoetienne</sub>"),
+            None
+        );
+        // Too short (M + fewer than 3 chars) → None
+        assert_eq!(
+            extract_minion_id_from_signature("Done. <sub>🤖 M1</sub>"),
+            None
+        );
+        // Doesn't start with M → None
+        assert_eq!(
+            extract_minion_id_from_signature("Done. <sub>🤖 X001</sub>"),
+            None
+        );
+        // Legacy uppercase base36 IDs are accepted
+        assert_eq!(
+            extract_minion_id_from_signature("Done!\n\n<sub>🤖 M00A</sub>"),
+            Some("M00A")
         );
     }
 
