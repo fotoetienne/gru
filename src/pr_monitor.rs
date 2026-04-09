@@ -1150,7 +1150,7 @@ When addressing a reviewer in any reply, use the name shown in backticks in the 
             "After committing your changes, reply to EACH inline review comment thread to explain what you changed. \
 Post EXACTLY ONE reply per comment ID — do not post duplicate replies. \
 Reply to each comment in a separate sequential step — do not batch reply API calls with each other \
-or with git operations such as push. Reply to them in the order they appear above.\n\n\
+or with git operations such as push. Reply to the comments in the order they appear above.\n\n\
 For each comment, post an inline reply using the GitHub API:\n\n\
 ```\n\
 gh api --method POST repos/{owner}/{repo}/pulls/{pr_number}/comments \\\n  \
@@ -1463,6 +1463,10 @@ mod tests {
         // Should not have a colon if line is None
         assert!(prompt.contains("**File:** README.md\n"));
         assert!(!prompt.contains("README.md:"));
+        // Anti-duplication instructions must be present for inline comments
+        assert!(prompt.contains("EXACTLY ONE reply per comment ID"));
+        assert!(prompt.contains("in a separate sequential step"));
+        assert!(prompt.contains("do not batch reply API calls"));
     }
 
     #[test]
@@ -1526,6 +1530,10 @@ mod tests {
         assert!(prompt.contains("Fix this line."));
         // Reply instructions present for inline comments
         assert!(prompt.contains("in_reply_to"));
+        // Anti-duplication instructions must be present for inline comments
+        assert!(prompt.contains("EXACTLY ONE reply per comment ID"));
+        assert!(prompt.contains("in a separate sequential step"));
+        assert!(prompt.contains("do not batch reply API calls"));
     }
 
     #[test]
@@ -1574,6 +1582,10 @@ mod tests {
 
         assert!(prompt.contains("**Reviewer:** `M1ab` (@fotoetienne)"));
         assert!(!prompt.contains("**Reviewer:** `fotoetienne`"));
+        // Anti-duplication instructions must be present for inline comments
+        assert!(prompt.contains("EXACTLY ONE reply per comment ID"));
+        assert!(prompt.contains("in a separate sequential step"));
+        assert!(prompt.contains("do not batch reply API calls"));
     }
 
     // ========================================================================
