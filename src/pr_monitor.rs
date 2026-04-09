@@ -612,7 +612,7 @@ async fn poll_once(
     // fetch would permanently lose any human comments posted in that window (they would
     // never be retried), undermining the monitor's ability to respond to PR conversation.
     let (all_issue_comments, issue_comments_fetch_failed) =
-        match fetch_issue_comments(host, owner, repo, pr_number).await {
+        match fetch_issue_comments(host, owner, repo, pr_number, *last_check_time).await {
             Ok(c) => (c, false),
             Err(e) => {
                 log::warn!(
@@ -846,17 +846,27 @@ pub(crate) async fn get_all_reviews(
     Ok(reviews)
 }
 
-/// Fetch all general PR conversation comments (issue comments) for a PR.
+/// Fetch general PR conversation comments (issue comments) for a PR.
 ///
 /// Uses `--paginate` with `--jq ".[]"` to stream individual comment objects.
+/// Passes `since` as a server-side pre-filter (`?since=`) to reduce payload size on
+/// long-lived PRs with many comments. Note: GitHub filters by `updated_at`, while the
+/// local filter in `filter_new_issue_comments` uses `created_at`; the local filter
+/// remains authoritative and prevents edited old comments from being treated as new.
 async fn fetch_issue_comments(
     host: &str,
     owner: &str,
     repo: &str,
     pr_number: &str,
+    since: DateTime<Utc>,
 ) -> Result<Vec<IssueComment>> {
     let repo_full = github::repo_slug(owner, repo);
-    let endpoint = format!("repos/{repo_full}/issues/{pr_number}/comments");
+    // Embed `since` directly in the URL using the `Z` suffix (no special URL chars).
+    // GitHub's `?since=` filters by `updated_at`; the local filter is the authoritative gate.
+    let endpoint = format!(
+        "repos/{repo_full}/issues/{pr_number}/comments?since={}",
+        since.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+    );
     let output = gh_api_with_retry(
         host,
         &["api", "--paginate", &endpoint, "--jq", ".[]"],
