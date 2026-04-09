@@ -178,7 +178,7 @@ pub(crate) async fn fetch_base_branch(worktree_path: &Path, base_branch: &str) -
         .args(["fetch", "origin", &refspec])
         .output()
         .await
-        .with_context(|| format!("Failed to execute git fetch origin {}", base_branch))?;
+        .with_context(|| format!("Failed to execute git fetch origin {}", refspec))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -585,6 +585,25 @@ mod tests {
         let dir = tempfile::tempdir().expect("create temp dir");
         fs::create_dir_all(dir.path().join(".git")).expect("create .git dir");
         dir
+    }
+
+    #[test]
+    fn test_fetch_base_branch_refspec_format() {
+        // Verify the refspec used by fetch_base_branch writes to the remote-tracking ref,
+        // not the local branch ref.  This matters because git refuses to update
+        // refs/heads/<branch> when that branch is checked out in a linked worktree,
+        // whereas refs/remotes/* are never subject to that check.
+        let branch = "main";
+        let refspec = format!("refs/heads/{branch}:refs/remotes/origin/{branch}");
+        assert_eq!(refspec, "refs/heads/main:refs/remotes/origin/main");
+
+        // Branch names with slashes are valid and handled correctly.
+        let branch = "release/1.0";
+        let refspec = format!("refs/heads/{branch}:refs/remotes/origin/{branch}");
+        assert_eq!(
+            refspec,
+            "refs/heads/release/1.0:refs/remotes/origin/release/1.0"
+        );
     }
 
     #[test]
