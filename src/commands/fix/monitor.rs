@@ -200,6 +200,21 @@ async fn auto_rebase_pr(worktree_path: &Path) -> Result<AutoRebaseResult> {
             }
 
             if exit_code == 0 {
+                // Verify the agent actually completed the rebase before trusting it.
+                // An agent that exits 0 without rebasing (e.g. sees a clean worktree
+                // post-abort and does nothing) would otherwise cause a spurious
+                // RebasedAndPushed result and a force-push of the unchanged branch.
+                if let Err(e) = check_clean_worktree(worktree_path).await {
+                    log::warn!("Agent rebase left dirty worktree: {}", e);
+                    return Ok(AutoRebaseResult::ConflictUnresolved);
+                }
+                if !is_up_to_date(worktree_path, &base_branch).await? {
+                    log::warn!(
+                        "Agent rebase exited 0 but origin/{} is not an ancestor of HEAD — rebase did not complete",
+                        base_branch
+                    );
+                    return Ok(AutoRebaseResult::ConflictUnresolved);
+                }
                 // Defensively force push in case the /rebase skill didn't push
                 log::info!("Auto force-pushing after conflict resolution (autonomous mode, --force-with-lease)");
                 force_push(worktree_path).await?;
