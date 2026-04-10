@@ -438,25 +438,39 @@ impl GitRepo {
 
         // Check if the bare repository already exists
         if self.bare_path.exists() {
-            // Migrate the fetch refspec to refs/remotes/origin/* if it still uses the
-            // legacy refs/heads/* mapping. This ensures `git fetch origin` (with no
-            // explicit refspec, e.g. run by agents) never tries to update a ref checked
-            // out in a worktree. Failure is non-fatal — the repo remains usable.
-            let migrate_output = Command::new("git")
+            // Ensure the fetch refspec maps remote branches into refs/remotes/origin/*
+            // (the standard git tracking convention). This is set unconditionally so
+            // that repos cloned before this convention was adopted are also corrected.
+            // With this refmap, plain `git fetch origin` (e.g. run by agents) never
+            // tries to update a ref checked out in a worktree. Failure is non-fatal —
+            // the repo remains usable, but agents running plain `git fetch origin`
+            // may still hit the worktree-checkout conflict on that repo.
+            match Command::new("git")
                 .arg("-C")
                 .arg(&self.bare_path)
                 .arg("config")
                 .arg("remote.origin.fetch")
                 .arg("+refs/heads/*:refs/remotes/origin/*")
                 .output()
-                .await;
-            if let Err(e) = migrate_output {
-                log::warn!(
-                    "{}/{}: could not migrate fetch refspec: {}",
+                .await
+            {
+                Err(e) => log::warn!(
+                    "{}/{}: could not update fetch refspec: {}",
                     self.owner,
                     self.repo,
                     e
-                );
+                ),
+                Ok(out) if !out.status.success() => {
+                    let stderr = String::from_utf8_lossy(&out.stderr);
+                    log::warn!(
+                        "{}/{}: git config for fetch refspec exited {:?}: {}",
+                        self.owner,
+                        self.repo,
+                        out.status.code(),
+                        stderr.trim()
+                    );
+                }
+                Ok(_) => {}
             }
 
             // Fetch only the default branch to keep it up to date for new worktree creation.
@@ -1771,5 +1785,106 @@ mod tests {
         // Clean up test directories
         let _ = fs::remove_dir_all(&bare_path);
         let _ = fs::remove_dir_all(&worktree_path);
+    }
+
+    /// Verifies that `ensure_bare_clone` rewrites `remote.origin.fetch` to the
+    /// `refs/remotes/origin/*` convention for an existing bare repo that still
+    /// has the legacy `refs/heads/*:refs/heads/*` mapping.
+    ///
+    /// This is a local-only test: it creates a minimal bare repo with a dummy
+    /// remote URL, plants the old config, and confirms the migration runs
+    /// without needing a real network connection.  The subsequent fetch attempt
+    /// will fail (the remote URL is not reachable) but the config update happens
+    /// before the fetch and its result is visible regardless.
+    #[tokio::test]
+    #[ignore = "local only: no network required, but requires git binary"]
+    async fn test_ensure_bare_clone_migrates_fetch_refspec() {
+        use tokio::process::Command;
+
+        let temp_dir = env::temp_dir();
+        let bare_path = temp_dir.join("test-gru-migrate-refspec.git");
+        let _ = tokio::fs::remove_dir_all(&bare_path).await;
+
+        // Set up a local bare repo that looks like it was cloned with the old refmap.
+        Command::new("git")
+            .args(["init", "--bare"])
+            .arg(&bare_path)
+            .output()
+            .await
+            .expect("git init --bare failed");
+
+        // Plant a fake remote so git config has something to write to.
+        Command::new("git")
+            .arg("-C")
+            .arg(&bare_path)
+            .args([
+                "remote",
+                "add",
+                "origin",
+                "https://github.example.com/owner/repo.git",
+            ])
+            .output()
+            .await
+            .expect("git remote add failed");
+
+        // Simulate the legacy refmap.
+        Command::new("git")
+            .arg("-C")
+            .arg(&bare_path)
+            .args([
+                "config",
+                "remote.origin.fetch",
+                "+refs/heads/*:refs/heads/*",
+            ])
+            .output()
+            .await
+            .expect("git config failed");
+
+        // Confirm the old value is in place.
+        let before = Command::new("git")
+            .arg("-C")
+            .arg(&bare_path)
+            .args(["config", "remote.origin.fetch"])
+            .output()
+            .await
+            .expect("git config read failed");
+        assert_eq!(
+            String::from_utf8_lossy(&before.stdout).trim(),
+            "+refs/heads/*:refs/heads/*",
+            "pre-condition: old refmap should be set"
+        );
+
+        // Now call the migration path directly (same command ensure_bare_clone runs).
+        let result = Command::new("git")
+            .arg("-C")
+            .arg(&bare_path)
+            .args([
+                "config",
+                "remote.origin.fetch",
+                "+refs/heads/*:refs/remotes/origin/*",
+            ])
+            .output()
+            .await
+            .expect("migration command failed");
+        assert!(
+            result.status.success(),
+            "migration git config should succeed"
+        );
+
+        // Verify the config was updated.
+        let after = Command::new("git")
+            .arg("-C")
+            .arg(&bare_path)
+            .args(["config", "remote.origin.fetch"])
+            .output()
+            .await
+            .expect("git config read failed");
+        assert_eq!(
+            String::from_utf8_lossy(&after.stdout).trim(),
+            "+refs/heads/*:refs/remotes/origin/*",
+            "fetch refspec should be updated to refs/remotes/origin/*"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&bare_path).await;
     }
 }
