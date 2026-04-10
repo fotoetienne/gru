@@ -407,23 +407,78 @@ async fn reap_children(children: &mut Vec<SpawnedChild>, retry_queue: &mut Retry
                             }
                         } else {
                             // Non-early failure: restore labels first, then enqueue for retry.
-                            // This prevents the issue from being orphaned if lab restarts
-                            // before the retry fires.
-                            if let Err(e) = github::edit_labels_via_cli(
+                            // Check for terminal labels before restoring to avoid overwriting
+                            // gru:done/failed — a long-running minion may have finished
+                            // successfully before the process crashed.
+                            let terminal_label = match github::has_any_label_via_cli(
                                 &meta.host,
                                 &meta.owner,
                                 &meta.repo,
                                 meta.issue_number,
-                                &[&meta.ready_label],
-                                &[labels::IN_PROGRESS],
+                                &[labels::DONE, labels::FAILED],
                             )
                             .await
                             {
-                                log::warn!(
-                                    "⚠️  Failed to restore labels on issue #{} after non-early exit: {}",
+                                Ok(label) => label,
+                                Err(e) => {
+                                    log::warn!(
+                                        "⚠️  Failed to check labels on issue #{}: {} \
+                                         — proceeding with label restoration (fail-open)",
+                                        meta.issue_number,
+                                        e
+                                    );
+                                    None
+                                }
+                            };
+
+                            if let Some(label) = terminal_label {
+                                log::info!(
+                                    "⏭️  Issue #{} already has {} — skipping gru:todo restoration, \
+                                     removing gru:in-progress only",
                                     meta.issue_number,
-                                    e
+                                    label
                                 );
+                                if let Err(e) = github::edit_labels_via_cli(
+                                    &meta.host,
+                                    &meta.owner,
+                                    &meta.repo,
+                                    meta.issue_number,
+                                    &[],
+                                    &[labels::IN_PROGRESS],
+                                )
+                                .await
+                                {
+                                    log::warn!(
+                                        "⚠️  Failed to remove gru:in-progress from issue #{}: {}",
+                                        meta.issue_number,
+                                        e
+                                    );
+                                }
+                            } else {
+                                log::warn!(
+                                    "⚠️  Spawned gru do for issue #{} exited with {} after {:.1}s \
+                                     — restoring label before retry",
+                                    meta.issue_number,
+                                    status,
+                                    elapsed.as_secs_f64()
+                                );
+                                if let Err(e) = github::edit_labels_via_cli(
+                                    &meta.host,
+                                    &meta.owner,
+                                    &meta.repo,
+                                    meta.issue_number,
+                                    &[&meta.ready_label],
+                                    &[labels::IN_PROGRESS],
+                                )
+                                .await
+                                {
+                                    log::warn!(
+                                        "⚠️  Failed to restore labels on issue #{} after non-early exit: {} \
+                                         — issue may need manual label fix",
+                                        meta.issue_number,
+                                        e
+                                    );
+                                }
                             }
                             let reason = format!(
                                 "exited with {} after {:.0}s",
@@ -2409,11 +2464,11 @@ mod tests {
 
     #[test]
     fn test_should_restore_label_beyond_threshold() {
-        // A process spawned well before the threshold should not qualify
-        let spawned_at = Instant::now() - Duration::from_secs(180);
+        // A process spawned well past the threshold should not qualify
+        let spawned_at = Instant::now() - EARLY_EXIT_THRESHOLD - Duration::from_secs(60);
         assert!(
             !should_restore_label(spawned_at),
-            "Process spawned 180s ago should not qualify for label restoration"
+            "Process spawned past EARLY_EXIT_THRESHOLD should not qualify for label restoration"
         );
     }
 
