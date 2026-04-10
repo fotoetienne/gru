@@ -522,6 +522,46 @@ pub(crate) async fn list_ready_issues_via_cli(
     Ok(items)
 }
 
+/// List open issues with the `gru:in-progress` label using gh CLI.
+///
+/// Returns a list of issue numbers. Used by the lab recovery scan to find
+/// orphaned issues that have no live Minion process.
+pub(crate) async fn list_in_progress_issues_via_cli(
+    host: &str,
+    owner: &str,
+    repo: &str,
+) -> Result<Vec<u64>> {
+    let repo_full = repo_slug(owner, repo);
+    let stdout = run_gh(
+        host,
+        &[
+            "issue",
+            "list",
+            "--repo",
+            &repo_full,
+            "--label",
+            labels::IN_PROGRESS,
+            "--state",
+            "open",
+            "--json",
+            "number",
+            "--limit",
+            "100",
+        ],
+    )
+    .await?;
+
+    #[derive(serde::Deserialize)]
+    struct NumberOnly {
+        number: u64,
+    }
+
+    let items: Vec<NumberOnly> =
+        serde_json::from_str(&stdout).context("Failed to parse gh issue list JSON output")?;
+
+    Ok(items.into_iter().map(|i| i.number).collect())
+}
+
 /// Issue candidate returned by list queries, with optional body for dependency checking
 #[derive(Debug, Clone, serde::Deserialize)]
 pub(crate) struct CandidateIssue {

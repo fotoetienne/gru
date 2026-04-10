@@ -126,6 +126,13 @@ pub(crate) struct DaemonConfig {
     /// Set to 0 to disable TTL-based archiving.
     #[serde(default = "default_archive_ttl_hours")]
     pub(crate) archive_ttl_hours: u64,
+
+    /// Minutes an issue can be gru:in-progress without a live Minion before
+    /// auto-recovery resets it to gru:todo. Set to 0 to disable (recommended
+    /// for multi-lab deployments where another machine may hold the issue).
+    /// Default: 30 minutes.
+    #[serde(default = "default_recovery_threshold_mins")]
+    pub(crate) recovery_threshold_mins: u64,
 }
 
 impl Default for DaemonConfig {
@@ -140,6 +147,7 @@ impl Default for DaemonConfig {
             max_retry_backoff_secs: default_max_retry_backoff_secs(),
             poll_interval_max_secs: default_poll_interval_max(),
             archive_ttl_hours: default_archive_ttl_hours(),
+            recovery_threshold_mins: default_recovery_threshold_mins(),
         }
     }
 }
@@ -249,6 +257,13 @@ pub(crate) const DEFAULT_ARCHIVE_TTL_HOURS: u64 = 24;
 
 fn default_archive_ttl_hours() -> u64 {
     DEFAULT_ARCHIVE_TTL_HOURS
+}
+
+/// Default recovery threshold in minutes before a stuck gru:in-progress issue is reset.
+pub(crate) const DEFAULT_RECOVERY_THRESHOLD_MINS: u64 = 30;
+
+fn default_recovery_threshold_mins() -> u64 {
+    DEFAULT_RECOVERY_THRESHOLD_MINS
 }
 
 /// Parse a repo entry from the config into `(host, owner, repo)`.

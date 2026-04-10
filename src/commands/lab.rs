@@ -143,6 +143,12 @@ pub(crate) async fn handle_lab(
     // only serves to rate-limit GitHub API calls within a session.
     let mut wake_check_times: HashMap<String, DateTime<Utc>> = HashMap::new();
 
+    // Poll cycle counter for recovery scan cadence.
+    // First cycle is skipped to avoid false positives while minions are re-registering.
+    let mut poll_cycle: u64 = 0;
+    // Run recovery every ~5 minutes (at least every 1 cycle).
+    let recovery_every = std::cmp::max(1, 300 / config.daemon.poll_interval_secs);
+
     if no_resume {
         tprintln!("⏭️  Auto-resume disabled (--no-resume)");
         tprintln!();
@@ -294,6 +300,19 @@ pub(crate) async fn handle_lab(
                 // Log retry queue status when non-empty
                 if !retry_queue.is_empty() {
                     log_retry_queue_status(&retry_queue);
+                }
+
+                // Periodic recovery scan: reset orphaned gru:in-progress issues.
+                // Skips the first cycle to avoid false positives while minions are
+                // re-registering after a lab restart.
+                poll_cycle += 1;
+                if config.daemon.recovery_threshold_mins > 0
+                    && poll_cycle > 1
+                    && poll_cycle % recovery_every == 0
+                {
+                    if let Err(e) = recover_stuck_in_progress_issues(&config).await {
+                        log::warn!("⚠️  Recovery scan error: {:#}", e);
+                    }
                 }
 
                 // Check if a signal arrived during poll_and_spawn
@@ -2252,6 +2271,105 @@ async fn fallback_list_issues(
         .collect();
 
     Ok(filtered)
+}
+
+/// Scan for issues stuck at `gru:in-progress` with no live Minion and reset them.
+///
+/// For each configured repo, queries GitHub for open `gru:in-progress` issues, then
+/// cross-checks against the local Minion registry. Issues with no live Minion are
+/// reset to `gru:todo` with an explanatory comment so the lab can retry them.
+///
+/// Errors from individual repos are logged as warnings and do not abort the scan.
+async fn recover_stuck_in_progress_issues(config: &crate::config::LabConfig) -> Result<()> {
+    for repo_spec in &config.daemon.repos {
+        let Some((host, owner, repo)) =
+            crate::config::parse_repo_entry_with_hosts(repo_spec, &config.github_hosts)
+        else {
+            log::warn!(
+                "⚠️  Recovery scan: could not parse repo spec '{}'",
+                repo_spec
+            );
+            continue;
+        };
+
+        let full_repo = crate::github::repo_slug(&owner, &repo);
+
+        let in_progress = match github::list_in_progress_issues_via_cli(&host, &owner, &repo).await
+        {
+            Ok(issues) => issues,
+            Err(e) => {
+                log::warn!(
+                    "⚠️  Recovery scan: failed to list in-progress issues for {}: {:#}",
+                    repo_spec,
+                    e
+                );
+                continue;
+            }
+        };
+
+        for issue_number in in_progress {
+            // If a live Minion holds this issue, skip it.
+            match is_issue_claimed(&full_repo, Some(issue_number)).await {
+                Ok(true) => continue,
+                Ok(false) => {}
+                Err(e) => {
+                    log::warn!(
+                        "⚠️  Recovery scan: could not check claim status for {}/issues/{}: {:#}",
+                        repo_spec,
+                        issue_number,
+                        e
+                    );
+                    continue;
+                }
+            }
+
+            // Orphaned issue — reset to gru:todo and leave a comment.
+            tprintln!(
+                "🔄 Recovery: resetting orphaned in-progress issue #{} in {} to gru:todo",
+                issue_number,
+                repo_spec
+            );
+
+            if let Err(e) = github::edit_labels_via_cli(
+                &host,
+                &owner,
+                &repo,
+                issue_number,
+                &[labels::TODO],
+                &[labels::IN_PROGRESS],
+            )
+            .await
+            {
+                log::warn!(
+                    "⚠️  Recovery scan: failed to reset labels for {}/issues/{}: {:#}",
+                    repo_spec,
+                    issue_number,
+                    e
+                );
+                continue;
+            }
+
+            if let Err(e) = github::post_comment_via_cli(
+                &host,
+                &owner,
+                &repo,
+                issue_number,
+                "⚠️ Gru auto-recovery: issue was stuck at `gru:in-progress` with no live \
+                 Minion process. Resetting to `gru:todo` so it can be retried.",
+            )
+            .await
+            {
+                log::warn!(
+                    "⚠️  Recovery scan: failed to post comment on {}/issues/{}: {:#}",
+                    repo_spec,
+                    issue_number,
+                    e
+                );
+            }
+        }
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]

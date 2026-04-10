@@ -75,6 +75,11 @@
 # to disable TTL-based archiving.
 # archive_ttl_hours = 24
 
+# Minutes an issue can be gru:in-progress with no live Minion before the
+# lab auto-resets it to gru:todo. Set to 0 to disable (recommended for
+# multi-lab deployments where another machine may hold the issue).
+# recovery_threshold_mins = 30
+
 # ─────────────────────────────────────────────────────────────────────
 # Agent backend
 # ─────────────────────────────────────────────────────────────────────
