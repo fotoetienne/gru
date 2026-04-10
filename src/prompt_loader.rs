@@ -251,6 +251,8 @@ After resolving each conflict:
 
 ## 5. After Rebase Completes
 - Review the changes: `git log --oneline origin/<base_branch>..HEAD`
+- Verify the rebase succeeded: `git merge-base --is-ancestor origin/<base_branch> HEAD`
+  - If this command exits non-zero, the rebase did not complete — report what went wrong and run `bash -c 'exit 1'`
 - Run the project's test suite to ensure nothing broke (check CLAUDE.md for test commands, if present)
 - Force push the rebased branch: `git push --force-with-lease`
 - Report the result to the user
@@ -1631,6 +1633,8 @@ Repo content"#,
         assert!(prompt.content.contains("Fetch and Rebase"));
         assert!(prompt.content.contains("Resolve Conflicts"));
         assert!(prompt.content.contains("force-with-lease"));
+        assert!(prompt.content.contains("merge-base --is-ancestor"));
+        assert!(prompt.content.contains("bash -c 'exit 1'"));
 
         // Template should NOT hardcode origin/ before {{ base_branch }}
         // to avoid double-prefixing when base_branch is "origin/main"
