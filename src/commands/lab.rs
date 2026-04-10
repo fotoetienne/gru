@@ -1768,10 +1768,6 @@ async fn dispatch_due_retries(
             entry.reason
         );
 
-        // Remove dead registry entries before retrying to prevent stale PIDs
-        // from blocking the new spawn via `check_existing_minions`.
-        prune_dead_entries_for_issue(&full_repo, entry.issue_number).await;
-
         match spawn_minion(&full_repo, &entry.host, entry.issue_number).await {
             Ok(child) => {
                 children.push(SpawnedChild {
@@ -1853,13 +1849,16 @@ async fn available_slots(max_slots: usize) -> Result<usize> {
     Ok(max_slots.saturating_sub(active_count))
 }
 
-/// Removes registry entries for an issue where the minion's recorded PID is no
-/// longer alive.
+/// Clears the recorded PID for entries whose process is no longer alive and
+/// transitions them to `Stopped`.
 ///
-/// Only entries that held a PID (i.e. were once running) are removed. Cleanly
-/// stopped entries (`pid = None`) are left intact so they remain eligible for
-/// resume. Called before spawning a new Minion to prevent `check_existing_minions`
-/// from treating recycled PIDs as live processes. Errors are logged and ignored —
+/// Only entries that held a PID (i.e. were once running) are touched. Cleanly
+/// stopped entries (`pid = None`) are left intact. Preserving the entry (rather
+/// than deleting it) keeps session/worktree metadata available for potential
+/// resume: if the worktree still exists, `check_existing_minions` will offer a
+/// `Resumable` path instead of forcing a fully fresh start. Called before
+/// spawning a new Minion to prevent `check_existing_minions` from treating
+/// recycled PIDs as live processes. Errors are logged and ignored —
 /// a failed prune is non-fatal since the spawn will still proceed.
 async fn prune_dead_entries_for_issue(repo: &str, issue_number: u64) {
     let repo = repo.to_string();
@@ -1871,12 +1870,18 @@ async fn prune_dead_entries_for_issue(repo: &str, issue_number: u64) {
             .map(|(id, _)| id)
             .collect();
         if !dead.is_empty() {
-            log::debug!(
-                "Pruning {} dead registry entries for issue #{}",
+            log::info!(
+                "Clearing dead PIDs for {} registry entries for issue #{}",
                 dead.len(),
                 issue_number
             );
-            registry.remove_batch(&dead)?;
+            for id in &dead {
+                registry.update(id, |info| {
+                    info.clear_pid();
+                    info.mode = MinionMode::Stopped;
+                    info.last_activity = Utc::now();
+                })?;
+            }
         }
         Ok(())
     })
@@ -1897,7 +1902,16 @@ async fn is_issue_claimed(repo: &str, issue_number: Option<u64>) -> Result<bool>
     let repo = repo.to_string();
     with_registry(move |registry| {
         let claimed = registry.list().iter().any(|(_id, info)| {
-            info.repo == repo && info.issue == Some(issue_number) && info.is_running()
+            info.repo == repo
+                && info.issue == Some(issue_number)
+                && info.is_running()
+                // Only trust entries with start-time validation on platforms that
+                // support it (macOS, Linux). Legacy entries (pid_start_time = None)
+                // rely on bare kill(pid, 0) which cannot detect PID recycling.
+                // On other platforms we fall back to plain is_running() to avoid
+                // treating all minions as unclaimed.
+                && (info.pid_start_time.is_some()
+                    || !cfg!(any(target_os = "macos", target_os = "linux")))
         });
         Ok(claimed)
     })
