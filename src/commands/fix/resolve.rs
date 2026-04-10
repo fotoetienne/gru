@@ -58,8 +58,13 @@ pub(super) async fn check_existing_minions(
             .then_with(|| b.last_activity.cmp(&a.last_activity))
     });
 
-    // Check if any minion is actually running
-    let any_running = existing.iter().any(|(_, info)| info.is_running());
+    // Check if any minion is actually running.
+    // Only trust "running" when start-time validation is available: legacy entries
+    // (pid_start_time = None) rely solely on kill(pid, 0) which cannot detect PID
+    // recycling and may falsely report a stopped minion as alive.
+    let any_running = existing
+        .iter()
+        .any(|(_, info)| info.is_running() && info.pid_start_time.is_some());
 
     if any_running {
         // A minion is actively running - show error with suggestions
