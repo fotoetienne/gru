@@ -451,6 +451,9 @@ impl GitRepo {
                 .arg("config")
                 .arg("remote.origin.fetch")
                 .arg("+refs/heads/*:refs/remotes/origin/*")
+                .env_remove("GIT_DIR")
+                .env_remove("GIT_WORK_TREE")
+                .env_remove("GIT_INDEX_FILE")
                 .output()
                 .await
             {
@@ -1801,14 +1804,12 @@ mod tests {
     async fn test_ensure_bare_clone_migrates_fetch_refspec() {
         use tokio::process::Command;
 
-        let temp_dir = env::temp_dir();
-        let work_path = temp_dir.join("test-gru-migrate-work");
-        let source_path = temp_dir.join("test-gru-migrate-source.git");
-        let clone_path = temp_dir.join("test-gru-migrate-clone.git");
-
-        for p in [&work_path, &source_path, &clone_path] {
-            let _ = tokio::fs::remove_dir_all(p).await;
-        }
+        // Use tempfile::tempdir() for a unique, auto-cleaned directory so
+        // concurrent runs or leftover directories don't cause collisions.
+        let tmp = tempfile::tempdir().expect("create temp dir");
+        let work_path = tmp.path().join("work");
+        let source_path = tmp.path().join("source.git");
+        let clone_path = tmp.path().join("clone.git");
 
         // Create a working directory with an initial commit so the source bare
         // repo has at least one branch (required for a successful fetch later).
@@ -1907,9 +1908,6 @@ mod tests {
             "+refs/heads/*:refs/remotes/origin/*",
             "fetch refspec should be updated to refs/remotes/origin/* after ensure_bare_clone"
         );
-
-        for p in [&work_path, &source_path, &clone_path] {
-            let _ = tokio::fs::remove_dir_all(p).await;
-        }
+        // `tmp` drops here, cleaning up all directories automatically.
     }
 }
