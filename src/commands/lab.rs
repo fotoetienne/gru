@@ -1497,6 +1497,10 @@ async fn spawn_for_candidate_issues(
                 break;
             }
 
+            // Prune dead entries first so a recycled PID doesn't cause
+            // `is_issue_claimed` to skip this issue before the spawn-time prune runs.
+            prune_dead_entries_for_issue(&ctx.full, candidate.number).await;
+
             // Check if issue is already being worked on (by a live process)
             if is_issue_claimed(&ctx.full, Some(candidate.number)).await? {
                 continue;
@@ -1724,6 +1728,10 @@ async fn dispatch_due_retries(
         }
 
         let full_repo = format!("{}/{}", entry.owner, entry.repo);
+
+        // Prune dead entries before the liveness check so a recycled PID
+        // doesn't cause the issue to be skipped before the spawn-time prune runs.
+        prune_dead_entries_for_issue(&full_repo, entry.issue_number).await;
 
         // Skip if issue is already being worked on by a live process
         if is_issue_claimed(&full_repo, Some(entry.issue_number)).await? {

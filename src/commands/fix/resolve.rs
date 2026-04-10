@@ -49,10 +49,12 @@ pub(super) async fn check_existing_minions(
         return Ok(ExistingMinionCheck::None);
     }
 
-    // Sort deterministically: running Minions first, then by most recent start time.
+    // Sort deterministically: validated-running Minions first, then by most recent
+    // start time. Use the same `pid_start_time`-gated predicate as `any_running`
+    // below so the sort order is consistent with what triggers the AlreadyRunning path.
     existing.sort_by(|(_, a), (_, b)| {
-        let a_running = a.is_running();
-        let b_running = b.is_running();
+        let a_running = a.is_running() && a.pid_start_time.is_some();
+        let b_running = b.is_running() && b.pid_start_time.is_some();
         b_running
             .cmp(&a_running)
             .then_with(|| b.last_activity.cmp(&a.last_activity))
