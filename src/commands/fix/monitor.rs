@@ -217,6 +217,14 @@ async fn auto_rebase_pr(worktree_path: &Path) -> Result<AutoRebaseResult> {
                     .output()
                     .await
                     .context("Failed to check tracked-file status after agent rebase")?;
+                if !tracked_status.status.success() {
+                    let stderr = String::from_utf8_lossy(&tracked_status.stderr);
+                    anyhow::bail!(
+                        "git status failed after agent rebase (exit {:?}): {}",
+                        tracked_status.status.code(),
+                        stderr.trim()
+                    );
+                }
                 if !tracked_status.stdout.is_empty() {
                     let details = String::from_utf8_lossy(&tracked_status.stdout);
                     log::warn!(
