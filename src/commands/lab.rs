@@ -304,16 +304,17 @@ pub(crate) async fn handle_lab(
 
                 // Periodic recovery scan: reset orphaned gru:in-progress issues.
                 // Skips the first cycle to avoid false positives while minions are
-                // re-registering after a lab restart. The first eligible scan fires
-                // immediately on the second cycle (no 5-minute warmup), but the
-                // recovery_threshold_mins guard prevents false positives regardless.
-                // Subsequent scans use wall-clock time (immune to adaptive backoff skew).
+                // re-registering after a lab restart. On the second cycle the timer
+                // is initialised, so the first actual scan runs RECOVERY_SCAN_INTERVAL_SECS
+                // later (not immediately). Subsequent scans use wall-clock time
+                // (immune to adaptive backoff skew).
                 if config.daemon.recovery_threshold_mins > 0 {
                     if !recovery_scan_eligible {
-                        // First cycle — mark eligible for future scans.
+                        // First cycle — start the wall-clock timer for future scans.
                         recovery_scan_eligible = true;
+                        last_recovery_scan = Some(Instant::now());
                     } else {
-                        let should_scan = last_recovery_scan.map_or(true, |t| {
+                        let should_scan = last_recovery_scan.is_some_and(|t| {
                             t.elapsed()
                                 >= Duration::from_secs(
                                     crate::config::RECOVERY_SCAN_INTERVAL_SECS,
@@ -2295,7 +2296,9 @@ async fn fallback_list_issues(
 ///
 /// Per-repo and per-issue errors are logged as warnings and do not abort the scan.
 async fn recover_stuck_in_progress_issues(config: &crate::config::LabConfig) -> Result<()> {
-    let threshold = chrono::Duration::minutes(config.daemon.recovery_threshold_mins as i64);
+    let threshold_mins = i64::try_from(config.daemon.recovery_threshold_mins)
+        .context("daemon.recovery_threshold_mins exceeds the maximum supported value")?;
+    let threshold = chrono::Duration::minutes(threshold_mins);
 
     for repo_spec in &config.daemon.repos {
         let Some((host, owner, repo)) =
