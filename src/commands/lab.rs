@@ -454,6 +454,7 @@ async fn reap_children(children: &mut Vec<SpawnedChild>, retry_queue: &mut Retry
                                         e
                                     );
                                 }
+                                // Issue is already done/failed — no retry needed.
                             } else {
                                 log::warn!(
                                     "⚠️  Spawned gru do for issue #{} exited with {} after {:.1}s \
@@ -479,26 +480,26 @@ async fn reap_children(children: &mut Vec<SpawnedChild>, retry_queue: &mut Retry
                                         e
                                     );
                                 }
-                            }
-                            let reason = format!(
-                                "exited with {} after {:.0}s",
-                                status,
-                                elapsed.as_secs_f64()
-                            );
-                            if !retry_queue.enqueue_failure(
-                                &meta.host,
-                                &meta.owner,
-                                &meta.repo,
-                                meta.issue_number,
-                                meta.retry_attempt,
-                                &reason,
-                                None,
-                                None,
-                            ) {
-                                log::warn!(
-                                    "⚠️  Issue #{} exceeded max retry attempts — not retrying",
-                                    meta.issue_number,
+                                let reason = format!(
+                                    "exited with {} after {:.0}s",
+                                    status,
+                                    elapsed.as_secs_f64()
                                 );
+                                if !retry_queue.enqueue_failure(
+                                    &meta.host,
+                                    &meta.owner,
+                                    &meta.repo,
+                                    meta.issue_number,
+                                    meta.retry_attempt,
+                                    &reason,
+                                    None,
+                                    None,
+                                ) {
+                                    log::warn!(
+                                        "⚠️  Issue #{} exceeded max retry attempts — not retrying",
+                                        meta.issue_number,
+                                    );
+                                }
                             }
                         }
                     }
