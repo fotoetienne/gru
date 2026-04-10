@@ -438,9 +438,28 @@ impl GitRepo {
 
         // Check if the bare repository already exists
         if self.bare_path.exists() {
+            // Migrate the fetch refspec to refs/remotes/origin/* if it still uses the
+            // legacy refs/heads/* mapping. This ensures `git fetch origin` (with no
+            // explicit refspec, e.g. run by agents) never tries to update a ref checked
+            // out in a worktree. Failure is non-fatal — the repo remains usable.
+            let migrate_output = Command::new("git")
+                .arg("-C")
+                .arg(&self.bare_path)
+                .arg("config")
+                .arg("remote.origin.fetch")
+                .arg("+refs/heads/*:refs/remotes/origin/*")
+                .output()
+                .await;
+            if let Err(e) = migrate_output {
+                log::warn!(
+                    "{}/{}: could not migrate fetch refspec: {}",
+                    self.owner,
+                    self.repo,
+                    e
+                );
+            }
+
             // Fetch only the default branch to keep it up to date for new worktree creation.
-            // We avoid fetching all branches (refs/heads/*) because git refuses to update
-            // any ref that is checked out in a worktree, causing the entire fetch to fail.
             // Feature branches are fetched on demand via fetch_branch().
             let mut fetched = false;
             for branch in DEFAULT_BRANCHES {
@@ -550,14 +569,18 @@ impl GitRepo {
                 );
             }
 
-            // Configure fetch refspec so future fetches update local branches directly
-            // (git clone --bare doesn't set this by default)
+            // Configure fetch refspec to map remote branches into refs/remotes/origin/*
+            // (the standard git convention). Using refs/remotes/origin/* instead of
+            // refs/heads/* means `git fetch origin` (with no explicit refspec) never tries
+            // to update a ref that may be checked out in a worktree, eliminating the
+            // "refusing to fetch into branch" error that occurs when another worktree has
+            // the default branch checked out.
             let output = Command::new("git")
                 .arg("-C")
                 .arg(&self.bare_path)
                 .arg("config")
                 .arg("remote.origin.fetch")
-                .arg("+refs/heads/*:refs/heads/*")
+                .arg("+refs/heads/*:refs/remotes/origin/*")
                 .output()
                 .await
                 .context("Failed to execute git config for remote.origin.fetch")?;
