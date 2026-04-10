@@ -2,6 +2,7 @@
 
 [![CI](https://github.com/fotoetienne/gru/actions/workflows/ci.yml/badge.svg)](https://github.com/fotoetienne/gru/actions/workflows/ci.yml)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+[![Docs](https://img.shields.io/badge/docs-fotoetienne.github.io%2Fgru-blue.svg)](https://fotoetienne.github.io/gru/)
 
 **Gru turns GitHub issues into merged PRs — autonomously, locally, with the AI coding agent of your choice.**
 
