@@ -180,12 +180,10 @@ pub(crate) async fn check_clean_worktree(worktree_path: &Path) -> Result<()> {
 
 /// Builds the argument list (after `git -C <path>`) used by [`fetch_base_branch`].
 ///
-/// `--refmap=` (empty string) disables the configured remote refmap
-/// (`+refs/heads/*:refs/heads/*`).  Without it, git applies both the explicit
-/// refspec **and** the configured refmap, and the refmap still tries to update
-/// `refs/heads/<branch>` — which git refuses when that branch is checked out in
-/// another worktree.  With `--refmap=` only our explicit refspec runs, which
-/// writes to `refs/remotes/origin/<branch>` and is never subject to that check.
+/// `--refmap=` (empty string) ensures only our explicit refspec runs, regardless
+/// of what `remote.origin.fetch` is configured to.  The configured refmap now
+/// uses `refs/remotes/origin/*` (safe), but `--refmap=` is kept as defense-in-depth
+/// and to avoid fetching all branches when only one is needed.
 fn make_fetch_args(base_branch: &str) -> Vec<String> {
     vec![
         "fetch".to_string(),
@@ -197,11 +195,8 @@ fn make_fetch_args(base_branch: &str) -> Vec<String> {
 
 /// Fetches only the specified base branch from origin.
 ///
-/// Uses an explicit refspec that writes to `refs/remotes/origin/<base_branch>`
-/// rather than `refs/heads/<base_branch>`, combined with `--refmap=` to
-/// suppress the configured remote refmap.  Together these ensure git never
-/// tries to update `refs/heads/*`, which would fail when another worktree has
-/// the base branch checked out.
+/// Uses an explicit refspec that writes to `refs/remotes/origin/<base_branch>`,
+/// combined with `--refmap=` to ensure only the named branch is fetched.
 pub(crate) async fn fetch_base_branch(worktree_path: &Path, base_branch: &str) -> Result<()> {
     let args = make_fetch_args(base_branch);
     let output = Command::new("git")
@@ -782,10 +777,8 @@ mod tests {
     #[test]
     fn test_fetch_base_branch_refspec_format() {
         // Verify the full argument list: --refmap= appears before the refspec
-        // to suppress the configured remote refmap (+refs/heads/*:refs/heads/*).
-        // Without it, git applies both our explicit refspec and the configured
-        // refmap; the refmap would still try to update refs/heads/<branch>, which
-        // git refuses when that branch is checked out in another worktree.
+        // to ensure only our explicit refspec runs (defense-in-depth and avoids
+        // fetching all branches when only one is needed).
         // The refspec writes to refs/remotes/origin/* (never checked against
         // worktree state).  The leading '+' forces the update after a force-push.
         assert_eq!(

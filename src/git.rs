@@ -438,9 +438,45 @@ impl GitRepo {
 
         // Check if the bare repository already exists
         if self.bare_path.exists() {
+            // Ensure the fetch refspec maps remote branches into refs/remotes/origin/*
+            // (the standard git tracking convention). This is set unconditionally so
+            // that repos cloned before this convention was adopted are also corrected.
+            // With this refmap, plain `git fetch origin` (e.g. run by agents) never
+            // tries to update a ref checked out in a worktree. Failure is non-fatal —
+            // the repo remains usable, but agents running plain `git fetch origin`
+            // may still hit the worktree-checkout conflict on that repo.
+            match Command::new("git")
+                .arg("-C")
+                .arg(&self.bare_path)
+                .arg("config")
+                .arg("remote.origin.fetch")
+                .arg("+refs/heads/*:refs/remotes/origin/*")
+                .env_remove("GIT_DIR")
+                .env_remove("GIT_WORK_TREE")
+                .env_remove("GIT_INDEX_FILE")
+                .output()
+                .await
+            {
+                Err(e) => log::warn!(
+                    "{}/{}: could not update fetch refspec: {}",
+                    self.owner,
+                    self.repo,
+                    e
+                ),
+                Ok(out) if !out.status.success() => {
+                    let stderr = String::from_utf8_lossy(&out.stderr);
+                    log::warn!(
+                        "{}/{}: git config for fetch refspec exited {:?}: {}",
+                        self.owner,
+                        self.repo,
+                        out.status.code(),
+                        stderr.trim()
+                    );
+                }
+                Ok(_) => {}
+            }
+
             // Fetch only the default branch to keep it up to date for new worktree creation.
-            // We avoid fetching all branches (refs/heads/*) because git refuses to update
-            // any ref that is checked out in a worktree, causing the entire fetch to fail.
             // Feature branches are fetched on demand via fetch_branch().
             let mut fetched = false;
             for branch in DEFAULT_BRANCHES {
@@ -550,14 +586,18 @@ impl GitRepo {
                 );
             }
 
-            // Configure fetch refspec so future fetches update local branches directly
-            // (git clone --bare doesn't set this by default)
+            // Configure fetch refspec to map remote branches into refs/remotes/origin/*
+            // (the standard git convention). Using refs/remotes/origin/* instead of
+            // refs/heads/* means `git fetch origin` (with no explicit refspec) never tries
+            // to update a ref that may be checked out in a worktree, eliminating the
+            // "refusing to fetch into branch" error that occurs when another worktree has
+            // the default branch checked out.
             let output = Command::new("git")
                 .arg("-C")
                 .arg(&self.bare_path)
                 .arg("config")
                 .arg("remote.origin.fetch")
-                .arg("+refs/heads/*:refs/heads/*")
+                .arg("+refs/heads/*:refs/remotes/origin/*")
                 .output()
                 .await
                 .context("Failed to execute git config for remote.origin.fetch")?;
@@ -1748,5 +1788,126 @@ mod tests {
         // Clean up test directories
         let _ = fs::remove_dir_all(&bare_path);
         let _ = fs::remove_dir_all(&worktree_path);
+    }
+
+    /// Verifies that `ensure_bare_clone` rewrites `remote.origin.fetch` to the
+    /// `refs/remotes/origin/*` convention when called on a bare repo that still
+    /// has the legacy `+refs/heads/*:refs/heads/*` mapping.
+    ///
+    /// Uses a fully local setup (no network): a "source" bare repo with a real
+    /// branch is created, a "clone" bare repo is set up pointing at it, the old
+    /// refmap is planted on the clone, and then `ensure_bare_clone` is called.
+    /// Because the local source is reachable, the fetch inside `ensure_bare_clone`
+    /// also succeeds, exercising the full code path.
+    #[tokio::test]
+    #[ignore = "local only: no network required, but requires git binary"]
+    async fn test_ensure_bare_clone_migrates_fetch_refspec() {
+        use tokio::process::Command;
+
+        // Use tempfile::tempdir() for a unique, auto-cleaned directory so
+        // concurrent runs or leftover directories don't cause collisions.
+        let tmp = tempfile::tempdir().expect("create temp dir");
+        let work_path = tmp.path().join("work");
+        let source_path = tmp.path().join("source.git");
+        let clone_path = tmp.path().join("clone.git");
+
+        // Create a working directory with an initial commit so the source bare
+        // repo has at least one branch (required for a successful fetch later).
+        Command::new("git")
+            .args(["init"])
+            .arg(&work_path)
+            .output()
+            .await
+            .expect("git init failed");
+        for (k, v) in [("user.email", "test@test.com"), ("user.name", "Test")] {
+            Command::new("git")
+                .arg("-C")
+                .arg(&work_path)
+                .args(["config", k, v])
+                .output()
+                .await
+                .expect("git config failed");
+        }
+        Command::new("git")
+            .arg("-C")
+            .arg(&work_path)
+            .args(["commit", "--allow-empty", "-m", "init"])
+            .output()
+            .await
+            .expect("git commit failed");
+
+        // Create the "source" bare repo from the working directory.
+        Command::new("git")
+            .args(["clone", "--bare"])
+            .arg(&work_path)
+            .arg(&source_path)
+            .output()
+            .await
+            .expect("git clone --bare failed");
+
+        // Create the "clone" bare repo from the source.
+        Command::new("git")
+            .args(["clone", "--bare"])
+            .arg(&source_path)
+            .arg(&clone_path)
+            .output()
+            .await
+            .expect("git clone --bare (clone) failed");
+
+        // Plant the legacy refmap on the clone to simulate a pre-fix repo.
+        Command::new("git")
+            .arg("-C")
+            .arg(&clone_path)
+            .args([
+                "config",
+                "remote.origin.fetch",
+                "+refs/heads/*:refs/heads/*",
+            ])
+            .output()
+            .await
+            .expect("git config failed");
+
+        // Pre-condition: verify old refmap is set.
+        let before = Command::new("git")
+            .arg("-C")
+            .arg(&clone_path)
+            .args(["config", "remote.origin.fetch"])
+            .output()
+            .await
+            .expect("git config read failed");
+        assert_eq!(
+            String::from_utf8_lossy(&before.stdout).trim(),
+            "+refs/heads/*:refs/heads/*",
+            "pre-condition: old refmap should be set before calling ensure_bare_clone"
+        );
+
+        // Call ensure_bare_clone — this should migrate the refmap.
+        let repo = GitRepo::new(
+            "test-owner",
+            "test-repo",
+            "github.example.com",
+            clone_path.clone(),
+        );
+        let result = repo.ensure_bare_clone().await;
+        assert!(
+            result.is_ok(),
+            "ensure_bare_clone should succeed on a local repo: {:?}",
+            result
+        );
+
+        // Post-condition: refmap must be updated.
+        let after = Command::new("git")
+            .arg("-C")
+            .arg(&clone_path)
+            .args(["config", "remote.origin.fetch"])
+            .output()
+            .await
+            .expect("git config read failed");
+        assert_eq!(
+            String::from_utf8_lossy(&after.stdout).trim(),
+            "+refs/heads/*:refs/remotes/origin/*",
+            "fetch refspec should be updated to refs/remotes/origin/* after ensure_bare_clone"
+        );
+        // `tmp` drops here, cleaning up all directories automatically.
     }
 }
