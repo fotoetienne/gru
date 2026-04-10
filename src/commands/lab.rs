@@ -34,6 +34,10 @@ macro_rules! tprintln {
 /// causing processes that exited at ~35s to bypass label restoration.
 const EARLY_EXIT_THRESHOLD: Duration = Duration::from_secs(120);
 
+/// How often the lab runs the periodic recovery scan for orphaned in-progress issues.
+/// Not user-configurable — this is an implementation cadence, not a config knob.
+const RECOVERY_SCAN_INTERVAL: Duration = Duration::from_secs(300);
+
 /// A child process tracked by the lab, with optional metadata for label restoration.
 struct SpawnedChild {
     child: Child,
@@ -142,6 +146,15 @@ pub(crate) async fn handle_lab(
     // Not persisted — resets on daemon restart, which is fine since the cooldown
     // only serves to rate-limit GitHub API calls within a session.
     let mut wake_check_times: HashMap<String, DateTime<Utc>> = HashMap::new();
+
+    // Recovery scan timer. Uses a single Option<Instant>:
+    //   None  → first main-loop iteration (after the initial startup poll): set to
+    //           Some(now) to start the 5-minute timer without scanning.
+    //   Some  → on later main-loop iterations, scan when elapsed >= RECOVERY_SCAN_INTERVAL,
+    //           then reset.
+    // Skipping a scan on the first main-loop iteration (after the initial startup poll)
+    // avoids false positives while minions re-register after a lab restart.
+    let mut last_recovery_scan: Option<Instant> = None;
 
     if no_resume {
         tprintln!("⏭️  Auto-resume disabled (--no-resume)");
@@ -294,6 +307,28 @@ pub(crate) async fn handle_lab(
                 // Log retry queue status when non-empty
                 if !retry_queue.is_empty() {
                     log_retry_queue_status(&retry_queue);
+                }
+
+                // Periodic recovery scan: reset orphaned gru:in-progress issues.
+                // None  → first main-loop iteration after the initial startup poll:
+                //         start the timer without scanning so minions can re-register
+                //         after a lab restart.
+                // Some  → scan when RECOVERY_SCAN_INTERVAL has elapsed, then reset.
+                if config.daemon.recovery_threshold_mins > 0 {
+                    match last_recovery_scan {
+                        None => {
+                            // First main-loop iteration after the initial startup poll:
+                            // start the wall-clock timer without scanning.
+                            last_recovery_scan = Some(Instant::now());
+                        }
+                        Some(t) if t.elapsed() >= RECOVERY_SCAN_INTERVAL => {
+                            last_recovery_scan = Some(Instant::now());
+                            if let Err(e) = recover_stuck_in_progress_issues(&config).await {
+                                log::warn!("⚠️  Recovery scan error: {:#}", e);
+                            }
+                        }
+                        Some(_) => {}
+                    }
                 }
 
                 // Check if a signal arrived during poll_and_spawn
@@ -2252,6 +2287,130 @@ async fn fallback_list_issues(
         .collect();
 
     Ok(filtered)
+}
+
+/// Scan for issues stuck at `gru:in-progress` with no live Minion and reset them.
+///
+/// For each configured repo, queries GitHub for open `gru:in-progress` issues, then
+/// cross-checks against the local Minion registry. Issues with no live Minion *and*
+/// whose `updatedAt` is older than `recovery_threshold_mins` are reset to the
+/// configured daemon pickup label (`daemon.label`) with an explanatory comment so
+/// the lab can retry them.
+///
+/// Per-repo and per-issue errors are logged as warnings and do not abort the scan.
+async fn recover_stuck_in_progress_issues(config: &crate::config::LabConfig) -> Result<()> {
+    let threshold_mins = i64::try_from(config.daemon.recovery_threshold_mins)
+        .context("daemon.recovery_threshold_mins exceeds the maximum supported value")?;
+    let threshold = chrono::Duration::minutes(threshold_mins);
+
+    for repo_spec in &config.daemon.repos {
+        let Some((host, owner, repo)) =
+            crate::config::parse_repo_entry_with_hosts(repo_spec, &config.github_hosts)
+        else {
+            log::warn!(
+                "⚠️  Recovery scan: could not parse repo spec '{}'",
+                repo_spec
+            );
+            continue;
+        };
+
+        let full_repo = crate::github::repo_slug(&owner, &repo);
+
+        let in_progress = match github::list_in_progress_issues_via_cli(&host, &owner, &repo).await
+        {
+            Ok(issues) => issues,
+            Err(e) => {
+                log::warn!(
+                    "⚠️  Recovery scan: failed to list in-progress issues for {}: {:#}",
+                    repo_spec,
+                    e
+                );
+                continue;
+            }
+        };
+
+        for issue in in_progress {
+            // Only reset if the issue has been in-progress for longer than the threshold.
+            let age = chrono::Utc::now().signed_duration_since(issue.updated_at);
+            if age < threshold {
+                log::debug!(
+                    "Recovery scan: skipping issue #{} in {} — only {}m old (threshold: {}m)",
+                    issue.number,
+                    repo_spec,
+                    age.num_minutes(),
+                    config.daemon.recovery_threshold_mins,
+                );
+                continue;
+            }
+
+            // Prune stale registry entries before checking, to avoid PID-recycled
+            // entries masking an orphaned issue.
+            prune_dead_entries_for_issue(&full_repo, issue.number).await;
+
+            // If a live Minion holds this issue, skip it.
+            match is_issue_claimed(&full_repo, Some(issue.number)).await {
+                Ok(true) => continue,
+                Ok(false) => {}
+                Err(e) => {
+                    log::warn!(
+                        "⚠️  Recovery scan: could not check claim status for {}/issues/{}: {:#}",
+                        repo_spec,
+                        issue.number,
+                        e
+                    );
+                    continue;
+                }
+            }
+
+            // Orphaned issue — reset to the configured pickup label and leave a comment.
+            let ready_label = &config.daemon.label;
+            tprintln!(
+                "🔄 Recovery: resetting orphaned in-progress issue #{} in {} to {} \
+                 (stuck for {}m)",
+                issue.number,
+                repo_spec,
+                ready_label,
+                age.num_minutes(),
+            );
+
+            if let Err(e) = github::edit_labels_via_cli(
+                &host,
+                &owner,
+                &repo,
+                issue.number,
+                &[ready_label.as_str()],
+                &[labels::IN_PROGRESS],
+            )
+            .await
+            {
+                log::warn!(
+                    "⚠️  Recovery scan: failed to reset labels for {}/issues/{}: {:#}",
+                    repo_spec,
+                    issue.number,
+                    e
+                );
+                continue;
+            }
+
+            let comment = format!(
+                "⚠️ Gru auto-recovery: issue was stuck at `gru:in-progress` with no live \
+                 Minion process. Resetting to `{}` so it can be retried.",
+                ready_label
+            );
+            if let Err(e) =
+                github::post_comment_via_cli(&host, &owner, &repo, issue.number, &comment).await
+            {
+                log::warn!(
+                    "⚠️  Recovery scan: failed to post comment on {}/issues/{}: {:#}",
+                    repo_spec,
+                    issue.number,
+                    e
+                );
+            }
+        }
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]

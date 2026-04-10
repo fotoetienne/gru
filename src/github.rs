@@ -522,6 +522,88 @@ pub(crate) async fn list_ready_issues_via_cli(
     Ok(items)
 }
 
+/// An in-progress issue returned by the recovery scan query.
+#[derive(Debug)]
+pub(crate) struct InProgressIssue {
+    pub(crate) number: u64,
+    /// When the issue was last updated (proxy for when it was claimed).
+    pub(crate) updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Parse the JSON output of `gh issue list --json number,updatedAt` into
+/// `InProgressIssue` values.
+///
+/// Exposed for unit testing. Returns an error if the JSON is malformed.
+/// Logs a warning when the result count equals `limit` (possible truncation).
+pub(crate) fn parse_in_progress_issues(
+    json: &str,
+    owner: &str,
+    repo: &str,
+    limit: usize,
+) -> Result<Vec<InProgressIssue>> {
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct IssueRow {
+        number: u64,
+        updated_at: chrono::DateTime<chrono::Utc>,
+    }
+
+    let items: Vec<IssueRow> = serde_json::from_str(json)
+        .context("Failed to parse gh issue list (in-progress) JSON output")?;
+
+    if items.len() == limit {
+        log::warn!(
+            "⚠️  Recovery scan: gh issue list returned exactly {} results for {}/{} — \
+             some in-progress issues may have been truncated",
+            limit,
+            owner,
+            repo
+        );
+    }
+
+    Ok(items
+        .into_iter()
+        .map(|i| InProgressIssue {
+            number: i.number,
+            updated_at: i.updated_at,
+        })
+        .collect())
+}
+
+/// List open issues with the `gru:in-progress` label using gh CLI.
+///
+/// Returns issue numbers and their `updatedAt` timestamps so callers can filter
+/// by how long the issue has been in-progress. Used by the lab recovery scan.
+pub(crate) async fn list_in_progress_issues_via_cli(
+    host: &str,
+    owner: &str,
+    repo: &str,
+) -> Result<Vec<InProgressIssue>> {
+    const LIMIT: usize = 100;
+    let repo_full = repo_slug(owner, repo);
+    let limit_str = LIMIT.to_string();
+    let stdout = run_gh(
+        host,
+        &[
+            "issue",
+            "list",
+            "--repo",
+            &repo_full,
+            "--label",
+            labels::IN_PROGRESS,
+            "--state",
+            "open",
+            "--json",
+            "number,updatedAt",
+            "--limit",
+            &limit_str,
+        ],
+    )
+    .await?;
+
+    parse_in_progress_issues(&stdout, owner, repo, LIMIT)
+}
+
 /// Issue candidate returned by list queries, with optional body for dependency checking
 #[derive(Debug, Clone, serde::Deserialize)]
 pub(crate) struct CandidateIssue {
@@ -2316,5 +2398,69 @@ mod tests {
         let order: Vec<u64> = candidates.iter().map(|c| c.number).collect();
         // Stable sort preserves original order within same priority tier
         assert_eq!(order, vec![10, 20, 30]);
+    }
+
+    // --- parse_in_progress_issues tests ---
+
+    #[test]
+    fn test_parse_in_progress_issues_empty() {
+        let result = parse_in_progress_issues("[]", "owner", "repo", 100).unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_parse_in_progress_issues_single() {
+        let json = r#"[{"number":42,"updatedAt":"2024-01-15T10:30:00Z"}]"#;
+        let result = parse_in_progress_issues(json, "owner", "repo", 100).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].number, 42);
+        assert_eq!(
+            result[0].updated_at,
+            "2024-01-15T10:30:00Z"
+                .parse::<chrono::DateTime<chrono::Utc>>()
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn test_parse_in_progress_issues_multiple() {
+        let json = r#"[
+            {"number":1,"updatedAt":"2024-01-01T00:00:00Z"},
+            {"number":2,"updatedAt":"2024-01-02T00:00:00Z"}
+        ]"#;
+        let result = parse_in_progress_issues(json, "owner", "repo", 100).unwrap();
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].number, 1);
+        assert_eq!(result[1].number, 2);
+    }
+
+    #[test]
+    fn test_parse_in_progress_issues_invalid_json() {
+        let err = parse_in_progress_issues("not json", "owner", "repo", 100).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("Failed to parse gh issue list (in-progress) JSON output"));
+    }
+
+    #[test]
+    fn test_parse_in_progress_issues_at_limit_logs_warning() {
+        // Build a JSON array of exactly LIMIT items; the function should succeed
+        // (the warning is logged, not returned as an error).
+        let limit = 3usize;
+        let rows: Vec<String> = (1..=limit)
+            .map(|n| format!(r#"{{"number":{},"updatedAt":"2024-01-01T00:00:00Z"}}"#, n))
+            .collect();
+        let json = format!("[{}]", rows.join(","));
+        let result = parse_in_progress_issues(&json, "owner", "repo", limit).unwrap();
+        assert_eq!(result.len(), limit);
+    }
+
+    #[test]
+    fn test_parse_in_progress_issues_below_limit_no_warning() {
+        let json = r#"[{"number":7,"updatedAt":"2024-06-01T12:00:00Z"}]"#;
+        // limit=100, only 1 item — no truncation
+        let result = parse_in_progress_issues(json, "owner", "repo", 100).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].number, 7);
     }
 }
