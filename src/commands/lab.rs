@@ -28,7 +28,11 @@ macro_rules! tprintln {
 /// Maximum age of a spawn to be considered an "early exit" eligible for label restoration.
 /// Processes that fail within this window likely never started meaningful work, so the
 /// issue label should be restored to the ready state rather than left as in-progress.
-const EARLY_EXIT_THRESHOLD: Duration = Duration::from_secs(30);
+///
+/// 120s covers observed startup/auth/lock-wait delays (registry file lock contention can
+/// cause up to ~42s of backoff in file_lock.rs). The previous 30s threshold was too low,
+/// causing processes that exited at ~35s to bypass label restoration.
+const EARLY_EXIT_THRESHOLD: Duration = Duration::from_secs(120);
 
 /// A child process tracked by the lab, with optional metadata for label restoration.
 struct SpawnedChild {
@@ -402,7 +406,25 @@ async fn reap_children(children: &mut Vec<SpawnedChild>, retry_queue: &mut Retry
                                 }
                             }
                         } else {
-                            // Non-early failure: enqueue for retry with backoff
+                            // Non-early failure: restore labels first, then enqueue for retry.
+                            // This prevents the issue from being orphaned if lab restarts
+                            // before the retry fires.
+                            if let Err(e) = github::edit_labels_via_cli(
+                                &meta.host,
+                                &meta.owner,
+                                &meta.repo,
+                                meta.issue_number,
+                                &[&meta.ready_label],
+                                &[labels::IN_PROGRESS],
+                            )
+                            .await
+                            {
+                                log::warn!(
+                                    "⚠️  Failed to restore labels on issue #{} after non-early exit: {}",
+                                    meta.issue_number,
+                                    e
+                                );
+                            }
                             let reason = format!(
                                 "exited with {} after {:.0}s",
                                 status,
@@ -1792,6 +1814,24 @@ async fn dispatch_due_retries(
                     entry.issue_number,
                     e
                 );
+                // Restore the label so the issue isn't orphaned at gru:in-progress
+                // if lab restarts between retry attempts.
+                if let Err(re) = github::edit_labels_via_cli(
+                    &entry.host,
+                    &entry.owner,
+                    &entry.repo,
+                    entry.issue_number,
+                    &[labels::TODO],
+                    &[labels::IN_PROGRESS],
+                )
+                .await
+                {
+                    log::warn!(
+                        "⚠️  Failed to restore labels for retry issue #{}: {}",
+                        entry.issue_number,
+                        re
+                    );
+                }
                 // Reinsert so a transient spawn failure doesn't permanently drop retry state.
                 retry_queue.reinsert(entry);
             }
@@ -2370,10 +2410,10 @@ mod tests {
     #[test]
     fn test_should_restore_label_beyond_threshold() {
         // A process spawned well before the threshold should not qualify
-        let spawned_at = Instant::now() - Duration::from_secs(60);
+        let spawned_at = Instant::now() - Duration::from_secs(180);
         assert!(
             !should_restore_label(spawned_at),
-            "Process spawned 60s ago should not qualify for label restoration"
+            "Process spawned 180s ago should not qualify for label restoration"
         );
     }
 
