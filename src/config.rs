@@ -128,9 +128,9 @@ pub(crate) struct DaemonConfig {
     pub(crate) archive_ttl_hours: u64,
 
     /// Minutes an issue can be gru:in-progress without a live Minion before
-    /// auto-recovery resets it to gru:todo. Set to 0 to disable (recommended
-    /// for multi-lab deployments where another machine may hold the issue).
-    /// Default: 30 minutes.
+    /// auto-recovery resets it to the configured daemon pickup label (`daemon.label`).
+    /// Set to 0 to disable (recommended for multi-lab deployments where another
+    /// machine may hold the issue). Default: 30 minutes.
     ///
     /// Note: the recovery scan runs every 5 minutes, so values smaller than 5
     /// are accepted but offer no finer detection granularity.
