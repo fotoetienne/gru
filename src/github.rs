@@ -522,16 +522,25 @@ pub(crate) async fn list_ready_issues_via_cli(
     Ok(items)
 }
 
+/// An in-progress issue returned by the recovery scan query.
+pub(crate) struct InProgressIssue {
+    pub(crate) number: u64,
+    /// When the issue was last updated (proxy for when it was claimed).
+    pub(crate) updated_at: chrono::DateTime<chrono::Utc>,
+}
+
 /// List open issues with the `gru:in-progress` label using gh CLI.
 ///
-/// Returns a list of issue numbers. Used by the lab recovery scan to find
-/// orphaned issues that have no live Minion process.
+/// Returns issue numbers and their `updatedAt` timestamps so callers can filter
+/// by how long the issue has been in-progress. Used by the lab recovery scan.
 pub(crate) async fn list_in_progress_issues_via_cli(
     host: &str,
     owner: &str,
     repo: &str,
-) -> Result<Vec<u64>> {
+) -> Result<Vec<InProgressIssue>> {
+    const LIMIT: usize = 100;
     let repo_full = repo_slug(owner, repo);
+    let limit_str = LIMIT.to_string();
     let stdout = run_gh(
         host,
         &[
@@ -544,22 +553,40 @@ pub(crate) async fn list_in_progress_issues_via_cli(
             "--state",
             "open",
             "--json",
-            "number",
+            "number,updatedAt",
             "--limit",
-            "100",
+            &limit_str,
         ],
     )
     .await?;
 
     #[derive(serde::Deserialize)]
-    struct NumberOnly {
+    #[serde(rename_all = "camelCase")]
+    struct IssueRow {
         number: u64,
+        updated_at: chrono::DateTime<chrono::Utc>,
     }
 
-    let items: Vec<NumberOnly> =
-        serde_json::from_str(&stdout).context("Failed to parse gh issue list JSON output")?;
+    let items: Vec<IssueRow> = serde_json::from_str(&stdout)
+        .context("Failed to parse gh issue list (in-progress) JSON output")?;
 
-    Ok(items.into_iter().map(|i| i.number).collect())
+    if items.len() == LIMIT {
+        log::warn!(
+            "⚠️  Recovery scan: gh issue list returned exactly {} results for {}/{} — \
+             some in-progress issues may have been truncated",
+            LIMIT,
+            owner,
+            repo
+        );
+    }
+
+    Ok(items
+        .into_iter()
+        .map(|i| InProgressIssue {
+            number: i.number,
+            updated_at: i.updated_at,
+        })
+        .collect())
 }
 
 /// Issue candidate returned by list queries, with optional body for dependency checking
