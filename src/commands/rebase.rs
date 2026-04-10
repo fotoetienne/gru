@@ -89,6 +89,19 @@ pub(crate) async fn handle_rebase(
                 // Agent succeeded: enforce branch recovery (any failure is a real error).
                 ensure_on_branch(&worktree_path, &local_branch).await?;
 
+                // Postcondition: verify the rebase actually completed.
+                // Claude Code exits 0 by default even when the rebase fails, so
+                // we check independently that origin/<base_branch> is now an ancestor
+                // of HEAD — the canonical proof that the rebase landed.
+                if !is_up_to_date(&worktree_path, &base_branch).await? {
+                    println!(
+                        "❌ Agent exited 0 but origin/{} is not an ancestor of HEAD — rebase did not complete.\n\
+                         You can retry with `gru rebase`, or perform the rebase manually with `git rebase origin/{}`.",
+                        base_branch, base_branch
+                    );
+                    return Ok(1);
+                }
+
                 if push {
                     // Defensively force push in case the /rebase skill didn't push
                     if !maybe_force_push(&worktree_path, yes).await? {
