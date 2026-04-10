@@ -260,6 +260,7 @@ After resolving each conflict:
 ## 6. If Something Goes Wrong
 - If the rebase cannot be completed, abort with `git rebase --abort`
 - Report what went wrong and suggest next steps
+- Signal failure by running `bash -c 'exit 1'` so gru records a non-zero exit code
 "#,
     },
 ];
