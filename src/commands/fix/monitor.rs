@@ -204,10 +204,29 @@ async fn auto_rebase_pr(worktree_path: &Path) -> Result<AutoRebaseResult> {
                 // An agent that exits 0 without rebasing (e.g. sees a clean worktree
                 // post-abort and does nothing) would otherwise cause a spurious
                 // RebasedAndPushed result and a force-push of the unchanged branch.
-                if let Err(e) = check_clean_worktree(worktree_path).await {
-                    log::warn!("Agent rebase left dirty worktree: {}", e);
+                //
+                // Use --untracked-files=no so that untracked files (e.g. editor
+                // temp files or generated artifacts) left by the agent don't
+                // produce false positives. We only care about uncommitted tracked
+                // changes (conflict markers, staged edits) that indicate an
+                // incomplete rebase.
+                let tracked_status = TokioCommand::new("git")
+                    .arg("-C")
+                    .arg(worktree_path)
+                    .args(["status", "--porcelain", "--untracked-files=no"])
+                    .output()
+                    .await
+                    .context("Failed to check tracked-file status after agent rebase")?;
+                if !tracked_status.stdout.is_empty() {
+                    let details = String::from_utf8_lossy(&tracked_status.stdout);
+                    log::warn!(
+                        "Agent rebase left uncommitted tracked changes:\n{}",
+                        details.trim()
+                    );
                     return Ok(AutoRebaseResult::ConflictUnresolved);
                 }
+                // is_up_to_date checks that origin/<base_branch> is an ancestor of HEAD,
+                // which is the canonical proof that the rebase actually happened.
                 if !is_up_to_date(worktree_path, &base_branch).await? {
                     log::warn!(
                         "Agent rebase exited 0 but origin/{} is not an ancestor of HEAD — rebase did not complete",
