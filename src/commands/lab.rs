@@ -28,7 +28,11 @@ macro_rules! tprintln {
 /// Maximum age of a spawn to be considered an "early exit" eligible for label restoration.
 /// Processes that fail within this window likely never started meaningful work, so the
 /// issue label should be restored to the ready state rather than left as in-progress.
-const EARLY_EXIT_THRESHOLD: Duration = Duration::from_secs(30);
+///
+/// 120s covers observed startup/auth/lock-wait delays (registry file lock contention can
+/// cause up to ~42s of backoff in file_lock.rs). The previous 30s threshold was too low,
+/// causing processes that exited at ~35s to bypass label restoration.
+const EARLY_EXIT_THRESHOLD: Duration = Duration::from_secs(120);
 
 /// A child process tracked by the lab, with optional metadata for label restoration.
 struct SpawnedChild {
@@ -402,26 +406,100 @@ async fn reap_children(children: &mut Vec<SpawnedChild>, retry_queue: &mut Retry
                                 }
                             }
                         } else {
-                            // Non-early failure: enqueue for retry with backoff
-                            let reason = format!(
-                                "exited with {} after {:.0}s",
-                                status,
-                                elapsed.as_secs_f64()
-                            );
-                            if !retry_queue.enqueue_failure(
+                            // Non-early failure: restore labels first, then enqueue for retry.
+                            // Check for terminal labels before restoring to avoid overwriting
+                            // gru:done/failed — a long-running minion may have finished
+                            // successfully before the process crashed.
+                            let terminal_label = match github::has_any_label_via_cli(
                                 &meta.host,
                                 &meta.owner,
                                 &meta.repo,
                                 meta.issue_number,
-                                meta.retry_attempt,
-                                &reason,
-                                None,
-                                None,
-                            ) {
-                                log::warn!(
-                                    "⚠️  Issue #{} exceeded max retry attempts — not retrying",
+                                &[labels::DONE, labels::FAILED],
+                            )
+                            .await
+                            {
+                                Ok(label) => label,
+                                Err(e) => {
+                                    log::warn!(
+                                        "⚠️  Failed to check labels on issue #{}: {} \
+                                         — proceeding with label restoration (fail-open)",
+                                        meta.issue_number,
+                                        e
+                                    );
+                                    None
+                                }
+                            };
+
+                            if let Some(label) = terminal_label {
+                                log::info!(
+                                    "⏭️  Issue #{} already has {} — skipping gru:todo restoration, \
+                                     removing gru:in-progress only",
                                     meta.issue_number,
+                                    label
                                 );
+                                if let Err(e) = github::edit_labels_via_cli(
+                                    &meta.host,
+                                    &meta.owner,
+                                    &meta.repo,
+                                    meta.issue_number,
+                                    &[],
+                                    &[labels::IN_PROGRESS],
+                                )
+                                .await
+                                {
+                                    log::warn!(
+                                        "⚠️  Failed to remove gru:in-progress from issue #{}: {}",
+                                        meta.issue_number,
+                                        e
+                                    );
+                                }
+                                // Issue is already done/failed — no retry needed.
+                            } else {
+                                log::warn!(
+                                    "⚠️  Spawned gru do for issue #{} exited with {} after {:.1}s \
+                                     — restoring label before retry",
+                                    meta.issue_number,
+                                    status,
+                                    elapsed.as_secs_f64()
+                                );
+                                if let Err(e) = github::edit_labels_via_cli(
+                                    &meta.host,
+                                    &meta.owner,
+                                    &meta.repo,
+                                    meta.issue_number,
+                                    &[&meta.ready_label],
+                                    &[labels::IN_PROGRESS],
+                                )
+                                .await
+                                {
+                                    log::warn!(
+                                        "⚠️  Failed to restore labels on issue #{} after non-early exit: {} \
+                                         — issue may need manual label fix",
+                                        meta.issue_number,
+                                        e
+                                    );
+                                }
+                                let reason = format!(
+                                    "exited with {} after {:.0}s",
+                                    status,
+                                    elapsed.as_secs_f64()
+                                );
+                                if !retry_queue.enqueue_failure(
+                                    &meta.host,
+                                    &meta.owner,
+                                    &meta.repo,
+                                    meta.issue_number,
+                                    meta.retry_attempt,
+                                    &reason,
+                                    None,
+                                    None,
+                                ) {
+                                    log::warn!(
+                                        "⚠️  Issue #{} exceeded max retry attempts — not retrying",
+                                        meta.issue_number,
+                                    );
+                                }
                             }
                         }
                     }
@@ -1792,6 +1870,24 @@ async fn dispatch_due_retries(
                     entry.issue_number,
                     e
                 );
+                // Restore the label so the issue isn't orphaned at gru:in-progress
+                // if lab restarts between retry attempts.
+                if let Err(re) = github::edit_labels_via_cli(
+                    &entry.host,
+                    &entry.owner,
+                    &entry.repo,
+                    entry.issue_number,
+                    &[labels::TODO],
+                    &[labels::IN_PROGRESS],
+                )
+                .await
+                {
+                    log::warn!(
+                        "⚠️  Failed to restore labels for retry issue #{}: {}",
+                        entry.issue_number,
+                        re
+                    );
+                }
                 // Reinsert so a transient spawn failure doesn't permanently drop retry state.
                 retry_queue.reinsert(entry);
             }
@@ -2369,11 +2465,11 @@ mod tests {
 
     #[test]
     fn test_should_restore_label_beyond_threshold() {
-        // A process spawned well before the threshold should not qualify
-        let spawned_at = Instant::now() - Duration::from_secs(60);
+        // A process spawned well past the threshold should not qualify
+        let spawned_at = Instant::now() - EARLY_EXIT_THRESHOLD - Duration::from_secs(60);
         assert!(
             !should_restore_label(spawned_at),
-            "Process spawned 60s ago should not qualify for label restoration"
+            "Process spawned past EARLY_EXIT_THRESHOLD should not qualify for label restoration"
         );
     }
 
