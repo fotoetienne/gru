@@ -781,7 +781,7 @@ mod tests {
 
     #[test]
     fn test_fetch_base_branch_refspec_format() {
-        // Verify the full argument list: --refmap= must appear before the refspec
+        // Verify the full argument list: --refmap= appears before the refspec
         // to suppress the configured remote refmap (+refs/heads/*:refs/heads/*).
         // Without it, git applies both our explicit refspec and the configured
         // refmap; the refmap would still try to update refs/heads/<branch>, which
