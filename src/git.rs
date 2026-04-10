@@ -1788,49 +1788,75 @@ mod tests {
     }
 
     /// Verifies that `ensure_bare_clone` rewrites `remote.origin.fetch` to the
-    /// `refs/remotes/origin/*` convention for an existing bare repo that still
-    /// has the legacy `refs/heads/*:refs/heads/*` mapping.
+    /// `refs/remotes/origin/*` convention when called on a bare repo that still
+    /// has the legacy `+refs/heads/*:refs/heads/*` mapping.
     ///
-    /// This is a local-only test: it creates a minimal bare repo with a dummy
-    /// remote URL, plants the old config, and confirms the migration runs
-    /// without needing a real network connection.  The subsequent fetch attempt
-    /// will fail (the remote URL is not reachable) but the config update happens
-    /// before the fetch and its result is visible regardless.
+    /// Uses a fully local setup (no network): a "source" bare repo with a real
+    /// branch is created, a "clone" bare repo is set up pointing at it, the old
+    /// refmap is planted on the clone, and then `ensure_bare_clone` is called.
+    /// Because the local source is reachable, the fetch inside `ensure_bare_clone`
+    /// also succeeds, exercising the full code path.
     #[tokio::test]
     #[ignore = "local only: no network required, but requires git binary"]
     async fn test_ensure_bare_clone_migrates_fetch_refspec() {
         use tokio::process::Command;
 
         let temp_dir = env::temp_dir();
-        let bare_path = temp_dir.join("test-gru-migrate-refspec.git");
-        let _ = tokio::fs::remove_dir_all(&bare_path).await;
+        let work_path = temp_dir.join("test-gru-migrate-work");
+        let source_path = temp_dir.join("test-gru-migrate-source.git");
+        let clone_path = temp_dir.join("test-gru-migrate-clone.git");
 
-        // Set up a local bare repo that looks like it was cloned with the old refmap.
+        for p in [&work_path, &source_path, &clone_path] {
+            let _ = tokio::fs::remove_dir_all(p).await;
+        }
+
+        // Create a working directory with an initial commit so the source bare
+        // repo has at least one branch (required for a successful fetch later).
         Command::new("git")
-            .args(["init", "--bare"])
-            .arg(&bare_path)
+            .args(["init"])
+            .arg(&work_path)
             .output()
             .await
-            .expect("git init --bare failed");
-
-        // Plant a fake remote so git config has something to write to.
+            .expect("git init failed");
+        for (k, v) in [("user.email", "test@test.com"), ("user.name", "Test")] {
+            Command::new("git")
+                .arg("-C")
+                .arg(&work_path)
+                .args(["config", k, v])
+                .output()
+                .await
+                .expect("git config failed");
+        }
         Command::new("git")
             .arg("-C")
-            .arg(&bare_path)
-            .args([
-                "remote",
-                "add",
-                "origin",
-                "https://github.example.com/owner/repo.git",
-            ])
+            .arg(&work_path)
+            .args(["commit", "--allow-empty", "-m", "init"])
             .output()
             .await
-            .expect("git remote add failed");
+            .expect("git commit failed");
 
-        // Simulate the legacy refmap.
+        // Create the "source" bare repo from the working directory.
+        Command::new("git")
+            .args(["clone", "--bare"])
+            .arg(&work_path)
+            .arg(&source_path)
+            .output()
+            .await
+            .expect("git clone --bare failed");
+
+        // Create the "clone" bare repo from the source.
+        Command::new("git")
+            .args(["clone", "--bare"])
+            .arg(&source_path)
+            .arg(&clone_path)
+            .output()
+            .await
+            .expect("git clone --bare (clone) failed");
+
+        // Plant the legacy refmap on the clone to simulate a pre-fix repo.
         Command::new("git")
             .arg("-C")
-            .arg(&bare_path)
+            .arg(&clone_path)
             .args([
                 "config",
                 "remote.origin.fetch",
@@ -1840,10 +1866,10 @@ mod tests {
             .await
             .expect("git config failed");
 
-        // Confirm the old value is in place.
+        // Pre-condition: verify old refmap is set.
         let before = Command::new("git")
             .arg("-C")
-            .arg(&bare_path)
+            .arg(&clone_path)
             .args(["config", "remote.origin.fetch"])
             .output()
             .await
@@ -1851,30 +1877,27 @@ mod tests {
         assert_eq!(
             String::from_utf8_lossy(&before.stdout).trim(),
             "+refs/heads/*:refs/heads/*",
-            "pre-condition: old refmap should be set"
+            "pre-condition: old refmap should be set before calling ensure_bare_clone"
         );
 
-        // Now call the migration path directly (same command ensure_bare_clone runs).
-        let result = Command::new("git")
-            .arg("-C")
-            .arg(&bare_path)
-            .args([
-                "config",
-                "remote.origin.fetch",
-                "+refs/heads/*:refs/remotes/origin/*",
-            ])
-            .output()
-            .await
-            .expect("migration command failed");
+        // Call ensure_bare_clone — this should migrate the refmap.
+        let repo = GitRepo::new(
+            "test-owner",
+            "test-repo",
+            "github.example.com",
+            clone_path.clone(),
+        );
+        let result = repo.ensure_bare_clone().await;
         assert!(
-            result.status.success(),
-            "migration git config should succeed"
+            result.is_ok(),
+            "ensure_bare_clone should succeed on a local repo: {:?}",
+            result
         );
 
-        // Verify the config was updated.
+        // Post-condition: refmap must be updated.
         let after = Command::new("git")
             .arg("-C")
-            .arg(&bare_path)
+            .arg(&clone_path)
             .args(["config", "remote.origin.fetch"])
             .output()
             .await
@@ -1882,9 +1905,11 @@ mod tests {
         assert_eq!(
             String::from_utf8_lossy(&after.stdout).trim(),
             "+refs/heads/*:refs/remotes/origin/*",
-            "fetch refspec should be updated to refs/remotes/origin/*"
+            "fetch refspec should be updated to refs/remotes/origin/* after ensure_bare_clone"
         );
 
-        let _ = tokio::fs::remove_dir_all(&bare_path).await;
+        for p in [&work_path, &source_path, &clone_path] {
+            let _ = tokio::fs::remove_dir_all(p).await;
+        }
     }
 }
