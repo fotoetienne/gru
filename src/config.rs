@@ -132,8 +132,12 @@ pub(crate) struct DaemonConfig {
     /// for multi-lab deployments where another machine may hold the issue).
     /// Default: 30 minutes.
     ///
-    /// Note: the recovery scan runs every `RECOVERY_SCAN_INTERVAL_SECS` (5 min),
-    /// so values smaller than 5 are accepted but offer no finer detection granularity.
+    /// Note: the recovery scan runs every 5 minutes, so values smaller than 5
+    /// are accepted but offer no finer detection granularity.
+    ///
+    /// Note: `updatedAt` is used as a proxy for when the issue was claimed.
+    /// Any activity on the issue (including manual comments) will reset this
+    /// clock and delay auto-recovery by the threshold duration.
     #[serde(default = "default_recovery_threshold_mins")]
     pub(crate) recovery_threshold_mins: u64,
 }
@@ -264,11 +268,6 @@ fn default_archive_ttl_hours() -> u64 {
 
 /// Default recovery threshold in minutes before a stuck gru:in-progress issue is reset.
 pub(crate) const DEFAULT_RECOVERY_THRESHOLD_MINS: u64 = 30;
-
-/// How often (in seconds) the lab runs the recovery scan. Values of
-/// `recovery_threshold_mins` smaller than this divided by 60 will still work
-/// correctly — the scan just won't run more frequently than this interval.
-pub(crate) const RECOVERY_SCAN_INTERVAL_SECS: u64 = 300;
 
 fn default_recovery_threshold_mins() -> u64 {
     DEFAULT_RECOVERY_THRESHOLD_MINS

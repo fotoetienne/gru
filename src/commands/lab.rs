@@ -34,6 +34,10 @@ macro_rules! tprintln {
 /// causing processes that exited at ~35s to bypass label restoration.
 const EARLY_EXIT_THRESHOLD: Duration = Duration::from_secs(120);
 
+/// How often the lab runs the periodic recovery scan for orphaned in-progress issues.
+/// Not user-configurable — this is an implementation cadence, not a config knob.
+const RECOVERY_SCAN_INTERVAL: Duration = Duration::from_secs(300);
+
 /// A child process tracked by the lab, with optional metadata for label restoration.
 struct SpawnedChild {
     child: Child,
@@ -143,11 +147,11 @@ pub(crate) async fn handle_lab(
     // only serves to rate-limit GitHub API calls within a session.
     let mut wake_check_times: HashMap<String, DateTime<Utc>> = HashMap::new();
 
-    // Wall-clock time of the last recovery scan. None until the second poll cycle so
-    // the first cycle is always skipped (avoids false positives while minions are
-    // re-registering after a lab restart).
+    // Recovery scan timer. Uses a single Option<Instant>:
+    //   None  → first cycle; set to Some(now) to start the 5-min timer without scanning.
+    //   Some  → scan when elapsed >= RECOVERY_SCAN_INTERVAL, then reset.
+    // The first cycle skip avoids false positives while minions re-register after restart.
     let mut last_recovery_scan: Option<Instant> = None;
-    let mut recovery_scan_eligible = false; // set true after the first poll cycle
 
     if no_resume {
         tprintln!("⏭️  Auto-resume disabled (--no-resume)");
@@ -303,29 +307,22 @@ pub(crate) async fn handle_lab(
                 }
 
                 // Periodic recovery scan: reset orphaned gru:in-progress issues.
-                // Skips the first cycle to avoid false positives while minions are
-                // re-registering after a lab restart. On the second cycle the timer
-                // is initialised, so the first actual scan runs RECOVERY_SCAN_INTERVAL_SECS
-                // later (not immediately). Subsequent scans use wall-clock time
-                // (immune to adaptive backoff skew).
+                // None  → first cycle: start the timer without scanning (skip to let
+                //         minions re-register after a lab restart).
+                // Some  → scan when RECOVERY_SCAN_INTERVAL has elapsed, then reset.
                 if config.daemon.recovery_threshold_mins > 0 {
-                    if !recovery_scan_eligible {
-                        // First cycle — start the wall-clock timer for future scans.
-                        recovery_scan_eligible = true;
-                        last_recovery_scan = Some(Instant::now());
-                    } else {
-                        let should_scan = last_recovery_scan.is_some_and(|t| {
-                            t.elapsed()
-                                >= Duration::from_secs(
-                                    crate::config::RECOVERY_SCAN_INTERVAL_SECS,
-                                )
-                        });
-                        if should_scan {
+                    match last_recovery_scan {
+                        None => {
+                            // First cycle — start the wall-clock timer without scanning.
+                            last_recovery_scan = Some(Instant::now());
+                        }
+                        Some(t) if t.elapsed() >= RECOVERY_SCAN_INTERVAL => {
                             last_recovery_scan = Some(Instant::now());
                             if let Err(e) = recover_stuck_in_progress_issues(&config).await {
                                 log::warn!("⚠️  Recovery scan error: {:#}", e);
                             }
                         }
+                        Some(_) => {}
                     }
                 }
 
