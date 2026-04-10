@@ -523,6 +523,7 @@ pub(crate) async fn list_ready_issues_via_cli(
 }
 
 /// An in-progress issue returned by the recovery scan query.
+#[derive(Debug)]
 pub(crate) struct InProgressIssue {
     pub(crate) number: u64,
     /// When the issue was last updated (proxy for when it was claimed).

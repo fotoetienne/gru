@@ -304,15 +304,21 @@ pub(crate) async fn handle_lab(
 
                 // Periodic recovery scan: reset orphaned gru:in-progress issues.
                 // Skips the first cycle to avoid false positives while minions are
-                // re-registering after a lab restart. After that, runs every 5 minutes
-                // using wall-clock time (immune to adaptive backoff skew).
+                // re-registering after a lab restart. The first eligible scan fires
+                // immediately on the second cycle (no 5-minute warmup), but the
+                // recovery_threshold_mins guard prevents false positives regardless.
+                // Subsequent scans use wall-clock time (immune to adaptive backoff skew).
                 if config.daemon.recovery_threshold_mins > 0 {
                     if !recovery_scan_eligible {
                         // First cycle — mark eligible for future scans.
                         recovery_scan_eligible = true;
                     } else {
-                        let should_scan = last_recovery_scan
-                            .map_or(true, |t| t.elapsed() >= Duration::from_secs(300));
+                        let should_scan = last_recovery_scan.map_or(true, |t| {
+                            t.elapsed()
+                                >= Duration::from_secs(
+                                    crate::config::RECOVERY_SCAN_INTERVAL_SECS,
+                                )
+                        });
                         if should_scan {
                             last_recovery_scan = Some(Instant::now());
                             if let Err(e) = recover_stuck_in_progress_issues(&config).await {
