@@ -178,34 +178,43 @@ pub(crate) async fn check_clean_worktree(worktree_path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Builds the refspec used by [`fetch_base_branch`].
+/// Builds the argument list (after `git -C <path>`) used by [`fetch_base_branch`].
 ///
-/// Writes to `refs/remotes/origin/<branch>` instead of `refs/heads/<branch>`
-/// so that git's worktree-checkout safety check is never triggered.
-fn make_fetch_refspec(base_branch: &str) -> String {
-    format!("+refs/heads/{base_branch}:refs/remotes/origin/{base_branch}")
+/// `--refmap=` (empty string) disables the configured remote refmap
+/// (`+refs/heads/*:refs/heads/*`).  Without it, git applies both the explicit
+/// refspec **and** the configured refmap, and the refmap still tries to update
+/// `refs/heads/<branch>` — which git refuses when that branch is checked out in
+/// another worktree.  With `--refmap=` only our explicit refspec runs, which
+/// writes to `refs/remotes/origin/<branch>` and is never subject to that check.
+fn make_fetch_args(base_branch: &str) -> Vec<String> {
+    vec![
+        "fetch".to_string(),
+        "origin".to_string(),
+        "--refmap=".to_string(),
+        format!("+refs/heads/{base_branch}:refs/remotes/origin/{base_branch}"),
+    ]
 }
 
 /// Fetches only the specified base branch from origin.
 ///
 /// Uses an explicit refspec that writes to `refs/remotes/origin/<base_branch>`
-/// rather than `refs/heads/<base_branch>`. This avoids the git safety error
-/// that occurs when another worktree has the base branch checked out — git
-/// refuses to update `refs/heads/*` for checked-out branches, but never
-/// checks `refs/remotes/*` refs against worktree state.
+/// rather than `refs/heads/<base_branch>`, combined with `--refmap=` to
+/// suppress the configured remote refmap.  Together these ensure git never
+/// tries to update `refs/heads/*`, which would fail when another worktree has
+/// the base branch checked out.
 pub(crate) async fn fetch_base_branch(worktree_path: &Path, base_branch: &str) -> Result<()> {
-    let refspec = make_fetch_refspec(base_branch);
+    let args = make_fetch_args(base_branch);
     let output = Command::new("git")
         .arg("-C")
         .arg(worktree_path)
-        .args(["fetch", "origin", &refspec])
+        .args(&args)
         .output()
         .await
-        .with_context(|| format!("Failed to execute git fetch origin {}", refspec))?;
+        .with_context(|| format!("Failed to execute git {}", args.join(" ")))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("git fetch origin {} failed: {}", refspec, stderr.trim());
+        anyhow::bail!("git {} failed: {}", args.join(" "), stderr.trim());
     }
 
     Ok(())
@@ -772,22 +781,32 @@ mod tests {
 
     #[test]
     fn test_fetch_base_branch_refspec_format() {
-        // Verify that make_fetch_refspec (used by fetch_base_branch) writes to the
-        // remote-tracking ref, not the local branch ref.  This matters because git
-        // refuses to update refs/heads/<branch> when that branch is checked out in a
-        // linked worktree, whereas refs/remotes/* are never subject to that check.
-        // The leading '+' forces the update even for non-fast-forward changes
-        // (e.g. after a force-push of the base branch), matching the behavior of
-        // the configured remote refmap (+refs/heads/*:refs/heads/*).
+        // Verify the full argument list: --refmap= appears before the refspec
+        // to suppress the configured remote refmap (+refs/heads/*:refs/heads/*).
+        // Without it, git applies both our explicit refspec and the configured
+        // refmap; the refmap would still try to update refs/heads/<branch>, which
+        // git refuses when that branch is checked out in another worktree.
+        // The refspec writes to refs/remotes/origin/* (never checked against
+        // worktree state).  The leading '+' forces the update after a force-push.
         assert_eq!(
-            make_fetch_refspec("main"),
-            "+refs/heads/main:refs/remotes/origin/main"
+            make_fetch_args("main"),
+            vec![
+                "fetch",
+                "origin",
+                "--refmap=",
+                "+refs/heads/main:refs/remotes/origin/main",
+            ]
         );
 
         // Branch names with slashes are valid and handled correctly.
         assert_eq!(
-            make_fetch_refspec("release/1.0"),
-            "+refs/heads/release/1.0:refs/remotes/origin/release/1.0"
+            make_fetch_args("release/1.0"),
+            vec![
+                "fetch",
+                "origin",
+                "--refmap=",
+                "+refs/heads/release/1.0:refs/remotes/origin/release/1.0",
+            ]
         );
     }
 
