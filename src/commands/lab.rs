@@ -1348,6 +1348,10 @@ async fn try_spawn_for_issue(
     label: &str,
     children: &mut Vec<SpawnedChild>,
 ) -> Result<bool> {
+    // Remove any dead registry entries before claiming, so that stale entries
+    // with recycled PIDs cannot cause `check_existing_minions` to block the spawn.
+    prune_dead_entries_for_issue(&ctx.full, issue_number).await;
+
     // Try to claim the issue via CLI
     if let Err(e) =
         github::claim_issue_via_cli(&ctx.host, &ctx.owner, &ctx.repo, issue_number, label).await
@@ -1492,6 +1496,10 @@ async fn spawn_for_candidate_issues(
             if *available == 0 || shutdown_flag.load(Ordering::Acquire) {
                 break;
             }
+
+            // Prune dead entries first so a recycled PID doesn't cause
+            // `is_issue_claimed` to skip this issue before the spawn-time prune runs.
+            prune_dead_entries_for_issue(&ctx.full, candidate.number).await;
 
             // Check if issue is already being worked on (by a live process)
             if is_issue_claimed(&ctx.full, Some(candidate.number)).await? {
@@ -1721,6 +1729,10 @@ async fn dispatch_due_retries(
 
         let full_repo = format!("{}/{}", entry.owner, entry.repo);
 
+        // Prune dead entries before the liveness check so a recycled PID
+        // doesn't cause the issue to be skipped before the spawn-time prune runs.
+        prune_dead_entries_for_issue(&full_repo, entry.issue_number).await;
+
         // Skip if issue is already being worked on by a live process
         if is_issue_claimed(&full_repo, Some(entry.issue_number)).await? {
             log::info!(
@@ -1837,7 +1849,52 @@ async fn available_slots(max_slots: usize) -> Result<usize> {
     Ok(max_slots.saturating_sub(active_count))
 }
 
-/// Check if an issue is already being worked on by a live Minion process
+/// Clears the recorded PID for entries whose process is no longer alive and
+/// transitions them to `Stopped`.
+///
+/// Only entries that held a PID (i.e. were once running) are touched. Cleanly
+/// stopped entries (`pid = None`) are left intact. Preserving the entry (rather
+/// than deleting it) keeps session/worktree metadata available for potential
+/// resume: if the worktree still exists, `check_existing_minions` will offer a
+/// `Resumable` path instead of forcing a fully fresh start. Called before
+/// spawning a new Minion to prevent `check_existing_minions` from treating
+/// recycled PIDs as live processes. Errors are logged and ignored —
+/// a failed prune is non-fatal since the spawn will still proceed.
+async fn prune_dead_entries_for_issue(repo: &str, issue_number: u64) {
+    let repo = repo.to_string();
+    if let Err(e) = with_registry(move |registry| {
+        let dead: Vec<String> = registry
+            .find_by_issue(&repo, issue_number)
+            .into_iter()
+            .filter(|(_, info)| info.pid.is_some() && !info.is_running())
+            .map(|(id, _)| id)
+            .collect();
+        if !dead.is_empty() {
+            log::info!(
+                "Clearing dead PIDs for {} registry entries for issue #{}",
+                dead.len(),
+                issue_number
+            );
+            for id in &dead {
+                registry.update(id, |info| {
+                    info.clear_pid();
+                    info.mode = MinionMode::Stopped;
+                    info.last_activity = Utc::now();
+                })?;
+            }
+        }
+        Ok(())
+    })
+    .await
+    {
+        log::warn!(
+            "⚠️  Failed to prune dead registry entries for issue #{}: {}",
+            issue_number,
+            e
+        );
+    }
+}
+
 async fn is_issue_claimed(repo: &str, issue_number: Option<u64>) -> Result<bool> {
     let Some(issue_number) = issue_number else {
         return Ok(false);
@@ -1845,7 +1902,16 @@ async fn is_issue_claimed(repo: &str, issue_number: Option<u64>) -> Result<bool>
     let repo = repo.to_string();
     with_registry(move |registry| {
         let claimed = registry.list().iter().any(|(_id, info)| {
-            info.repo == repo && info.issue == Some(issue_number) && info.is_running()
+            info.repo == repo
+                && info.issue == Some(issue_number)
+                && info.is_running()
+                // Only trust entries with start-time validation on platforms that
+                // support it (macOS, Linux). Legacy entries (pid_start_time = None)
+                // rely on bare kill(pid, 0) which cannot detect PID recycling.
+                // On other platforms we fall back to plain is_running() to avoid
+                // treating all minions as unclaimed.
+                && (info.pid_start_time.is_some()
+                    || !cfg!(any(target_os = "macos", target_os = "linux")))
         });
         Ok(claimed)
     })

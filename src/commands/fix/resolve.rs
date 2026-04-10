@@ -1,5 +1,5 @@
 use super::types::{ExistingMinionCheck, IssueContext, IssueDetails};
-use crate::minion_registry::{with_registry, MinionMode};
+use crate::minion_registry::{with_registry, MinionInfo, MinionMode};
 use crate::url_utils::parse_issue_info;
 use anyhow::{Context, Result};
 
@@ -49,17 +49,27 @@ pub(super) async fn check_existing_minions(
         return Ok(ExistingMinionCheck::None);
     }
 
-    // Sort deterministically: running Minions first, then by most recent start time.
+    // On macOS and Linux, `get_process_start_time` returns `Some`, so we can
+    // validate that the live PID actually belongs to the recorded process.
+    // On other platforms the start time is always `None`, so we fall back to
+    // the plain `is_running()` check to avoid ignoring all running minions.
+    let is_validated_running = |info: &MinionInfo| {
+        info.is_running()
+            && (info.pid_start_time.is_some()
+                || !cfg!(any(target_os = "macos", target_os = "linux")))
+    };
+
+    // Sort deterministically: validated-running Minions first, then by most recent
+    // start time. Use the same predicate as `any_running` below so the sort order
+    // is consistent with what triggers the AlreadyRunning path.
     existing.sort_by(|(_, a), (_, b)| {
-        let a_running = a.is_running();
-        let b_running = b.is_running();
-        b_running
-            .cmp(&a_running)
+        is_validated_running(b)
+            .cmp(&is_validated_running(a))
             .then_with(|| b.last_activity.cmp(&a.last_activity))
     });
 
-    // Check if any minion is actually running
-    let any_running = existing.iter().any(|(_, info)| info.is_running());
+    // Check if any minion is actually running.
+    let any_running = existing.iter().any(|(_, info)| is_validated_running(info));
 
     if any_running {
         // A minion is actively running - show error with suggestions
