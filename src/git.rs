@@ -182,18 +182,12 @@ pub(crate) async fn get_github_remote(host_registry: &HostRegistry) -> Result<St
     })
 }
 
-/// Checks if a URL is a GitHub URL (including configured GHE hosts and
-/// their web UI hostnames).
+/// Checks if `url` is a GitHub URL whose hostname matches any entry in
+/// `hosts`, using the three supported URL shapes (https, http, SSH).
 ///
-/// Matches against every API host and every configured `web_url` host in
-/// `host_registry`.
-fn is_github_url(url: &str, host_registry: &HostRegistry) -> bool {
-    url_matches_any_host(url, &host_registry.all_url_hosts())
-}
-
-/// Tests `url` against a pre-computed list of hostnames using the three
-/// supported URL shapes (https, http, SSH). Factored out so callers that check
-/// many URLs in a row can compute the host list once.
+/// Takes a pre-computed slice so callers that check many URLs in a row can
+/// build the host list once via [`HostRegistry::all_url_hosts`]. Recognises
+/// every API host and every configured `web_url` host in the registry.
 fn url_matches_any_host(url: &str, hosts: &[String]) -> bool {
     for host in hosts {
         if url.starts_with(&format!("https://{}/", host))
@@ -219,11 +213,14 @@ pub(crate) fn parse_github_remote(
     url: &str,
     host_registry: &HostRegistry,
 ) -> Result<(String, String, String)> {
-    if !is_github_url(url, host_registry) {
+    // Compute the host list once and use it for both the membership check and
+    // the per-host prefix strip below.
+    let url_hosts = host_registry.all_url_hosts();
+    if !url_matches_any_host(url, &url_hosts) {
         anyhow::bail!("Not a GitHub URL: {}", url);
     }
 
-    for host in host_registry.all_url_hosts() {
+    for host in &url_hosts {
         let https_prefix = format!("https://{}/", host);
         let http_prefix = format!("http://{}/", host);
         let ssh_prefix = format!("git@{}:", host);
@@ -243,7 +240,7 @@ pub(crate) fn parse_github_remote(
             // `host` came from `all_url_hosts()`, which is derived from the same
             // registry, so `canonical_host` is guaranteed to resolve.
             let canonical = host_registry
-                .canonical_host(&host)
+                .canonical_host(host)
                 .expect("host from all_url_hosts is always resolvable");
             return Ok((canonical, parts[0].to_string(), parts[1].to_string()));
         }
@@ -1282,6 +1279,12 @@ mod tests {
     fn test_parse_github_remote_rejects_invalid_format() {
         let result = parse_github_remote("https://github.com/incomplete", &default_hosts());
         assert!(result.is_err());
+    }
+
+    /// Convenience wrapper around `url_matches_any_host` so tests can pass a
+    /// `HostRegistry` directly rather than building the URL-host slice.
+    fn is_github_url(url: &str, registry: &HostRegistry) -> bool {
+        url_matches_any_host(url, &registry.all_url_hosts())
     }
 
     #[test]
