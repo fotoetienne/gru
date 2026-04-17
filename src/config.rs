@@ -437,6 +437,33 @@ fn web_url_to_host(web_url: &str) -> Option<String> {
     }
 }
 
+/// Validates a `[github_hosts.<name>].web_url` value, failing fast on shapes
+/// that `web_url_to_host` would silently discard (missing scheme, empty
+/// hostname, no dot). Runs at config-load time so misconfigurations surface
+/// immediately instead of causing URL parsing to quietly ignore the entry.
+fn validate_web_url(host_name: &str, web_url: &str) -> Result<()> {
+    let trimmed = web_url.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("[github_hosts.{}]: 'web_url' must not be empty", host_name);
+    }
+    let host = web_url_to_host(trimmed).ok_or_else(|| {
+        anyhow::anyhow!(
+            "[github_hosts.{}]: 'web_url' value '{}' is not a valid URL \
+             (expected 'https://<hostname>' or 'http://<hostname>')",
+            host_name,
+            web_url
+        )
+    })?;
+    if !host.contains('.') {
+        anyhow::bail!(
+            "[github_hosts.{}]: 'web_url' hostname '{}' does not look like a hostname (no dot)",
+            host_name,
+            host
+        );
+    }
+    Ok(())
+}
+
 impl LabConfig {
     /// Generate default config file content with commented-out options.
     ///
@@ -610,12 +637,16 @@ impl LabConfig {
     ///
     /// Use this for non-daemon commands (e.g., `gru do`) that only need
     /// agent/merge config but may not have `[daemon].repos` configured.
+    /// Still validates `[github_hosts.*]` since those entries drive URL
+    /// parsing used by every command.
     pub(crate) fn load_partial(path: &Path) -> Result<Self> {
         let contents = fs::read_to_string(path)
             .with_context(|| format!("Failed to read config file: {}", path.display()))?;
 
         let config: LabConfig = toml::from_str(&contents)
             .with_context(|| format!("Failed to parse config file: {}", path.display()))?;
+
+        config.validate_github_hosts()?;
 
         Ok(config)
     }
@@ -654,29 +685,7 @@ impl LabConfig {
             anyhow::bail!("max_resume_attempts must be at least 1");
         }
 
-        // Validate github_hosts entries
-        let mut seen_hosts: HashMap<&str, &str> = HashMap::new();
-        for (name, gh_host) in &self.github_hosts {
-            if gh_host.host.is_empty() {
-                anyhow::bail!("[github_hosts.{}]: 'host' must not be empty", name);
-            }
-            if !gh_host.host.contains('.') {
-                anyhow::bail!(
-                    "[github_hosts.{}]: 'host' value '{}' does not look like a hostname (no dot)",
-                    name,
-                    gh_host.host
-                );
-            }
-            if let Some(existing_name) = seen_hosts.get(gh_host.host.as_str()) {
-                anyhow::bail!(
-                    "[github_hosts.{}]: duplicate host '{}' (already defined by [github_hosts.{}])",
-                    name,
-                    gh_host.host,
-                    existing_name
-                );
-            }
-            seen_hosts.insert(&gh_host.host, name);
-        }
+        self.validate_github_hosts()?;
 
         // Validate repo format and host name references
         for repo in &self.daemon.repos {
@@ -710,6 +719,42 @@ impl LabConfig {
             }
         }
 
+        Ok(())
+    }
+
+    /// Validate the `[github_hosts.*]` section.
+    ///
+    /// Runs independently of daemon validation because these entries drive
+    /// URL parsing used by every command — a misconfigured `web_url` would
+    /// silently cause web UI URLs to be rejected without the user learning
+    /// why, so this runs in both `load()` and `load_partial()`.
+    fn validate_github_hosts(&self) -> Result<()> {
+        let mut seen_hosts: HashMap<&str, &str> = HashMap::new();
+        for (name, gh_host) in &self.github_hosts {
+            if gh_host.host.is_empty() {
+                anyhow::bail!("[github_hosts.{}]: 'host' must not be empty", name);
+            }
+            if !gh_host.host.contains('.') {
+                anyhow::bail!(
+                    "[github_hosts.{}]: 'host' value '{}' does not look like a hostname (no dot)",
+                    name,
+                    gh_host.host
+                );
+            }
+            if let Some(existing_name) = seen_hosts.get(gh_host.host.as_str()) {
+                anyhow::bail!(
+                    "[github_hosts.{}]: duplicate host '{}' (already defined by [github_hosts.{}])",
+                    name,
+                    gh_host.host,
+                    existing_name
+                );
+            }
+            seen_hosts.insert(&gh_host.host, name);
+
+            if let Some(web_url) = &gh_host.web_url {
+                validate_web_url(name, web_url)?;
+            }
+        }
         Ok(())
     }
 
@@ -1491,6 +1536,111 @@ repos = ["owner/repo1", "ghe.example.com/org/svc1", "ghe.example.com/org/svc2"]
         config.daemon.repos = vec!["owner/repo".to_string()];
         let err = config.validate().unwrap_err();
         assert!(err.to_string().contains("duplicate host 'ghe.example.com'"));
+    }
+
+    #[test]
+    fn test_validate_github_host_rejects_web_url_missing_scheme() {
+        let mut config = LabConfig::default();
+        config.github_hosts.insert(
+            "netflix".to_string(),
+            GhHostConfig {
+                host: "git.netflix.net".to_string(),
+                web_url: Some("github.netflix.net".to_string()),
+            },
+        );
+        config.daemon.repos = vec!["owner/repo".to_string()];
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("is not a valid URL"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_github_host_rejects_empty_web_url() {
+        let mut config = LabConfig::default();
+        config.github_hosts.insert(
+            "netflix".to_string(),
+            GhHostConfig {
+                host: "git.netflix.net".to_string(),
+                web_url: Some(String::new()),
+            },
+        );
+        config.daemon.repos = vec!["owner/repo".to_string()];
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("must not be empty"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn test_validate_github_host_rejects_web_url_empty_hostname() {
+        let mut config = LabConfig::default();
+        config.github_hosts.insert(
+            "netflix".to_string(),
+            GhHostConfig {
+                host: "git.netflix.net".to_string(),
+                web_url: Some("https:///path".to_string()),
+            },
+        );
+        config.daemon.repos = vec!["owner/repo".to_string()];
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("is not a valid URL"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_github_host_rejects_web_url_no_dot() {
+        let mut config = LabConfig::default();
+        config.github_hosts.insert(
+            "local".to_string(),
+            GhHostConfig {
+                host: "git.local.example.com".to_string(),
+                web_url: Some("https://localhost".to_string()),
+            },
+        );
+        config.daemon.repos = vec!["owner/repo".to_string()];
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("does not look like a hostname"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_github_host_accepts_valid_web_url() {
+        let mut config = LabConfig::default();
+        config.github_hosts.insert(
+            "netflix".to_string(),
+            GhHostConfig {
+                host: "git.netflix.net".to_string(),
+                web_url: Some("https://github.netflix.net".to_string()),
+            },
+        );
+        config.daemon.repos = vec!["owner/repo".to_string()];
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_load_partial_validates_web_url() {
+        // load_partial() must also reject a malformed web_url because URL
+        // parsing is used by non-daemon commands like `gru do`.
+        let config_toml = r#"
+[github_hosts.netflix]
+host = "git.netflix.net"
+web_url = "github.netflix.net"
+"#;
+        let mut temp_file = NamedTempFile::new().unwrap();
+        temp_file.write_all(config_toml.as_bytes()).unwrap();
+        temp_file.flush().unwrap();
+
+        let err = LabConfig::load_partial(temp_file.path())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("is not a valid URL"),
+            "unexpected error: {err}"
+        );
     }
 
     // --- Config parsing with github_hosts ---
