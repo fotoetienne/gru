@@ -104,6 +104,30 @@ fn redact_credentials(stderr: &str) -> String {
     result
 }
 
+/// Parses the default branch ref from `git ls-remote --symref origin HEAD` output.
+///
+/// Expected first line shape: `ref: refs/heads/<branch>\tHEAD`.
+/// Returns the full `refs/heads/<branch>` ref, or `None` if the remote HEAD is
+/// detached, absent, or points outside `refs/heads/` (e.g., tags) — writing a
+/// bogus target into `refs/remotes/origin/HEAD` would corrupt the ref.
+fn parse_symref_head(output: &str) -> Option<String> {
+    const HEADS_PREFIX: &str = "refs/heads/";
+    for line in output.lines() {
+        let Some(rest) = line.strip_prefix("ref:") else {
+            continue;
+        };
+        let rest = rest.trim_start();
+        let target = rest
+            .split_once(|c: char| c.is_whitespace())
+            .map(|(t, _)| t)
+            .unwrap_or(rest);
+        if target.starts_with(HEADS_PREFIX) && target.len() > HEADS_PREFIX.len() {
+            return Some(target.to_string());
+        }
+    }
+    None
+}
+
 /// Detects if the current directory is within a git repository
 /// Returns the root path of the git repository
 pub(crate) async fn detect_git_repo() -> Result<PathBuf> {
@@ -684,6 +708,13 @@ impl GitRepo {
     /// default branch via `git symbolic-ref refs/remotes/origin/HEAD` without
     /// needing an API call.
     ///
+    /// Uses `git ls-remote --symref origin HEAD` to discover the remote's
+    /// default branch, then writes the symbolic-ref directly. This avoids
+    /// `git remote set-head --auto`, which fails on bare repos where
+    /// `refs/remotes/origin/<branch>` has not yet been populated (bare clones
+    /// place branches under `refs/heads/*`, and explicit-refspec fetches never
+    /// touch `refs/remotes/origin/*`).
+    ///
     /// Failures are logged but not propagated — this is a best-effort
     /// optimisation that doesn't block clone or fetch.
     async fn update_origin_head(&self, token: Option<&str>) {
@@ -696,19 +727,46 @@ impl GitRepo {
             let output = cmd
                 .arg("-C")
                 .arg(&self.bare_path)
-                .args(["remote", "set-head", "origin", "--auto"])
+                .args(["ls-remote", "--symref", "origin", "HEAD"])
                 .output()
                 .await
-                .context("Failed to execute git remote set-head")?;
+                .context("Failed to execute git ls-remote")?;
 
             if !output.status.success() {
                 let stderr = String::from_utf8_lossy(&output.stderr);
-                let stderr = redact_credentials(stderr.trim());
-                log::warn!(
-                    "{}/{}: git remote set-head origin --auto failed: {}",
-                    self.owner,
-                    self.repo,
-                    stderr
+                anyhow::bail!(
+                    "git ls-remote exited {:?}: {}",
+                    output.status.code(),
+                    redact_credentials(stderr.trim())
+                );
+            }
+
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let default_ref = parse_symref_head(&stdout).ok_or_else(|| {
+                anyhow::anyhow!("could not parse default branch from ls-remote --symref output")
+            })?;
+
+            // parse_symref_head guarantees the refs/heads/ prefix.
+            let branch = default_ref
+                .strip_prefix("refs/heads/")
+                .expect("parse_symref_head returned non-refs/heads/ ref");
+            let target = format!("refs/remotes/origin/{}", branch);
+
+            // symbolic-ref is a local-only operation; no auth needed.
+            let output = Command::new("git")
+                .arg("-C")
+                .arg(&self.bare_path)
+                .args(["symbolic-ref", "refs/remotes/origin/HEAD", &target])
+                .output()
+                .await
+                .context("Failed to execute git symbolic-ref")?;
+
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                anyhow::bail!(
+                    "git symbolic-ref exited {:?}: {}",
+                    output.status.code(),
+                    stderr.trim()
                 );
             }
             Ok(())
@@ -759,29 +817,26 @@ impl GitRepo {
 
         if output.status.success() {
             let stdout = String::from_utf8_lossy(&output.stdout);
-            // Parse: "ref: refs/heads/main\tHEAD"
-            if let Some(line) = stdout.lines().next() {
-                if let Some(branch_name) = line
-                    .strip_prefix("ref: refs/heads/")
-                    .and_then(|s| s.split('\t').next())
-                {
-                    // Bare repos may store branches either directly ("main") or with
-                    // remote prefix ("origin/main") depending on how they were cloned.
-                    // Try both patterns and return whichever exists.
-                    for candidate in [branch_name.to_string(), format!("origin/{}", branch_name)] {
-                        let check = Command::new("git")
-                            .arg("-C")
-                            .arg(&self.bare_path)
-                            .arg("rev-parse")
-                            .arg("--verify")
-                            .arg(&candidate)
-                            .output()
-                            .await;
+            if let Some(full_ref) = parse_symref_head(&stdout) {
+                let branch_name = full_ref
+                    .strip_prefix("refs/heads/")
+                    .expect("parse_symref_head returned non-refs/heads/ ref");
+                // Bare repos may store branches either directly ("main") or with
+                // remote prefix ("origin/main") depending on how they were cloned.
+                // Try both patterns and return whichever exists.
+                for candidate in [branch_name.to_string(), format!("origin/{}", branch_name)] {
+                    let check = Command::new("git")
+                        .arg("-C")
+                        .arg(&self.bare_path)
+                        .arg("rev-parse")
+                        .arg("--verify")
+                        .arg(&candidate)
+                        .output()
+                        .await;
 
-                        if let Ok(result) = check {
-                            if result.status.success() {
-                                return Ok(candidate);
-                            }
+                    if let Ok(result) = check {
+                        if result.status.success() {
+                            return Ok(candidate);
                         }
                     }
                 }
@@ -1257,6 +1312,47 @@ mod tests {
             },
         );
         HostRegistry::from_config(&config)
+    }
+
+    #[test]
+    fn test_parse_symref_head_standard() {
+        let output = "ref: refs/heads/main\tHEAD\n0123abcd\tHEAD\n";
+        assert_eq!(
+            parse_symref_head(output),
+            Some("refs/heads/main".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_symref_head_master() {
+        let output = "ref: refs/heads/master\tHEAD\n";
+        assert_eq!(
+            parse_symref_head(output),
+            Some("refs/heads/master".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_symref_head_missing() {
+        let output = "0123abcd\tHEAD\n";
+        assert_eq!(parse_symref_head(output), None);
+    }
+
+    #[test]
+    fn test_parse_symref_head_empty() {
+        assert_eq!(parse_symref_head(""), None);
+    }
+
+    #[test]
+    fn test_parse_symref_head_rejects_non_heads_namespace() {
+        let output = "ref: refs/tags/v1.0\tHEAD\n";
+        assert_eq!(parse_symref_head(output), None);
+    }
+
+    #[test]
+    fn test_parse_symref_head_rejects_bare_heads_prefix() {
+        let output = "ref: refs/heads/\tHEAD\n";
+        assert_eq!(parse_symref_head(output), None);
     }
 
     #[test]
