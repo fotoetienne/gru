@@ -756,29 +756,26 @@ impl GitRepo {
 
         if output.status.success() {
             let stdout = String::from_utf8_lossy(&output.stdout);
-            // Parse: "ref: refs/heads/main\tHEAD"
-            if let Some(line) = stdout.lines().next() {
-                if let Some(branch_name) = line
-                    .strip_prefix("ref: refs/heads/")
-                    .and_then(|s| s.split('\t').next())
-                {
-                    // Bare repos may store branches either directly ("main") or with
-                    // remote prefix ("origin/main") depending on how they were cloned.
-                    // Try both patterns and return whichever exists.
-                    for candidate in [branch_name.to_string(), format!("origin/{}", branch_name)] {
-                        let check = Command::new("git")
-                            .arg("-C")
-                            .arg(&self.bare_path)
-                            .arg("rev-parse")
-                            .arg("--verify")
-                            .arg(&candidate)
-                            .output()
-                            .await;
+            if let Some(full_ref) = parse_symref_head(&stdout) {
+                let branch_name = full_ref
+                    .strip_prefix("refs/heads/")
+                    .expect("parse_symref_head returned non-refs/heads/ ref");
+                // Bare repos may store branches either directly ("main") or with
+                // remote prefix ("origin/main") depending on how they were cloned.
+                // Try both patterns and return whichever exists.
+                for candidate in [branch_name.to_string(), format!("origin/{}", branch_name)] {
+                    let check = Command::new("git")
+                        .arg("-C")
+                        .arg(&self.bare_path)
+                        .arg("rev-parse")
+                        .arg("--verify")
+                        .arg(&candidate)
+                        .output()
+                        .await;
 
-                        if let Ok(result) = check {
-                            if result.status.success() {
-                                return Ok(candidate);
-                            }
+                    if let Ok(result) = check {
+                        if result.status.success() {
+                            return Ok(candidate);
                         }
                     }
                 }
