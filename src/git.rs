@@ -685,10 +685,11 @@ impl GitRepo {
                 anyhow::anyhow!("could not parse default branch from ls-remote --symref output")
             })?;
 
-            let target = format!(
-                "refs/remotes/origin/{}",
-                default_ref.trim_start_matches("refs/heads/")
-            );
+            // parse_symref_head guarantees the refs/heads/ prefix.
+            let branch = default_ref
+                .strip_prefix("refs/heads/")
+                .expect("parse_symref_head returned non-refs/heads/ ref");
+            let target = format!("refs/remotes/origin/{}", branch);
 
             // symbolic-ref is a local-only operation; no auth needed.
             let output = Command::new("git")
