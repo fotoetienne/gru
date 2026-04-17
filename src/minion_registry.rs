@@ -743,16 +743,17 @@ pub(crate) fn is_process_alive_with_start_time(pid: u32, recorded_start_time: Op
     // If we have a recorded start time, verify the PID still belongs to the same process.
     if let Some(recorded) = recorded_start_time {
         match get_process_start_time(pid) {
-            Some(actual) => {
-                if actual != recorded {
-                    log::debug!(
-                        "PID {} recycled: recorded start_time={}, actual={}",
-                        pid,
-                        recorded,
-                        actual
-                    );
-                    return false;
-                }
+            Some(actual) if actual != recorded => {
+                log::debug!(
+                    "PID {} recycled: recorded start_time={}, actual={}",
+                    pid,
+                    recorded,
+                    actual
+                );
+                return false;
+            }
+            Some(_) => {
+                // PID still belongs to the same process.
             }
             None => {
                 // Couldn't query start time (process may have just exited between
