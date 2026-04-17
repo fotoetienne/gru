@@ -218,40 +218,24 @@ pub(crate) fn parse_github_remote(
         let http_prefix = format!("http://{}/", host);
         let ssh_prefix = format!("git@{}:", host);
 
-        let matched = if url.starts_with(&https_prefix) || url.starts_with(&http_prefix) {
-            let path = url
-                .trim_start_matches(&https_prefix)
-                .trim_start_matches(&http_prefix)
-                .trim_end_matches(".git")
-                .trim_end_matches('/');
+        let remainder = url
+            .strip_prefix(&https_prefix)
+            .or_else(|| url.strip_prefix(&http_prefix))
+            .or_else(|| url.strip_prefix(&ssh_prefix));
 
-            let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
-            if parts.len() >= 2 && !parts[0].is_empty() && !parts[1].is_empty() {
-                Some((parts[0].to_string(), parts[1].to_string()))
-            } else {
-                None
-            }
-        } else if url.starts_with(&ssh_prefix) {
-            let path = url
-                .trim_start_matches(&ssh_prefix)
-                .trim_end_matches(".git")
-                .trim_end_matches('/');
-
-            let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
-            if parts.len() >= 2 && !parts[0].is_empty() && !parts[1].is_empty() {
-                Some((parts[0].to_string(), parts[1].to_string()))
-            } else {
-                None
-            }
-        } else {
-            None
+        let Some(remainder) = remainder else {
+            continue;
         };
 
-        if let Some((owner, repo)) = matched {
+        let path = remainder.trim_end_matches(".git").trim_end_matches('/');
+        let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+        if parts.len() >= 2 && !parts[0].is_empty() && !parts[1].is_empty() {
+            // `host` came from `all_url_hosts()`, which is derived from the same
+            // registry, so `canonical_host` is guaranteed to resolve.
             let canonical = host_registry
                 .canonical_host(&host)
-                .with_context(|| format!("Unknown host '{}' in URL: {}", host, url))?;
-            return Ok((canonical, owner, repo));
+                .expect("host from all_url_hosts is always resolvable");
+            return Ok((canonical, parts[0].to_string(), parts[1].to_string()));
         }
     }
 

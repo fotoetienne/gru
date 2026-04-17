@@ -600,4 +600,23 @@ mod tests {
         assert_eq!(num, "2612");
         assert_eq!(host, "git.netflix.net");
     }
+
+    #[tokio::test]
+    async fn test_parse_pr_info_rejects_issue_url_on_web_url_host() {
+        // Issue URL via web UI hostname is recognized (rejected for being a PR
+        // parser, not for being unrecognized). The error message references the
+        // issue URL type — confirming parsing succeeded before type validation.
+        let err = parse_pr_info(
+            "https://github.netflix.net/corp/service/issues/42",
+            &hosts_with_web_url(),
+        )
+        .await
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("issue URL"),
+            "Expected specific error for issue URL given to PR parser, got: {}",
+            msg
+        );
+    }
 }
