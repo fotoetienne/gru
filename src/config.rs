@@ -728,9 +728,25 @@ impl LabConfig {
     /// URL parsing used by every command — a misconfigured `web_url` would
     /// silently cause web UI URLs to be rejected without the user learning
     /// why, so this runs in both `load()` and `load_partial()`.
+    ///
+    /// Rejects:
+    /// - Empty / malformed `host` or `web_url` values.
+    /// - Two entries with the same API `host`.
+    /// - Two entries whose derived `web_url` hostnames collide — either with
+    ///   each other, or with a different entry's API `host`. Such collisions
+    ///   make [`HostRegistry::canonical_host`] ambiguous and the resolution
+    ///   order-dependent on `HashMap` iteration.
     fn validate_github_hosts(&self) -> Result<()> {
-        let mut seen_hosts: HashMap<&str, &str> = HashMap::new();
-        for (name, gh_host) in &self.github_hosts {
+        // Visit entries in sorted order so error messages are deterministic
+        // regardless of the underlying `HashMap` iteration order.
+        let mut names: Vec<&String> = self.github_hosts.keys().collect();
+        names.sort();
+
+        // Pass 1: validate each entry in isolation and collect the API host
+        // owner map.
+        let mut api_hosts: HashMap<&str, &str> = HashMap::new();
+        for name in &names {
+            let gh_host = &self.github_hosts[*name];
             if gh_host.host.is_empty() {
                 anyhow::bail!("[github_hosts.{}]: 'host' must not be empty", name);
             }
@@ -741,7 +757,7 @@ impl LabConfig {
                     gh_host.host
                 );
             }
-            if let Some(existing_name) = seen_hosts.get(gh_host.host.as_str()) {
+            if let Some(existing_name) = api_hosts.get(gh_host.host.as_str()) {
                 anyhow::bail!(
                     "[github_hosts.{}]: duplicate host '{}' (already defined by [github_hosts.{}])",
                     name,
@@ -749,12 +765,55 @@ impl LabConfig {
                     existing_name
                 );
             }
-            seen_hosts.insert(&gh_host.host, name);
+            api_hosts.insert(&gh_host.host, name);
 
             if let Some(web_url) = &gh_host.web_url {
                 validate_web_url(name, web_url)?;
             }
         }
+
+        // Pass 2: check that derived web_url hostnames don't collide with
+        // other entries' API or web_url hosts.
+        let mut web_url_hosts: HashMap<String, &str> = HashMap::new();
+        for name in &names {
+            let gh_host = &self.github_hosts[*name];
+            let Some(web_url) = &gh_host.web_url else {
+                continue;
+            };
+            // Pass 1 already validated the web_url, so the extraction succeeds.
+            let web_host = web_url_to_host(web_url)
+                .expect("validate_web_url ensures web_url_to_host returns Some");
+
+            // Trivial: a web_url whose hostname equals this entry's own API
+            // host is redundant but unambiguous — allow it.
+            if web_host == gh_host.host {
+                continue;
+            }
+
+            // Collides with a different entry's API host?
+            if let Some(other_name) = api_hosts.get(web_host.as_str()) {
+                if *other_name != name.as_str() {
+                    anyhow::bail!(
+                        "[github_hosts.{}]: 'web_url' hostname '{}' collides with the 'host' of [github_hosts.{}]",
+                        name,
+                        web_host,
+                        other_name
+                    );
+                }
+            }
+
+            // Collides with another entry's web_url hostname?
+            if let Some(other_name) = web_url_hosts.get(&web_host) {
+                anyhow::bail!(
+                    "[github_hosts.{}]: 'web_url' hostname '{}' is also used by [github_hosts.{}]",
+                    name,
+                    web_host,
+                    other_name
+                );
+            }
+            web_url_hosts.insert(web_host, name);
+        }
+
         Ok(())
     }
 
@@ -1615,6 +1674,76 @@ repos = ["owner/repo1", "ghe.example.com/org/svc1", "ghe.example.com/org/svc2"]
             GhHostConfig {
                 host: "git.netflix.net".to_string(),
                 web_url: Some("https://github.netflix.net".to_string()),
+            },
+        );
+        config.daemon.repos = vec!["owner/repo".to_string()];
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_github_host_rejects_duplicate_web_url_hosts() {
+        // Two entries claim the same web_url hostname → canonical_host()
+        // would resolve non-deterministically.
+        let mut config = LabConfig::default();
+        config.github_hosts.insert(
+            "alpha".to_string(),
+            GhHostConfig {
+                host: "git.alpha.example.com".to_string(),
+                web_url: Some("https://web.example.com".to_string()),
+            },
+        );
+        config.github_hosts.insert(
+            "beta".to_string(),
+            GhHostConfig {
+                host: "git.beta.example.com".to_string(),
+                web_url: Some("https://web.example.com".to_string()),
+            },
+        );
+        config.daemon.repos = vec!["owner/repo".to_string()];
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("'web_url' hostname 'web.example.com' is also used by"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_github_host_rejects_web_url_colliding_with_other_api_host() {
+        // One entry's web_url hostname equals another entry's API host →
+        // ambiguous mapping.
+        let mut config = LabConfig::default();
+        config.github_hosts.insert(
+            "alpha".to_string(),
+            GhHostConfig {
+                host: "git.netflix.net".to_string(),
+                web_url: None,
+            },
+        );
+        config.github_hosts.insert(
+            "beta".to_string(),
+            GhHostConfig {
+                host: "git.other.net".to_string(),
+                web_url: Some("https://git.netflix.net".to_string()),
+            },
+        );
+        config.daemon.repos = vec!["owner/repo".to_string()];
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("'web_url' hostname 'git.netflix.net' collides with the 'host'"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_github_host_allows_web_url_equal_to_own_api_host() {
+        // Redundant but unambiguous: web_url hostname matches this entry's
+        // own API host. Allowed because it doesn't create ambiguity.
+        let mut config = LabConfig::default();
+        config.github_hosts.insert(
+            "netflix".to_string(),
+            GhHostConfig {
+                host: "git.netflix.net".to_string(),
+                web_url: Some("https://git.netflix.net".to_string()),
             },
         );
         config.daemon.repos = vec!["owner/repo".to_string()];
