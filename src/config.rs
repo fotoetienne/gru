@@ -195,10 +195,15 @@ impl Drop for TestConfigGuard {
     }
 }
 
-/// Try to load the config file, returning `None` on any error.
+/// Try to load the config file, returning `None` when no config is usable.
 ///
-/// This is a convenience for callers that want to inspect config
-/// but can gracefully handle its absence.
+/// Distinguishes two cases:
+/// - The config file doesn't exist — returns `None` silently (normal for
+///   users who never ran `gru init`).
+/// - The config file exists but fails to parse or validate — logs a
+///   `warn!` with the error and returns `None`. Callers that fall back to
+///   defaults (like [`load_host_registry`]) won't exit, but the user sees
+///   why their configured `[github_hosts.*]` entries were ignored.
 ///
 /// In test builds, checks for a thread-local path override set via
 /// [`set_test_config_path`] before falling back to the default path.
@@ -207,11 +212,34 @@ pub(crate) fn try_load_config() -> Option<LabConfig> {
     {
         let override_path = TEST_CONFIG_PATH_OVERRIDE.with(|cell| cell.borrow().clone());
         if let Some(path) = override_path {
-            return LabConfig::load_partial(&path).ok();
+            return load_or_warn(&path);
         }
     }
     let path = LabConfig::default_path().ok()?;
-    LabConfig::load_partial(&path).ok()
+    load_or_warn(&path)
+}
+
+/// Loads config from `path` if it exists, logging any parse/validation error.
+///
+/// Returns `None` both when the file is absent and when loading fails —
+/// the caller can't distinguish the two, which matches the silent-fallback
+/// contract — but failures are surfaced via the log rather than swallowed.
+fn load_or_warn(path: &Path) -> Option<LabConfig> {
+    if !path.exists() {
+        return None;
+    }
+    match LabConfig::load_partial(path) {
+        Ok(cfg) => Some(cfg),
+        Err(err) => {
+            log::warn!(
+                "Failed to load config file {}: {:#}. Falling back to defaults; \
+                 configured [github_hosts.*] entries will be ignored until this is fixed.",
+                path.display(),
+                err
+            );
+            None
+        }
+    }
 }
 
 /// Load a `HostRegistry` from the default config file.
@@ -1929,6 +1957,60 @@ default = "test-agent"
         let _guard = super::set_test_config_path(temp_file.path().to_path_buf());
         let config = super::try_load_config().expect("should load from override path");
         assert_eq!(config.agent.default, "test-agent");
+    }
+
+    #[test]
+    fn test_try_load_config_missing_file_returns_none() {
+        // A path that doesn't exist returns None without any log output.
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("never-created.toml");
+
+        let _guard = super::set_test_config_path(missing);
+        assert!(super::try_load_config().is_none());
+    }
+
+    #[test]
+    fn test_try_load_config_invalid_file_returns_none_and_logs() {
+        // A file that exists but fails validation returns None. load_or_warn
+        // emits the error via log::warn rather than swallowing it silently —
+        // we can't easily capture the log in a unit test, but we can at
+        // least confirm invalid config doesn't masquerade as valid.
+        let mut temp_file = NamedTempFile::new().unwrap();
+        let bad_config = r#"
+[github_hosts.netflix]
+host = "git.netflix.net"
+web_url = "github.netflix.net"
+"#;
+        temp_file.write_all(bad_config.as_bytes()).unwrap();
+        temp_file.flush().unwrap();
+
+        let _guard = super::set_test_config_path(temp_file.path().to_path_buf());
+        assert!(
+            super::try_load_config().is_none(),
+            "try_load_config should return None when the file fails validation"
+        );
+    }
+
+    #[test]
+    fn test_load_host_registry_falls_back_when_config_invalid() {
+        // When the config file is present but invalid, load_host_registry
+        // falls back to the default registry rather than panicking.
+        let mut temp_file = NamedTempFile::new().unwrap();
+        let bad_config = r#"
+[github_hosts.netflix]
+host = "git.netflix.net"
+web_url = ""
+"#;
+        temp_file.write_all(bad_config.as_bytes()).unwrap();
+        temp_file.flush().unwrap();
+
+        let _guard = super::set_test_config_path(temp_file.path().to_path_buf());
+        let registry = super::load_host_registry();
+        // Default registry only has github.com — the malformed entry is
+        // dropped rather than silently accepted.
+        let mut hosts = registry.all_url_hosts();
+        hosts.sort();
+        assert_eq!(hosts, vec!["github.com"]);
     }
 
     #[test]

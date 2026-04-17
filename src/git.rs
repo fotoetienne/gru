@@ -202,8 +202,9 @@ fn url_matches_any_host(url: &str, hosts: &[String]) -> bool {
 
 /// Parses a GitHub remote URL to extract host, owner, and repo name.
 ///
-/// Supports both HTTPS and SSH formats for any configured GitHub host:
+/// Accepts HTTPS, HTTP, and SSH formats for any configured GitHub host:
 /// - `https://<host>/owner/repo.git`
+/// - `http://<host>/owner/repo.git`
 /// - `git@<host>:owner/repo.git`
 ///
 /// Matches against every API host and every configured `web_url` host in
