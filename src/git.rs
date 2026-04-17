@@ -106,8 +106,11 @@ fn redact_credentials(stderr: &str) -> String {
 /// Parses the default branch ref from `git ls-remote --symref origin HEAD` output.
 ///
 /// Expected first line shape: `ref: refs/heads/<branch>\tHEAD`.
-/// Returns the full `refs/heads/<branch>` ref, or `None` if unparseable.
+/// Returns the full `refs/heads/<branch>` ref, or `None` if the remote HEAD is
+/// detached, absent, or points outside `refs/heads/` (e.g., tags) — writing a
+/// bogus target into `refs/remotes/origin/HEAD` would corrupt the ref.
 fn parse_symref_head(output: &str) -> Option<String> {
+    const HEADS_PREFIX: &str = "refs/heads/";
     for line in output.lines() {
         let Some(rest) = line.strip_prefix("ref:") else {
             continue;
@@ -117,7 +120,7 @@ fn parse_symref_head(output: &str) -> Option<String> {
             .split_once(|c: char| c.is_whitespace())
             .map(|(t, _)| t)
             .unwrap_or(rest);
-        if !target.is_empty() {
+        if target.starts_with(HEADS_PREFIX) && target.len() > HEADS_PREFIX.len() {
             return Some(target.to_string());
         }
     }
@@ -687,6 +690,7 @@ impl GitRepo {
                 default_ref.trim_start_matches("refs/heads/")
             );
 
+            // symbolic-ref is a local-only operation; no auth needed.
             let output = Command::new("git")
                 .arg("-C")
                 .arg(&self.bare_path)
@@ -1257,6 +1261,18 @@ mod tests {
     #[test]
     fn test_parse_symref_head_empty() {
         assert_eq!(parse_symref_head(""), None);
+    }
+
+    #[test]
+    fn test_parse_symref_head_rejects_non_heads_namespace() {
+        let output = "ref: refs/tags/v1.0\tHEAD\n";
+        assert_eq!(parse_symref_head(output), None);
+    }
+
+    #[test]
+    fn test_parse_symref_head_rejects_bare_heads_prefix() {
+        let output = "ref: refs/heads/\tHEAD\n";
+        assert_eq!(parse_symref_head(output), None);
     }
 
     #[test]
