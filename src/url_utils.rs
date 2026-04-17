@@ -43,59 +43,55 @@ fn clean_url(url: &str) -> &str {
 /// Handles URLs like:
 /// - `https://github.com/owner/repo/issues/42`
 /// - `https://github.com/owner/repo/pull/42`
-/// - `https://<configured-ghe-host>/owner/repo/issues/42`
+/// - `http://<configured-host>/owner/repo/issues/42`
+/// - `https://<configured-host>:8443/owner/repo/issues/42` (explicit port)
 /// - `https://<configured-web-url-host>/owner/repo/issues/42`
 /// - URLs with query params, fragments, and trailing slashes
+///
+/// Both `http://` and `https://` schemes are accepted, matching
+/// [`crate::config::GhHostConfig::web_url`] validation. SSH-style URLs
+/// (`git@host:...`) are rejected since they're remote URLs, not web URLs.
 ///
 /// Returns `None` if the URL is not a valid GitHub issue/PR URL.
 pub(crate) fn parse_github_url(url: &str, host_registry: &HostRegistry) -> Option<GitHubUrl> {
     let cleaned = clean_url(url);
+    let parts = git::split_github_url(cleaned)?;
 
-    for host in host_registry.all_url_hosts() {
-        let prefix = format!("https://{}/", host);
-        if let Some(path) = cleaned.strip_prefix(&prefix) {
-            let parts: Vec<&str> = path.split('/').collect();
-
-            if parts.len() != 4 {
-                continue;
-            }
-
-            let owner = parts[0];
-            let repo = parts[1];
-            let resource_type_str = parts[2];
-            let number_str = parts[3];
-
-            if owner.is_empty() || repo.is_empty() {
-                continue;
-            }
-
-            let resource_type = match resource_type_str {
-                "issues" => GitHubResourceType::Issue,
-                "pull" => GitHubResourceType::Pull,
-                _ => continue,
-            };
-
-            let number = match number_str.parse::<u32>() {
-                Ok(n) => n,
-                Err(_) => continue,
-            };
-
-            // `host` came from `all_url_hosts()`, so `canonical_host` always resolves.
-            let canonical = host_registry
-                .canonical_host(&host)
-                .expect("host from all_url_hosts is always resolvable");
-
-            return Some(GitHubUrl {
-                host: canonical,
-                owner: owner.to_string(),
-                repo: repo.to_string(),
-                resource_type,
-                number,
-            });
-        }
+    // parse_github_url is for web URLs — SSH remote URLs are not valid here.
+    if !matches!(
+        parts.scheme,
+        git::GitUrlScheme::Https | git::GitUrlScheme::Http
+    ) {
+        return None;
     }
 
-    None
+    let canonical = host_registry.canonical_host(parts.host)?;
+
+    // Expect exactly `/owner/repo/(issues|pull)/<num>`
+    let path = parts.rest.strip_prefix('/')?;
+    let segments: Vec<&str> = path.split('/').collect();
+    if segments.len() != 4 {
+        return None;
+    }
+    let (owner, repo, resource_type_str, number_str) =
+        (segments[0], segments[1], segments[2], segments[3]);
+    if owner.is_empty() || repo.is_empty() {
+        return None;
+    }
+    let resource_type = match resource_type_str {
+        "issues" => GitHubResourceType::Issue,
+        "pull" => GitHubResourceType::Pull,
+        _ => return None,
+    };
+    let number = number_str.parse::<u32>().ok()?;
+
+    Some(GitHubUrl {
+        host: canonical,
+        owner: owner.to_string(),
+        repo: repo.to_string(),
+        resource_type,
+        number,
+    })
 }
 
 /// Extracts owner, repo, host, and issue number from an issue argument.
@@ -388,11 +384,37 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_github_url_rejects_http() {
-        // parse_github_url only accepts https:// web URLs;
-        // use git::parse_github_remote for git remote URLs (which accept http:// and SSH)
+    fn test_parse_github_url_accepts_http_scheme() {
+        // parse_github_url accepts both http:// and https:// to match
+        // what validate_web_url allows for GhHostConfig::web_url.
+        let result =
+            parse_github_url("http://github.com/owner/repo/issues/42", &default_hosts()).unwrap();
+        assert_eq!(result.host, "github.com");
+        assert_eq!(result.owner, "owner");
+        assert_eq!(result.repo, "repo");
+        assert_eq!(result.resource_type, GitHubResourceType::Issue);
+        assert_eq!(result.number, 42);
+    }
+
+    #[test]
+    fn test_parse_github_url_accepts_explicit_port() {
+        // Users on self-hosted GHE sometimes have a custom port on the URL.
+        let result = parse_github_url(
+            "https://ghe.netflix.net:8443/netflix/some-service/issues/99",
+            &hosts_with_ghe(),
+        )
+        .unwrap();
+        assert_eq!(result.host, "ghe.netflix.net");
+        assert_eq!(result.owner, "netflix");
+        assert_eq!(result.repo, "some-service");
+        assert_eq!(result.number, 99);
+    }
+
+    #[test]
+    fn test_parse_github_url_rejects_ssh() {
+        // SSH-style URLs are git remote URLs, not web URLs — not accepted.
         assert!(
-            parse_github_url("http://github.com/owner/repo/issues/42", &default_hosts()).is_none()
+            parse_github_url("git@github.com:owner/repo/issues/42", &default_hosts()).is_none()
         );
     }
 
