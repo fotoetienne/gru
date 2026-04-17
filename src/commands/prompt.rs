@@ -37,8 +37,8 @@ fn parse_params(params: &[String]) -> Result<HashMap<String, String>> {
 async fn fetch_issue_context(
     issue_str: &str,
 ) -> Result<(PromptContext, String, String, String, u64)> {
-    let github_hosts = crate::config::load_host_registry().all_hosts();
-    let (owner, repo, issue_num_str, host) = parse_issue_info(issue_str, &github_hosts).await?;
+    let host_registry = crate::config::load_host_registry();
+    let (owner, repo, issue_num_str, host) = parse_issue_info(issue_str, &host_registry).await?;
     let issue_number: u64 = issue_num_str
         .parse()
         .context("Failed to parse issue number")?;
@@ -73,7 +73,7 @@ async fn fetch_issue_context(
 /// For plain numbers, auto-detects the repository from the current directory.
 /// For URLs, extracts components directly.
 async fn parse_pr_arg(pr_str: &str) -> Result<(String, String, String, u64)> {
-    let github_hosts = crate::config::load_host_registry().all_hosts();
+    let host_registry = crate::config::load_host_registry();
 
     if let Ok(num) = pr_str.parse::<u64>() {
         // Auto-detect repository from current directory
@@ -81,17 +81,17 @@ async fn parse_pr_arg(pr_str: &str) -> Result<(String, String, String, u64)> {
             .await
             .context("Failed to detect git repository")?;
 
-        let remote_url = git::get_github_remote(&github_hosts)
+        let remote_url = git::get_github_remote(&host_registry)
             .await
             .context("Failed to get GitHub remote")?;
 
-        let (host, owner, repo) = git::parse_github_remote(&remote_url, &github_hosts)
+        let (host, owner, repo) = git::parse_github_remote(&remote_url, &host_registry)
             .context("Failed to parse GitHub remote URL")?;
 
         return Ok((owner, repo, host, num));
     }
 
-    if let Some(parsed) = parse_github_url(pr_str, &github_hosts) {
+    if let Some(parsed) = parse_github_url(pr_str, &host_registry) {
         if parsed.resource_type == GitHubResourceType::Pull {
             return Ok((parsed.owner, parsed.repo, parsed.host, parsed.number as u64));
         }

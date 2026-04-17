@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 
+use crate::config::HostRegistry;
 use std::path::{Path, PathBuf};
 use tempfile::NamedTempFile;
 use tokio::process::Command;
@@ -131,7 +132,7 @@ pub(crate) async fn detect_git_repo() -> Result<PathBuf> {
 
 /// Gets the GitHub remote URL from the current git repository
 /// Tries "origin" first, then falls back to the first GitHub remote found
-pub(crate) async fn get_github_remote(github_hosts: &[String]) -> Result<String> {
+pub(crate) async fn get_github_remote(host_registry: &HostRegistry) -> Result<String> {
     // Use `git remote -v` to get all remotes and their URLs in one call
     let output = Command::new("git")
         .arg("remote")
@@ -158,7 +159,7 @@ pub(crate) async fn get_github_remote(github_hosts: &[String]) -> Result<String>
         let remote_url = parts.next();
 
         if let (Some(name), Some(url)) = (remote_name, remote_url) {
-            if is_github_url(url, github_hosts) {
+            if is_github_url(url, host_registry) {
                 // Prioritize "origin" remote
                 if name == "origin" && origin_url.is_none() {
                     origin_url = Some(url.to_string());
@@ -178,11 +179,13 @@ pub(crate) async fn get_github_remote(github_hosts: &[String]) -> Result<String>
     })
 }
 
-/// Checks if a URL is a GitHub URL (including configured GHE hosts).
+/// Checks if a URL is a GitHub URL (including configured GHE hosts and
+/// their web UI hostnames).
 ///
-/// `github_hosts` should contain all recognized hosts (e.g., `["github.com", "ghe.example.com"]`).
-fn is_github_url(url: &str, github_hosts: &[String]) -> bool {
-    for host in github_hosts {
+/// Matches against every API host and every configured `web_url` host in
+/// `host_registry`.
+fn is_github_url(url: &str, host_registry: &HostRegistry) -> bool {
+    for host in host_registry.all_url_hosts() {
         if url.starts_with(&format!("https://{}/", host))
             || url.starts_with(&format!("http://{}/", host))
             || url.starts_with(&format!("git@{}:", host))
@@ -199,22 +202,23 @@ fn is_github_url(url: &str, github_hosts: &[String]) -> bool {
 /// - `https://<host>/owner/repo.git`
 /// - `git@<host>:owner/repo.git`
 ///
-/// `github_hosts` should contain all recognized hosts (e.g., `["github.com", "ghe.example.com"]`).
+/// Matches against every API host and every configured `web_url` host in
+/// `host_registry`. The returned host is always the canonical API host, even
+/// when the input used a web UI hostname.
 pub(crate) fn parse_github_remote(
     url: &str,
-    github_hosts: &[String],
+    host_registry: &HostRegistry,
 ) -> Result<(String, String, String)> {
-    if !is_github_url(url, github_hosts) {
+    if !is_github_url(url, host_registry) {
         anyhow::bail!("Not a GitHub URL: {}", url);
     }
 
-    for host in github_hosts {
+    for host in host_registry.all_url_hosts() {
         let https_prefix = format!("https://{}/", host);
         let http_prefix = format!("http://{}/", host);
         let ssh_prefix = format!("git@{}:", host);
 
-        // Handle HTTPS format
-        if url.starts_with(&https_prefix) || url.starts_with(&http_prefix) {
+        let matched = if url.starts_with(&https_prefix) || url.starts_with(&http_prefix) {
             let path = url
                 .trim_start_matches(&https_prefix)
                 .trim_start_matches(&http_prefix)
@@ -223,12 +227,11 @@ pub(crate) fn parse_github_remote(
 
             let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
             if parts.len() >= 2 && !parts[0].is_empty() && !parts[1].is_empty() {
-                return Ok((host.clone(), parts[0].to_string(), parts[1].to_string()));
+                Some((parts[0].to_string(), parts[1].to_string()))
+            } else {
+                None
             }
-        }
-
-        // Handle SSH format: git@<host>:owner/repo.git
-        if url.starts_with(&ssh_prefix) {
+        } else if url.starts_with(&ssh_prefix) {
             let path = url
                 .trim_start_matches(&ssh_prefix)
                 .trim_end_matches(".git")
@@ -236,8 +239,19 @@ pub(crate) fn parse_github_remote(
 
             let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
             if parts.len() >= 2 && !parts[0].is_empty() && !parts[1].is_empty() {
-                return Ok((host.clone(), parts[0].to_string(), parts[1].to_string()));
+                Some((parts[0].to_string(), parts[1].to_string()))
+            } else {
+                None
             }
+        } else {
+            None
+        };
+
+        if let Some((owner, repo)) = matched {
+            let canonical = host_registry
+                .canonical_host(&host)
+                .with_context(|| format!("Unknown host '{}' in URL: {}", host, url))?;
+            return Ok((canonical, owner, repo));
         }
     }
 
@@ -1167,14 +1181,35 @@ impl GitRepo {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{GhHostConfig, LabConfig};
     use std::env;
 
-    fn default_hosts() -> Vec<String> {
-        vec!["github.com".to_string()]
+    fn default_hosts() -> HostRegistry {
+        HostRegistry::from_config(&LabConfig::default())
     }
 
-    fn hosts_with_ghe() -> Vec<String> {
-        vec!["github.com".to_string(), "ghe.example.com".to_string()]
+    fn hosts_with_ghe() -> HostRegistry {
+        let mut config = LabConfig::default();
+        config.github_hosts.insert(
+            "ghe".to_string(),
+            GhHostConfig {
+                host: "ghe.example.com".to_string(),
+                web_url: None,
+            },
+        );
+        HostRegistry::from_config(&config)
+    }
+
+    fn hosts_with_web_url() -> HostRegistry {
+        let mut config = LabConfig::default();
+        config.github_hosts.insert(
+            "netflix".to_string(),
+            GhHostConfig {
+                host: "git.netflix.net".to_string(),
+                web_url: Some("https://github.netflix.net".to_string()),
+            },
+        );
+        HostRegistry::from_config(&config)
     }
 
     #[test]
@@ -1289,6 +1324,62 @@ mod tests {
             &hosts
         ));
         assert!(is_github_url("git@ghe.example.com:owner/repo.git", &hosts));
+    }
+
+    #[test]
+    fn test_is_github_url_recognizes_web_url_host() {
+        let hosts = hosts_with_web_url();
+        // Both the API host and the web UI host are recognized
+        assert!(is_github_url(
+            "https://git.netflix.net/corp/repo.git",
+            &hosts
+        ));
+        assert!(is_github_url(
+            "https://github.netflix.net/corp/repo.git",
+            &hosts
+        ));
+        assert!(is_github_url(
+            "git@github.netflix.net:corp/repo.git",
+            &hosts
+        ));
+    }
+
+    #[test]
+    fn test_parse_github_remote_web_url_maps_to_api_host() {
+        // HTTPS URL using the web UI host should resolve to the API host
+        let result = parse_github_remote(
+            "https://github.netflix.net/corp/service.git",
+            &hosts_with_web_url(),
+        )
+        .unwrap();
+        assert_eq!(result.0, "git.netflix.net");
+        assert_eq!(result.1, "corp");
+        assert_eq!(result.2, "service");
+    }
+
+    #[test]
+    fn test_parse_github_remote_api_host_still_works_with_web_url_config() {
+        // API host continues to work when web_url is also configured
+        let result = parse_github_remote(
+            "https://git.netflix.net/corp/service.git",
+            &hosts_with_web_url(),
+        )
+        .unwrap();
+        assert_eq!(result.0, "git.netflix.net");
+        assert_eq!(result.1, "corp");
+        assert_eq!(result.2, "service");
+    }
+
+    #[test]
+    fn test_parse_github_remote_ssh_web_url_maps_to_api_host() {
+        let result = parse_github_remote(
+            "git@github.netflix.net:corp/service.git",
+            &hosts_with_web_url(),
+        )
+        .unwrap();
+        assert_eq!(result.0, "git.netflix.net");
+        assert_eq!(result.1, "corp");
+        assert_eq!(result.2, "service");
     }
 
     #[test]

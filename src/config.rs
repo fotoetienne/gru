@@ -375,9 +375,65 @@ impl HostRegistry {
         Self { hosts }
     }
 
-    /// All known hostnames (always includes `github.com`).
-    pub(crate) fn all_hosts(&self) -> Vec<String> {
-        self.hosts.keys().cloned().collect()
+    /// All hostnames recognized when matching a GitHub URL: every API host plus
+    /// every configured `web_url` host.
+    ///
+    /// Web UI and API hosts may differ (e.g. Netflix has the API at
+    /// `git.netflix.net` and the web UI at `github.netflix.net`). A URL using
+    /// either form is a legitimate reference to the same repository, so URL
+    /// parsers match against this broader list. After a match, resolve the
+    /// matched host back to the API host via [`HostRegistry::canonical_host`].
+    pub(crate) fn all_url_hosts(&self) -> Vec<String> {
+        let mut result: Vec<String> = self.hosts.keys().cloned().collect();
+        for web_url in self.hosts.values().flatten() {
+            if let Some(host) = web_url_to_host(web_url) {
+                if !result.iter().any(|h| h == &host) {
+                    result.push(host);
+                }
+            }
+        }
+        result
+    }
+
+    /// Maps any recognized hostname back to its canonical API host.
+    ///
+    /// If `host` is already a known API host, returns it. If it matches a
+    /// configured `web_url` hostname, returns the associated API host. Returns
+    /// `None` when `host` is unknown.
+    pub(crate) fn canonical_host(&self, host: &str) -> Option<String> {
+        if self.hosts.contains_key(host) {
+            return Some(host.to_string());
+        }
+        for (api_host, web_url_opt) in &self.hosts {
+            if let Some(web_url) = web_url_opt {
+                if let Some(web_host) = web_url_to_host(web_url) {
+                    if web_host == host {
+                        return Some(api_host.clone());
+                    }
+                }
+            }
+        }
+        None
+    }
+}
+
+/// Extracts the hostname from a configured `web_url` value.
+///
+/// Accepts values like `"https://github.netflix.net"`,
+/// `"https://github.netflix.net/"`, or `"https://github.netflix.net:8080"`,
+/// returning `"github.netflix.net"`. Returns `None` when the value is missing
+/// an `http(s)://` prefix or the hostname is empty.
+fn web_url_to_host(web_url: &str) -> Option<String> {
+    let s = web_url.trim();
+    let rest = s
+        .strip_prefix("https://")
+        .or_else(|| s.strip_prefix("http://"))?;
+    let end = rest.find(['/', ':']).unwrap_or(rest.len());
+    let host = &rest[..end];
+    if host.is_empty() {
+        None
+    } else {
+        Some(host.to_string())
     }
 }
 
@@ -1055,7 +1111,7 @@ confidence_threshold = 6
     fn test_github_hosts_default() {
         let config = LabConfig::default();
         let registry = HostRegistry::from_config(&config);
-        let mut hosts = registry.all_hosts();
+        let mut hosts = registry.all_url_hosts();
         hosts.sort();
         assert_eq!(hosts, vec!["github.com"]);
     }
@@ -1072,7 +1128,7 @@ repos = ["owner/repo", "ghe.example.com/org/service", "git.corp.net/team/app"]
 
         let config = LabConfig::load(temp_file.path()).unwrap();
         let registry = HostRegistry::from_config(&config);
-        let mut hosts = registry.all_hosts();
+        let mut hosts = registry.all_url_hosts();
         hosts.sort();
         assert_eq!(hosts, vec!["ghe.example.com", "git.corp.net", "github.com"]);
     }
@@ -1089,7 +1145,7 @@ repos = ["owner/repo1", "ghe.example.com/org/svc1", "ghe.example.com/org/svc2"]
 
         let config = LabConfig::load(temp_file.path()).unwrap();
         let registry = HostRegistry::from_config(&config);
-        let mut hosts = registry.all_hosts();
+        let mut hosts = registry.all_url_hosts();
         hosts.sort();
         assert_eq!(hosts, vec!["ghe.example.com", "github.com"]);
     }
@@ -1212,7 +1268,7 @@ repos = ["owner/repo1", "ghe.example.com/org/svc1", "ghe.example.com/org/svc2"]
     fn test_host_registry_default_config() {
         let config = LabConfig::default();
         let registry = HostRegistry::from_config(&config);
-        let mut hosts = registry.all_hosts();
+        let mut hosts = registry.all_url_hosts();
         hosts.sort();
         assert_eq!(hosts, vec!["github.com"]);
     }
@@ -1228,9 +1284,102 @@ repos = ["owner/repo1", "ghe.example.com/org/svc1", "ghe.example.com/org/svc2"]
             },
         );
         let registry = HostRegistry::from_config(&config);
-        let mut hosts = registry.all_hosts();
+        // all_url_hosts includes both API host (git.netflix.net) and web UI host (github.netflix.net)
+        let mut hosts = registry.all_url_hosts();
         hosts.sort();
-        assert_eq!(hosts, vec!["git.netflix.net", "github.com"]);
+        assert_eq!(
+            hosts,
+            vec!["git.netflix.net", "github.com", "github.netflix.net"]
+        );
+    }
+
+    #[test]
+    fn test_canonical_host_resolves_web_url_to_api_host() {
+        let mut config = LabConfig::default();
+        config.github_hosts.insert(
+            "netflix".to_string(),
+            GhHostConfig {
+                host: "git.netflix.net".to_string(),
+                web_url: Some("https://github.netflix.net".to_string()),
+            },
+        );
+        let registry = HostRegistry::from_config(&config);
+
+        // Web UI hostname resolves to API host
+        assert_eq!(
+            registry.canonical_host("github.netflix.net").as_deref(),
+            Some("git.netflix.net")
+        );
+        // API host resolves to itself
+        assert_eq!(
+            registry.canonical_host("git.netflix.net").as_deref(),
+            Some("git.netflix.net")
+        );
+        // github.com is always recognized
+        assert_eq!(
+            registry.canonical_host("github.com").as_deref(),
+            Some("github.com")
+        );
+        // Unknown hosts return None
+        assert_eq!(registry.canonical_host("unknown.example.com"), None);
+    }
+
+    #[test]
+    fn test_canonical_host_without_web_url() {
+        let mut config = LabConfig::default();
+        config.github_hosts.insert(
+            "ghe".to_string(),
+            GhHostConfig {
+                host: "ghe.example.com".to_string(),
+                web_url: None,
+            },
+        );
+        let registry = HostRegistry::from_config(&config);
+
+        // Configured API host resolves to itself
+        assert_eq!(
+            registry.canonical_host("ghe.example.com").as_deref(),
+            Some("ghe.example.com")
+        );
+        // No web URL is configured, so nothing maps here
+        assert_eq!(registry.canonical_host("ghe-web.example.com"), None);
+    }
+
+    #[test]
+    fn test_all_url_hosts_without_web_url() {
+        // Without web_url, all_url_hosts returns the same set as the API hosts
+        let mut config = LabConfig::default();
+        config.github_hosts.insert(
+            "ghe".to_string(),
+            GhHostConfig {
+                host: "ghe.example.com".to_string(),
+                web_url: None,
+            },
+        );
+        let registry = HostRegistry::from_config(&config);
+        let mut hosts = registry.all_url_hosts();
+        hosts.sort();
+        assert_eq!(hosts, vec!["ghe.example.com", "github.com"]);
+    }
+
+    #[test]
+    fn test_all_url_hosts_web_url_with_port_and_path() {
+        // Hostname extraction strips scheme, path, and port
+        let mut config = LabConfig::default();
+        config.github_hosts.insert(
+            "netflix".to_string(),
+            GhHostConfig {
+                host: "git.netflix.net".to_string(),
+                web_url: Some("https://github.netflix.net:443/".to_string()),
+            },
+        );
+        let registry = HostRegistry::from_config(&config);
+        let mut hosts = registry.all_url_hosts();
+        hosts.sort();
+        assert_eq!(
+            hosts,
+            vec!["git.netflix.net", "github.com", "github.netflix.net"]
+        );
     }
 
     #[test]
@@ -1238,7 +1387,7 @@ repos = ["owner/repo1", "ghe.example.com/org/svc1", "ghe.example.com/org/svc2"]
         let mut config = LabConfig::default();
         config.daemon.repos = vec!["ghe.example.com/org/repo".to_string()];
         let registry = HostRegistry::from_config(&config);
-        let mut hosts = registry.all_hosts();
+        let mut hosts = registry.all_url_hosts();
         hosts.sort();
         assert_eq!(hosts, vec!["ghe.example.com", "github.com"]);
     }
@@ -1255,7 +1404,7 @@ repos = ["owner/repo1", "ghe.example.com/org/svc1", "ghe.example.com/org/svc2"]
         );
         config.daemon.repos = vec!["netflix:corp/service".to_string()];
         let registry = HostRegistry::from_config(&config);
-        let mut hosts = registry.all_hosts();
+        let mut hosts = registry.all_url_hosts();
         hosts.sort();
         assert_eq!(hosts, vec!["git.netflix.net", "github.com"]);
     }

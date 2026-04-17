@@ -1,4 +1,5 @@
 use super::types::{ExistingMinionCheck, IssueContext, IssueDetails};
+use crate::config::HostRegistry;
 use crate::minion_registry::{with_registry, MinionInfo, MinionMode};
 use crate::url_utils::parse_issue_info;
 use anyhow::{Context, Result};
@@ -9,8 +10,11 @@ use anyhow::{Context, Result};
 /// Note: Does NOT claim the issue — that happens after worktree setup to avoid
 /// marking issues as in-progress when setup fails.
 /// Note: Existing minion check is done in `handle_fix` to support resume logic.
-pub(crate) async fn resolve_issue(issue: &str, github_hosts: &[String]) -> Result<IssueContext> {
-    let (owner, repo, issue_num_str, host) = parse_issue_info(issue, github_hosts).await?;
+pub(crate) async fn resolve_issue(
+    issue: &str,
+    host_registry: &HostRegistry,
+) -> Result<IssueContext> {
+    let (owner, repo, issue_num_str, host) = parse_issue_info(issue, host_registry).await?;
     let issue_num: u64 = issue_num_str
         .parse()
         .context("Failed to parse issue number")?;

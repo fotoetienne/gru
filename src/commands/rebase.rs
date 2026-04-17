@@ -283,9 +283,9 @@ pub(crate) async fn detect_base_branch(worktree_path: &Path) -> Result<String> {
     }
 
     // Query GitHub API for the default branch
-    let github_hosts = crate::config::load_host_registry().all_hosts();
+    let host_registry = crate::config::load_host_registry();
     if let Ok(remote_url) = get_remote_url(worktree_path).await {
-        match git::parse_github_remote(&remote_url, &github_hosts) {
+        match git::parse_github_remote(&remote_url, &host_registry) {
             Ok((host, owner, repo)) => {
                 match github::get_default_branch(&host, &owner, &repo).await {
                     Ok(branch_name) => return Ok(branch_name),
@@ -492,9 +492,9 @@ pub(crate) async fn ensure_on_branch(worktree_path: &Path, expected_branch: &str
 /// Tries to get the base branch from an associated PR via GitHub CLI.
 async fn get_pr_base_branch(worktree_path: &Path, branch: &str) -> Result<Option<String>> {
     // Detect repo from the worktree (not CWD) to pick gh vs ghe
-    let github_hosts = crate::config::load_host_registry().all_hosts();
+    let host_registry = crate::config::load_host_registry();
     let remote_url = get_remote_url(worktree_path).await?;
-    let (host, owner, repo) = git::parse_github_remote(&remote_url, &github_hosts)?;
+    let (host, owner, repo) = git::parse_github_remote(&remote_url, &host_registry)?;
     let repo_full = github::repo_slug(&owner, &repo);
 
     let output = github::gh_cli_command(&host)

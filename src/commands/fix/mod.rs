@@ -187,8 +187,8 @@ async fn run_worker(minion_id: &str, issue: &str, opts: FixOptions) -> Result<i3
     let backend = agent_registry::resolve_backend(&agent_name)?;
 
     // Fetch fresh issue details for the worker
-    let github_hosts = crate::config::load_host_registry().all_hosts();
-    let issue_ctx = resolve_issue(issue, &github_hosts).await?;
+    let host_registry = crate::config::load_host_registry();
+    let issue_ctx = resolve_issue(issue, &host_registry).await?;
 
     // Determine resume phase from registry
     let start_phase = info.orchestration_phase.clone();
@@ -357,8 +357,8 @@ pub(crate) async fn handle_fix(issue: &str, opts: FixOptions) -> Result<i32> {
     let ignore_deps = opts.ignore_deps;
 
     // Phase 1: Resolve issue
-    let github_hosts = crate::config::load_host_registry().all_hosts();
-    let issue_ctx = resolve_issue(issue, &github_hosts).await?;
+    let host_registry = crate::config::load_host_registry();
+    let issue_ctx = resolve_issue(issue, &host_registry).await?;
 
     // Check for unresolved blockers (unless --ignore-deps)
     if !ignore_deps {
