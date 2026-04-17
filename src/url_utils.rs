@@ -80,7 +80,10 @@ pub(crate) fn parse_github_url(url: &str, host_registry: &HostRegistry) -> Optio
                 Err(_) => continue,
             };
 
-            let canonical = host_registry.canonical_host(&host)?;
+            // `host` came from `all_url_hosts()`, so `canonical_host` always resolves.
+            let canonical = host_registry
+                .canonical_host(&host)
+                .expect("host from all_url_hosts is always resolvable");
 
             return Some(GitHubUrl {
                 host: canonical,

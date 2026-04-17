@@ -152,6 +152,9 @@ pub(crate) async fn get_github_remote(host_registry: &HostRegistry) -> Result<St
     let mut origin_url: Option<String> = None;
     let mut first_github_url: Option<String> = None;
 
+    // Compute once, reuse across every remote line.
+    let url_hosts = host_registry.all_url_hosts();
+
     // Each line format: <name> <url> (fetch|push)
     for line in remote_lines.lines() {
         let mut parts = line.split_whitespace();
@@ -159,7 +162,7 @@ pub(crate) async fn get_github_remote(host_registry: &HostRegistry) -> Result<St
         let remote_url = parts.next();
 
         if let (Some(name), Some(url)) = (remote_name, remote_url) {
-            if is_github_url(url, host_registry) {
+            if url_matches_any_host(url, &url_hosts) {
                 // Prioritize "origin" remote
                 if name == "origin" && origin_url.is_none() {
                     origin_url = Some(url.to_string());
@@ -185,7 +188,14 @@ pub(crate) async fn get_github_remote(host_registry: &HostRegistry) -> Result<St
 /// Matches against every API host and every configured `web_url` host in
 /// `host_registry`.
 fn is_github_url(url: &str, host_registry: &HostRegistry) -> bool {
-    for host in host_registry.all_url_hosts() {
+    url_matches_any_host(url, &host_registry.all_url_hosts())
+}
+
+/// Tests `url` against a pre-computed list of hostnames using the three
+/// supported URL shapes (https, http, SSH). Factored out so callers that check
+/// many URLs in a row can compute the host list once.
+fn url_matches_any_host(url: &str, hosts: &[String]) -> bool {
+    for host in hosts {
         if url.starts_with(&format!("https://{}/", host))
             || url.starts_with(&format!("http://{}/", host))
             || url.starts_with(&format!("git@{}:", host))
