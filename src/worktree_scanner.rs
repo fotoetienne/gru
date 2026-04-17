@@ -314,7 +314,7 @@ pub(crate) async fn discover_worktrees(repos_dir: &Path) -> Result<Vec<Worktree>
     }
 
     // Load configured hosts once for all repos
-    let github_hosts = crate::config::load_host_registry().all_hosts();
+    let host_registry = crate::config::load_host_registry();
 
     // Find all bare repositories recursively
     let bare_repos = find_bare_repos(repos_dir).await?;
@@ -322,7 +322,7 @@ pub(crate) async fn discover_worktrees(repos_dir: &Path) -> Result<Vec<Worktree>
     for bare_repo_path in bare_repos {
         // Extract repo name and host from git config
         let (host, repo_name) =
-            match extract_repo_from_git_config(&bare_repo_path, &github_hosts).await {
+            match extract_repo_from_git_config(&bare_repo_path, &host_registry).await {
                 Ok(result) => result,
                 Err(e) => {
                     log::warn!(
@@ -453,7 +453,7 @@ async fn find_bare_repos(dir: &Path) -> Result<Vec<PathBuf>> {
 /// Returns `(host, "owner/repo")`.
 async fn extract_repo_from_git_config(
     path: &Path,
-    github_hosts: &[String],
+    host_registry: &crate::config::HostRegistry,
 ) -> Result<(String, String)> {
     // Get remote.origin.url from git config
     let output = Command::new("git")
@@ -471,7 +471,7 @@ async fn extract_repo_from_git_config(
 
     let url = String::from_utf8_lossy(&output.stdout).trim().to_string();
 
-    let (host, owner, repo) = git::parse_github_remote(&url, github_hosts)
+    let (host, owner, repo) = git::parse_github_remote(&url, host_registry)
         .context("Failed to parse repo from remote URL")?;
     Ok((host, github::repo_slug(&owner, &repo)))
 }

@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 
+use crate::config::HostRegistry;
 use std::path::{Path, PathBuf};
 use tempfile::NamedTempFile;
 use tokio::process::Command;
@@ -131,7 +132,7 @@ pub(crate) async fn detect_git_repo() -> Result<PathBuf> {
 
 /// Gets the GitHub remote URL from the current git repository
 /// Tries "origin" first, then falls back to the first GitHub remote found
-pub(crate) async fn get_github_remote(github_hosts: &[String]) -> Result<String> {
+pub(crate) async fn get_github_remote(host_registry: &HostRegistry) -> Result<String> {
     // Use `git remote -v` to get all remotes and their URLs in one call
     let output = Command::new("git")
         .arg("remote")
@@ -151,6 +152,9 @@ pub(crate) async fn get_github_remote(github_hosts: &[String]) -> Result<String>
     let mut origin_url: Option<String> = None;
     let mut first_github_url: Option<String> = None;
 
+    // Compute once, reuse across every remote line.
+    let url_hosts = host_registry.all_url_hosts();
+
     // Each line format: <name> <url> (fetch|push)
     for line in remote_lines.lines() {
         let mut parts = line.split_whitespace();
@@ -158,7 +162,7 @@ pub(crate) async fn get_github_remote(github_hosts: &[String]) -> Result<String>
         let remote_url = parts.next();
 
         if let (Some(name), Some(url)) = (remote_name, remote_url) {
-            if is_github_url(url, github_hosts) {
+            if url_matches_any_host(url, &url_hosts) {
                 // Prioritize "origin" remote
                 if name == "origin" && origin_url.is_none() {
                     origin_url = Some(url.to_string());
@@ -178,70 +182,127 @@ pub(crate) async fn get_github_remote(github_hosts: &[String]) -> Result<String>
     })
 }
 
-/// Checks if a URL is a GitHub URL (including configured GHE hosts).
+/// Supported URL schemes for GitHub remotes and web URLs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GitUrlScheme {
+    Https,
+    Http,
+    Ssh,
+}
+
+/// A GitHub-style URL split into scheme, hostname, and remainder.
 ///
-/// `github_hosts` should contain all recognized hosts (e.g., `["github.com", "ghe.example.com"]`).
-fn is_github_url(url: &str, github_hosts: &[String]) -> bool {
-    for host in github_hosts {
-        if url.starts_with(&format!("https://{}/", host))
-            || url.starts_with(&format!("http://{}/", host))
-            || url.starts_with(&format!("git@{}:", host))
-        {
-            return true;
+/// The hostname has any `:port` suffix stripped so callers can compare it
+/// directly to configured host names.
+#[derive(Debug, Clone)]
+pub(crate) struct GitUrlParts<'a> {
+    pub(crate) scheme: GitUrlScheme,
+    /// Hostname with any port stripped.
+    pub(crate) host: &'a str,
+    /// Everything after the authority. For HTTPS/HTTP URLs this includes the
+    /// leading `/` (e.g. `/owner/repo.git`); for SSH (`git@host:path`) it's
+    /// the path with no leading slash.
+    pub(crate) rest: &'a str,
+}
+
+/// Splits a URL into scheme, hostname (port stripped), and remainder.
+///
+/// Accepts `https://<host>[:port]/<rest>`, `http://<host>[:port]/<rest>`, and
+/// SSH (`git@<host>:<rest>`). Returns `None` for URLs with an unsupported
+/// scheme, HTTP userinfo (`https://user@host/...`), or an empty hostname.
+pub(crate) fn split_github_url(url: &str) -> Option<GitUrlParts<'_>> {
+    if let Some(rest) = url.strip_prefix("git@") {
+        let (host, path) = rest.split_once(':')?;
+        if host.is_empty() {
+            return None;
         }
+        return Some(GitUrlParts {
+            scheme: GitUrlScheme::Ssh,
+            host,
+            rest: path,
+        });
     }
-    false
+    let (scheme, rest) = if let Some(r) = url.strip_prefix("https://") {
+        (GitUrlScheme::Https, r)
+    } else if let Some(r) = url.strip_prefix("http://") {
+        (GitUrlScheme::Http, r)
+    } else {
+        return None;
+    };
+    // The authority runs up to the first path/query/fragment separator.
+    let auth_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..auth_end];
+    let path = &rest[auth_end..];
+    // Reject HTTP userinfo (`user[:pass]@host`) — not in scope.
+    if authority.contains('@') {
+        return None;
+    }
+    // Strip optional `:port` from the authority.
+    let host = authority
+        .split_once(':')
+        .map(|(h, _)| h)
+        .unwrap_or(authority);
+    if host.is_empty() {
+        return None;
+    }
+    Some(GitUrlParts {
+        scheme,
+        host,
+        rest: path,
+    })
+}
+
+/// Checks whether `url`'s hostname matches any entry in `hosts`, across the
+/// supported URL shapes (HTTPS, HTTP, SSH) and with any `:port` stripped.
+///
+/// Takes a pre-computed slice so callers that check many URLs in a row can
+/// build the host list once via [`HostRegistry::all_url_hosts`]. Recognises
+/// every API host and every configured `web_url` host in the registry.
+fn url_matches_any_host(url: &str, hosts: &[String]) -> bool {
+    let Some(parts) = split_github_url(url) else {
+        return false;
+    };
+    hosts.iter().any(|h| h == parts.host)
 }
 
 /// Parses a GitHub remote URL to extract host, owner, and repo name.
 ///
-/// Supports both HTTPS and SSH formats for any configured GitHub host:
-/// - `https://<host>/owner/repo.git`
+/// Accepts HTTPS, HTTP, and SSH formats for any configured GitHub host,
+/// including URLs with an explicit port (e.g.
+/// `https://ghe.example.com:8443/owner/repo.git`):
+/// - `https://<host>[:port]/owner/repo.git`
+/// - `http://<host>[:port]/owner/repo.git`
 /// - `git@<host>:owner/repo.git`
 ///
-/// `github_hosts` should contain all recognized hosts (e.g., `["github.com", "ghe.example.com"]`).
+/// Matches against every API host and every configured `web_url` host in
+/// `host_registry`. The returned host is always the canonical API host, even
+/// when the input used a web UI hostname.
 pub(crate) fn parse_github_remote(
     url: &str,
-    github_hosts: &[String],
+    host_registry: &HostRegistry,
 ) -> Result<(String, String, String)> {
-    if !is_github_url(url, github_hosts) {
+    let parts =
+        split_github_url(url).ok_or_else(|| anyhow::anyhow!("Not a GitHub URL: {}", url))?;
+
+    let url_hosts = host_registry.all_url_hosts();
+    if !url_hosts.iter().any(|h| h == parts.host) {
         anyhow::bail!("Not a GitHub URL: {}", url);
     }
 
-    for host in github_hosts {
-        let https_prefix = format!("https://{}/", host);
-        let http_prefix = format!("http://{}/", host);
-        let ssh_prefix = format!("git@{}:", host);
-
-        // Handle HTTPS format
-        if url.starts_with(&https_prefix) || url.starts_with(&http_prefix) {
-            let path = url
-                .trim_start_matches(&https_prefix)
-                .trim_start_matches(&http_prefix)
-                .trim_end_matches(".git")
-                .trim_end_matches('/');
-
-            let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
-            if parts.len() >= 2 && !parts[0].is_empty() && !parts[1].is_empty() {
-                return Ok((host.clone(), parts[0].to_string(), parts[1].to_string()));
-            }
-        }
-
-        // Handle SSH format: git@<host>:owner/repo.git
-        if url.starts_with(&ssh_prefix) {
-            let path = url
-                .trim_start_matches(&ssh_prefix)
-                .trim_end_matches(".git")
-                .trim_end_matches('/');
-
-            let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
-            if parts.len() >= 2 && !parts[0].is_empty() && !parts[1].is_empty() {
-                return Ok((host.clone(), parts[0].to_string(), parts[1].to_string()));
-            }
-        }
+    let path = parts
+        .rest
+        .trim_start_matches('/')
+        .trim_end_matches(".git")
+        .trim_end_matches('/');
+    let segs: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    if segs.len() < 2 || segs[0].is_empty() || segs[1].is_empty() {
+        anyhow::bail!("Could not parse GitHub URL: {}", url);
     }
-
-    anyhow::bail!("Could not parse GitHub URL: {}", url);
+    // The host matched a known API or web_url host, so canonicalization cannot fail.
+    let canonical = host_registry
+        .canonical_host(parts.host)
+        .expect("matched host is always resolvable");
+    Ok((canonical, segs[0].to_string(), segs[1].to_string()))
 }
 
 /// Represents a single entry from `git worktree list --porcelain` output.
@@ -1167,14 +1228,35 @@ impl GitRepo {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{GhHostConfig, LabConfig};
     use std::env;
 
-    fn default_hosts() -> Vec<String> {
-        vec!["github.com".to_string()]
+    fn default_hosts() -> HostRegistry {
+        HostRegistry::from_config(&LabConfig::default())
     }
 
-    fn hosts_with_ghe() -> Vec<String> {
-        vec!["github.com".to_string(), "ghe.example.com".to_string()]
+    fn hosts_with_ghe() -> HostRegistry {
+        let mut config = LabConfig::default();
+        config.github_hosts.insert(
+            "ghe".to_string(),
+            GhHostConfig {
+                host: "ghe.example.com".to_string(),
+                web_url: None,
+            },
+        );
+        HostRegistry::from_config(&config)
+    }
+
+    fn hosts_with_web_url() -> HostRegistry {
+        let mut config = LabConfig::default();
+        config.github_hosts.insert(
+            "netflix".to_string(),
+            GhHostConfig {
+                host: "git.netflix.net".to_string(),
+                web_url: Some("https://github.netflix.net".to_string()),
+            },
+        );
+        HostRegistry::from_config(&config)
     }
 
     #[test]
@@ -1255,6 +1337,12 @@ mod tests {
         assert!(result.is_err());
     }
 
+    /// Convenience wrapper around `url_matches_any_host` so tests can pass a
+    /// `HostRegistry` directly rather than building the URL-host slice.
+    fn is_github_url(url: &str, registry: &HostRegistry) -> bool {
+        url_matches_any_host(url, &registry.all_url_hosts())
+    }
+
     #[test]
     fn test_is_github_url() {
         let hosts = default_hosts();
@@ -1289,6 +1377,164 @@ mod tests {
             &hosts
         ));
         assert!(is_github_url("git@ghe.example.com:owner/repo.git", &hosts));
+    }
+
+    #[test]
+    fn test_is_github_url_recognizes_web_url_host() {
+        let hosts = hosts_with_web_url();
+        // Both the API host and the web UI host are recognized
+        assert!(is_github_url(
+            "https://git.netflix.net/corp/repo.git",
+            &hosts
+        ));
+        assert!(is_github_url(
+            "https://github.netflix.net/corp/repo.git",
+            &hosts
+        ));
+        assert!(is_github_url(
+            "git@github.netflix.net:corp/repo.git",
+            &hosts
+        ));
+    }
+
+    #[test]
+    fn test_parse_github_remote_web_url_maps_to_api_host() {
+        // HTTPS URL using the web UI host should resolve to the API host
+        let result = parse_github_remote(
+            "https://github.netflix.net/corp/service.git",
+            &hosts_with_web_url(),
+        )
+        .unwrap();
+        assert_eq!(result.0, "git.netflix.net");
+        assert_eq!(result.1, "corp");
+        assert_eq!(result.2, "service");
+    }
+
+    #[test]
+    fn test_parse_github_remote_api_host_still_works_with_web_url_config() {
+        // API host continues to work when web_url is also configured
+        let result = parse_github_remote(
+            "https://git.netflix.net/corp/service.git",
+            &hosts_with_web_url(),
+        )
+        .unwrap();
+        assert_eq!(result.0, "git.netflix.net");
+        assert_eq!(result.1, "corp");
+        assert_eq!(result.2, "service");
+    }
+
+    #[test]
+    fn test_parse_github_remote_ssh_web_url_maps_to_api_host() {
+        let result = parse_github_remote(
+            "git@github.netflix.net:corp/service.git",
+            &hosts_with_web_url(),
+        )
+        .unwrap();
+        assert_eq!(result.0, "git.netflix.net");
+        assert_eq!(result.1, "corp");
+        assert_eq!(result.2, "service");
+    }
+
+    #[test]
+    fn test_parse_github_remote_https_with_explicit_port() {
+        // Self-hosted GHE behind a non-standard port must still resolve.
+        let result = parse_github_remote(
+            "https://ghe.example.com:8443/netflix/service.git",
+            &hosts_with_ghe(),
+        )
+        .unwrap();
+        assert_eq!(result.0, "ghe.example.com");
+        assert_eq!(result.1, "netflix");
+        assert_eq!(result.2, "service");
+    }
+
+    #[test]
+    fn test_parse_github_remote_http_scheme() {
+        let result = parse_github_remote(
+            "http://ghe.example.com/netflix/service.git",
+            &hosts_with_ghe(),
+        )
+        .unwrap();
+        assert_eq!(result.0, "ghe.example.com");
+        assert_eq!(result.1, "netflix");
+        assert_eq!(result.2, "service");
+    }
+
+    #[test]
+    fn test_is_github_url_accepts_explicit_port() {
+        let hosts = hosts_with_ghe();
+        assert!(is_github_url(
+            "https://ghe.example.com:8443/owner/repo.git",
+            &hosts
+        ));
+    }
+
+    #[test]
+    fn test_is_github_url_rejects_userinfo() {
+        // URLs with HTTP userinfo (user@host) are out of scope.
+        let hosts = default_hosts();
+        assert!(!is_github_url(
+            "https://user@github.com/owner/repo.git",
+            &hosts
+        ));
+    }
+
+    // --- split_github_url unit tests ---
+
+    #[test]
+    fn test_split_github_url_https_no_port() {
+        let parts = split_github_url("https://github.com/owner/repo.git").unwrap();
+        assert_eq!(parts.scheme, GitUrlScheme::Https);
+        assert_eq!(parts.host, "github.com");
+        assert_eq!(parts.rest, "/owner/repo.git");
+    }
+
+    #[test]
+    fn test_split_github_url_https_with_port() {
+        let parts = split_github_url("https://ghe.example.com:8443/owner/repo").unwrap();
+        assert_eq!(parts.scheme, GitUrlScheme::Https);
+        assert_eq!(parts.host, "ghe.example.com");
+        assert_eq!(parts.rest, "/owner/repo");
+    }
+
+    #[test]
+    fn test_split_github_url_http_scheme() {
+        let parts = split_github_url("http://github.com/owner/repo").unwrap();
+        assert_eq!(parts.scheme, GitUrlScheme::Http);
+        assert_eq!(parts.host, "github.com");
+    }
+
+    #[test]
+    fn test_split_github_url_ssh() {
+        let parts = split_github_url("git@github.com:owner/repo.git").unwrap();
+        assert_eq!(parts.scheme, GitUrlScheme::Ssh);
+        assert_eq!(parts.host, "github.com");
+        assert_eq!(parts.rest, "owner/repo.git");
+    }
+
+    #[test]
+    fn test_split_github_url_host_only() {
+        let parts = split_github_url("https://github.com").unwrap();
+        assert_eq!(parts.host, "github.com");
+        assert_eq!(parts.rest, "");
+    }
+
+    #[test]
+    fn test_split_github_url_rejects_userinfo() {
+        assert!(split_github_url("https://user@github.com/owner/repo").is_none());
+        assert!(split_github_url("https://user:pw@github.com/owner/repo").is_none());
+    }
+
+    #[test]
+    fn test_split_github_url_rejects_unsupported_scheme() {
+        assert!(split_github_url("ftp://github.com/x").is_none());
+        assert!(split_github_url("github.com/x").is_none());
+    }
+
+    #[test]
+    fn test_split_github_url_rejects_empty_host() {
+        assert!(split_github_url("https:///owner/repo").is_none());
+        assert!(split_github_url("git@:owner/repo").is_none());
     }
 
     #[test]

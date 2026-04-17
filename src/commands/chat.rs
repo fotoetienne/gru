@@ -81,9 +81,9 @@ async fn detect_project_context(repo_flag: Option<String>) -> Option<(PathBuf, S
 
     // Try to detect from current directory
     let repo_root = git::detect_git_repo().await.ok()?;
-    let github_hosts = crate::config::load_host_registry().all_hosts();
-    let remote_url = git::get_github_remote(&github_hosts).await.ok()?;
-    let (_host, owner, repo_name) = git::parse_github_remote(&remote_url, &github_hosts).ok()?;
+    let host_registry = crate::config::load_host_registry();
+    let remote_url = git::get_github_remote(&host_registry).await.ok()?;
+    let (_host, owner, repo_name) = git::parse_github_remote(&remote_url, &host_registry).ok()?;
     Some((repo_root, owner, repo_name))
 }
 

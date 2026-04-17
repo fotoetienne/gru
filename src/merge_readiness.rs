@@ -460,10 +460,8 @@ fn evaluate_reviews(reviews: &[ReviewApiResponse], pr_author: &str) -> bool {
                     author_commented = false;
                 }
             }
-            "COMMENTED" => {
-                if review.user.login == pr_author {
-                    author_commented = true;
-                }
+            "COMMENTED" if review.user.login == pr_author => {
+                author_commented = true;
             }
             _ => {
                 // PENDING — don't change approval state

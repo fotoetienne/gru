@@ -441,7 +441,7 @@ pub(crate) async fn resolve_host_from_worktree(
     checkout_path: &std::path::Path,
     owner: &str,
 ) -> String {
-    let github_hosts = crate::config::load_host_registry().all_hosts();
+    let host_registry = crate::config::load_host_registry();
 
     // Try to get the host from the worktree's git remote
     let output = tokio::process::Command::new("git")
@@ -454,7 +454,7 @@ pub(crate) async fn resolve_host_from_worktree(
         if output.status.success() {
             let remote_url = String::from_utf8_lossy(&output.stdout).trim().to_string();
             // First try the full parser (validates against known hosts)
-            if let Ok((host, _, _)) = crate::git::parse_github_remote(&remote_url, &github_hosts) {
+            if let Ok((host, _, _)) = crate::git::parse_github_remote(&remote_url, &host_registry) {
                 return host;
             }
             // If the remote URL is valid but the host isn't in the registry,

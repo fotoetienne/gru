@@ -306,8 +306,8 @@ async fn resolve_pr_from_arg(arg: &str) -> Result<(String, String, String, Strin
     }
 
     // Strategy 2: Try as PR number or URL (existing behavior)
-    let github_hosts = crate::config::load_host_registry().all_hosts();
-    match parse_pr_info(arg, &github_hosts).await {
+    let host_registry = crate::config::load_host_registry();
+    match parse_pr_info(arg, &host_registry).await {
         Ok(pr_info) => return Ok(pr_info),
         Err(e) => errors.push(format!("PR number/URL '{}': {:#}", arg, e)),
     }
@@ -363,8 +363,8 @@ async fn get_pr_info_from_number(pr_num: &str) -> Result<(String, String, String
         .with_context(|| format!("Invalid PR number format: '{}'", pr_num))?;
 
     // Use parse_pr_info which fetches metadata from GitHub
-    let github_hosts = crate::config::load_host_registry().all_hosts();
-    parse_pr_info(pr_num, &github_hosts).await
+    let host_registry = crate::config::load_host_registry();
+    parse_pr_info(pr_num, &host_registry).await
 }
 
 /// Finds a PR number associated with an issue number
@@ -374,11 +374,11 @@ async fn find_pr_for_issue(issue_num: u64) -> Result<String> {
     git::detect_git_repo()
         .await
         .context("Failed to detect git repository")?;
-    let github_hosts = crate::config::load_host_registry().all_hosts();
-    let remote_url = git::get_github_remote(&github_hosts)
+    let host_registry = crate::config::load_host_registry();
+    let remote_url = git::get_github_remote(&host_registry)
         .await
         .context("Failed to get GitHub remote")?;
-    let (host, det_owner, det_repo) = git::parse_github_remote(&remote_url, &github_hosts)
+    let (host, det_owner, det_repo) = git::parse_github_remote(&remote_url, &host_registry)
         .context("Failed to parse GitHub remote URL")?;
     let repo_full = github::repo_slug(&det_owner, &det_repo);
     // Safe: issue_num is validated as u64 by the type system, which can only contain digits.

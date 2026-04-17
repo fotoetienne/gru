@@ -1,3 +1,4 @@
+use crate::config::HostRegistry;
 use crate::git;
 use crate::github;
 use anyhow::{Context, Result};
@@ -33,68 +34,75 @@ fn clean_url(url: &str) -> &str {
 
 /// Parses a GitHub issue or PR URL into its components.
 ///
-/// `github_hosts` should contain all recognized hosts (e.g., `["github.com", "ghe.example.com"]`).
+/// Matches against every API host and every configured web UI host in
+/// `host_registry`. When the URL uses a web UI host (e.g. the Netflix pattern
+/// where `git.netflix.net` is the API host and `github.netflix.net` is the web
+/// UI host), the returned `GitHubUrl::host` is the canonical API host so
+/// subsequent `gh` CLI calls target the correct endpoint.
 ///
 /// Handles URLs like:
 /// - `https://github.com/owner/repo/issues/42`
 /// - `https://github.com/owner/repo/pull/42`
-/// - `https://<configured-ghe-host>/owner/repo/issues/42`
+/// - `http://<configured-host>/owner/repo/issues/42`
+/// - `https://<configured-host>:8443/owner/repo/issues/42` (explicit port)
+/// - `https://<configured-web-url-host>/owner/repo/issues/42`
 /// - URLs with query params, fragments, and trailing slashes
 ///
+/// Both `http://` and `https://` schemes are accepted, matching
+/// [`crate::config::GhHostConfig::web_url`] validation. SSH-style URLs
+/// (`git@host:...`) are rejected since they're remote URLs, not web URLs.
+///
 /// Returns `None` if the URL is not a valid GitHub issue/PR URL.
-pub(crate) fn parse_github_url(url: &str, github_hosts: &[String]) -> Option<GitHubUrl> {
+pub(crate) fn parse_github_url(url: &str, host_registry: &HostRegistry) -> Option<GitHubUrl> {
     let cleaned = clean_url(url);
+    let parts = git::split_github_url(cleaned)?;
 
-    for host in github_hosts {
-        let prefix = format!("https://{}/", host);
-        if let Some(path) = cleaned.strip_prefix(&prefix) {
-            let parts: Vec<&str> = path.split('/').collect();
-
-            if parts.len() != 4 {
-                continue;
-            }
-
-            let owner = parts[0];
-            let repo = parts[1];
-            let resource_type_str = parts[2];
-            let number_str = parts[3];
-
-            if owner.is_empty() || repo.is_empty() {
-                continue;
-            }
-
-            let resource_type = match resource_type_str {
-                "issues" => GitHubResourceType::Issue,
-                "pull" => GitHubResourceType::Pull,
-                _ => continue,
-            };
-
-            let number = match number_str.parse::<u32>() {
-                Ok(n) => n,
-                Err(_) => continue,
-            };
-
-            return Some(GitHubUrl {
-                host: host.clone(),
-                owner: owner.to_string(),
-                repo: repo.to_string(),
-                resource_type,
-                number,
-            });
-        }
+    // parse_github_url is for web URLs — SSH remote URLs are not valid here.
+    if !matches!(
+        parts.scheme,
+        git::GitUrlScheme::Https | git::GitUrlScheme::Http
+    ) {
+        return None;
     }
 
-    None
+    let canonical = host_registry.canonical_host(parts.host)?;
+
+    // Expect exactly `/owner/repo/(issues|pull)/<num>`
+    let path = parts.rest.strip_prefix('/')?;
+    let segments: Vec<&str> = path.split('/').collect();
+    if segments.len() != 4 {
+        return None;
+    }
+    let (owner, repo, resource_type_str, number_str) =
+        (segments[0], segments[1], segments[2], segments[3]);
+    if owner.is_empty() || repo.is_empty() {
+        return None;
+    }
+    let resource_type = match resource_type_str {
+        "issues" => GitHubResourceType::Issue,
+        "pull" => GitHubResourceType::Pull,
+        _ => return None,
+    };
+    let number = number_str.parse::<u32>().ok()?;
+
+    Some(GitHubUrl {
+        host: canonical,
+        owner: owner.to_string(),
+        repo: repo.to_string(),
+        resource_type,
+        number,
+    })
 }
 
 /// Extracts owner, repo, host, and issue number from an issue argument.
 ///
 /// Supports both plain issue numbers (auto-detects from current directory) and GitHub URLs.
-/// `github_hosts` should contain all recognized hosts (e.g., `["github.com", "ghe.example.com"]`).
+/// `host_registry` defines all recognized hosts. The returned `host` is always
+/// the canonical API host, even when a URL used a configured web UI host.
 /// Returns `(owner, repo, issue_number, host)`.
 pub(crate) async fn parse_issue_info(
     issue: &str,
-    github_hosts: &[String],
+    host_registry: &HostRegistry,
 ) -> Result<(String, String, String, String)> {
     // Check if it's a plain number
     if let Ok(num) = issue.parse::<u32>() {
@@ -103,18 +111,18 @@ pub(crate) async fn parse_issue_info(
             .await
             .context("Failed to detect git repository")?;
 
-        let remote_url = git::get_github_remote(github_hosts)
+        let remote_url = git::get_github_remote(host_registry)
             .await
             .context("Failed to get GitHub remote")?;
 
-        let (host, owner, repo) = git::parse_github_remote(&remote_url, github_hosts)
+        let (host, owner, repo) = git::parse_github_remote(&remote_url, host_registry)
             .context("Failed to parse GitHub remote URL")?;
 
         return Ok((owner, repo, num.to_string(), host));
     }
 
     // Try parsing as a GitHub URL
-    if let Some(parsed) = parse_github_url(issue, github_hosts) {
+    if let Some(parsed) = parse_github_url(issue, host_registry) {
         if parsed.resource_type == GitHubResourceType::Issue {
             return Ok((
                 parsed.owner,
@@ -160,12 +168,13 @@ fn build_pr_view_args(pr_num: &str, repo: Option<&str>) -> Vec<String> {
 /// Extracts owner, repo, PR number, and branch name from a PR argument.
 ///
 /// Supports both plain PR numbers and GitHub URLs.
-/// `github_hosts` should contain all recognized hosts (e.g., `["github.com", "ghe.example.com"]`).
+/// `host_registry` defines all recognized hosts. The returned `host` is always
+/// the canonical API host, even when a URL used a configured web UI host.
 /// For plain numbers, fetches metadata from GitHub to get branch info.
 /// Returns `(owner, repo, pr_number, branch, host)`.
 pub(crate) async fn parse_pr_info(
     pr: &str,
-    github_hosts: &[String],
+    host_registry: &HostRegistry,
 ) -> Result<(String, String, String, String, String)> {
     // Extract PR number, gh command, and optional repo qualifier
     let (pr_num, detected_host, repo_flag) = if pr.parse::<u32>().is_ok() {
@@ -173,13 +182,13 @@ pub(crate) async fn parse_pr_info(
         git::detect_git_repo()
             .await
             .context("Failed to detect git repository")?;
-        let remote_url = git::get_github_remote(github_hosts)
+        let remote_url = git::get_github_remote(host_registry)
             .await
             .context("Failed to get GitHub remote")?;
-        let (host, _det_owner, _det_repo) = git::parse_github_remote(&remote_url, github_hosts)
+        let (host, _det_owner, _det_repo) = git::parse_github_remote(&remote_url, host_registry)
             .context("Failed to parse GitHub remote URL")?;
         (pr.to_string(), host, None)
-    } else if let Some(parsed) = parse_github_url(pr, github_hosts) {
+    } else if let Some(parsed) = parse_github_url(pr, host_registry) {
         if parsed.resource_type != GitHubResourceType::Pull {
             // Parsed successfully but wrong resource type (e.g., issue URL given for review command)
             anyhow::bail!(
@@ -233,13 +242,34 @@ pub(crate) async fn parse_pr_info(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{GhHostConfig, LabConfig};
 
-    fn default_hosts() -> Vec<String> {
-        vec!["github.com".to_string()]
+    fn default_hosts() -> HostRegistry {
+        HostRegistry::from_config(&LabConfig::default())
     }
 
-    fn hosts_with_ghe() -> Vec<String> {
-        vec!["github.com".to_string(), "ghe.netflix.net".to_string()]
+    fn hosts_with_ghe() -> HostRegistry {
+        let mut config = LabConfig::default();
+        config.github_hosts.insert(
+            "ghe".to_string(),
+            GhHostConfig {
+                host: "ghe.netflix.net".to_string(),
+                web_url: None,
+            },
+        );
+        HostRegistry::from_config(&config)
+    }
+
+    fn hosts_with_web_url() -> HostRegistry {
+        let mut config = LabConfig::default();
+        config.github_hosts.insert(
+            "netflix".to_string(),
+            GhHostConfig {
+                host: "git.netflix.net".to_string(),
+                web_url: Some("https://github.netflix.net".to_string()),
+            },
+        );
+        HostRegistry::from_config(&config)
     }
 
     // --- parse_github_url tests ---
@@ -354,11 +384,37 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_github_url_rejects_http() {
-        // parse_github_url only accepts https:// web URLs;
-        // use git::parse_github_remote for git remote URLs (which accept http:// and SSH)
+    fn test_parse_github_url_accepts_http_scheme() {
+        // parse_github_url accepts both http:// and https:// to match
+        // what validate_web_url allows for GhHostConfig::web_url.
+        let result =
+            parse_github_url("http://github.com/owner/repo/issues/42", &default_hosts()).unwrap();
+        assert_eq!(result.host, "github.com");
+        assert_eq!(result.owner, "owner");
+        assert_eq!(result.repo, "repo");
+        assert_eq!(result.resource_type, GitHubResourceType::Issue);
+        assert_eq!(result.number, 42);
+    }
+
+    #[test]
+    fn test_parse_github_url_accepts_explicit_port() {
+        // Users on self-hosted GHE sometimes have a custom port on the URL.
+        let result = parse_github_url(
+            "https://ghe.netflix.net:8443/netflix/some-service/issues/99",
+            &hosts_with_ghe(),
+        )
+        .unwrap();
+        assert_eq!(result.host, "ghe.netflix.net");
+        assert_eq!(result.owner, "netflix");
+        assert_eq!(result.repo, "some-service");
+        assert_eq!(result.number, 99);
+    }
+
+    #[test]
+    fn test_parse_github_url_rejects_ssh() {
+        // SSH-style URLs are git remote URLs, not web URLs — not accepted.
         assert!(
-            parse_github_url("http://github.com/owner/repo/issues/42", &default_hosts()).is_none()
+            parse_github_url("git@github.com:owner/repo/issues/42", &default_hosts()).is_none()
         );
     }
 
@@ -505,6 +561,82 @@ mod tests {
         let err = parse_pr_info("https://github.com/owner/repo/issues/42", &default_hosts())
             .await
             .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("issue URL"),
+            "Expected specific error for issue URL given to PR parser, got: {}",
+            msg
+        );
+    }
+
+    // --- web_url → API host mapping tests ---
+
+    #[test]
+    fn test_parse_github_url_web_url_issue_maps_to_api_host() {
+        // URL using the configured web UI hostname is accepted, and the
+        // returned host is the canonical API host.
+        let result = parse_github_url(
+            "https://github.netflix.net/corp/service/issues/42",
+            &hosts_with_web_url(),
+        )
+        .unwrap();
+        assert_eq!(result.host, "git.netflix.net");
+        assert_eq!(result.owner, "corp");
+        assert_eq!(result.repo, "service");
+        assert_eq!(result.resource_type, GitHubResourceType::Issue);
+        assert_eq!(result.number, 42);
+    }
+
+    #[test]
+    fn test_parse_github_url_web_url_pull_maps_to_api_host() {
+        let result = parse_github_url(
+            "https://github.netflix.net/corp/service/pull/99",
+            &hosts_with_web_url(),
+        )
+        .unwrap();
+        assert_eq!(result.host, "git.netflix.net");
+        assert_eq!(result.resource_type, GitHubResourceType::Pull);
+        assert_eq!(result.number, 99);
+    }
+
+    #[test]
+    fn test_parse_github_url_api_host_still_works_with_web_url_config() {
+        // The API host continues to parse correctly when web_url is also configured.
+        let result = parse_github_url(
+            "https://git.netflix.net/corp/service/issues/7",
+            &hosts_with_web_url(),
+        )
+        .unwrap();
+        assert_eq!(result.host, "git.netflix.net");
+        assert_eq!(result.number, 7);
+    }
+
+    #[tokio::test]
+    async fn test_parse_issue_info_web_url_returns_api_host() {
+        // End-to-end: web UI URL resolves to API host for subsequent gh CLI calls.
+        let (owner, repo, num, host) = parse_issue_info(
+            "https://github.netflix.net/corp/service/issues/2612",
+            &hosts_with_web_url(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(owner, "corp");
+        assert_eq!(repo, "service");
+        assert_eq!(num, "2612");
+        assert_eq!(host, "git.netflix.net");
+    }
+
+    #[tokio::test]
+    async fn test_parse_pr_info_rejects_issue_url_on_web_url_host() {
+        // Issue URL via web UI hostname is recognized (rejected for being a PR
+        // parser, not for being unrecognized). The error message references the
+        // issue URL type — confirming parsing succeeded before type validation.
+        let err = parse_pr_info(
+            "https://github.netflix.net/corp/service/issues/42",
+            &hosts_with_web_url(),
+        )
+        .await
+        .unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("issue URL"),

@@ -356,11 +356,11 @@ async fn resolve_issue_from_pr(pr_num: u64) -> Result<u64> {
     git::detect_git_repo()
         .await
         .context("Failed to detect git repository")?;
-    let github_hosts = crate::config::load_host_registry().all_hosts();
-    let remote_url = git::get_github_remote(&github_hosts)
+    let host_registry = crate::config::load_host_registry();
+    let remote_url = git::get_github_remote(&host_registry)
         .await
         .context("Failed to get GitHub remote")?;
-    let (host, det_owner, det_repo) = git::parse_github_remote(&remote_url, &github_hosts)
+    let (host, det_owner, det_repo) = git::parse_github_remote(&remote_url, &host_registry)
         .context("Failed to parse GitHub remote URL")?;
     let repo_full = github::repo_slug(&det_owner, &det_repo);
     // Use gh CLI to get linked issue from PR body
