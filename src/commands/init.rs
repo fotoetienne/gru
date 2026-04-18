@@ -99,8 +99,8 @@ fn build_repo_entry(
     if host.eq_ignore_ascii_case("github.com") {
         return Some(format!("{}/{}", owner, repo));
     }
-    // `validate_github_hosts` enforces that `host` is unique across entries,
-    // so at most one match is possible here.
+    // `validate_github_hosts` enforces case-insensitive uniqueness of `host`
+    // across entries, so at most one match is possible here.
     if let Some((name, _)) = github_hosts
         .iter()
         .find(|(_, gh)| gh.host.eq_ignore_ascii_case(host))
@@ -239,8 +239,10 @@ pub(crate) async fn handle_init(repo_arg: String, host_override: Option<String>)
         Ok(cfg) => cfg.github_hosts,
         Err(e) => {
             log::warn!(
-                "  ⚠️  Could not load config for [github_hosts.*] lookup, \
-                 falling back to legacy host/owner/repo form: {:#}",
+                "  ⚠️  Could not load config for [github_hosts.*] lookup; \
+                 proceeding without alias resolution (repo entry will use \
+                 owner/repo for github.com, legacy host/owner/repo for other \
+                 hosts with a dot, or be skipped): {:#}",
                 e
             );
             HashMap::new()
