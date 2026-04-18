@@ -94,6 +94,15 @@ pub(crate) fn parse_github_url(url: &str, host_registry: &HostRegistry) -> Optio
     })
 }
 
+/// Escapes a string for use inside a TOML basic string literal.
+///
+/// TOML basic strings require `\` and `"` to be escaped. Hostnames produced by
+/// `split_github_url` are unlikely to contain either, but defending against
+/// malformed input keeps the emitted snippet syntactically valid.
+fn toml_escape(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
 /// If `input` looks like an HTTP(S) URL with an unrecognized host, returns a
 /// targeted error message naming the host and suggesting a `[github_hosts.*]`
 /// config entry. Returns `None` for non-URL input or URLs whose host is
@@ -111,10 +120,11 @@ fn unrecognized_host_error(input: &str, host_registry: &HostRegistry) -> Option<
         return None;
     }
     let host = parts.host;
+    let host_value = toml_escape(host);
     Some(format!(
         "Unrecognized GitHub host '{host}'.\n\
          Add it to ~/.gru/config.toml:\n\
-         \n    [github_hosts.\"{host}\"]\n    host = \"{host}\"\n\
+         \n    [github_hosts.myhost]\n    host = \"{host_value}\"\n\
          \n\
          Then retry with the original URL."
     ))
@@ -302,6 +312,18 @@ mod tests {
             },
         );
         HostRegistry::from_config(&config)
+    }
+
+    // --- toml_escape tests ---
+
+    #[test]
+    fn test_toml_escape_passthrough() {
+        assert_eq!(toml_escape("ghe.example.com"), "ghe.example.com");
+    }
+
+    #[test]
+    fn test_toml_escape_backslash_and_quote() {
+        assert_eq!(toml_escape(r#"a\b"c"#), r#"a\\b\"c"#);
     }
 
     // --- parse_github_url tests ---
