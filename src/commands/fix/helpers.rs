@@ -1,4 +1,6 @@
 use crate::minion_registry::{with_registry, MinionMode, OrchestrationPhase};
+use std::path::Path;
+use tokio::process::Command as TokioCommand;
 
 /// Updates the orchestration phase for a minion in the registry.
 /// Logs a warning if the update fails, since phase tracking is important for resume correctness.
@@ -75,6 +77,162 @@ pub(crate) async fn try_mark_issue_failed(host: &str, owner: &str, repo: &str, i
             log::warn!("⚠️  Failed to update issue label: {:#}", e);
         }
     }
+}
+
+/// Resolves the base branch for a worktree, preferring local `origin/HEAD`
+/// and falling back to the GitHub API.
+async fn resolve_base_branch(checkout_path: &Path, host: &str, owner: &str, repo: &str) -> String {
+    if let Ok(out) = TokioCommand::new("git")
+        .arg("-C")
+        .arg(checkout_path)
+        .args(["symbolic-ref", "refs/remotes/origin/HEAD"])
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .env_remove("GIT_COMMON_DIR")
+        .output()
+        .await
+    {
+        if out.status.success() {
+            let raw = String::from_utf8_lossy(&out.stdout);
+            if let Some(branch) = raw.trim().strip_prefix("refs/remotes/origin/") {
+                return branch.to_string();
+            }
+        }
+    }
+
+    crate::github::get_default_branch(host, owner, repo)
+        .await
+        .unwrap_or_else(|e| {
+            log::warn!(
+                "Could not determine default branch from GitHub API: {}. Falling back to 'main'.",
+                e
+            );
+            "main".to_string()
+        })
+}
+
+/// Counts commits on HEAD that are not on the base branch.
+/// Returns 0 on any error (conservative: only act when we're confident).
+async fn count_commits_ahead(checkout_path: &Path, base_branch: &str) -> usize {
+    let output = match TokioCommand::new("git")
+        .arg("-C")
+        .arg(checkout_path)
+        .args([
+            "rev-list",
+            "--count",
+            &format!("origin/{}..HEAD", base_branch),
+        ])
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .env_remove("GIT_COMMON_DIR")
+        .output()
+        .await
+    {
+        Ok(o) => o,
+        Err(e) => {
+            log::warn!("Failed to count commits ahead of base: {}", e);
+            return 0;
+        }
+    };
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        log::warn!("git rev-list --count failed: {}", stderr.trim());
+        return 0;
+    }
+
+    String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse::<usize>()
+        .unwrap_or(0)
+}
+
+/// Pushes the branch to origin from within the worktree's checkout.
+async fn push_branch(checkout_path: &Path, branch_name: &str) -> anyhow::Result<()> {
+    let output = TokioCommand::new("git")
+        .arg("-C")
+        .arg(checkout_path)
+        .args(["push", "origin", branch_name])
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .env_remove("GIT_COMMON_DIR")
+        .output()
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to execute git push: {}", e))?;
+
+    if output.status.success() {
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        Err(anyhow::anyhow!("git push failed: {}", stderr.trim()))
+    }
+}
+
+/// Attempts to preserve committed work when the agent exits unexpectedly.
+///
+/// If the branch has local commits that aren't on the base, pushes the branch
+/// and posts a diagnostic comment on the issue so the user (or a future minion)
+/// can recover the work. Fire-and-forget: errors are logged, not propagated.
+///
+/// Returns `true` if commits were found and a push was attempted (regardless of
+/// whether the push itself succeeded).
+pub(crate) async fn try_preserve_branch_work(
+    host: &str,
+    owner: &str,
+    repo: &str,
+    issue_num: Option<u64>,
+    checkout_path: &Path,
+    branch_name: &str,
+    minion_id: &str,
+) -> bool {
+    let base_branch = resolve_base_branch(checkout_path, host, owner, repo).await;
+    let commits_ahead = count_commits_ahead(checkout_path, &base_branch).await;
+
+    if commits_ahead == 0 {
+        return false;
+    }
+
+    let push_result = push_branch(checkout_path, branch_name).await;
+    let push_succeeded = push_result.is_ok();
+    if let Err(ref e) = push_result {
+        log::warn!(
+            "⚠️  Failed to push branch '{}' after agent exit: {:#}",
+            branch_name,
+            e
+        );
+    } else {
+        println!(
+            "🚀 Pushed branch '{}' to preserve agent's work",
+            branch_name
+        );
+    }
+
+    if let Some(num) = issue_num {
+        let branch_line = if push_succeeded {
+            format!(
+                "Branch pushed: [`{}`](https://{}/{}/{}/tree/{})",
+                branch_name, host, owner, repo, branch_name
+            )
+        } else {
+            format!(
+                "⚠️  Branch push failed — commits remain only in the local worktree for `{}`.",
+                branch_name
+            )
+        };
+        let comment = format!(
+            "⚠️  Minion `{}` exited unexpectedly during the agent phase with {} \
+             unpushed commit(s) on its branch.\n\n\
+             {}\n\n\
+             Use `gru resume {}` to retry, or inspect the branch to recover the work.",
+            minion_id, commits_ahead, branch_line, minion_id
+        );
+        try_post_issue_comment(host, owner, repo, num, &comment).await;
+    }
+
+    true
 }
 
 /// Cleans up orchestration state after a post-agent failure. Without this,
@@ -267,6 +425,74 @@ mod tests {
             "⚠️  Minion `M1gt` failed after the agent phase: PR creation failed: no PR was created\n\n\
              Use `gru resume M1gt` to retry."
         );
+    }
+
+    /// Sets up a tiny git repo with `main` as base and a feature branch with
+    /// `extra` commits ahead. The `origin` remote points to a bare clone so
+    /// that `origin/main` resolves locally.
+    fn setup_test_repo_ahead(dir: &std::path::Path, extra: usize) -> std::path::PathBuf {
+        use std::process::Command as StdCmd;
+        let run = |args: &[&str], cwd: &std::path::Path| {
+            let out = StdCmd::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .env_remove("GIT_DIR")
+                .env_remove("GIT_WORK_TREE")
+                .env_remove("GIT_INDEX_FILE")
+                .env_remove("GIT_COMMON_DIR")
+                .output()
+                .expect("git failed");
+            assert!(
+                out.status.success(),
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+
+        let bare = dir.join("origin.git");
+        StdCmd::new("git")
+            .args(["init", "--bare", bare.to_str().unwrap()])
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
+            .env_remove("GIT_COMMON_DIR")
+            .status()
+            .unwrap();
+
+        let wt = dir.join("wt");
+        std::fs::create_dir_all(&wt).unwrap();
+        run(&["init", "-b", "main"], &wt);
+        run(&["config", "user.email", "t@t"], &wt);
+        run(&["config", "user.name", "t"], &wt);
+        run(&["remote", "add", "origin", bare.to_str().unwrap()], &wt);
+        std::fs::write(wt.join("base.txt"), "base").unwrap();
+        run(&["add", "."], &wt);
+        run(&["commit", "-m", "base"], &wt);
+        run(&["push", "-u", "origin", "main"], &wt);
+        run(&["checkout", "-b", "feature"], &wt);
+        for i in 0..extra {
+            std::fs::write(wt.join(format!("f{}.txt", i)), "x").unwrap();
+            run(&["add", "."], &wt);
+            run(&["commit", "-m", &format!("c{}", i)], &wt);
+        }
+        wt
+    }
+
+    #[tokio::test]
+    async fn test_count_commits_ahead_with_new_commits() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wt = setup_test_repo_ahead(tmp.path(), 2);
+        let n = super::count_commits_ahead(&wt, "main").await;
+        assert_eq!(n, 2);
+    }
+
+    #[tokio::test]
+    async fn test_count_commits_ahead_no_new_commits() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wt = setup_test_repo_ahead(tmp.path(), 0);
+        let n = super::count_commits_ahead(&wt, "main").await;
+        assert_eq!(n, 0);
     }
 
     #[test]

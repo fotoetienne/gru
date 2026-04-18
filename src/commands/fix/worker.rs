@@ -1,5 +1,8 @@
 use super::agent::{resume_agent_session, run_agent_session};
-use super::helpers::{try_mark_issue_blocked, try_mark_issue_failed, update_orchestration_phase};
+use super::helpers::{
+    try_mark_issue_blocked, try_mark_issue_failed, try_preserve_branch_work,
+    update_orchestration_phase,
+};
 use super::monitor::{monitor_ci_after_fix, monitor_pr_lifecycle};
 use super::pr::handle_pr_creation;
 use super::types::{AgentResult, IssueContext, WorktreeContext};
@@ -56,6 +59,16 @@ pub(crate) async fn run_agent_phase(
         Ok(result) => {
             if !result.status.success() {
                 update_orchestration_phase(&wt_ctx.minion_id, OrchestrationPhase::Failed).await;
+                try_preserve_branch_work(
+                    &issue_ctx.host,
+                    &issue_ctx.owner,
+                    &issue_ctx.repo,
+                    issue_ctx.issue_num,
+                    &wt_ctx.checkout_path,
+                    &wt_ctx.branch_name,
+                    &wt_ctx.minion_id,
+                )
+                .await;
                 if let Some(issue_num) = issue_ctx.issue_num {
                     try_mark_issue_failed(
                         &issue_ctx.host,
