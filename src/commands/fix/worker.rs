@@ -1,5 +1,8 @@
 use super::agent::{resume_agent_session, run_agent_session};
-use super::helpers::{try_mark_issue_blocked, try_mark_issue_failed, update_orchestration_phase};
+use super::helpers::{
+    try_mark_issue_blocked, try_mark_issue_failed, try_preserve_branch_work,
+    update_orchestration_phase,
+};
 use super::monitor::{monitor_ci_after_fix, monitor_pr_lifecycle};
 use super::pr::handle_pr_creation;
 use super::types::{AgentResult, IssueContext, WorktreeContext};
@@ -51,6 +54,29 @@ pub(crate) async fn run_agent_phase(
     } else {
         run_agent_session(backend, issue_ctx, wt_ctx, quiet, timeout_opt).await
     };
+
+    // Preserve any committed work BEFORE any failure-path bookkeeping — a
+    // concurrent `gru resume` could otherwise spawn a new agent session on the
+    // same branch and force-push over the commits we're trying to rescue. All
+    // three failure arms below (non-zero exit, stuck/timeout, other error) hit
+    // the same user-visible #847 symptom when the branch has committed work,
+    // so preservation runs for all three.
+    let agent_failed = match &result {
+        Ok(r) => !r.status.success(),
+        Err(_) => true,
+    };
+    if agent_failed {
+        try_preserve_branch_work(
+            &issue_ctx.host,
+            &issue_ctx.owner,
+            &issue_ctx.repo,
+            issue_ctx.issue_num,
+            &wt_ctx.checkout_path,
+            &wt_ctx.branch_name,
+            &wt_ctx.minion_id,
+        )
+        .await;
+    }
 
     match result {
         Ok(result) => {
