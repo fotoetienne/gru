@@ -1,4 +1,4 @@
-use crate::minion_registry::{with_registry, OrchestrationPhase};
+use crate::minion_registry::{with_registry, MinionMode, OrchestrationPhase};
 
 /// Updates the orchestration phase for a minion in the registry.
 /// Logs a warning if the update fails, since phase tracking is important for resume correctness.
@@ -74,6 +74,58 @@ pub(crate) async fn try_mark_issue_failed(host: &str, owner: &str, repo: &str, i
         Err(e) => {
             log::warn!("⚠️  Failed to update issue label: {:#}", e);
         }
+    }
+}
+
+/// Cleans up orchestration state after a post-agent failure. Without this,
+/// a failure between the agent exiting and the worker exiting leaves the
+/// issue with `gru:in-progress` and no live process — an "orphaned label"
+/// recoverable only by the multi-hour auto-recovery scan.
+///
+/// This helper:
+/// 1. Posts an explanatory comment on the issue
+/// 2. Transitions the issue label `gru:in-progress` → `gru:failed`
+/// 3. Clears the PID and marks the minion as `Stopped` in the registry
+///
+/// Currently wired only to PR creation failures in `run_worker`. The PR
+/// lifecycle monitoring phase (`monitor_pr_phase`) handles its own label
+/// transitions (to `gru:blocked`), so invoking this helper there would
+/// double-label the issue.
+///
+/// Fire-and-forget: logs on failure but does not propagate errors, since the
+/// caller is already returning an error of its own.
+pub(crate) async fn cleanup_post_agent_failure(
+    host: &str,
+    owner: &str,
+    repo: &str,
+    issue_num: Option<u64>,
+    minion_id: &str,
+    reason: &str,
+) {
+    if let Some(num) = issue_num {
+        let comment = format!(
+            "⚠️  Minion `{}` failed after the agent phase: {}\n\n\
+             Use `gru resume {}` to retry.",
+            minion_id, reason, minion_id
+        );
+        try_post_issue_comment(host, owner, repo, num, &comment).await;
+        try_mark_issue_failed(host, owner, repo, num).await;
+    }
+
+    let mid = minion_id.to_string();
+    if let Err(e) = with_registry(move |reg| {
+        reg.update(&mid, |info| {
+            info.clear_pid();
+            info.mode = MinionMode::Stopped;
+        })
+    })
+    .await
+    {
+        log::warn!(
+            "⚠️  Failed to clear registry state for {}: {:#}",
+            minion_id,
+            e
+        );
     }
 }
 
@@ -198,6 +250,22 @@ mod tests {
                 "CI auto-fix failed after {} attempts. See PR #123 for details. Human intervention required.",
                 crate::ci::MAX_CI_FIX_ATTEMPTS
             )
+        );
+    }
+
+    #[test]
+    fn test_post_agent_failure_comment_format() {
+        let minion_id = "M1gt";
+        let reason = "PR creation failed: no PR was created";
+        let comment = format!(
+            "⚠️  Minion `{}` failed after the agent phase: {}\n\n\
+             Use `gru resume {}` to retry.",
+            minion_id, reason, minion_id
+        );
+        assert_eq!(
+            comment,
+            "⚠️  Minion `M1gt` failed after the agent phase: PR creation failed: no PR was created\n\n\
+             Use `gru resume M1gt` to retry."
         );
     }
 
