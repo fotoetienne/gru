@@ -218,7 +218,22 @@ async fn run_worker(minion_id: &str, issue: &str, opts: FixOptions) -> Result<i3
     }
 
     // Phase 4: Create PR
-    let pr_number = worker::create_pr_phase(&issue_ctx, &wt_ctx, &start_phase, auto_merge).await?;
+    let pr_number =
+        match worker::create_pr_phase(&issue_ctx, &wt_ctx, &start_phase, auto_merge).await {
+            Ok(pr) => pr,
+            Err(e) => {
+                helpers::cleanup_post_agent_failure(
+                    &issue_ctx.host,
+                    &issue_ctx.owner,
+                    &issue_ctx.repo,
+                    issue_ctx.issue_num,
+                    &wt_ctx.minion_id,
+                    &format!("{:#}", e),
+                )
+                .await;
+                return Err(e);
+            }
+        };
 
     if no_watch {
         if let Some(ref pr_num) = pr_number {
@@ -244,6 +259,8 @@ async fn run_worker(minion_id: &str, issue: &str, opts: FixOptions) -> Result<i3
     .await;
 
     if monitor_result.is_err() {
+        // monitor_pr_phase already marks the issue as blocked on its known
+        // failure paths; no label cleanup needed here.
         return Ok(1);
     }
 
