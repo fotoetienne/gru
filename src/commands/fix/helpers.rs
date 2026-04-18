@@ -79,9 +79,17 @@ pub(crate) async fn try_mark_issue_failed(host: &str, owner: &str, repo: &str, i
     }
 }
 
-/// Resolves the base branch for a worktree, preferring local `origin/HEAD`
-/// and falling back to the GitHub API.
-async fn resolve_base_branch(checkout_path: &Path, host: &str, owner: &str, repo: &str) -> String {
+/// Resolves candidate base-branch names in preference order: local
+/// `origin/HEAD`, then the GitHub API result, then `main` / `master`.
+/// Callers pick the first candidate whose `origin/<branch>` ref exists locally.
+async fn base_branch_candidates(
+    checkout_path: &Path,
+    host: &str,
+    owner: &str,
+    repo: &str,
+) -> Vec<String> {
+    let mut candidates: Vec<String> = Vec::new();
+
     if let Ok(out) = TokioCommand::new("git")
         .arg("-C")
         .arg(checkout_path)
@@ -96,20 +104,33 @@ async fn resolve_base_branch(checkout_path: &Path, host: &str, owner: &str, repo
         if out.status.success() {
             let raw = String::from_utf8_lossy(&out.stdout);
             if let Some(branch) = raw.trim().strip_prefix("refs/remotes/origin/") {
-                return branch.to_string();
+                candidates.push(branch.to_string());
             }
         }
     }
 
-    crate::github::get_default_branch(host, owner, repo)
-        .await
-        .unwrap_or_else(|e| {
+    match crate::github::get_default_branch(host, owner, repo).await {
+        Ok(branch) => {
+            if !candidates.iter().any(|c| c == &branch) {
+                candidates.push(branch);
+            }
+        }
+        Err(e) => {
             log::warn!(
-                "Could not determine default branch from GitHub API: {}. Falling back to 'main'.",
+                "Could not determine default branch from GitHub API: {}. \
+                 Falling back to 'main' / 'master' guesses.",
                 e
             );
-            "main".to_string()
-        })
+        }
+    }
+
+    for guess in ["main", "master"] {
+        if !candidates.iter().any(|c| c == guess) {
+            candidates.push(guess.to_string());
+        }
+    }
+
+    candidates
 }
 
 /// Returns `true` if `refs/remotes/origin/<branch>` exists locally in the worktree.
@@ -218,12 +239,41 @@ pub(crate) async fn try_preserve_branch_work(
     branch_name: &str,
     minion_id: &str,
 ) -> bool {
-    let base_branch = resolve_base_branch(checkout_path, host, owner, repo).await;
-    let commits_ahead = count_commits_ahead(checkout_path, &base_branch).await;
+    let candidates = base_branch_candidates(checkout_path, host, owner, repo).await;
+    let mut resolved: Option<(String, usize)> = None;
+    for base in &candidates {
+        if !origin_ref_exists(checkout_path, base).await {
+            continue;
+        }
+        let n = count_commits_ahead(checkout_path, base).await;
+        resolved = Some((base.clone(), n));
+        break;
+    }
+
+    let (base_branch, commits_ahead) = match resolved {
+        Some(r) => r,
+        None => {
+            log::error!(
+                "🚨 Could not resolve a base branch for commit preservation on '{}'. \
+                 Tried: {:?}. Committed work on the branch remains only in the local \
+                 worktree at {}.",
+                branch_name,
+                candidates,
+                checkout_path.display()
+            );
+            return false;
+        }
+    };
 
     if commits_ahead == 0 {
         return false;
     }
+    log::info!(
+        "Preserving {} commit(s) on '{}' (base: origin/{})",
+        commits_ahead,
+        branch_name,
+        base_branch
+    );
 
     let push_result = push_branch(checkout_path, branch_name).await;
     let push_succeeded = push_result.is_ok();

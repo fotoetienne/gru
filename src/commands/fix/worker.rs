@@ -55,23 +55,32 @@ pub(crate) async fn run_agent_phase(
         run_agent_session(backend, issue_ctx, wt_ctx, quiet, timeout_opt).await
     };
 
+    // Preserve any committed work BEFORE any failure-path bookkeeping — a
+    // concurrent `gru resume` could otherwise spawn a new agent session on the
+    // same branch and force-push over the commits we're trying to rescue. All
+    // three failure arms below (non-zero exit, stuck/timeout, other error) hit
+    // the same user-visible #847 symptom when the branch has committed work,
+    // so preservation runs for all three.
+    let agent_failed = match &result {
+        Ok(r) => !r.status.success(),
+        Err(_) => true,
+    };
+    if agent_failed {
+        try_preserve_branch_work(
+            &issue_ctx.host,
+            &issue_ctx.owner,
+            &issue_ctx.repo,
+            issue_ctx.issue_num,
+            &wt_ctx.checkout_path,
+            &wt_ctx.branch_name,
+            &wt_ctx.minion_id,
+        )
+        .await;
+    }
+
     match result {
         Ok(result) => {
             if !result.status.success() {
-                // Preserve any committed work BEFORE flipping the phase to
-                // Failed — a concurrent `gru resume` could otherwise spawn a
-                // new agent session on the same branch and force-push over
-                // the commits we're trying to rescue.
-                try_preserve_branch_work(
-                    &issue_ctx.host,
-                    &issue_ctx.owner,
-                    &issue_ctx.repo,
-                    issue_ctx.issue_num,
-                    &wt_ctx.checkout_path,
-                    &wt_ctx.branch_name,
-                    &wt_ctx.minion_id,
-                )
-                .await;
                 update_orchestration_phase(&wt_ctx.minion_id, OrchestrationPhase::Failed).await;
                 if let Some(issue_num) = issue_ctx.issue_num {
                     try_mark_issue_failed(
