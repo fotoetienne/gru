@@ -262,9 +262,11 @@ mod tests {
              Use `gru resume {}` to retry.",
             minion_id, reason, minion_id
         );
-        assert!(comment.contains("Minion `M1gt` failed after the agent phase"));
-        assert!(comment.contains("PR creation failed"));
-        assert!(comment.contains("gru resume M1gt"));
+        assert_eq!(
+            comment,
+            "⚠️  Minion `M1gt` failed after the agent phase: PR creation failed: no PR was created\n\n\
+             Use `gru resume M1gt` to retry."
+        );
     }
 
     #[test]
