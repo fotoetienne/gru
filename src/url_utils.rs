@@ -94,6 +94,32 @@ pub(crate) fn parse_github_url(url: &str, host_registry: &HostRegistry) -> Optio
     })
 }
 
+/// If `input` looks like an HTTP(S) URL with an unrecognized host, returns a
+/// targeted error message naming the host and suggesting a `[github_hosts.*]`
+/// config entry. Returns `None` for non-URL input or URLs whose host is
+/// already recognized (caller should emit the generic error in that case).
+fn unrecognized_host_error(input: &str, host_registry: &HostRegistry) -> Option<String> {
+    let cleaned = clean_url(input);
+    let parts = git::split_github_url(cleaned)?;
+    if !matches!(
+        parts.scheme,
+        git::GitUrlScheme::Https | git::GitUrlScheme::Http
+    ) {
+        return None;
+    }
+    if host_registry.canonical_host(parts.host).is_some() {
+        return None;
+    }
+    let host = parts.host;
+    Some(format!(
+        "Unrecognized GitHub host '{host}'.\n\
+         Add it to ~/.gru/config.toml:\n\
+         \n    [github_hosts.myhost]\n    host = \"{host}\"\n\
+         \n\
+         Then retry with the original URL."
+    ))
+}
+
 /// Extracts owner, repo, host, and issue number from an issue argument.
 ///
 /// Supports both plain issue numbers (auto-detects from current directory) and GitHub URLs.
@@ -136,6 +162,10 @@ pub(crate) async fn parse_issue_info(
             "Expected a GitHub issue URL, but got a pull request URL.\n\
              Did you mean to use `gru review` instead?"
         );
+    }
+
+    if let Some(msg) = unrecognized_host_error(issue, host_registry) {
+        anyhow::bail!("{}", msg);
     }
 
     anyhow::bail!(
@@ -198,6 +228,8 @@ pub(crate) async fn parse_pr_info(
         }
         let repo_full = github::repo_slug(&parsed.owner, &parsed.repo);
         (parsed.number.to_string(), parsed.host, Some(repo_full))
+    } else if let Some(msg) = unrecognized_host_error(pr, host_registry) {
+        anyhow::bail!("{}", msg);
     } else {
         anyhow::bail!(
             "Invalid PR format. Expected: <number> or <github-url>\n\
@@ -503,6 +535,82 @@ mod tests {
         assert!(parse_issue_info("not-a-number", &hosts).await.is_err());
         assert!(parse_issue_info("", &hosts).await.is_err());
         assert!(parse_issue_info("-42", &hosts).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_parse_issue_info_unrecognized_host_url() {
+        let err = parse_issue_info(
+            "https://ghe.example.com/org/repo/issues/42",
+            &default_hosts(),
+        )
+        .await
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Unrecognized GitHub host 'ghe.example.com'"),
+            "Expected unrecognized host error, got: {}",
+            msg
+        );
+        assert!(
+            msg.contains("[github_hosts."),
+            "Expected TOML snippet, got: {}",
+            msg
+        );
+        assert!(
+            msg.contains("host = \"ghe.example.com\""),
+            "Expected host line in TOML snippet, got: {}",
+            msg
+        );
+    }
+
+    #[tokio::test]
+    async fn test_parse_issue_info_malformed_path_on_recognized_host_uses_generic_error() {
+        // Recognized host but malformed path → generic "Invalid issue format" error.
+        let err = parse_issue_info("https://github.com/owner/repo/wiki/42", &default_hosts())
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Invalid issue format"),
+            "Expected generic invalid format error, got: {}",
+            msg
+        );
+        assert!(
+            !msg.contains("Unrecognized GitHub host"),
+            "Should not emit unrecognized host error for known host, got: {}",
+            msg
+        );
+    }
+
+    #[tokio::test]
+    async fn test_parse_issue_info_non_url_uses_generic_error() {
+        let err = parse_issue_info("not-a-number", &default_hosts())
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Invalid issue format"),
+            "Expected generic error for non-URL input, got: {}",
+            msg
+        );
+    }
+
+    #[tokio::test]
+    async fn test_parse_pr_info_unrecognized_host_url() {
+        let err = parse_pr_info("https://ghe.example.com/org/repo/pull/42", &default_hosts())
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Unrecognized GitHub host 'ghe.example.com'"),
+            "Expected unrecognized host error, got: {}",
+            msg
+        );
+        assert!(
+            msg.contains("host = \"ghe.example.com\""),
+            "Expected TOML snippet, got: {}",
+            msg
+        );
     }
 
     #[tokio::test]
