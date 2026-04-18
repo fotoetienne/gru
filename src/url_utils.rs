@@ -114,7 +114,7 @@ fn unrecognized_host_error(input: &str, host_registry: &HostRegistry) -> Option<
     Some(format!(
         "Unrecognized GitHub host '{host}'.\n\
          Add it to ~/.gru/config.toml:\n\
-         \n    [github_hosts.myhost]\n    host = \"{host}\"\n\
+         \n    [github_hosts.\"{host}\"]\n    host = \"{host}\"\n\
          \n\
          Then retry with the original URL."
     ))
@@ -591,6 +591,23 @@ mod tests {
         assert!(
             msg.contains("Invalid issue format"),
             "Expected generic error for non-URL input, got: {}",
+            msg
+        );
+    }
+
+    #[tokio::test]
+    async fn test_parse_issue_info_unrecognized_host_with_port() {
+        // Port should be stripped before registry lookup; error still names the bare host.
+        let err = parse_issue_info(
+            "https://ghe.example.com:8443/org/repo/issues/42",
+            &default_hosts(),
+        )
+        .await
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Unrecognized GitHub host 'ghe.example.com'"),
+            "Expected unrecognized host error (port stripped), got: {}",
             msg
         );
     }
