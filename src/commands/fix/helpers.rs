@@ -77,16 +77,20 @@ pub(crate) async fn try_mark_issue_failed(host: &str, owner: &str, repo: &str, i
     }
 }
 
-/// Cleans up orchestration state after a post-agent failure (PR creation or
-/// PR lifecycle monitoring). Without this, a failure between the agent exiting
-/// and the worker exiting leaves the issue with `gru:in-progress` and no live
-/// process — an "orphaned label" recoverable only by the multi-hour auto-recovery
-/// scan.
+/// Cleans up orchestration state after a post-agent failure. Without this,
+/// a failure between the agent exiting and the worker exiting leaves the
+/// issue with `gru:in-progress` and no live process — an "orphaned label"
+/// recoverable only by the multi-hour auto-recovery scan.
 ///
 /// This helper:
 /// 1. Posts an explanatory comment on the issue
 /// 2. Transitions the issue label `gru:in-progress` → `gru:failed`
 /// 3. Clears the PID and marks the minion as `Stopped` in the registry
+///
+/// Currently wired only to PR creation failures in `run_worker`. The PR
+/// lifecycle monitoring phase (`monitor_pr_phase`) handles its own label
+/// transitions (to `gru:blocked`), so invoking this helper there would
+/// double-label the issue.
 ///
 /// Fire-and-forget: logs on failure but does not propagate errors, since the
 /// caller is already returning an error of its own.
