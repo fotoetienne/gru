@@ -58,7 +58,10 @@ pub(crate) async fn run_agent_phase(
     match result {
         Ok(result) => {
             if !result.status.success() {
-                update_orchestration_phase(&wt_ctx.minion_id, OrchestrationPhase::Failed).await;
+                // Preserve any committed work BEFORE flipping the phase to
+                // Failed — a concurrent `gru resume` could otherwise spawn a
+                // new agent session on the same branch and force-push over
+                // the commits we're trying to rescue.
                 try_preserve_branch_work(
                     &issue_ctx.host,
                     &issue_ctx.owner,
@@ -69,6 +72,7 @@ pub(crate) async fn run_agent_phase(
                     &wt_ctx.minion_id,
                 )
                 .await;
+                update_orchestration_phase(&wt_ctx.minion_id, OrchestrationPhase::Failed).await;
                 if let Some(issue_num) = issue_ctx.issue_num {
                     try_mark_issue_failed(
                         &issue_ctx.host,
