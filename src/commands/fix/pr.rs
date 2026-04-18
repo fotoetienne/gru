@@ -457,15 +457,11 @@ pub(crate) async fn handle_pr_creation(
                         );
                         Ok(Some(pr_number))
                     }
-                    None => {
-                        log::warn!(
-                            "   No existing PR found for branch '{}'. \
-                             You can create the PR manually at: {}",
-                            wt_ctx.branch_name,
-                            manual_link
-                        );
-                        Ok(None)
-                    }
+                    None => Err(e.context(format!(
+                        "PR creation failed and no existing PR found for branch '{}'. \
+                         You can create the PR manually at: {}",
+                        wt_ctx.branch_name, manual_link
+                    ))),
                 }
             }
         }
