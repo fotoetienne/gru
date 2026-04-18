@@ -133,17 +133,12 @@ async fn base_branch_candidates(
     candidates
 }
 
-/// Returns `true` if `refs/remotes/origin/<branch>` exists locally in the worktree.
-async fn origin_ref_exists(checkout_path: &Path, branch: &str) -> bool {
+/// Checks whether a git ref exists in the worktree.
+async fn ref_exists(checkout_path: &Path, refname: &str) -> bool {
     TokioCommand::new("git")
         .arg("-C")
         .arg(checkout_path)
-        .args([
-            "show-ref",
-            "--verify",
-            "--quiet",
-            &format!("refs/remotes/origin/{}", branch),
-        ])
+        .args(["show-ref", "--verify", "--quiet", refname])
         .env_remove("GIT_DIR")
         .env_remove("GIT_WORK_TREE")
         .env_remove("GIT_INDEX_FILE")
@@ -154,26 +149,30 @@ async fn origin_ref_exists(checkout_path: &Path, branch: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Counts commits on HEAD that are not on the base branch.
-/// Returns 0 when `origin/<base_branch>` is missing or the rev-list fails —
-/// callers treat 0 as "nothing to preserve".
-async fn count_commits_ahead(checkout_path: &Path, base_branch: &str) -> usize {
-    if !origin_ref_exists(checkout_path, base_branch).await {
-        log::warn!(
-            "origin/{} not present in worktree; cannot count commits ahead of base",
-            base_branch
-        );
-        return 0;
+/// Resolves a usable base ref for `branch`, preferring the remote-tracking
+/// ref and falling back to the local head. Gru's bare-repo worktrees typically
+/// fetch the default branch into `refs/heads/<base>`, not
+/// `refs/remotes/origin/<base>`, so the local fallback keeps the rescue from
+/// silently giving up on otherwise-standard setups.
+async fn resolve_base_ref(checkout_path: &Path, branch: &str) -> Option<String> {
+    let remote = format!("refs/remotes/origin/{}", branch);
+    if ref_exists(checkout_path, &remote).await {
+        return Some(remote);
     }
+    let local = format!("refs/heads/{}", branch);
+    if ref_exists(checkout_path, &local).await {
+        return Some(local);
+    }
+    None
+}
 
+/// Counts commits on HEAD that are not on `base_ref`.
+/// Returns 0 on any error — callers treat 0 as "nothing to preserve".
+async fn count_commits_ahead(checkout_path: &Path, base_ref: &str) -> usize {
     let output = match TokioCommand::new("git")
         .arg("-C")
         .arg(checkout_path)
-        .args([
-            "rev-list",
-            "--count",
-            &format!("origin/{}..HEAD", base_branch),
-        ])
+        .args(["rev-list", "--count", &format!("{}..HEAD", base_ref)])
         .env_remove("GIT_DIR")
         .env_remove("GIT_WORK_TREE")
         .env_remove("GIT_INDEX_FILE")
@@ -200,12 +199,18 @@ async fn count_commits_ahead(checkout_path: &Path, base_branch: &str) -> usize {
         .unwrap_or(0)
 }
 
-/// Pushes the branch to origin from within the worktree's checkout.
+/// Pushes the worktree's HEAD to `refs/heads/<branch_name>` on origin.
+///
+/// Using an explicit `HEAD:refs/heads/<branch>` refspec (rather than
+/// `origin <branch>`) makes the rescue robust when the worktree is in a
+/// detached-HEAD state (rebase, merge, or mid-cherry-pick), which can
+/// happen if the agent was killed at the wrong moment.
 async fn push_branch(checkout_path: &Path, branch_name: &str) -> anyhow::Result<()> {
+    let refspec = format!("HEAD:refs/heads/{}", branch_name);
     let output = TokioCommand::new("git")
         .arg("-C")
         .arg(checkout_path)
-        .args(["push", "--force-with-lease", "origin", branch_name])
+        .args(["push", "--force-with-lease", "origin", &refspec])
         .env_remove("GIT_DIR")
         .env_remove("GIT_WORK_TREE")
         .env_remove("GIT_INDEX_FILE")
@@ -240,17 +245,16 @@ pub(crate) async fn try_preserve_branch_work(
     minion_id: &str,
 ) -> bool {
     let candidates = base_branch_candidates(checkout_path, host, owner, repo).await;
-    let mut resolved: Option<(String, usize)> = None;
+    let mut resolved: Option<(String, String, usize)> = None;
     for base in &candidates {
-        if !origin_ref_exists(checkout_path, base).await {
-            continue;
+        if let Some(base_ref) = resolve_base_ref(checkout_path, base).await {
+            let n = count_commits_ahead(checkout_path, &base_ref).await;
+            resolved = Some((base.clone(), base_ref, n));
+            break;
         }
-        let n = count_commits_ahead(checkout_path, base).await;
-        resolved = Some((base.clone(), n));
-        break;
     }
 
-    let (base_branch, commits_ahead) = match resolved {
+    let (base_branch, base_ref, commits_ahead) = match resolved {
         Some(r) => r,
         None => {
             log::error!(
@@ -269,10 +273,11 @@ pub(crate) async fn try_preserve_branch_work(
         return false;
     }
     log::info!(
-        "Preserving {} commit(s) on '{}' (base: origin/{})",
+        "Preserving {} commit(s) on '{}' (base: {} via '{}')",
         commits_ahead,
         branch_name,
-        base_branch
+        base_branch,
+        base_ref
     );
 
     let push_result = push_branch(checkout_path, branch_name).await;
@@ -531,14 +536,15 @@ mod tests {
         };
 
         let bare = dir.join("origin.git");
-        StdCmd::new("git")
+        let status = StdCmd::new("git")
             .args(["init", "--bare", bare.to_str().unwrap()])
             .env_remove("GIT_DIR")
             .env_remove("GIT_WORK_TREE")
             .env_remove("GIT_INDEX_FILE")
             .env_remove("GIT_COMMON_DIR")
             .status()
-            .unwrap();
+            .expect("git init --bare failed to spawn");
+        assert!(status.success(), "git init --bare exited {:?}", status);
 
         let wt = dir.join("wt");
         std::fs::create_dir_all(&wt).unwrap();
@@ -563,8 +569,54 @@ mod tests {
     async fn test_count_commits_ahead_with_new_commits() {
         let tmp = tempfile::tempdir().unwrap();
         let wt = setup_test_repo_ahead(tmp.path(), 2);
-        let n = super::count_commits_ahead(&wt, "main").await;
+        let n = super::count_commits_ahead(&wt, "refs/remotes/origin/main").await;
         assert_eq!(n, 2);
+    }
+
+    #[tokio::test]
+    async fn test_resolve_base_ref_prefers_remote_then_local() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wt = setup_test_repo_ahead(tmp.path(), 1);
+
+        // feature branch is checked out; local `main` exists and so does
+        // `refs/remotes/origin/main` — remote should win.
+        let base = super::resolve_base_ref(&wt, "main").await;
+        assert_eq!(base.as_deref(), Some("refs/remotes/origin/main"));
+
+        // Missing branch returns None.
+        let missing = super::resolve_base_ref(&wt, "nope").await;
+        assert!(missing.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_resolve_base_ref_falls_back_to_local_head() {
+        // Repo with a local `refs/heads/main` but no `refs/remotes/origin/main`
+        // — mimics Gru's bare-repo-worktree layout where the default branch
+        // is fetched into refs/heads/<base>, not refs/remotes/origin/<base>.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        use std::process::Command as StdCmd;
+        let run = |args: &[&str]| {
+            let out = StdCmd::new("git")
+                .args(args)
+                .current_dir(dir)
+                .env_remove("GIT_DIR")
+                .env_remove("GIT_WORK_TREE")
+                .env_remove("GIT_INDEX_FILE")
+                .env_remove("GIT_COMMON_DIR")
+                .output()
+                .unwrap();
+            assert!(out.status.success());
+        };
+        run(&["init", "-b", "main"]);
+        run(&["config", "user.email", "t@t"]);
+        run(&["config", "user.name", "t"]);
+        std::fs::write(dir.join("a"), "a").unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-m", "a"]);
+
+        let base = super::resolve_base_ref(dir, "main").await;
+        assert_eq!(base.as_deref(), Some("refs/heads/main"));
     }
 
     #[tokio::test]
@@ -595,31 +647,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_count_commits_ahead_missing_origin_ref_returns_zero() {
-        // Worktree with no `origin/<base>` ref should report 0, not error.
+    async fn test_push_branch_from_detached_head() {
+        // Detach HEAD, then push — the explicit `HEAD:refs/heads/<branch>`
+        // refspec should still advance the remote branch.
         let tmp = tempfile::tempdir().unwrap();
-        let dir = tmp.path();
+        let wt = setup_test_repo_ahead(tmp.path(), 1);
         use std::process::Command as StdCmd;
-        let run = |args: &[&str]| {
-            let out = StdCmd::new("git")
-                .args(args)
-                .current_dir(dir)
-                .env_remove("GIT_DIR")
-                .env_remove("GIT_WORK_TREE")
-                .env_remove("GIT_INDEX_FILE")
-                .env_remove("GIT_COMMON_DIR")
-                .output()
-                .unwrap();
-            assert!(out.status.success());
-        };
-        run(&["init", "-b", "main"]);
-        run(&["config", "user.email", "t@t"]);
-        run(&["config", "user.name", "t"]);
-        std::fs::write(dir.join("a"), "a").unwrap();
-        run(&["add", "."]);
-        run(&["commit", "-m", "a"]);
-        // No origin remote, no origin/main ref.
-        let n = super::count_commits_ahead(dir, "main").await;
+        let out = StdCmd::new("git")
+            .args(["-C", wt.to_str().unwrap(), "checkout", "--detach", "HEAD"])
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
+            .env_remove("GIT_COMMON_DIR")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git checkout --detach failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        let result = super::push_branch(&wt, "feature").await;
+        assert!(result.is_ok(), "push_branch failed: {:?}", result.err());
+    }
+
+    #[tokio::test]
+    async fn test_count_commits_ahead_bad_ref_returns_zero() {
+        // Bogus base ref → rev-list fails → function returns 0 rather than erroring.
+        let tmp = tempfile::tempdir().unwrap();
+        let wt = setup_test_repo_ahead(tmp.path(), 1);
+        let n = super::count_commits_ahead(&wt, "refs/remotes/origin/does-not-exist").await;
         assert_eq!(n, 0);
     }
 
@@ -627,7 +684,7 @@ mod tests {
     async fn test_count_commits_ahead_no_new_commits() {
         let tmp = tempfile::tempdir().unwrap();
         let wt = setup_test_repo_ahead(tmp.path(), 0);
-        let n = super::count_commits_ahead(&wt, "main").await;
+        let n = super::count_commits_ahead(&wt, "refs/remotes/origin/main").await;
         assert_eq!(n, 0);
     }
 
