@@ -416,14 +416,11 @@ pub(crate) async fn handle_pr_creation(
                         println!("✅ Recovered existing PR #{}", pr_number);
                         Ok(Some(pr_number))
                     }
-                    None => {
-                        log::warn!(
-                            "⚠️  PR exists for branch '{}' but `gh pr list --head` returned no results. \
-                             This may be a transient GitHub API issue or auth problem; retry with 'gru resume'.",
-                            wt_ctx.branch_name
-                        );
-                        Ok(None)
-                    }
+                    None => Err(e.context(format!(
+                        "PR exists for branch '{}' but `gh pr list --head` returned no results. \
+                         This may be a transient GitHub API issue or auth problem; retry with 'gru resume'.",
+                        wt_ctx.branch_name
+                    ))),
                 }
             } else if err_msg.contains("branch not found") || err_msg.contains("does not exist") {
                 log::warn!("⚠️  Branch was pushed but is no longer available.");
@@ -457,15 +454,11 @@ pub(crate) async fn handle_pr_creation(
                         );
                         Ok(Some(pr_number))
                     }
-                    None => {
-                        log::warn!(
-                            "   No existing PR found for branch '{}'. \
-                             You can create the PR manually at: {}",
-                            wt_ctx.branch_name,
-                            manual_link
-                        );
-                        Ok(None)
-                    }
+                    None => Err(e.context(format!(
+                        "PR creation failed and no existing PR found for branch '{}'. \
+                         You can create the PR manually at: {}",
+                        wt_ctx.branch_name, manual_link
+                    ))),
                 }
             }
         }
