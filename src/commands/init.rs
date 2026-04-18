@@ -1,10 +1,11 @@
 use anyhow::{bail, Context, Result};
 
-use crate::config::LabConfig;
+use crate::config::{GhHostConfig, LabConfig};
 use crate::git::GitRepo;
 use crate::github;
 use crate::labels;
 use crate::workspace::Workspace;
+use std::collections::HashMap;
 
 /// Repository source type for initialization
 #[derive(Debug, Clone)]
@@ -80,6 +81,36 @@ fn validate_host(host: &str) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// Build the `daemon.repos` entry for a repository.
+///
+/// Resolution order:
+/// 1. `github.com` → `owner/repo`
+/// 2. Host matches a named `[github_hosts.*]` entry → `name:owner/repo`
+/// 3. Host contains a dot → legacy `host/owner/repo`
+/// 4. Otherwise → `None` (caller should warn and skip)
+fn build_repo_entry(
+    host: &str,
+    owner: &str,
+    repo: &str,
+    github_hosts: &HashMap<String, GhHostConfig>,
+) -> Option<String> {
+    if host.eq_ignore_ascii_case("github.com") {
+        return Some(format!("{}/{}", owner, repo));
+    }
+    // `validate_github_hosts` enforces case-insensitive uniqueness of `host`
+    // across entries, so at most one match is possible here.
+    if let Some((name, _)) = github_hosts
+        .iter()
+        .find(|(_, gh)| gh.host.eq_ignore_ascii_case(host))
+    {
+        return Some(format!("{}:{}/{}", name, owner, repo));
+    }
+    if host.contains('.') {
+        return Some(format!("{}/{}/{}", host, owner, repo));
+    }
+    None
 }
 
 /// Run prerequisite checks before initialization.
@@ -204,27 +235,21 @@ pub(crate) async fn handle_init(repo_arg: String, host_override: Option<String>)
     }
 
     // 4. Add repo to daemon.repos in config
-    let repo_entry = if host.eq_ignore_ascii_case("github.com") {
-        // Default GitHub host uses owner/repo format
-        format!("{}/{}", owner, repo)
-    } else if host.contains('.') {
-        // Non-GitHub host with a dot is supported in legacy host/owner/repo form
-        format!("{}/{}/{}", host, owner, repo)
-    } else {
-        // Hosts without dots (e.g., "localhost") can't be represented in
-        // host/owner/repo format (config parser requires a dot). Skip and advise.
-        log::warn!(
-            "  ⚠️  Cannot add {}/{}/{} to daemon.repos: host {:?} has no dot. \
-             Add the repo manually using a [github_hosts.*] named entry.",
-            host,
-            owner,
-            repo,
-            host,
-        );
-        String::new()
+    let github_hosts = match LabConfig::load_partial(&config_path) {
+        Ok(cfg) => cfg.github_hosts,
+        Err(e) => {
+            log::warn!(
+                "  ⚠️  Could not load config for [github_hosts.*] lookup; \
+                 proceeding without alias resolution (repo entry will use \
+                 owner/repo for github.com, legacy host/owner/repo for other \
+                 hosts with a dot, or be skipped): {:#}",
+                e
+            );
+            HashMap::new()
+        }
     };
-    if !repo_entry.is_empty() {
-        match LabConfig::add_repo_to_config(&config_path, &repo_entry) {
+    match build_repo_entry(&host, &owner, &repo, &github_hosts) {
+        Some(repo_entry) => match LabConfig::add_repo_to_config(&config_path, &repo_entry) {
             Ok(true) => {
                 println!(
                     "✓ Added {} to daemon.repos in {}",
@@ -238,6 +263,18 @@ pub(crate) async fn handle_init(repo_arg: String, host_override: Option<String>)
             Err(e) => {
                 log::warn!("  ⚠️  Could not update daemon.repos: {}", e);
             }
+        },
+        None => {
+            // Hosts without dots (e.g., "localhost") can't be represented in
+            // host/owner/repo format (config parser requires a dot). Skip and advise.
+            log::warn!(
+                "  ⚠️  Cannot add {}/{}/{} to daemon.repos: host {:?} has no dot. \
+                 Add the repo manually using a [github_hosts.*] named entry.",
+                host,
+                owner,
+                repo,
+                host,
+            );
         }
     }
 
@@ -448,6 +485,78 @@ mod tests {
     #[test]
     fn test_validate_host_rejects_at_sign() {
         assert!(validate_host("user@ghe.example.com").is_err());
+    }
+
+    fn host(h: &str) -> GhHostConfig {
+        GhHostConfig {
+            host: h.to_string(),
+            web_url: None,
+        }
+    }
+
+    #[test]
+    fn test_build_repo_entry_github_com() {
+        let hosts = HashMap::new();
+        assert_eq!(
+            build_repo_entry("github.com", "foo", "bar", &hosts),
+            Some("foo/bar".to_string())
+        );
+    }
+
+    #[test]
+    fn test_build_repo_entry_prefers_named_host_alias() {
+        let mut hosts = HashMap::new();
+        hosts.insert("netflix".to_string(), host("github.netflix.net"));
+        assert_eq!(
+            build_repo_entry("github.netflix.net", "foo", "bar", &hosts),
+            Some("netflix:foo/bar".to_string())
+        );
+    }
+
+    #[test]
+    fn test_build_repo_entry_named_host_match_is_case_insensitive() {
+        let mut hosts = HashMap::new();
+        hosts.insert("corp".to_string(), host("GHE.Example.COM"));
+        assert_eq!(
+            build_repo_entry("ghe.example.com", "o", "r", &hosts),
+            Some("corp:o/r".to_string())
+        );
+    }
+
+    #[test]
+    fn test_build_repo_entry_non_matching_named_host_falls_through_to_legacy() {
+        let mut hosts = HashMap::new();
+        hosts.insert("netflix".to_string(), host("github.netflix.net"));
+        assert_eq!(
+            build_repo_entry("ghe.other.com", "foo", "bar", &hosts),
+            Some("ghe.other.com/foo/bar".to_string())
+        );
+    }
+
+    #[test]
+    fn test_build_repo_entry_falls_through_when_no_alias_matches() {
+        let mut hosts = HashMap::new();
+        hosts.insert("netflix".to_string(), host("github.netflix.net"));
+        // Host doesn't match the configured alias — should fall through to legacy.
+        assert_eq!(
+            build_repo_entry("ghe.other.com", "foo", "bar", &hosts),
+            Some("ghe.other.com/foo/bar".to_string())
+        );
+    }
+
+    #[test]
+    fn test_build_repo_entry_legacy_fallback_for_unnamed_host() {
+        let hosts = HashMap::new();
+        assert_eq!(
+            build_repo_entry("ghe.example.com", "foo", "bar", &hosts),
+            Some("ghe.example.com/foo/bar".to_string())
+        );
+    }
+
+    #[test]
+    fn test_build_repo_entry_host_without_dot_returns_none() {
+        let hosts = HashMap::new();
+        assert_eq!(build_repo_entry("localhost", "foo", "bar", &hosts), None);
     }
 
     #[test]

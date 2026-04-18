@@ -771,8 +771,10 @@ impl LabConfig {
         names.sort();
 
         // Pass 1: validate each entry in isolation and collect the API host
-        // owner map.
-        let mut api_hosts: HashMap<&str, &str> = HashMap::new();
+        // owner map. DNS hostnames are case-insensitive, so duplicates are
+        // detected using a lowercased key to match how callers compare hosts
+        // (see `build_repo_entry` in `src/commands/init.rs`).
+        let mut api_hosts: HashMap<String, &str> = HashMap::new();
         for name in &names {
             let gh_host = &self.github_hosts[*name];
             if gh_host.host.is_empty() {
@@ -785,7 +787,8 @@ impl LabConfig {
                     gh_host.host
                 );
             }
-            if let Some(existing_name) = api_hosts.get(gh_host.host.as_str()) {
+            let host_key = gh_host.host.to_ascii_lowercase();
+            if let Some(existing_name) = api_hosts.get(&host_key) {
                 anyhow::bail!(
                     "[github_hosts.{}]: duplicate host '{}' (already defined by [github_hosts.{}])",
                     name,
@@ -793,7 +796,7 @@ impl LabConfig {
                     existing_name
                 );
             }
-            api_hosts.insert(&gh_host.host, name);
+            api_hosts.insert(host_key, name);
 
             if let Some(web_url) = &gh_host.web_url {
                 validate_web_url(name, web_url)?;
@@ -812,14 +815,16 @@ impl LabConfig {
             let web_host = web_url_to_host(web_url)
                 .expect("validate_web_url ensures web_url_to_host returns Some");
 
+            let web_host_key = web_host.to_ascii_lowercase();
+
             // Trivial: a web_url whose hostname equals this entry's own API
             // host is redundant but unambiguous — allow it.
-            if web_host == gh_host.host {
+            if web_host_key == gh_host.host.to_ascii_lowercase() {
                 continue;
             }
 
             // Collides with a different entry's API host?
-            if let Some(other_name) = api_hosts.get(web_host.as_str()) {
+            if let Some(other_name) = api_hosts.get(&web_host_key) {
                 if *other_name != name.as_str() {
                     anyhow::bail!(
                         "[github_hosts.{}]: 'web_url' hostname '{}' collides with the 'host' of [github_hosts.{}]",
@@ -831,7 +836,7 @@ impl LabConfig {
             }
 
             // Collides with another entry's web_url hostname?
-            if let Some(other_name) = web_url_hosts.get(&web_host) {
+            if let Some(other_name) = web_url_hosts.get(&web_host_key) {
                 anyhow::bail!(
                     "[github_hosts.{}]: 'web_url' hostname '{}' is also used by [github_hosts.{}]",
                     name,
@@ -839,7 +844,7 @@ impl LabConfig {
                     other_name
                 );
             }
-            web_url_hosts.insert(web_host, name);
+            web_url_hosts.insert(web_host_key, name);
         }
 
         Ok(())
@@ -1623,6 +1628,28 @@ repos = ["owner/repo1", "ghe.example.com/org/svc1", "ghe.example.com/org/svc2"]
         config.daemon.repos = vec!["owner/repo".to_string()];
         let err = config.validate().unwrap_err();
         assert!(err.to_string().contains("duplicate host 'ghe.example.com'"));
+    }
+
+    #[test]
+    fn test_validate_github_host_duplicate_host_case_insensitive() {
+        let mut config = LabConfig::default();
+        config.github_hosts.insert(
+            "alpha".to_string(),
+            GhHostConfig {
+                host: "ghe.example.com".to_string(),
+                web_url: None,
+            },
+        );
+        config.github_hosts.insert(
+            "beta".to_string(),
+            GhHostConfig {
+                host: "GHE.Example.COM".to_string(),
+                web_url: None,
+            },
+        );
+        config.daemon.repos = vec!["owner/repo".to_string()];
+        let err = config.validate().unwrap_err();
+        assert!(err.to_string().contains("duplicate host"));
     }
 
     #[test]
