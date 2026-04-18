@@ -99,6 +99,8 @@ fn build_repo_entry(
     if host.eq_ignore_ascii_case("github.com") {
         return Some(format!("{}/{}", owner, repo));
     }
+    // `validate_github_hosts` enforces that `host` is unique across entries,
+    // so at most one match is possible here.
     if let Some((name, _)) = github_hosts
         .iter()
         .find(|(_, gh)| gh.host.eq_ignore_ascii_case(host))
@@ -233,9 +235,17 @@ pub(crate) async fn handle_init(repo_arg: String, host_override: Option<String>)
     }
 
     // 4. Add repo to daemon.repos in config
-    let github_hosts = LabConfig::load_partial(&config_path)
-        .map(|cfg| cfg.github_hosts)
-        .unwrap_or_default();
+    let github_hosts = match LabConfig::load_partial(&config_path) {
+        Ok(cfg) => cfg.github_hosts,
+        Err(e) => {
+            log::warn!(
+                "  ⚠️  Could not load config for [github_hosts.*] lookup, \
+                 falling back to legacy host/owner/repo form: {:#}",
+                e
+            );
+            HashMap::new()
+        }
+    };
     let repo_entry = build_repo_entry(&host, &owner, &repo, &github_hosts).unwrap_or_else(|| {
         // Hosts without dots (e.g., "localhost") can't be represented in
         // host/owner/repo format (config parser requires a dot). Skip and advise.
