@@ -2,7 +2,7 @@ use super::helpers::try_post_progress_comment;
 use super::types::{AgentResult, IssueContext, WorktreeContext};
 use crate::agent::{AgentBackend, AgentEvent};
 use crate::agent_runner::{run_agent_with_stream_monitoring, EXIT_CODE_SIGNAL_TERMINATED};
-use crate::minion_registry::{with_registry, MinionMode, MinionRegistry};
+use crate::minion_registry::{get_process_start_time, with_registry, MinionMode, MinionRegistry};
 use crate::progress::{ProgressConfig, ProgressDisplay};
 use crate::progress_comments::{MinionPhase, ProgressCommentTracker};
 use crate::prompt_loader;
@@ -250,22 +250,54 @@ async fn run_agent_session_inner(
     )
     .await;
 
-    // Best-effort cleanup: clear PID, set mode to Stopped, and save token usage.
-    // Token usage is persisted regardless of exit status (Ok with non-zero exit) because
-    // cost data is valuable even for failed tasks. Only stream-level errors (timeout, stuck)
-    // result in Err, in which case partial usage is not saved.
+    // The agent child process has exited, but the parent worker process
+    // continues into PR creation and monitoring. Transfer ownership back to
+    // the current (parent) process PID and keep mode=Autonomous so that
+    // concurrent `gru resume`/`gru attach` attempts are rejected by
+    // `check_and_claim_session` (see issue #862: without this, the registry
+    // reports the minion as Stopped while the worker is still alive, and a
+    // second process can claim it and spawn a duplicate agent against the
+    // same session, producing duplicate review replies).
+    //
+    // Token usage is persisted regardless of exit status (Ok with non-zero
+    // exit) because cost data is valuable even for failed tasks. Only
+    // stream-level errors (timeout, stuck) result in Err, in which case
+    // partial usage is not saved.
     let token_usage = run_result.as_ref().ok().map(|r| r.token_usage.clone());
     let exit_minion_id = wt_ctx.minion_id.clone();
-    let _ = with_registry(move |registry| {
+    // `run_agent_session_inner` is only invoked from within a worker process
+    // (via `run_agent_phase` in worker.rs / resume.rs), so `process::id()`
+    // here is always the worker PID — the process that owns the minion for
+    // PR creation and monitoring after the agent child exits.
+    let parent_pid = std::process::id();
+    let parent_start_time = get_process_start_time(parent_pid);
+    let log_minion_id = wt_ctx.minion_id.clone();
+    if let Err(e) = with_registry(move |registry| {
         registry.update(&exit_minion_id, |info| {
-            info.clear_pid();
-            info.mode = MinionMode::Stopped;
+            info.pid = Some(parent_pid);
+            info.pid_start_time = parent_start_time;
+            info.mode = MinionMode::Autonomous;
+            info.last_activity = chrono::Utc::now();
             if let Some(usage) = token_usage {
                 info.token_usage = Some(usage);
             }
         })
     })
-    .await;
+    .await
+    {
+        // A failure here leaves the registry pointing at the now-dead agent
+        // child PID. `session_claim` would treat that as a stale entry and
+        // allow a concurrent `gru resume`/`gru attach` to claim the minion —
+        // the exact failure mode this block exists to prevent (issue #862).
+        // Log loudly so operators can correlate a duplicate-agent incident
+        // with the registry write that failed.
+        log::warn!(
+            "Failed to transfer registry ownership to worker PID for {}: {:#}. \
+             Registry may briefly allow concurrent claim.",
+            log_minion_id,
+            e
+        );
+    }
 
     let agent_run = run_result?;
 
