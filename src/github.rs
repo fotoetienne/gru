@@ -410,10 +410,13 @@ pub(crate) async fn sleep_until_rate_limit_reset(host: &str) {
                 RATE_LIMIT_FALLBACK_SLEEP_SECS,
                 RATE_LIMIT_FALLBACK_SLEEP_SECS,
             );
-            // Signal peer Minions with the full reset epoch; they will
-            // sleep until the window closes rather than repeating our
-            // fallback-sized waits.
-            crate::shared_rate_limit::write_rate_limit_until(host, info.reset);
+            // Signal peers with our fallback window, not info.reset: if the
+            // local Minion doesn't trust the reset epoch enough to sleep
+            // that long, peers shouldn't either.
+            crate::shared_rate_limit::write_rate_limit_until(
+                host,
+                now + RATE_LIMIT_FALLBACK_SLEEP_SECS,
+            );
         } else {
             // Reset epoch is in the past — likely stale or clock skew
             log::warn!(

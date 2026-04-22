@@ -10,6 +10,10 @@
 //! independently. Writes are atomic (temp-file + rename). Reads may observe
 //! stale state; the worst case is one extra failed API call before the local
 //! Minion also writes the shared state — by design, no locking is used.
+//!
+//! Only callers that go through [`github::gh_api_with_retry`] benefit from
+//! the shared check; direct `gh_cli_command` callers bypass it and will
+//! discover the rate limit on their own (and then signal via this module).
 
 use std::fs;
 use std::io::Write;
@@ -99,7 +103,10 @@ pub(crate) fn write_rate_limit_until(host: &str, reset_epoch: u64) {
         return;
     };
 
-    let temp_path = path.with_extension("txt.tmp");
+    // PID-suffix the temp file so two Minions writing for the same host
+    // don't clobber each other's in-flight temp. The rename step is still
+    // the serializing point (last rename wins), which is acceptable.
+    let temp_path = path.with_extension(format!("txt.{}.tmp", std::process::id()));
     let write_result = (|| -> std::io::Result<()> {
         let mut file = fs::OpenOptions::new()
             .write(true)
@@ -281,8 +288,46 @@ mod tests {
         write_rate_limit_until("github.com", future_epoch);
 
         let path = rate_limit_path("github.com").unwrap();
-        let temp_path = path.with_extension("txt.tmp");
         assert!(path.exists());
-        assert!(!temp_path.exists());
+        // No *.tmp files left behind in the state dir.
+        let state_dir = path.parent().unwrap();
+        for entry in fs::read_dir(state_dir).unwrap() {
+            let entry = entry.unwrap();
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            assert!(
+                !name_str.ends_with(".tmp"),
+                "unexpected leftover temp file: {}",
+                name_str
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn wait_returns_immediately_when_no_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = set_test_workspace(tmp.path().to_path_buf()).unwrap();
+
+        // Missing file — should return immediately without sleeping.
+        let start = std::time::Instant::now();
+        wait_if_shared_rate_limited("github.com").await;
+        assert!(start.elapsed() < Duration::from_millis(500));
+    }
+
+    #[tokio::test]
+    async fn wait_returns_immediately_when_file_is_expired() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = set_test_workspace(tmp.path().to_path_buf()).unwrap();
+
+        // Write a past epoch directly so read_rate_limit_until's cleanup path
+        // fires and wait returns without sleeping.
+        let path = rate_limit_path("github.com").unwrap();
+        fs::write(&path, (now_secs() - 10).to_string()).unwrap();
+
+        let start = std::time::Instant::now();
+        wait_if_shared_rate_limited("github.com").await;
+        assert!(start.elapsed() < Duration::from_millis(500));
+        // Expired file should have been cleaned up.
+        assert!(!path.exists());
     }
 }
