@@ -113,6 +113,10 @@ impl ProgressUpdate {
         // Body message
         comment.push_str(&self.message);
 
+        // Trailing Minion signature — authoritative agent marker that the
+        // merge-judge bookkeeping filter can gate on.
+        comment.push_str(&minion_signature(&self.minion_id));
+
         comment
     }
 }

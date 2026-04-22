@@ -590,11 +590,24 @@ async fn fetch_pr_context(
 
 /// Return true if `body` is Gru's own bookkeeping — not reviewer-feedback signal.
 ///
-/// Matches on body patterns, not on author identity, because only the agent
-/// posts these exact shapes. Importantly this does NOT drop substantive
-/// Minion replies to reviewers (e.g. "fixed in c9cf557"): those lack these
-/// markers and remain in the context as evidence the feedback was addressed.
+/// Two signals must align before a comment is dropped:
+/// 1. The body carries a trailing Minion signature (`<sub>🤖 Mxxx</sub>`),
+///    an authoritative agent-authored marker. A human reviewer cannot
+///    accidentally trigger the filter by quoting bookkeeping text.
+/// 2. The body matches one of the known bookkeeping shapes.
+///
+/// Substantive Minion replies to reviewers (e.g. "fixed in c9cf557") carry
+/// the signature but not the shape, and are preserved as evidence that
+/// feedback was addressed.
 pub(crate) fn is_bookkeeping_body(body: &str) -> bool {
+    // Gate on authoritative agent identity first. A comment without a
+    // trailing Minion signature is never treated as bookkeeping, which
+    // eliminates the spoof where a reviewer pastes a marker into their
+    // own comment.
+    if crate::progress_comments::extract_minion_id_from_signature(body).is_none() {
+        return false;
+    }
+
     // YAML frontmatter notifications: "---\ntype: monitoring-paused\n---",
     // "---\ntype: *-cleared\n---", etc.
     if let Some(after) = body.strip_prefix("---\n") {
@@ -632,8 +645,12 @@ fn filter_bookkeeping_ndjson(stdout: &[u8]) -> String {
             continue;
         }
         let Ok(val) = serde_json::from_str::<serde_json::Value>(line) else {
-            // Keep malformed lines rather than silently dropping evidence.
-            items.push(line.to_string());
+            // Keep malformed lines rather than silently dropping evidence,
+            // but wrap them as valid JSON so the surrounding array remains
+            // well-formed (pushing the raw line would yield broken JSON
+            // when the line contains unescaped quotes or other metacharacters).
+            log::warn!("Skipping malformed JSON line in judge context: {line:?}");
+            items.push(serde_json::json!({ "malformed_line": line }).to_string());
             continue;
         };
         let body = val.get("body").and_then(|b| b.as_str()).unwrap_or("");
@@ -706,7 +723,7 @@ fn build_judge_prompt(
     let current_facts = format_current_facts(facts);
 
     format!(
-        r#"You are a merge-readiness judge for PR #{pr_number}. All deterministic checks have already passed (CI green, reviews approved, no conflicts, not draft).
+        r#"You are a merge-readiness judge for PR #{pr_number}. Deterministic repository state (CI, labels, mergeability, draft status) is provided in the authoritative "Current facts" block below — defer to it in all cases.
 
 ## Scope
 
@@ -1098,19 +1115,27 @@ pub(crate) async fn has_needs_human_review_label(
 }
 
 /// Post an escalation comment explaining why the judge escalated.
+///
+/// The trailing Minion signature is mandatory: the bookkeeping filter
+/// requires an authoritative agent marker before it will drop a comment,
+/// so a verdict without a signature would persist in future judge prompts
+/// as stale evidence.
 pub(crate) async fn post_judge_escalation_comment(
     host: &str,
     owner: &str,
     repo: &str,
     pr_number: &str,
     response: &JudgeResponse,
+    minion_id: &str,
 ) {
     let repo_full = github::repo_slug(owner, repo);
     let body = format!(
         "{MERGE_READINESS_MARKER}: {}/10 — needs human review**\n\n{}\n\n\
          _To proceed, remove the `gru:needs-human-review` label. \
-         The judge will re-evaluate on the next PR state change._",
-        response.confidence, response.reasoning
+         The judge will re-evaluate on the next PR state change._{}",
+        response.confidence,
+        response.reasoning,
+        crate::progress_comments::minion_signature(minion_id),
     );
 
     match github::run_gh(
@@ -1594,6 +1619,20 @@ That's my verdict."#;
     }
 
     #[test]
+    fn test_filter_bookkeeping_ndjson_malformed_line_stays_valid_json() {
+        // Raw line with an unescaped quote would produce invalid JSON if
+        // pushed verbatim; it must be wrapped so the output array still parses.
+        let input =
+            b"{\"id\":1,\"body\":\"ok\"}\nnot-json \"with quote\"\n{\"id\":2,\"body\":\"also ok\"}";
+        let result = filter_bookkeeping_ndjson(input);
+        let parsed: Vec<serde_json::Value> =
+            serde_json::from_str(&result).expect("output must be valid JSON");
+        assert_eq!(parsed.len(), 3);
+        // Middle entry is wrapped under `malformed_line` to preserve evidence.
+        assert!(parsed[1].get("malformed_line").is_some());
+    }
+
+    #[test]
     fn test_filter_bookkeeping_ndjson_multiple_objects() {
         let input =
             b"{\"id\":1,\"body\":\"a\"}\n{\"id\":2,\"body\":\"b\"}\n{\"id\":3,\"body\":\"c\"}";
@@ -1651,7 +1690,7 @@ That's my verdict."#;
 
     #[test]
     fn test_is_bookkeeping_body_detects_monitoring_paused_frontmatter() {
-        let body = "---\ntype: monitoring-paused\n---\n\n⏸️ This PR's automated agent has paused.";
+        let body = "---\ntype: monitoring-paused\n---\n\n⏸️ This PR's automated agent has paused.\n\n<sub>🤖 M1cu</sub>";
         assert!(is_bookkeeping_body(body));
     }
 
@@ -1663,8 +1702,28 @@ That's my verdict."#;
 
     #[test]
     fn test_is_bookkeeping_body_detects_prior_judge_verdict() {
-        let body = "🧑‍⚖️ **Merge readiness: 3/10 — needs human review**\n\nStale.";
+        let body =
+            "🧑‍⚖️ **Merge readiness: 3/10 — needs human review**\n\nStale.\n\n<sub>🤖 M1cu</sub>";
         assert!(is_bookkeeping_body(body));
+    }
+
+    #[test]
+    fn test_is_bookkeeping_body_rejects_unsigned_marker_spoof() {
+        // A reviewer quoting the CI Fix Escalation header in their own
+        // comment (no Minion signature) must NOT be filtered — it could
+        // carry substantive feedback.
+        let body = "## 🚨 CI Fix Escalation — quoting this from earlier to ask: \
+                    is the interval_millis rename really required here?";
+        assert!(!is_bookkeeping_body(body));
+    }
+
+    #[test]
+    fn test_is_bookkeeping_body_rejects_unsigned_frontmatter_spoof() {
+        // Reviewer pasting frontmatter-ish text without a Minion signature
+        // must not be filtered.
+        let body = "---\ntype: monitoring-paused\n---\n\nI see this in the thread — \
+                    can you confirm the PR is intentionally paused?";
+        assert!(!is_bookkeeping_body(body));
     }
 
     #[test]
@@ -1687,10 +1746,12 @@ That's my verdict."#;
         // escalation + prior 3/10 verdict all stripped; reviewer request
         // and Minion substantive reply preserved.
         // Each line is a JSON object; body values embed escaped \n pairs.
+        // Bookkeeping entries carry a trailing Minion signature (the
+        // authoritative agent marker); the reviewer entry does not.
         let lines = [
-            "{\"id\":1,\"body\":\"---\\ntype: monitoring-paused\\n---\\n\\nPaused\"}",
-            "{\"id\":2,\"body\":\"## \u{1f6a8} CI Fix Escalation\\n\\nfailing on interval_secs\"}",
-            "{\"id\":3,\"body\":\"\u{1f9d1}\u{200d}\u{2696}\u{fe0f} **Merge readiness: 3/10 \u{2014} needs human review**\\n\\nCI failing\"}",
+            "{\"id\":1,\"body\":\"---\\ntype: monitoring-paused\\n---\\n\\nPaused\\n\\n<sub>\u{1f916} M1cu</sub>\"}",
+            "{\"id\":2,\"body\":\"## \u{1f6a8} CI Fix Escalation\\n\\nfailing on interval_secs\\n\\n<sub>\u{1f916} M1cu</sub>\"}",
+            "{\"id\":3,\"body\":\"\u{1f9d1}\u{200d}\u{2696}\u{fe0f} **Merge readiness: 3/10 \u{2014} needs human review**\\n\\nCI failing\\n\\n<sub>\u{1f916} M1cu</sub>\"}",
             "{\"id\":4,\"body\":\"Please rename interval_secs to interval_millis.\"}",
             "{\"id\":5,\"body\":\"Fixed in c9cf557.\\n\\n<sub>\u{1f916} M1cu</sub>\"}",
         ];
