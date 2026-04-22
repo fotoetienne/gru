@@ -12,6 +12,7 @@
 use crate::github;
 use crate::github::ReviewUser;
 use crate::github::DEFAULT_MAX_RETRIES;
+use crate::graphql;
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::fmt;
@@ -111,7 +112,49 @@ pub(crate) struct PreFetchedCheckRun {
 ///
 /// This is a pure query function — it reads GitHub state and returns a
 /// deterministic result. Same API state always produces the same output.
+///
+/// Prefers a single GraphQL query that bundles PR metadata, reviews, check
+/// runs, legacy status contexts, and labels into one round-trip. Falls back
+/// to the multi-call REST path when GraphQL is unavailable (e.g., disabled
+/// on GHES) or when paginated sub-collections overflow the query limits.
 pub(crate) async fn check_merge_readiness(
+    host: &str,
+    owner: &str,
+    repo: &str,
+    pr_number: u64,
+) -> Result<MergeReadiness> {
+    match graphql::fetch_pr_merge_data(host, owner, repo, pr_number).await {
+        Ok(graphql::FetchOutcome::Available(data)) if !data.has_more_pages => {
+            return Ok(evaluate_graphql_data(&data));
+        }
+        Ok(graphql::FetchOutcome::Available(_)) => {
+            log::info!(
+                "GraphQL result for {}/{} PR #{} has additional pages; falling back to REST for completeness",
+                owner,
+                repo,
+                pr_number
+            );
+        }
+        Ok(graphql::FetchOutcome::Unavailable) => {
+            // is_graphql_unavailable already logged at info level
+        }
+        Err(e) => {
+            log::warn!(
+                "GraphQL merge-readiness fetch failed for {}/{} PR #{}: {:#}. Falling back to REST.",
+                owner,
+                repo,
+                pr_number,
+                e
+            );
+        }
+    }
+
+    check_merge_readiness_rest(host, owner, repo, pr_number).await
+}
+
+/// REST-based merge readiness check. Used as a fallback when GraphQL is
+/// unavailable.
+async fn check_merge_readiness_rest(
     host: &str,
     owner: &str,
     repo: &str,
@@ -394,6 +437,56 @@ async fn get_combined_status(
         serde_json::from_slice(&output.stdout).context("Failed to parse combined status JSON")?;
 
     Ok(status)
+}
+
+/// Evaluate merge readiness from a fully-populated GraphQL response.
+///
+/// Mirrors the REST path's logic so results are identical for the same
+/// underlying GitHub state. Legacy status contexts from the rollup are
+/// treated like the combined-status API: the gate passes when every context
+/// is in the `success` state, or when there are no contexts at all.
+fn evaluate_graphql_data(data: &graphql::MergeReadinessData) -> MergeReadiness {
+    if data.draft {
+        return MergeReadiness {
+            not_draft: false,
+            ci_passing: false,
+            review_approved: false,
+            no_conflicts: false,
+        };
+    }
+
+    let check_runs: Vec<CheckRun> = data
+        .check_runs
+        .iter()
+        .map(|cr| CheckRun {
+            conclusion: cr.conclusion.clone(),
+            status: cr.status.clone(),
+        })
+        .collect();
+
+    let reviews: Vec<ReviewApiResponse> = data
+        .reviews
+        .iter()
+        .map(|r| ReviewApiResponse {
+            state: r.state.clone(),
+            user: ReviewUser {
+                login: r.author_login.clone(),
+            },
+        })
+        .collect();
+
+    let legacy_statuses_ok = data.status_contexts.iter().all(|sc| sc.state == "success");
+
+    let ci_passing = evaluate_ci(&check_runs) && legacy_statuses_ok;
+    let review_approved = evaluate_reviews(&reviews, &data.author_login);
+    let no_conflicts = data.mergeable == Some(true);
+
+    MergeReadiness {
+        not_draft: true,
+        ci_passing,
+        review_approved,
+        no_conflicts,
+    }
 }
 
 // --- Evaluation logic (pure functions, easy to test) ---
@@ -1249,6 +1342,140 @@ mod tests {
 
         let readiness = evaluate_from_prefetched(&data);
         assert!(!readiness.no_conflicts);
+    }
+
+    // --- GraphQL evaluation tests ---
+
+    fn gql_data(
+        draft: bool,
+        mergeable: Option<bool>,
+        author: &str,
+        reviews: Vec<(&str, &str)>,
+        check_runs: Vec<(Option<&str>, Option<&str>)>,
+        status_contexts: Vec<&str>,
+    ) -> graphql::MergeReadinessData {
+        graphql::MergeReadinessData {
+            head_sha: "sha".into(),
+            draft,
+            mergeable,
+            author_login: author.into(),
+            reviews: reviews
+                .into_iter()
+                .map(|(state, login)| graphql::ReviewInfo {
+                    state: state.into(),
+                    author_login: login.into(),
+                })
+                .collect(),
+            check_runs: check_runs
+                .into_iter()
+                .map(|(status, conclusion)| graphql::CheckRunInfo {
+                    status: status.map(Into::into),
+                    conclusion: conclusion.map(Into::into),
+                })
+                .collect(),
+            status_contexts: status_contexts
+                .into_iter()
+                .map(|state| graphql::StatusContextInfo {
+                    state: state.into(),
+                })
+                .collect(),
+            labels: vec![],
+            has_more_pages: false,
+        }
+    }
+
+    #[test]
+    fn test_graphql_evaluate_all_passing() {
+        let data = gql_data(
+            false,
+            Some(true),
+            "bot",
+            vec![("APPROVED", "alice")],
+            vec![(Some("completed"), Some("success"))],
+            vec!["success"],
+        );
+        let mr = evaluate_graphql_data(&data);
+        assert!(mr.is_ready());
+    }
+
+    #[test]
+    fn test_graphql_evaluate_draft_bails_out() {
+        let data = gql_data(true, Some(true), "bot", vec![], vec![], vec![]);
+        let mr = evaluate_graphql_data(&data);
+        assert!(!mr.not_draft);
+        assert!(!mr.is_ready());
+    }
+
+    #[test]
+    fn test_graphql_evaluate_legacy_status_failure_blocks() {
+        let data = gql_data(
+            false,
+            Some(true),
+            "bot",
+            vec![("APPROVED", "alice")],
+            vec![], // no modern check runs
+            vec!["success", "pending"],
+        );
+        let mr = evaluate_graphql_data(&data);
+        assert!(!mr.ci_passing);
+    }
+
+    #[test]
+    fn test_graphql_evaluate_no_legacy_statuses_ok() {
+        // Repos using only Check Runs emit an empty status contexts list;
+        // that should not block readiness.
+        let data = gql_data(
+            false,
+            Some(true),
+            "bot",
+            vec![("APPROVED", "alice")],
+            vec![(Some("completed"), Some("success"))],
+            vec![],
+        );
+        let mr = evaluate_graphql_data(&data);
+        assert!(mr.is_ready());
+    }
+
+    #[test]
+    fn test_graphql_evaluate_unknown_mergeable_blocks() {
+        let data = gql_data(
+            false,
+            None,
+            "bot",
+            vec![("APPROVED", "alice")],
+            vec![(Some("completed"), Some("success"))],
+            vec![],
+        );
+        let mr = evaluate_graphql_data(&data);
+        assert!(!mr.no_conflicts);
+    }
+
+    #[test]
+    fn test_graphql_evaluate_self_review_gate() {
+        let data = gql_data(
+            false,
+            Some(true),
+            "minion-bot",
+            vec![("COMMENTED", "minion-bot")],
+            vec![(Some("completed"), Some("success"))],
+            vec![],
+        );
+        let mr = evaluate_graphql_data(&data);
+        assert!(mr.is_ready());
+    }
+
+    #[test]
+    fn test_graphql_evaluate_changes_requested_blocks() {
+        let data = gql_data(
+            false,
+            Some(true),
+            "bot",
+            vec![("CHANGES_REQUESTED", "alice")],
+            vec![(Some("completed"), Some("success"))],
+            vec!["success"],
+        );
+        let mr = evaluate_graphql_data(&data);
+        assert!(!mr.review_approved);
     }
 
     #[test]
