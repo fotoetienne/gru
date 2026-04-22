@@ -883,7 +883,16 @@ async fn handle_new_reviews(
     // replies the agent posts during this invocation — replies from prior
     // sessions, which the human reviewer has implicitly accepted, are left
     // untouched.
-    let session_start = Utc::now();
+    //
+    // Subtract a 1-minute safety margin to absorb clock skew between the
+    // local host (`Utc::now()`) and GitHub's server clock (which sets
+    // `created_at`). Without this margin, if the local clock runs ahead,
+    // the very first reply could land with `created_at < session_start`
+    // and be excluded — then a later duplicate would be kept and the
+    // earlier original discarded. A minute is wide enough for any
+    // plausible skew and still far narrower than any prior-session reply
+    // (which would be minutes to hours older).
+    let session_start = Utc::now() - chrono::Duration::minutes(1);
 
     match invoke_agent_for_reviews(
         ctx.backend,

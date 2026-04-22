@@ -132,6 +132,11 @@ struct ApiReviewComment {
     created_at: DateTime<Utc>,
 }
 
+/// Default used when `created_at` is missing from the API payload (which
+/// GitHub should always include for a real comment, but may be omitted in
+/// test fixtures). The UNIX epoch is load-bearing for dedup safety: any
+/// comment we can't date is classified as pre-`since` by
+/// `identify_duplicate_minion_replies` and therefore never deleted.
 fn default_api_review_comment_created_at() -> DateTime<Utc> {
     DateTime::<Utc>::from_timestamp(0, 0).expect("UNIX epoch is a valid DateTime")
 }
