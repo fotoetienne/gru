@@ -265,6 +265,10 @@ async fn run_agent_session_inner(
     // partial usage is not saved.
     let token_usage = run_result.as_ref().ok().map(|r| r.token_usage.clone());
     let exit_minion_id = wt_ctx.minion_id.clone();
+    // `run_agent_session_inner` is only invoked from within a worker process
+    // (via `run_agent_phase` in worker.rs / resume.rs), so `process::id()`
+    // here is always the worker PID — the process that owns the minion for
+    // PR creation and monitoring after the agent child exits.
     let parent_pid = std::process::id();
     let parent_start_time = get_process_start_time(parent_pid);
     let _ = with_registry(move |registry| {
