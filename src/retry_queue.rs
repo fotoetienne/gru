@@ -55,6 +55,11 @@ pub struct RetryEntry {
     pub workspace_path: Option<PathBuf>,
     /// GitHub host for this issue.
     pub host: String,
+    /// Ready label to restore when the retry spawn itself fails, and to remove
+    /// when flagging `gru:blocked` after max retries. Propagated from
+    /// `config.daemon.label` through the spawn path so retries preserve a
+    /// customized pickup label instead of falling back to `gru:todo`.
+    pub ready_label: String,
 }
 
 /// In-memory retry queue for the lab poll loop.
@@ -95,6 +100,7 @@ impl RetryQueue {
         reason: &str,
         minion_id: Option<&str>,
         workspace_path: Option<PathBuf>,
+        ready_label: &str,
     ) -> bool {
         let attempt = current_attempt + 1;
         if self.max_attempts == 0 || attempt > self.max_attempts {
@@ -128,6 +134,7 @@ impl RetryQueue {
                 minion_id: minion_id.map(String::from),
                 workspace_path,
                 host: host.to_string(),
+                ready_label: ready_label.to_string(),
             },
         );
 
@@ -150,6 +157,7 @@ impl RetryQueue {
         minion_id: &str,
         workspace_path: PathBuf,
         reason: &str,
+        ready_label: &str,
     ) {
         let key = entry_key(host, owner, repo, issue_number);
 
@@ -175,6 +183,7 @@ impl RetryQueue {
                 minion_id: Some(minion_id.to_string()),
                 workspace_path: Some(workspace_path),
                 host: host.to_string(),
+                ready_label: ready_label.to_string(),
             },
         );
     }
@@ -300,12 +309,32 @@ mod tests {
         let mut queue = RetryQueue::new(2, 300);
 
         // Attempt 1 (from 0): should succeed
-        assert!(queue.enqueue_failure("github.com", "owner", "repo", 42, 0, "timeout", None, None));
+        assert!(queue.enqueue_failure(
+            "github.com",
+            "owner",
+            "repo",
+            42,
+            0,
+            "timeout",
+            None,
+            None,
+            "gru:todo"
+        ));
         assert_eq!(queue.len(), 1);
 
         // Attempt 2 (from 1): should succeed
         queue.entries.clear();
-        assert!(queue.enqueue_failure("github.com", "owner", "repo", 42, 1, "timeout", None, None));
+        assert!(queue.enqueue_failure(
+            "github.com",
+            "owner",
+            "repo",
+            42,
+            1,
+            "timeout",
+            None,
+            None,
+            "gru:todo"
+        ));
 
         // Attempt 3 (from 2): exceeds max_attempts=2, should fail
         queue.entries.clear();
@@ -317,7 +346,8 @@ mod tests {
             2,
             "timeout",
             None,
-            None
+            None,
+            "gru:todo",
         ));
     }
 
@@ -332,7 +362,8 @@ mod tests {
             0,
             "timeout",
             None,
-            None
+            None,
+            "gru:todo",
         ));
     }
 
@@ -348,6 +379,7 @@ mod tests {
             "M001",
             PathBuf::from("/tmp/worktree"),
             "issue still open",
+            "gru:todo",
         );
         assert_eq!(queue.len(), 1);
 
@@ -377,6 +409,7 @@ mod tests {
                 minion_id: None,
                 workspace_path: None,
                 host: "github.com".to_string(),
+                ready_label: "gru:todo".to_string(),
             },
         );
 
@@ -405,6 +438,7 @@ mod tests {
                 minion_id: None,
                 workspace_path: None,
                 host: "github.com".to_string(),
+                ready_label: "gru:todo".to_string(),
             },
         );
 
@@ -433,6 +467,7 @@ mod tests {
                 minion_id: None,
                 workspace_path: None,
                 host: "github.com".to_string(),
+                ready_label: "gru:todo".to_string(),
             },
         );
 
@@ -451,6 +486,7 @@ mod tests {
                 minion_id: Some("M001".to_string()),
                 workspace_path: Some(PathBuf::from("/tmp")),
                 host: "github.com".to_string(),
+                ready_label: "gru:todo".to_string(),
             },
         );
 
@@ -463,7 +499,17 @@ mod tests {
     #[test]
     fn test_cancel() {
         let mut queue = RetryQueue::new(3, 300);
-        queue.enqueue_failure("github.com", "owner", "repo", 42, 0, "timeout", None, None);
+        queue.enqueue_failure(
+            "github.com",
+            "owner",
+            "repo",
+            42,
+            0,
+            "timeout",
+            None,
+            None,
+            "gru:todo",
+        );
         assert_eq!(queue.len(), 1);
 
         queue.cancel("github.com", "owner", "repo", 42);
@@ -475,15 +521,45 @@ mod tests {
         let mut queue = RetryQueue::new(3, 300);
         assert!(!queue.has_pending("github.com", "owner", "repo", 42));
 
-        queue.enqueue_failure("github.com", "owner", "repo", 42, 0, "timeout", None, None);
+        queue.enqueue_failure(
+            "github.com",
+            "owner",
+            "repo",
+            42,
+            0,
+            "timeout",
+            None,
+            None,
+            "gru:todo",
+        );
         assert!(queue.has_pending("github.com", "owner", "repo", 42));
     }
 
     #[test]
     fn test_dedup_overwrites_existing() {
         let mut queue = RetryQueue::new(3, 300);
-        queue.enqueue_failure("github.com", "owner", "repo", 42, 0, "first", None, None);
-        queue.enqueue_failure("github.com", "owner", "repo", 42, 1, "second", None, None);
+        queue.enqueue_failure(
+            "github.com",
+            "owner",
+            "repo",
+            42,
+            0,
+            "first",
+            None,
+            None,
+            "gru:todo",
+        );
+        queue.enqueue_failure(
+            "github.com",
+            "owner",
+            "repo",
+            42,
+            1,
+            "second",
+            None,
+            None,
+            "gru:todo",
+        );
 
         assert_eq!(queue.len(), 1); // same key, overwritten
         let entries = queue.pending_entries();
@@ -514,6 +590,7 @@ mod tests {
             minion_id: None,
             workspace_path: None,
             host: "github.com".to_string(),
+            ready_label: "gru:todo".to_string(),
         };
 
         queue.reinsert(entry);

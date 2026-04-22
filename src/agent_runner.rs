@@ -29,8 +29,9 @@ pub(crate) const EXIT_CODE_SIGNAL_TERMINATED: i32 = 128;
 
 /// Internal CLI contract: exit code returned by `gru do` when it detects that
 /// another live Minion is already working on the same issue. Lab uses this to
-/// short-circuit label restoration on the early-exit arm — restoring the ready
-/// label would just respawn into the same duplicate-detect, looping forever.
+/// short-circuit label restoration and retry handling for duplicate detection —
+/// restoring the ready label would just respawn into the same already-running
+/// condition and loop forever.
 ///
 /// Code 3 (not 1 or 2): clap reserves 2 for argument-parsing errors; 1 is the
 /// generic catch-all. 3 is outside both ranges and not reserved by any

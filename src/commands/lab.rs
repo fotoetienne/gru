@@ -401,6 +401,13 @@ async fn handle_failed_exit(
     // — another minion is already working on this issue (or, in the corrupted-
     // registry case, the spawn-time prune will heal it on the next cycle).
     // Either way, restoring would just respawn into the same detection.
+    //
+    // Note: this path intentionally does not call `enqueue_failure`. A persistent
+    // duplicate-detection loop (e.g. a stuck sibling PID that keeps getting
+    // detected) will not advance the retry counter and therefore will not trip
+    // the circuit breaker. The PID-stamping fix in `find_by_issue` should
+    // prevent this in practice; if it ever does recur, the log line below
+    // is the signal.
     if status.code() == Some(EXIT_ALREADY_RUNNING) {
         log::warn!(
             "⏭️  gru do for issue #{} exited with EXIT_ALREADY_RUNNING (after {:.1}s) — \
@@ -474,6 +481,7 @@ async fn handle_failed_exit(
         &reason,
         None,
         None,
+        &meta.ready_label,
     ) {
         // Retry remaining: restore the ready label so the issue is picked up again.
         log::warn!(
@@ -1899,7 +1907,7 @@ async fn dispatch_due_retries(
                         repo: entry.repo.clone(),
 
                         issue_number: entry.issue_number,
-                        ready_label: labels::TODO.to_string(),
+                        ready_label: entry.ready_label.clone(),
                         spawned_at: Instant::now(),
                         retry_attempt: entry.attempt, // carry through for next failure
                     }),
@@ -1920,7 +1928,7 @@ async fn dispatch_due_retries(
                     &entry.owner,
                     &entry.repo,
                     entry.issue_number,
-                    &[labels::TODO],
+                    &[entry.ready_label.as_str()],
                     &[labels::IN_PROGRESS],
                 )
                 .await

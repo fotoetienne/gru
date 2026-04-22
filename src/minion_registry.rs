@@ -237,14 +237,7 @@ pub(crate) async fn prune_stale_entries() -> Result<usize> {
 /// Returns an error if the registry cannot be saved to disk.
 pub async fn clear_pids_on_archived_entries() -> Result<usize> {
     with_registry(|registry| {
-        let mut count = 0usize;
-        for info in registry.data.minions.values_mut() {
-            if info.archived_at.is_some() && (info.pid.is_some() || info.pid_start_time.is_some()) {
-                info.pid = None;
-                info.pid_start_time = None;
-                count += 1;
-            }
-        }
+        let count = clear_pids_on_archived_entries_impl(registry);
         if count > 0 {
             log::info!(
                 "Clearing stale pid/pid_start_time on {} archived registry entries \
@@ -258,6 +251,21 @@ pub async fn clear_pids_on_archived_entries() -> Result<usize> {
         Ok(count)
     })
     .await
+}
+
+/// Mutation-only core of [`clear_pids_on_archived_entries`]. Returns the number
+/// of entries whose `pid`/`pid_start_time` were nulled. Shared with tests so
+/// the assertion path exercises the real filter.
+fn clear_pids_on_archived_entries_impl(registry: &mut MinionRegistry) -> usize {
+    let mut count = 0usize;
+    for info in registry.data.minions.values_mut() {
+        if info.archived_at.is_some() && (info.pid.is_some() || info.pid_start_time.is_some()) {
+            info.pid = None;
+            info.pid_start_time = None;
+            count += 1;
+        }
+    }
+    count
 }
 
 /// Returns the number of entries archived.
@@ -1175,10 +1183,8 @@ impl MinionRegistry {
     /// live PIDs onto archived entries, causing a respawn loop (issue #857). Hiding
     /// them at the registry layer prevents the corruption pattern from recurring.
     ///
-    /// If a future caller ever stamps PIDs on archived entries again, the
-    /// `prune_dead_entries_for_issue` path will silently skip them — that path
-    /// also relies on this filter. Add a sibling accessor (e.g.
-    /// `find_by_issue_including_archived`) only when an actual caller needs it.
+    /// If a future caller ever needs archived results, add a sibling accessor
+    /// (e.g. `find_by_issue_including_archived`) rather than removing this filter.
     ///
     /// Callers should check [`MinionInfo::is_running`] to determine which
     /// Minions among the returned (non-archived) entries are actually running.
@@ -1840,17 +1846,14 @@ mod tests {
             .register("M003".to_string(), live_with_pid)
             .unwrap();
 
-        // Inline the fixup logic on the local registry (with_registry talks to the
-        // global state and we intentionally don't touch that in unit tests).
-        let mut count = 0usize;
-        for info in registry.data.minions.values_mut() {
-            if info.archived_at.is_some() && (info.pid.is_some() || info.pid_start_time.is_some()) {
-                info.pid = None;
-                info.pid_start_time = None;
-                count += 1;
-            }
-        }
+        // Call the production mutation core directly. `clear_pids_on_archived_entries`
+        // itself talks to the global registry via `with_registry`; exercising the
+        // shared `_impl` function keeps the test aligned with the real filter.
+        let count = clear_pids_on_archived_entries_impl(&mut registry);
         assert_eq!(count, 1);
+
+        // Calling again is a no-op (idempotent).
+        assert_eq!(clear_pids_on_archived_entries_impl(&mut registry), 0);
         assert!(registry.get("M001").unwrap().pid.is_none());
         assert!(registry.get("M001").unwrap().pid_start_time.is_none());
         assert_eq!(registry.get("M003").unwrap().pid, Some(99998));
