@@ -99,7 +99,7 @@ Note: if the repo uses squash merges, the pre-merge SHA may become unreachable a
 When your implementation is complete and ready for human review:
 
 1. **Commit your implementation changes** with a descriptive commit message prefixed with your Minion ID, e.g. `[{{ minion_id }}] Fix null pointer in parser`
-2. **Push the branch** to the remote repository
+2. **Push the current branch** — run `git push -u origin HEAD`. Do NOT rename, create, or switch branches; Gru set up the branch for you and tracks it by name.
 3. Write `PR_DESCRIPTION.md` to `{{ minion_dir }}/PR_DESCRIPTION.md` with this format:
    ```markdown
    ## Summary
