@@ -1,9 +1,220 @@
+use super::helpers::commits_ahead_of_base;
 use super::types::{IssueContext, WorktreeContext};
+use crate::agent::{AgentEvent, TimestampedEvent};
 use crate::minion_registry::with_registry;
 use crate::pr_state::PrState;
 use anyhow::{Context, Result};
 use std::path::Path;
+use tokio::io::AsyncBufReadExt;
 use tokio::process::Command as TokioCommand;
+
+/// Typed errors produced by the PR creation phase.
+///
+/// Used so the worker can distinguish "already handled with `gru:blocked`"
+/// from generic failures that need the `gru:failed` cleanup path.
+#[derive(Debug)]
+pub(crate) enum PrCreationError {
+    /// The agent exited cleanly, produced no commits, and did not push a branch.
+    /// The issue has already been labeled `gru:blocked` and a comment posted
+    /// with the agent's final message.
+    NoCommitsCleanExit,
+}
+
+impl std::fmt::Display for PrCreationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PrCreationError::NoCommitsCleanExit => write!(
+                f,
+                "Agent exited cleanly with no commits and no pushed branch; \
+                 issue marked `gru:blocked`"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for PrCreationError {}
+
+/// Returns true if the error indicates the PR phase already applied `gru:blocked`.
+pub(crate) fn is_no_commits_clean_exit(err: &anyhow::Error) -> bool {
+    matches!(
+        err.downcast_ref::<PrCreationError>(),
+        Some(PrCreationError::NoCommitsCleanExit)
+    )
+}
+
+/// Maximum characters of the agent's final message to include in the issue comment.
+/// Long messages are truncated by appending `_[message truncated]_` to avoid
+/// oversized comments.
+const MAX_FINAL_MESSAGE_CHARS: usize = 4000;
+
+/// Extracts the agent's final assistant message from an `events.jsonl` file.
+///
+/// Streams the file line-by-line, accumulating `TextDelta` text into a buffer
+/// that is latched to `last_completed` whenever a `MessageComplete` is
+/// encountered. The final non-empty completed message is what the agent said
+/// before ending its turn. Returns `None` if the file cannot be opened or no
+/// assistant text was produced.
+///
+/// Uses a `BufReader` so memory stays bounded on long sessions dominated by
+/// tool-use events.
+pub(super) async fn extract_final_assistant_message(events_path: &Path) -> Option<String> {
+    let file = tokio::fs::File::open(events_path).await.ok()?;
+    let mut reader = tokio::io::BufReader::new(file);
+    let mut line = String::new();
+
+    let mut buffer = String::new();
+    let mut last_completed: Option<String> = None;
+
+    loop {
+        line.clear();
+        match reader.read_line(&mut line).await {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(e) => {
+                log::warn!(
+                    "Failed to read {}: {}. Returning partial final message.",
+                    events_path.display(),
+                    e
+                );
+                break;
+            }
+        }
+
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let te: TimestampedEvent = match serde_json::from_str(trimmed) {
+            Ok(te) => te,
+            Err(_) => continue,
+        };
+        match te.event {
+            AgentEvent::TextDelta { text } => buffer.push_str(&text),
+            AgentEvent::MessageComplete { .. } => {
+                let trimmed_buf = buffer.trim();
+                if !trimmed_buf.is_empty() {
+                    last_completed = Some(trimmed_buf.to_string());
+                }
+                buffer.clear();
+            }
+            _ => {}
+        }
+    }
+
+    // Recovery path: session ended without any MessageComplete (e.g., agent
+    // killed mid-stream). Any accumulated TextDelta is the best available
+    // signal of what the agent was trying to say.
+    if last_completed.is_none() {
+        let trimmed_buf = buffer.trim();
+        if !trimmed_buf.is_empty() {
+            last_completed = Some(trimmed_buf.to_string());
+        }
+    }
+
+    last_completed.map(|m| truncate_message(&m, MAX_FINAL_MESSAGE_CHARS))
+}
+
+/// Truncates `message` to at most `limit` chars, appending an ellipsis marker
+/// when truncation occurs. Operates on characters (not bytes) to avoid slicing
+/// inside a multi-byte codepoint.
+fn truncate_message(message: &str, limit: usize) -> String {
+    if message.chars().count() <= limit {
+        return message.to_string();
+    }
+    let truncated: String = message.chars().take(limit).collect();
+    format!("{truncated}\n\n_[message truncated]_")
+}
+
+/// Handles the "clean exit, zero commits, no push" outcome described in #850:
+/// posts the agent's final message as an issue comment and applies `gru:blocked`
+/// so auto-recovery does not re-queue the issue.
+async fn handle_no_commits_clean_exit(
+    issue_ctx: &IssueContext,
+    wt_ctx: &WorktreeContext,
+) -> Result<()> {
+    let events_path = wt_ctx.minion_dir.join("events.jsonl");
+    let final_message = extract_final_assistant_message(&events_path).await;
+
+    let Some(issue_num) = issue_ctx.issue_num else {
+        log::warn!(
+            "⚠️  Minion {} exited cleanly with no commits, but has no issue to label.",
+            wt_ctx.minion_id
+        );
+        return Ok(());
+    };
+
+    let message_block = match final_message.as_deref() {
+        Some(msg) => {
+            // Blockquote every line so long multi-paragraph messages stay
+            // visually distinct from the minion's preamble.
+            msg.lines()
+                .map(|line| {
+                    if line.is_empty() {
+                        ">".to_string()
+                    } else {
+                        format!("> {line}")
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+        None => "_The agent did not produce a final message. Check the minion logs for details._"
+            .to_string(),
+    };
+
+    let comment = format!(
+        "🤖 Minion `{}` ended its turn without making any commits or pushing a branch.\n\n\
+         Marking this issue `gru:blocked` so it is not re-queued automatically. \
+         Re-label to `gru:todo` to retry after addressing the minion's feedback below.\n\n\
+         ---\n\n\
+         **Agent's final message:**\n\n\
+         {}",
+        wt_ctx.minion_id, message_block
+    );
+
+    if let Err(e) = crate::github::post_comment_via_cli(
+        &issue_ctx.host,
+        &issue_ctx.owner,
+        &issue_ctx.repo,
+        issue_num,
+        &comment,
+    )
+    .await
+    {
+        log::warn!(
+            "⚠️  Failed to post no-commits comment on issue #{}: {:#}",
+            issue_num,
+            e
+        );
+    }
+
+    // Propagate label failure to the caller so `run_worker` can fall back to
+    // the `gru:failed` cleanup path instead of swallowing the label error and
+    // returning `NoCommitsCleanExit`. Otherwise a labeling failure would leave
+    // the issue stuck at `gru:in-progress` with no follow-up.
+    crate::github::mark_issue_blocked_via_cli(
+        &issue_ctx.host,
+        &issue_ctx.owner,
+        &issue_ctx.repo,
+        issue_num,
+    )
+    .await
+    .with_context(|| {
+        format!(
+            "failed to apply '{}' label to issue #{}",
+            crate::labels::BLOCKED,
+            issue_num
+        )
+    })?;
+
+    println!(
+        "🏷️  Updated issue #{} label to '{}'",
+        issue_num,
+        crate::labels::BLOCKED
+    );
+
+    Ok(())
+}
 
 /// Checks if a branch has been pushed to the remote by querying GitHub's API.
 ///
@@ -339,6 +550,34 @@ pub(crate) async fn handle_pr_creation(
 
     if !branch_pushed {
         println!("ℹ️  Branch was not pushed. No PR will be created.");
+
+        // If the agent produced no commits (#850), surface its final message
+        // to the issue and apply `gru:blocked` so auto-recovery does not
+        // re-queue the issue endlessly.
+        //
+        // Invariant: `handle_pr_creation` only runs after the agent phase
+        // succeeded — `run_worker` early-returns on non-success before
+        // reaching `create_pr_phase`, and `create_pr_phase` only skips the
+        // agent phase when a prior run already advanced past `RunningAgent`
+        // (which requires a successful agent exit). So reaching this block
+        // means the agent exited cleanly and simply produced nothing.
+        let commits_ahead = commits_ahead_of_base(
+            &wt_ctx.checkout_path,
+            &issue_ctx.host,
+            &issue_ctx.owner,
+            &issue_ctx.repo,
+        )
+        .await;
+
+        // Only block when the count is *known* to be zero. An unresolved count
+        // (e.g., a broken remote setup returning `None`) falls through to the
+        // normal "branch not pushed" error so we never falsely block an issue
+        // on an unreliable signal.
+        if matches!(commits_ahead, Some(0)) {
+            handle_no_commits_clean_exit(issue_ctx, wt_ctx).await?;
+            return Err(PrCreationError::NoCommitsCleanExit.into());
+        }
+
         println!(
             "   Push your changes with: git push origin {}",
             wt_ctx.branch_name
@@ -584,6 +823,203 @@ mod tests {
     /// Writes an intentionally-invalid `minions.json` to a temp workspace
     /// and verifies that `MinionRegistry::load` fails with a parse error,
     /// proving that the `if let Err` guard in `finalize_pr` would catch it.
+    #[test]
+    fn test_is_no_commits_clean_exit_detects_typed_error() {
+        let err: anyhow::Error = PrCreationError::NoCommitsCleanExit.into();
+        assert!(is_no_commits_clean_exit(&err));
+    }
+
+    #[test]
+    fn test_is_no_commits_clean_exit_wrapped_in_context() {
+        let err: anyhow::Error = PrCreationError::NoCommitsCleanExit.into();
+        let wrapped = err.context("PR creation failed");
+        assert!(is_no_commits_clean_exit(&wrapped));
+    }
+
+    #[test]
+    fn test_is_no_commits_clean_exit_rejects_other_errors() {
+        let err = anyhow::anyhow!("Branch 'feature' was not pushed — push it and retry");
+        assert!(!is_no_commits_clean_exit(&err));
+    }
+
+    #[tokio::test]
+    async fn test_extract_final_assistant_message_single_turn() {
+        use crate::agent::{AgentEvent, TimestampedEventRef};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("events.jsonl");
+        let events = [
+            AgentEvent::Started { usage: None },
+            AgentEvent::TextDelta {
+                text: "Recommendation: run ".to_string(),
+            },
+            AgentEvent::TextDelta {
+                text: "/decompose 2620.".to_string(),
+            },
+            AgentEvent::MessageComplete {
+                stop_reason: Some("end_turn".to_string()),
+                usage: None,
+            },
+        ];
+        let ts = "2026-04-21T12:00:00Z".to_string();
+        let lines: Vec<String> = events
+            .iter()
+            .map(|e| serde_json::to_string(&TimestampedEventRef { ts: &ts, event: e }).unwrap())
+            .collect();
+        std::fs::write(&path, lines.join("\n")).unwrap();
+
+        let msg = extract_final_assistant_message(&path)
+            .await
+            .expect("message present");
+        assert_eq!(msg, "Recommendation: run /decompose 2620.");
+    }
+
+    #[tokio::test]
+    async fn test_extract_final_assistant_message_prefers_last_turn() {
+        // Simulate a multi-turn session where an earlier turn used a tool
+        // and the final turn produced the recommendation text.
+        use crate::agent::{AgentEvent, TimestampedEventRef};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("events.jsonl");
+        let events = [
+            AgentEvent::TextDelta {
+                text: "Let me look at the code.".to_string(),
+            },
+            AgentEvent::MessageComplete {
+                stop_reason: Some("tool_use".to_string()),
+                usage: None,
+            },
+            AgentEvent::ToolUse {
+                tool_name: "Read".to_string(),
+                tool_use_id: "t1".to_string(),
+                input_summary: None,
+            },
+            AgentEvent::TextDelta {
+                text: "This issue is too large.".to_string(),
+            },
+            AgentEvent::MessageComplete {
+                stop_reason: Some("end_turn".to_string()),
+                usage: None,
+            },
+        ];
+        let ts = "2026-04-21T12:00:00Z".to_string();
+        let lines: Vec<String> = events
+            .iter()
+            .map(|e| serde_json::to_string(&TimestampedEventRef { ts: &ts, event: e }).unwrap())
+            .collect();
+        std::fs::write(&path, lines.join("\n")).unwrap();
+
+        let msg = extract_final_assistant_message(&path)
+            .await
+            .expect("message present");
+        assert_eq!(msg, "This issue is too large.");
+    }
+
+    #[tokio::test]
+    async fn test_extract_final_assistant_message_missing_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("nonexistent.jsonl");
+        assert!(extract_final_assistant_message(&path).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_extract_final_assistant_message_empty_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("events.jsonl");
+        std::fs::write(&path, "").unwrap();
+        assert!(extract_final_assistant_message(&path).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_extract_final_assistant_message_no_text_events() {
+        // A session that only ran tools and never produced assistant text.
+        use crate::agent::{AgentEvent, TimestampedEventRef};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("events.jsonl");
+        let events = [
+            AgentEvent::ToolUse {
+                tool_name: "Bash".to_string(),
+                tool_use_id: "t1".to_string(),
+                input_summary: None,
+            },
+            AgentEvent::MessageComplete {
+                stop_reason: Some("end_turn".to_string()),
+                usage: None,
+            },
+        ];
+        let ts = "2026-04-21T12:00:00Z".to_string();
+        let lines: Vec<String> = events
+            .iter()
+            .map(|e| serde_json::to_string(&TimestampedEventRef { ts: &ts, event: e }).unwrap())
+            .collect();
+        std::fs::write(&path, lines.join("\n")).unwrap();
+
+        assert!(extract_final_assistant_message(&path).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_extract_final_assistant_message_skips_malformed_lines() {
+        // A corrupt line in the middle should not prevent extraction.
+        use crate::agent::{AgentEvent, TimestampedEventRef};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("events.jsonl");
+        let ts = "2026-04-21T12:00:00Z".to_string();
+        let good_1 = serde_json::to_string(&TimestampedEventRef {
+            ts: &ts,
+            event: &AgentEvent::TextDelta {
+                text: "hello ".to_string(),
+            },
+        })
+        .unwrap();
+        let good_2 = serde_json::to_string(&TimestampedEventRef {
+            ts: &ts,
+            event: &AgentEvent::TextDelta {
+                text: "world".to_string(),
+            },
+        })
+        .unwrap();
+        let good_3 = serde_json::to_string(&TimestampedEventRef {
+            ts: &ts,
+            event: &AgentEvent::MessageComplete {
+                stop_reason: Some("end_turn".to_string()),
+                usage: None,
+            },
+        })
+        .unwrap();
+        let contents = format!("{good_1}\n{{not valid json}}\n{good_2}\n{good_3}\n");
+        std::fs::write(&path, contents).unwrap();
+
+        let msg = extract_final_assistant_message(&path)
+            .await
+            .expect("message present");
+        assert_eq!(msg, "hello world");
+    }
+
+    #[test]
+    fn test_truncate_message_below_limit() {
+        assert_eq!(truncate_message("short", 100), "short");
+    }
+
+    #[test]
+    fn test_truncate_message_above_limit() {
+        let long = "a".repeat(500);
+        let truncated = truncate_message(&long, 100);
+        let expected = format!("{}\n\n_[message truncated]_", "a".repeat(100));
+        assert_eq!(truncated, expected);
+    }
+
+    #[test]
+    fn test_truncate_message_multibyte_safe() {
+        // Ensure the truncator operates on chars, not bytes, so it never
+        // panics in the middle of a multi-byte codepoint.
+        let s = "漢字".repeat(100);
+        let truncated = truncate_message(&s, 50);
+        assert!(truncated.ends_with("_[message truncated]_"));
+    }
+
     #[test]
     fn test_registry_parse_error_is_non_fatal() {
         use crate::minion_registry::MinionRegistry;

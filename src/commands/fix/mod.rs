@@ -221,6 +221,21 @@ async fn run_worker(minion_id: &str, issue: &str, opts: FixOptions) -> Result<i3
     let pr_number =
         match worker::create_pr_phase(&issue_ctx, &wt_ctx, &start_phase, auto_merge).await {
             Ok(pr) => pr,
+            Err(e) if pr::is_no_commits_clean_exit(&e) => {
+                // `handle_pr_creation` already posted the agent's final message
+                // and applied `gru:blocked`. Skip the `gru:failed` cleanup so
+                // the blocked label is not overwritten, but still clear the
+                // PID/mode in the registry.
+                let mid = wt_ctx.minion_id.clone();
+                let _ = with_registry(move |reg| {
+                    reg.update(&mid, |info| {
+                        info.clear_pid();
+                        info.mode = MinionMode::Stopped;
+                    })
+                })
+                .await;
+                return Ok(1);
+            }
             Err(e) => {
                 helpers::cleanup_post_agent_failure(
                     &issue_ctx.host,
