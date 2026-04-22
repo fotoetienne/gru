@@ -894,7 +894,7 @@ async fn handle_new_reviews(
     // (which would be minutes to hours older).
     let session_start = Utc::now() - chrono::Duration::minutes(1);
 
-    match invoke_agent_for_reviews(
+    let agent_result = invoke_agent_for_reviews(
         ctx.backend,
         &ctx.wt_ctx.checkout_path,
         &ctx.wt_ctx.minion_dir,
@@ -903,30 +903,31 @@ async fn handle_new_reviews(
         ctx.timeout_opt,
         &ctx.issue_ctx.host,
     )
+    .await;
+
+    // Post-hoc backstop for #805: even with the prompt-level constraint
+    // added in #804, the agent may post duplicate inline replies. Run the
+    // sweep regardless of whether the invocation succeeded — a timeout or
+    // late error does not unpost replies the agent already made, and a
+    // partial-session Minion can still have produced duplicates.
+    match pr_monitor::dedup_minion_inline_replies(
+        &ctx.issue_ctx.host,
+        &ctx.issue_ctx.owner,
+        &ctx.issue_ctx.repo,
+        ctx.pr_number,
+        &ctx.wt_ctx.minion_id,
+        session_start,
+    )
     .await
     {
+        Ok(0) => {}
+        Ok(n) => println!("🧹 Removed {} duplicate inline reply comment(s)", n),
+        Err(e) => log::warn!("⚠️  Duplicate inline reply sweep failed: {:#}", e),
+    }
+
+    match agent_result {
         Ok(()) => {
             println!("\n✅ Finished addressing review comments");
-
-            // Post-hoc backstop for #805: even with the prompt-level
-            // constraint added in #804, the agent may occasionally post
-            // duplicate inline replies. Sweep them before continuing to
-            // monitor.
-            match pr_monitor::dedup_minion_inline_replies(
-                &ctx.issue_ctx.host,
-                &ctx.issue_ctx.owner,
-                &ctx.issue_ctx.repo,
-                ctx.pr_number,
-                &ctx.wt_ctx.minion_id,
-                session_start,
-            )
-            .await
-            {
-                Ok(0) => {}
-                Ok(n) => println!("🧹 Removed {} duplicate inline reply comment(s)", n),
-                Err(e) => log::warn!("⚠️  Duplicate inline reply sweep failed: {:#}", e),
-            }
-
             println!("🔄 Continuing to monitor PR...\n");
             // Use the check_time returned by monitor_pr, which was
             // advanced past the reviews we just handled. This ensures

@@ -1106,7 +1106,10 @@ pub(crate) async fn dedup_minion_inline_replies(
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("Failed to fetch PR inline comments for dedup: {}", stderr);
+        anyhow::bail!(
+            "Failed to fetch inline comments for dedup on {repo_full} PR #{pr_number}: {}",
+            stderr
+        );
     }
 
     let stdout = std::str::from_utf8(&output.stdout)
