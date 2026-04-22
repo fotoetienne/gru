@@ -32,6 +32,7 @@ const QUERY: &str = r#"query($owner: String!, $repo: String!, $number: Int!) {
         nodes {
           commit {
             statusCheckRollup {
+              state
               contexts(first: 100) {
                 nodes {
                   __typename
@@ -86,6 +87,10 @@ pub(crate) struct MergeReadinessData {
     pub reviews: Vec<ReviewInfo>,
     pub check_runs: Vec<CheckRunInfo>,
     pub status_contexts: Vec<StatusContextInfo>,
+    /// Top-level rollup state aggregating all contexts (`success`, `pending`,
+    /// `failure`, `error`, `expected`). `None` when no commits / no checks
+    /// exist on the head commit. Lower-cased to match REST conventions.
+    pub rollup_state: Option<String>,
     #[allow(dead_code)]
     pub labels: Vec<String>,
     /// `true` if any of the paginated sub-connections (reviews, rollup
@@ -181,6 +186,7 @@ fn is_graphql_unavailable(stderr: &str) -> bool {
     // 404/403 on the /graphql endpoint itself, or "not supported" messaging.
     (lower.contains("404") && lower.contains("not found"))
         || (lower.contains("403") && lower.contains("forbidden"))
+        || (lower.contains("401") && lower.contains("unauthorized"))
         || lower.contains("graphql is not supported")
         || lower.contains("graphql not enabled")
 }
@@ -209,6 +215,10 @@ fn parse_response(resp: GqlResponse) -> Result<MergeReadinessData> {
 
     let mut has_more_pages = pr.reviews.page_info.has_next_page;
 
+    // Review states are intentionally left in SCREAMING_SNAKE_CASE to match
+    // the REST `ReviewApiResponse.state` format that `evaluate_reviews`
+    // already compares against (e.g. `"APPROVED"`, `"CHANGES_REQUESTED"`).
+    // Normalizing would require updating the shared evaluator.
     let reviews: Vec<ReviewInfo> = pr
         .reviews
         .nodes
@@ -223,8 +233,10 @@ fn parse_response(resp: GqlResponse) -> Result<MergeReadinessData> {
 
     let mut check_runs: Vec<CheckRunInfo> = Vec::new();
     let mut status_contexts: Vec<StatusContextInfo> = Vec::new();
+    let mut rollup_state: Option<String> = None;
     if let Some(commit_node) = pr.commits.nodes.into_iter().next() {
         if let Some(rollup) = commit_node.commit.status_check_rollup {
+            rollup_state = rollup.state.as_deref().map(normalize_enum);
             if rollup.contexts.page_info.has_next_page {
                 has_more_pages = true;
             }
@@ -258,6 +270,7 @@ fn parse_response(resp: GqlResponse) -> Result<MergeReadinessData> {
         reviews,
         check_runs,
         status_contexts,
+        rollup_state,
         labels,
         has_more_pages,
     })
@@ -364,6 +377,11 @@ struct GqlCommit {
 
 #[derive(Debug, Deserialize)]
 struct GqlRollup {
+    /// Top-level aggregate state (`SUCCESS` | `PENDING` | `FAILURE` | `ERROR`
+    /// | `EXPECTED`). Not paginated, so it remains accurate even when
+    /// `contexts` exceeds our page size.
+    #[serde(default)]
+    state: Option<String>,
     contexts: GqlContextConnection,
 }
 
@@ -419,6 +437,7 @@ mod tests {
                   "nodes": [{
                     "commit": {
                       "statusCheckRollup": {
+                        "state": "SUCCESS",
                         "contexts": {
                           "nodes": [
                             {"__typename":"CheckRun","name":"build","status":"COMPLETED","conclusion":"SUCCESS"},
@@ -449,6 +468,7 @@ mod tests {
         assert_eq!(data.check_runs[0].conclusion.as_deref(), Some("success"));
         assert_eq!(data.status_contexts.len(), 1);
         assert_eq!(data.status_contexts[0].state, "success");
+        assert_eq!(data.rollup_state.as_deref(), Some("success"));
         assert!(!data.has_more_pages);
     }
 
@@ -601,6 +621,9 @@ mod tests {
         ));
         assert!(is_graphql_unavailable(
             "HTTP 403: Forbidden (graphql disabled)"
+        ));
+        assert!(is_graphql_unavailable(
+            "HTTP 401: Unauthorized (auth proxy blocked graphql)"
         ));
         assert!(is_graphql_unavailable(
             "GraphQL is not supported on this server"

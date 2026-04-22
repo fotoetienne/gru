@@ -475,7 +475,15 @@ fn evaluate_graphql_data(data: &graphql::MergeReadinessData) -> MergeReadiness {
         })
         .collect();
 
-    let legacy_statuses_ok = data.status_contexts.iter().all(|sc| sc.state == "success");
+    // Prefer the rollup's top-level aggregate state when available: it is not
+    // paginated, so it remains accurate even when `contexts` exceeds our page
+    // size. Fall back to per-StatusContext aggregation (matching the REST
+    // `evaluate_combined_status` behavior of treating zero legacy statuses as
+    // passing) when the rollup is null (no CI wired up on the head commit).
+    let legacy_statuses_ok = match data.rollup_state.as_deref() {
+        Some(state) => state == "success",
+        None => data.status_contexts.iter().all(|sc| sc.state == "success"),
+    };
 
     let ci_passing = evaluate_ci(&check_runs) && legacy_statuses_ok;
     let review_approved = evaluate_reviews(&reviews, &data.author_login);
@@ -1379,6 +1387,7 @@ mod tests {
                     state: state.into(),
                 })
                 .collect(),
+            rollup_state: None,
             labels: vec![],
             has_more_pages: false,
         }
@@ -1462,6 +1471,55 @@ mod tests {
         );
         let mr = evaluate_graphql_data(&data);
         assert!(mr.is_ready());
+    }
+
+    #[test]
+    fn test_graphql_evaluate_rollup_state_success_takes_precedence() {
+        // Rollup state is authoritative when present (not paginated), so a
+        // missing StatusContext (e.g. >100 contexts) can't cause a false pass.
+        let mut data = gql_data(
+            false,
+            Some(true),
+            "bot",
+            vec![("APPROVED", "alice")],
+            vec![(Some("completed"), Some("success"))],
+            vec![], // no per-context statuses visible
+        );
+        data.rollup_state = Some("success".into());
+        let mr = evaluate_graphql_data(&data);
+        assert!(mr.is_ready());
+    }
+
+    #[test]
+    fn test_graphql_evaluate_rollup_state_failure_blocks() {
+        // Rollup state reports failure even though visible contexts all pass
+        // (simulates a failing context not returned in the current page).
+        let mut data = gql_data(
+            false,
+            Some(true),
+            "bot",
+            vec![("APPROVED", "alice")],
+            vec![(Some("completed"), Some("success"))],
+            vec!["success"],
+        );
+        data.rollup_state = Some("failure".into());
+        let mr = evaluate_graphql_data(&data);
+        assert!(!mr.ci_passing);
+    }
+
+    #[test]
+    fn test_graphql_evaluate_rollup_state_pending_blocks() {
+        let mut data = gql_data(
+            false,
+            Some(true),
+            "bot",
+            vec![("APPROVED", "alice")],
+            vec![(Some("completed"), Some("success"))],
+            vec![],
+        );
+        data.rollup_state = Some("pending".into());
+        let mr = evaluate_graphql_data(&data);
+        assert!(!mr.ci_passing);
     }
 
     #[test]
