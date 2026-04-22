@@ -427,19 +427,6 @@ pub(crate) async fn get_pr_snapshot(
     Ok((fingerprint, facts))
 }
 
-/// Backwards-compatible thin wrapper returning only the fingerprint.
-#[cfg(test)]
-#[allow(dead_code)]
-pub(crate) async fn get_pr_fingerprint(
-    host: &str,
-    owner: &str,
-    repo: &str,
-    pr_number: &str,
-) -> Result<PrStateFingerprint> {
-    let (fp, _) = get_pr_snapshot(host, owner, repo, pr_number).await?;
-    Ok(fp)
-}
-
 /// Fetch check-runs for `head_sha` and roll them up into a single conclusion.
 ///
 /// Returns:
@@ -720,7 +707,7 @@ fn build_judge_prompt(
 Your job is **reviewer-feedback satisfaction only**. You do NOT re-adjudicate deterministic gates (CI, mergeability, labels) — those are captured in the "Current facts" block below and are authoritative. Focus exclusively on whether human reviewer comments have been genuinely addressed.
 
 {current_facts}
-Your job is to evaluate whether review feedback has been **genuinely addressed** — not just mechanically replied to.
+Evaluate whether review feedback has been **genuinely addressed** — not just mechanically replied to.
 
 ## Evaluation criteria
 
@@ -1735,6 +1722,15 @@ That's my verdict."#;
     #[test]
     fn test_roll_up_check_runs_empty_is_none() {
         assert_eq!(roll_up_check_runs(""), "NONE");
+    }
+
+    #[test]
+    fn test_roll_up_check_runs_failure_beats_pending() {
+        // Priority: FAILURE > PENDING > SUCCESS. A failed check dominates
+        // even when another check is still in progress.
+        let nd = r#"{"status":"completed","conclusion":"failure"}
+{"status":"in_progress","conclusion":null}"#;
+        assert_eq!(roll_up_check_runs(nd), "FAILURE");
     }
 
     #[test]
