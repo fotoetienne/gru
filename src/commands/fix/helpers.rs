@@ -95,6 +95,14 @@ pub(super) async fn commits_ahead_of_base(
             return count_commits_ahead(checkout_path, &base_ref).await;
         }
     }
+    // No base ref resolved — callers treat 0 as "no commits", which can mask
+    // real commits behind a broken remote setup. Log so ops can tell this
+    // apart from a legitimate zero-commit session.
+    log::warn!(
+        "Could not resolve any base ref for {} (tried: {:?}); treating HEAD as 0 commits ahead",
+        checkout_path.display(),
+        candidates
+    );
     0
 }
 

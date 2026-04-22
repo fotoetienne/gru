@@ -124,9 +124,24 @@ async fn handle_no_commits_clean_exit(
         return Ok(());
     };
 
-    let message_block = final_message.as_deref().unwrap_or(
-        "_The agent did not produce a final message. Check the minion logs for details._",
-    );
+    let message_block = match final_message.as_deref() {
+        Some(msg) => {
+            // Blockquote every line so long multi-paragraph messages stay
+            // visually distinct from the minion's preamble.
+            msg.lines()
+                .map(|line| {
+                    if line.is_empty() {
+                        ">".to_string()
+                    } else {
+                        format!("> {line}")
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+        None => "_The agent did not produce a final message. Check the minion logs for details._"
+            .to_string(),
+    };
 
     let comment = format!(
         "🤖 Minion `{}` ended its turn without making any commits or pushing a branch.\n\n\
