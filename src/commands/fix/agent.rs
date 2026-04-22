@@ -271,7 +271,8 @@ async fn run_agent_session_inner(
     // PR creation and monitoring after the agent child exits.
     let parent_pid = std::process::id();
     let parent_start_time = get_process_start_time(parent_pid);
-    let _ = with_registry(move |registry| {
+    let log_minion_id = wt_ctx.minion_id.clone();
+    if let Err(e) = with_registry(move |registry| {
         registry.update(&exit_minion_id, |info| {
             info.pid = Some(parent_pid);
             info.pid_start_time = parent_start_time;
@@ -282,7 +283,21 @@ async fn run_agent_session_inner(
             }
         })
     })
-    .await;
+    .await
+    {
+        // A failure here leaves the registry pointing at the now-dead agent
+        // child PID. `session_claim` would treat that as a stale entry and
+        // allow a concurrent `gru resume`/`gru attach` to claim the minion —
+        // the exact failure mode this block exists to prevent (issue #862).
+        // Log loudly so operators can correlate a duplicate-agent incident
+        // with the registry write that failed.
+        log::warn!(
+            "Failed to transfer registry ownership to worker PID for {}: {:#}. \
+             Registry may briefly allow concurrent claim.",
+            log_minion_id,
+            e
+        );
+    }
 
     let agent_run = run_result?;
 
