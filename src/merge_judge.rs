@@ -37,6 +37,11 @@ const MAX_WAIT_MINUTES: u64 = 120;
 /// Label applied when the judge escalates for human review.
 const NEEDS_HUMAN_REVIEW_LABEL: &str = labels::NEEDS_HUMAN_REVIEW;
 
+/// Marker opening of a merge-judge verdict comment. Shared between the
+/// writer (`post_judge_escalation_comment`) and the bookkeeping filter so
+/// they cannot drift apart.
+const MERGE_READINESS_MARKER: &str = "🧑‍⚖️ **Merge readiness";
+
 /// Action the judge can take.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum JudgeAction {
@@ -96,6 +101,9 @@ impl CurrentFacts {
     fn ci_label_hash(&self) -> u64 {
         let mut hasher = DefaultHasher::new();
         self.ci_conclusion.hash(&mut hasher);
+        // Include mergeable so `None → Some(true)` transitions on the same
+        // head also re-trigger the judge.
+        self.mergeable.hash(&mut hasher);
         let mut sorted = self.labels.clone();
         sorted.sort();
         sorted.dedup();
@@ -589,13 +597,11 @@ async fn fetch_pr_context(
 pub(crate) fn is_bookkeeping_body(body: &str) -> bool {
     // YAML frontmatter notifications: "---\ntype: monitoring-paused\n---",
     // "---\ntype: *-cleared\n---", etc.
-    if body.starts_with("---\n") {
-        if let Some(after) = body.strip_prefix("---\n") {
-            if let Some(end) = after.find("\n---") {
-                let fm = &after[..end];
-                if fm.lines().any(|l| l.trim_start().starts_with("type:")) {
-                    return true;
-                }
+    if let Some(after) = body.strip_prefix("---\n") {
+        if let Some(end) = after.find("\n---") {
+            let fm = &after[..end];
+            if fm.lines().any(|l| l.trim_start().starts_with("type:")) {
+                return true;
             }
         }
     }
@@ -603,9 +609,9 @@ pub(crate) fn is_bookkeeping_body(body: &str) -> bool {
     if body.contains("## 🚨 CI Fix Escalation") {
         return true;
     }
-    // Prior merge-judge verdicts.
-    if body.contains("🧑\u{200d}⚖️ **Merge readiness") || body.contains("🧑‍⚖️ **Merge readiness")
-    {
+    // Prior merge-judge verdicts — matcher shares MERGE_READINESS_MARKER
+    // with the writer so they cannot drift apart.
+    if body.contains(MERGE_READINESS_MARKER) {
         return true;
     }
     // Minion progress updates from progress_comments.rs (contain "progress update").
@@ -1101,7 +1107,7 @@ pub(crate) async fn post_judge_escalation_comment(
 ) {
     let repo_full = github::repo_slug(owner, repo);
     let body = format!(
-        "🧑‍⚖️ **Merge readiness: {}/10 — needs human review**\n\n{}\n\n\
+        "{MERGE_READINESS_MARKER}: {}/10 — needs human review**\n\n{}\n\n\
          _To proceed, remove the `gru:needs-human-review` label. \
          The judge will re-evaluate on the next PR state change._",
         response.confidence, response.reasoning
