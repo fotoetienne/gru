@@ -755,6 +755,7 @@ async fn handle_ready_to_merge(
                     &ctx.issue_ctx.repo,
                     ctx.pr_number,
                     &response,
+                    &ctx.wt_ctx.minion_id,
                 )
                 .await;
                 // Also post an explanatory comment on the issue.
@@ -817,6 +818,7 @@ async fn handle_ready_to_merge(
                             e
                         ),
                     },
+                    &ctx.wt_ctx.minion_id,
                 )
                 .await;
                 // Only mark escalation complete if the label was applied.

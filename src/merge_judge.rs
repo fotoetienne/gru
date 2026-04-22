@@ -12,6 +12,8 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::task::JoinSet;
@@ -34,6 +36,11 @@ const MAX_WAIT_MINUTES: u64 = 120;
 
 /// Label applied when the judge escalates for human review.
 const NEEDS_HUMAN_REVIEW_LABEL: &str = labels::NEEDS_HUMAN_REVIEW;
+
+/// Marker opening of a merge-judge verdict comment. Shared between the
+/// writer (`post_judge_escalation_comment`) and the bookkeeping filter so
+/// they cannot drift apart.
+const MERGE_READINESS_MARKER: &str = "🧑‍⚖️ **Merge readiness";
 
 /// Action the judge can take.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -65,10 +72,46 @@ pub(crate) struct JudgeResponse {
 }
 
 /// Fingerprint of PR state used to avoid redundant judge invocations.
+///
+/// `ci_label_hash` covers CI conclusion + sorted label set so that a
+/// red→green CI flip (or a label change) on the same head triggers
+/// re-evaluation even when no new comments landed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PrStateFingerprint {
     pub(crate) head_sha: String,
     pub(crate) comment_count: usize,
+    pub(crate) ci_label_hash: u64,
+}
+
+/// Authoritative live state of a PR. Injected into the judge prompt so the
+/// LLM does not re-derive CI / label state from comment archaeology.
+#[derive(Debug, Clone)]
+pub(crate) struct CurrentFacts {
+    pub(crate) head_sha: String,
+    /// Rolled-up CI conclusion: "SUCCESS", "FAILURE", "PENDING", or "NONE".
+    pub(crate) ci_conclusion: String,
+    /// Labels currently on the PR.
+    pub(crate) labels: Vec<String>,
+    /// GitHub's `mergeable` flag: Some(true) clean, Some(false) conflicts,
+    /// None when still computing.
+    pub(crate) mergeable: Option<bool>,
+}
+
+impl CurrentFacts {
+    fn ci_label_hash(&self) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        self.ci_conclusion.hash(&mut hasher);
+        // Include mergeable so `None → Some(true)` transitions on the same
+        // head also re-trigger the judge.
+        self.mergeable.hash(&mut hasher);
+        let mut sorted = self.labels.clone();
+        sorted.sort();
+        sorted.dedup();
+        for l in &sorted {
+            l.hash(&mut hasher);
+        }
+        hasher.finish()
+    }
 }
 
 /// Tracks the judge's state across poll iterations.
@@ -291,17 +334,23 @@ async fn run_gh_parallel(host: &str, arg_sets: Vec<Vec<String>>) -> Result<Vec<S
         .collect()
 }
 
-/// Lightweight fingerprint fetch — only head SHA + comment counts.
-/// Used to check `should_invoke` before fetching full context.
-pub(crate) async fn get_pr_fingerprint(
+/// Lightweight snapshot fetch: fingerprint + authoritative current facts.
+///
+/// Fetches PR metadata (head SHA, labels, mergeable), comment counts, and
+/// check-runs for the current head so the fingerprint reacts to CI / label
+/// transitions even without a new comment, and so the judge prompt can
+/// carry authoritative live state.
+pub(crate) async fn get_pr_snapshot(
     host: &str,
     owner: &str,
     repo: &str,
     pr_number: &str,
-) -> Result<PrStateFingerprint> {
+) -> Result<(PrStateFingerprint, CurrentFacts)> {
     let repo_full = github::repo_slug(owner, repo);
 
-    let results = run_gh_parallel(
+    // Phase 1: need head SHA before we can query check-runs. Do PR +
+    // comment/review counts in parallel (head SHA is not needed for counts).
+    let phase1 = run_gh_parallel(
         host,
         vec![
             vec![
@@ -342,23 +391,130 @@ pub(crate) async fn get_pr_fingerprint(
     .await?;
 
     #[derive(Deserialize)]
-    struct PrHead {
+    struct PrJson {
         head: Head,
+        #[serde(default)]
+        mergeable: Option<bool>,
+        #[serde(default)]
+        labels: Vec<LabelJson>,
     }
     #[derive(Deserialize)]
     struct Head {
         sha: String,
     }
-    let pr: PrHead = serde_json::from_str(&results[0]).context("Failed to parse PR JSON")?;
+    #[derive(Deserialize)]
+    struct LabelJson {
+        name: String,
+    }
 
-    let ic = parse_paginated_lengths(results[1].as_bytes());
-    let rv = parse_paginated_lengths(results[2].as_bytes());
-    let rc = parse_paginated_lengths(results[3].as_bytes());
+    let pr: PrJson = serde_json::from_str(&phase1[0]).context("Failed to parse PR JSON")?;
+    let head_sha = pr.head.sha;
+    let labels: Vec<String> = pr.labels.into_iter().map(|l| l.name).collect();
+    let mergeable = pr.mergeable;
 
-    Ok(PrStateFingerprint {
-        head_sha: pr.head.sha,
+    let ic = parse_paginated_lengths(phase1[1].as_bytes());
+    let rv = parse_paginated_lengths(phase1[2].as_bytes());
+    let rc = parse_paginated_lengths(phase1[3].as_bytes());
+
+    // Phase 2: check-runs for the head SHA.
+    let ci_conclusion = fetch_ci_conclusion(host, &repo_full, &head_sha).await;
+
+    let facts = CurrentFacts {
+        head_sha: head_sha.clone(),
+        ci_conclusion,
+        labels,
+        mergeable,
+    };
+
+    let fingerprint = PrStateFingerprint {
+        head_sha,
         comment_count: ic + rv + rc,
-    })
+        ci_label_hash: facts.ci_label_hash(),
+    };
+
+    Ok((fingerprint, facts))
+}
+
+/// Fetch check-runs for `head_sha` and roll them up into a single conclusion.
+///
+/// Returns:
+/// - "FAILURE" if any check failed / was cancelled / timed out / action_required
+/// - "PENDING" if any check is still running / queued
+/// - "SUCCESS" if all checks are success / neutral / skipped
+/// - "NONE" if there are no checks or the API call fails (logged as warning)
+///
+/// Errors are swallowed intentionally: the merge judge is a best-effort
+/// advisor and shouldn't fail when CI metadata is unavailable.
+async fn fetch_ci_conclusion(host: &str, repo_full: &str, head_sha: &str) -> String {
+    let endpoint = format!("repos/{repo_full}/commits/{head_sha}/check-runs");
+    let output = match github::run_gh(
+        host,
+        &[
+            "api",
+            &endpoint,
+            "--cache",
+            "20s",
+            "--paginate",
+            "--jq",
+            ".check_runs[] | {status, conclusion}",
+        ],
+    )
+    .await
+    {
+        Ok(s) => s,
+        Err(e) => {
+            log::warn!("Failed to fetch check-runs for {head_sha}: {e}");
+            return "NONE".to_string();
+        }
+    };
+
+    roll_up_check_runs(&output)
+}
+
+#[derive(Deserialize)]
+struct CheckRunStatus {
+    #[serde(default)]
+    status: String,
+    #[serde(default)]
+    conclusion: Option<String>,
+}
+
+/// Roll up newline-delimited check-run JSON (one object per line) into a
+/// single conclusion string.
+fn roll_up_check_runs(ndjson: &str) -> String {
+    let mut any = false;
+    let mut pending = false;
+    let mut failed = false;
+
+    for line in ndjson.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(cr) = serde_json::from_str::<CheckRunStatus>(line) else {
+            continue;
+        };
+        any = true;
+        if cr.status != "completed" {
+            pending = true;
+            continue;
+        }
+        match cr.conclusion.as_deref() {
+            Some("success") | Some("neutral") | Some("skipped") => {}
+            Some(_) => failed = true,
+            None => pending = true,
+        }
+    }
+
+    if !any {
+        "NONE".to_string()
+    } else if failed {
+        "FAILURE".to_string()
+    } else if pending {
+        "PENDING".to_string()
+    } else {
+        "SUCCESS".to_string()
+    }
 }
 
 /// Parse the output of `gh api --paginate --jq "length"`.
@@ -426,23 +582,88 @@ async fn fetch_pr_context(
 
     Ok(PrContext {
         diff: results[0].clone(),
-        comments: wrap_ndjson(results[1].as_bytes()),
-        reviews: wrap_ndjson(results[2].as_bytes()),
-        review_comments: wrap_ndjson(results[3].as_bytes()),
+        comments: filter_bookkeeping_ndjson(results[1].as_bytes()),
+        reviews: filter_bookkeeping_ndjson(results[2].as_bytes()),
+        review_comments: filter_bookkeeping_ndjson(results[3].as_bytes()),
     })
 }
 
-/// Wrap newline-delimited JSON objects into a JSON array string.
-fn wrap_ndjson(stdout: &[u8]) -> String {
-    let raw = String::from_utf8_lossy(stdout);
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return "[]".to_string();
+/// Return true if `body` is Gru's own bookkeeping — not reviewer-feedback signal.
+///
+/// Two signals must align before a comment is dropped:
+/// 1. The body carries a trailing Minion signature (`<sub>🤖 Mxxx</sub>`),
+///    an authoritative agent-authored marker. A human reviewer cannot
+///    accidentally trigger the filter by quoting bookkeeping text.
+/// 2. The body matches one of the known bookkeeping shapes.
+///
+/// Substantive Minion replies to reviewers (e.g. "fixed in c9cf557") carry
+/// the signature but not the shape, and are preserved as evidence that
+/// feedback was addressed.
+pub(crate) fn is_bookkeeping_body(body: &str) -> bool {
+    // Gate on authoritative agent identity first. A comment without a
+    // trailing Minion signature is never treated as bookkeeping, which
+    // eliminates the spoof where a reviewer pastes a marker into their
+    // own comment.
+    if crate::progress_comments::extract_minion_id_from_signature(body).is_none() {
+        return false;
     }
-    // Each line from `--jq '.[]'` is a complete JSON object.
-    // Join them with commas and wrap in brackets.
-    let items: Vec<&str> = trimmed.lines().collect();
-    format!("[{}]", items.join(","))
+
+    // YAML frontmatter notifications: "---\ntype: monitoring-paused\n---",
+    // "---\ntype: *-cleared\n---", etc.
+    if let Some(after) = body.strip_prefix("---\n") {
+        if let Some(end) = after.find("\n---") {
+            let fm = &after[..end];
+            if fm.lines().any(|l| l.trim_start().starts_with("type:")) {
+                return true;
+            }
+        }
+    }
+    // Escalation comments posted by ci.rs.
+    if body.contains("## 🚨 CI Fix Escalation") {
+        return true;
+    }
+    // Prior merge-judge verdicts — matcher shares MERGE_READINESS_MARKER
+    // with the writer so they cannot drift apart.
+    if body.contains(MERGE_READINESS_MARKER) {
+        return true;
+    }
+    // Minion progress updates from progress_comments.rs (contain "progress update").
+    if body.contains("🤖 **Minion ") && body.contains("progress update**") {
+        return true;
+    }
+    false
+}
+
+/// Filter out bookkeeping entries from newline-delimited JSON objects and
+/// re-wrap as a JSON array.
+fn filter_bookkeeping_ndjson(stdout: &[u8]) -> String {
+    let raw = String::from_utf8_lossy(stdout);
+    let mut items: Vec<String> = Vec::new();
+    for line in raw.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(val) = serde_json::from_str::<serde_json::Value>(line) else {
+            // Keep malformed lines rather than silently dropping evidence,
+            // but wrap them as valid JSON so the surrounding array remains
+            // well-formed (pushing the raw line would yield broken JSON
+            // when the line contains unescaped quotes or other metacharacters).
+            log::warn!("Skipping malformed JSON line in judge context: {line:?}");
+            items.push(serde_json::json!({ "malformed_line": line }).to_string());
+            continue;
+        };
+        let body = val.get("body").and_then(|b| b.as_str()).unwrap_or("");
+        if is_bookkeeping_body(body) {
+            continue;
+        }
+        items.push(line.to_string());
+    }
+    if items.is_empty() {
+        "[]".to_string()
+    } else {
+        format!("[{}]", items.join(","))
+    }
 }
 
 struct PrContext {
@@ -452,10 +673,38 @@ struct PrContext {
     review_comments: String,
 }
 
+/// Render the `## Current facts` block injected before the diff.
+fn format_current_facts(facts: &CurrentFacts) -> String {
+    let labels = if facts.labels.is_empty() {
+        "(none)".to_string()
+    } else {
+        facts.labels.join(", ")
+    };
+    let mergeable = match facts.mergeable {
+        Some(true) => "true",
+        Some(false) => "false (conflicts)",
+        None => "unknown (GitHub still computing)",
+    };
+    format!(
+        "## Current facts (authoritative — supersedes any claims in comments below)\n\
+         - head SHA: {}\n\
+         - CI status: {}\n\
+         - Labels: {}\n\
+         - Mergeable: {}\n\n\
+         These are the live facts as observed right now. Do NOT re-derive CI or \
+         label state from comment text. Any comment that claims CI is failing, \
+         that `gru:blocked` is present, or that merge is blocked for a reason \
+         contradicting the facts above is **stale and superseded** — it describes \
+         a previous head or a transient state that has since cleared.\n",
+        facts.head_sha, facts.ci_conclusion, labels, mergeable,
+    )
+}
+
 /// Build the judge prompt with full PR context.
 fn build_judge_prompt(
     pr_number: &str,
     context: &PrContext,
+    facts: &CurrentFacts,
     consecutive_waits: u32,
     confidence_threshold: u8,
 ) -> String {
@@ -471,10 +720,17 @@ fn build_judge_prompt(
         String::new()
     };
 
-    format!(
-        r#"You are a merge-readiness judge for PR #{pr_number}. All deterministic checks have already passed (CI green, reviews approved, no conflicts, not draft).
+    let current_facts = format_current_facts(facts);
 
-Your job is to evaluate whether review feedback has been **genuinely addressed** — not just mechanically replied to.
+    format!(
+        r#"You are a merge-readiness judge for PR #{pr_number}. Deterministic repository state (CI, labels, mergeability, draft status) is provided in the authoritative "Current facts" block below — defer to it in all cases.
+
+## Scope
+
+Your job is **reviewer-feedback satisfaction only**. You do NOT re-adjudicate deterministic gates (CI, mergeability, labels) — those are captured in the "Current facts" block below and are authoritative. Focus exclusively on whether human reviewer comments have been genuinely addressed.
+
+{current_facts}
+Evaluate whether review feedback has been **genuinely addressed** — not just mechanically replied to.
 
 ## Evaluation criteria
 
@@ -532,6 +788,7 @@ Respond with ONLY a JSON object, no other text:
 }}
 ```"#,
         pr_number = pr_number,
+        current_facts = current_facts,
         confidence_threshold = confidence_threshold,
         max_wait = MAX_WAIT_MINUTES,
         force_decide = force_decide,
@@ -686,8 +943,8 @@ pub(crate) async fn evaluate(
     state: &mut JudgeState,
     confidence_threshold: u8,
 ) -> Result<Option<JudgeResponse>> {
-    // Lightweight fingerprint check first to avoid fetching full context.
-    let fingerprint = get_pr_fingerprint(host, owner, repo, pr_number).await?;
+    // Lightweight snapshot check first to avoid fetching full context.
+    let (fingerprint, facts) = get_pr_snapshot(host, owner, repo, pr_number).await?;
 
     if !state.should_invoke(&fingerprint) {
         return Ok(None);
@@ -700,6 +957,7 @@ pub(crate) async fn evaluate(
     let prompt = build_judge_prompt(
         pr_number,
         &context,
+        &facts,
         state.consecutive_waits(),
         confidence_threshold,
     );
@@ -857,19 +1115,27 @@ pub(crate) async fn has_needs_human_review_label(
 }
 
 /// Post an escalation comment explaining why the judge escalated.
+///
+/// The trailing Minion signature is mandatory: the bookkeeping filter
+/// requires an authoritative agent marker before it will drop a comment,
+/// so a verdict without a signature would persist in future judge prompts
+/// as stale evidence.
 pub(crate) async fn post_judge_escalation_comment(
     host: &str,
     owner: &str,
     repo: &str,
     pr_number: &str,
     response: &JudgeResponse,
+    minion_id: &str,
 ) {
     let repo_full = github::repo_slug(owner, repo);
     let body = format!(
-        "🧑‍⚖️ **Merge readiness: {}/10 — needs human review**\n\n{}\n\n\
+        "{MERGE_READINESS_MARKER}: {}/10 — needs human review**\n\n{}\n\n\
          _To proceed, remove the `gru:needs-human-review` label. \
-         The judge will re-evaluate on the next PR state change._",
-        response.confidence, response.reasoning
+         The judge will re-evaluate on the next PR state change._{}",
+        response.confidence,
+        response.reasoning,
+        crate::progress_comments::minion_signature(minion_id),
     );
 
     match github::run_gh(
@@ -995,6 +1261,7 @@ That's my verdict."#;
         let fp = PrStateFingerprint {
             head_sha: "abc123".to_string(),
             comment_count: 5,
+            ci_label_hash: 0,
         };
         assert!(state.should_invoke(&fp));
     }
@@ -1005,6 +1272,7 @@ That's my verdict."#;
         let fp = PrStateFingerprint {
             head_sha: "abc123".to_string(),
             comment_count: 5,
+            ci_label_hash: 0,
         };
         let response = JudgeResponse {
             confidence: 9,
@@ -1021,6 +1289,7 @@ That's my verdict."#;
         let fp1 = PrStateFingerprint {
             head_sha: "abc123".to_string(),
             comment_count: 5,
+            ci_label_hash: 0,
         };
         let response = JudgeResponse {
             confidence: 9,
@@ -1032,6 +1301,7 @@ That's my verdict."#;
         let fp2 = PrStateFingerprint {
             head_sha: "def456".to_string(),
             comment_count: 5,
+            ci_label_hash: 0,
         };
         assert!(state.should_invoke(&fp2));
     }
@@ -1042,6 +1312,7 @@ That's my verdict."#;
         let fp = PrStateFingerprint {
             head_sha: "abc".to_string(),
             comment_count: 1,
+            ci_label_hash: 0,
         };
         let wait_resp = JudgeResponse {
             confidence: 5,
@@ -1060,6 +1331,7 @@ That's my verdict."#;
         let fp2 = PrStateFingerprint {
             head_sha: "def".to_string(),
             comment_count: 2,
+            ci_label_hash: 0,
         };
         state.record_response(fp2, &wait_resp);
         assert_eq!(state.consecutive_waits(), 1);
@@ -1078,6 +1350,7 @@ That's my verdict."#;
         let fp = PrStateFingerprint {
             head_sha: "abc".to_string(),
             comment_count: 1,
+            ci_label_hash: 0,
         };
         let resp = JudgeResponse {
             confidence: 3,
@@ -1098,6 +1371,7 @@ That's my verdict."#;
         let fp = PrStateFingerprint {
             head_sha: "abc".to_string(),
             comment_count: 1,
+            ci_label_hash: 0,
         };
         let resp = JudgeResponse {
             confidence: 9,
@@ -1117,6 +1391,7 @@ That's my verdict."#;
         let fp = PrStateFingerprint {
             head_sha: "abc123".to_string(),
             comment_count: 5,
+            ci_label_hash: 0,
         };
         state.record_failure(fp.clone());
         assert_eq!(state.consecutive_failures(), 1);
@@ -1132,6 +1407,7 @@ That's my verdict."#;
         let fp = PrStateFingerprint {
             head_sha: "abc123".to_string(),
             comment_count: 5,
+            ci_label_hash: 0,
         };
         state.record_failure(fp.clone());
         assert_eq!(state.consecutive_failures(), 1);
@@ -1152,11 +1428,13 @@ That's my verdict."#;
         let fp1 = PrStateFingerprint {
             head_sha: "abc".to_string(),
             comment_count: 1,
+            ci_label_hash: 0,
         };
         state.record_failure(fp1);
         state.record_failure(PrStateFingerprint {
             head_sha: "abc".to_string(),
             comment_count: 1,
+            ci_label_hash: 0,
         });
         assert_eq!(state.consecutive_failures(), 2);
 
@@ -1164,6 +1442,7 @@ That's my verdict."#;
         let fp2 = PrStateFingerprint {
             head_sha: "def".to_string(),
             comment_count: 2,
+            ci_label_hash: 0,
         };
         state.record_failure(fp2);
         assert_eq!(state.consecutive_failures(), 1);
@@ -1175,6 +1454,7 @@ That's my verdict."#;
         let fp = PrStateFingerprint {
             head_sha: "abc".to_string(),
             comment_count: 1,
+            ci_label_hash: 0,
         };
         state.record_failure(fp.clone());
         state.record_failure(fp.clone());
@@ -1196,6 +1476,7 @@ That's my verdict."#;
         let fp = PrStateFingerprint {
             head_sha: "abc123".to_string(),
             comment_count: 5,
+            ci_label_hash: 0,
         };
 
         // Hit the failure cap.
@@ -1211,6 +1492,7 @@ That's my verdict."#;
         let fp2 = PrStateFingerprint {
             head_sha: "def456".to_string(),
             comment_count: 5,
+            ci_label_hash: 0,
         };
         assert!(state.should_invoke(&fp2));
     }
@@ -1221,6 +1503,7 @@ That's my verdict."#;
         let fp = PrStateFingerprint {
             head_sha: "abc123".to_string(),
             comment_count: 5,
+            ci_label_hash: 0,
         };
         state.record_failure(fp.clone());
         assert_eq!(state.consecutive_failures(), 1);
@@ -1239,6 +1522,7 @@ That's my verdict."#;
         let fp = PrStateFingerprint {
             head_sha: "abc".to_string(),
             comment_count: 1,
+            ci_label_hash: 0,
         };
         for _ in 0..MAX_CONSECUTIVE_FAILURES {
             state.record_failure(fp.clone());
@@ -1256,6 +1540,7 @@ That's my verdict."#;
         let fp1 = PrStateFingerprint {
             head_sha: "abc".to_string(),
             comment_count: 1,
+            ci_label_hash: 0,
         };
         let wait_resp = JudgeResponse {
             confidence: 5,
@@ -1270,6 +1555,7 @@ That's my verdict."#;
         let fp2 = PrStateFingerprint {
             head_sha: "def".to_string(),
             comment_count: 2,
+            ci_label_hash: 0,
         };
         state.record_failure(fp2);
         assert_eq!(state.consecutive_waits(), 0);
@@ -1282,6 +1568,7 @@ That's my verdict."#;
         let fp = PrStateFingerprint {
             head_sha: "abc".to_string(),
             comment_count: 1,
+            ci_label_hash: 0,
         };
 
         // Accumulate failures up to the escalation threshold.
@@ -1319,22 +1606,37 @@ That's my verdict."#;
     }
 
     #[test]
-    fn test_wrap_ndjson_empty() {
-        assert_eq!(wrap_ndjson(b""), "[]");
-        assert_eq!(wrap_ndjson(b"  \n  "), "[]");
+    fn test_filter_bookkeeping_ndjson_empty() {
+        assert_eq!(filter_bookkeeping_ndjson(b""), "[]");
+        assert_eq!(filter_bookkeeping_ndjson(b"  \n  "), "[]");
     }
 
     #[test]
-    fn test_wrap_ndjson_single_object() {
+    fn test_filter_bookkeeping_ndjson_single_object() {
         let input = br#"{"id":1,"body":"hello"}"#;
-        let result = wrap_ndjson(input);
+        let result = filter_bookkeeping_ndjson(input);
         assert_eq!(result, r#"[{"id":1,"body":"hello"}]"#);
     }
 
     #[test]
-    fn test_wrap_ndjson_multiple_objects() {
-        let input = b"{\"id\":1}\n{\"id\":2}\n{\"id\":3}";
-        let result = wrap_ndjson(input);
+    fn test_filter_bookkeeping_ndjson_malformed_line_stays_valid_json() {
+        // Raw line with an unescaped quote would produce invalid JSON if
+        // pushed verbatim; it must be wrapped so the output array still parses.
+        let input =
+            b"{\"id\":1,\"body\":\"ok\"}\nnot-json \"with quote\"\n{\"id\":2,\"body\":\"also ok\"}";
+        let result = filter_bookkeeping_ndjson(input);
+        let parsed: Vec<serde_json::Value> =
+            serde_json::from_str(&result).expect("output must be valid JSON");
+        assert_eq!(parsed.len(), 3);
+        // Middle entry is wrapped under `malformed_line` to preserve evidence.
+        assert!(parsed[1].get("malformed_line").is_some());
+    }
+
+    #[test]
+    fn test_filter_bookkeeping_ndjson_multiple_objects() {
+        let input =
+            b"{\"id\":1,\"body\":\"a\"}\n{\"id\":2,\"body\":\"b\"}\n{\"id\":3,\"body\":\"c\"}";
+        let result = filter_bookkeeping_ndjson(input);
         let parsed: Vec<serde_json::Value> = serde_json::from_str(&result).unwrap();
         assert_eq!(parsed.len(), 3);
     }
@@ -1347,6 +1649,15 @@ That's my verdict."#;
         assert_eq!(parse_paginated_lengths(b"10\n"), 10);
     }
 
+    fn test_facts() -> CurrentFacts {
+        CurrentFacts {
+            head_sha: "deadbeef".to_string(),
+            ci_conclusion: "SUCCESS".to_string(),
+            labels: vec!["gru:auto-merge".to_string()],
+            mergeable: Some(true),
+        }
+    }
+
     #[test]
     fn test_build_judge_prompt_includes_threshold() {
         let ctx = PrContext {
@@ -1355,9 +1666,12 @@ That's my verdict."#;
             reviews: "[]".to_string(),
             review_comments: "[]".to_string(),
         };
-        let prompt = build_judge_prompt("42", &ctx, 0, 8);
+        let prompt = build_judge_prompt("42", &ctx, &test_facts(), 0, 8);
         assert!(prompt.contains("confidence threshold is 8/10"));
         assert!(!prompt.contains("IMPORTANT: This is your final evaluation"));
+        assert!(prompt.contains("## Current facts"));
+        assert!(prompt.contains("head SHA: deadbeef"));
+        assert!(prompt.contains("CI status: SUCCESS"));
     }
 
     #[test]
@@ -1369,9 +1683,179 @@ That's my verdict."#;
             review_comments: "[]".to_string(),
         };
         // MAX_CONSECUTIVE_WAITS - 1 = 2, so at 2 consecutive waits, force decide.
-        let prompt = build_judge_prompt("42", &ctx, 2, 8);
+        let prompt = build_judge_prompt("42", &ctx, &test_facts(), 2, 8);
         assert!(prompt.contains("IMPORTANT: This is your final evaluation"));
         assert!(prompt.contains("attempt 3 of 3"));
+    }
+
+    #[test]
+    fn test_is_bookkeeping_body_detects_monitoring_paused_frontmatter() {
+        let body = "---\ntype: monitoring-paused\n---\n\n⏸️ This PR's automated agent has paused.\n\n<sub>🤖 M1cu</sub>";
+        assert!(is_bookkeeping_body(body));
+    }
+
+    #[test]
+    fn test_is_bookkeeping_body_detects_ci_fix_escalation() {
+        let body = "## 🚨 CI Fix Escalation\n\nBuild failed: foo\n\n<sub>🤖 M1cu</sub>";
+        assert!(is_bookkeeping_body(body));
+    }
+
+    #[test]
+    fn test_is_bookkeeping_body_detects_prior_judge_verdict() {
+        let body =
+            "🧑‍⚖️ **Merge readiness: 3/10 — needs human review**\n\nStale.\n\n<sub>🤖 M1cu</sub>";
+        assert!(is_bookkeeping_body(body));
+    }
+
+    #[test]
+    fn test_is_bookkeeping_body_rejects_unsigned_marker_spoof() {
+        // A reviewer quoting the CI Fix Escalation header in their own
+        // comment (no Minion signature) must NOT be filtered — it could
+        // carry substantive feedback.
+        let body = "## 🚨 CI Fix Escalation — quoting this from earlier to ask: \
+                    is the interval_millis rename really required here?";
+        assert!(!is_bookkeeping_body(body));
+    }
+
+    #[test]
+    fn test_is_bookkeeping_body_rejects_unsigned_frontmatter_spoof() {
+        // Reviewer pasting frontmatter-ish text without a Minion signature
+        // must not be filtered.
+        let body = "---\ntype: monitoring-paused\n---\n\nI see this in the thread — \
+                    can you confirm the PR is intentionally paused?";
+        assert!(!is_bookkeeping_body(body));
+    }
+
+    #[test]
+    fn test_is_bookkeeping_body_preserves_minion_reply_to_reviewer() {
+        // Substantive Minion reply with a signature — must NOT be filtered.
+        let body = "Fixed in c9cf557 — switched from `interval_secs` to \
+                    `interval_millis` as requested.\n\n<sub>🤖 M1cu</sub>";
+        assert!(!is_bookkeeping_body(body));
+    }
+
+    #[test]
+    fn test_is_bookkeeping_body_preserves_reviewer_comment() {
+        let body = "Please rename `interval_secs` to `interval_millis`.";
+        assert!(!is_bookkeeping_body(body));
+    }
+
+    #[test]
+    fn test_filter_bookkeeping_ndjson_drops_bookkeeping_preserves_signal() {
+        // Reproduces the verso#275 stream: monitoring-paused + stale CI
+        // escalation + prior 3/10 verdict all stripped; reviewer request
+        // and Minion substantive reply preserved.
+        // Each line is a JSON object; body values embed escaped \n pairs.
+        // Bookkeeping entries carry a trailing Minion signature (the
+        // authoritative agent marker); the reviewer entry does not.
+        let lines = [
+            "{\"id\":1,\"body\":\"---\\ntype: monitoring-paused\\n---\\n\\nPaused\\n\\n<sub>\u{1f916} M1cu</sub>\"}",
+            "{\"id\":2,\"body\":\"## \u{1f6a8} CI Fix Escalation\\n\\nfailing on interval_secs\\n\\n<sub>\u{1f916} M1cu</sub>\"}",
+            "{\"id\":3,\"body\":\"\u{1f9d1}\u{200d}\u{2696}\u{fe0f} **Merge readiness: 3/10 \u{2014} needs human review**\\n\\nCI failing\\n\\n<sub>\u{1f916} M1cu</sub>\"}",
+            "{\"id\":4,\"body\":\"Please rename interval_secs to interval_millis.\"}",
+            "{\"id\":5,\"body\":\"Fixed in c9cf557.\\n\\n<sub>\u{1f916} M1cu</sub>\"}",
+        ];
+        let ndjson = lines.join("\n");
+        let out = filter_bookkeeping_ndjson(ndjson.as_bytes());
+        let parsed: Vec<serde_json::Value> = serde_json::from_str(&out).unwrap();
+        let ids: Vec<u64> = parsed
+            .iter()
+            .filter_map(|v| v.get("id").and_then(|i| i.as_u64()))
+            .collect();
+        assert_eq!(ids, vec![4, 5]);
+    }
+
+    #[test]
+    fn test_roll_up_check_runs_all_success() {
+        let nd = r#"{"status":"completed","conclusion":"success"}
+{"status":"completed","conclusion":"success"}"#;
+        assert_eq!(roll_up_check_runs(nd), "SUCCESS");
+    }
+
+    #[test]
+    fn test_roll_up_check_runs_any_failure() {
+        let nd = r#"{"status":"completed","conclusion":"success"}
+{"status":"completed","conclusion":"failure"}"#;
+        assert_eq!(roll_up_check_runs(nd), "FAILURE");
+    }
+
+    #[test]
+    fn test_roll_up_check_runs_pending() {
+        let nd = r#"{"status":"completed","conclusion":"success"}
+{"status":"in_progress","conclusion":null}"#;
+        assert_eq!(roll_up_check_runs(nd), "PENDING");
+    }
+
+    #[test]
+    fn test_roll_up_check_runs_empty_is_none() {
+        assert_eq!(roll_up_check_runs(""), "NONE");
+    }
+
+    #[test]
+    fn test_roll_up_check_runs_failure_beats_pending() {
+        // Priority: FAILURE > PENDING > SUCCESS. A failed check dominates
+        // even when another check is still in progress.
+        let nd = r#"{"status":"completed","conclusion":"failure"}
+{"status":"in_progress","conclusion":null}"#;
+        assert_eq!(roll_up_check_runs(nd), "FAILURE");
+    }
+
+    #[test]
+    fn test_ci_label_hash_differs_for_different_ci() {
+        let green = CurrentFacts {
+            head_sha: "abc".to_string(),
+            ci_conclusion: "SUCCESS".to_string(),
+            labels: vec!["gru:auto-merge".to_string()],
+            mergeable: Some(true),
+        };
+        let red = CurrentFacts {
+            ci_conclusion: "FAILURE".to_string(),
+            ..green.clone()
+        };
+        assert_ne!(green.ci_label_hash(), red.ci_label_hash());
+    }
+
+    #[test]
+    fn test_ci_label_hash_label_order_independent() {
+        let a = CurrentFacts {
+            head_sha: "abc".to_string(),
+            ci_conclusion: "SUCCESS".to_string(),
+            labels: vec!["a".to_string(), "b".to_string()],
+            mergeable: Some(true),
+        };
+        let b = CurrentFacts {
+            labels: vec!["b".to_string(), "a".to_string()],
+            ..a.clone()
+        };
+        assert_eq!(a.ci_label_hash(), b.ci_label_hash());
+    }
+
+    #[test]
+    fn test_fingerprint_ci_change_triggers_reinvoke_on_same_head() {
+        // Regression for the "CI flips red→green on same head with no new
+        // comments" gap. Pre-fix the judge would skip re-evaluation.
+        let mut state = JudgeState::new();
+        let red_fp = PrStateFingerprint {
+            head_sha: "abc".to_string(),
+            comment_count: 5,
+            ci_label_hash: 1111, // hash of (FAILURE, labels)
+        };
+        let response = JudgeResponse {
+            confidence: 3,
+            action: JudgeAction::Escalate,
+            reasoning: "CI red".to_string(),
+        };
+        state.record_response(red_fp, &response);
+
+        let green_fp = PrStateFingerprint {
+            head_sha: "abc".to_string(),
+            comment_count: 5,
+            ci_label_hash: 2222, // hash of (SUCCESS, labels)
+        };
+        assert!(
+            state.should_invoke(&green_fp),
+            "judge must re-invoke when CI flips on same head"
+        );
     }
 
     // --- T7: Wait timer expiry test ---
@@ -1382,6 +1866,7 @@ That's my verdict."#;
         let fp = PrStateFingerprint {
             head_sha: "abc123".to_string(),
             comment_count: 5,
+            ci_label_hash: 0,
         };
         // Record a Wait response with Duration::ZERO so wait_until = now + 0,
         // meaning the timer is already expired by the time we check.
@@ -1405,6 +1890,7 @@ That's my verdict."#;
         let fp = PrStateFingerprint {
             head_sha: "abc123".to_string(),
             comment_count: 5,
+            ci_label_hash: 0,
         };
         // Record a Wait response with a very long duration.
         let response = JudgeResponse {
