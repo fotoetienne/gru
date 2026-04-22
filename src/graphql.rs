@@ -20,7 +20,14 @@ const QUERY: &str = r#"query($owner: String!, $repo: String!, $number: Int!) {
       mergeable
       headRefOid
       author { login }
-      labels(first: 50) { nodes { name } }
+      labels(first: 50) {
+        nodes { name }
+        pageInfo { hasNextPage }
+      }
+      # Reviews are returned in ascending creation order (GitHub's default for
+      # this connection — there is no orderBy argument on PullRequest.reviews).
+      # `evaluate_reviews` depends on this chronological ordering so that
+      # DISMISSED can correctly clear a reviewer's prior state.
       reviews(first: 100) {
         nodes {
           state
@@ -138,6 +145,8 @@ pub(crate) async fn fetch_pr_merge_data(
         &[
             "api",
             "graphql",
+            "--cache",
+            "20s",
             "-f",
             &query_arg,
             "-F",
@@ -213,7 +222,8 @@ fn parse_response(resp: GqlResponse) -> Result<MergeReadinessData> {
 
     let author_login = pr.author.map(|a| a.login).unwrap_or_default();
 
-    let mut has_more_pages = pr.reviews.page_info.has_next_page;
+    let mut has_more_pages =
+        pr.reviews.page_info.has_next_page || pr.labels.page_info.has_next_page;
 
     // Review states are intentionally left in SCREAMING_SNAKE_CASE to match
     // the REST `ReviewApiResponse.state` format that `evaluate_reviews`
@@ -331,6 +341,8 @@ struct GqlAuthor {
 struct GqlLabelConnection {
     #[serde(default)]
     nodes: Vec<GqlLabel>,
+    #[serde(rename = "pageInfo", default)]
+    page_info: GqlPageInfo,
 }
 
 #[derive(Debug, Deserialize)]
@@ -557,6 +569,20 @@ mod tests {
             "author": {"login":"a"},
             "labels": {"nodes": []},
             "reviews": {"nodes": [], "pageInfo":{"hasNextPage":true}},
+            "commits": {"nodes": []}
+        }}}}"#;
+        assert!(parse(json).unwrap().has_more_pages);
+    }
+
+    #[test]
+    fn flags_pagination_overflow_on_labels() {
+        let json = r#"{"data":{"repository":{"pullRequest":{
+            "isDraft": false,
+            "mergeable": "MERGEABLE",
+            "headRefOid": "abc",
+            "author": {"login":"a"},
+            "labels": {"nodes": [], "pageInfo": {"hasNextPage": true}},
+            "reviews": {"nodes": [], "pageInfo":{"hasNextPage":false}},
             "commits": {"nodes": []}
         }}}}"#;
         assert!(parse(json).unwrap().has_more_pages);
