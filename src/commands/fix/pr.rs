@@ -5,6 +5,7 @@ use crate::minion_registry::with_registry;
 use crate::pr_state::PrState;
 use anyhow::{Context, Result};
 use std::path::Path;
+use tokio::io::AsyncBufReadExt;
 use tokio::process::Command as TokioCommand;
 
 /// Typed errors produced by the PR creation phase.
@@ -42,25 +43,43 @@ pub(crate) fn is_no_commits_clean_exit(err: &anyhow::Error) -> bool {
 }
 
 /// Maximum characters of the agent's final message to include in the issue comment.
-/// Long messages are truncated with an ellipsis to avoid oversized comments.
+/// Long messages are truncated by appending `_[message truncated]_` to avoid
+/// oversized comments.
 const MAX_FINAL_MESSAGE_CHARS: usize = 4000;
 
 /// Extracts the agent's final assistant message from an `events.jsonl` file.
 ///
-/// Scans events in order, accumulating `TextDelta` text into a buffer that is
-/// latched to `last_completed` whenever a `MessageComplete` is encountered. The
-/// final non-empty completed message is what the agent said before ending its
-/// turn. Returns `None` if the file cannot be read or no assistant text was
-/// produced.
+/// Streams the file line-by-line, accumulating `TextDelta` text into a buffer
+/// that is latched to `last_completed` whenever a `MessageComplete` is
+/// encountered. The final non-empty completed message is what the agent said
+/// before ending its turn. Returns `None` if the file cannot be opened or no
+/// assistant text was produced.
 ///
-/// Async to avoid blocking the executor on large event logs.
+/// Uses a `BufReader` so memory stays bounded on long sessions dominated by
+/// tool-use events.
 pub(super) async fn extract_final_assistant_message(events_path: &Path) -> Option<String> {
-    let content = tokio::fs::read_to_string(events_path).await.ok()?;
+    let file = tokio::fs::File::open(events_path).await.ok()?;
+    let mut reader = tokio::io::BufReader::new(file);
+    let mut line = String::new();
 
     let mut buffer = String::new();
     let mut last_completed: Option<String> = None;
 
-    for line in content.lines() {
+    loop {
+        line.clear();
+        match reader.read_line(&mut line).await {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(e) => {
+                log::warn!(
+                    "Failed to read {}: {}. Returning partial final message.",
+                    events_path.display(),
+                    e
+                );
+                break;
+            }
+        }
+
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
@@ -169,30 +188,30 @@ async fn handle_no_commits_clean_exit(
         );
     }
 
-    match crate::github::mark_issue_blocked_via_cli(
+    // Propagate label failure to the caller so `run_worker` can fall back to
+    // the `gru:failed` cleanup path instead of swallowing the label error and
+    // returning `NoCommitsCleanExit`. Otherwise a labeling failure would leave
+    // the issue stuck at `gru:in-progress` with no follow-up.
+    crate::github::mark_issue_blocked_via_cli(
         &issue_ctx.host,
         &issue_ctx.owner,
         &issue_ctx.repo,
         issue_num,
     )
     .await
-    {
-        Ok(()) => {
-            println!(
-                "🏷️  Updated issue #{} label to '{}'",
-                issue_num,
-                crate::labels::BLOCKED
-            );
-        }
-        Err(e) => {
-            log::warn!(
-                "⚠️  Failed to apply '{}' label to issue #{}: {:#}",
-                crate::labels::BLOCKED,
-                issue_num,
-                e
-            );
-        }
-    }
+    .with_context(|| {
+        format!(
+            "failed to apply '{}' label to issue #{}",
+            crate::labels::BLOCKED,
+            issue_num
+        )
+    })?;
+
+    println!(
+        "🏷️  Updated issue #{} label to '{}'",
+        issue_num,
+        crate::labels::BLOCKED
+    );
 
     Ok(())
 }
@@ -550,7 +569,11 @@ pub(crate) async fn handle_pr_creation(
         )
         .await;
 
-        if commits_ahead == 0 {
+        // Only block when the count is *known* to be zero. An unresolved count
+        // (e.g., a broken remote setup returning `None`) falls through to the
+        // normal "branch not pushed" error so we never falsely block an issue
+        // on an unreliable signal.
+        if matches!(commits_ahead, Some(0)) {
             handle_no_commits_clean_exit(issue_ctx, wt_ctx).await?;
             return Err(PrCreationError::NoCommitsCleanExit.into());
         }

@@ -80,7 +80,8 @@ pub(crate) async fn try_mark_issue_failed(host: &str, owner: &str, repo: &str, i
 }
 
 /// Resolves a base ref and counts how many commits HEAD is ahead of it.
-/// Returns 0 when no base ref can be resolved or the count fails.
+/// Returns `None` when no base ref can be resolved so callers can distinguish
+/// "unknown" from "legitimately zero" and avoid acting on an unreliable signal.
 /// Shared between the crash-path preservation flow and the clean-exit
 /// detection in `pr.rs`.
 pub(super) async fn commits_ahead_of_base(
@@ -88,22 +89,19 @@ pub(super) async fn commits_ahead_of_base(
     host: &str,
     owner: &str,
     repo: &str,
-) -> usize {
+) -> Option<usize> {
     let candidates = base_branch_candidates(checkout_path, host, owner, repo).await;
     for base in &candidates {
         if let Some(base_ref) = resolve_base_ref(checkout_path, base).await {
-            return count_commits_ahead(checkout_path, &base_ref).await;
+            return Some(count_commits_ahead(checkout_path, &base_ref).await);
         }
     }
-    // No base ref resolved — callers treat 0 as "no commits", which can mask
-    // real commits behind a broken remote setup. Log so ops can tell this
-    // apart from a legitimate zero-commit session.
     log::warn!(
-        "Could not resolve any base ref for {} (tried: {:?}); treating HEAD as 0 commits ahead",
+        "Could not resolve any base ref for {} (tried: {:?}); commit count unavailable",
         checkout_path.display(),
         candidates
     );
-    0
+    None
 }
 
 /// Resolves candidate base-branch names in preference order: local
