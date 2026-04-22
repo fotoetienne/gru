@@ -79,6 +79,25 @@ pub(crate) async fn try_mark_issue_failed(host: &str, owner: &str, repo: &str, i
     }
 }
 
+/// Resolves a base ref and counts how many commits HEAD is ahead of it.
+/// Returns 0 when no base ref can be resolved or the count fails.
+/// Shared between the crash-path preservation flow and the clean-exit
+/// detection in `pr.rs`.
+pub(super) async fn commits_ahead_of_base(
+    checkout_path: &Path,
+    host: &str,
+    owner: &str,
+    repo: &str,
+) -> usize {
+    let candidates = base_branch_candidates(checkout_path, host, owner, repo).await;
+    for base in &candidates {
+        if let Some(base_ref) = resolve_base_ref(checkout_path, base).await {
+            return count_commits_ahead(checkout_path, &base_ref).await;
+        }
+    }
+    0
+}
+
 /// Resolves candidate base-branch names in preference order: local
 /// `origin/HEAD`, then the GitHub API result, then `main` / `master`.
 /// Callers pick the first candidate whose `origin/<branch>` ref exists locally.
