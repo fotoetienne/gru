@@ -879,7 +879,22 @@ async fn handle_new_reviews(
 
     println!("🔄 Re-invoking to address review feedback...\n");
 
-    match invoke_agent_for_reviews(
+    // Capture the session start time so the post-hoc dedup only considers
+    // replies the agent posts during this invocation — replies from prior
+    // sessions, which the human reviewer has implicitly accepted, are left
+    // untouched.
+    //
+    // Subtract a 1-minute safety margin to absorb clock skew between the
+    // local host (`Utc::now()`) and GitHub's server clock (which sets
+    // `created_at`). Without this margin, if the local clock runs ahead,
+    // the very first reply could land with `created_at < session_start`
+    // and be excluded — then a later duplicate would be kept and the
+    // earlier original discarded. A minute is wide enough for any
+    // plausible skew and still far narrower than any prior-session reply
+    // (which would be minutes to hours older).
+    let session_start = Utc::now() - chrono::Duration::minutes(1);
+
+    let agent_result = invoke_agent_for_reviews(
         ctx.backend,
         &ctx.wt_ctx.checkout_path,
         &ctx.wt_ctx.minion_dir,
@@ -888,8 +903,29 @@ async fn handle_new_reviews(
         ctx.timeout_opt,
         &ctx.issue_ctx.host,
     )
+    .await;
+
+    // Post-hoc backstop for #805: even with the prompt-level constraint
+    // added in #804, the agent may post duplicate inline replies. Run the
+    // sweep regardless of whether the invocation succeeded — a timeout or
+    // late error does not unpost replies the agent already made, and a
+    // partial-session Minion can still have produced duplicates.
+    match pr_monitor::dedup_minion_inline_replies(
+        &ctx.issue_ctx.host,
+        &ctx.issue_ctx.owner,
+        &ctx.issue_ctx.repo,
+        ctx.pr_number,
+        &ctx.wt_ctx.minion_id,
+        session_start,
+    )
     .await
     {
+        Ok(0) => {}
+        Ok(n) => println!("🧹 Removed {} duplicate inline reply comment(s)", n),
+        Err(e) => log::warn!("⚠️  Duplicate inline reply sweep failed: {:#}", e),
+    }
+
+    match agent_result {
         Ok(()) => {
             println!("\n✅ Finished addressing review comments");
             println!("🔄 Continuing to monitor PR...\n");

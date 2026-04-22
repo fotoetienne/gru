@@ -128,6 +128,17 @@ struct ApiReviewComment {
     user: User,
     #[serde(default)]
     in_reply_to_id: Option<u64>,
+    #[serde(default = "default_api_review_comment_created_at")]
+    created_at: DateTime<Utc>,
+}
+
+/// Default used when `created_at` is missing from the API payload (which
+/// GitHub should always include for a real comment, but may be omitted in
+/// test fixtures). The UNIX epoch is load-bearing for dedup safety: any
+/// comment we can't date is classified as pre-`since` by
+/// `identify_duplicate_minion_replies` and therefore never deleted.
+fn default_api_review_comment_created_at() -> DateTime<Utc> {
+    DateTime::<Utc>::from_timestamp(0, 0).expect("UNIX epoch is a valid DateTime")
 }
 
 /// A general PR conversation comment (issue comment, not a formal review)
@@ -1002,6 +1013,157 @@ fn filter_unanswered_comments(
             !has_minion_signature_for(&c.body, minion_id) && !already_answered.contains(&c.id)
         })
         .collect()
+}
+
+/// Identify duplicate inline review comment replies posted by this Minion.
+///
+/// A Minion is instructed (in `format_review_prompt`) to post exactly one
+/// reply per inline comment thread, but prompt constraints are best-effort.
+/// This backstop inspects the comments returned by the PR-comments endpoint
+/// and, for each thread containing more than one Minion-signed reply created
+/// at/after `since`, returns the IDs of all duplicates (all but the earliest
+/// by `(created_at, id)` — `id` breaks ties when two replies share a
+/// timestamp).
+///
+/// Only comments created at/after `since` are considered — this confines the
+/// dedup to replies from the current review-response session and avoids ever
+/// deleting replies from prior sessions whose correctness was implicitly
+/// accepted by the human reviewer.
+///
+/// Orphan Minion-signed comments (no `in_reply_to_id`) are ignored here —
+/// they don't belong to any inline thread and are out of scope for this
+/// dedup.
+///
+/// Grouping caveat: `in_reply_to_id` is the direct parent comment being
+/// replied to, which is not always the thread root. In practice, GitHub
+/// normalizes most PR inline-comment replies to point at the root, but two
+/// Minion replies pointing at different ancestors within the same thread
+/// would land in different groups and not be deduped here. That is an
+/// acceptable miss for this backstop — the guarantee is "no duplicates
+/// *against the same parent*," which is what the prompt instructs.
+fn identify_duplicate_minion_replies(
+    api_comments: &[ApiReviewComment],
+    minion_id: &str,
+    since: DateTime<Utc>,
+) -> Vec<u64> {
+    use std::collections::HashMap;
+    let mut groups: HashMap<u64, Vec<&ApiReviewComment>> = HashMap::new();
+    for c in api_comments {
+        if c.created_at < since {
+            continue;
+        }
+        if !has_minion_signature_for(&c.body, minion_id) {
+            continue;
+        }
+        let Some(parent) = c.in_reply_to_id else {
+            continue;
+        };
+        groups.entry(parent).or_default().push(c);
+    }
+
+    let mut duplicates: Vec<u64> = Vec::new();
+    for replies in groups.values_mut() {
+        if replies.len() < 2 {
+            continue;
+        }
+        replies.sort_by_key(|c| (c.created_at, c.id));
+        // Keep the first; mark the rest for deletion.
+        for dup in replies.iter().skip(1) {
+            duplicates.push(dup.id);
+        }
+    }
+    duplicates.sort_unstable();
+    duplicates
+}
+
+/// Fetch all inline review comments on a PR and delete any duplicate replies
+/// authored by this Minion in the current review-response session.
+///
+/// Returns the number of duplicate comments deleted (0 on a healthy run).
+/// Errors from individual `DELETE` calls are logged and do not abort the
+/// sweep — a partial dedup is strictly better than none, and the next
+/// review-response cycle will catch any stragglers.
+pub(crate) async fn dedup_minion_inline_replies(
+    host: &str,
+    owner: &str,
+    repo: &str,
+    pr_number: &str,
+    minion_id: &str,
+    since: DateTime<Utc>,
+) -> Result<usize> {
+    let repo_full = github::repo_slug(owner, repo);
+    let endpoint = format!("repos/{repo_full}/pulls/{pr_number}/comments");
+    // `--paginate` without `--jq` concatenates raw JSON arrays across pages
+    // (`[...][...]`), which is not valid JSON. Pair with `--jq ".[]"` to
+    // stream one comment per line instead, matching the pattern used by
+    // `get_check_runs` elsewhere in this file.
+    let output = gh_api_with_retry(
+        host,
+        &["api", "--paginate", &endpoint, "--jq", ".[]"],
+        DEFAULT_MAX_RETRIES,
+    )
+    .await?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!(
+            "Failed to fetch inline comments for dedup on {repo_full} PR #{pr_number}: {}",
+            stderr
+        );
+    }
+
+    let stdout = std::str::from_utf8(&output.stdout)
+        .context("Failed to decode PR inline comments stdout as UTF-8")?;
+    let mut api_comments: Vec<ApiReviewComment> = Vec::new();
+    for line in stdout.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let comment: ApiReviewComment = serde_json::from_str(line)
+            .context("Failed to parse PR inline comment JSON line for dedup")?;
+        api_comments.push(comment);
+    }
+
+    let duplicate_ids = identify_duplicate_minion_replies(&api_comments, minion_id, since);
+
+    let mut deleted = 0usize;
+    for id in &duplicate_ids {
+        let delete_endpoint = format!("repos/{repo_full}/pulls/comments/{id}");
+        let result = gh_api_with_retry(
+            host,
+            &["api", "--method", "DELETE", &delete_endpoint],
+            DEFAULT_MAX_RETRIES,
+        )
+        .await;
+        match result {
+            Ok(out) if out.status.success() => {
+                deleted += 1;
+                log::info!(
+                    "🧹 Deleted duplicate inline reply comment {} on PR #{}",
+                    id,
+                    pr_number
+                );
+            }
+            Ok(out) => {
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                log::warn!(
+                    "⚠️  Failed to delete duplicate inline reply {}: {}",
+                    id,
+                    stderr.trim()
+                );
+            }
+            Err(e) => {
+                log::warn!(
+                    "⚠️  Failed to delete duplicate inline reply {}: {:#}",
+                    id,
+                    e
+                );
+            }
+        }
+    }
+
+    Ok(deleted)
 }
 
 /// Fetch review bodies and inline comments for specific reviews with retry logic.
@@ -2319,6 +2481,15 @@ mod tests {
     }
 
     fn make_api_comment(id: u64, body: &str, in_reply_to_id: Option<u64>) -> ApiReviewComment {
+        make_api_comment_at(id, body, in_reply_to_id, "2024-01-01T00:00:00Z")
+    }
+
+    fn make_api_comment_at(
+        id: u64,
+        body: &str,
+        in_reply_to_id: Option<u64>,
+        created_at: &str,
+    ) -> ApiReviewComment {
         ApiReviewComment {
             id,
             path: "src/main.rs".to_string(),
@@ -2328,6 +2499,7 @@ mod tests {
                 login: "reviewer".to_string(),
             },
             in_reply_to_id,
+            created_at: created_at.parse().unwrap(),
         }
     }
 
@@ -2374,6 +2546,179 @@ mod tests {
         let result = filter_unanswered_comments(vec![orphan_minion, unrelated], "M001");
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].id, 2);
+    }
+
+    // ========================================================================
+    // identify_duplicate_minion_replies tests
+    // ========================================================================
+
+    fn t(s: &str) -> DateTime<Utc> {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn test_identify_duplicates_empty_no_duplicates() {
+        let comments = vec![
+            make_api_comment(1, "Please fix this.", None),
+            make_api_comment_at(
+                2,
+                "Done!\n\n<sub>🤖 M001</sub>",
+                Some(1),
+                "2024-06-15T12:00:00Z",
+            ),
+        ];
+        let dups = identify_duplicate_minion_replies(&comments, "M001", t("2024-06-15T11:00:00Z"));
+        assert!(dups.is_empty());
+    }
+
+    #[test]
+    fn test_identify_duplicates_keeps_earliest_by_created_at() {
+        // Two Minion replies to the same thread; the later one is a duplicate.
+        let comments = vec![
+            make_api_comment(1, "Please fix this.", None),
+            make_api_comment_at(
+                2,
+                "Done!\n\n<sub>🤖 M001</sub>",
+                Some(1),
+                "2024-06-15T12:00:00Z",
+            ),
+            make_api_comment_at(
+                3,
+                "Done!\n\n<sub>🤖 M001</sub>",
+                Some(1),
+                "2024-06-15T12:05:00Z",
+            ),
+        ];
+        let dups = identify_duplicate_minion_replies(&comments, "M001", t("2024-06-15T11:00:00Z"));
+        assert_eq!(dups, vec![3]);
+    }
+
+    #[test]
+    fn test_identify_duplicates_ignores_pre_since() {
+        // A duplicate-looking reply from before `since` should be ignored —
+        // it belongs to a prior session.
+        let comments = vec![
+            make_api_comment(1, "Please fix this.", None),
+            make_api_comment_at(
+                2,
+                "Done!\n\n<sub>🤖 M001</sub>",
+                Some(1),
+                "2024-06-15T10:00:00Z",
+            ),
+            make_api_comment_at(
+                3,
+                "Done again!\n\n<sub>🤖 M001</sub>",
+                Some(1),
+                "2024-06-15T12:00:00Z",
+            ),
+        ];
+        let dups = identify_duplicate_minion_replies(&comments, "M001", t("2024-06-15T11:00:00Z"));
+        // Only one reply is within the session window — no duplicates to delete.
+        assert!(dups.is_empty());
+    }
+
+    #[test]
+    fn test_identify_duplicates_ignores_other_minions() {
+        // A sibling Minion's signature must not count toward this Minion's
+        // duplicates.
+        let comments = vec![
+            make_api_comment(1, "Please fix this.", None),
+            make_api_comment_at(
+                2,
+                "Done!\n\n<sub>🤖 M001</sub>",
+                Some(1),
+                "2024-06-15T12:00:00Z",
+            ),
+            make_api_comment_at(
+                3,
+                "Done!\n\n<sub>🤖 M002</sub>",
+                Some(1),
+                "2024-06-15T12:05:00Z",
+            ),
+        ];
+        let dups = identify_duplicate_minion_replies(&comments, "M001", t("2024-06-15T11:00:00Z"));
+        assert!(dups.is_empty());
+    }
+
+    #[test]
+    fn test_identify_duplicates_orphan_minion_replies_ignored() {
+        // Minion-signed comments without `in_reply_to_id` are not inline
+        // thread replies — leave them alone.
+        let comments = vec![
+            make_api_comment_at(
+                1,
+                "Done!\n\n<sub>🤖 M001</sub>",
+                None,
+                "2024-06-15T12:00:00Z",
+            ),
+            make_api_comment_at(
+                2,
+                "Done!\n\n<sub>🤖 M001</sub>",
+                None,
+                "2024-06-15T12:01:00Z",
+            ),
+        ];
+        let dups = identify_duplicate_minion_replies(&comments, "M001", t("2024-06-15T11:00:00Z"));
+        assert!(dups.is_empty());
+    }
+
+    #[test]
+    fn test_identify_duplicates_multiple_threads() {
+        // Duplicates in two separate threads; all duplicates across threads
+        // are returned.
+        let comments = vec![
+            make_api_comment(1, "A", None),
+            make_api_comment(10, "B", None),
+            make_api_comment_at(
+                2,
+                "Done!\n\n<sub>🤖 M001</sub>",
+                Some(1),
+                "2024-06-15T12:00:00Z",
+            ),
+            make_api_comment_at(
+                3,
+                "Done!\n\n<sub>🤖 M001</sub>",
+                Some(1),
+                "2024-06-15T12:01:00Z",
+            ),
+            make_api_comment_at(
+                11,
+                "Done!\n\n<sub>🤖 M001</sub>",
+                Some(10),
+                "2024-06-15T12:02:00Z",
+            ),
+            make_api_comment_at(
+                12,
+                "Done!\n\n<sub>🤖 M001</sub>",
+                Some(10),
+                "2024-06-15T12:03:00Z",
+            ),
+        ];
+        let dups = identify_duplicate_minion_replies(&comments, "M001", t("2024-06-15T11:00:00Z"));
+        assert_eq!(dups, vec![3, 12]);
+    }
+
+    #[test]
+    fn test_identify_duplicates_ties_broken_by_id() {
+        // Two replies with identical timestamps: keep the lower id,
+        // delete the higher id.
+        let comments = vec![
+            make_api_comment(1, "A", None),
+            make_api_comment_at(
+                5,
+                "Done!\n\n<sub>🤖 M001</sub>",
+                Some(1),
+                "2024-06-15T12:00:00Z",
+            ),
+            make_api_comment_at(
+                2,
+                "Done!\n\n<sub>🤖 M001</sub>",
+                Some(1),
+                "2024-06-15T12:00:00Z",
+            ),
+        ];
+        let dups = identify_duplicate_minion_replies(&comments, "M001", t("2024-06-15T11:00:00Z"));
+        assert_eq!(dups, vec![5]);
     }
 
     // ========================================================================
