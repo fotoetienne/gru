@@ -26,15 +26,6 @@ macro_rules! tprintln {
     };
 }
 
-/// Maximum age of a spawn to be considered an "early exit" eligible for label restoration.
-/// Processes that fail within this window likely never started meaningful work, so the
-/// issue label should be restored to the ready state rather than left as in-progress.
-///
-/// 120s covers observed startup/auth/lock-wait delays (registry file lock contention can
-/// cause up to ~42s of backoff in file_lock.rs). The previous 30s threshold was too low,
-/// causing processes that exited at ~35s to bypass label restoration.
-const EARLY_EXIT_THRESHOLD: Duration = Duration::from_secs(120);
-
 /// How often the lab runs the periodic recovery scan for orphaned in-progress issues.
 /// Not user-configurable — this is an implementation cadence, not a config knob.
 const RECOVERY_SCAN_INTERVAL: Duration = Duration::from_secs(300);
@@ -352,12 +343,10 @@ pub(crate) async fn handle_lab(
 }
 
 /// Remove finished child processes from the tracking vec.
-/// For early exits (non-zero within threshold), restore labels to prevent orphaning.
 ///
-/// Note: This is called once per poll interval, so the effective early-exit window
-/// is `EARLY_EXIT_THRESHOLD` minus any delay before the next reap cycle. With typical
-/// poll intervals (≤30s) this is fine, but very long poll intervals could cause
-/// early exits to be detected after the threshold has passed.
+/// On success, clears any pending retry counter for the issue. On non-zero
+/// exits, routes through `handle_failed_exit`, which uses the retry queue as
+/// a circuit breaker before flagging `gru:blocked`.
 async fn reap_children(children: &mut Vec<SpawnedChild>, retry_queue: &mut RetryQueue) {
     let mut i = 0;
     while i < children.len() {
@@ -366,21 +355,15 @@ async fn reap_children(children: &mut Vec<SpawnedChild>, retry_queue: &mut Retry
                 log::info!("Minion process exited with status: {}", status);
 
                 if let Some(meta) = &children[i].spawn_meta {
-                    let elapsed = meta.spawned_at.elapsed();
-
                     if status.success() {
-                        // A spawn that exited successfully past the early-exit window
-                        // is the "made progress" signal — clear any pending retry
-                        // counter so a future failure starts fresh.
-                        if elapsed >= EARLY_EXIT_THRESHOLD {
-                            retry_queue.cancel(
-                                &meta.host,
-                                &meta.owner,
-                                &meta.repo,
-                                meta.issue_number,
-                            );
-                        }
+                        // Any successful exit clears the retry counter so the next
+                        // failure (if any) starts from attempt zero. A clean fast
+                        // success is just as valid a "made progress" signal as a
+                        // slow one — the early-exit threshold is only relevant to
+                        // the failure path.
+                        retry_queue.cancel(&meta.host, &meta.owner, &meta.repo, meta.issue_number);
                     } else {
+                        let elapsed = meta.spawned_at.elapsed();
                         handle_failed_exit(meta, status, elapsed, retry_queue).await;
                     }
                 }
@@ -2635,7 +2618,7 @@ mod tests {
             retry_attempt: 0,
         };
         assert_eq!(meta.issue_number, 42);
-        assert!(meta.spawned_at.elapsed() <= EARLY_EXIT_THRESHOLD);
+        assert!(meta.spawned_at.elapsed() < Duration::from_secs(60));
     }
 
     #[tokio::test]
