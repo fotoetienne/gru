@@ -52,8 +52,10 @@ const MAX_FINAL_MESSAGE_CHARS: usize = 4000;
 /// final non-empty completed message is what the agent said before ending its
 /// turn. Returns `None` if the file cannot be read or no assistant text was
 /// produced.
-pub(super) fn extract_final_assistant_message(events_path: &Path) -> Option<String> {
-    let content = std::fs::read_to_string(events_path).ok()?;
+///
+/// Async to avoid blocking the executor on large event logs.
+pub(super) async fn extract_final_assistant_message(events_path: &Path) -> Option<String> {
+    let content = tokio::fs::read_to_string(events_path).await.ok()?;
 
     let mut buffer = String::new();
     let mut last_completed: Option<String> = None;
@@ -80,7 +82,9 @@ pub(super) fn extract_final_assistant_message(events_path: &Path) -> Option<Stri
         }
     }
 
-    // Flush any trailing text that never saw a MessageComplete (unlikely but safe).
+    // Recovery path: session ended without any MessageComplete (e.g., agent
+    // killed mid-stream). Any accumulated TextDelta is the best available
+    // signal of what the agent was trying to say.
     if last_completed.is_none() {
         let trimmed_buf = buffer.trim();
         if !trimmed_buf.is_empty() {
@@ -110,7 +114,7 @@ async fn handle_no_commits_clean_exit(
     wt_ctx: &WorktreeContext,
 ) -> Result<()> {
     let events_path = wt_ctx.minion_dir.join("events.jsonl");
-    let final_message = extract_final_assistant_message(&events_path);
+    let final_message = extract_final_assistant_message(&events_path).await;
 
     let Some(issue_num) = issue_ctx.issue_num else {
         log::warn!(
@@ -513,10 +517,16 @@ pub(crate) async fn handle_pr_creation(
     if !branch_pushed {
         println!("ℹ️  Branch was not pushed. No PR will be created.");
 
-        // If the agent exited cleanly with no commits (#850), surface its final
-        // message to the issue and apply `gru:blocked` so auto-recovery does
-        // not re-queue the issue endlessly. Callers reach this branch only
-        // after a successful (status.success() == true) agent exit.
+        // If the agent produced no commits (#850), surface its final message
+        // to the issue and apply `gru:blocked` so auto-recovery does not
+        // re-queue the issue endlessly.
+        //
+        // Invariant: `handle_pr_creation` only runs after the agent phase
+        // succeeded — `run_worker` early-returns on non-success before
+        // reaching `create_pr_phase`, and `create_pr_phase` only skips the
+        // agent phase when a prior run already advanced past `RunningAgent`
+        // (which requires a successful agent exit). So reaching this block
+        // means the agent exited cleanly and simply produced nothing.
         let commits_ahead = commits_ahead_of_base(
             &wt_ctx.checkout_path,
             &issue_ctx.host,
@@ -794,8 +804,8 @@ mod tests {
         assert!(!is_no_commits_clean_exit(&err));
     }
 
-    #[test]
-    fn test_extract_final_assistant_message_single_turn() {
+    #[tokio::test]
+    async fn test_extract_final_assistant_message_single_turn() {
         use crate::agent::{AgentEvent, TimestampedEventRef};
 
         let tmp = tempfile::tempdir().unwrap();
@@ -820,12 +830,14 @@ mod tests {
             .collect();
         std::fs::write(&path, lines.join("\n")).unwrap();
 
-        let msg = extract_final_assistant_message(&path).expect("message present");
+        let msg = extract_final_assistant_message(&path)
+            .await
+            .expect("message present");
         assert_eq!(msg, "Recommendation: run /decompose 2620.");
     }
 
-    #[test]
-    fn test_extract_final_assistant_message_prefers_last_turn() {
+    #[tokio::test]
+    async fn test_extract_final_assistant_message_prefers_last_turn() {
         // Simulate a multi-turn session where an earlier turn used a tool
         // and the final turn produced the recommendation text.
         use crate::agent::{AgentEvent, TimestampedEventRef};
@@ -860,27 +872,29 @@ mod tests {
             .collect();
         std::fs::write(&path, lines.join("\n")).unwrap();
 
-        let msg = extract_final_assistant_message(&path).expect("message present");
+        let msg = extract_final_assistant_message(&path)
+            .await
+            .expect("message present");
         assert_eq!(msg, "This issue is too large.");
     }
 
-    #[test]
-    fn test_extract_final_assistant_message_missing_file() {
+    #[tokio::test]
+    async fn test_extract_final_assistant_message_missing_file() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("nonexistent.jsonl");
-        assert!(extract_final_assistant_message(&path).is_none());
+        assert!(extract_final_assistant_message(&path).await.is_none());
     }
 
-    #[test]
-    fn test_extract_final_assistant_message_empty_file() {
+    #[tokio::test]
+    async fn test_extract_final_assistant_message_empty_file() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("events.jsonl");
         std::fs::write(&path, "").unwrap();
-        assert!(extract_final_assistant_message(&path).is_none());
+        assert!(extract_final_assistant_message(&path).await.is_none());
     }
 
-    #[test]
-    fn test_extract_final_assistant_message_no_text_events() {
+    #[tokio::test]
+    async fn test_extract_final_assistant_message_no_text_events() {
         // A session that only ran tools and never produced assistant text.
         use crate::agent::{AgentEvent, TimestampedEventRef};
 
@@ -904,11 +918,11 @@ mod tests {
             .collect();
         std::fs::write(&path, lines.join("\n")).unwrap();
 
-        assert!(extract_final_assistant_message(&path).is_none());
+        assert!(extract_final_assistant_message(&path).await.is_none());
     }
 
-    #[test]
-    fn test_extract_final_assistant_message_skips_malformed_lines() {
+    #[tokio::test]
+    async fn test_extract_final_assistant_message_skips_malformed_lines() {
         // A corrupt line in the middle should not prevent extraction.
         use crate::agent::{AgentEvent, TimestampedEventRef};
 
@@ -940,7 +954,9 @@ mod tests {
         let contents = format!("{good_1}\n{{not valid json}}\n{good_2}\n{good_3}\n");
         std::fs::write(&path, contents).unwrap();
 
-        let msg = extract_final_assistant_message(&path).expect("message present");
+        let msg = extract_final_assistant_message(&path)
+            .await
+            .expect("message present");
         assert_eq!(msg, "hello world");
     }
 
