@@ -93,6 +93,31 @@ async fn check_resumption_preconditions(
         }
     };
 
+    // Record our own PID as the live owner of this minion so concurrent
+    // `gru resume`/`gru attach` attempts are rejected as AlreadyRunning.
+    // Without this, `check_and_claim_session` only sets mode=Autonomous but
+    // leaves pid=None; a second process checking the registry would treat
+    // the entry as stale (non-Stopped mode with no PID) and reset + claim
+    // it, producing two live resumes against the same session (issue #862).
+    let parent_pid = std::process::id();
+    let parent_start_time = crate::minion_registry::get_process_start_time(parent_pid);
+    let mid = minion.minion_id.clone();
+    if let Err(e) = with_registry(move |reg| {
+        reg.update(&mid, |i| {
+            i.pid = Some(parent_pid);
+            i.pid_start_time = parent_start_time;
+            i.last_activity = Utc::now();
+        })
+    })
+    .await
+    {
+        log::warn!(
+            "Failed to record resume process PID for {}: {:#}",
+            minion.minion_id,
+            e
+        );
+    }
+
     // Parse owner/repo from "owner/repo" format
     let (owner, repo_name) = info
         .repo
