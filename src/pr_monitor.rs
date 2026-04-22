@@ -1028,6 +1028,14 @@ fn filter_unanswered_comments(
 /// Orphan Minion-signed comments (no `in_reply_to_id`) are ignored here —
 /// they don't belong to any inline thread and are out of scope for this
 /// dedup.
+///
+/// Grouping caveat: `in_reply_to_id` is the direct parent comment being
+/// replied to, which is not always the thread root. In practice, GitHub
+/// normalizes most PR inline-comment replies to point at the root, but two
+/// Minion replies pointing at different ancestors within the same thread
+/// would land in different groups and not be deduped here. That is an
+/// acceptable miss for this backstop — the guarantee is "no duplicates
+/// *against the same parent*," which is what the prompt instructs.
 fn identify_duplicate_minion_replies(
     api_comments: &[ApiReviewComment],
     minion_id: &str,
@@ -1080,16 +1088,34 @@ pub(crate) async fn dedup_minion_inline_replies(
 ) -> Result<usize> {
     let repo_full = github::repo_slug(owner, repo);
     let endpoint = format!("repos/{repo_full}/pulls/{pr_number}/comments");
-    let output =
-        gh_api_with_retry(host, &["api", "--paginate", &endpoint], DEFAULT_MAX_RETRIES).await?;
+    // `--paginate` without `--jq` concatenates raw JSON arrays across pages
+    // (`[...][...]`), which is not valid JSON. Pair with `--jq ".[]"` to
+    // stream one comment per line instead, matching the pattern used by
+    // `get_check_runs` elsewhere in this file.
+    let output = gh_api_with_retry(
+        host,
+        &["api", "--paginate", &endpoint, "--jq", ".[]"],
+        DEFAULT_MAX_RETRIES,
+    )
+    .await?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         anyhow::bail!("Failed to fetch PR inline comments for dedup: {}", stderr);
     }
 
-    let api_comments: Vec<ApiReviewComment> = serde_json::from_slice(&output.stdout)
-        .context("Failed to parse PR inline comments JSON for dedup")?;
+    let stdout = std::str::from_utf8(&output.stdout)
+        .context("Failed to decode PR inline comments stdout as UTF-8")?;
+    let mut api_comments: Vec<ApiReviewComment> = Vec::new();
+    for line in stdout.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let comment: ApiReviewComment = serde_json::from_str(line)
+            .context("Failed to parse PR inline comment JSON line for dedup")?;
+        api_comments.push(comment);
+    }
 
     let duplicate_ids = identify_duplicate_minion_replies(&api_comments, minion_id, since);
 

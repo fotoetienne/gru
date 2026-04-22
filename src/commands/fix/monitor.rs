@@ -899,9 +899,10 @@ async fn handle_new_reviews(
         Ok(()) => {
             println!("\n✅ Finished addressing review comments");
 
-            // Post-hoc backstop for #801: even with the prompt-level
-            // constraint, the agent may occasionally post duplicate inline
-            // replies. Sweep them before continuing to monitor.
+            // Post-hoc backstop for #805: even with the prompt-level
+            // constraint added in #804, the agent may occasionally post
+            // duplicate inline replies. Sweep them before continuing to
+            // monitor.
             match pr_monitor::dedup_minion_inline_replies(
                 &ctx.issue_ctx.host,
                 &ctx.issue_ctx.owner,
