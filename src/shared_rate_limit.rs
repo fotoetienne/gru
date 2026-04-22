@@ -14,6 +14,12 @@
 //! Only callers that go through [`github::gh_api_with_retry`] benefit from
 //! the shared check; direct `gh_cli_command` callers bypass it and will
 //! discover the rate limit on their own (and then signal via this module).
+//!
+//! A successful API call unconditionally clears the shared file. If a peer
+//! Minion wrote a fresh signal between our check and our success, we'll
+//! clobber it and the next peer will re-discover the limit itself — this
+//! degrades to the pre-PR behavior (one extra failed call), which the PRD
+//! explicitly accepts as the worst case.
 
 use std::fs;
 use std::io::Write;
@@ -26,9 +32,11 @@ use crate::workspace::Workspace;
 /// when many Minions resume simultaneously.
 const JITTER_SECS: u64 = 5;
 
-/// Files older than this (measured against the stored reset epoch) are
-/// considered stale and removed on read. GitHub rate-limit windows are
-/// at most ~60 minutes; anything claiming 2h in the past is corruption.
+/// Reset epochs claiming more than this far in the future are treated as
+/// corruption and removed on read. GitHub rate-limit windows are at most
+/// ~60 minutes, so anything >2h ahead is implausible. Past epochs are
+/// unconditionally treated as expired (see `read_rate_limit_until`) — this
+/// threshold only bounds the future direction.
 const STALE_THRESHOLD_SECS: u64 = 2 * 60 * 60;
 
 /// Sanitize a hostname into a filesystem-safe component by replacing any
