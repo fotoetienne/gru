@@ -13,6 +13,13 @@ use crate::github::DEFAULT_MAX_RETRIES;
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
+/// Sentinels substituted for null author logins. They contain `<`, which is
+/// invalid in a GitHub login, so they can never collide with a real user —
+/// and the per-review suffix ensures two ghost reviewers never match each
+/// other or a ghost PR author.
+const GHOST_PR_AUTHOR: &str = "<ghost-pr-author>";
+const GHOST_REVIEW_AUTHOR_PREFIX: &str = "<ghost-review-author-";
+
 const QUERY: &str = r#"query($owner: String!, $repo: String!, $number: Int!) {
   repository(owner: $owner, name: $repo) {
     pullRequest(number: $number) {
@@ -75,9 +82,12 @@ pub(crate) enum FetchOutcome {
 
 /// Merge-readiness data returned by the GraphQL query.
 ///
-/// All enum-valued fields (states, conclusions, statuses) are lower-cased
-/// here so downstream evaluation logic can share behavior with the REST path,
-/// which returns already-lowercase strings.
+/// Enum-valued fields are normalized to lowercase where appropriate so
+/// downstream evaluation logic can share behavior with the REST path, which
+/// returns already-lowercase strings. Review `state` is the exception — it
+/// intentionally preserves GitHub's SCREAMING_SNAKE_CASE to match the REST
+/// `ReviewApiResponse.state` format that the shared `evaluate_reviews`
+/// function compares against.
 #[derive(Debug)]
 pub(crate) struct MergeReadinessData {
     // head_sha and labels are fetched by the query (per #727 acceptance
@@ -220,7 +230,16 @@ fn parse_response(resp: GqlResponse) -> Result<MergeReadinessData> {
         _ => None, // UNKNOWN or anything unexpected
     };
 
-    let author_login = pr.author.map(|a| a.login).unwrap_or_default();
+    // Null authors (ghost/deleted users) must never match each other via
+    // empty-string equality, or the self-review exception in
+    // `evaluate_reviews` would fire for a ghost-authored PR with a
+    // ghost-authored review. Use distinct sentinels containing `<`, which is
+    // invalid in a GitHub login, so collisions with real users or between
+    // sentinels are impossible.
+    let author_login = pr
+        .author
+        .map(|a| a.login)
+        .unwrap_or_else(|| GHOST_PR_AUTHOR.to_string());
 
     let mut has_more_pages =
         pr.reviews.page_info.has_next_page || pr.labels.page_info.has_next_page;
@@ -233,9 +252,13 @@ fn parse_response(resp: GqlResponse) -> Result<MergeReadinessData> {
         .reviews
         .nodes
         .into_iter()
-        .map(|r| ReviewInfo {
+        .enumerate()
+        .map(|(idx, r)| ReviewInfo {
             state: r.state,
-            author_login: r.author.map(|a| a.login).unwrap_or_default(),
+            author_login: r
+                .author
+                .map(|a| a.login)
+                .unwrap_or_else(|| format!("{GHOST_REVIEW_AUTHOR_PREFIX}{idx}>")),
         })
         .collect();
 
@@ -556,8 +579,33 @@ mod tests {
             "commits": {"nodes": []}
         }}}}"#;
         let data = parse(json).unwrap();
-        assert_eq!(data.author_login, "");
-        assert_eq!(data.reviews[0].author_login, "");
+        // Ghost authors get distinct sentinels, so the self-review exception
+        // can't accidentally fire for ghost-authored PR + ghost reviewer.
+        assert_eq!(data.author_login, GHOST_PR_AUTHOR);
+        assert_eq!(data.reviews[0].author_login, "<ghost-review-author-0>");
+        assert_ne!(data.author_login, data.reviews[0].author_login);
+    }
+
+    #[test]
+    fn ghost_pr_author_does_not_match_ghost_reviewer() {
+        // Regression test for #855 inline comment: null author logins must
+        // never allow the self-review exception to pass.
+        let json = r#"{"data":{"repository":{"pullRequest":{
+            "isDraft": false,
+            "mergeable": "MERGEABLE",
+            "headRefOid": "abc",
+            "author": null,
+            "labels": {"nodes": []},
+            "reviews": {"nodes": [
+              {"state":"COMMENTED","author": null},
+              {"state":"COMMENTED","author": null}
+            ], "pageInfo":{"hasNextPage":false}},
+            "commits": {"nodes": []}
+        }}}}"#;
+        let data = parse(json).unwrap();
+        assert_ne!(data.author_login, data.reviews[0].author_login);
+        assert_ne!(data.author_login, data.reviews[1].author_login);
+        assert_ne!(data.reviews[0].author_login, data.reviews[1].author_login);
     }
 
     #[test]
