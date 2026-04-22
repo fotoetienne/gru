@@ -12,6 +12,7 @@ mod display_utils;
 mod file_lock;
 mod git;
 mod github;
+mod graphql;
 mod labels;
 mod log_viewer;
 mod mcp;
