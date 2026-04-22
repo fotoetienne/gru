@@ -412,11 +412,13 @@ pub(crate) async fn sleep_until_rate_limit_reset(host: &str) {
             );
             // Signal peers with our fallback window, not info.reset: if the
             // local Minion doesn't trust the reset epoch enough to sleep
-            // that long, peers shouldn't either.
-            crate::shared_rate_limit::write_rate_limit_until(
-                host,
-                now + RATE_LIMIT_FALLBACK_SLEEP_SECS,
-            );
+            // that long, peers shouldn't either. Subtract the peer-side
+            // jitter so peers wake at roughly `now + fallback` — the same
+            // wall-clock moment as the local Minion — rather than `jitter`
+            // seconds later.
+            let peer_reset = (now + RATE_LIMIT_FALLBACK_SLEEP_SECS)
+                .saturating_sub(crate::shared_rate_limit::JITTER_SECS);
+            crate::shared_rate_limit::write_rate_limit_until(host, peer_reset);
         } else {
             // Reset epoch is in the past — likely stale or clock skew
             log::warn!(

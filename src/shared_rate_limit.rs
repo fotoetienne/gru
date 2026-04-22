@@ -15,11 +15,12 @@
 //! the shared check; direct `gh_cli_command` callers bypass it and will
 //! discover the rate limit on their own (and then signal via this module).
 //!
-//! A successful API call unconditionally clears the shared file. If a peer
-//! Minion wrote a fresh signal between our check and our success, we'll
-//! clobber it and the next peer will re-discover the limit itself — this
-//! degrades to the pre-PR behavior (one extra failed call), which the PRD
-//! explicitly accepts as the worst case.
+//! After a coordinated sleep, the wake-up path re-reads the file and only
+//! clears it when the stored epoch is no later than the one we slept on —
+//! so if a peer wrote a *later* signal while we slept, we leave it alone.
+//! A successful API call still clears unconditionally; a peer's fresh
+//! signal can be clobbered there, but the next peer will just re-discover
+//! the limit itself (the PRD-accepted "one extra failed call" worst case).
 
 use std::fs;
 use std::io::Write;
@@ -29,8 +30,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use crate::workspace::Workspace;
 
 /// Small jitter added after the reset timestamp to avoid thundering herd
-/// when many Minions resume simultaneously.
-const JITTER_SECS: u64 = 5;
+/// when many Minions resume simultaneously. Exposed so writers can subtract
+/// it from the stored epoch to keep peer and writer wake times aligned
+/// when the writer's own sleep doesn't include jitter.
+pub(crate) const JITTER_SECS: u64 = 5;
 
 /// Reset epochs claiming more than this far in the future are treated as
 /// corruption and removed on read. GitHub rate-limit windows are at most
@@ -66,8 +69,8 @@ fn now_secs() -> u64 {
 ///
 /// Returns `Some(epoch)` only when the file exists, parses, and points to a
 /// future time within the sanity window. Returns `None` (and removes the
-/// file) when the stored value is expired, stale (>2h in the past), or
-/// implausibly far in the future (>2h ahead).
+/// file) when the stored value is expired (epoch <= now), unparseable, or
+/// implausibly far in the future (>`STALE_THRESHOLD_SECS` ahead).
 pub(crate) fn read_rate_limit_until(host: &str) -> Option<u64> {
     let path = rate_limit_path(host)?;
     let contents = fs::read_to_string(&path).ok()?;
@@ -166,8 +169,17 @@ pub(crate) async fn wait_if_shared_rate_limited(host: &str) {
         wait_secs,
     );
     tokio::time::sleep(Duration::from_secs(wait_secs)).await;
-    // Window elapsed — remove the file so the next caller doesn't re-read it.
-    clear_rate_limit(host);
+    // A peer may have written a *later* reset epoch while we slept (e.g., a
+    // shorter fallback window first, then a longer real reset). Only clear
+    // the file if the current stored epoch is no later than the one we slept
+    // on — otherwise we'd clobber a signal that's still meaningful to peers.
+    // `read_rate_limit_until` already removes files whose epoch is in the
+    // past, so a `None` return here means someone else has taken care of it.
+    if let Some(current) = read_rate_limit_until(host) {
+        if current <= reset_epoch {
+            clear_rate_limit(host);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -320,6 +332,50 @@ mod tests {
         let start = std::time::Instant::now();
         wait_if_shared_rate_limited("github.com").await;
         assert!(start.elapsed() < Duration::from_millis(500));
+    }
+
+    #[tokio::test]
+    async fn wait_preserves_newer_signal_written_during_sleep() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = set_test_workspace(tmp.path().to_path_buf()).unwrap();
+
+        // Seed with an already-expired epoch so wait_if_shared_rate_limited
+        // doesn't actually sleep. The "we slept on this" value is the past
+        // epoch; after the (no-op) sleep, a peer has written a *newer*,
+        // future reset — we must not clobber it.
+        let past = now_secs() - 10;
+        let newer_future = now_secs() + 600;
+        let path = rate_limit_path("github.com").unwrap();
+
+        // Simulate: read_rate_limit_until sees a just-past epoch (which it
+        // would clean up) — so instead put a very-recently-expired epoch
+        // and have the test inject the newer signal between the read and
+        // the post-sleep check. We can't hook the sleep, so instead drive
+        // the logic directly: write the past epoch and the newer one
+        // during a zero-duration wait sequence.
+        //
+        // Easiest: write a near-future epoch (1s) so the function sleeps
+        // briefly, then overwrite with a much-later epoch before it wakes.
+        let short_future = now_secs() + 1;
+        fs::write(&path, short_future.to_string()).unwrap();
+
+        let host = "github.com".to_string();
+        let wait_task = tokio::spawn(async move {
+            wait_if_shared_rate_limited(&host).await;
+        });
+
+        // Race in the newer signal before the sleeper wakes.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        fs::write(&path, newer_future.to_string()).unwrap();
+
+        wait_task.await.unwrap();
+
+        // The newer signal must survive.
+        let after = fs::read_to_string(&path).unwrap();
+        assert_eq!(after.trim(), newer_future.to_string());
+
+        // Keep `past` referenced for clarity in the test narrative.
+        let _ = past;
     }
 
     #[tokio::test]
