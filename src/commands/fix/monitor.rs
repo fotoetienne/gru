@@ -1063,16 +1063,16 @@ async fn handle_failed_checks(
             }
             println!("⚠️  CI auto-fix escalated to human after max attempts");
             println!(
-                "   Review the checks at: https://github.com/{}/{}/pull/{}/checks",
-                ctx.issue_ctx.owner, ctx.issue_ctx.repo, ctx.pr_number
+                "   Review the checks at: https://{}/{}/{}/pull/{}/checks",
+                ctx.issue_ctx.host, ctx.issue_ctx.owner, ctx.issue_ctx.repo, ctx.pr_number
             );
             println!("🔄 Continuing to monitor PR for other events...\n");
         }
         Err(e) => {
             println!("⚠️  CI auto-fix error: {}", e);
             println!(
-                "   Review the checks at: https://github.com/{}/{}/pull/{}/checks",
-                ctx.issue_ctx.owner, ctx.issue_ctx.repo, ctx.pr_number
+                "   Review the checks at: https://{}/{}/{}/pull/{}/checks",
+                ctx.issue_ctx.host, ctx.issue_ctx.owner, ctx.issue_ctx.repo, ctx.pr_number
             );
             println!("🔄 Will retry CI auto-fix on subsequent monitoring cycles...\n");
         }
@@ -1181,8 +1181,8 @@ fn handle_timeout(state: &MonitorLoopState, ctx: &MonitorContext<'_>) -> LoopAct
     let display = format_duration(state.monitor_start.elapsed().as_secs());
     println!("⏰ PR monitoring timed out after {}", display);
     println!(
-        "   PR is still open: https://github.com/{}/{}/pull/{}",
-        ctx.issue_ctx.owner, ctx.issue_ctx.repo, ctx.pr_number
+        "   PR is still open: https://{}/{}/{}/pull/{}",
+        ctx.issue_ctx.host, ctx.issue_ctx.owner, ctx.issue_ctx.repo, ctx.pr_number
     );
     LoopAction::Break
 }
@@ -1190,8 +1190,8 @@ fn handle_timeout(state: &MonitorLoopState, ctx: &MonitorContext<'_>) -> LoopAct
 fn handle_interrupted(ctx: &MonitorContext<'_>) -> LoopAction {
     println!("\n⚠️  Monitoring interrupted by user");
     println!(
-        "   PR is still open: https://github.com/{}/{}/pull/{}",
-        ctx.issue_ctx.owner, ctx.issue_ctx.repo, ctx.pr_number
+        "   PR is still open: https://{}/{}/{}/pull/{}",
+        ctx.issue_ctx.host, ctx.issue_ctx.owner, ctx.issue_ctx.repo, ctx.pr_number
     );
     LoopAction::Break
 }
@@ -1250,7 +1250,8 @@ async fn handle_monitor_error(
             error
         );
         log::warn!(
-            "   You can monitor manually at: https://github.com/{}/{}/pull/{}",
+            "   You can monitor manually at: https://{}/{}/{}/pull/{}",
+            ctx.issue_ctx.host,
             ctx.issue_ctx.owner,
             ctx.issue_ctx.repo,
             ctx.pr_number
@@ -1554,8 +1555,8 @@ pub(crate) async fn monitor_pr_lifecycle(
             let display = format_duration(state.monitor_start.elapsed().as_secs());
             println!("⏰ PR monitoring timed out after {}", display);
             println!(
-                "   PR is still open: https://github.com/{}/{}/pull/{}",
-                ctx.issue_ctx.owner, ctx.issue_ctx.repo, ctx.pr_number
+                "   PR is still open: https://{}/{}/{}/pull/{}",
+                ctx.issue_ctx.host, ctx.issue_ctx.owner, ctx.issue_ctx.repo, ctx.pr_number
             );
             break;
         }
