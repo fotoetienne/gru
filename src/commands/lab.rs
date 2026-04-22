@@ -1,3 +1,4 @@
+use crate::agent_runner::EXIT_ALREADY_RUNNING;
 use crate::config::{parse_repo_entry_with_hosts, LabConfig};
 use crate::github::{self, list_ready_issues_via_cli};
 use crate::labels;
@@ -58,13 +59,6 @@ struct SpawnMeta {
     /// Retry attempt counter — carried through from RetryEntry so the retry
     /// queue can track attempts without depending on the registry.
     retry_attempt: u32,
-}
-
-/// Determines whether a failed spawn qualifies for label restoration.
-/// Returns true if the process exited within the early-exit threshold, meaning it
-/// likely never started meaningful work and the issue should be returned to the ready state.
-fn should_restore_label(spawned_at: Instant) -> bool {
-    spawned_at.elapsed() <= EARLY_EXIT_THRESHOLD
 }
 
 /// Handles the lab daemon command
@@ -128,6 +122,18 @@ pub(crate) async fn handle_lab(
     tprintln!();
     tprintln!("Press Ctrl-C to stop...");
     tprintln!();
+
+    // One-time fixup: clear pid/pid_start_time on archived registry entries.
+    // Pre-#857 lab versions stamped live PIDs onto archived entries, causing the
+    // duplicate-detection path to loop. Idempotent — does nothing on a clean registry.
+    match crate::minion_registry::clear_pids_on_archived_entries().await {
+        Ok(0) => {}
+        Ok(n) => tprintln!("🩹 Cleared stale PIDs on {} archived registry entries", n),
+        Err(e) => log::warn!(
+            "⚠️  Failed to clear stale PIDs on archived entries: {:#}",
+            e
+        ),
+    }
 
     // Track child processes for graceful shutdown
     let mut children: Vec<SpawnedChild> = Vec::new();
@@ -362,181 +368,20 @@ async fn reap_children(children: &mut Vec<SpawnedChild>, retry_queue: &mut Retry
                 if let Some(meta) = &children[i].spawn_meta {
                     let elapsed = meta.spawned_at.elapsed();
 
-                    if !status.success() {
-                        if should_restore_label(meta.spawned_at) {
-                            // Check if the issue already has a terminal label before
-                            // restoring gru:todo — the minion may have finished
-                            // (done or failed) before the process exited.
-                            let terminal_label = match github::has_any_label_via_cli(
+                    if status.success() {
+                        // A spawn that exited successfully past the early-exit window
+                        // is the "made progress" signal — clear any pending retry
+                        // counter so a future failure starts fresh.
+                        if elapsed >= EARLY_EXIT_THRESHOLD {
+                            retry_queue.cancel(
                                 &meta.host,
                                 &meta.owner,
                                 &meta.repo,
                                 meta.issue_number,
-                                &[labels::DONE, labels::FAILED],
-                            )
-                            .await
-                            {
-                                Ok(label) => label,
-                                Err(e) => {
-                                    // Fail-open: proceed with restoration rather than
-                                    // risk leaving the issue stuck in gru:in-progress.
-                                    log::warn!(
-                                        "⚠️  Failed to check labels on issue #{}: {} \
-                                         — proceeding with label restoration (fail-open)",
-                                        meta.issue_number,
-                                        e
-                                    );
-                                    None
-                                }
-                            };
-
-                            if let Some(label) = terminal_label {
-                                log::info!(
-                                    "⏭️  Issue #{} already has {} — skipping gru:todo restoration, \
-                                     removing gru:in-progress only",
-                                    meta.issue_number,
-                                    label
-                                );
-                                // Still remove gru:in-progress so the issue doesn't
-                                // end up with both a terminal label and in-progress.
-                                if let Err(e) = github::edit_labels_via_cli(
-                                    &meta.host,
-                                    &meta.owner,
-                                    &meta.repo,
-                                    meta.issue_number,
-                                    &[],
-                                    &[labels::IN_PROGRESS],
-                                )
-                                .await
-                                {
-                                    log::warn!(
-                                        "⚠️  Failed to remove gru:in-progress from issue #{}: {}",
-                                        meta.issue_number,
-                                        e
-                                    );
-                                }
-                            } else {
-                                log::warn!(
-                                    "⚠️  Spawned gru do for issue #{} exited early with {} (after {:.1}s) — restoring label",
-                                    meta.issue_number,
-                                    status,
-                                    elapsed.as_secs_f64()
-                                );
-                                if let Err(e) = github::edit_labels_via_cli(
-                                    &meta.host,
-                                    &meta.owner,
-                                    &meta.repo,
-                                    meta.issue_number,
-                                    &[&meta.ready_label],
-                                    &[labels::IN_PROGRESS],
-                                )
-                                .await
-                                {
-                                    log::warn!(
-                                        "⚠️  Failed to restore labels on issue #{}: {} \
-                                         — issue may need manual label fix",
-                                        meta.issue_number,
-                                        e
-                                    );
-                                }
-                            }
-                        } else {
-                            // Non-early failure: restore labels first, then enqueue for retry.
-                            // Check for terminal labels before restoring to avoid overwriting
-                            // gru:done/failed — a long-running minion may have finished
-                            // successfully before the process crashed.
-                            let terminal_label = match github::has_any_label_via_cli(
-                                &meta.host,
-                                &meta.owner,
-                                &meta.repo,
-                                meta.issue_number,
-                                &[labels::DONE, labels::FAILED],
-                            )
-                            .await
-                            {
-                                Ok(label) => label,
-                                Err(e) => {
-                                    log::warn!(
-                                        "⚠️  Failed to check labels on issue #{}: {} \
-                                         — proceeding with label restoration (fail-open)",
-                                        meta.issue_number,
-                                        e
-                                    );
-                                    None
-                                }
-                            };
-
-                            if let Some(label) = terminal_label {
-                                log::info!(
-                                    "⏭️  Issue #{} already has {} — skipping gru:todo restoration, \
-                                     removing gru:in-progress only",
-                                    meta.issue_number,
-                                    label
-                                );
-                                if let Err(e) = github::edit_labels_via_cli(
-                                    &meta.host,
-                                    &meta.owner,
-                                    &meta.repo,
-                                    meta.issue_number,
-                                    &[],
-                                    &[labels::IN_PROGRESS],
-                                )
-                                .await
-                                {
-                                    log::warn!(
-                                        "⚠️  Failed to remove gru:in-progress from issue #{}: {}",
-                                        meta.issue_number,
-                                        e
-                                    );
-                                }
-                                // Issue is already done/failed — no retry needed.
-                            } else {
-                                log::warn!(
-                                    "⚠️  Spawned gru do for issue #{} exited with {} after {:.1}s \
-                                     — restoring label before retry",
-                                    meta.issue_number,
-                                    status,
-                                    elapsed.as_secs_f64()
-                                );
-                                if let Err(e) = github::edit_labels_via_cli(
-                                    &meta.host,
-                                    &meta.owner,
-                                    &meta.repo,
-                                    meta.issue_number,
-                                    &[&meta.ready_label],
-                                    &[labels::IN_PROGRESS],
-                                )
-                                .await
-                                {
-                                    log::warn!(
-                                        "⚠️  Failed to restore labels on issue #{} after non-early exit: {} \
-                                         — issue may need manual label fix",
-                                        meta.issue_number,
-                                        e
-                                    );
-                                }
-                                let reason = format!(
-                                    "exited with {} after {:.0}s",
-                                    status,
-                                    elapsed.as_secs_f64()
-                                );
-                                if !retry_queue.enqueue_failure(
-                                    &meta.host,
-                                    &meta.owner,
-                                    &meta.repo,
-                                    meta.issue_number,
-                                    meta.retry_attempt,
-                                    &reason,
-                                    None,
-                                    None,
-                                ) {
-                                    log::warn!(
-                                        "⚠️  Issue #{} exceeded max retry attempts — not retrying",
-                                        meta.issue_number,
-                                    );
-                                }
-                            }
+                            );
                         }
+                    } else {
+                        handle_failed_exit(meta, status, elapsed, retry_queue).await;
                     }
                 }
 
@@ -549,6 +394,180 @@ async fn reap_children(children: &mut Vec<SpawnedChild>, retry_queue: &mut Retry
                 log::warn!("Failed to check child process status: {}", e);
                 i += 1;
             }
+        }
+    }
+}
+
+/// Handle a non-zero exit from a spawned `gru do` process.
+///
+/// All non-success exits route through `RetryQueue::enqueue_failure`. When
+/// retries remain, the ready label is restored. When max attempts have been
+/// reached, the issue is marked `gru:blocked` instead of being respawned —
+/// this is the circuit breaker that prevents the respawn loop in #857.
+///
+/// `EXIT_ALREADY_RUNNING` (3) short-circuits: if `gru do` detected a duplicate
+/// live minion, the issue is definitionally in-flight and the label must not
+/// be restored.
+async fn handle_failed_exit(
+    meta: &SpawnMeta,
+    status: std::process::ExitStatus,
+    elapsed: Duration,
+    retry_queue: &mut RetryQueue,
+) {
+    // Short-circuit: gru do detected a live duplicate. Don't restore the label
+    // — another minion is already working on this issue (or, in the corrupted-
+    // registry case, the spawn-time prune will heal it on the next cycle).
+    // Either way, restoring would just respawn into the same detection.
+    if status.code() == Some(EXIT_ALREADY_RUNNING) {
+        log::warn!(
+            "⏭️  gru do for issue #{} exited with EXIT_ALREADY_RUNNING (after {:.1}s) — \
+             leaving labels unchanged",
+            meta.issue_number,
+            elapsed.as_secs_f64()
+        );
+        return;
+    }
+
+    // Check for terminal labels first — a long-running minion may have finished
+    // (gru:done or gru:failed) before the process actually exited.
+    let terminal_label = match github::has_any_label_via_cli(
+        &meta.host,
+        &meta.owner,
+        &meta.repo,
+        meta.issue_number,
+        &[labels::DONE, labels::FAILED],
+    )
+    .await
+    {
+        Ok(label) => label,
+        Err(e) => {
+            // Fail-open: proceed rather than risk leaving the issue stuck in
+            // gru:in-progress.
+            log::warn!(
+                "⚠️  Failed to check labels on issue #{}: {} \
+                 — proceeding with retry/restore logic (fail-open)",
+                meta.issue_number,
+                e
+            );
+            None
+        }
+    };
+
+    if let Some(label) = terminal_label {
+        log::info!(
+            "⏭️  Issue #{} already has {} — removing gru:in-progress only, no retry",
+            meta.issue_number,
+            label
+        );
+        if let Err(e) = github::edit_labels_via_cli(
+            &meta.host,
+            &meta.owner,
+            &meta.repo,
+            meta.issue_number,
+            &[],
+            &[labels::IN_PROGRESS],
+        )
+        .await
+        {
+            log::warn!(
+                "⚠️  Failed to remove gru:in-progress from issue #{}: {}",
+                meta.issue_number,
+                e
+            );
+        }
+        // Issue already terminal — clear any pending retry state.
+        retry_queue.cancel(&meta.host, &meta.owner, &meta.repo, meta.issue_number);
+        return;
+    }
+
+    let reason = format!("exited with {} after {:.0}s", status, elapsed.as_secs_f64());
+
+    if retry_queue.enqueue_failure(
+        &meta.host,
+        &meta.owner,
+        &meta.repo,
+        meta.issue_number,
+        meta.retry_attempt,
+        &reason,
+        None,
+        None,
+    ) {
+        // Retry remaining: restore the ready label so the issue is picked up again.
+        log::warn!(
+            "⚠️  Spawned gru do for issue #{} exited with {} after {:.1}s — \
+             restoring label for retry",
+            meta.issue_number,
+            status,
+            elapsed.as_secs_f64()
+        );
+        if let Err(e) = github::edit_labels_via_cli(
+            &meta.host,
+            &meta.owner,
+            &meta.repo,
+            meta.issue_number,
+            &[&meta.ready_label],
+            &[labels::IN_PROGRESS],
+        )
+        .await
+        {
+            log::warn!(
+                "⚠️  Failed to restore labels on issue #{}: {} \
+                 — issue may need manual label fix",
+                meta.issue_number,
+                e
+            );
+        }
+    } else {
+        // Circuit broken: max retries exhausted. Mark the issue blocked so a human
+        // can investigate, and stop the respawn loop. Removing gru:in-progress
+        // avoids the "in progress + blocked + no live PID" zombie state.
+        log::warn!(
+            "🚫 Issue #{} exceeded max retry attempts — flagging gru:blocked",
+            meta.issue_number,
+        );
+        if let Err(e) = github::edit_labels_via_cli(
+            &meta.host,
+            &meta.owner,
+            &meta.repo,
+            meta.issue_number,
+            &[labels::BLOCKED],
+            &[labels::IN_PROGRESS, &meta.ready_label],
+        )
+        .await
+        {
+            log::warn!(
+                "⚠️  Failed to flag gru:blocked on issue #{}: {} \
+                 — issue may need manual intervention",
+                meta.issue_number,
+                e
+            );
+        }
+
+        let comment = format!(
+            "🚫 Gru lab: issue exceeded max retry attempts ({} consecutive failures). \
+             Last failure: `{}` after {:.0}s. Marking `{}` so a human can investigate. \
+             Clear `{}` and re-add `{}` to retry.",
+            meta.retry_attempt + 1,
+            status,
+            elapsed.as_secs_f64(),
+            labels::BLOCKED,
+            labels::BLOCKED,
+            meta.ready_label,
+        );
+        if let Err(e) = github::post_comment_via_cli(
+            &meta.host,
+            &meta.owner,
+            &meta.repo,
+            meta.issue_number,
+            &comment,
+        )
+        .await
+        {
+            log::warn!(
+                "⚠️  Failed to post blocked comment on issue #{}: {}",
+                meta.issue_number,
+                e
+            );
         }
     }
 }
@@ -1568,6 +1587,7 @@ async fn spawn_for_candidate_issues(
     available: &mut usize,
     label: &str,
     shutdown_flag: &AtomicBool,
+    retry_queue: &mut RetryQueue,
 ) -> Result<usize> {
     let mut spawned = 0usize;
 
@@ -1644,6 +1664,10 @@ async fn spawn_for_candidate_issues(
             if !github::is_issue_still_eligible(&ctx.owner, &ctx.repo, &ctx.host, candidate.number)
                 .await
             {
+                // The issue has been defused outside lab's view (closed, label changed,
+                // or human intervention). Clear any pending retry counter so a future
+                // re-claim starts from attempt zero.
+                retry_queue.cancel(&ctx.host, &ctx.owner, &ctx.repo, candidate.number);
                 continue;
             }
 
@@ -1796,6 +1820,7 @@ async fn poll_and_spawn(
         &mut available,
         &config.daemon.label,
         shutdown_flag,
+        retry_queue,
     )
     .await?;
 
@@ -2035,6 +2060,7 @@ async fn is_issue_claimed(repo: &str, issue_number: Option<u64>) -> Result<bool>
         let claimed = registry.list().iter().any(|(_id, info)| {
             info.repo == repo
                 && info.issue == Some(issue_number)
+                && info.archived_at.is_none()
                 && info.is_running()
                 // Only trust entries with start-time validation on platforms that
                 // support it (macOS, Linux). Legacy entries (pid_start_time = None)
@@ -2612,26 +2638,6 @@ mod tests {
         assert!(meta.spawned_at.elapsed() <= EARLY_EXIT_THRESHOLD);
     }
 
-    #[test]
-    fn test_should_restore_label_within_threshold() {
-        // A just-spawned process should qualify for label restoration
-        let spawned_at = Instant::now();
-        assert!(
-            should_restore_label(spawned_at),
-            "Process that just spawned should qualify for label restoration"
-        );
-    }
-
-    #[test]
-    fn test_should_restore_label_beyond_threshold() {
-        // A process spawned well past the threshold should not qualify
-        let spawned_at = Instant::now() - EARLY_EXIT_THRESHOLD - Duration::from_secs(60);
-        assert!(
-            !should_restore_label(spawned_at),
-            "Process spawned past EARLY_EXIT_THRESHOLD should not qualify for label restoration"
-        );
-    }
-
     #[tokio::test]
     async fn test_shutdown_children_detach_leaves_process_running() {
         // Spawn a process that sleeps
@@ -2692,16 +2698,6 @@ mod tests {
         assert!(
             !is_process_alive(pid),
             "Process should be dead after stop shutdown"
-        );
-    }
-
-    #[test]
-    fn test_should_restore_label_just_under_threshold() {
-        // A process spawned just under the threshold should still qualify
-        let spawned_at = Instant::now() - EARLY_EXIT_THRESHOLD + Duration::from_secs(1);
-        assert!(
-            should_restore_label(spawned_at),
-            "Process at 1s under threshold should still qualify for label restoration"
         );
     }
 

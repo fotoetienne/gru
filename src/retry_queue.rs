@@ -214,7 +214,6 @@ impl RetryQueue {
     }
 
     /// Cancel a retry for a specific issue (e.g., issue was closed or re-dispatched).
-    #[allow(dead_code)] // Used in tests; will be called from lab when issues are re-dispatched
     pub fn cancel(&mut self, host: &str, owner: &str, repo: &str, issue_number: u64) {
         let key = entry_key(host, owner, repo, issue_number);
         if self.entries.remove(&key).is_some() {

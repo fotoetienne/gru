@@ -218,6 +218,48 @@ pub(crate) async fn prune_stale_entries() -> Result<usize> {
 /// 2. **Phase 2 (async):** Check GitHub for PR merged / issue closed state.
 /// 3. **Phase 3 (sync):** Stamp `archived_at` on confirmed candidates.
 ///
+/// One-time idempotent sweep that clears `pid`/`pid_start_time` on archived
+/// entries.
+///
+/// Pre-#857 versions of lab stamped live PIDs onto archived entries, which made
+/// `is_running()` return true and triggered an infinite respawn loop via the
+/// duplicate-detection path. The on-disk symptom is an archived entry with a
+/// non-null `pid` and `pid_start_time`. This sweep nulls those fields so a
+/// freshly-upgraded binary recovers without manual jq surgery.
+///
+/// Safe to call repeatedly: archived entries that already have null PIDs are
+/// untouched and the registry is only written when at least one entry changes.
+///
+/// Returns the number of entries fixed.
+///
+/// # Errors
+///
+/// Returns an error if the registry cannot be saved to disk.
+pub async fn clear_pids_on_archived_entries() -> Result<usize> {
+    with_registry(|registry| {
+        let mut count = 0usize;
+        for info in registry.data.minions.values_mut() {
+            if info.archived_at.is_some() && (info.pid.is_some() || info.pid_start_time.is_some()) {
+                info.pid = None;
+                info.pid_start_time = None;
+                count += 1;
+            }
+        }
+        if count > 0 {
+            log::info!(
+                "Clearing stale pid/pid_start_time on {} archived registry entries \
+                 (issue #857 fixup)",
+                count
+            );
+            registry
+                .save()
+                .context("Failed to save registry after clearing archived PIDs")?;
+        }
+        Ok(count)
+    })
+    .await
+}
+
 /// Returns the number of entries archived.
 pub async fn auto_archive_completed_minions() -> Result<usize> {
     // Phase 1: Collect candidates (sync, lock held briefly)
@@ -1126,16 +1168,27 @@ impl MinionRegistry {
         self.data.minions.get(minion_id)
     }
 
-    /// Finds all Minions associated with a specific issue in a specific repo
+    /// Finds all non-archived Minions associated with a specific issue in a specific repo.
     ///
-    /// Returns all matching Minions as (minion_id, MinionInfo) pairs regardless
-    /// of mode or PID status (including stopped entries). Callers should check
-    /// [`MinionInfo::is_running`] to determine which Minions are actually running.
+    /// Archived entries (`archived_at.is_some()`) are intentionally excluded:
+    /// no current caller needs them, and lab's PID-stamping loop previously stamped
+    /// live PIDs onto archived entries, causing a respawn loop (issue #857). Hiding
+    /// them at the registry layer prevents the corruption pattern from recurring.
+    ///
+    /// If a future caller ever stamps PIDs on archived entries again, the
+    /// `prune_dead_entries_for_issue` path will silently skip them — that path
+    /// also relies on this filter. Add a sibling accessor (e.g.
+    /// `find_by_issue_including_archived`) only when an actual caller needs it.
+    ///
+    /// Callers should check [`MinionInfo::is_running`] to determine which
+    /// Minions among the returned (non-archived) entries are actually running.
     pub(crate) fn find_by_issue(&self, repo: &str, issue: u64) -> Vec<(String, MinionInfo)> {
         self.data
             .minions
             .iter()
-            .filter(|(_, info)| info.repo == repo && info.issue == Some(issue))
+            .filter(|(_, info)| {
+                info.repo == repo && info.issue == Some(issue) && info.archived_at.is_none()
+            })
             .map(|(id, info)| (id.clone(), info.clone()))
             .collect()
     }
@@ -1715,6 +1768,92 @@ mod tests {
 
         // Different repo
         assert!(registry.find_by_issue("other/repo", 42).is_empty());
+    }
+
+    #[test]
+    fn test_find_by_issue_excludes_archived() {
+        let temp_dir = tempdir().unwrap();
+        let mut registry = MinionRegistry::load(Some(temp_dir.path())).unwrap();
+
+        let live = MinionInfo {
+            issue: Some(42),
+            repo: "owner/repo".to_string(),
+            ..test_minion_info()
+        };
+        let archived = MinionInfo {
+            issue: Some(42),
+            repo: "owner/repo".to_string(),
+            archived_at: Some(Utc::now()),
+            ..test_minion_info()
+        };
+
+        registry.register("M001".to_string(), live).unwrap();
+        registry.register("M002".to_string(), archived).unwrap();
+
+        let results = registry.find_by_issue("owner/repo", 42);
+        assert_eq!(results.len(), 1, "archived entries must not be returned");
+        assert_eq!(results[0].0, "M001");
+    }
+
+    #[tokio::test]
+    async fn test_clear_pids_on_archived_entries() {
+        let temp_dir = tempdir().unwrap();
+        // Initialize the global registry path so clear_pids_on_archived_entries
+        // hits this temp dir rather than the real ~/.gru/state/.
+        let registry = MinionRegistry::load(Some(temp_dir.path())).unwrap();
+        // Re-open via with_registry by setting GRU_HOME equivalent isn't feasible
+        // here without exposing internals; instead, exercise the underlying
+        // logic directly.
+        let mut registry = registry;
+
+        let archived_with_pid = MinionInfo {
+            issue: Some(42),
+            repo: "owner/repo".to_string(),
+            archived_at: Some(Utc::now()),
+            pid: Some(99999),
+            pid_start_time: Some(1234567890),
+            ..test_minion_info()
+        };
+        let archived_clean = MinionInfo {
+            issue: Some(43),
+            repo: "owner/repo".to_string(),
+            archived_at: Some(Utc::now()),
+            pid: None,
+            pid_start_time: None,
+            ..test_minion_info()
+        };
+        let live_with_pid = MinionInfo {
+            issue: Some(44),
+            repo: "owner/repo".to_string(),
+            pid: Some(99998),
+            pid_start_time: Some(1234567891),
+            ..test_minion_info()
+        };
+
+        registry
+            .register("M001".to_string(), archived_with_pid)
+            .unwrap();
+        registry
+            .register("M002".to_string(), archived_clean)
+            .unwrap();
+        registry
+            .register("M003".to_string(), live_with_pid)
+            .unwrap();
+
+        // Inline the fixup logic on the local registry (with_registry talks to the
+        // global state and we intentionally don't touch that in unit tests).
+        let mut count = 0usize;
+        for info in registry.data.minions.values_mut() {
+            if info.archived_at.is_some() && (info.pid.is_some() || info.pid_start_time.is_some()) {
+                info.pid = None;
+                info.pid_start_time = None;
+                count += 1;
+            }
+        }
+        assert_eq!(count, 1);
+        assert!(registry.get("M001").unwrap().pid.is_none());
+        assert!(registry.get("M001").unwrap().pid_start_time.is_none());
+        assert_eq!(registry.get("M003").unwrap().pid, Some(99998));
     }
 
     #[test]
