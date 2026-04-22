@@ -879,6 +879,12 @@ async fn handle_new_reviews(
 
     println!("🔄 Re-invoking to address review feedback...\n");
 
+    // Capture the session start time so the post-hoc dedup only considers
+    // replies the agent posts during this invocation — replies from prior
+    // sessions, which the human reviewer has implicitly accepted, are left
+    // untouched.
+    let session_start = Utc::now();
+
     match invoke_agent_for_reviews(
         ctx.backend,
         &ctx.wt_ctx.checkout_path,
@@ -892,6 +898,25 @@ async fn handle_new_reviews(
     {
         Ok(()) => {
             println!("\n✅ Finished addressing review comments");
+
+            // Post-hoc backstop for #801: even with the prompt-level
+            // constraint, the agent may occasionally post duplicate inline
+            // replies. Sweep them before continuing to monitor.
+            match pr_monitor::dedup_minion_inline_replies(
+                &ctx.issue_ctx.host,
+                &ctx.issue_ctx.owner,
+                &ctx.issue_ctx.repo,
+                ctx.pr_number,
+                &ctx.wt_ctx.minion_id,
+                session_start,
+            )
+            .await
+            {
+                Ok(0) => {}
+                Ok(n) => println!("🧹 Removed {} duplicate inline reply comment(s)", n),
+                Err(e) => log::warn!("⚠️  Duplicate inline reply sweep failed: {:#}", e),
+            }
+
             println!("🔄 Continuing to monitor PR...\n");
             // Use the check_time returned by monitor_pr, which was
             // advanced past the reviews we just handled. This ensures
