@@ -18,7 +18,9 @@ pub(crate) use worker::{agent_exit_code, create_pr_phase, monitor_pr_phase, run_
 use worktree::setup_worktree;
 
 use crate::agent_registry;
-use crate::agent_runner::{is_stuck_or_timeout_error, parse_timeout, EXIT_CODE_SIGNAL_TERMINATED};
+use crate::agent_runner::{
+    is_stuck_or_timeout_error, parse_timeout, EXIT_ALREADY_RUNNING, EXIT_CODE_SIGNAL_TERMINATED,
+};
 use crate::minion_registry::{with_registry, MinionMode, OrchestrationPhase};
 use crate::tmux::TmuxGuard;
 use anyhow::{bail, Context, Result};
@@ -468,7 +470,7 @@ pub(crate) async fn handle_fix(issue: &str, opts: FixOptions) -> Result<i32> {
                     false,
                 )
             }
-            ExistingMinionCheck::AlreadyRunning => return Ok(1),
+            ExistingMinionCheck::AlreadyRunning => return Ok(EXIT_ALREADY_RUNNING),
         }
     };
 
