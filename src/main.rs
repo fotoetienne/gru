@@ -29,6 +29,7 @@ mod prompt_renderer;
 mod prompt_utils;
 mod retry_queue;
 mod session_claim;
+mod shared_rate_limit;
 mod stream;
 mod text_buffer;
 mod tmux;

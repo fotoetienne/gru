@@ -186,6 +186,11 @@ pub(crate) async fn gh_api_with_retry(
     let args_str = args.join(" ");
 
     loop {
+        // If another Minion has signalled a rate limit for this host, wait
+        // for the reset window before spawning `gh`. Avoids the N×62s waste
+        // of every Minion independently discovering the same limit.
+        crate::shared_rate_limit::wait_if_shared_rate_limited(host).await;
+
         let output = gh_cli_command(host)
             .args(args)
             .output()
@@ -196,6 +201,9 @@ pub(crate) async fn gh_api_with_retry(
             if attempts > 0 || rate_limit_retried {
                 log::info!("GitHub API call succeeded after retries: gh {}", args_str);
             }
+            // Clear any shared rate-limit signal: the window has passed
+            // (otherwise this call would have failed).
+            crate::shared_rate_limit::clear_rate_limit(host);
             return Ok(output);
         }
 
@@ -389,6 +397,8 @@ pub(crate) async fn sleep_until_rate_limit_reset(host: &str) {
                     dur_min,
                     dur_sec,
                 );
+                // Signal peer Minions so they skip their own doomed calls.
+                crate::shared_rate_limit::write_rate_limit_until(host, info.reset);
                 tokio::time::sleep(std::time::Duration::from_secs(sleep_secs)).await;
                 return;
             }
@@ -400,6 +410,10 @@ pub(crate) async fn sleep_until_rate_limit_reset(host: &str) {
                 RATE_LIMIT_FALLBACK_SLEEP_SECS,
                 RATE_LIMIT_FALLBACK_SLEEP_SECS,
             );
+            // Signal peer Minions with the full reset epoch; they will
+            // sleep until the window closes rather than repeating our
+            // fallback-sized waits.
+            crate::shared_rate_limit::write_rate_limit_until(host, info.reset);
         } else {
             // Reset epoch is in the past — likely stale or clock skew
             log::warn!(
