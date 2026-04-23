@@ -66,6 +66,7 @@ pub(crate) async fn handle_attach(
     let registry_data = match session_claim::check_and_claim_session(
         &minion.minion_id,
         MinionMode::Interactive,
+        None, // PID is stamped after spawn() below via a separate registry update
         true, // graceful: allow attach without registry
     )
     .await
@@ -84,6 +85,7 @@ pub(crate) async fn handle_attach(
                 session_claim::check_and_claim_session(
                     &minion.minion_id,
                     MinionMode::Interactive,
+                    None,
                     true,
                 )
                 .await?
