@@ -31,11 +31,53 @@ use crate::workspace::Workspace;
 /// Subdirectory under `~/.gru/state/` holding per-minion lockfiles.
 const MINION_LOCKS_SUBDIR: &str = "minions";
 
+/// Rejects minion IDs containing characters that could escape the lock directory.
+///
+/// Any `/`, `\`, or `..` in an ID would let a caller (corrupt registry entry,
+/// hand-passed `--worker` flag) write a lockfile outside `<state>/minions/`.
+/// Mirrors the same defence applied to minion IDs in `workspace::archive_dir`.
+fn validate_minion_id(minion_id: &str) -> io::Result<()> {
+    if minion_id.is_empty()
+        || minion_id.contains('/')
+        || minion_id.contains('\\')
+        || minion_id.contains("..")
+        || minion_id.contains('\0')
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("Minion ID '{minion_id}' contains invalid characters"),
+        ));
+    }
+    Ok(())
+}
+
 /// Computes the lockfile path `<state>/minions/<minion_id>.lock`.
-fn lock_path(state_dir: &Path, minion_id: &str) -> PathBuf {
-    state_dir
-        .join(MINION_LOCKS_SUBDIR)
-        .join(format!("{minion_id}.lock"))
+///
+/// Callers must have validated `minion_id` via [`validate_minion_id`] first —
+/// this function performs a final containment check but does not re-validate
+/// characters.
+fn lock_path(state_dir: &Path, minion_id: &str) -> io::Result<PathBuf> {
+    let minions_dir = state_dir.join(MINION_LOCKS_SUBDIR);
+    let path = minions_dir.join(format!("{minion_id}.lock"));
+
+    // Belt-and-braces containment check: refuse any joined path whose components
+    // include `..`, since a lexical `starts_with` alone would accept
+    // `minions/../escape.lock`. Done on the constructed path (no filesystem
+    // touch) so traversal is caught before we open anything.
+    use std::path::Component;
+    if path.components().any(|c| matches!(c, Component::ParentDir)) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("Minion lock path would escape {}", minions_dir.display()),
+        ));
+    }
+    if !path.starts_with(&minions_dir) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("Minion lock path would escape {}", minions_dir.display()),
+        ));
+    }
+    Ok(path)
 }
 
 /// RAII guard holding an exclusive advisory lock on a per-minion lockfile.
@@ -70,7 +112,10 @@ impl MinionLock {
     /// directory rather than the global workspace. Used by unit tests to
     /// avoid clashing with the real `~/.gru/state/minions/`.
     pub(crate) fn try_acquire_in_dir(state_dir: &Path, minion_id: &str) -> Result<Self> {
-        let path = lock_path(state_dir, minion_id);
+        validate_minion_id(minion_id)
+            .with_context(|| format!("Invalid minion ID for lock: {minion_id:?}"))?;
+        let path = lock_path(state_dir, minion_id)
+            .with_context(|| format!("Failed to resolve lock path for {minion_id:?}"))?;
 
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
@@ -157,6 +202,66 @@ mod tests {
     }
 
     #[test]
+    fn rejects_minion_ids_that_could_escape_state_dir() {
+        let tmp = tempdir().unwrap();
+        let minions_dir = tmp.path().join(MINION_LOCKS_SUBDIR);
+
+        // Each of these would either traverse out of minions/ or drop a lockfile
+        // at an attacker-chosen path. All must be rejected before open(2).
+        let bad_ids = [
+            "",                     // empty
+            "..",                   // parent dir
+            "../escape",            // traversal
+            "foo/../../etc/passwd", // embedded traversal
+            "a/b",                  // forward slash
+            r"a\b",                 // backslash (Windows separator)
+            "null\0byte",           // NUL byte
+        ];
+
+        for id in bad_ids {
+            let err = MinionLock::try_acquire_in_dir(tmp.path(), id).unwrap_err_or_else(id);
+            let msg = format!("{:#}", err);
+            assert!(
+                msg.contains("invalid characters") || msg.contains("escape"),
+                "expected rejection for {id:?}, got: {msg}"
+            );
+        }
+
+        // The minions/ directory should never have been written to since every
+        // input was rejected before create_dir_all ran.
+        assert!(
+            !minions_dir.exists(),
+            "no lockfiles should have been created for invalid IDs"
+        );
+    }
+
+    /// Test helper: like `Result::unwrap_err`, but annotates the panic with the
+    /// input that was expected to fail.
+    trait UnwrapErrOrElse {
+        type Err;
+        fn unwrap_err_or_else(self, label: &str) -> Self::Err;
+    }
+    impl<T: std::fmt::Debug, E> UnwrapErrOrElse for std::result::Result<T, E> {
+        type Err = E;
+        fn unwrap_err_or_else(self, label: &str) -> E {
+            match self {
+                Ok(v) => panic!("expected error for input {label:?}, got Ok({v:?})"),
+                Err(e) => e,
+            }
+        }
+    }
+
+    #[test]
+    fn lock_path_rejects_traversal_even_if_validation_skipped() {
+        let tmp = tempdir().unwrap();
+        // Direct call into lock_path with a pathological ID — simulates a future
+        // refactor that accidentally skips `validate_minion_id`. The containment
+        // check must still catch the traversal.
+        let err = lock_path(tmp.path(), "../escape").unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
     fn second_acquire_fails_with_lock_contention() {
         let tmp = tempdir().unwrap();
         let _first = MinionLock::try_acquire_in_dir(tmp.path(), "M001").unwrap();
@@ -219,7 +324,7 @@ mod tests {
         let tmp = tempdir().unwrap();
         let _holder = MinionLock::try_acquire_in_dir(tmp.path(), "M077").unwrap();
 
-        let path = lock_path(tmp.path(), "M077");
+        let path = lock_path(tmp.path(), "M077").unwrap();
         let contender = OpenOptions::new()
             .read(true)
             .write(true)
