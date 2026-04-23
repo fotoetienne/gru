@@ -33,6 +33,13 @@ impl std::error::Error for SessionClaimError {}
 /// closing the TOCTOU window where a concurrent claimer would otherwise see
 /// `mode=<target>, pid=None` and treat the entry as stale (see issue #864).
 ///
+/// When `claim_pid` is `None`, only `mode`/`last_activity`/`archived_at` are
+/// touched in the claim write — whatever `pid`/`pid_start_time` survived from
+/// the earlier branches (the stale-reset's `clear_pid`, or the pre-existing
+/// values on a clean Stopped entry) remain. The caller is expected to stamp a
+/// PID separately. This is the path `attach.rs` uses because the spawned
+/// child's PID isn't known until after `cmd.spawn()`.
+///
 /// Returns a snapshot of the `MinionInfo` before claiming.
 fn claim_session_in_registry(
     reg: &mut MinionRegistry,

@@ -282,9 +282,8 @@ async fn run_agent_session_inner(
     let parent_pid = std::process::id();
     let parent_start_time = get_process_start_time(parent_pid);
 
-    let claim_minion_id = wt_ctx.minion_id.clone();
     let claim_result = crate::session_claim::check_and_claim_session(
-        &claim_minion_id,
+        &wt_ctx.minion_id,
         MinionMode::Autonomous,
         Some((parent_pid, parent_start_time)),
         true, // graceful: don't fail the worker over a transient registry error
