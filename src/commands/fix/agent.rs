@@ -7,7 +7,6 @@ use crate::progress::{ProgressConfig, ProgressDisplay};
 use crate::progress_comments::{MinionPhase, ProgressCommentTracker};
 use crate::prompt_loader;
 use crate::prompt_renderer::{render_template, PromptContext};
-use crate::session_claim::SessionClaimError;
 use anyhow::{Context, Result};
 use tokio::process::Command as TokioCommand;
 use uuid::Uuid;
@@ -292,39 +291,22 @@ async fn run_agent_session_inner(
     )
     .await;
 
-    match claim_result {
-        Ok(_) => {
-            // Ownership transfer succeeded (Some) or registry was unavailable
-            // and graceful-mode swallowed it (None). The graceful case leaves
-            // the registry in its pre-exit state (pid=<dead child>) but the
-            // worker continues; this matches the previous behavior where a
-            // failed update was logged but non-fatal.
-        }
-        Err(e) if e.downcast_ref::<SessionClaimError>().is_some() => {
-            // A concurrent `gru resume`/`gru attach` won the race and now
-            // owns the minion. The worker cannot safely continue into PR
-            // creation without competing writes, but killing it would lose
-            // the work already done. Log loudly so operators can investigate,
-            // and proceed — the other process owns the session claim but
-            // this worker still has the in-memory agent_run to return.
-            log::warn!(
-                "Concurrent claim detected while transferring post-agent ownership for {}: {:#}. \
-                 Another process may now own the minion; proceeding with this worker anyway.",
-                wt_ctx.minion_id,
-                e
-            );
-        }
-        Err(e) => {
-            // Non-graceful error (shouldn't happen since graceful=true, but
-            // handle defensively). Matches the original log-and-continue
-            // behavior.
-            log::warn!(
-                "Failed to transfer registry ownership to worker PID for {}: {:#}. \
-                 Registry may briefly allow concurrent claim.",
-                wt_ctx.minion_id,
-                e
-            );
-        }
+    // With graceful=true, `check_and_claim_session` only surfaces
+    // `SessionClaimError::AlreadyRunning`; IO/lock errors are swallowed into
+    // `Ok(None)`. So any `Err` here is a concurrent-claim conflict.
+    if let Err(e) = claim_result {
+        // A concurrent `gru resume`/`gru attach` won the race and now owns
+        // the minion. The worker cannot safely re-stamp ownership, but
+        // killing it would lose the work already done. Log loudly so
+        // operators can correlate duplicate-agent incidents with this event,
+        // and proceed — the other process owns the session claim but this
+        // worker still has the in-memory agent_run to return.
+        log::warn!(
+            "Concurrent claim detected while transferring post-agent ownership for {}: {:#}. \
+             Another process may now own the minion; proceeding with this worker anyway.",
+            wt_ctx.minion_id,
+            e
+        );
     }
 
     // Persist token_usage in a separate update. This is not part of the

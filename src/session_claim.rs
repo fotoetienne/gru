@@ -197,7 +197,10 @@ pub(crate) async fn check_and_claim_session_with_dir(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::minion_registry::{get_process_start_time, MinionRegistry, OrchestrationPhase};
+    use crate::minion_registry::{
+        get_process_start_time, is_process_alive_with_start_time, MinionRegistry,
+        OrchestrationPhase,
+    };
     use std::path::PathBuf;
     use tempfile::tempdir;
 
@@ -532,22 +535,47 @@ mod tests {
 
     /// Concurrent-claim race: two threads race to claim the same minion with
     /// distinct PIDs. Exactly one must win the claim; the other must see
-    /// `AlreadyRunning`. This validates the atomic pid-write closes the
-    /// microsecond-wide TOCTOU window described in issue #864.
+    /// `AlreadyRunning`. This validates that the file-lock + atomic pid-write
+    /// in a single save close the TOCTOU window described in issue #864 —
+    /// there is no observable intermediate state where `mode=<target>` and
+    /// `pid=None`.
+    ///
+    /// Uses distinct live PIDs (the test process and its parent) so that the
+    /// final registry state uniquely identifies which thread won: the loser
+    /// must see the winner's PID in the registry, not its own.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn test_concurrent_claim_only_one_wins() {
         let tmp = tempdir().unwrap();
         let info = test_minion_info(); // mode: Stopped, pid: None
         register_minion(tmp.path(), "M001", info);
 
-        // Use PIDs that the OS will report as "alive" so whichever thread
-        // wins the claim, the loser will observe `AlreadyRunning` instead of
-        // the "dead pid ⇒ reset + claim" path. `std::process::id()` is the
-        // test runner — guaranteed alive for the duration of the test.
-        let live_pid_a = std::process::id();
-        let start_a = get_process_start_time(live_pid_a);
-        let live_pid_b = std::process::id();
-        let start_b = get_process_start_time(live_pid_b);
+        // Use two distinct PIDs the OS reports as alive: the test process and
+        // its parent (cargo/nextest runner), both live for the duration of
+        // the test. The whole point is that whichever thread wins, the loser
+        // reads a *live, matching start_time* pid from the registry and
+        // correctly returns `AlreadyRunning` — not the "dead pid ⇒ reset +
+        // claim" path.
+        //
+        // If `parent_id()` cannot be resolved to a live process (e.g. some
+        // exotic CI runner), the test falls back to reusing `process::id()`,
+        // which still exercises the mutual-exclusion invariant (just with a
+        // weaker distinct-PID assertion at the end).
+        let pid_a = std::process::id();
+        let start_a = get_process_start_time(pid_a);
+        #[cfg(unix)]
+        let parent = {
+            use std::os::unix::process::parent_id;
+            parent_id()
+        };
+        #[cfg(not(unix))]
+        let parent: u32 = 0;
+        let (pid_b, start_b) =
+            match (parent != 0 && parent != pid_a).then(|| get_process_start_time(parent)) {
+                Some(Some(st)) if is_process_alive_with_start_time(parent, Some(st)) => {
+                    (parent, Some(st))
+                }
+                _ => (pid_a, start_a),
+            };
 
         let dir_a = tmp.path().to_path_buf();
         let dir_b = tmp.path().to_path_buf();
@@ -557,7 +585,7 @@ mod tests {
                 &dir_a,
                 "M001",
                 MinionMode::Autonomous,
-                Some((live_pid_a, start_a)),
+                Some((pid_a, start_a)),
                 false,
             )
             .await
@@ -567,7 +595,7 @@ mod tests {
                 &dir_b,
                 "M001",
                 MinionMode::Autonomous,
-                Some((live_pid_b, start_b)),
+                Some((pid_b, start_b)),
                 false,
             )
             .await
@@ -577,10 +605,12 @@ mod tests {
         let result_a = result_a.unwrap();
         let result_b = result_b.unwrap();
 
-        // Exactly one must succeed and one must return AlreadyRunning.
-        let (winner, loser) = match (&result_a, &result_b) {
-            (Ok(_), Err(_)) => (&result_a, &result_b),
-            (Err(_), Ok(_)) => (&result_b, &result_a),
+        // Exactly one must succeed and one must return AlreadyRunning — the
+        // file lock serializes the two claims and the atomic pid-write means
+        // the second caller never sees a `pid=None` intermediate state.
+        let (winner_pid, loser_result) = match (&result_a, &result_b) {
+            (Ok(_), Err(_)) => (pid_a, &result_b),
+            (Err(_), Ok(_)) => (pid_b, &result_a),
             (Ok(a), Ok(b)) => panic!(
                 "both claims succeeded: a={:?}, b={:?} — the atomic pid-write \
                  should force the second caller to observe AlreadyRunning",
@@ -589,17 +619,22 @@ mod tests {
             (Err(a), Err(b)) => panic!("both claims failed: a={:#}, b={:#}", a, b),
         };
 
-        assert!(winner.is_ok());
-        let loser_err = loser.as_ref().unwrap_err();
+        let loser_err = loser_result.as_ref().unwrap_err();
         assert!(
             loser_err.downcast_ref::<SessionClaimError>().is_some(),
             "loser should fail with SessionClaimError::AlreadyRunning, got: {:#}",
             loser_err
         );
 
-        // Exactly one pid should be stamped in the registry.
+        // The registry must reflect the winner's PID — not some arbitrary
+        // intermediate state. This directly validates that the claim write
+        // and the pid write landed in the same registry save.
         let final_state = read_minion(tmp.path(), "M001").unwrap();
         assert_eq!(final_state.mode, MinionMode::Autonomous);
-        assert!(final_state.pid.is_some(), "pid should be stamped");
+        assert_eq!(
+            final_state.pid,
+            Some(winner_pid),
+            "registry should contain the winning thread's PID"
+        );
     }
 }
