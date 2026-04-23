@@ -55,10 +55,19 @@ impl MinionLock {
     /// Attempts to acquire an exclusive non-blocking lock on
     /// `~/.gru/state/minions/<minion_id>.lock`.
     ///
-    /// Returns [`SessionClaimError::AlreadyRunning`] (with mode unknown, set
-    /// to [`MinionMode::Autonomous`](crate::minion_registry::MinionMode::Autonomous))
-    /// if another process already holds the lock. Other IO failures propagate
-    /// as [`anyhow::Error`].
+    /// Returns [`SessionClaimError::AlreadyRunning`] if another process
+    /// already holds the lock. Other IO failures propagate as
+    /// [`anyhow::Error`].
+    ///
+    /// **Important:** the `mode` field of the returned error is set to
+    /// [`MinionMode::Autonomous`] as a placeholder — we cannot read the
+    /// registry for the actual mode without re-entering registry code. The
+    /// value is only meaningful for the error's `Display` message. Callers
+    /// (specifically `handle_attach`) that branch on `mode == Autonomous`
+    /// to decide whether to auto-stop a running minion MUST acquire the
+    /// advisory lock **after** the registry-level
+    /// `check_and_claim_session` — never before — or the hardcoded mode
+    /// will route a kernel-lock contention into the auto-stop path.
     pub(crate) fn try_acquire(minion_id: &str) -> Result<Self> {
         let ws = Workspace::global().context("Failed to initialize workspace for minion lock")?;
         Self::try_acquire_in_dir(ws.state(), minion_id)

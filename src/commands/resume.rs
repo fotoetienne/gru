@@ -1,6 +1,8 @@
 use crate::agent::AgentBackend;
 use crate::agent_registry;
-use crate::agent_runner::{is_stuck_or_timeout_error, EXIT_CODE_SIGNAL_TERMINATED};
+use crate::agent_runner::{
+    is_stuck_or_timeout_error, EXIT_ALREADY_RUNNING, EXIT_CODE_SIGNAL_TERMINATED,
+};
 use crate::commands::fix::{
     agent_exit_code, create_pr_phase, fetch_issue_details, monitor_pr_phase, run_agent_phase,
     update_orchestration_phase, IssueContext, WorktreeContext,
@@ -53,7 +55,16 @@ pub(crate) async fn handle_resume(
     timeout_opt: Option<String>,
     quiet: bool,
 ) -> Result<i32> {
-    let ctx = check_resumption_preconditions(id, additional_prompt, timeout_opt).await?;
+    let ctx = match check_resumption_preconditions(id, additional_prompt, timeout_opt).await {
+        Ok(ctx) => ctx,
+        Err(e) if e.downcast_ref::<SessionClaimError>().is_some() => {
+            // `gru do` returns EXIT_ALREADY_RUNNING on the same condition so
+            // lab can short-circuit retries; keep resume's contract aligned.
+            eprintln!("{:#}", e);
+            return Ok(EXIT_ALREADY_RUNNING);
+        }
+        Err(e) => return Err(e),
+    };
     run_resume_pipeline(ctx, quiet).await
 }
 
@@ -82,20 +93,10 @@ async fn check_resumption_preconditions(
     // that if another process already owns this minion we bail out without
     // mutating any shared state. Held for the lifetime of the resume
     // pipeline; released on drop (issue #865).
-    let minion_lock = match MinionLock::try_acquire(&minion.minion_id) {
-        Ok(lock) => lock,
-        Err(e) => {
-            if let Some(SessionClaimError::AlreadyRunning { minion_id, .. }) = e.downcast_ref() {
-                bail!(
-                    "Minion {} already has a live owner (advisory lock held). \
-                     Stop it first with: gru stop {}",
-                    minion_id,
-                    minion_id
-                );
-            }
-            return Err(e);
-        }
-    };
+    //
+    // On contention the error is a `SessionClaimError::AlreadyRunning` —
+    // `handle_resume` downcasts this to exit with `EXIT_ALREADY_RUNNING`.
+    let minion_lock = MinionLock::try_acquire(&minion.minion_id)?;
 
     // Atomically check registry state and claim as Autonomous with our own
     // PID in a single file-locked write. Passing `claim_pid` here closes the
