@@ -1,4 +1,5 @@
 use crate::agent_registry;
+use crate::minion_lock::MinionLock;
 use crate::minion_registry::{
     is_process_alive_with_start_time, revert_to_stopped, with_registry, MinionMode,
 };
@@ -36,7 +37,11 @@ use uuid::Uuid;
 /// - During attach: updates registry with PID after spawn
 /// - After exit: updates registry with mode=Stopped and clears PID
 /// - Signal handling: Ctrl-C is caught to ensure registry cleanup runs
-/// - On error: registry is reverted to Stopped via [`revert_to_stopped`]
+/// - On error: registry is reverted to Stopped via [`revert_to_stopped`],
+///   but only when we actually claimed the registry. Under `graceful=true`,
+///   `check_and_claim_session` returns `Ok(None)` for both "not in registry"
+///   and "transient registry failure" — in either case no write happened, so
+///   reverting could clobber another live process's entry.
 pub(crate) async fn handle_attach(
     id: String,
     yolo: bool,
@@ -95,6 +100,23 @@ pub(crate) async fn handle_attach(
         }
     };
 
+    // Track whether we actually claimed the registry. `Ok(None)` from
+    // check_and_claim_session can mean either "minion not in registry" or
+    // (because `graceful=true`) "transient registry failure". In both cases
+    // no write happened, so we must NOT call revert_to_stopped on a later
+    // error — doing so could clobber the entry of a live process that owns
+    // the minion, briefly misreporting it as Stopped to observers (lab
+    // polling, gru status). See PR #872 Copilot review.
+    let claimed_registry = registry_data.is_some();
+    let revert_if_claimed = || {
+        let mid = minion.minion_id.clone();
+        async move {
+            if claimed_registry {
+                revert_to_stopped(&mid).await;
+            }
+        }
+    };
+
     // Extract session_id, agent_name, and repo; default to "claude" when not in registry
     let (session_id, agent_name, repo_str) = match registry_data {
         Some(info) => (Some(info.session_id), info.agent_name, Some(info.repo)),
@@ -105,7 +127,7 @@ pub(crate) async fn handle_attach(
     let backend = match agent_registry::resolve_backend(&agent_name) {
         Ok(b) => b,
         Err(e) => {
-            revert_to_stopped(&minion.minion_id).await;
+            revert_if_claimed().await;
             return Err(e).context(format!(
                 "Failed to resolve agent backend '{}' for attach",
                 agent_name
@@ -136,7 +158,7 @@ pub(crate) async fn handle_attach(
             let session_uuid = match Uuid::parse_str(sid) {
                 Ok(uuid) => uuid,
                 Err(e) => {
-                    revert_to_stopped(&minion.minion_id).await;
+                    revert_if_claimed().await;
                     return Err(
                         anyhow::anyhow!(e).context("Failed to parse session ID from registry")
                     );
@@ -149,7 +171,7 @@ pub(crate) async fn handle_attach(
             ) {
                 Some(c) => c,
                 None => {
-                    revert_to_stopped(&minion.minion_id).await;
+                    revert_if_claimed().await;
                     anyhow::bail!(
                         "Agent backend '{}' does not support interactive mode. \
                          Use 'gru resume {}' for autonomous mode instead.",
@@ -182,11 +204,41 @@ pub(crate) async fn handle_attach(
         cmd.arg("--dangerously-skip-permissions");
     }
 
+    // Acquire the per-minion advisory lock just before spawning. This is the
+    // defence-in-depth layer for issue #865: even if the registry claim above
+    // silently races (stale PID not detected, mode transition bug, concurrent
+    // write), the kernel-level lock makes a second live agent structurally
+    // impossible. Held until this function returns (normal exit or panic).
+    //
+    // Placed after the auto-stop retry path so that, when `check_and_claim_session`
+    // dislodged a running autonomous minion, the child process has had time to
+    // exit and release its own lock fd.
+    let _minion_lock = match MinionLock::try_acquire(&minion.minion_id) {
+        Ok(lock) => lock,
+        Err(e) => {
+            // Unified error path: if we mutated the registry to Interactive
+            // during `check_and_claim_session` above, we must roll that claim
+            // back — otherwise the registry reports mode=Interactive for a
+            // minion no agent will actually run.
+            //
+            // `revert_if_claimed` is a no-op when `claimed_registry == false`
+            // (graceful `Ok(None)` from the initial claim), which covers the
+            // case where another live process owns the minion and we never
+            // wrote anything to clobber. When we *did* claim, reverting to
+            // Stopped is strictly better than leaving a stale Interactive
+            // entry — the true lock-holder's `pid_callback` during agent
+            // spawn rewrites the authoritative mode/PID, so the brief
+            // Stopped window self-heals. See PR #872 Copilot review.
+            revert_if_claimed().await;
+            return Err(e);
+        }
+    };
+
     // Spawn agent process (not exec - we need to update registry after exit)
     let mut child = match cmd.spawn() {
         Ok(child) => child,
         Err(e) => {
-            revert_to_stopped(&minion.minion_id).await;
+            revert_if_claimed().await;
             return Err(e).context(format!(
                 "Failed to start agent '{}'. Is the CLI installed and in your PATH?",
                 agent_name
@@ -231,6 +283,11 @@ pub(crate) async fn handle_attach(
     // On successful exit, offer to resume autonomous monitoring
     if status.success() && !no_auto_resume && !quiet && prompt_auto_resume().await {
         println!("Resuming autonomous monitoring...");
+        // Release our advisory lock before handing off to the resume pipeline;
+        // `handle_resume` acquires its own lock on the same minion and would
+        // otherwise deadlock against this process's fd (fs2 locks are
+        // per-fd — reopening the same path in the same process still blocks).
+        drop(_minion_lock);
         return crate::commands::resume::handle_resume(minion.minion_id, None, None, quiet).await;
     }
 

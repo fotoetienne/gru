@@ -19,6 +19,7 @@ mod mcp;
 mod merge_judge;
 mod merge_readiness;
 mod minion;
+mod minion_lock;
 mod minion_registry;
 mod minion_resolver;
 mod pr_monitor;

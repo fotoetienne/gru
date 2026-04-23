@@ -5,8 +5,16 @@ use chrono::Utc;
 /// Typed errors from session-claim operations (shared by attach and resume).
 #[derive(Debug)]
 pub(crate) enum SessionClaimError {
-    /// The minion has a live process — user must stop it first.
+    /// The registry says the minion has a live process — user must stop it first.
+    /// Carries the registry-recorded mode so callers (`gru attach`) can decide
+    /// whether to auto-stop an autonomous owner before taking over.
     AlreadyRunning { minion_id: String, mode: MinionMode },
+    /// Another process holds the per-minion advisory lockfile (issue #865).
+    /// Surfaced from [`MinionLock::try_acquire`](crate::minion_lock::MinionLock::try_acquire).
+    /// Distinct from [`AlreadyRunning`](Self::AlreadyRunning) because the registry
+    /// mode is unknown at the point of contention — the lock-holder owns both
+    /// the file lock and the authoritative registry state.
+    LockContention { minion_id: String },
 }
 
 impl std::fmt::Display for SessionClaimError {
@@ -17,6 +25,14 @@ impl std::fmt::Display for SessionClaimError {
                     f,
                     "Minion {} is already running (mode: {}). Stop it first with: gru stop {}",
                     minion_id, mode, minion_id
+                )
+            }
+            SessionClaimError::LockContention { minion_id } => {
+                write!(
+                    f,
+                    "Minion {} already has a live owner (advisory lock held). \
+                     Stop it first with: gru stop {}",
+                    minion_id, minion_id
                 )
             }
         }
@@ -266,6 +282,27 @@ mod tests {
         assert!(err.downcast_ref::<SessionClaimError>().is_some());
     }
 
+    #[test]
+    fn test_session_claim_error_display_lock_contention() {
+        let err = SessionClaimError::LockContention {
+            minion_id: "M042".to_string(),
+        };
+        let msg = format!("{}", err);
+        // Must NOT include a fabricated registry mode (issue #865 review feedback).
+        assert!(!msg.contains("mode:"), "unexpected mode in message: {msg}");
+        assert!(msg.contains("advisory lock held"));
+        assert!(msg.contains("gru stop M042"));
+    }
+
+    #[test]
+    fn test_session_claim_error_lock_contention_downcastable() {
+        let err: anyhow::Error = SessionClaimError::LockContention {
+            minion_id: "M042".to_string(),
+        }
+        .into();
+        assert!(err.downcast_ref::<SessionClaimError>().is_some());
+    }
+
     // --- Async tests for check_and_claim_session ---
 
     /// Helper: register a minion directly in a temp-dir registry.
@@ -329,9 +366,13 @@ mod tests {
         .unwrap_err();
 
         let claim_err = err.downcast_ref::<SessionClaimError>().unwrap();
-        let SessionClaimError::AlreadyRunning { minion_id, mode } = claim_err;
-        assert_eq!(minion_id, "M001");
-        assert_eq!(*mode, MinionMode::Autonomous);
+        match claim_err {
+            SessionClaimError::AlreadyRunning { minion_id, mode } => {
+                assert_eq!(minion_id, "M001");
+                assert_eq!(*mode, MinionMode::Autonomous);
+            }
+            other => panic!("expected AlreadyRunning, got {:?}", other),
+        }
 
         // Registry should be unchanged
         let unchanged = read_minion(tmp.path(), "M001").unwrap();

@@ -1,15 +1,18 @@
 use crate::agent::AgentBackend;
 use crate::agent_registry;
-use crate::agent_runner::{is_stuck_or_timeout_error, EXIT_CODE_SIGNAL_TERMINATED};
+use crate::agent_runner::{
+    is_stuck_or_timeout_error, EXIT_ALREADY_RUNNING, EXIT_CODE_SIGNAL_TERMINATED,
+};
 use crate::commands::fix::{
     agent_exit_code, create_pr_phase, fetch_issue_details, monitor_pr_phase, run_agent_phase,
     update_orchestration_phase, IssueContext, WorktreeContext,
 };
+use crate::minion_lock::MinionLock;
 use crate::minion_registry::{
     mark_minion_failed, revert_to_stopped, with_registry, MinionMode, OrchestrationPhase,
 };
 use crate::minion_resolver;
-use crate::session_claim;
+use crate::session_claim::{self, SessionClaimError};
 use crate::tmux::TmuxGuard;
 use anyhow::{bail, Result};
 use chrono::{DateTime, Utc};
@@ -27,6 +30,10 @@ struct ResumeContext {
     no_watch: bool,
     /// The command that originally created this minion (e.g., "do", "prompt", "review").
     command: String,
+    /// Advisory lock held for the lifetime of the resume pipeline. Prevents
+    /// concurrent `gru resume` / `gru attach` from spawning a second agent
+    /// against the same minion (issue #865). Released on drop.
+    _minion_lock: MinionLock,
 }
 
 /// Handles the resume command: resumes a stopped Minion in autonomous mode.
@@ -48,7 +55,16 @@ pub(crate) async fn handle_resume(
     timeout_opt: Option<String>,
     quiet: bool,
 ) -> Result<i32> {
-    let ctx = check_resumption_preconditions(id, additional_prompt, timeout_opt).await?;
+    let ctx = match check_resumption_preconditions(id, additional_prompt, timeout_opt).await {
+        Ok(ctx) => ctx,
+        Err(e) if e.downcast_ref::<SessionClaimError>().is_some() => {
+            // `gru do` returns EXIT_ALREADY_RUNNING on the same condition so
+            // lab can short-circuit retries; keep resume's contract aligned.
+            eprintln!("{:#}", e);
+            return Ok(EXIT_ALREADY_RUNNING);
+        }
+        Err(e) => return Err(e),
+    };
     run_resume_pipeline(ctx, quiet).await
 }
 
@@ -72,6 +88,17 @@ async fn check_resumption_preconditions(
             minion.worktree_path.display()
         );
     }
+
+    // Acquire the per-minion advisory lock before touching the registry so
+    // that if another process already owns this minion we bail out without
+    // mutating any shared state. Held for the lifetime of the resume
+    // pipeline; released on drop (issue #865).
+    //
+    // On contention the error is `SessionClaimError::LockContention`;
+    // `handle_resume` downcasts any `SessionClaimError` variant (lock or
+    // registry) to exit with `EXIT_ALREADY_RUNNING`, keeping the retry
+    // contract uniform across both barriers.
+    let minion_lock = MinionLock::try_acquire(&minion.minion_id)?;
 
     // Atomically check registry state and claim as Autonomous with our own
     // PID in a single file-locked write. Passing `claim_pid` here closes the
@@ -264,6 +291,7 @@ async fn check_resumption_preconditions(
         effective_timeout,
         no_watch,
         command,
+        _minion_lock: minion_lock,
     })
 }
 
@@ -281,6 +309,7 @@ async fn run_resume_pipeline(ctx: ResumeContext, quiet: bool) -> Result<i32> {
         effective_timeout,
         no_watch,
         command,
+        _minion_lock,
     } = ctx;
 
     // Non-"do" minions (e.g., "prompt", "review") only run the agent phase —

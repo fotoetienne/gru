@@ -322,7 +322,9 @@ When making changes, keep docs in sync:
 ├── state/              # Local state
 │   ├── next_id.txt     # Minion ID counter
 │   ├── minions.json    # Persistent Minion registry
-│   └── minions.json.lock  # Registry file lock
+│   ├── minions.json.lock  # Registry file lock
+│   └── minions/        # Per-Minion advisory lockfiles (issue #865)
+│       └── <minion_id>.lock  # Held for lifetime of owning worker/resume/attach process
 └── archive/            # Completed work (future)
 ```
 

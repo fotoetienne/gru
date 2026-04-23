@@ -21,7 +21,9 @@ use crate::agent_registry;
 use crate::agent_runner::{
     is_stuck_or_timeout_error, parse_timeout, EXIT_ALREADY_RUNNING, EXIT_CODE_SIGNAL_TERMINATED,
 };
+use crate::minion_lock::MinionLock;
 use crate::minion_registry::{with_registry, MinionMode, OrchestrationPhase};
+use crate::session_claim::SessionClaimError;
 use crate::tmux::TmuxGuard;
 use anyhow::{bail, Context, Result};
 use chrono::Utc;
@@ -133,6 +135,26 @@ async fn spawn_worker(
 /// Looks up the minion in the registry by ID, resolves the agent backend,
 /// and runs the agent session, PR creation, and monitoring phases.
 async fn run_worker(minion_id: &str, issue: &str, opts: FixOptions) -> Result<i32> {
+    // Defence-in-depth against duplicate agent subprocesses (issue #865).
+    // Held for the lifetime of this function; released on drop (normal exit,
+    // panic, or SIGKILL via kernel fd close). The registry check in
+    // `check_and_claim_session` is the primary barrier — this advisory lock
+    // is a second layer so a registry bug (stale PID, mode mismatch) cannot
+    // produce two live agents against the same minion.
+    let _minion_lock = match MinionLock::try_acquire(minion_id) {
+        Ok(lock) => lock,
+        Err(e) => {
+            if e.downcast_ref::<SessionClaimError>().is_some() {
+                log::error!(
+                    "Minion {} already has a live owner (advisory lock held); refusing to start worker",
+                    minion_id
+                );
+                return Ok(EXIT_ALREADY_RUNNING);
+            }
+            return Err(e);
+        }
+    };
+
     let FixOptions {
         timeout: timeout_opt,
         review_timeout: review_timeout_opt,
