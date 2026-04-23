@@ -282,30 +282,52 @@ async fn run_agent_session_inner(
     let parent_pid = std::process::id();
     let parent_start_time = get_process_start_time(parent_pid);
 
+    // Call with graceful=false so that transient registry IO/lock failures
+    // propagate as Err rather than being silently swallowed into Ok(None) —
+    // a silent failure here would leave the registry pointing at the dead
+    // child PID, which is the exact state #864 aims to eliminate. We then
+    // locally downgrade both error shapes to warn+continue so neither kills
+    // the worker (which still has a valid agent_run to return) but both
+    // remain visible in operator logs.
     let claim_result = crate::session_claim::check_and_claim_session(
         &wt_ctx.minion_id,
         MinionMode::Autonomous,
         Some((parent_pid, parent_start_time)),
-        true, // graceful: don't fail the worker over a transient registry error
+        false,
     )
     .await;
 
-    // With graceful=true, `check_and_claim_session` only surfaces
-    // `SessionClaimError::AlreadyRunning`; IO/lock errors are swallowed into
-    // `Ok(None)`. So any `Err` here is a concurrent-claim conflict.
-    if let Err(e) = claim_result {
-        // A concurrent `gru resume`/`gru attach` won the race and now owns
-        // the minion. The worker cannot safely re-stamp ownership, but
-        // killing it would lose the work already done. Log loudly so
-        // operators can correlate duplicate-agent incidents with this event,
-        // and proceed — the other process owns the session claim but this
-        // worker still has the in-memory agent_run to return.
-        log::warn!(
-            "Concurrent claim detected while transferring post-agent ownership for {}: {:#}. \
-             Another process may now own the minion; proceeding with this worker anyway.",
-            wt_ctx.minion_id,
-            e
-        );
+    match claim_result {
+        Ok(_) => {}
+        Err(e)
+            if e.downcast_ref::<crate::session_claim::SessionClaimError>()
+                .is_some() =>
+        {
+            // A concurrent `gru resume`/`gru attach` won the race and now
+            // owns the minion. The worker cannot safely re-stamp ownership,
+            // but killing it would lose the work already done. Log loudly so
+            // operators can correlate duplicate-agent incidents with this
+            // event, and proceed — the other process owns the session claim
+            // but this worker still has the in-memory agent_run to return.
+            log::warn!(
+                "Concurrent claim detected while transferring post-agent ownership for {}: {:#}. \
+                 Another process may now own the minion; proceeding with this worker anyway.",
+                wt_ctx.minion_id,
+                e
+            );
+        }
+        Err(e) => {
+            // Transient registry error (IO, lock timeout). Registry still
+            // points at the dead child PID, so a concurrent claimer could
+            // observe a stale-PID entry — same failure shape #864 aims to
+            // close, now visible instead of silent.
+            log::warn!(
+                "Failed to transfer registry ownership to worker PID for {}: {:#}. \
+                 Registry may briefly allow concurrent claim.",
+                wt_ctx.minion_id,
+                e
+            );
+        }
     }
 
     // Persist token_usage in a separate update. This is not part of the

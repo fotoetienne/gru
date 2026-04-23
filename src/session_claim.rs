@@ -569,10 +569,18 @@ mod tests {
         // weaker distinct-PID assertion at the end).
         let pid_a = std::process::id();
         let start_a = get_process_start_time(pid_a);
+        // Use `libc::getppid()` rather than `std::os::unix::process::parent_id()`
+        // — the latter is only available on Rust 1.83+, but the crate MSRV
+        // (Cargo.toml `rust-version`) is 1.73. libc is already a direct
+        // dependency.
         #[cfg(unix)]
         let parent = {
-            use std::os::unix::process::parent_id;
-            parent_id()
+            let ppid = unsafe { libc::getppid() };
+            if ppid > 0 {
+                ppid as u32
+            } else {
+                0
+            }
         };
         #[cfg(not(unix))]
         let parent: u32 = 0;
