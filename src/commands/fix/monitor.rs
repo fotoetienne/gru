@@ -842,6 +842,56 @@ async fn handle_ready_to_merge(
     LoopAction::Continue
 }
 
+/// Apply the #867 idempotency filter to review feedback before invoking the
+/// agent. Fetches the bot user's login and every inline comment on the PR,
+/// then drops any thread where a bot reply already exists. On failure, logs
+/// a warning and returns the feedback unchanged so the normal path proceeds.
+async fn apply_bot_reply_idempotency_filter(
+    ctx: &MonitorContext<'_>,
+    feedback: pr_monitor::ReviewFeedback,
+) -> pr_monitor::ReviewFeedback {
+    let bot_user = match github::get_authenticated_user(&ctx.issue_ctx.host).await {
+        Ok(u) => u,
+        Err(e) => {
+            log::warn!(
+                "⚠️  Could not resolve bot user for review-reply idempotency check: {:#}",
+                e
+            );
+            return feedback;
+        }
+    };
+
+    let already_replied = match pr_monitor::fetch_threads_with_bot_replies(
+        &ctx.issue_ctx.host,
+        &ctx.issue_ctx.owner,
+        &ctx.issue_ctx.repo,
+        ctx.pr_number,
+        &bot_user,
+    )
+    .await
+    {
+        Ok(set) => set,
+        Err(e) => {
+            log::warn!(
+                "⚠️  Review-reply idempotency check failed (proceeding): {:#}",
+                e
+            );
+            return feedback;
+        }
+    };
+
+    let original_count = feedback.comments.len();
+    let filtered = pr_monitor::filter_feedback_against_replied_threads(feedback, &already_replied);
+    let skipped = original_count.saturating_sub(filtered.comments.len());
+    if skipped > 0 {
+        println!(
+            "🛡️  Skipping {} review thread(s) already replied to by @{}",
+            skipped, bot_user
+        );
+    }
+    filtered
+}
+
 async fn handle_new_reviews(
     state: &mut MonitorLoopState,
     ctx: &MonitorContext<'_>,
@@ -866,6 +916,20 @@ async fn handle_new_reviews(
             ctx.issue_ctx.host, ctx.issue_ctx.owner, ctx.issue_ctx.repo, ctx.pr_number
         );
         return LoopAction::Break;
+    }
+
+    // Best-effort idempotency check (#867): drop inline comments on threads
+    // where the bot user has already posted a reply. Belt on top of the
+    // process-level lockfile + registry guards from #862/#863. On any
+    // API failure we proceed with the unfiltered feedback.
+    let feedback = apply_bot_reply_idempotency_filter(ctx, feedback).await;
+
+    if feedback.is_empty() {
+        println!("✅ All review threads already have a bot reply; nothing to address");
+        state.review_baseline = Some(check_time);
+        save_review_check_time(&ctx.wt_ctx.minion_id, check_time).await;
+        reset_attempt_count(&ctx.wt_ctx.minion_id).await;
+        return LoopAction::Continue;
     }
 
     let review_prompt = pr_monitor::format_review_prompt(
