@@ -778,10 +778,18 @@ const REBASE_PROMPT_TEMPLATE: &str = include_str!("rebase_prompt.md");
 /// `checkout` to avoid accidentally climbing one level too high on legacy
 /// layouts where the checkout directory happens to have a `.git` marker
 /// but is not named `checkout`.
+///
+/// The empty-path guard protects the pathological `"checkout"` relative-
+/// path case: `Path::parent()` returns `Some("")` for a bare `"checkout"`,
+/// and returning that would silently resolve to the process CWD. Production
+/// callers always pass absolute paths from `workspace.work_dir()`, so this
+/// guard only matters for defensive robustness.
 pub(crate) fn derive_events_dir(checkout_path: &Path) -> PathBuf {
     if checkout_path.file_name().and_then(|s| s.to_str()) == Some("checkout") {
         if let Some(parent) = checkout_path.parent() {
-            return parent.to_path_buf();
+            if !parent.as_os_str().is_empty() {
+                return parent.to_path_buf();
+            }
         }
     }
     checkout_path.to_path_buf()
@@ -909,11 +917,13 @@ mod tests {
     }
 
     #[test]
-    fn test_derive_events_dir_bare_checkout_does_not_panic() {
-        // A bare "checkout" path (no parent components) should not panic;
-        // it returns the empty-path parent that Path::parent() yields.
+    fn test_derive_events_dir_bare_checkout_returns_input() {
+        // A bare "checkout" path has an empty-path parent (`Some("")`).
+        // Returning that would silently resolve to the process CWD at
+        // runtime, so the empty-path guard must fall through and return
+        // the input unchanged.
         let bare = PathBuf::from("checkout");
-        let _ = derive_events_dir(&bare);
+        assert_eq!(derive_events_dir(&bare), bare);
     }
 
     #[test]
