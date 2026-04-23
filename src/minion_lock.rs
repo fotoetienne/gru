@@ -55,19 +55,12 @@ impl MinionLock {
     /// Attempts to acquire an exclusive non-blocking lock on
     /// `~/.gru/state/minions/<minion_id>.lock`.
     ///
-    /// Returns [`SessionClaimError::AlreadyRunning`] if another process
-    /// already holds the lock. Other IO failures propagate as
-    /// [`anyhow::Error`].
-    ///
-    /// **Important:** the `mode` field of the returned error is set to
-    /// [`MinionMode::Autonomous`] as a placeholder — we cannot read the
-    /// registry for the actual mode without re-entering registry code. The
-    /// value is only meaningful for the error's `Display` message. Callers
-    /// (specifically `handle_attach`) that branch on `mode == Autonomous`
-    /// to decide whether to auto-stop a running minion MUST acquire the
-    /// advisory lock **after** the registry-level
-    /// `check_and_claim_session` — never before — or the hardcoded mode
-    /// will route a kernel-lock contention into the auto-stop path.
+    /// Returns [`SessionClaimError::LockContention`] if another process
+    /// already holds the lock. The separate variant (distinct from
+    /// [`SessionClaimError::AlreadyRunning`]) avoids fabricating a
+    /// registry mode we don't know, and keeps the `mode == Autonomous`
+    /// branching in `handle_attach` bound strictly to the registry-level
+    /// claim. Other IO failures propagate as [`anyhow::Error`].
     pub(crate) fn try_acquire(minion_id: &str) -> Result<Self> {
         let ws = Workspace::global().context("Failed to initialize workspace for minion lock")?;
         Self::try_acquire_in_dir(ws.state(), minion_id)
@@ -98,9 +91,8 @@ impl MinionLock {
                 minion_id: minion_id.to_string(),
                 path,
             }),
-            Err(e) if is_lock_contention(&e) => Err(SessionClaimError::AlreadyRunning {
+            Err(e) if is_lock_contention(&e) => Err(SessionClaimError::LockContention {
                 minion_id: minion_id.to_string(),
-                mode: crate::minion_registry::MinionMode::Autonomous,
             }
             .into()),
             Err(e) => Err(anyhow::Error::new(e)
@@ -165,16 +157,21 @@ mod tests {
     }
 
     #[test]
-    fn second_acquire_fails_with_already_running() {
+    fn second_acquire_fails_with_lock_contention() {
         let tmp = tempdir().unwrap();
         let _first = MinionLock::try_acquire_in_dir(tmp.path(), "M001").unwrap();
 
         let err = MinionLock::try_acquire_in_dir(tmp.path(), "M001").unwrap_err();
         let claim = err
             .downcast_ref::<SessionClaimError>()
-            .expect("second acquire must surface SessionClaimError::AlreadyRunning");
-        let SessionClaimError::AlreadyRunning { minion_id, .. } = claim;
-        assert_eq!(minion_id, "M001");
+            .expect("second acquire must surface SessionClaimError::LockContention");
+        match claim {
+            SessionClaimError::LockContention { minion_id } => assert_eq!(minion_id, "M001"),
+            other => panic!("expected LockContention, got {other:?}"),
+        }
+        // The Display message must not fabricate a registry mode (review feedback on #872).
+        let msg = format!("{:#}", err);
+        assert!(!msg.contains("mode:"), "unexpected mode in message: {msg}");
     }
 
     #[test]
@@ -238,7 +235,7 @@ mod tests {
     /// Integration-style test (acceptance criterion for issue #865): spawn
     /// multiple concurrent workers against the same minion and confirm
     /// exactly one acquires the lock while the others fail with
-    /// `SessionClaimError::AlreadyRunning`.
+    /// `SessionClaimError::LockContention`.
     ///
     /// Uses real OS threads rather than tokio tasks so each acquisition
     /// runs in parallel on distinct file descriptors (fs2 uses flock(2) on
@@ -266,7 +263,7 @@ mod tests {
             .collect();
 
         let mut acquired = 0;
-        let mut already_running = 0;
+        let mut contended = 0;
         let mut other_err = 0;
 
         // Keep the winning lock alive until all contenders have been inspected
@@ -279,8 +276,13 @@ mod tests {
                     winners.push(lock);
                     acquired += 1;
                 }
-                Err(e) if e.downcast_ref::<SessionClaimError>().is_some() => {
-                    already_running += 1;
+                Err(e)
+                    if matches!(
+                        e.downcast_ref::<SessionClaimError>(),
+                        Some(SessionClaimError::LockContention { .. })
+                    ) =>
+                {
+                    contended += 1;
                 }
                 Err(_) => other_err += 1,
             }
@@ -291,9 +293,9 @@ mod tests {
             "exactly one worker must acquire the lock (got {acquired})"
         );
         assert_eq!(
-            already_running,
+            contended,
             WORKERS - 1,
-            "the remaining workers must surface AlreadyRunning (got {already_running})"
+            "the remaining workers must surface LockContention (got {contended})"
         );
         assert_eq!(
             other_err, 0,

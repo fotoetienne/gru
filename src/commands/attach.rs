@@ -194,16 +194,18 @@ pub(crate) async fn handle_attach(
     // exit and release its own lock fd.
     let _minion_lock = match MinionLock::try_acquire(&minion.minion_id) {
         Ok(lock) => lock,
+        Err(e) if e.downcast_ref::<SessionClaimError>().is_some() => {
+            // Lock contention: the true owner holds the registry state. Do NOT
+            // call `revert_to_stopped` — clobbering their mode to Stopped would
+            // briefly misreport a running minion as idle to observers (lab
+            // polling, `gru status`). The lock-holder's own exit cleanup is
+            // responsible for the registry; we just surface the typed error
+            // so `handle_attach`'s caller (main) can report it. See PR #872
+            // review feedback from M1jj.
+            return Err(e);
+        }
         Err(e) => {
             revert_to_stopped(&minion.minion_id).await;
-            if let Some(SessionClaimError::AlreadyRunning { minion_id, .. }) = e.downcast_ref() {
-                anyhow::bail!(
-                    "Minion {} already has a live owner (advisory lock held). \
-                     Stop it first with: gru stop {}",
-                    minion_id,
-                    minion_id
-                );
-            }
             return Err(e);
         }
     };

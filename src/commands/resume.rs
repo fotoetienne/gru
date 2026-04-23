@@ -94,8 +94,10 @@ async fn check_resumption_preconditions(
     // mutating any shared state. Held for the lifetime of the resume
     // pipeline; released on drop (issue #865).
     //
-    // On contention the error is a `SessionClaimError::AlreadyRunning` —
-    // `handle_resume` downcasts this to exit with `EXIT_ALREADY_RUNNING`.
+    // On contention the error is `SessionClaimError::LockContention`;
+    // `handle_resume` downcasts any `SessionClaimError` variant (lock or
+    // registry) to exit with `EXIT_ALREADY_RUNNING`, keeping the retry
+    // contract uniform across both barriers.
     let minion_lock = MinionLock::try_acquire(&minion.minion_id)?;
 
     // Atomically check registry state and claim as Autonomous with our own
