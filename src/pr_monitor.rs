@@ -1104,6 +1104,11 @@ async fn fetch_all_pr_inline_comments(
     .await?;
 
     if !output.status.success() {
+        // `gh_api_with_retry` may return `Ok(output)` with a non-success exit
+        // code when the error is not retryable. Convert that into an `Err`
+        // here so callers can decide whether to hard-fail or fall back
+        // (`get_review_feedback` logs and proceeds with the per-review set;
+        // `dedup_minion_inline_replies` propagates the error).
         let stderr = String::from_utf8_lossy(&output.stderr);
         anyhow::bail!(
             "Failed to fetch inline comments on {repo_full} PR #{pr_number}: {}",
@@ -2676,38 +2681,24 @@ mod tests {
 
     #[test]
     fn test_filter_unanswered_comments_fixture_parses_gh_api_response() {
-        // Exercise the full parse path: feed a recorded `gh api` response
-        // (same shape returned by `/pulls/{pr_number}/comments`) through the
-        // JSON parser and into the filter. This guards against drift in the
-        // `ApiReviewComment` deserialization contract.
-        let fixture = r#"[
-            {
-                "id": 100,
-                "path": "src/lib.rs",
-                "line": 10,
-                "body": "Please add a test.",
-                "user": {"login": "reviewer"},
-                "created_at": "2024-06-15T10:00:00Z"
-            },
-            {
-                "id": 200,
-                "path": "src/lib.rs",
-                "line": 10,
-                "body": "Added a test.\n\n<sub>🤖 M1jc</sub>",
-                "user": {"login": "minion-bot"},
-                "in_reply_to_id": 100,
-                "created_at": "2024-06-15T10:30:00Z"
-            },
-            {
-                "id": 300,
-                "path": "src/main.rs",
-                "line": 5,
-                "body": "Rename this variable.",
-                "user": {"login": "reviewer"},
-                "created_at": "2024-06-15T11:00:00Z"
+        // Exercise the actual parse path used by `fetch_all_pr_inline_comments`
+        // in production: `gh api --paginate --jq ".[]"` emits one JSON object
+        // per line, and the function calls `serde_json::from_str` on each
+        // trimmed line. The fixture below matches that shape so the test
+        // catches drift in the `ApiReviewComment` per-line deserialization
+        // contract, not just top-level array deserialization.
+        let fixture = r#"{"id":100,"path":"src/lib.rs","line":10,"body":"Please add a test.","user":{"login":"reviewer"},"created_at":"2024-06-15T10:00:00Z"}
+{"id":200,"path":"src/lib.rs","line":10,"body":"Added a test.\n\n<sub>🤖 M1jc</sub>","user":{"login":"minion-bot"},"in_reply_to_id":100,"created_at":"2024-06-15T10:30:00Z"}
+{"id":300,"path":"src/main.rs","line":5,"body":"Rename this variable.","user":{"login":"reviewer"},"created_at":"2024-06-15T11:00:00Z"}"#;
+
+        let mut sources: Vec<ApiReviewComment> = Vec::new();
+        for line in fixture.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
             }
-        ]"#;
-        let sources: Vec<ApiReviewComment> = serde_json::from_str(fixture).unwrap();
+            sources.push(serde_json::from_str(line).unwrap());
+        }
 
         // Candidates include both root comments (100 answered, 300 unanswered).
         let candidates = vec![sources[0].clone(), sources[2].clone()];
