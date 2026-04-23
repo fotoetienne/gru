@@ -10,9 +10,16 @@
 //! same minion.
 //!
 //! Acquire the lock in the three process entry points that spawn an agent:
-//!   - `fix::run_worker` (the background worker for `gru do`).
-//!   - `resume::run_resume_pipeline` (for `gru resume`).
-//!   - `attach::handle_attach`, just before spawning the interactive agent.
+//!   - `fix::run_worker` (the background worker for `gru do`) — acquired at
+//!     the top of the worker function, *before* any registry interaction, so
+//!     contention short-circuits with `EXIT_ALREADY_RUNNING` without mutating
+//!     any shared state.
+//!   - `resume::check_resumption_preconditions` (for `gru resume`) — acquired
+//!     *before* the registry claim, then carried through `ResumeContext` into
+//!     `run_resume_pipeline` so the guard lives for the full pipeline.
+//!   - `attach::handle_attach`, just before spawning the interactive agent —
+//!     acquired *after* the registry claim (so the `mode == Autonomous`
+//!     auto-stop branch can dislodge a running owner before retrying).
 //!
 //! The lock is released automatically on normal exit, panic, or SIGKILL — the
 //! kernel drops the file lock when the fd is closed, so no shutdown handler is

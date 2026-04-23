@@ -215,17 +215,20 @@ pub(crate) async fn handle_attach(
     // exit and release its own lock fd.
     let _minion_lock = match MinionLock::try_acquire(&minion.minion_id) {
         Ok(lock) => lock,
-        Err(e) if e.downcast_ref::<SessionClaimError>().is_some() => {
-            // Lock contention: the true owner holds the registry state. Do NOT
-            // call `revert_to_stopped` — clobbering their mode to Stopped would
-            // briefly misreport a running minion as idle to observers (lab
-            // polling, `gru status`). The lock-holder's own exit cleanup is
-            // responsible for the registry; we just surface the typed error
-            // so `handle_attach`'s caller (main) can report it. See PR #872
-            // review feedback from M1jj.
-            return Err(e);
-        }
         Err(e) => {
+            // Unified error path: if we mutated the registry to Interactive
+            // during `check_and_claim_session` above, we must roll that claim
+            // back — otherwise the registry reports mode=Interactive for a
+            // minion no agent will actually run.
+            //
+            // `revert_if_claimed` is a no-op when `claimed_registry == false`
+            // (graceful `Ok(None)` from the initial claim), which covers the
+            // case where another live process owns the minion and we never
+            // wrote anything to clobber. When we *did* claim, reverting to
+            // Stopped is strictly better than leaving a stale Interactive
+            // entry — the true lock-holder's `pid_callback` during agent
+            // spawn rewrites the authoritative mode/PID, so the brief
+            // Stopped window self-heals. See PR #872 Copilot review.
             revert_if_claimed().await;
             return Err(e);
         }
