@@ -28,11 +28,17 @@ impl std::error::Error for SessionClaimError {}
 /// Core claim logic shared by the production function and the test-only variant.
 ///
 /// Checks if a minion is available in the given registry and claims it with
-/// `target_mode`. Returns a snapshot of the `MinionInfo` before claiming.
+/// `target_mode`. When `claim_pid` is `Some((pid, start_time))`, the PID and
+/// its start time are written in the same registry save as the mode flip,
+/// closing the TOCTOU window where a concurrent claimer would otherwise see
+/// `mode=<target>, pid=None` and treat the entry as stale (see issue #864).
+///
+/// Returns a snapshot of the `MinionInfo` before claiming.
 fn claim_session_in_registry(
     reg: &mut MinionRegistry,
     minion_id: &str,
     target_mode: MinionMode,
+    claim_pid: Option<(u32, Option<i64>)>,
 ) -> Result<Option<MinionInfo>> {
     let id = minion_id.to_string();
     let info = match reg.get(&id) {
@@ -84,10 +90,17 @@ fn claim_session_in_registry(
 
     // Claim the session with the requested mode.
     // Clear archived_at so a resumed/attached minion is visible in `gru status`.
+    // When claim_pid is provided, stamp pid/pid_start_time atomically so no
+    // concurrent claimer can observe a `mode=<target>, pid=None` intermediate
+    // state (issue #864).
     reg.update(&id, |i| {
         i.mode = target_mode.clone();
         i.last_activity = Utc::now();
         i.archived_at = None;
+        if let Some((pid, start_time)) = claim_pid {
+            i.pid = Some(pid);
+            i.pid_start_time = start_time;
+        }
     })?;
 
     Ok(Some(info))
@@ -123,6 +136,14 @@ fn handle_claim_result(
 /// call, which holds an exclusive file lock for the duration. This prevents
 /// TOCTOU races between concurrent attach/resume calls.
 ///
+/// When `claim_pid` is `Some((pid, start_time))`, the PID and start time are
+/// written in the same registry save as the mode flip. Callers that own a
+/// live process (e.g., `gru resume` with `std::process::id()`, or the
+/// post-agent cleanup in `fix/agent.rs` transferring ownership from the
+/// now-dead child to the parent worker) should use this to close the TOCTOU
+/// window where a concurrent claimer would otherwise observe
+/// `mode=<target>, pid=None` and treat the entry as stale (issue #864).
+///
 /// Returns a clone of the [`MinionInfo`] (as it was before claiming) if the
 /// minion is found in the registry. Callers can extract whatever fields they
 /// need from this snapshot.
@@ -139,10 +160,12 @@ fn handle_claim_result(
 pub(crate) async fn check_and_claim_session(
     minion_id: &str,
     target_mode: MinionMode,
+    claim_pid: Option<(u32, Option<i64>)>,
     graceful: bool,
 ) -> Result<Option<MinionInfo>> {
     let id = minion_id.to_string();
-    let result = with_registry(move |reg| claim_session_in_registry(reg, &id, target_mode)).await;
+    let result =
+        with_registry(move |reg| claim_session_in_registry(reg, &id, target_mode, claim_pid)).await;
 
     handle_claim_result(result, graceful)
 }
@@ -155,6 +178,7 @@ pub(crate) async fn check_and_claim_session_with_dir(
     state_dir: &std::path::Path,
     minion_id: &str,
     target_mode: MinionMode,
+    claim_pid: Option<(u32, Option<i64>)>,
     graceful: bool,
 ) -> Result<Option<MinionInfo>> {
     use anyhow::Context as _;
@@ -162,7 +186,7 @@ pub(crate) async fn check_and_claim_session_with_dir(
     let dir = state_dir.to_path_buf();
     let result = tokio::task::spawn_blocking(move || {
         let mut reg = MinionRegistry::load(Some(&dir))?;
-        claim_session_in_registry(&mut reg, &id, target_mode)
+        claim_session_in_registry(&mut reg, &id, target_mode, claim_pid)
     })
     .await
     .context("Registry task panicked")?;
@@ -252,10 +276,15 @@ mod tests {
         let info = test_minion_info(); // mode: Stopped, pid: None
         register_minion(tmp.path(), "M001", info.clone());
 
-        let result =
-            check_and_claim_session_with_dir(tmp.path(), "M001", MinionMode::Interactive, false)
-                .await
-                .unwrap();
+        let result = check_and_claim_session_with_dir(
+            tmp.path(),
+            "M001",
+            MinionMode::Interactive,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
 
         // Returns the pre-claim snapshot
         let snapshot = result.expect("should return Some for existing minion");
@@ -279,10 +308,15 @@ mod tests {
         };
         register_minion(tmp.path(), "M001", info);
 
-        let err =
-            check_and_claim_session_with_dir(tmp.path(), "M001", MinionMode::Interactive, false)
-                .await
-                .unwrap_err();
+        let err = check_and_claim_session_with_dir(
+            tmp.path(),
+            "M001",
+            MinionMode::Interactive,
+            None,
+            false,
+        )
+        .await
+        .unwrap_err();
 
         let claim_err = err.downcast_ref::<SessionClaimError>().unwrap();
         let SessionClaimError::AlreadyRunning { minion_id, mode } = claim_err;
@@ -308,10 +342,15 @@ mod tests {
         };
         register_minion(tmp.path(), "M001", info);
 
-        let result =
-            check_and_claim_session_with_dir(tmp.path(), "M001", MinionMode::Interactive, false)
-                .await
-                .unwrap();
+        let result = check_and_claim_session_with_dir(
+            tmp.path(),
+            "M001",
+            MinionMode::Interactive,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
 
         // Should succeed — the dead PID was detected and the entry was reset
         let snapshot = result.expect("should return Some after dead-PID reset");
@@ -336,10 +375,15 @@ mod tests {
         };
         register_minion(tmp.path(), "M001", info);
 
-        let result =
-            check_and_claim_session_with_dir(tmp.path(), "M001", MinionMode::Interactive, false)
-                .await
-                .unwrap();
+        let result = check_and_claim_session_with_dir(
+            tmp.path(),
+            "M001",
+            MinionMode::Interactive,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
 
         // Should succeed — the stale entry was detected and reset
         let snapshot = result.expect("should return Some after stale-entry reset");
@@ -366,6 +410,7 @@ mod tests {
             &impossible_dir,
             "M001",
             MinionMode::Interactive,
+            None,
             true, // graceful
         )
         .await;
@@ -386,6 +431,7 @@ mod tests {
             &impossible_dir,
             "M001",
             MinionMode::Interactive,
+            None,
             false, // non-graceful
         )
         .await;
@@ -404,11 +450,156 @@ mod tests {
     async fn test_nonexistent_minion_returns_none() {
         let tmp = tempdir().unwrap();
         // Empty registry — no minions registered
-        let result =
-            check_and_claim_session_with_dir(tmp.path(), "M999", MinionMode::Interactive, false)
-                .await
-                .unwrap();
+        let result = check_and_claim_session_with_dir(
+            tmp.path(),
+            "M999",
+            MinionMode::Interactive,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
 
         assert!(result.is_none());
+    }
+
+    // --- issue #864: atomic claim-with-PID ---
+
+    #[tokio::test]
+    async fn test_claim_with_pid_writes_pid_atomically() {
+        let tmp = tempdir().unwrap();
+        let info = test_minion_info(); // mode: Stopped, pid: None
+        register_minion(tmp.path(), "M001", info);
+
+        let our_pid = std::process::id();
+        let our_start = get_process_start_time(our_pid);
+
+        let result = check_and_claim_session_with_dir(
+            tmp.path(),
+            "M001",
+            MinionMode::Autonomous,
+            Some((our_pid, our_start)),
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert!(result.is_some(), "claim should have succeeded");
+
+        // The registry write should contain mode, pid, and pid_start_time.
+        let updated = read_minion(tmp.path(), "M001").unwrap();
+        assert_eq!(updated.mode, MinionMode::Autonomous);
+        assert_eq!(updated.pid, Some(our_pid));
+        assert_eq!(updated.pid_start_time, our_start);
+    }
+
+    #[tokio::test]
+    async fn test_claim_with_pid_after_dead_pid_reset() {
+        // Dead PID in the registry (the scenario fix/agent.rs post-exit cleanup
+        // sees: registry points at the now-dead agent child). A concurrent claim
+        // that passes its own pid should reset the stale entry and atomically
+        // stamp the new pid in a single save.
+        let tmp = tempdir().unwrap();
+        let dead_pid = 4_194_304_u32;
+        let info = MinionInfo {
+            mode: MinionMode::Autonomous,
+            pid: Some(dead_pid),
+            pid_start_time: Some(1_000_000),
+            ..test_minion_info()
+        };
+        register_minion(tmp.path(), "M001", info);
+
+        let our_pid = std::process::id();
+        let our_start = get_process_start_time(our_pid);
+
+        let result = check_and_claim_session_with_dir(
+            tmp.path(),
+            "M001",
+            MinionMode::Autonomous,
+            Some((our_pid, our_start)),
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert!(result.is_some());
+
+        let updated = read_minion(tmp.path(), "M001").unwrap();
+        assert_eq!(updated.mode, MinionMode::Autonomous);
+        assert_eq!(updated.pid, Some(our_pid));
+        assert_eq!(updated.pid_start_time, our_start);
+    }
+
+    /// Concurrent-claim race: two threads race to claim the same minion with
+    /// distinct PIDs. Exactly one must win the claim; the other must see
+    /// `AlreadyRunning`. This validates the atomic pid-write closes the
+    /// microsecond-wide TOCTOU window described in issue #864.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_concurrent_claim_only_one_wins() {
+        let tmp = tempdir().unwrap();
+        let info = test_minion_info(); // mode: Stopped, pid: None
+        register_minion(tmp.path(), "M001", info);
+
+        // Use PIDs that the OS will report as "alive" so whichever thread
+        // wins the claim, the loser will observe `AlreadyRunning` instead of
+        // the "dead pid ⇒ reset + claim" path. `std::process::id()` is the
+        // test runner — guaranteed alive for the duration of the test.
+        let live_pid_a = std::process::id();
+        let start_a = get_process_start_time(live_pid_a);
+        let live_pid_b = std::process::id();
+        let start_b = get_process_start_time(live_pid_b);
+
+        let dir_a = tmp.path().to_path_buf();
+        let dir_b = tmp.path().to_path_buf();
+
+        let handle_a = tokio::spawn(async move {
+            check_and_claim_session_with_dir(
+                &dir_a,
+                "M001",
+                MinionMode::Autonomous,
+                Some((live_pid_a, start_a)),
+                false,
+            )
+            .await
+        });
+        let handle_b = tokio::spawn(async move {
+            check_and_claim_session_with_dir(
+                &dir_b,
+                "M001",
+                MinionMode::Autonomous,
+                Some((live_pid_b, start_b)),
+                false,
+            )
+            .await
+        });
+
+        let (result_a, result_b) = tokio::join!(handle_a, handle_b);
+        let result_a = result_a.unwrap();
+        let result_b = result_b.unwrap();
+
+        // Exactly one must succeed and one must return AlreadyRunning.
+        let (winner, loser) = match (&result_a, &result_b) {
+            (Ok(_), Err(_)) => (&result_a, &result_b),
+            (Err(_), Ok(_)) => (&result_b, &result_a),
+            (Ok(a), Ok(b)) => panic!(
+                "both claims succeeded: a={:?}, b={:?} — the atomic pid-write \
+                 should force the second caller to observe AlreadyRunning",
+                a, b
+            ),
+            (Err(a), Err(b)) => panic!("both claims failed: a={:#}, b={:#}", a, b),
+        };
+
+        assert!(winner.is_ok());
+        let loser_err = loser.as_ref().unwrap_err();
+        assert!(
+            loser_err.downcast_ref::<SessionClaimError>().is_some(),
+            "loser should fail with SessionClaimError::AlreadyRunning, got: {:#}",
+            loser_err
+        );
+
+        // Exactly one pid should be stamped in the registry.
+        let final_state = read_minion(tmp.path(), "M001").unwrap();
+        assert_eq!(final_state.mode, MinionMode::Autonomous);
+        assert!(final_state.pid.is_some(), "pid should be stamped");
     }
 }

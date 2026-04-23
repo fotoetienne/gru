@@ -7,6 +7,7 @@ use crate::progress::{ProgressConfig, ProgressDisplay};
 use crate::progress_comments::{MinionPhase, ProgressCommentTracker};
 use crate::prompt_loader;
 use crate::prompt_renderer::{render_template, PromptContext};
+use crate::session_claim::SessionClaimError;
 use anyhow::{Context, Result};
 use tokio::process::Command as TokioCommand;
 use uuid::Uuid;
@@ -259,44 +260,92 @@ async fn run_agent_session_inner(
     // second process can claim it and spawn a duplicate agent against the
     // same session, producing duplicate review replies).
     //
+    // The ownership transfer is routed through `check_and_claim_session` so
+    // the mode flip and the new PID are written in the same file-locked save.
+    // A prior implementation wrote pid/mode as one registry.update and the
+    // stale-pid check in `session_claim` happened in a separate lock window,
+    // leaving a microsecond-wide TOCTOU window where a concurrent claimer
+    // could observe `mode=Autonomous, pid=<dead child>` and reset + claim the
+    // minion (issue #864).
+    //
     // Token usage is persisted regardless of exit status (Ok with non-zero
     // exit) because cost data is valuable even for failed tasks. Only
     // stream-level errors (timeout, stuck) result in Err, in which case
-    // partial usage is not saved.
+    // partial usage is not saved. Token-usage is written in a separate
+    // registry update because it is not part of the concurrency invariant;
+    // serializing it with the atomic claim would entangle a presentation
+    // concern with the lock-ordering guarantee.
     let token_usage = run_result.as_ref().ok().map(|r| r.token_usage.clone());
-    let exit_minion_id = wt_ctx.minion_id.clone();
     // `run_agent_session_inner` is only invoked from within a worker process
     // (via `run_agent_phase` in worker.rs / resume.rs), so `process::id()`
     // here is always the worker PID — the process that owns the minion for
     // PR creation and monitoring after the agent child exits.
     let parent_pid = std::process::id();
     let parent_start_time = get_process_start_time(parent_pid);
-    let log_minion_id = wt_ctx.minion_id.clone();
-    if let Err(e) = with_registry(move |registry| {
-        registry.update(&exit_minion_id, |info| {
-            info.pid = Some(parent_pid);
-            info.pid_start_time = parent_start_time;
-            info.mode = MinionMode::Autonomous;
-            info.last_activity = chrono::Utc::now();
-            if let Some(usage) = token_usage {
+
+    let claim_minion_id = wt_ctx.minion_id.clone();
+    let claim_result = crate::session_claim::check_and_claim_session(
+        &claim_minion_id,
+        MinionMode::Autonomous,
+        Some((parent_pid, parent_start_time)),
+        true, // graceful: don't fail the worker over a transient registry error
+    )
+    .await;
+
+    match claim_result {
+        Ok(_) => {
+            // Ownership transfer succeeded (Some) or registry was unavailable
+            // and graceful-mode swallowed it (None). The graceful case leaves
+            // the registry in its pre-exit state (pid=<dead child>) but the
+            // worker continues; this matches the previous behavior where a
+            // failed update was logged but non-fatal.
+        }
+        Err(e) if e.downcast_ref::<SessionClaimError>().is_some() => {
+            // A concurrent `gru resume`/`gru attach` won the race and now
+            // owns the minion. The worker cannot safely continue into PR
+            // creation without competing writes, but killing it would lose
+            // the work already done. Log loudly so operators can investigate,
+            // and proceed — the other process owns the session claim but
+            // this worker still has the in-memory agent_run to return.
+            log::warn!(
+                "Concurrent claim detected while transferring post-agent ownership for {}: {:#}. \
+                 Another process may now own the minion; proceeding with this worker anyway.",
+                wt_ctx.minion_id,
+                e
+            );
+        }
+        Err(e) => {
+            // Non-graceful error (shouldn't happen since graceful=true, but
+            // handle defensively). Matches the original log-and-continue
+            // behavior.
+            log::warn!(
+                "Failed to transfer registry ownership to worker PID for {}: {:#}. \
+                 Registry may briefly allow concurrent claim.",
+                wt_ctx.minion_id,
+                e
+            );
+        }
+    }
+
+    // Persist token_usage in a separate update. This is not part of the
+    // concurrency invariant: token counters are additive and not inspected
+    // by the claim logic.
+    if let Some(usage) = token_usage {
+        let usage_minion_id = wt_ctx.minion_id.clone();
+        if let Err(e) = with_registry(move |registry| {
+            registry.update(&usage_minion_id, |info| {
                 info.token_usage = Some(usage);
-            }
+                info.last_activity = chrono::Utc::now();
+            })
         })
-    })
-    .await
-    {
-        // A failure here leaves the registry pointing at the now-dead agent
-        // child PID. `session_claim` would treat that as a stale entry and
-        // allow a concurrent `gru resume`/`gru attach` to claim the minion —
-        // the exact failure mode this block exists to prevent (issue #862).
-        // Log loudly so operators can correlate a duplicate-agent incident
-        // with the registry write that failed.
-        log::warn!(
-            "Failed to transfer registry ownership to worker PID for {}: {:#}. \
-             Registry may briefly allow concurrent claim.",
-            log_minion_id,
-            e
-        );
+        .await
+        {
+            log::warn!(
+                "Failed to persist token usage for {}: {:#}",
+                wt_ctx.minion_id,
+                e
+            );
+        }
     }
 
     let agent_run = run_result?;
