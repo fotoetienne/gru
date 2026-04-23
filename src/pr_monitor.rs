@@ -119,6 +119,10 @@ impl ReviewFeedback {
     }
 }
 
+// `Clone` is required by the PR-wide/per-review union in `get_review_feedback`
+// (a `raw_comments` entry missing from the PR-wide fetch is cloned into
+// `reply_sources`) and by the idempotency test fixtures that share comments
+// between the candidate and `reply_sources` slices.
 #[derive(Debug, Clone, Deserialize)]
 struct ApiReviewComment {
     id: u64,
