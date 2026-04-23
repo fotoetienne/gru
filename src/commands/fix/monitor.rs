@@ -925,6 +925,17 @@ async fn handle_new_reviews(
     let feedback = apply_bot_reply_idempotency_filter(ctx, feedback).await;
 
     if feedback.is_empty() {
+        if feedback.had_fetch_failures {
+            // Some reviews failed to fetch upstream. The comments we did
+            // fetch are all already-replied, but the unfetched ones may
+            // still contain unhandled threads — leave the baseline alone
+            // so poll_once retries on the next cycle.
+            log::warn!(
+                "⚠️  All fetched review threads already have bot replies, but some \
+                 review fetches failed — will retry on the next poll cycle"
+            );
+            return LoopAction::Continue;
+        }
         println!("✅ All review threads already have a bot reply; nothing to address");
         state.review_baseline = Some(check_time);
         save_review_check_time(&ctx.wt_ctx.minion_id, check_time).await;
