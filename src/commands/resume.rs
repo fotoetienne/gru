@@ -5,11 +5,12 @@ use crate::commands::fix::{
     agent_exit_code, create_pr_phase, fetch_issue_details, monitor_pr_phase, run_agent_phase,
     update_orchestration_phase, IssueContext, WorktreeContext,
 };
+use crate::minion_lock::MinionLock;
 use crate::minion_registry::{
     mark_minion_failed, revert_to_stopped, with_registry, MinionMode, OrchestrationPhase,
 };
 use crate::minion_resolver;
-use crate::session_claim;
+use crate::session_claim::{self, SessionClaimError};
 use crate::tmux::TmuxGuard;
 use anyhow::{bail, Result};
 use chrono::{DateTime, Utc};
@@ -27,6 +28,10 @@ struct ResumeContext {
     no_watch: bool,
     /// The command that originally created this minion (e.g., "do", "prompt", "review").
     command: String,
+    /// Advisory lock held for the lifetime of the resume pipeline. Prevents
+    /// concurrent `gru resume` / `gru attach` from spawning a second agent
+    /// against the same minion (issue #865). Released on drop.
+    _minion_lock: MinionLock,
 }
 
 /// Handles the resume command: resumes a stopped Minion in autonomous mode.
@@ -72,6 +77,25 @@ async fn check_resumption_preconditions(
             minion.worktree_path.display()
         );
     }
+
+    // Acquire the per-minion advisory lock before touching the registry so
+    // that if another process already owns this minion we bail out without
+    // mutating any shared state. Held for the lifetime of the resume
+    // pipeline; released on drop (issue #865).
+    let minion_lock = match MinionLock::try_acquire(&minion.minion_id) {
+        Ok(lock) => lock,
+        Err(e) => {
+            if let Some(SessionClaimError::AlreadyRunning { minion_id, .. }) = e.downcast_ref() {
+                bail!(
+                    "Minion {} already has a live owner (advisory lock held). \
+                     Stop it first with: gru stop {}",
+                    minion_id,
+                    minion_id
+                );
+            }
+            return Err(e);
+        }
+    };
 
     // Atomically check registry state and claim as Autonomous with our own
     // PID in a single file-locked write. Passing `claim_pid` here closes the
@@ -264,6 +288,7 @@ async fn check_resumption_preconditions(
         effective_timeout,
         no_watch,
         command,
+        _minion_lock: minion_lock,
     })
 }
 
@@ -281,6 +306,7 @@ async fn run_resume_pipeline(ctx: ResumeContext, quiet: bool) -> Result<i32> {
         effective_timeout,
         no_watch,
         command,
+        _minion_lock,
     } = ctx;
 
     // Non-"do" minions (e.g., "prompt", "review") only run the agent phase —

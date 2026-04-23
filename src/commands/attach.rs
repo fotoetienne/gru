@@ -1,4 +1,5 @@
 use crate::agent_registry;
+use crate::minion_lock::MinionLock;
 use crate::minion_registry::{
     is_process_alive_with_start_time, revert_to_stopped, with_registry, MinionMode,
 };
@@ -182,6 +183,31 @@ pub(crate) async fn handle_attach(
         cmd.arg("--dangerously-skip-permissions");
     }
 
+    // Acquire the per-minion advisory lock just before spawning. This is the
+    // defence-in-depth layer for issue #865: even if the registry claim above
+    // silently races (stale PID not detected, mode transition bug, concurrent
+    // write), the kernel-level lock makes a second live agent structurally
+    // impossible. Held until this function returns (normal exit or panic).
+    //
+    // Placed after the auto-stop retry path so that, when `check_and_claim_session`
+    // dislodged a running autonomous minion, the child process has had time to
+    // exit and release its own lock fd.
+    let _minion_lock = match MinionLock::try_acquire(&minion.minion_id) {
+        Ok(lock) => lock,
+        Err(e) => {
+            revert_to_stopped(&minion.minion_id).await;
+            if let Some(SessionClaimError::AlreadyRunning { minion_id, .. }) = e.downcast_ref() {
+                anyhow::bail!(
+                    "Minion {} already has a live owner (advisory lock held). \
+                     Stop it first with: gru stop {}",
+                    minion_id,
+                    minion_id
+                );
+            }
+            return Err(e);
+        }
+    };
+
     // Spawn agent process (not exec - we need to update registry after exit)
     let mut child = match cmd.spawn() {
         Ok(child) => child,
@@ -231,6 +257,11 @@ pub(crate) async fn handle_attach(
     // On successful exit, offer to resume autonomous monitoring
     if status.success() && !no_auto_resume && !quiet && prompt_auto_resume().await {
         println!("Resuming autonomous monitoring...");
+        // Release our advisory lock before handing off to the resume pipeline;
+        // `handle_resume` acquires its own lock on the same minion and would
+        // otherwise deadlock against this process's fd (fs2 locks are
+        // per-fd — reopening the same path in the same process still blocks).
+        drop(_minion_lock);
         return crate::commands::resume::handle_resume(minion.minion_id, None, None, quiet).await;
     }
 
