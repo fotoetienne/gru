@@ -119,7 +119,7 @@ impl ReviewFeedback {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct ApiReviewComment {
     id: u64,
     path: String,
@@ -982,21 +982,26 @@ pub(crate) fn format_issue_comments_prompt(
 /// - Comments that the current Minion has already directly replied to
 ///   (identified by appearing as `in_reply_to_id` on a Minion reply comment)
 ///
-/// This function is called once on the full set of comments accumulated across
-/// all reviews in the batch (Bug 2 fix).  Because GitHub stores a Minion's reply
-/// comments in implicit review objects (with empty bodies), accumulating across
-/// all reviews makes those prior replies visible when building `already_answered`,
-/// preventing duplicate replies after a session restart.
+/// `candidate_comments` is the set to filter (typically the comments drawn from
+/// the new reviews being processed this cycle). `reply_sources` is the pool
+/// scanned to build the `already_answered` set — passing the full set of PR
+/// inline comments here (see `fetch_all_pr_inline_comments`) makes the filter
+/// idempotent against replies from prior sessions or concurrent processes
+/// (issue #866): even if a Minion reply lives in an implicit review that is
+/// not part of the current review batch, the candidate it answered is still
+/// dropped. Callers that don't need the PR-wide view can pass
+/// `&candidate_comments` as `reply_sources` (same semantics as before).
 ///
 /// Returns raw `ApiReviewComment`s so that display-name lookups can be
 /// deferred until after filtering (avoiding API calls for already-answered or
 /// Minion-authored threads).
 fn filter_unanswered_comments(
-    api_comments: Vec<ApiReviewComment>,
+    candidate_comments: Vec<ApiReviewComment>,
+    reply_sources: &[ApiReviewComment],
     minion_id: &str,
 ) -> Vec<ApiReviewComment> {
     // Collect IDs of comments that this Minion has already directly replied to.
-    let already_answered: std::collections::HashSet<u64> = api_comments
+    let already_answered: std::collections::HashSet<u64> = reply_sources
         .iter()
         .filter_map(|c| {
             if has_minion_signature_for(&c.body, minion_id) {
@@ -1007,7 +1012,7 @@ fn filter_unanswered_comments(
         })
         .collect();
 
-    api_comments
+    candidate_comments
         .into_iter()
         .filter(|c| {
             !has_minion_signature_for(&c.body, minion_id) && !already_answered.contains(&c.id)
@@ -1076,6 +1081,51 @@ fn identify_duplicate_minion_replies(
     duplicates
 }
 
+/// Fetch every inline review comment on a PR (across all reviews) by
+/// paginating `/pulls/{pr_number}/comments`.
+///
+/// `--paginate` without `--jq` concatenates raw JSON arrays across pages
+/// (`[...][...]`), which is not valid JSON. Pair with `--jq ".[]"` to
+/// stream one comment per line instead, matching the pattern used by
+/// `get_check_runs`.
+async fn fetch_all_pr_inline_comments(
+    host: &str,
+    owner: &str,
+    repo: &str,
+    pr_number: &str,
+) -> Result<Vec<ApiReviewComment>> {
+    let repo_full = github::repo_slug(owner, repo);
+    let endpoint = format!("repos/{repo_full}/pulls/{pr_number}/comments");
+    let output = gh_api_with_retry(
+        host,
+        &["api", "--paginate", &endpoint, "--jq", ".[]"],
+        DEFAULT_MAX_RETRIES,
+    )
+    .await?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!(
+            "Failed to fetch inline comments on {repo_full} PR #{pr_number}: {}",
+            stderr
+        );
+    }
+
+    let stdout = std::str::from_utf8(&output.stdout)
+        .context("Failed to decode PR inline comments stdout as UTF-8")?;
+    let mut api_comments: Vec<ApiReviewComment> = Vec::new();
+    for line in stdout.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let comment: ApiReviewComment =
+            serde_json::from_str(line).context("Failed to parse PR inline comment JSON line")?;
+        api_comments.push(comment);
+    }
+    Ok(api_comments)
+}
+
 /// Fetch all inline review comments on a PR and delete any duplicate replies
 /// authored by this Minion in the current review-response session.
 ///
@@ -1092,38 +1142,7 @@ pub(crate) async fn dedup_minion_inline_replies(
     since: DateTime<Utc>,
 ) -> Result<usize> {
     let repo_full = github::repo_slug(owner, repo);
-    let endpoint = format!("repos/{repo_full}/pulls/{pr_number}/comments");
-    // `--paginate` without `--jq` concatenates raw JSON arrays across pages
-    // (`[...][...]`), which is not valid JSON. Pair with `--jq ".[]"` to
-    // stream one comment per line instead, matching the pattern used by
-    // `get_check_runs` elsewhere in this file.
-    let output = gh_api_with_retry(
-        host,
-        &["api", "--paginate", &endpoint, "--jq", ".[]"],
-        DEFAULT_MAX_RETRIES,
-    )
-    .await?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!(
-            "Failed to fetch inline comments for dedup on {repo_full} PR #{pr_number}: {}",
-            stderr
-        );
-    }
-
-    let stdout = std::str::from_utf8(&output.stdout)
-        .context("Failed to decode PR inline comments stdout as UTF-8")?;
-    let mut api_comments: Vec<ApiReviewComment> = Vec::new();
-    for line in stdout.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let comment: ApiReviewComment = serde_json::from_str(line)
-            .context("Failed to parse PR inline comment JSON line for dedup")?;
-        api_comments.push(comment);
-    }
+    let api_comments = fetch_all_pr_inline_comments(host, owner, repo, pr_number).await?;
 
     let duplicate_ids = identify_duplicate_minion_replies(&api_comments, minion_id, since);
 
@@ -1258,10 +1277,48 @@ async fn get_review_feedback(
         );
     }
 
+    // Pre-emptive idempotency check (issue #866): fetch every inline comment
+    // on the PR — not just the ones in the new reviews being processed — so
+    // that the `already_answered` set also catches Minion replies posted
+    // during prior sessions or by a concurrent agent process. A comment the
+    // Minion has already replied to anywhere on the PR is dropped from the
+    // candidate set here, so it will not appear in the review prompt and will
+    // not trigger a duplicate reply.
+    //
+    // Degrade gracefully on fetch failure: fall back to scanning only the
+    // comments from the new reviews. A transient API failure should not
+    // block review handling, and the existing post-hoc dedup
+    // (`dedup_minion_inline_replies`) plus the registry lock still prevent
+    // duplicates from persisting.
+    let pr_wide_replies = match fetch_all_pr_inline_comments(host, owner, repo, pr_number).await {
+        Ok(comments) => comments,
+        Err(e) => {
+            log::warn!(
+                "⚠️  Failed to fetch PR-wide inline comments for idempotency check (falling back to per-review scan): {:#}",
+                e
+            );
+            Vec::new()
+        }
+    };
+
+    // Build the replies source from the PR-wide fetch when available, union'd
+    // with `raw_comments` so the filter still works if the fetch returned
+    // empty (fallback path above) but the per-review set contains Minion
+    // replies from implicit reviews in the batch.
+    let mut reply_sources: Vec<ApiReviewComment> = pr_wide_replies;
+    // Avoid O(n²) dedup by tracking seen IDs; `raw_comments` may overlap with
+    // `pr_wide_replies` when both include the same comment.
+    let mut seen: std::collections::HashSet<u64> = reply_sources.iter().map(|c| c.id).collect();
+    for c in &raw_comments {
+        if seen.insert(c.id) {
+            reply_sources.push(c.clone());
+        }
+    }
+
     // Filter all accumulated comments at once (Bug 2 fix: cross-review dedup).
     // Filtering happens before display-name lookup so we only call the API for
     // authors of comments that will actually be replied to.
-    let unanswered_raw = filter_unanswered_comments(raw_comments, minion_id);
+    let unanswered_raw = filter_unanswered_comments(raw_comments, &reply_sources, minion_id);
 
     // Fetch display names only for unique authors of unanswered comments.
     let mut display_names: std::collections::HashMap<String, String> =
@@ -2509,7 +2566,8 @@ mod tests {
         let original = make_api_comment(1, "Please fix this.", None);
         let minion_reply = make_api_comment(2, "Done!\n\n<sub>🤖 M001</sub>", Some(1));
 
-        let result = filter_unanswered_comments(vec![original, minion_reply], "M001");
+        let sources = vec![original.clone(), minion_reply.clone()];
+        let result = filter_unanswered_comments(vec![original, minion_reply], &sources, "M001");
         assert!(
             result.is_empty(),
             "Already-answered comment should be filtered out"
@@ -2523,8 +2581,16 @@ mod tests {
         let unanswered_root = make_api_comment(2, "Add error handling.", None);
         let minion_reply = make_api_comment(3, "Fixed!\n\n<sub>🤖 M001</sub>", Some(1));
 
-        let result =
-            filter_unanswered_comments(vec![answered_root, unanswered_root, minion_reply], "M001");
+        let sources = vec![
+            answered_root.clone(),
+            unanswered_root.clone(),
+            minion_reply.clone(),
+        ];
+        let result = filter_unanswered_comments(
+            vec![answered_root, unanswered_root, minion_reply],
+            &sources,
+            "M001",
+        );
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].id, 2);
         assert_eq!(result[0].body, "Add error handling.");
@@ -2532,7 +2598,7 @@ mod tests {
 
     #[test]
     fn test_filter_unanswered_comments_empty_input() {
-        let result = filter_unanswered_comments(vec![], "M001");
+        let result = filter_unanswered_comments(vec![], &[], "M001");
         assert!(result.is_empty());
     }
 
@@ -2543,9 +2609,111 @@ mod tests {
         let orphan_minion = make_api_comment(1, "Done!\n\n<sub>🤖 M001</sub>", None);
         let unrelated = make_api_comment(2, "Please fix this.", None);
 
-        let result = filter_unanswered_comments(vec![orphan_minion, unrelated], "M001");
+        let sources = vec![orphan_minion.clone(), unrelated.clone()];
+        let result = filter_unanswered_comments(vec![orphan_minion, unrelated], &sources, "M001");
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].id, 2);
+    }
+
+    // ========================================================================
+    // Idempotency tests (issue #866): replies from a separate PR-wide source
+    // ========================================================================
+
+    #[test]
+    fn test_filter_unanswered_comments_reply_in_external_source_only() {
+        // The candidate set contains only the reviewer's root comment (e.g. a
+        // fresh batch of new reviews). The Minion's prior reply lives in the
+        // PR-wide sources fetch (an implicit review from a previous session or
+        // a concurrent process). The candidate must still be dropped.
+        let original = make_api_comment(1, "Please fix this.", None);
+        let prior_minion_reply_elsewhere =
+            make_api_comment(42, "Done!\n\n<sub>🤖 M001</sub>", Some(1));
+
+        let sources = vec![original.clone(), prior_minion_reply_elsewhere];
+        let result = filter_unanswered_comments(vec![original], &sources, "M001");
+        assert!(
+            result.is_empty(),
+            "Comment answered in the PR-wide source must be filtered from candidates"
+        );
+    }
+
+    #[test]
+    fn test_filter_unanswered_comments_sibling_minion_reply_ignored() {
+        // A reply signed by a sibling Minion (different ID) does NOT mark the
+        // comment as answered for this Minion — each Minion's idempotency
+        // check runs against its own signature only.
+        let original = make_api_comment(1, "Please fix this.", None);
+        let sibling_reply = make_api_comment(2, "Done!\n\n<sub>🤖 M999</sub>", Some(1));
+
+        let sources = vec![original.clone(), sibling_reply];
+        let result = filter_unanswered_comments(vec![original], &sources, "M001");
+        assert_eq!(result.len(), 1, "Sibling Minion's reply must not suppress");
+        assert_eq!(result[0].id, 1);
+    }
+
+    #[test]
+    fn test_filter_unanswered_comments_race_regression_862() {
+        // Regression for #862: two agent processes race to respond to the
+        // same review thread. The first one posts its reply; by the time the
+        // second fetches the PR state, that reply is visible in the PR-wide
+        // sources — so the second process must skip this candidate rather
+        // than post a duplicate.
+        let root = make_api_comment(10, "Needs a test.", None);
+        // Raced reply that landed first, posted by the OTHER process (same
+        // Minion identity — both processes share the Minion ID).
+        let winner_reply = make_api_comment(11, "Added a test.\n\n<sub>🤖 M1jc</sub>", Some(10));
+
+        // Second process's candidate list (freshly fetched from the review)
+        // still contains the root comment; its PR-wide fetch contains the
+        // winner's reply.
+        let sources = vec![root.clone(), winner_reply];
+        let result = filter_unanswered_comments(vec![root], &sources, "M1jc");
+        assert!(
+            result.is_empty(),
+            "Second racing process must no-op when the winner has already replied"
+        );
+    }
+
+    #[test]
+    fn test_filter_unanswered_comments_fixture_parses_gh_api_response() {
+        // Exercise the full parse path: feed a recorded `gh api` response
+        // (same shape returned by `/pulls/{pr_number}/comments`) through the
+        // JSON parser and into the filter. This guards against drift in the
+        // `ApiReviewComment` deserialization contract.
+        let fixture = r#"[
+            {
+                "id": 100,
+                "path": "src/lib.rs",
+                "line": 10,
+                "body": "Please add a test.",
+                "user": {"login": "reviewer"},
+                "created_at": "2024-06-15T10:00:00Z"
+            },
+            {
+                "id": 200,
+                "path": "src/lib.rs",
+                "line": 10,
+                "body": "Added a test.\n\n<sub>🤖 M1jc</sub>",
+                "user": {"login": "minion-bot"},
+                "in_reply_to_id": 100,
+                "created_at": "2024-06-15T10:30:00Z"
+            },
+            {
+                "id": 300,
+                "path": "src/main.rs",
+                "line": 5,
+                "body": "Rename this variable.",
+                "user": {"login": "reviewer"},
+                "created_at": "2024-06-15T11:00:00Z"
+            }
+        ]"#;
+        let sources: Vec<ApiReviewComment> = serde_json::from_str(fixture).unwrap();
+
+        // Candidates include both root comments (100 answered, 300 unanswered).
+        let candidates = vec![sources[0].clone(), sources[2].clone()];
+        let result = filter_unanswered_comments(candidates, &sources, "M1jc");
+        assert_eq!(result.len(), 1, "Only the unanswered root should remain");
+        assert_eq!(result[0].id, 300);
     }
 
     // ========================================================================
