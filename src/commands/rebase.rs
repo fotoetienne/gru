@@ -82,8 +82,15 @@ pub(crate) async fn handle_rebase(
             // recover if the agent leaves the worktree in detached HEAD state.
             let local_branch = get_current_branch(&worktree_path).await?;
 
-            // Spawn Claude Code with /rebase command
-            let exit_code = run_agent_rebase(&worktree_path, timeout).await?;
+            // Spawn Claude Code with inlined rebase instructions.
+            //
+            // events.jsonl lives in the minion metadata directory
+            // (<minion_dir>/events.jsonl), not inside the git checkout. For
+            // the CLI path we derive it from the worktree path so the rebase
+            // session's events land next to the main agent's events.
+            let events_dir = derive_events_dir(&worktree_path);
+            let exit_code =
+                run_agent_rebase(&worktree_path, &events_dir, &base_branch, timeout).await?;
 
             if exit_code == 0 {
                 // Agent succeeded: enforce branch recovery (any failure is a real error).
@@ -749,21 +756,64 @@ pub(crate) async fn force_push(worktree_path: &Path) -> Result<()> {
 /// Default timeout for agent conflict resolution (30 minutes).
 const DEFAULT_CONFLICT_TIMEOUT: &str = "30m";
 
-/// Spawns the agent with the `/rebase` command to resolve conflicts.
+/// Inlined rebase instructions sent to the agent as the prompt.
+///
+/// Passing an explicit prompt (rather than `/rebase`) makes the rebase agent
+/// independent of slash-command / skill discovery from the target project's
+/// `.claude/` directory. Without this, the agent silently no-ops on any repo
+/// that isn't the Gru source tree itself (see issue #873).
+///
+/// The `<BASE_BRANCH>` marker is substituted with the resolved base branch
+/// at runtime.
+const REBASE_PROMPT_TEMPLATE: &str = include_str!("rebase_prompt.md");
+
+/// Derives the minion metadata directory from a git checkout path.
+///
+/// New-layout worktrees live in `<minion_dir>/checkout/`, so the parent of
+/// the checkout path is the minion directory where `events.jsonl` and other
+/// metadata live. Legacy-layout worktrees put the checkout directly at the
+/// minion directory, in which case we return the checkout path itself.
+///
+/// The parent lookup is gated on the directory name being literally
+/// `checkout` to avoid accidentally climbing one level too high on legacy
+/// layouts where the checkout directory happens to have a `.git` marker
+/// but is not named `checkout`.
+pub(crate) fn derive_events_dir(checkout_path: &Path) -> PathBuf {
+    if checkout_path.file_name().and_then(|s| s.to_str()) == Some("checkout") {
+        if let Some(parent) = checkout_path.parent() {
+            return parent.to_path_buf();
+        }
+    }
+    checkout_path.to_path_buf()
+}
+
+/// Spawns the agent with inlined rebase instructions to resolve conflicts.
+///
+/// `checkout_path` is the git worktree where the agent runs (its `cwd`).
+/// `events_dir` is the directory where `events.jsonl` is written; this is
+/// typically the minion metadata directory (one level above `checkout/`)
+/// so the rebase session's events sit alongside the main agent's events.
 ///
 /// Uses a 30-minute default timeout if none is provided.
 /// Returns the agent's exit code.
-pub(crate) async fn run_agent_rebase(worktree_path: &Path, timeout: Option<&str>) -> Result<i32> {
+pub(crate) async fn run_agent_rebase(
+    checkout_path: &Path,
+    events_dir: &Path,
+    base_branch: &str,
+    timeout: Option<&str>,
+) -> Result<i32> {
     let backend = agent_registry::resolve_backend(agent_registry::DEFAULT_AGENT)?;
     let session_id = Uuid::new_v4();
-    let github_host = super::resume::resolve_host_from_worktree(worktree_path, "").await;
-    let cmd = backend.build_command(worktree_path, &session_id, "/rebase", &github_host);
+    let github_host = super::resume::resolve_host_from_worktree(checkout_path, "").await;
+
+    let prompt = REBASE_PROMPT_TEMPLATE.replace("<BASE_BRANCH>", base_branch);
+    let cmd = backend.build_command(checkout_path, &session_id, &prompt, &github_host);
 
     let effective_timeout = Some(timeout.unwrap_or(DEFAULT_CONFLICT_TIMEOUT));
     let result = run_agent_with_stream_monitoring(
         cmd,
         &*backend,
-        worktree_path,
+        events_dir,
         effective_timeout,
         None::<fn(&AgentEvent)>, // no output callback
         None,                    // no on_spawn callback
@@ -785,6 +835,85 @@ mod tests {
         let dir = tempfile::tempdir().expect("create temp dir");
         fs::create_dir_all(dir.path().join(".git")).expect("create .git dir");
         dir
+    }
+
+    #[test]
+    fn test_rebase_prompt_template_substitutes_base_branch() {
+        let prompt = REBASE_PROMPT_TEMPLATE.replace("<BASE_BRANCH>", "main");
+        assert!(
+            !prompt.contains("<BASE_BRANCH>"),
+            "every occurrence of the placeholder must be substituted"
+        );
+        assert!(
+            prompt.contains("origin/main"),
+            "substitution must produce origin/<base_branch>"
+        );
+
+        // Sanity-check with a non-trivial branch name (slashes, case).
+        let prompt_release = REBASE_PROMPT_TEMPLATE.replace("<BASE_BRANCH>", "release/1.0");
+        assert!(prompt_release.contains("origin/release/1.0"));
+    }
+
+    #[test]
+    fn test_rebase_prompt_template_has_post_condition() {
+        // The prompt must include an explicit post-condition that the agent
+        // MUST verify before exiting successfully. Without this, an agent
+        // that sees a clean worktree post-abort and does nothing will exit 0
+        // and silently fail the rebase.
+        assert!(
+            REBASE_PROMPT_TEMPLATE.contains("git merge-base --is-ancestor"),
+            "prompt must include the ancestor post-condition check"
+        );
+        // Must also instruct the agent to abort cleanly on inability to finish,
+        // so the caller's recovery logic isn't left with a half-rebased worktree.
+        assert!(
+            REBASE_PROMPT_TEMPLATE.contains("git rebase --abort"),
+            "prompt must instruct the agent to abort cleanly on failure"
+        );
+    }
+
+    #[test]
+    fn test_rebase_prompt_is_not_a_slash_command() {
+        // Guard against regression to the pre-#873 bug where `/rebase` was
+        // passed as the prompt. The agent must receive an inline instruction
+        // rather than a slash command reference, because target-repo
+        // worktrees don't have Gru's .claude/ skills available.
+        assert!(
+            !REBASE_PROMPT_TEMPLATE.trim_start().starts_with('/'),
+            "prompt must be inline instructions, not a slash command"
+        );
+    }
+
+    #[test]
+    fn test_derive_events_dir_new_layout() {
+        let minion_dir = PathBuf::from("/some/work/minion/issue-42-M001");
+        let checkout = minion_dir.join("checkout");
+        assert_eq!(derive_events_dir(&checkout), minion_dir);
+    }
+
+    #[test]
+    fn test_derive_events_dir_legacy_layout() {
+        // Legacy worktrees put the git checkout directly at the minion dir
+        // (no `checkout/` subdir). derive_events_dir must return the path
+        // unchanged so events.jsonl lands next to the legacy worktree.
+        let legacy = PathBuf::from("/some/work/minion/issue-42-M001");
+        assert_eq!(derive_events_dir(&legacy), legacy);
+    }
+
+    #[test]
+    fn test_derive_events_dir_root_path() {
+        // Defensive: if someone passes "/" as the entire path, we must not
+        // panic. The fallback returns the input path unchanged.
+        let root = PathBuf::from("/");
+        assert_eq!(derive_events_dir(&root), root);
+    }
+
+    #[test]
+    fn test_derive_events_dir_bare_checkout_does_not_panic() {
+        // A bare "checkout" path (no parent components) should not panic;
+        // it returns the empty-path parent that Path::parent() yields.
+        let bare = PathBuf::from("checkout");
+        let _ = derive_events_dir(&bare);
     }
 
     #[test]

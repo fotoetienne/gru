@@ -121,7 +121,13 @@ enum AutoRebaseResult {
 }
 
 /// Attempts to auto-rebase the worktree branch onto its base branch.
-async fn auto_rebase_pr(worktree_path: &Path) -> Result<AutoRebaseResult> {
+///
+/// `checkout_path` is the git worktree where all git operations and the
+/// conflict-resolution agent run. `minion_dir` is the parent metadata
+/// directory where `events.jsonl` is written — passing it explicitly keeps
+/// the rebase agent's stream events co-located with the main agent's
+/// events instead of landing inside the checkout.
+async fn auto_rebase_pr(checkout_path: &Path, minion_dir: &Path) -> Result<AutoRebaseResult> {
     use super::super::rebase::{
         abort_rebase, attempt_rebase, check_clean_worktree, detect_base_branch, ensure_on_branch,
         fetch_base_branch, force_push, get_current_branch, is_rebase_in_progress, is_up_to_date,
@@ -131,28 +137,28 @@ async fn auto_rebase_pr(worktree_path: &Path) -> Result<AutoRebaseResult> {
     // Abort any stale in-progress rebase left by a previous crashed attempt.
     // This must happen before check_clean_worktree because UU files from a
     // stale rebase would otherwise cause a false "uncommitted changes" error.
-    if is_rebase_in_progress(worktree_path) {
+    if is_rebase_in_progress(checkout_path) {
         log::warn!("⚠️  Stale in-progress rebase detected; aborting before retrying");
         println!("⚠️  Aborting stale in-progress rebase...");
-        abort_rebase(worktree_path).await?;
+        abort_rebase(checkout_path).await?;
     }
 
     // Bail early if worktree has uncommitted changes (e.g., agent crashed mid-edit)
-    check_clean_worktree(worktree_path)
+    check_clean_worktree(checkout_path)
         .await
         .context("Cannot auto-rebase: worktree has uncommitted changes")?;
 
     // Detect the base branch first so we can fetch only what we need
-    let base_branch = detect_base_branch(worktree_path).await?;
+    let base_branch = detect_base_branch(checkout_path).await?;
 
     // Fetch only the base branch to avoid conflicts with other worktrees that
     // have different branches checked out on the same repo
     println!("📡 Fetching latest changes from origin...");
-    fetch_base_branch(worktree_path, &base_branch).await?;
+    fetch_base_branch(checkout_path, &base_branch).await?;
 
     // Short-circuit if already up-to-date (avoids no-op rebase + force-push
     // that would reset GitHub's mergeable cache timer)
-    if is_up_to_date(worktree_path, &base_branch).await? {
+    if is_up_to_date(checkout_path, &base_branch).await? {
         println!(
             "✅ Already up-to-date with origin/{}, skipping rebase",
             base_branch
@@ -163,7 +169,7 @@ async fn auto_rebase_pr(worktree_path: &Path) -> Result<AutoRebaseResult> {
     println!("🔄 Rebasing onto origin/{}...", base_branch);
 
     // Attempt the rebase
-    match attempt_rebase(worktree_path, &base_branch).await? {
+    match attempt_rebase(checkout_path, &base_branch).await? {
         RebaseOutcome::Clean { commit_count } => {
             println!(
                 "✅ Clean rebase: {} commit{} replayed",
@@ -171,26 +177,26 @@ async fn auto_rebase_pr(worktree_path: &Path) -> Result<AutoRebaseResult> {
                 if commit_count == 1 { "" } else { "s" }
             );
             log::info!("Auto force-pushing rebased branch (autonomous mode, --force-with-lease)");
-            force_push(worktree_path).await?;
+            force_push(checkout_path).await?;
             println!("🚀 Force-pushed rebased branch");
             Ok(AutoRebaseResult::RebasedAndPushed)
         }
         RebaseOutcome::Conflicts => {
             println!("⚠️  Conflicts detected, launching agent to resolve...");
-            abort_rebase(worktree_path).await?;
+            abort_rebase(checkout_path).await?;
 
             // Capture local branch name now (abort_rebase restores it) so we can
             // recover if the agent leaves the worktree in detached HEAD state.
-            let local_branch = get_current_branch(worktree_path).await?;
+            let local_branch = get_current_branch(checkout_path).await?;
 
             // None uses the 30m default inside run_agent_rebase
-            let exit_code = run_agent_rebase(worktree_path, None).await?;
+            let exit_code = run_agent_rebase(checkout_path, minion_dir, &base_branch, None).await?;
 
             // Defensive check: agent may have checked out a remote tracking ref
             // (e.g. `origin/<branch>`) leaving the worktree in detached HEAD.
             // Treat a recovery failure as ConflictUnresolved rather than an
             // unexpected error so the caller receives an actionable escalation.
-            if let Err(err) = ensure_on_branch(worktree_path, &local_branch).await {
+            if let Err(err) = ensure_on_branch(checkout_path, &local_branch).await {
                 log::warn!(
                     "Agent rebase finished but failed to restore local branch '{}': {}",
                     local_branch,
@@ -212,7 +218,7 @@ async fn auto_rebase_pr(worktree_path: &Path) -> Result<AutoRebaseResult> {
                 // incomplete rebase.
                 let tracked_status = TokioCommand::new("git")
                     .arg("-C")
-                    .arg(worktree_path)
+                    .arg(checkout_path)
                     .args(["status", "--porcelain", "--untracked-files=no"])
                     .output()
                     .await
@@ -235,16 +241,16 @@ async fn auto_rebase_pr(worktree_path: &Path) -> Result<AutoRebaseResult> {
                 }
                 // is_up_to_date checks that origin/<base_branch> is an ancestor of HEAD,
                 // which is the canonical proof that the rebase actually happened.
-                if !is_up_to_date(worktree_path, &base_branch).await? {
+                if !is_up_to_date(checkout_path, &base_branch).await? {
                     log::warn!(
                         "Agent rebase exited 0 but origin/{} is not an ancestor of HEAD — rebase did not complete",
                         base_branch
                     );
                     return Ok(AutoRebaseResult::ConflictUnresolved);
                 }
-                // Defensively force push in case the /rebase skill didn't push
+                // Defensively force push in case the rebase agent didn't push.
                 log::info!("Auto force-pushing after conflict resolution (autonomous mode, --force-with-lease)");
-                force_push(worktree_path).await?;
+                force_push(checkout_path).await?;
                 println!("🚀 Force-pushed rebased branch");
                 Ok(AutoRebaseResult::RebasedAndPushed)
             } else {
@@ -1279,7 +1285,7 @@ async fn handle_merge_conflict(
         ctx.pr_number, state.rebase_attempts, MAX_REBASE_ATTEMPTS
     );
 
-    match auto_rebase_pr(&ctx.wt_ctx.checkout_path).await {
+    match auto_rebase_pr(&ctx.wt_ctx.checkout_path, &ctx.wt_ctx.minion_dir).await {
         Ok(AutoRebaseResult::RebasedAndPushed) => {
             // Reset counter on success — GitHub may still report
             // mergeable: false for a few poll cycles after force-push
