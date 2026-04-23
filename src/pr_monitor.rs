@@ -7,6 +7,7 @@ use crate::progress_comments::{extract_minion_id_from_signature, has_minion_sign
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
+use std::collections::HashSet;
 use std::process::Output;
 use tokio::time::{sleep, Duration, Instant};
 
@@ -996,7 +997,7 @@ fn filter_unanswered_comments(
     minion_id: &str,
 ) -> Vec<ApiReviewComment> {
     // Collect IDs of comments that this Minion has already directly replied to.
-    let already_answered: std::collections::HashSet<u64> = api_comments
+    let already_answered: HashSet<u64> = api_comments
         .iter()
         .filter_map(|c| {
             if has_minion_signature_for(&c.body, minion_id) {
@@ -1133,7 +1134,7 @@ async fn fetch_pr_inline_comments_raw(
 fn collect_threads_with_bot_replies(
     api_comments: &[ApiReviewComment],
     bot_user: &str,
-) -> std::collections::HashSet<u64> {
+) -> HashSet<u64> {
     api_comments
         .iter()
         .filter_map(|c| {
@@ -1151,7 +1152,7 @@ fn collect_threads_with_bot_replies(
 /// check is scoped per-comment, not per-review (#867).
 pub(crate) fn filter_feedback_against_replied_threads(
     feedback: ReviewFeedback,
-    already_replied: &std::collections::HashSet<u64>,
+    already_replied: &HashSet<u64>,
 ) -> ReviewFeedback {
     let ReviewFeedback {
         comments,
@@ -1183,7 +1184,7 @@ pub(crate) async fn fetch_threads_with_bot_replies(
     repo: &str,
     pr_number: &str,
     bot_user: &str,
-) -> Result<std::collections::HashSet<u64>> {
+) -> Result<HashSet<u64>> {
     let api_comments = fetch_pr_inline_comments_raw(host, owner, repo, pr_number).await?;
     Ok(collect_threads_with_bot_replies(&api_comments, bot_user))
 }
@@ -2928,7 +2929,7 @@ mod tests {
             bodies: vec![],
             had_fetch_failures: false,
         };
-        let already_replied: std::collections::HashSet<u64> = [100].into_iter().collect();
+        let already_replied: HashSet<u64> = [100].into_iter().collect();
 
         let filtered = filter_feedback_against_replied_threads(feedback, &already_replied);
         assert_eq!(filtered.comments.len(), 1);
@@ -2950,7 +2951,7 @@ mod tests {
             bodies: vec![body],
             had_fetch_failures: false,
         };
-        let already_replied: std::collections::HashSet<u64> = [100].into_iter().collect();
+        let already_replied: HashSet<u64> = [100].into_iter().collect();
 
         let filtered = filter_feedback_against_replied_threads(feedback, &already_replied);
         assert!(filtered.comments.is_empty());
@@ -2965,8 +2966,7 @@ mod tests {
             bodies: vec![],
             had_fetch_failures: false,
         };
-        let filtered =
-            filter_feedback_against_replied_threads(feedback, &std::collections::HashSet::new());
+        let filtered = filter_feedback_against_replied_threads(feedback, &HashSet::new());
         assert_eq!(filtered.comments.len(), 1);
         assert_eq!(filtered.comments[0].comment_id, 100);
     }
@@ -2978,7 +2978,7 @@ mod tests {
             bodies: vec![],
             had_fetch_failures: true,
         };
-        let already_replied: std::collections::HashSet<u64> = [100].into_iter().collect();
+        let already_replied: HashSet<u64> = [100].into_iter().collect();
         let filtered = filter_feedback_against_replied_threads(feedback, &already_replied);
         assert!(filtered.had_fetch_failures);
     }

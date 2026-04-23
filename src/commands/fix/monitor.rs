@@ -850,6 +850,13 @@ async fn apply_bot_reply_idempotency_filter(
     ctx: &MonitorContext<'_>,
     feedback: pr_monitor::ReviewFeedback,
 ) -> pr_monitor::ReviewFeedback {
+    // Short-circuit: if there are no inline comments, the per-thread filter
+    // has nothing to do. Skip the `gh api user` + `pulls/{n}/comments` round
+    // trips on review-body-only cycles.
+    if feedback.comments.is_empty() {
+        return feedback;
+    }
+
     let bot_user = match github::get_authenticated_user(&ctx.issue_ctx.host).await {
         Ok(u) => u,
         Err(e) => {
@@ -892,17 +899,82 @@ async fn apply_bot_reply_idempotency_filter(
     filtered
 }
 
+/// Decision taken after the idempotency filter runs.
+///
+/// Extracted so the branch taken by `handle_new_reviews` is unit-testable
+/// without spinning up the monitor loop.
+#[derive(Debug, PartialEq, Eq)]
+enum PostFilterAction {
+    /// Feedback is empty with no fetch failures — advance the baseline and
+    /// skip the agent invocation.
+    SkipAdvance,
+    /// Feedback is empty but some upstream fetches failed — hold the
+    /// baseline and retry on the next poll cycle.
+    SkipHold,
+    /// Feedback still contains items to address — invoke the agent.
+    Invoke,
+}
+
+fn decide_post_filter_action(feedback: &pr_monitor::ReviewFeedback) -> PostFilterAction {
+    if !feedback.is_empty() {
+        return PostFilterAction::Invoke;
+    }
+    if feedback.had_fetch_failures {
+        PostFilterAction::SkipHold
+    } else {
+        PostFilterAction::SkipAdvance
+    }
+}
+
 async fn handle_new_reviews(
     state: &mut MonitorLoopState,
     ctx: &MonitorContext<'_>,
     feedback: pr_monitor::ReviewFeedback,
     check_time: DateTime<Utc>,
 ) -> LoopAction {
-    state.review_round += 1;
     let count = feedback.comments.len() + feedback.bodies.len();
     println!(
-        "💬 Detected {} new review feedback item(s) on PR #{} (review round {}/{})",
-        count, ctx.pr_number, state.review_round, MAX_REVIEW_ROUNDS
+        "💬 Detected {} new review feedback item(s) on PR #{}",
+        count, ctx.pr_number
+    );
+
+    // Best-effort idempotency check (#867): drop inline comments on threads
+    // where the bot user has already posted a reply. Belt on top of the
+    // process-level lockfile + registry guards from #862/#863. On any
+    // API failure we proceed with the unfiltered feedback.
+    let feedback = apply_bot_reply_idempotency_filter(ctx, feedback).await;
+
+    match decide_post_filter_action(&feedback) {
+        PostFilterAction::SkipHold => {
+            // Some reviews failed to fetch upstream. The comments we did
+            // fetch are all already-replied, but the unfetched ones may
+            // still contain unhandled threads — leave the baseline alone so
+            // poll_once retries on the next cycle. review_round has not
+            // been incremented, so repeated retries cannot burn the round
+            // budget.
+            log::warn!(
+                "⚠️  All fetched review threads already have bot replies, but some \
+                 review fetches failed — will retry on the next poll cycle"
+            );
+            return LoopAction::Continue;
+        }
+        PostFilterAction::SkipAdvance => {
+            println!("✅ All review threads already have a bot reply; nothing to address");
+            state.review_baseline = Some(check_time);
+            save_review_check_time(&ctx.wt_ctx.minion_id, check_time).await;
+            reset_attempt_count(&ctx.wt_ctx.minion_id).await;
+            return LoopAction::Continue;
+        }
+        PostFilterAction::Invoke => {}
+    }
+
+    // Count this against MAX_REVIEW_ROUNDS only when we are actually going
+    // to invoke the agent — filtered-to-empty batches and fetch-failure
+    // retries must not burn the budget.
+    state.review_round += 1;
+    println!(
+        "🔄 Review round {}/{}",
+        state.review_round, MAX_REVIEW_ROUNDS
     );
 
     if state.review_round > MAX_REVIEW_ROUNDS {
@@ -916,31 +988,6 @@ async fn handle_new_reviews(
             ctx.issue_ctx.host, ctx.issue_ctx.owner, ctx.issue_ctx.repo, ctx.pr_number
         );
         return LoopAction::Break;
-    }
-
-    // Best-effort idempotency check (#867): drop inline comments on threads
-    // where the bot user has already posted a reply. Belt on top of the
-    // process-level lockfile + registry guards from #862/#863. On any
-    // API failure we proceed with the unfiltered feedback.
-    let feedback = apply_bot_reply_idempotency_filter(ctx, feedback).await;
-
-    if feedback.is_empty() {
-        if feedback.had_fetch_failures {
-            // Some reviews failed to fetch upstream. The comments we did
-            // fetch are all already-replied, but the unfetched ones may
-            // still contain unhandled threads — leave the baseline alone
-            // so poll_once retries on the next cycle.
-            log::warn!(
-                "⚠️  All fetched review threads already have bot replies, but some \
-                 review fetches failed — will retry on the next poll cycle"
-            );
-            return LoopAction::Continue;
-        }
-        println!("✅ All review threads already have a bot reply; nothing to address");
-        state.review_baseline = Some(check_time);
-        save_review_check_time(&ctx.wt_ctx.minion_id, check_time).await;
-        reset_attempt_count(&ctx.wt_ctx.minion_id).await;
-        return LoopAction::Continue;
     }
 
     let review_prompt = pr_monitor::format_review_prompt(
@@ -2134,6 +2181,89 @@ mod tests {
         assert!(
             body.contains("type: monitoring-paused"),
             "comment must include YAML frontmatter type"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // decide_post_filter_action (#867)
+    //
+    // Exercises the handler's branch selection without spinning up the
+    // monitor loop: a synthetic "already replied" batch (empty feedback)
+    // must pick SkipAdvance so the agent is not invoked and the baseline
+    // can advance.
+    // ------------------------------------------------------------------
+
+    fn make_review_comment(id: u64) -> pr_monitor::ReviewComment {
+        pr_monitor::ReviewComment {
+            file: "src/main.rs".to_string(),
+            line: Some(1),
+            body: "x".to_string(),
+            reviewer: "alice".to_string(),
+            reviewer_display_name: "Alice".to_string(),
+            comment_id: id,
+        }
+    }
+
+    fn empty_feedback(had_fetch_failures: bool) -> pr_monitor::ReviewFeedback {
+        pr_monitor::ReviewFeedback {
+            comments: Vec::new(),
+            bodies: Vec::new(),
+            had_fetch_failures,
+        }
+    }
+
+    #[test]
+    fn test_decide_post_filter_action_skip_advance_when_clean_empty() {
+        // Synthetic "already replied" batch: every fetched thread was
+        // dropped by the idempotency filter and no fetches failed.
+        let feedback = empty_feedback(false);
+        assert_eq!(
+            decide_post_filter_action(&feedback),
+            PostFilterAction::SkipAdvance
+        );
+    }
+
+    #[test]
+    fn test_decide_post_filter_action_skip_hold_when_empty_with_fetch_failures() {
+        // Same as above, but some upstream fetches failed. Must hold the
+        // baseline so unfetched threads are retried on the next cycle.
+        let feedback = empty_feedback(true);
+        assert_eq!(
+            decide_post_filter_action(&feedback),
+            PostFilterAction::SkipHold
+        );
+    }
+
+    #[test]
+    fn test_decide_post_filter_action_invoke_when_comment_remains() {
+        let feedback = pr_monitor::ReviewFeedback {
+            comments: vec![make_review_comment(100)],
+            bodies: Vec::new(),
+            had_fetch_failures: false,
+        };
+        assert_eq!(
+            decide_post_filter_action(&feedback),
+            PostFilterAction::Invoke
+        );
+    }
+
+    #[test]
+    fn test_decide_post_filter_action_invoke_when_only_body_remains() {
+        // Review bodies are not filtered by the per-comment idempotency
+        // check, so a body-only feedback must still drive an invocation.
+        let feedback = pr_monitor::ReviewFeedback {
+            comments: Vec::new(),
+            bodies: vec![pr_monitor::ReviewBody {
+                body: "LGTM".to_string(),
+                reviewer: "alice".to_string(),
+                reviewer_display_name: "Alice".to_string(),
+                state: "COMMENTED".to_string(),
+            }],
+            had_fetch_failures: false,
+        };
+        assert_eq!(
+            decide_post_filter_action(&feedback),
+            PostFilterAction::Invoke
         );
     }
 }
