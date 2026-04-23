@@ -7,6 +7,7 @@ use crate::progress_comments::{extract_minion_id_from_signature, has_minion_sign
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
+use std::collections::HashSet;
 use std::process::Output;
 use tokio::time::{sleep, Duration, Instant};
 
@@ -996,7 +997,7 @@ fn filter_unanswered_comments(
     minion_id: &str,
 ) -> Vec<ApiReviewComment> {
     // Collect IDs of comments that this Minion has already directly replied to.
-    let already_answered: std::collections::HashSet<u64> = api_comments
+    let already_answered: HashSet<u64> = api_comments
         .iter()
         .filter_map(|c| {
             if has_minion_signature_for(&c.body, minion_id) {
@@ -1076,6 +1077,118 @@ fn identify_duplicate_minion_replies(
     duplicates
 }
 
+/// Fetch all inline review comments on a PR (paginated).
+///
+/// Uses the `repos/{owner}/{repo}/pulls/{n}/comments` endpoint which returns
+/// every inline review comment on the PR (including replies), not just those
+/// from a single review. `--paginate` without `--jq` concatenates raw JSON
+/// arrays across pages (`[...][...]`), which is not valid JSON, so pair with
+/// `--jq ".[]"` to stream one comment per line instead.
+async fn fetch_pr_inline_comments_raw(
+    host: &str,
+    owner: &str,
+    repo: &str,
+    pr_number: &str,
+) -> Result<Vec<ApiReviewComment>> {
+    let repo_full = github::repo_slug(owner, repo);
+    let endpoint = format!("repos/{repo_full}/pulls/{pr_number}/comments");
+    let output = gh_api_with_retry(
+        host,
+        &["api", "--paginate", &endpoint, "--jq", ".[]"],
+        DEFAULT_MAX_RETRIES,
+    )
+    .await?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!(
+            "Failed to fetch inline comments on {repo_full} PR #{pr_number}: {}",
+            stderr
+        );
+    }
+
+    let stdout = std::str::from_utf8(&output.stdout)
+        .context("Failed to decode PR inline comments stdout as UTF-8")?;
+    let mut api_comments: Vec<ApiReviewComment> = Vec::new();
+    for line in stdout.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let comment: ApiReviewComment =
+            serde_json::from_str(line).context("Failed to parse PR inline comment JSON line")?;
+        api_comments.push(comment);
+    }
+    Ok(api_comments)
+}
+
+/// Collect comment thread parent IDs that the bot user has already replied to.
+///
+/// For each inline comment authored by `bot_user` with a non-empty body that
+/// targets a parent via `in_reply_to_id`, add that parent ID to the returned
+/// set. Per #867 the check is content-agnostic: any non-empty bot reply is
+/// enough — no minion-ID signature match is required. This is broader than
+/// `filter_unanswered_comments` and guards against "same reply twice" variants
+/// (bad retry, split turn, mid-batch restart) that the process-level lockfile
+/// + registry guards from #862/#863 may miss.
+fn collect_threads_with_bot_replies(
+    api_comments: &[ApiReviewComment],
+    bot_user: &str,
+) -> HashSet<u64> {
+    api_comments
+        .iter()
+        .filter_map(|c| {
+            if c.user.login == bot_user && !c.body.trim().is_empty() {
+                c.in_reply_to_id
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// Remove review comments whose `comment_id` is in `already_replied` from
+/// `feedback.comments`. Review bodies are not filtered — the idempotency
+/// check is scoped per-comment, not per-review (#867).
+pub(crate) fn filter_feedback_against_replied_threads(
+    feedback: ReviewFeedback,
+    already_replied: &HashSet<u64>,
+) -> ReviewFeedback {
+    let ReviewFeedback {
+        comments,
+        bodies,
+        had_fetch_failures,
+    } = feedback;
+    let filtered = comments
+        .into_iter()
+        .filter(|c| !already_replied.contains(&c.comment_id))
+        .collect();
+    ReviewFeedback {
+        comments: filtered,
+        bodies,
+        had_fetch_failures,
+    }
+}
+
+/// Fetch every inline comment on the PR and return the set of thread parent
+/// comment IDs where `bot_user` has already posted a non-empty reply.
+///
+/// Best-effort idempotency backstop for #867: callers use this to drop
+/// inline comments from review feedback before invoking the agent. On API
+/// failure the caller should log and proceed with the unfiltered feedback;
+/// the process-level lockfile + registry guards from #862/#863 remain in
+/// place.
+pub(crate) async fn fetch_threads_with_bot_replies(
+    host: &str,
+    owner: &str,
+    repo: &str,
+    pr_number: &str,
+    bot_user: &str,
+) -> Result<HashSet<u64>> {
+    let api_comments = fetch_pr_inline_comments_raw(host, owner, repo, pr_number).await?;
+    Ok(collect_threads_with_bot_replies(&api_comments, bot_user))
+}
+
 /// Fetch all inline review comments on a PR and delete any duplicate replies
 /// authored by this Minion in the current review-response session.
 ///
@@ -1092,38 +1205,7 @@ pub(crate) async fn dedup_minion_inline_replies(
     since: DateTime<Utc>,
 ) -> Result<usize> {
     let repo_full = github::repo_slug(owner, repo);
-    let endpoint = format!("repos/{repo_full}/pulls/{pr_number}/comments");
-    // `--paginate` without `--jq` concatenates raw JSON arrays across pages
-    // (`[...][...]`), which is not valid JSON. Pair with `--jq ".[]"` to
-    // stream one comment per line instead, matching the pattern used by
-    // `get_check_runs` elsewhere in this file.
-    let output = gh_api_with_retry(
-        host,
-        &["api", "--paginate", &endpoint, "--jq", ".[]"],
-        DEFAULT_MAX_RETRIES,
-    )
-    .await?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!(
-            "Failed to fetch inline comments for dedup on {repo_full} PR #{pr_number}: {}",
-            stderr
-        );
-    }
-
-    let stdout = std::str::from_utf8(&output.stdout)
-        .context("Failed to decode PR inline comments stdout as UTF-8")?;
-    let mut api_comments: Vec<ApiReviewComment> = Vec::new();
-    for line in stdout.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let comment: ApiReviewComment = serde_json::from_str(line)
-            .context("Failed to parse PR inline comment JSON line for dedup")?;
-        api_comments.push(comment);
-    }
+    let api_comments = fetch_pr_inline_comments_raw(host, owner, repo, pr_number).await?;
 
     let duplicate_ids = identify_duplicate_minion_replies(&api_comments, minion_id, since);
 
@@ -2719,6 +2801,186 @@ mod tests {
         ];
         let dups = identify_duplicate_minion_replies(&comments, "M001", t("2024-06-15T11:00:00Z"));
         assert_eq!(dups, vec![5]);
+    }
+
+    // ========================================================================
+    // collect_threads_with_bot_replies / filter_feedback_against_replied_threads tests
+    // ========================================================================
+
+    fn make_api_comment_by(
+        id: u64,
+        body: &str,
+        in_reply_to_id: Option<u64>,
+        login: &str,
+    ) -> ApiReviewComment {
+        ApiReviewComment {
+            id,
+            path: "src/main.rs".to_string(),
+            line: Some(1),
+            body: body.to_string(),
+            user: User {
+                login: login.to_string(),
+            },
+            in_reply_to_id,
+            created_at: "2024-06-15T12:00:00Z".parse().unwrap(),
+        }
+    }
+
+    fn make_review_comment(comment_id: u64, body: &str) -> ReviewComment {
+        ReviewComment {
+            file: "src/main.rs".to_string(),
+            line: Some(1),
+            body: body.to_string(),
+            reviewer: "alice".to_string(),
+            reviewer_display_name: "Alice".to_string(),
+            comment_id,
+        }
+    }
+
+    #[test]
+    fn test_collect_threads_with_bot_replies_identifies_bot_reply() {
+        // Root comment by reviewer + bot reply on the same thread → thread
+        // parent ID returned.
+        let comments = vec![
+            make_api_comment_by(1, "Please fix this.", None, "alice"),
+            make_api_comment_by(2, "Fixed!", Some(1), "gru-bot"),
+        ];
+        let replied = collect_threads_with_bot_replies(&comments, "gru-bot");
+        assert_eq!(replied.len(), 1);
+        assert!(replied.contains(&1));
+    }
+
+    #[test]
+    fn test_collect_threads_with_bot_replies_empty_input() {
+        let replied = collect_threads_with_bot_replies(&[], "gru-bot");
+        assert!(replied.is_empty());
+    }
+
+    #[test]
+    fn test_collect_threads_with_bot_replies_ignores_non_bot_replies() {
+        // A reply authored by someone other than the bot must not count.
+        let comments = vec![
+            make_api_comment_by(1, "Please fix this.", None, "alice"),
+            make_api_comment_by(2, "Agreed", Some(1), "bob"),
+        ];
+        let replied = collect_threads_with_bot_replies(&comments, "gru-bot");
+        assert!(replied.is_empty());
+    }
+
+    #[test]
+    fn test_collect_threads_with_bot_replies_ignores_empty_body() {
+        // Per #867 a reply must have a non-empty body to count as handled.
+        let comments = vec![
+            make_api_comment_by(1, "Please fix this.", None, "alice"),
+            make_api_comment_by(2, "   ", Some(1), "gru-bot"),
+        ];
+        let replied = collect_threads_with_bot_replies(&comments, "gru-bot");
+        assert!(replied.is_empty());
+    }
+
+    #[test]
+    fn test_collect_threads_with_bot_replies_ignores_orphan_bot_comments() {
+        // A bot-authored comment without `in_reply_to_id` is a root-level
+        // comment, not a reply, and must not mark any thread as handled.
+        let comments = vec![make_api_comment_by(1, "FYI update", None, "gru-bot")];
+        let replied = collect_threads_with_bot_replies(&comments, "gru-bot");
+        assert!(replied.is_empty());
+    }
+
+    #[test]
+    fn test_collect_threads_with_bot_replies_content_agnostic() {
+        // Body content is not examined — any non-empty bot reply counts,
+        // regardless of whether it carries a Minion signature (#867).
+        let comments = vec![
+            make_api_comment_by(1, "Please fix this.", None, "alice"),
+            make_api_comment_by(2, "ack", Some(1), "gru-bot"),
+        ];
+        let replied = collect_threads_with_bot_replies(&comments, "gru-bot");
+        assert!(replied.contains(&1));
+    }
+
+    #[test]
+    fn test_collect_threads_with_bot_replies_multiple_threads() {
+        let comments = vec![
+            make_api_comment_by(1, "A", None, "alice"),
+            make_api_comment_by(10, "B", None, "alice"),
+            make_api_comment_by(20, "C", None, "alice"),
+            make_api_comment_by(2, "done", Some(1), "gru-bot"),
+            make_api_comment_by(11, "done", Some(10), "gru-bot"),
+            // No reply to 20.
+        ];
+        let replied = collect_threads_with_bot_replies(&comments, "gru-bot");
+        assert_eq!(replied.len(), 2);
+        assert!(replied.contains(&1));
+        assert!(replied.contains(&10));
+        assert!(!replied.contains(&20));
+    }
+
+    #[test]
+    fn test_filter_feedback_skips_already_replied_thread() {
+        // Synthetic "already replied" review: a reviewer comment whose
+        // thread already has a bot reply. The handler must drop it before
+        // invoking the agent so no duplicate reply is posted.
+        let feedback = ReviewFeedback {
+            comments: vec![
+                make_review_comment(100, "Please fix this"),
+                make_review_comment(200, "Please also fix that"),
+            ],
+            bodies: vec![],
+            had_fetch_failures: false,
+        };
+        let already_replied: HashSet<u64> = [100].into_iter().collect();
+
+        let filtered = filter_feedback_against_replied_threads(feedback, &already_replied);
+        assert_eq!(filtered.comments.len(), 1);
+        assert_eq!(filtered.comments[0].comment_id, 200);
+    }
+
+    #[test]
+    fn test_filter_feedback_preserves_bodies() {
+        // The idempotency check is per-comment, not per-review: review
+        // bodies must pass through unchanged.
+        let body = ReviewBody {
+            body: "LGTM overall".to_string(),
+            reviewer: "alice".to_string(),
+            reviewer_display_name: "Alice".to_string(),
+            state: "COMMENTED".to_string(),
+        };
+        let feedback = ReviewFeedback {
+            comments: vec![make_review_comment(100, "Please fix this")],
+            bodies: vec![body],
+            had_fetch_failures: false,
+        };
+        let already_replied: HashSet<u64> = [100].into_iter().collect();
+
+        let filtered = filter_feedback_against_replied_threads(feedback, &already_replied);
+        assert!(filtered.comments.is_empty());
+        assert_eq!(filtered.bodies.len(), 1);
+        assert_eq!(filtered.bodies[0].body, "LGTM overall");
+    }
+
+    #[test]
+    fn test_filter_feedback_empty_replied_set_is_noop() {
+        let feedback = ReviewFeedback {
+            comments: vec![make_review_comment(100, "Please fix this")],
+            bodies: vec![],
+            had_fetch_failures: false,
+        };
+        let filtered = filter_feedback_against_replied_threads(feedback, &HashSet::new());
+        assert_eq!(filtered.comments.len(), 1);
+        assert_eq!(filtered.comments[0].comment_id, 100);
+    }
+
+    #[test]
+    fn test_filter_feedback_preserves_had_fetch_failures_flag() {
+        let feedback = ReviewFeedback {
+            comments: vec![make_review_comment(100, "x")],
+            bodies: vec![],
+            had_fetch_failures: true,
+        };
+        let already_replied: HashSet<u64> = [100].into_iter().collect();
+        let filtered = filter_feedback_against_replied_threads(feedback, &already_replied);
+        assert!(filtered.had_fetch_failures);
     }
 
     // ========================================================================
