@@ -255,7 +255,7 @@ async fn auto_rebase_pr(checkout_path: &Path, minion_dir: &Path) -> Result<AutoR
                         POST_CHECK_RETRIES,
                         POST_CHECK_INTERVAL_SECS,
                     )
-                    .await?;
+                    .await;
                     if !resolved {
                         log::warn!(
                             "origin/{} still not an ancestor of HEAD after retry window — giving up",
@@ -282,31 +282,57 @@ async fn auto_rebase_pr(checkout_path: &Path, minion_dir: &Path) -> Result<AutoR
 /// Returns `true` as soon as `origin/<base_branch>` becomes an ancestor of HEAD,
 /// or `false` if the retry window expires. Intended for the post-rebase check
 /// where the primary agent may still be resolving the conflict in the same worktree.
+///
+/// Transient fetch and git errors are logged and skipped rather than propagated,
+/// since this is a polling loop designed to tolerate temporary failures.
 async fn wait_for_rebase_resolution(
     checkout_path: &Path,
     base_branch: &str,
     retries: u32,
     interval_secs: u64,
-) -> Result<bool> {
+) -> bool {
     use super::super::rebase::{fetch_base_branch, is_up_to_date};
     for attempt in 1..=retries {
-        tokio::time::sleep(Duration::from_secs(interval_secs)).await;
-        fetch_base_branch(checkout_path, base_branch).await?;
-        if is_up_to_date(checkout_path, base_branch).await? {
-            log::info!(
-                "Branch is up-to-date after {} retries — primary agent resolved the conflict",
-                attempt
+        if let Err(e) = fetch_base_branch(checkout_path, base_branch).await {
+            log::warn!(
+                "Post-check attempt {}/{}: fetch failed (will retry): {:#}",
+                attempt,
+                retries,
+                e
             );
-            return Ok(true);
+        } else {
+            match is_up_to_date(checkout_path, base_branch).await {
+                Ok(true) => {
+                    log::info!(
+                        "Branch is up-to-date on attempt {}/{} — primary agent resolved the conflict",
+                        attempt,
+                        retries
+                    );
+                    return true;
+                }
+                Ok(false) => {
+                    log::debug!(
+                        "Post-check attempt {}/{}: origin/{} still not ancestor of HEAD",
+                        attempt,
+                        retries,
+                        base_branch
+                    );
+                }
+                Err(e) => {
+                    log::warn!(
+                        "Post-check attempt {}/{}: is_up_to_date failed (will retry): {:#}",
+                        attempt,
+                        retries,
+                        e
+                    );
+                }
+            }
         }
-        log::debug!(
-            "Post-check retry {}/{}: origin/{} still not ancestor of HEAD",
-            attempt,
-            retries,
-            base_branch
-        );
+        if attempt < retries {
+            tokio::time::sleep(Duration::from_secs(interval_secs)).await;
+        }
     }
-    Ok(false)
+    false
 }
 
 /// Format the body of a monitoring-paused notification comment.
@@ -1372,6 +1398,11 @@ async fn handle_merge_conflict(
             // agent may have resolved via merge commit after the rebase sub-agent
             // exited, making the PR clean on the remote even though the local
             // post-check timed out.
+            //
+            // We only bypass escalation on Some(true). None means GitHub is still
+            // computing (common after a recent push), and Some(false) means the PR
+            // is still conflicted. Both fall through to escalation — after a 3-minute
+            // local retry window, this is the appropriate response.
             if let Ok((_, _, Some(true))) = pr_monitor::get_pr_info_for_wake_check(
                 &ctx.issue_ctx.host,
                 &ctx.issue_ctx.owner,
