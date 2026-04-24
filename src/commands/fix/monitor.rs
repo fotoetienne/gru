@@ -263,6 +263,31 @@ async fn auto_rebase_pr(checkout_path: &Path, minion_dir: &Path) -> Result<AutoR
                         );
                         return Ok(AutoRebaseResult::ConflictUnresolved);
                     }
+                    // Refresh the PR branch tracking ref before force_push. The
+                    // primary agent may have already pushed a merge commit, making
+                    // our local tracking ref stale. Without this fetch,
+                    // --force-with-lease would see a lease mismatch and fail.
+                    let fetch_out = TokioCommand::new("git")
+                        .arg("-C")
+                        .arg(checkout_path)
+                        .args(["fetch", "origin", local_branch.as_str()])
+                        .output()
+                        .await;
+                    match fetch_out {
+                        Ok(out) if !out.status.success() => {
+                            log::warn!(
+                                "Could not refresh PR branch tracking ref before push: {}",
+                                String::from_utf8_lossy(&out.stderr).trim()
+                            );
+                        }
+                        Err(e) => {
+                            log::warn!(
+                                "Could not refresh PR branch tracking ref before push: {:#}",
+                                e
+                            );
+                        }
+                        Ok(_) => {}
+                    }
                 }
                 // Defensively force push in case the rebase agent didn't push.
                 log::info!("Auto force-pushing after conflict resolution (autonomous mode, --force-with-lease)");
@@ -292,39 +317,41 @@ async fn wait_for_rebase_resolution(
     interval_secs: u64,
 ) -> bool {
     for attempt in 1..=retries {
+        // Fetch is best-effort: a network hiccup shouldn't prevent us from
+        // checking local HEAD, which the primary agent may have already updated
+        // with a merge commit.
         if let Err(e) = fetch_base_branch(checkout_path, base_branch).await {
             log::warn!(
-                "Post-check attempt {}/{}: fetch failed (will retry): {:#}",
+                "Post-check attempt {}/{}: fetch failed (checking HEAD anyway): {:#}",
                 attempt,
                 retries,
                 e
             );
-        } else {
-            match is_up_to_date(checkout_path, base_branch).await {
-                Ok(true) => {
-                    log::info!(
-                        "Branch is up-to-date on attempt {}/{} — primary agent resolved the conflict",
-                        attempt,
-                        retries
-                    );
-                    return true;
-                }
-                Ok(false) => {
-                    log::debug!(
-                        "Post-check attempt {}/{}: origin/{} still not ancestor of HEAD",
-                        attempt,
-                        retries,
-                        base_branch
-                    );
-                }
-                Err(e) => {
-                    log::warn!(
-                        "Post-check attempt {}/{}: is_up_to_date failed (will retry): {:#}",
-                        attempt,
-                        retries,
-                        e
-                    );
-                }
+        }
+        match is_up_to_date(checkout_path, base_branch).await {
+            Ok(true) => {
+                log::info!(
+                    "Branch is up-to-date on attempt {}/{} — primary agent resolved the conflict",
+                    attempt,
+                    retries
+                );
+                return true;
+            }
+            Ok(false) => {
+                log::debug!(
+                    "Post-check attempt {}/{}: origin/{} still not ancestor of HEAD",
+                    attempt,
+                    retries,
+                    base_branch
+                );
+            }
+            Err(e) => {
+                log::warn!(
+                    "Post-check attempt {}/{}: is_up_to_date failed (will retry): {:#}",
+                    attempt,
+                    retries,
+                    e
+                );
             }
         }
         if attempt < retries {
@@ -1403,7 +1430,7 @@ async fn handle_merge_conflict(
             // computing (common after a recent push), and Some(false) means the PR
             // is still conflicted. Both fall through to escalation — after a 3-minute
             // local retry window, this is the appropriate response.
-            if let Ok((_, _, Some(true))) = pr_monitor::get_pr_info_for_wake_check(
+            match pr_monitor::get_pr_info_for_wake_check(
                 &ctx.issue_ctx.host,
                 &ctx.issue_ctx.owner,
                 &ctx.issue_ctx.repo,
@@ -1411,13 +1438,24 @@ async fn handle_merge_conflict(
             )
             .await
             {
-                log::info!(
-                    "PR is already mergeable on GitHub — primary agent resolved the conflict"
-                );
-                println!("✅ PR is mergeable on GitHub, continuing to monitor PR...\n");
-                state.rebase_attempts = 0;
-                state.rebase_cooldown_cycles = REBASE_COOLDOWN_CYCLES;
-                return LoopAction::Continue;
+                Ok((_, _, Some(true))) => {
+                    log::info!(
+                        "PR is already mergeable on GitHub — primary agent resolved the conflict"
+                    );
+                    println!("✅ PR is mergeable on GitHub, continuing to monitor PR...\n");
+                    state.rebase_attempts = 0;
+                    state.rebase_cooldown_cycles = REBASE_COOLDOWN_CYCLES;
+                    return LoopAction::Continue;
+                }
+                Ok((_, _, status)) => {
+                    log::debug!(
+                        "GitHub re-check: mergeable={:?} — proceeding to escalation",
+                        status
+                    );
+                }
+                Err(e) => {
+                    log::warn!("GitHub re-check failed, proceeding to escalation: {:#}", e);
+                }
             }
             println!("❌ Could not resolve merge conflicts automatically");
             post_escalation_comment(
