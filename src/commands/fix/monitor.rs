@@ -243,10 +243,26 @@ async fn auto_rebase_pr(checkout_path: &Path, minion_dir: &Path) -> Result<AutoR
                 // which is the canonical proof that the rebase actually happened.
                 if !is_up_to_date(checkout_path, &base_branch).await? {
                     log::warn!(
-                        "Agent rebase exited 0 but origin/{} is not an ancestor of HEAD — rebase did not complete",
+                        "Agent rebase exited 0 but origin/{} is not an ancestor of HEAD — waiting for primary agent to resolve",
                         base_branch
                     );
-                    return Ok(AutoRebaseResult::ConflictUnresolved);
+                    // The primary agent may still be running and resolve the conflict
+                    // via a merge commit in the same worktree. Poll for up to ~3 minutes
+                    // before declaring failure.
+                    let resolved = wait_for_rebase_resolution(
+                        checkout_path,
+                        &base_branch,
+                        POST_CHECK_RETRIES,
+                        POST_CHECK_INTERVAL_SECS,
+                    )
+                    .await?;
+                    if !resolved {
+                        log::warn!(
+                            "origin/{} still not an ancestor of HEAD after retry window — giving up",
+                            base_branch
+                        );
+                        return Ok(AutoRebaseResult::ConflictUnresolved);
+                    }
                 }
                 // Defensively force push in case the rebase agent didn't push.
                 log::info!("Auto force-pushing after conflict resolution (autonomous mode, --force-with-lease)");
@@ -259,6 +275,38 @@ async fn auto_rebase_pr(checkout_path: &Path, minion_dir: &Path) -> Result<AutoR
             }
         }
     }
+}
+
+/// Polls `is_up_to_date` with periodic re-fetches for up to `retries` attempts.
+///
+/// Returns `true` as soon as `origin/<base_branch>` becomes an ancestor of HEAD,
+/// or `false` if the retry window expires. Intended for the post-rebase check
+/// where the primary agent may still be resolving the conflict in the same worktree.
+async fn wait_for_rebase_resolution(
+    checkout_path: &Path,
+    base_branch: &str,
+    retries: u32,
+    interval_secs: u64,
+) -> Result<bool> {
+    use super::super::rebase::{fetch_base_branch, is_up_to_date};
+    for attempt in 1..=retries {
+        tokio::time::sleep(Duration::from_secs(interval_secs)).await;
+        fetch_base_branch(checkout_path, base_branch).await?;
+        if is_up_to_date(checkout_path, base_branch).await? {
+            log::info!(
+                "Branch is up-to-date after {} retries — primary agent resolved the conflict",
+                attempt
+            );
+            return Ok(true);
+        }
+        log::debug!(
+            "Post-check retry {}/{}: origin/{} still not ancestor of HEAD",
+            attempt,
+            retries,
+            base_branch
+        );
+    }
+    Ok(false)
 }
 
 /// Format the body of a monitoring-paused notification comment.
@@ -521,6 +569,14 @@ struct MonitorLoopState {
 /// rebase + force-push. At 30s per cycle, 4 cycles ≈ 2 minutes — enough for
 /// GitHub to recompute the `mergeable` field.
 const REBASE_COOLDOWN_CYCLES: u32 = 4;
+
+/// Retry attempts for the post-rebase up-to-date check. The primary agent may
+/// resolve the conflict (e.g. via merge commit) while the rebase sub-agent is
+/// running. At 20s per retry, 9 retries ≈ 3 minutes.
+const POST_CHECK_RETRIES: u32 = 9;
+
+/// Interval (seconds) between post-rebase up-to-date check retries.
+const POST_CHECK_INTERVAL_SECS: u64 = 20;
 
 /// Sleep duration (seconds) when suppressing a stale MergeConflict during
 /// cooldown. Matches the pr_monitor poll interval so suppressed cycles don't
@@ -1312,7 +1368,26 @@ async fn handle_merge_conflict(
             LoopAction::Continue
         }
         Ok(AutoRebaseResult::ConflictUnresolved) => {
-            // Agent couldn't resolve conflicts
+            // Before escalating, re-check GitHub's view of the PR. The primary
+            // agent may have resolved via merge commit after the rebase sub-agent
+            // exited, making the PR clean on the remote even though the local
+            // post-check timed out.
+            if let Ok((_, _, Some(true))) = pr_monitor::get_pr_info_for_wake_check(
+                &ctx.issue_ctx.host,
+                &ctx.issue_ctx.owner,
+                &ctx.issue_ctx.repo,
+                ctx.pr_number,
+            )
+            .await
+            {
+                log::info!(
+                    "PR is already mergeable on GitHub — primary agent resolved the conflict"
+                );
+                println!("✅ PR is mergeable on GitHub, continuing to monitor PR...\n");
+                state.rebase_attempts = 0;
+                state.rebase_cooldown_cycles = REBASE_COOLDOWN_CYCLES;
+                return LoopAction::Continue;
+            }
             println!("❌ Could not resolve merge conflicts automatically");
             post_escalation_comment(
                 &ctx.issue_ctx.owner,
