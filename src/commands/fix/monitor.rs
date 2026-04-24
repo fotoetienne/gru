@@ -247,8 +247,8 @@ async fn auto_rebase_pr(checkout_path: &Path, minion_dir: &Path) -> Result<AutoR
                         base_branch
                     );
                     // The primary agent may still be running and resolve the conflict
-                    // via a merge commit in the same worktree. Poll for up to ~3 minutes
-                    // before declaring failure.
+                    // via a merge commit in the same worktree. Poll for up to ~4 minutes
+                    // (POST_CHECK_RETRIES × POST_CHECK_INTERVAL_SECS) before declaring failure.
                     let resolved = wait_for_rebase_resolution(
                         checkout_path,
                         &base_branch,
@@ -267,10 +267,18 @@ async fn auto_rebase_pr(checkout_path: &Path, minion_dir: &Path) -> Result<AutoR
                     // primary agent may have already pushed a merge commit, making
                     // our local tracking ref stale. Without this fetch,
                     // --force-with-lease would see a lease mismatch and fail.
+                    //
+                    // Use --refmap= (empty) + explicit refspec so only this one
+                    // branch is fetched, independent of remote.origin.fetch config
+                    // (mirrors the approach used by fetch_base_branch).
+                    let pr_refspec = format!(
+                        "refs/heads/{}:refs/remotes/origin/{}",
+                        local_branch, local_branch
+                    );
                     let fetch_out = TokioCommand::new("git")
                         .arg("-C")
                         .arg(checkout_path)
-                        .args(["fetch", "origin", local_branch.as_str()])
+                        .args(["fetch", "--refmap=", "origin", pr_refspec.as_str()])
                         .output()
                         .await;
                     match fetch_out {
@@ -1428,8 +1436,8 @@ async fn handle_merge_conflict(
             //
             // We only bypass escalation on Some(true). None means GitHub is still
             // computing (common after a recent push), and Some(false) means the PR
-            // is still conflicted. Both fall through to escalation — after a 3-minute
-            // local retry window, this is the appropriate response.
+            // is still conflicted. Both fall through to escalation — after the
+            // configured local retry window (~4 minutes), this is the appropriate response.
             match pr_monitor::get_pr_info_for_wake_check(
                 &ctx.issue_ctx.host,
                 &ctx.issue_ctx.owner,
