@@ -1504,7 +1504,14 @@ async fn try_spawn_for_issue(
                             issue_number
                         );
                     }
-                    for (mid, _) in entries {
+                    for (mid, entry_info) in entries {
+                        // Skip terminal entries (Failed/Completed): they must
+                        // not be stamped with the new child's PID or their phase
+                        // would appear live to check_existing_minions, causing
+                        // EXIT_ALREADY_RUNNING and a thrash loop (issue #879).
+                        if entry_info.orchestration_phase.is_terminal() {
+                            continue;
+                        }
                         registry.update(&mid, |info| {
                             info.pid = Some(pid);
                             info.pid_start_time =
