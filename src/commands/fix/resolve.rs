@@ -69,13 +69,13 @@ fn evaluate_existing_minions(
     // On other platforms the start time is always `None`, so we fall back to
     // the plain `is_running()` check to avoid ignoring all running minions.
     //
-    // Terminal entries (Failed/Completed) are intentionally excluded: lab's
-    // try_spawn_for_issue stamps the new gru-do child PID onto all existing
-    // registry entries for the issue (including terminal ones) to close a
-    // race window where gru-do creates its entry after lab reads the pid.
-    // Without this guard a Failed minion would appear "AlreadyRunning" because
-    // the gru-do parent's live PID is sitting on it, causing EXIT_ALREADY_RUNNING
-    // and a thrash loop (issue #879).
+    // Terminal entries (Failed/Completed) are intentionally excluded.
+    // try_spawn_for_issue now skips terminal rows when stamping the new
+    // gru-do child PID onto existing registry entries, but terminal rows may
+    // still carry a spurious live PID from older versions or manual/corrupt
+    // registry state. Without this guard a Failed minion could appear
+    // "AlreadyRunning" because an unrelated live PID is sitting on it,
+    // causing EXIT_ALREADY_RUNNING and a thrash loop (issue #879).
     let is_validated_running = |info: &MinionInfo| {
         !info.orchestration_phase.is_terminal()
             && info.is_running()

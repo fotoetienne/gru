@@ -2060,8 +2060,9 @@ async fn is_issue_claimed(repo: &str, issue_number: Option<u64>) -> Result<bool>
                 && info.issue == Some(issue_number)
                 && info.archived_at.is_none()
                 // Terminal entries (Failed/Completed) must never block a new
-                // spawn even if try_spawn_for_issue has already stamped the new
-                // child's PID on them (issue #879).
+                // spawn, even if they still carry a PID due to legacy behavior
+                // from older versions or other stale/corrupt registry state
+                // (issue #879).
                 && !info.orchestration_phase.is_terminal()
                 && info.is_running()
                 // Only trust entries with start-time validation on platforms that
