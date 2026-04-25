@@ -56,6 +56,59 @@ struct SpawnMeta {
     retry_attempt: u32,
 }
 
+/// Tracks auto-recovery resets per issue to detect thrashing loops.
+///
+/// When the same issue is reset repeatedly within a sliding window, the tracker
+/// signals that it should be escalated to `gru:blocked` instead of being reset
+/// again. Once an issue is escalated, it is remembered until a recovery scan
+/// sees it back in `gru:in-progress` (meaning a human cleared `gru:blocked`
+/// and it was picked up again), at which point its history is cleared.
+struct RecoveryTracker {
+    /// Per-issue timestamps of auto-recovery resets within the tracking window.
+    /// Key: `(full_repo_slug, issue_number)`.
+    resets: HashMap<(String, u64), Vec<Instant>>,
+    /// Issues that were escalated to `gru:blocked` by this tracker.
+    /// Cleared when the issue re-enters `gru:in-progress` (human intervention).
+    escalated: HashSet<(String, u64)>,
+}
+
+impl RecoveryTracker {
+    fn new() -> Self {
+        Self {
+            resets: HashMap::new(),
+            escalated: HashSet::new(),
+        }
+    }
+
+    /// Record a reset for `(repo, issue)` and return the total reset count
+    /// within `window`. Timestamps older than `window` are pruned first.
+    fn record_reset(&mut self, repo: &str, issue: u64, window: Duration) -> usize {
+        let key = (repo.to_string(), issue);
+        let entry = self.resets.entry(key).or_default();
+        let cutoff = Instant::now() - window;
+        entry.retain(|&t| t > cutoff);
+        entry.push(Instant::now());
+        entry.len()
+    }
+
+    /// Mark an issue as escalated to `gru:blocked`.
+    fn mark_escalated(&mut self, repo: &str, issue: u64) {
+        self.escalated.insert((repo.to_string(), issue));
+    }
+
+    /// Returns true if this issue was previously escalated by the tracker.
+    fn is_escalated(&self, repo: &str, issue: u64) -> bool {
+        self.escalated.contains(&(repo.to_string(), issue))
+    }
+
+    /// Clear history and escalation state for an issue (human cleared gru:blocked).
+    fn clear(&mut self, repo: &str, issue: u64) {
+        let key = (repo.to_string(), issue);
+        self.resets.remove(&key);
+        self.escalated.remove(&key);
+    }
+}
+
 /// Handles the lab daemon command
 pub(crate) async fn handle_lab(
     config_path: Option<PathBuf>,
@@ -156,6 +209,7 @@ pub(crate) async fn handle_lab(
     // Skipping a scan on the first main-loop iteration (after the initial startup poll)
     // avoids false positives while minions re-register after a lab restart.
     let mut last_recovery_scan: Option<Instant> = None;
+    let mut recovery_tracker = RecoveryTracker::new();
 
     // Auto-merge sweep timer — same semantics as last_recovery_scan:
     //   None  → first main-loop iteration after startup: set the timer without
@@ -331,7 +385,12 @@ pub(crate) async fn handle_lab(
                         }
                         Some(t) if t.elapsed() >= RECOVERY_SCAN_INTERVAL => {
                             last_recovery_scan = Some(Instant::now());
-                            if let Err(e) = recover_stuck_in_progress_issues(&config).await {
+                            if let Err(e) = recover_stuck_in_progress_issues(
+                                &config,
+                                &mut recovery_tracker,
+                            )
+                            .await
+                            {
                                 log::warn!("⚠️  Recovery scan error: {:#}", e);
                             }
                         }
@@ -2338,11 +2397,22 @@ async fn fallback_list_issues(
 /// configured daemon pickup label (`daemon.label`) with an explanatory comment so
 /// the lab can retry them.
 ///
+/// When an issue has been reset N or more times within the configured window it is
+/// escalated to `gru:blocked` instead, preventing infinite thrash loops. When the
+/// tracker sees a previously-escalated issue back in `gru:in-progress` (indicating
+/// a human cleared `gru:blocked`), the history for that issue is reset.
+///
 /// Per-repo and per-issue errors are logged as warnings and do not abort the scan.
-async fn recover_stuck_in_progress_issues(config: &crate::config::LabConfig) -> Result<()> {
+async fn recover_stuck_in_progress_issues(
+    config: &crate::config::LabConfig,
+    tracker: &mut RecoveryTracker,
+) -> Result<()> {
     let threshold_mins = i64::try_from(config.daemon.recovery_threshold_mins)
         .context("daemon.recovery_threshold_mins exceeds the maximum supported value")?;
     let threshold = chrono::Duration::minutes(threshold_mins);
+
+    let max_resets = config.daemon.auto_recovery.max_resets;
+    let window = Duration::from_secs(config.daemon.auto_recovery.window_hours * 3600);
 
     for repo_spec in &config.daemon.repos {
         let Some((host, owner, repo)) =
@@ -2371,6 +2441,19 @@ async fn recover_stuck_in_progress_issues(config: &crate::config::LabConfig) -> 
         };
 
         for issue in in_progress {
+            // If this issue was previously escalated to gru:blocked but is now back
+            // in gru:in-progress, a human cleared gru:blocked and it was picked up
+            // again. Clear the history so it gets a fresh slate.
+            if tracker.is_escalated(&full_repo, issue.number) {
+                tprintln!(
+                    "♻️  Recovery: issue #{} in {} is back in-progress after escalation — \
+                     clearing reset history",
+                    issue.number,
+                    repo_spec,
+                );
+                tracker.clear(&full_repo, issue.number);
+            }
+
             // Only reset if the issue has been in-progress for longer than the threshold.
             let age = chrono::Utc::now().signed_duration_since(issue.updated_at);
             if age < threshold {
@@ -2403,50 +2486,119 @@ async fn recover_stuck_in_progress_issues(config: &crate::config::LabConfig) -> 
                 }
             }
 
-            // Orphaned issue — reset to the configured pickup label and leave a comment.
-            let ready_label = &config.daemon.label;
-            tprintln!(
-                "🔄 Recovery: resetting orphaned in-progress issue #{} in {} to {} \
-                 (stuck for {}m)",
-                issue.number,
-                repo_spec,
-                ready_label,
-                age.num_minutes(),
-            );
+            // Record this reset and check whether we've exceeded the threshold.
+            // When max_resets == 0, escalation is disabled — always reset.
+            let reset_count = if max_resets > 0 {
+                tracker.record_reset(&full_repo, issue.number, window)
+            } else {
+                0
+            };
 
-            if let Err(e) = github::edit_labels_via_cli(
-                &host,
-                &owner,
-                &repo,
-                issue.number,
-                &[ready_label.as_str()],
-                &[labels::IN_PROGRESS],
-            )
-            .await
-            {
-                log::warn!(
-                    "⚠️  Recovery scan: failed to reset labels for {}/issues/{}: {:#}",
-                    repo_spec,
+            if max_resets > 0 && reset_count > usize::try_from(max_resets).unwrap_or(usize::MAX) {
+                // Too many resets within the window — escalate to gru:blocked.
+                tprintln!(
+                    "🚫 Recovery: escalating issue #{} in {} to {} after {} resets in {}h \
+                     (stuck for {}m)",
                     issue.number,
-                    e
+                    repo_spec,
+                    labels::BLOCKED,
+                    reset_count,
+                    config.daemon.auto_recovery.window_hours,
+                    age.num_minutes(),
                 );
-                continue;
-            }
 
-            let comment = format!(
-                "⚠️ Gru auto-recovery: issue was stuck at `gru:in-progress` with no live \
-                 Minion process. Resetting to `{}` so it can be retried.",
-                ready_label
-            );
-            if let Err(e) =
-                github::post_comment_via_cli(&host, &owner, &repo, issue.number, &comment).await
-            {
-                log::warn!(
-                    "⚠️  Recovery scan: failed to post comment on {}/issues/{}: {:#}",
-                    repo_spec,
+                if let Err(e) = github::edit_labels_via_cli(
+                    &host,
+                    &owner,
+                    &repo,
                     issue.number,
-                    e
+                    &[labels::BLOCKED],
+                    &[labels::IN_PROGRESS],
+                )
+                .await
+                {
+                    log::warn!(
+                        "⚠️  Recovery scan: failed to escalate labels for {}/issues/{}: {:#}",
+                        repo_spec,
+                        issue.number,
+                        e
+                    );
+                    continue;
+                }
+
+                tracker.mark_escalated(&full_repo, issue.number);
+
+                let comment = format!(
+                    "🚫 Gru auto-recovery: issue has been reset {} times within {}h and \
+                     is still not making forward progress. Escalating to `{}` — \
+                     human review needed.\n\n\
+                     To re-enable automatic retries, remove the `{}` label. \
+                     The reset counter will clear once the issue is picked up again.",
+                    reset_count,
+                    config.daemon.auto_recovery.window_hours,
+                    labels::BLOCKED,
+                    labels::BLOCKED,
                 );
+                if let Err(e) =
+                    github::post_comment_via_cli(&host, &owner, &repo, issue.number, &comment).await
+                {
+                    log::warn!(
+                        "⚠️  Recovery scan: failed to post escalation comment on \
+                         {}/issues/{}: {:#}",
+                        repo_spec,
+                        issue.number,
+                        e
+                    );
+                }
+            } else {
+                // Within limit — reset to the configured pickup label.
+                let ready_label = &config.daemon.label;
+                tprintln!(
+                    "🔄 Recovery: resetting orphaned in-progress issue #{} in {} to {} \
+                     (stuck for {}m, reset #{} of {})",
+                    issue.number,
+                    repo_spec,
+                    ready_label,
+                    age.num_minutes(),
+                    reset_count,
+                    max_resets,
+                );
+
+                if let Err(e) = github::edit_labels_via_cli(
+                    &host,
+                    &owner,
+                    &repo,
+                    issue.number,
+                    &[ready_label.as_str()],
+                    &[labels::IN_PROGRESS],
+                )
+                .await
+                {
+                    log::warn!(
+                        "⚠️  Recovery scan: failed to reset labels for {}/issues/{}: {:#}",
+                        repo_spec,
+                        issue.number,
+                        e
+                    );
+                    continue;
+                }
+
+                let comment = format!(
+                    "⚠️ Gru auto-recovery: issue was stuck at `gru:in-progress` with no live \
+                     Minion process. Resetting to `{}` so it can be retried \
+                     (reset #{} of {}).",
+                    ready_label, reset_count, max_resets,
+                );
+                if let Err(e) =
+                    github::post_comment_via_cli(&host, &owner, &repo, issue.number, &comment).await
+                {
+                    log::warn!(
+                        "⚠️  Recovery scan: failed to post comment on {}/issues/{}: {:#}",
+                        repo_spec,
+                        issue.number,
+                        e
+                    );
+                }
             }
         }
     }
@@ -3458,5 +3610,75 @@ mod tests {
             !minion_has_pr_entry(&minions, "owner/repo", "42"),
             "Empty registry yields no match"
         );
+    }
+
+    // --- RecoveryTracker tests ---
+
+    #[test]
+    fn test_recovery_tracker_counts_resets() {
+        let mut tracker = RecoveryTracker::new();
+        let window = Duration::from_secs(3600);
+        assert_eq!(tracker.record_reset("owner/repo", 42, window), 1);
+        assert_eq!(tracker.record_reset("owner/repo", 42, window), 2);
+        assert_eq!(tracker.record_reset("owner/repo", 42, window), 3);
+    }
+
+    #[test]
+    fn test_recovery_tracker_counts_independent_per_issue() {
+        let mut tracker = RecoveryTracker::new();
+        let window = Duration::from_secs(3600);
+        tracker.record_reset("owner/repo", 1, window);
+        tracker.record_reset("owner/repo", 1, window);
+        assert_eq!(tracker.record_reset("owner/repo", 2, window), 1);
+    }
+
+    #[test]
+    fn test_recovery_tracker_clear_resets_history() {
+        let mut tracker = RecoveryTracker::new();
+        let window = Duration::from_secs(3600);
+        tracker.record_reset("owner/repo", 42, window);
+        tracker.record_reset("owner/repo", 42, window);
+        tracker.clear("owner/repo", 42);
+        assert_eq!(tracker.record_reset("owner/repo", 42, window), 1);
+    }
+
+    #[test]
+    fn test_recovery_tracker_escalated_flag() {
+        let mut tracker = RecoveryTracker::new();
+        assert!(!tracker.is_escalated("owner/repo", 42));
+        tracker.mark_escalated("owner/repo", 42);
+        assert!(tracker.is_escalated("owner/repo", 42));
+        tracker.clear("owner/repo", 42);
+        assert!(!tracker.is_escalated("owner/repo", 42));
+    }
+
+    #[test]
+    fn test_recovery_tracker_prunes_old_timestamps() {
+        let mut tracker = RecoveryTracker::new();
+        // Use a zero-duration window so any existing entry is immediately stale.
+        let tiny_window = Duration::from_nanos(0);
+        tracker.record_reset("owner/repo", 42, Duration::from_secs(3600));
+        // Recording with a zero window prunes the previous entry.
+        let count = tracker.record_reset("owner/repo", 42, tiny_window);
+        assert_eq!(count, 1, "stale entries should be pruned before counting");
+    }
+
+    #[test]
+    fn test_recovery_tracker_escalation_threshold() {
+        // Simulate the decision logic: escalate when count > max_resets.
+        let mut tracker = RecoveryTracker::new();
+        let window = Duration::from_secs(3600);
+        let max_resets: u32 = 2;
+
+        // First two resets: within limit.
+        let c1 = tracker.record_reset("owner/repo", 42, window);
+        assert!(c1 <= usize::try_from(max_resets).unwrap());
+
+        let c2 = tracker.record_reset("owner/repo", 42, window);
+        assert!(c2 <= usize::try_from(max_resets).unwrap());
+
+        // Third reset: exceeds max_resets → should escalate.
+        let c3 = tracker.record_reset("owner/repo", 42, window);
+        assert!(c3 > usize::try_from(max_resets).unwrap());
     }
 }

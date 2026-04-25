@@ -140,6 +140,26 @@ pub(crate) struct DaemonConfig {
     /// clock and delay auto-recovery by the threshold duration.
     #[serde(default = "default_recovery_threshold_mins")]
     pub(crate) recovery_threshold_mins: u64,
+
+    /// Auto-recovery escalation settings — tracks repeated resets and escalates
+    /// to gru:blocked when an issue loops too many times.
+    #[serde(default)]
+    pub(crate) auto_recovery: AutoRecoveryConfig,
+}
+
+/// Configuration for auto-recovery escalation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct AutoRecoveryConfig {
+    /// Maximum number of times an issue can be auto-recovered within the tracking
+    /// window before it is escalated to `gru:blocked` instead. Set to 0 to disable
+    /// escalation (issues will be reset indefinitely). Default: 2.
+    #[serde(default = "default_auto_recovery_max_resets")]
+    pub(crate) max_resets: u32,
+
+    /// Sliding window in hours within which repeated resets are counted. Resets
+    /// older than this window are forgotten. Default: 2 hours.
+    #[serde(default = "default_auto_recovery_window_hours")]
+    pub(crate) window_hours: u64,
 }
 
 impl Default for DaemonConfig {
@@ -155,6 +175,16 @@ impl Default for DaemonConfig {
             poll_interval_max_secs: default_poll_interval_max(),
             archive_ttl_hours: default_archive_ttl_hours(),
             recovery_threshold_mins: default_recovery_threshold_mins(),
+            auto_recovery: AutoRecoveryConfig::default(),
+        }
+    }
+}
+
+impl Default for AutoRecoveryConfig {
+    fn default() -> Self {
+        Self {
+            max_resets: default_auto_recovery_max_resets(),
+            window_hours: default_auto_recovery_window_hours(),
         }
     }
 }
@@ -299,6 +329,20 @@ pub(crate) const DEFAULT_RECOVERY_THRESHOLD_MINS: u64 = 30;
 
 fn default_recovery_threshold_mins() -> u64 {
     DEFAULT_RECOVERY_THRESHOLD_MINS
+}
+
+/// Default maximum times an issue can be auto-recovered before escalation.
+pub(crate) const DEFAULT_AUTO_RECOVERY_MAX_RESETS: u32 = 2;
+
+fn default_auto_recovery_max_resets() -> u32 {
+    DEFAULT_AUTO_RECOVERY_MAX_RESETS
+}
+
+/// Default sliding window in hours for tracking auto-recovery resets.
+pub(crate) const DEFAULT_AUTO_RECOVERY_WINDOW_HOURS: u64 = 2;
+
+fn default_auto_recovery_window_hours() -> u64 {
+    DEFAULT_AUTO_RECOVERY_WINDOW_HOURS
 }
 
 /// Parse a repo entry from the config into `(host, owner, repo)`.
