@@ -2412,7 +2412,13 @@ async fn recover_stuck_in_progress_issues(
     let threshold = chrono::Duration::minutes(threshold_mins);
 
     let max_resets = config.daemon.auto_recovery.max_resets;
-    let window = Duration::from_secs(config.daemon.auto_recovery.window_hours * 3600);
+    let window_secs = config
+        .daemon
+        .auto_recovery
+        .window_hours
+        .checked_mul(3600)
+        .context("auto_recovery.window_hours overflow")?;
+    let window = Duration::from_secs(window_secs);
 
     for repo_spec in &config.daemon.repos {
         let Some((host, owner, repo)) =
@@ -2494,7 +2500,7 @@ async fn recover_stuck_in_progress_issues(
                 0
             };
 
-            if max_resets > 0 && reset_count > usize::try_from(max_resets).unwrap_or(usize::MAX) {
+            if max_resets > 0 && reset_count > max_resets as usize {
                 // Too many resets within the window — escalate to gru:blocked.
                 tprintln!(
                     "🚫 Recovery: escalating issue #{} in {} to {} after {} resets in {}h \

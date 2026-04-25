@@ -151,8 +151,11 @@ pub(crate) struct DaemonConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct AutoRecoveryConfig {
     /// Maximum number of times an issue can be auto-recovered within the tracking
-    /// window before it is escalated to `gru:blocked` instead. Set to 0 to disable
-    /// escalation (issues will be reset indefinitely). Default: 2.
+    /// window. After exactly this many resets the issue is reset once more, and on
+    /// the (N+1)th stuck detection it is escalated to `gru:blocked` instead.
+    /// Set to 0 to disable escalation (issues reset indefinitely). Default: 2
+    /// (two resets are logged as "reset #1 of 2" and "reset #2 of 2"; the third
+    /// stuck detection triggers escalation).
     #[serde(default = "default_auto_recovery_max_resets")]
     pub(crate) max_resets: u32,
 
@@ -755,6 +758,14 @@ impl LabConfig {
 
         if self.daemon.max_resume_attempts == 0 {
             anyhow::bail!("max_resume_attempts must be at least 1");
+        }
+
+        if self.daemon.auto_recovery.max_resets > 0 && self.daemon.auto_recovery.window_hours == 0 {
+            anyhow::bail!(
+                "daemon.auto_recovery.window_hours must be at least 1 when \
+                 auto_recovery.max_resets > 0 (a zero-duration window disables \
+                 effective reset tracking)"
+            );
         }
 
         self.validate_github_hosts()?;
