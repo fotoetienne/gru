@@ -2534,16 +2534,19 @@ async fn recover_stuck_in_progress_issues(
 
                 tracker.mark_escalated(&full_repo, issue.number);
 
+                let ready_label = &config.daemon.label;
                 let comment = format!(
                     "🚫 Gru auto-recovery: issue has been reset {} times within {}h and \
                      is still not making forward progress. Escalating to `{}` — \
                      human review needed.\n\n\
-                     To re-enable automatic retries, remove the `{}` label. \
-                     The reset counter will clear once the issue is picked up again.",
+                     To re-enable automatic retries: remove the `{}` label and \
+                     re-add `{}`. The reset counter will clear once the issue \
+                     is picked up again.",
                     reset_count,
                     config.daemon.auto_recovery.window_hours,
                     labels::BLOCKED,
                     labels::BLOCKED,
+                    ready_label,
                 );
                 if let Err(e) =
                     github::post_comment_via_cli(&host, &owner, &repo, issue.number, &comment).await
@@ -2559,15 +2562,19 @@ async fn recover_stuck_in_progress_issues(
             } else {
                 // Within limit — reset to the configured pickup label.
                 let ready_label = &config.daemon.label;
+                let reset_suffix = if max_resets > 0 {
+                    format!(" (reset #{} of {})", reset_count, max_resets)
+                } else {
+                    String::new()
+                };
                 tprintln!(
                     "🔄 Recovery: resetting orphaned in-progress issue #{} in {} to {} \
-                     (stuck for {}m, reset #{} of {})",
+                     (stuck for {}m{})",
                     issue.number,
                     repo_spec,
                     ready_label,
                     age.num_minutes(),
-                    reset_count,
-                    max_resets,
+                    reset_suffix,
                 );
 
                 if let Err(e) = github::edit_labels_via_cli(
@@ -2591,9 +2598,8 @@ async fn recover_stuck_in_progress_issues(
 
                 let comment = format!(
                     "⚠️ Gru auto-recovery: issue was stuck at `gru:in-progress` with no live \
-                     Minion process. Resetting to `{}` so it can be retried \
-                     (reset #{} of {}).",
-                    ready_label, reset_count, max_resets,
+                     Minion process. Resetting to `{}` so it can be retried{}.",
+                    ready_label, reset_suffix,
                 );
                 if let Err(e) =
                     github::post_comment_via_cli(&host, &owner, &repo, issue.number, &comment).await
