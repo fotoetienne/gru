@@ -30,6 +30,10 @@ macro_rules! tprintln {
 /// Not user-configurable — this is an implementation cadence, not a config knob.
 const RECOVERY_SCAN_INTERVAL: Duration = Duration::from_secs(300);
 
+/// How often the lab sweeps for orphaned `gru:auto-merge` PRs.
+/// Not user-configurable — this is an implementation cadence, not a config knob.
+const AUTO_MERGE_SWEEP_INTERVAL: Duration = Duration::from_secs(300);
+
 /// A child process tracked by the lab, with optional metadata for label restoration.
 struct SpawnedChild {
     child: Child,
@@ -152,6 +156,13 @@ pub(crate) async fn handle_lab(
     // Skipping a scan on the first main-loop iteration (after the initial startup poll)
     // avoids false positives while minions re-register after a lab restart.
     let mut last_recovery_scan: Option<Instant> = None;
+
+    // Auto-merge sweep timer — same semantics as last_recovery_scan:
+    //   None  → first main-loop iteration after startup: set the timer without
+    //           sweeping, so re-registering Minions have time to appear in the
+    //           registry before the first sweep runs.
+    //   Some  → sweep when AUTO_MERGE_SWEEP_INTERVAL has elapsed, then reset.
+    let mut last_auto_merge_sweep: Option<Instant> = None;
 
     if no_resume {
         tprintln!("⏭️  Auto-resume disabled (--no-resume)");
@@ -326,6 +337,19 @@ pub(crate) async fn handle_lab(
                         }
                         Some(_) => {}
                     }
+                }
+
+                // Periodic auto-merge sweep: queue merges for orphaned auto-merge PRs.
+                // Same timer semantics as last_recovery_scan.
+                match last_auto_merge_sweep {
+                    None => {
+                        last_auto_merge_sweep = Some(Instant::now());
+                    }
+                    Some(t) if t.elapsed() >= AUTO_MERGE_SWEEP_INTERVAL => {
+                        last_auto_merge_sweep = Some(Instant::now());
+                        sweep_orphaned_auto_merge_prs(&config).await;
+                    }
+                    Some(_) => {}
                 }
 
                 // Check if a signal arrived during poll_and_spawn
@@ -2430,6 +2454,182 @@ async fn recover_stuck_in_progress_issues(config: &crate::config::LabConfig) -> 
     Ok(())
 }
 
+/// Scan all configured repos for open PRs labelled `gru:auto-merge` that have no
+/// live Minion monitoring them, and queue `--auto` merge when all deterministic
+/// readiness checks pass.
+///
+/// This handles PRs that were labelled outside of `gru do` (e.g., by a human or
+/// a Minion that has since exited) and whose label therefore has no consumer.
+///
+/// Per-repo and per-PR errors are logged as warnings and do not abort the scan.
+async fn sweep_orphaned_auto_merge_prs(config: &LabConfig) {
+    for repo_spec in &config.daemon.repos {
+        let Some((host, owner, repo)) =
+            parse_repo_entry_with_hosts(repo_spec, &config.github_hosts)
+        else {
+            log::warn!(
+                "⚠️  Auto-merge sweep: could not parse repo spec '{}'",
+                repo_spec
+            );
+            continue;
+        };
+
+        let prs = match github::list_auto_merge_prs(&host, &owner, &repo).await {
+            Ok(prs) => prs,
+            Err(e) => {
+                log::warn!(
+                    "⚠️  Auto-merge sweep: failed to list auto-merge PRs for {}: {:#}",
+                    repo_spec,
+                    e
+                );
+                continue;
+            }
+        };
+
+        if prs.is_empty() {
+            continue;
+        }
+
+        let full_repo = github::repo_slug(&owner, &repo);
+
+        for pr in &prs {
+            // Skip if a live Minion is already monitoring this PR.
+            if is_pr_monitored_by_live_minion(&full_repo, pr.number).await {
+                log::debug!(
+                    "Auto-merge sweep: skipping PR #{} in {} — live Minion is monitoring it",
+                    pr.number,
+                    repo_spec,
+                );
+                continue;
+            }
+
+            // Skip if gru:needs-human-review is present.
+            if pr
+                .labels
+                .iter()
+                .any(|l| l.name == labels::NEEDS_HUMAN_REVIEW)
+            {
+                log::debug!(
+                    "Auto-merge sweep: skipping PR #{} in {} — has gru:needs-human-review",
+                    pr.number,
+                    repo_spec,
+                );
+                continue;
+            }
+
+            // Check deterministic merge readiness.
+            let readiness = match crate::merge_readiness::check_merge_readiness(
+                &host, &owner, &repo, pr.number,
+            )
+            .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    log::warn!(
+                        "⚠️  Auto-merge sweep: failed to check readiness for PR #{} in {}: {:#}",
+                        pr.number,
+                        repo_spec,
+                        e
+                    );
+                    continue;
+                }
+            };
+
+            if !readiness.is_ready() {
+                log::debug!(
+                    "Auto-merge sweep: PR #{} in {} not ready ({})",
+                    pr.number,
+                    repo_spec,
+                    readiness,
+                );
+                continue;
+            }
+
+            tprintln!(
+                "🔀 Auto-merge sweep: queueing merge for orphaned PR #{} in {}",
+                pr.number,
+                repo_spec,
+            );
+
+            let pr_num_str = pr.number.to_string();
+            match github::gh_cli_command(&host)
+                .args([
+                    "pr",
+                    "merge",
+                    &pr_num_str,
+                    "--squash",
+                    "--auto",
+                    "-R",
+                    &full_repo,
+                ])
+                .output()
+                .await
+            {
+                Ok(output) if output.status.success() => {
+                    tprintln!(
+                        "✅ Auto-merge queued for orphaned PR #{} in {}",
+                        pr.number,
+                        repo_spec,
+                    );
+                }
+                Ok(output) => {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    log::warn!(
+                        "⚠️  Auto-merge sweep: merge command failed for PR #{} in {}: {}",
+                        pr.number,
+                        repo_spec,
+                        stderr.trim(),
+                    );
+                }
+                Err(e) => {
+                    log::warn!(
+                        "⚠️  Auto-merge sweep: failed to run merge command for PR #{} in {}: {:#}",
+                        pr.number,
+                        repo_spec,
+                        e,
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Pure predicate: returns `true` if any non-archived entry in `minions`
+/// matches the given repo and PR number.
+///
+/// Intentionally does not require `is_running()` — a Minion whose process just
+/// died but hasn't been archived yet is still "responsible" from the sweeper's
+/// perspective. The archive machinery will clean it up; we don't want to race
+/// against it by queueing a merge prematurely.
+fn minion_has_pr_entry(minions: &[(String, MinionInfo)], full_repo: &str, pr_number: &str) -> bool {
+    minions.iter().any(|(_id, info)| {
+        info.repo == full_repo
+            && info.pr.as_deref() == Some(pr_number)
+            && info.archived_at.is_none()
+    })
+}
+
+/// Returns `true` if a non-archived Minion entry in the registry is associated
+/// with the given PR. Fails-safe to `true` on registry errors to avoid
+/// double-queuing a merge.
+async fn is_pr_monitored_by_live_minion(full_repo: &str, pr_number: u64) -> bool {
+    let pr_str = pr_number.to_string();
+    let repo = full_repo.to_string();
+    match with_registry(move |registry| Ok(minion_has_pr_entry(&registry.list(), &repo, &pr_str)))
+        .await
+    {
+        Ok(result) => result,
+        Err(e) => {
+            log::warn!(
+                "Failed to check registry for PR #{}: {} — assuming monitored (fail-safe)",
+                pr_number,
+                e
+            );
+            true
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3188,5 +3388,75 @@ mod tests {
         assert_eq!(result[0].minion_id, "M003");
         // The most recent minion's PR is the one that will be checked
         assert_eq!(result[0].info.pr.as_deref(), Some("101"));
+    }
+
+    // --- minion_has_pr_entry tests ---
+
+    fn make_pr_minion(repo: &str, pr: Option<&str>, archived: bool) -> MinionInfo {
+        let mut info = make_completed_minion(pr, 0);
+        info.repo = repo.to_string();
+        if archived {
+            info.archived_at = Some(chrono::Utc::now());
+        }
+        info
+    }
+
+    #[test]
+    fn test_minion_has_pr_entry_matches() {
+        let info = make_pr_minion("owner/repo", Some("42"), false);
+        let minions = vec![("M001".to_string(), info)];
+        assert!(
+            minion_has_pr_entry(&minions, "owner/repo", "42"),
+            "Non-archived entry with matching repo+PR must return true"
+        );
+    }
+
+    #[test]
+    fn test_minion_has_pr_entry_archived_is_excluded() {
+        let info = make_pr_minion("owner/repo", Some("42"), true);
+        let minions = vec![("M001".to_string(), info)];
+        assert!(
+            !minion_has_pr_entry(&minions, "owner/repo", "42"),
+            "Archived entry must not block the sweeper"
+        );
+    }
+
+    #[test]
+    fn test_minion_has_pr_entry_wrong_pr() {
+        let info = make_pr_minion("owner/repo", Some("99"), false);
+        let minions = vec![("M001".to_string(), info)];
+        assert!(
+            !minion_has_pr_entry(&minions, "owner/repo", "42"),
+            "Entry with a different PR number must not match"
+        );
+    }
+
+    #[test]
+    fn test_minion_has_pr_entry_wrong_repo() {
+        let info = make_pr_minion("other/repo", Some("42"), false);
+        let minions = vec![("M001".to_string(), info)];
+        assert!(
+            !minion_has_pr_entry(&minions, "owner/repo", "42"),
+            "Entry for a different repo must not match"
+        );
+    }
+
+    #[test]
+    fn test_minion_has_pr_entry_no_pr_field() {
+        let info = make_pr_minion("owner/repo", None, false);
+        let minions = vec![("M001".to_string(), info)];
+        assert!(
+            !minion_has_pr_entry(&minions, "owner/repo", "42"),
+            "Entry with no PR field must not match"
+        );
+    }
+
+    #[test]
+    fn test_minion_has_pr_entry_empty_registry() {
+        let minions: Vec<(String, MinionInfo)> = vec![];
+        assert!(
+            !minion_has_pr_entry(&minions, "owner/repo", "42"),
+            "Empty registry yields no match"
+        );
     }
 }
