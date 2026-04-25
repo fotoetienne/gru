@@ -888,7 +888,9 @@ pub(crate) struct AutoMergePr {
 
 /// List open PRs that carry the `gru:auto-merge` label.
 ///
-/// Returns up to 100 results. Logs a warning if the result set is truncated.
+/// Returns up to 100 results. Logs a warning when exactly 100 results are
+/// returned, which may indicate the list was truncated (it is impossible to
+/// distinguish exactly-100 from truncated-at-100 without fetching more).
 pub(crate) async fn list_auto_merge_prs(
     host: &str,
     owner: &str,
