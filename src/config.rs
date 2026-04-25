@@ -576,6 +576,14 @@ impl LabConfig {
 # # Hours before a stopped Minion with no signal is auto-archived (default: 24)
 # archive_ttl_hours = 24
 
+# [daemon.auto_recovery]
+# # Maximum resets within the window before escalating to gru:blocked (0 = disabled).
+# # After max_resets resets, the next stuck detection escalates instead of resetting.
+# max_resets = 2
+#
+# # Sliding window in hours within which resets are counted (default: 2).
+# window_hours = 2
+
 # [agent]
 # # Which agent backend to use (default: "claude")
 # default = "claude"
@@ -763,8 +771,8 @@ impl LabConfig {
         if self.daemon.auto_recovery.max_resets > 0 && self.daemon.auto_recovery.window_hours == 0 {
             anyhow::bail!(
                 "daemon.auto_recovery.window_hours must be at least 1 when \
-                 auto_recovery.max_resets > 0 (a zero-duration window disables \
-                 effective reset tracking)"
+                 daemon.auto_recovery.max_resets > 0 (a zero-duration window \
+                 disables effective reset tracking)"
             );
         }
 

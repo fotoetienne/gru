@@ -65,10 +65,13 @@ struct SpawnMeta {
 /// and it was picked up again), at which point its history is cleared.
 struct RecoveryTracker {
     /// Per-issue timestamps of auto-recovery resets within the tracking window.
-    /// Key: `(full_repo_slug, issue_number)`.
+    /// Key: `(host_qualified_repo, issue_number)` where `host_qualified_repo`
+    /// is `host/owner/repo` — includes the GitHub host so multi-host daemons
+    /// cannot collide across hosts with the same `owner/repo` slug.
     resets: HashMap<(String, u64), Vec<Instant>>,
     /// Issues that were escalated to `gru:blocked` by this tracker.
     /// Cleared when the issue re-enters `gru:in-progress` (human intervention).
+    /// Keyed by the same canonical `(host/owner/repo, issue_number)` tuple.
     escalated: HashSet<(String, u64)>,
 }
 
@@ -85,9 +88,11 @@ impl RecoveryTracker {
     fn record_reset(&mut self, repo: &str, issue: u64, window: Duration) -> usize {
         let key = (repo.to_string(), issue);
         let entry = self.resets.entry(key).or_default();
-        let cutoff = Instant::now() - window;
-        entry.retain(|&t| t > cutoff);
-        entry.push(Instant::now());
+        let now = Instant::now();
+        if let Some(cutoff) = now.checked_sub(window) {
+            entry.retain(|&t| t > cutoff);
+        }
+        entry.push(now);
         entry.len()
     }
 
@@ -106,6 +111,20 @@ impl RecoveryTracker {
         let key = (repo.to_string(), issue);
         self.resets.remove(&key);
         self.escalated.remove(&key);
+    }
+
+    /// Remove entries whose entire timestamp history has expired outside `window`.
+    /// Call once per scan to prevent unbounded memory growth in long-running daemons.
+    fn prune(&mut self, window: Duration) {
+        let cutoff = Instant::now().checked_sub(window);
+        self.resets.retain(|_, timestamps| {
+            if let Some(cutoff) = cutoff {
+                timestamps.retain(|&t| t > cutoff);
+                !timestamps.is_empty()
+            } else {
+                true
+            }
+        });
     }
 }
 
@@ -2397,10 +2416,11 @@ async fn fallback_list_issues(
 /// configured daemon pickup label (`daemon.label`) with an explanatory comment so
 /// the lab can retry them.
 ///
-/// When an issue has been reset N or more times within the configured window it is
-/// escalated to `gru:blocked` instead, preventing infinite thrash loops. When the
-/// tracker sees a previously-escalated issue back in `gru:in-progress` (indicating
-/// a human cleared `gru:blocked`), the history for that issue is reset.
+/// When an issue has already been reset `max_resets` times within the configured
+/// window, the next qualifying detection escalates it to `gru:blocked` instead,
+/// preventing infinite thrash loops. When the tracker sees a previously-escalated
+/// issue back in `gru:in-progress` (indicating a human cleared `gru:blocked`),
+/// the history for that issue is reset.
 ///
 /// Per-repo and per-issue errors are logged as warnings and do not abort the scan.
 async fn recover_stuck_in_progress_issues(
@@ -2420,6 +2440,11 @@ async fn recover_stuck_in_progress_issues(
         .context("auto_recovery.window_hours overflow")?;
     let window = Duration::from_secs(window_secs);
 
+    // Prune stale tracker entries once per scan to bound in-memory state.
+    if max_resets > 0 {
+        tracker.prune(window);
+    }
+
     for repo_spec in &config.daemon.repos {
         let Some((host, owner, repo)) =
             crate::config::parse_repo_entry_with_hosts(repo_spec, &config.github_hosts)
@@ -2432,6 +2457,9 @@ async fn recover_stuck_in_progress_issues(
         };
 
         let full_repo = crate::github::repo_slug(&owner, &repo);
+        // Include the host in the tracker key so multi-host daemons don't
+        // collide across instances with the same owner/repo slug.
+        let tracker_key = format!("{}/{}", host, full_repo);
 
         let in_progress = match github::list_in_progress_issues_via_cli(&host, &owner, &repo).await
         {
@@ -2450,14 +2478,14 @@ async fn recover_stuck_in_progress_issues(
             // If this issue was previously escalated to gru:blocked but is now back
             // in gru:in-progress, a human cleared gru:blocked and it was picked up
             // again. Clear the history so it gets a fresh slate.
-            if tracker.is_escalated(&full_repo, issue.number) {
+            if tracker.is_escalated(&tracker_key, issue.number) {
                 tprintln!(
                     "♻️  Recovery: issue #{} in {} is back in-progress after escalation — \
                      clearing reset history",
                     issue.number,
                     repo_spec,
                 );
-                tracker.clear(&full_repo, issue.number);
+                tracker.clear(&tracker_key, issue.number);
             }
 
             // Only reset if the issue has been in-progress for longer than the threshold.
@@ -2495,7 +2523,7 @@ async fn recover_stuck_in_progress_issues(
             // Record this reset and check whether we've exceeded the threshold.
             // When max_resets == 0, escalation is disabled — always reset.
             let reset_count = if max_resets > 0 {
-                tracker.record_reset(&full_repo, issue.number, window)
+                tracker.record_reset(&tracker_key, issue.number, window)
             } else {
                 0
             };
@@ -2503,8 +2531,8 @@ async fn recover_stuck_in_progress_issues(
             if max_resets > 0 && reset_count > max_resets as usize {
                 // Too many resets within the window — escalate to gru:blocked.
                 tprintln!(
-                    "🚫 Recovery: escalating issue #{} in {} to {} after {} resets in {}h \
-                     (stuck for {}m)",
+                    "🚫 Recovery: escalating issue #{} in {} to {} after {} stuck detections \
+                     in {}h (stuck for {}m)",
                     issue.number,
                     repo_spec,
                     labels::BLOCKED,
@@ -2532,12 +2560,12 @@ async fn recover_stuck_in_progress_issues(
                     continue;
                 }
 
-                tracker.mark_escalated(&full_repo, issue.number);
+                tracker.mark_escalated(&tracker_key, issue.number);
 
                 let ready_label = &config.daemon.label;
                 let comment = format!(
-                    "🚫 Gru auto-recovery: issue has been reset {} times within {}h and \
-                     is still not making forward progress. Escalating to `{}` — \
+                    "🚫 Gru auto-recovery: issue has been detected stuck {} time(s) within \
+                     {}h and is still not making forward progress. Escalating to `{}` — \
                      human review needed.\n\n\
                      To re-enable automatic retries: remove the `{}` label and \
                      re-add `{}`. The reset counter will clear once the issue \
