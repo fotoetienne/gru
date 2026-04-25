@@ -405,9 +405,9 @@ async fn handle_failed_exit(
     // Note: this path intentionally does not call `enqueue_failure`. A persistent
     // duplicate-detection loop (e.g. a stuck sibling PID that keeps getting
     // detected) will not advance the retry counter and therefore will not trip
-    // the circuit breaker. The PID-stamping fix in `find_by_issue` should
-    // prevent this in practice; if it ever does recur, the log line below
-    // is the signal.
+    // the circuit breaker. The terminal-entry guards in try_spawn_for_issue and
+    // evaluate_existing_minions should prevent this in practice (issue #879);
+    // if it ever does recur, the log line below is the signal.
     if status.code() == Some(EXIT_ALREADY_RUNNING) {
         log::warn!(
             "⏭️  gru do for issue #{} exited with EXIT_ALREADY_RUNNING (after {:.1}s) — \
@@ -2059,6 +2059,10 @@ async fn is_issue_claimed(repo: &str, issue_number: Option<u64>) -> Result<bool>
             info.repo == repo
                 && info.issue == Some(issue_number)
                 && info.archived_at.is_none()
+                // Terminal entries (Failed/Completed) must never block a new
+                // spawn even if try_spawn_for_issue has already stamped the new
+                // child's PID on them (issue #879).
+                && !info.orchestration_phase.is_terminal()
                 && info.is_running()
                 // Only trust entries with start-time validation on platforms that
                 // support it (macOS, Linux). Legacy entries (pid_start_time = None)

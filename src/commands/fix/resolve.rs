@@ -96,14 +96,19 @@ fn evaluate_existing_minions(
     let any_running = existing.iter().any(|(_, info)| is_validated_running(info));
 
     if any_running {
-        // A minion is actively running - show error with suggestions
+        // Only show non-terminal entries in the error output — terminal ones
+        // were excluded from any_running and would just confuse the operator.
+        let non_terminal: Vec<_> = existing
+            .iter()
+            .filter(|(_, info)| !info.orchestration_phase.is_terminal())
+            .collect();
         eprintln!(
             "Error: {} existing Minion(s) found for issue {}:\n",
-            existing.len(),
+            non_terminal.len(),
             issue_num
         );
 
-        for (minion_id, info) in &existing {
+        for (minion_id, info) in &non_terminal {
             let actually_running = info.is_running();
             let status_msg = if actually_running {
                 match info.mode {
@@ -117,7 +122,7 @@ fn evaluate_existing_minions(
             eprintln!("  {} - status: {}", minion_id, status_msg);
         }
 
-        let (best_id, _) = existing.first().unwrap();
+        let (best_id, _) = non_terminal.first().unwrap();
         eprintln!("\nOptions:");
         eprintln!("  - Attach interactively: gru attach {}", best_id);
         eprintln!(
@@ -346,6 +351,27 @@ mod tests {
         assert!(
             matches!(result, ExistingMinionCheck::Resumable(ref id, _) if id == "M1ku"),
             "Stopped non-terminal minion with worktree must be Resumable, got: {:?}",
+            result
+        );
+    }
+
+    /// A Failed minion with live PID alongside a genuinely active non-terminal
+    /// minion must still surface AlreadyRunning — the terminal entry must not
+    /// suppress detection of the real running minion.
+    #[test]
+    fn active_minion_not_suppressed_by_failed_sibling_with_live_pid() {
+        let tmp = tempdir().unwrap();
+        let worktree = tmp.path().to_path_buf();
+        let live_pid = std::process::id();
+        let failed = make_info(OrchestrationPhase::Failed, Some(live_pid), worktree.clone());
+        let active = make_info(OrchestrationPhase::RunningAgent, Some(live_pid), worktree);
+        let entries = vec![("M1ku".into(), failed), ("M1lj".into(), active)];
+
+        let result = evaluate_existing_minions("owner", "repo", 329, entries);
+
+        assert!(
+            matches!(result, ExistingMinionCheck::AlreadyRunning),
+            "Active non-terminal sibling must still be detected as AlreadyRunning, got: {:?}",
             result
         );
     }
