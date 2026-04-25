@@ -113,8 +113,24 @@ impl RecoveryTracker {
         self.escalated.remove(&key);
     }
 
+    /// Undo the most recently recorded reset for `(repo, issue)`.
+    ///
+    /// Called when the label-edit that a `record_reset` was paired with fails,
+    /// so that a transient GitHub API error does not permanently increment the
+    /// counter and cause premature escalation on the next scan.
+    fn remove_last_reset(&mut self, repo: &str, issue: u64) {
+        let key = (repo.to_string(), issue);
+        if let Some(entry) = self.resets.get_mut(&key) {
+            entry.pop();
+            if entry.is_empty() {
+                self.resets.remove(&key);
+            }
+        }
+    }
+
     /// Remove entries whose entire timestamp history has expired outside `window`.
-    /// Call once per scan to prevent unbounded memory growth in long-running daemons.
+    /// Also prunes `escalated` entries for issues that have no remaining reset
+    /// history (e.g., closed while blocked). Call once per scan.
     fn prune(&mut self, window: Duration) {
         let cutoff = Instant::now().checked_sub(window);
         self.resets.retain(|_, timestamps| {
@@ -125,6 +141,11 @@ impl RecoveryTracker {
                 true
             }
         });
+        // Drop escalated entries whose reset history has fully expired.
+        // Uses a local reference to avoid a simultaneous mutable + immutable
+        // borrow of `self` through the closure.
+        let resets = &self.resets;
+        self.escalated.retain(|key| resets.contains_key(key));
     }
 }
 
@@ -2557,6 +2578,9 @@ async fn recover_stuck_in_progress_issues(
                         issue.number,
                         e
                     );
+                    // Undo the counter increment so a transient API failure does
+                    // not permanently advance the reset count.
+                    tracker.remove_last_reset(&tracker_key, issue.number);
                     continue;
                 }
 
@@ -2621,6 +2645,9 @@ async fn recover_stuck_in_progress_issues(
                         issue.number,
                         e
                     );
+                    // Undo the counter increment so a transient API failure does
+                    // not permanently advance the reset count.
+                    tracker.remove_last_reset(&tracker_key, issue.number);
                     continue;
                 }
 

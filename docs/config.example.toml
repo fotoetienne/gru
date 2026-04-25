@@ -83,7 +83,8 @@
 
 # Auto-recovery escalation: when an issue is reset too many times without
 # making forward progress, escalate it to gru:blocked instead of resetting.
-# Remove gru:blocked manually to re-enable automatic retries.
+# Remove gru:blocked and re-add the daemon pickup label (for example
+# gru:todo) manually to re-enable automatic retries.
 #
 # [daemon.auto_recovery]
 # Maximum resets within the window before escalation (0 = disabled, i.e.

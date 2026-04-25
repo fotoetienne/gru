@@ -151,8 +151,8 @@ pub(crate) struct DaemonConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct AutoRecoveryConfig {
     /// Maximum number of times an issue can be auto-recovered within the tracking
-    /// window. After exactly this many resets the issue is reset once more, and on
-    /// the (N+1)th stuck detection it is escalated to `gru:blocked` instead.
+    /// window. Once this many resets have already occurred, the next stuck
+    /// detection is escalated to `gru:blocked` instead of performing another reset.
     /// Set to 0 to disable escalation (issues reset indefinitely). Default: 2
     /// (two resets are logged as "reset #1 of 2" and "reset #2 of 2"; the third
     /// stuck detection triggers escalation).
