@@ -30,6 +30,10 @@ macro_rules! tprintln {
 /// Not user-configurable — this is an implementation cadence, not a config knob.
 const RECOVERY_SCAN_INTERVAL: Duration = Duration::from_secs(300);
 
+/// How often the lab sweeps for orphaned `gru:auto-merge` PRs.
+/// Not user-configurable — this is an implementation cadence, not a config knob.
+const AUTO_MERGE_SWEEP_INTERVAL: Duration = Duration::from_secs(300);
+
 /// A child process tracked by the lab, with optional metadata for label restoration.
 struct SpawnedChild {
     child: Child,
@@ -2446,9 +2450,6 @@ async fn recover_stuck_in_progress_issues(config: &crate::config::LabConfig) -> 
     Ok(())
 }
 
-/// How often the lab sweeps for orphaned `gru:auto-merge` PRs.
-const AUTO_MERGE_SWEEP_INTERVAL: Duration = Duration::from_secs(300);
-
 /// Scan all configured repos for open PRs labelled `gru:auto-merge` that have no
 /// live Minion monitoring them, and queue `--auto` merge when all deterministic
 /// readiness checks pass.
@@ -2547,7 +2548,6 @@ async fn sweep_orphaned_auto_merge_prs(config: &LabConfig) {
             );
 
             let pr_num_str = pr.number.to_string();
-            let repo_full = github::repo_slug(&owner, &repo);
             match github::gh_cli_command(&host)
                 .args([
                     "pr",
@@ -2556,7 +2556,7 @@ async fn sweep_orphaned_auto_merge_prs(config: &LabConfig) {
                     "--squash",
                     "--auto",
                     "-R",
-                    &repo_full,
+                    &full_repo,
                 ])
                 .output()
                 .await
@@ -2590,7 +2590,13 @@ async fn sweep_orphaned_auto_merge_prs(config: &LabConfig) {
     }
 }
 
-/// Returns `true` if a live Minion process is monitoring the given PR.
+/// Returns `true` if a non-archived Minion entry in the registry is associated
+/// with the given PR, indicating it may still be responsible for monitoring it.
+///
+/// Intentionally does not require `is_running()` — a Minion whose process just
+/// died but hasn't been archived yet is still "responsible" from the sweeper's
+/// perspective. The archive machinery will clean it up; we don't want to race
+/// against it by queueing a merge prematurely.
 ///
 /// Fails-safe to `true` on registry errors to avoid double-queuing a merge.
 async fn is_pr_monitored_by_live_minion(full_repo: &str, pr_number: u64) -> bool {
@@ -2601,7 +2607,6 @@ async fn is_pr_monitored_by_live_minion(full_repo: &str, pr_number: u64) -> bool
             info.repo == repo
                 && info.pr.as_deref() == Some(pr_str.as_str())
                 && info.archived_at.is_none()
-                && info.is_running()
         });
         Ok(monitored)
     })
