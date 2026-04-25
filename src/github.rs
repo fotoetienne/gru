@@ -878,6 +878,56 @@ pub async fn is_pr_merged_via_cli(
     Ok(state == "MERGED")
 }
 
+/// An open PR returned by the auto-merge sweep.
+#[derive(Debug, serde::Deserialize)]
+pub(crate) struct AutoMergePr {
+    pub(crate) number: u64,
+    #[serde(default)]
+    pub(crate) labels: Vec<IssueLabel>,
+}
+
+/// List open PRs that carry the `gru:auto-merge` label.
+///
+/// Returns up to 100 results. Logs a warning if the result set is truncated.
+pub(crate) async fn list_auto_merge_prs(
+    host: &str,
+    owner: &str,
+    repo: &str,
+) -> Result<Vec<AutoMergePr>> {
+    let repo_full = repo_slug(owner, repo);
+    let stdout = run_gh(
+        host,
+        &[
+            "pr",
+            "list",
+            "--repo",
+            &repo_full,
+            "--label",
+            labels::AUTO_MERGE,
+            "--state",
+            "open",
+            "--json",
+            "number,labels",
+            "--limit",
+            "100",
+        ],
+    )
+    .await?;
+
+    let items: Vec<AutoMergePr> =
+        serde_json::from_str(&stdout).context("Failed to parse gh pr list (auto-merge) JSON")?;
+
+    if items.len() == 100 {
+        log::warn!(
+            "⚠️  Auto-merge sweep: gh pr list returned exactly 100 results for {}/{} — some PRs may have been truncated",
+            owner,
+            repo
+        );
+    }
+
+    Ok(items)
+}
+
 /// Simple struct to hold issue information from gh CLI
 #[derive(Debug, serde::Deserialize)]
 pub(crate) struct IssueInfo {

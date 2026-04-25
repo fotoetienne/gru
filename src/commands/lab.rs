@@ -153,6 +153,9 @@ pub(crate) async fn handle_lab(
     // avoids false positives while minions re-register after a lab restart.
     let mut last_recovery_scan: Option<Instant> = None;
 
+    // Auto-merge sweep timer — same semantics as last_recovery_scan.
+    let mut last_auto_merge_sweep: Option<Instant> = None;
+
     if no_resume {
         tprintln!("⏭️  Auto-resume disabled (--no-resume)");
         tprintln!();
@@ -326,6 +329,19 @@ pub(crate) async fn handle_lab(
                         }
                         Some(_) => {}
                     }
+                }
+
+                // Periodic auto-merge sweep: queue merges for orphaned auto-merge PRs.
+                // Same timer semantics as last_recovery_scan.
+                match last_auto_merge_sweep {
+                    None => {
+                        last_auto_merge_sweep = Some(Instant::now());
+                    }
+                    Some(t) if t.elapsed() >= AUTO_MERGE_SWEEP_INTERVAL => {
+                        last_auto_merge_sweep = Some(Instant::now());
+                        sweep_orphaned_auto_merge_prs(&config).await;
+                    }
+                    Some(_) => {}
                 }
 
                 // Check if a signal arrived during poll_and_spawn
@@ -2428,6 +2444,179 @@ async fn recover_stuck_in_progress_issues(config: &crate::config::LabConfig) -> 
     }
 
     Ok(())
+}
+
+/// How often the lab sweeps for orphaned `gru:auto-merge` PRs.
+const AUTO_MERGE_SWEEP_INTERVAL: Duration = Duration::from_secs(300);
+
+/// Scan all configured repos for open PRs labelled `gru:auto-merge` that have no
+/// live Minion monitoring them, and queue `--auto` merge when all deterministic
+/// readiness checks pass.
+///
+/// This handles PRs that were labelled outside of `gru do` (e.g., by a human or
+/// a Minion that has since exited) and whose label therefore has no consumer.
+///
+/// Per-repo and per-PR errors are logged as warnings and do not abort the scan.
+async fn sweep_orphaned_auto_merge_prs(config: &LabConfig) {
+    for repo_spec in &config.daemon.repos {
+        let Some((host, owner, repo)) =
+            parse_repo_entry_with_hosts(repo_spec, &config.github_hosts)
+        else {
+            log::warn!(
+                "⚠️  Auto-merge sweep: could not parse repo spec '{}'",
+                repo_spec
+            );
+            continue;
+        };
+
+        let prs = match github::list_auto_merge_prs(&host, &owner, &repo).await {
+            Ok(prs) => prs,
+            Err(e) => {
+                log::warn!(
+                    "⚠️  Auto-merge sweep: failed to list auto-merge PRs for {}: {:#}",
+                    repo_spec,
+                    e
+                );
+                continue;
+            }
+        };
+
+        if prs.is_empty() {
+            continue;
+        }
+
+        let full_repo = github::repo_slug(&owner, &repo);
+
+        for pr in &prs {
+            // Skip if a live Minion is already monitoring this PR.
+            if is_pr_monitored_by_live_minion(&full_repo, pr.number).await {
+                log::debug!(
+                    "Auto-merge sweep: skipping PR #{} in {} — live Minion is monitoring it",
+                    pr.number,
+                    repo_spec,
+                );
+                continue;
+            }
+
+            // Skip if gru:needs-human-review is present.
+            if pr
+                .labels
+                .iter()
+                .any(|l| l.name == labels::NEEDS_HUMAN_REVIEW)
+            {
+                log::debug!(
+                    "Auto-merge sweep: skipping PR #{} in {} — has gru:needs-human-review",
+                    pr.number,
+                    repo_spec,
+                );
+                continue;
+            }
+
+            // Check deterministic merge readiness.
+            let readiness = match crate::merge_readiness::check_merge_readiness(
+                &host, &owner, &repo, pr.number,
+            )
+            .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    log::warn!(
+                        "⚠️  Auto-merge sweep: failed to check readiness for PR #{} in {}: {:#}",
+                        pr.number,
+                        repo_spec,
+                        e
+                    );
+                    continue;
+                }
+            };
+
+            if !readiness.is_ready() {
+                log::debug!(
+                    "Auto-merge sweep: PR #{} in {} not ready ({})",
+                    pr.number,
+                    repo_spec,
+                    readiness,
+                );
+                continue;
+            }
+
+            tprintln!(
+                "🔀 Auto-merge sweep: queueing merge for orphaned PR #{} in {}",
+                pr.number,
+                repo_spec,
+            );
+
+            let pr_num_str = pr.number.to_string();
+            let repo_full = github::repo_slug(&owner, &repo);
+            match github::gh_cli_command(&host)
+                .args([
+                    "pr",
+                    "merge",
+                    &pr_num_str,
+                    "--squash",
+                    "--auto",
+                    "-R",
+                    &repo_full,
+                ])
+                .output()
+                .await
+            {
+                Ok(output) if output.status.success() => {
+                    tprintln!(
+                        "✅ Auto-merge queued for orphaned PR #{} in {}",
+                        pr.number,
+                        repo_spec,
+                    );
+                }
+                Ok(output) => {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    log::warn!(
+                        "⚠️  Auto-merge sweep: merge command failed for PR #{} in {}: {}",
+                        pr.number,
+                        repo_spec,
+                        stderr.trim(),
+                    );
+                }
+                Err(e) => {
+                    log::warn!(
+                        "⚠️  Auto-merge sweep: failed to run merge command for PR #{} in {}: {:#}",
+                        pr.number,
+                        repo_spec,
+                        e,
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Returns `true` if a live Minion process is monitoring the given PR.
+///
+/// Fails-safe to `true` on registry errors to avoid double-queuing a merge.
+async fn is_pr_monitored_by_live_minion(full_repo: &str, pr_number: u64) -> bool {
+    let pr_str = pr_number.to_string();
+    let repo = full_repo.to_string();
+    match with_registry(move |registry| {
+        let monitored = registry.list().iter().any(|(_id, info)| {
+            info.repo == repo
+                && info.pr.as_deref() == Some(pr_str.as_str())
+                && info.archived_at.is_none()
+                && info.is_running()
+        });
+        Ok(monitored)
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(e) => {
+            log::warn!(
+                "Failed to check registry for PR #{}: {} — assuming monitored (fail-safe)",
+                pr_number,
+                e
+            );
+            true
+        }
+    }
 }
 
 #[cfg(test)]
