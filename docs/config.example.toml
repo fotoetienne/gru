@@ -81,6 +81,19 @@
 # machine may hold the issue).
 # recovery_threshold_mins = 30
 
+# Auto-recovery escalation: when an issue is reset too many times without
+# making forward progress, escalate it to gru:blocked instead of resetting.
+# Remove gru:blocked and re-add the daemon pickup label (for example
+# gru:todo) manually to re-enable automatic retries.
+#
+# [daemon.auto_recovery]
+# Maximum resets within the window before escalation (0 = disabled, i.e.
+# reset indefinitely).
+# max_resets = 2
+#
+# Sliding window in hours within which repeated resets are counted.
+# window_hours = 2
+
 # ─────────────────────────────────────────────────────────────────────
 # Agent backend
 # ─────────────────────────────────────────────────────────────────────
