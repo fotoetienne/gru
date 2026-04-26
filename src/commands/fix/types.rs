@@ -74,6 +74,7 @@ pub(crate) struct AgentResult {
 }
 
 /// Result of checking for existing minions on an issue.
+#[derive(Debug)]
 pub(crate) enum ExistingMinionCheck {
     /// No existing minions found, proceed with new session.
     None,

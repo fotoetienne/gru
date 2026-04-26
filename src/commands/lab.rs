@@ -528,9 +528,9 @@ async fn handle_failed_exit(
     // Note: this path intentionally does not call `enqueue_failure`. A persistent
     // duplicate-detection loop (e.g. a stuck sibling PID that keeps getting
     // detected) will not advance the retry counter and therefore will not trip
-    // the circuit breaker. The PID-stamping fix in `find_by_issue` should
-    // prevent this in practice; if it ever does recur, the log line below
-    // is the signal.
+    // the circuit breaker. The terminal-entry guards in try_spawn_for_issue and
+    // evaluate_existing_minions should prevent this in practice (issue #879);
+    // if it ever does recur, the log line below is the signal.
     if status.code() == Some(EXIT_ALREADY_RUNNING) {
         log::warn!(
             "⏭️  gru do for issue #{} exited with EXIT_ALREADY_RUNNING (after {:.1}s) — \
@@ -1627,7 +1627,14 @@ async fn try_spawn_for_issue(
                             issue_number
                         );
                     }
-                    for (mid, _) in entries {
+                    for (mid, entry_info) in entries {
+                        // Skip terminal entries (Failed/Completed): they must
+                        // not be stamped with the new child's PID or their phase
+                        // would appear live to check_existing_minions, causing
+                        // EXIT_ALREADY_RUNNING and a thrash loop (issue #879).
+                        if entry_info.orchestration_phase.is_terminal() {
+                            continue;
+                        }
                         registry.update(&mid, |info| {
                             info.pid = Some(pid);
                             info.pid_start_time =
@@ -2175,6 +2182,11 @@ async fn is_issue_claimed(repo: &str, issue_number: Option<u64>) -> Result<bool>
             info.repo == repo
                 && info.issue == Some(issue_number)
                 && info.archived_at.is_none()
+                // Terminal entries (Failed/Completed) must never block a new
+                // spawn, even if they still carry a PID due to legacy behavior
+                // from older versions or other stale/corrupt registry state
+                // (issue #879).
+                && !info.orchestration_phase.is_terminal()
                 && info.is_running()
                 // Only trust entries with start-time validation on platforms that
                 // support it (macOS, Linux). Legacy entries (pid_start_time = None)
