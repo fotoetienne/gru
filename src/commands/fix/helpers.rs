@@ -77,7 +77,7 @@ pub(crate) const GRU_RETRY_PARENT_ENV: &str = "GRU_RETRY_PARENT";
 /// (`GRU_RETRY_PARENT=lab` in the environment), lab owns retry/give-up policy and
 /// the label is deferred so the retry queue can fire.
 pub(crate) fn label_eagerly_on_failure() -> bool {
-    std::env::var(GRU_RETRY_PARENT_ENV).is_err()
+    std::env::var(GRU_RETRY_PARENT_ENV).as_deref() != Ok("lab")
 }
 
 /// Attempts to mark an issue as failed via CLI (fire-and-forget).
@@ -365,8 +365,9 @@ pub(crate) async fn try_preserve_branch_work(
 /// recoverable only by the multi-hour auto-recovery scan.
 ///
 /// This helper:
-/// 1. Posts an explanatory comment on the issue
-/// 2. Transitions the issue label `gru:in-progress` → `gru:failed`
+/// 1. Posts an explanatory comment on the issue (always)
+/// 2. Transitions the issue label `gru:in-progress` → `gru:failed` (only when
+///    `label_eagerly_on_failure()` returns true — deferred when lab spawned this process)
 /// 3. Clears the PID and marks the minion as `Stopped` in the registry
 ///
 /// Currently wired only to PR creation failures in `run_worker`. The PR
@@ -491,6 +492,13 @@ mod tests {
     fn no_eager_label_when_env_set() {
         temp_env::with_var(GRU_RETRY_PARENT_ENV, Some("lab"), || {
             assert!(!label_eagerly_on_failure());
+        });
+    }
+
+    #[test]
+    fn eager_label_when_env_has_unexpected_value() {
+        temp_env::with_var(GRU_RETRY_PARENT_ENV, Some("1"), || {
+            assert!(label_eagerly_on_failure());
         });
     }
 

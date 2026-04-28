@@ -2319,6 +2319,8 @@ async fn spawn_minion(repo: &str, host: &str, issue_number: u64) -> Result<Child
     let mut cmd = tokio::process::Command::new(exe);
     cmd.arg("do")
         .arg(&issue_ref)
+        // GRU_RETRY_PARENT=lab tells the worker to defer gru:failed labeling so
+        // lab's retry queue can fire (see commands::fix::GRU_RETRY_PARENT_ENV).
         .env("GRU_RETRY_PARENT", "lab")
         .env_remove("TMUX")
         .env_remove("TMUX_PANE");
@@ -2348,6 +2350,8 @@ async fn spawn_resume(minion_id: &str) -> Result<Child> {
     let mut cmd = tokio::process::Command::new(exe);
     cmd.arg("resume")
         .arg(minion_id)
+        // Match spawn_minion: defer gru:failed labeling so lab can control the outcome.
+        .env("GRU_RETRY_PARENT", "lab")
         .env_remove("TMUX")
         .env_remove("TMUX_PANE");
 
