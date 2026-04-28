@@ -66,21 +66,14 @@ pub(crate) async fn try_remove_blocked_label(
     }
 }
 
-/// Environment variable set by `gru lab` on spawned `gru do` children.
-/// Presence (with value `GRU_RETRY_PARENT_VALUE`) signals that lab owns retry/give-up
-/// policy, so the worker should defer `gru:failed` labeling.
-pub(crate) const GRU_RETRY_PARENT_ENV: &str = "GRU_RETRY_PARENT";
-
-/// Expected value of `GRU_RETRY_PARENT` when set by lab.
-pub(crate) const GRU_RETRY_PARENT_VALUE: &str = "lab";
-
 /// Returns `true` when the worker should eagerly apply `gru:failed` on agent failure.
 ///
 /// Standalone `gru do` invocations always label eagerly. When spawned by `gru lab`
 /// (`GRU_RETRY_PARENT=lab` in the environment), lab owns retry/give-up policy and
 /// the label is deferred so the retry queue can fire.
 pub(crate) fn label_eagerly_on_failure() -> bool {
-    std::env::var(GRU_RETRY_PARENT_ENV).as_deref() != Ok(GRU_RETRY_PARENT_VALUE)
+    std::env::var(crate::labels::GRU_RETRY_PARENT_ENV).as_deref()
+        != Ok(crate::labels::GRU_RETRY_PARENT_VALUE)
 }
 
 /// Attempts to mark an issue as failed via CLI (fire-and-forget).
@@ -389,7 +382,8 @@ pub(crate) async fn cleanup_post_agent_failure(
     reason: &str,
 ) {
     if let Some(num) = issue_num {
-        let comment = if label_eagerly_on_failure() {
+        let eager = label_eagerly_on_failure();
+        let comment = if eager {
             format!(
                 "⚠️  Minion `{}` failed after the agent phase: {}\n\n\
                  Use `gru resume {}` to retry.",
@@ -404,7 +398,7 @@ pub(crate) async fn cleanup_post_agent_failure(
             )
         };
         try_post_issue_comment(host, owner, repo, num, &comment).await;
-        if label_eagerly_on_failure() {
+        if eager {
             try_mark_issue_failed(host, owner, repo, num).await;
         } else {
             log::debug!(
@@ -497,7 +491,8 @@ mod tests {
     use crate::agent_runner::AgentRunnerError;
     use std::time::Duration;
 
-    use super::{label_eagerly_on_failure, GRU_RETRY_PARENT_ENV, GRU_RETRY_PARENT_VALUE};
+    use super::label_eagerly_on_failure;
+    use crate::labels::{GRU_RETRY_PARENT_ENV, GRU_RETRY_PARENT_VALUE};
 
     #[test]
     fn eager_label_when_env_unset() {

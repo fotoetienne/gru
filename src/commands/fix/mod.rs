@@ -8,9 +8,7 @@ mod worker;
 mod worktree;
 
 // Re-export public API used by other modules (e.g., resume.rs)
-pub(crate) use helpers::{
-    update_orchestration_phase, GRU_RETRY_PARENT_ENV, GRU_RETRY_PARENT_VALUE,
-};
+pub(crate) use helpers::update_orchestration_phase;
 pub(crate) use resolve::fetch_issue_details;
 use resolve::{check_existing_minions, claim_issue, resolve_issue};
 use types::ExistingMinionCheck;

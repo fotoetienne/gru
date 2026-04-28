@@ -35,7 +35,7 @@ pub(crate) fn build_claude_command(
         .env("GH_HOST", github_host)
         // Prevent GRU_RETRY_PARENT from leaking into Claude Code and any tools
         // it spawns — the guard is meant for the direct gru do/resume process only.
-        .env_remove(crate::commands::fix::GRU_RETRY_PARENT_ENV);
+        .env_remove(crate::labels::GRU_RETRY_PARENT_ENV);
     cmd
 }
 
@@ -63,6 +63,6 @@ pub(crate) fn build_claude_resume_command(
         .stderr(std::process::Stdio::inherit())
         .current_dir(worktree_path)
         .env("GH_HOST", github_host)
-        .env_remove(crate::commands::fix::GRU_RETRY_PARENT_ENV);
+        .env_remove(crate::labels::GRU_RETRY_PARENT_ENV);
     cmd
 }
