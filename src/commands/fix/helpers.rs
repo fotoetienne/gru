@@ -66,6 +66,16 @@ pub(crate) async fn try_remove_blocked_label(
     }
 }
 
+/// Returns `true` when the worker should eagerly apply `gru:failed` on agent failure.
+///
+/// Standalone `gru do` invocations always label eagerly. When spawned by `gru lab`
+/// (`GRU_RETRY_PARENT=lab` in the environment), lab owns retry/give-up policy and
+/// the label is deferred so the retry queue can fire.
+pub(crate) fn label_eagerly_on_failure() -> bool {
+    std::env::var(crate::labels::GRU_RETRY_PARENT_ENV).as_deref()
+        != Ok(crate::labels::GRU_RETRY_PARENT_VALUE)
+}
+
 /// Attempts to mark an issue as failed via CLI (fire-and-forget).
 /// Logs success/failure but does not propagate errors.
 pub(crate) async fn try_mark_issue_failed(host: &str, owner: &str, repo: &str, issue_num: u64) {
@@ -351,8 +361,9 @@ pub(crate) async fn try_preserve_branch_work(
 /// recoverable only by the multi-hour auto-recovery scan.
 ///
 /// This helper:
-/// 1. Posts an explanatory comment on the issue
-/// 2. Transitions the issue label `gru:in-progress` → `gru:failed`
+/// 1. Posts an explanatory comment on the issue (always)
+/// 2. Transitions the issue label `gru:in-progress` → `gru:failed` (only when
+///    `label_eagerly_on_failure()` returns true — deferred when lab spawned this process)
 /// 3. Clears the PID and marks the minion as `Stopped` in the registry
 ///
 /// Currently wired only to PR creation failures in `run_worker`. The PR
@@ -371,13 +382,31 @@ pub(crate) async fn cleanup_post_agent_failure(
     reason: &str,
 ) {
     if let Some(num) = issue_num {
-        let comment = format!(
-            "⚠️  Minion `{}` failed after the agent phase: {}\n\n\
-             Use `gru resume {}` to retry.",
-            minion_id, reason, minion_id
-        );
+        let eager = label_eagerly_on_failure();
+        let comment = if eager {
+            format!(
+                "⚠️  Minion `{}` failed after the agent phase: {}\n\n\
+                 Use `gru resume {}` to retry.",
+                minion_id, reason, minion_id
+            )
+        } else {
+            format!(
+                "⚠️  Minion `{}` failed after the agent phase: {}\n\n\
+                 `gru lab` will retry automatically. To retry manually instead, \
+                 use `gru resume {}`.",
+                minion_id, reason, minion_id
+            )
+        };
         try_post_issue_comment(host, owner, repo, num, &comment).await;
-        try_mark_issue_failed(host, owner, repo, num).await;
+        if eager {
+            try_mark_issue_failed(host, owner, repo, num).await;
+        } else {
+            log::debug!(
+                "GRU_RETRY_PARENT=lab: deferring gru:failed for issue #{} — \
+                 lab's retry queue will decide",
+                num
+            );
+        }
     }
 
     let mid = minion_id.to_string();
@@ -462,6 +491,30 @@ mod tests {
     use crate::agent_runner::AgentRunnerError;
     use std::time::Duration;
 
+    use super::label_eagerly_on_failure;
+    use crate::labels::{GRU_RETRY_PARENT_ENV, GRU_RETRY_PARENT_VALUE};
+
+    #[test]
+    fn eager_label_when_env_unset() {
+        temp_env::with_var_unset(GRU_RETRY_PARENT_ENV, || {
+            assert!(label_eagerly_on_failure());
+        });
+    }
+
+    #[test]
+    fn no_eager_label_when_env_set() {
+        temp_env::with_var(GRU_RETRY_PARENT_ENV, Some(GRU_RETRY_PARENT_VALUE), || {
+            assert!(!label_eagerly_on_failure());
+        });
+    }
+
+    #[test]
+    fn eager_label_when_env_has_unexpected_value() {
+        temp_env::with_var(GRU_RETRY_PARENT_ENV, Some("1"), || {
+            assert!(label_eagerly_on_failure());
+        });
+    }
+
     #[test]
     fn test_blocked_reason_inactivity_stuck() {
         let minion_id = "M042";
@@ -522,7 +575,7 @@ mod tests {
     }
 
     #[test]
-    fn test_post_agent_failure_comment_format() {
+    fn test_post_agent_failure_comment_format_standalone() {
         let minion_id = "M1gt";
         let reason = "PR creation failed: no PR was created";
         let comment = format!(
@@ -534,6 +587,23 @@ mod tests {
             comment,
             "⚠️  Minion `M1gt` failed after the agent phase: PR creation failed: no PR was created\n\n\
              Use `gru resume M1gt` to retry."
+        );
+    }
+
+    #[test]
+    fn test_post_agent_failure_comment_format_lab() {
+        let minion_id = "M1gt";
+        let reason = "PR creation failed: no PR was created";
+        let comment = format!(
+            "⚠️  Minion `{}` failed after the agent phase: {}\n\n\
+             `gru lab` will retry automatically. To retry manually instead, \
+             use `gru resume {}`.",
+            minion_id, reason, minion_id
+        );
+        assert_eq!(
+            comment,
+            "⚠️  Minion `M1gt` failed after the agent phase: PR creation failed: no PR was created\n\n\
+             `gru lab` will retry automatically. To retry manually instead, use `gru resume M1gt`."
         );
     }
 

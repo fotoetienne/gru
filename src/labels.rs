@@ -52,6 +52,17 @@ pub(crate) const ALL_LABELS: &[(&str, &str, &str)] = &[
     ),
 ];
 
+// ============================================================================
+// Environment variable keys used by the lab ↔ worker handshake
+// ============================================================================
+
+/// Set by `gru lab` on spawned `gru do` children (value: `GRU_RETRY_PARENT_VALUE`).
+/// Tells the worker to defer `gru:failed` labeling so lab's retry queue can decide.
+pub(crate) const GRU_RETRY_PARENT_ENV: &str = "GRU_RETRY_PARENT";
+
+/// Expected value of `GRU_RETRY_PARENT` when set by lab.
+pub(crate) const GRU_RETRY_PARENT_VALUE: &str = "lab";
+
 /// Look up the color and description for a label by its canonical name.
 /// Returns `Some((color, description))` if found in `ALL_LABELS`.
 pub(crate) fn get_label_info(canonical: &str) -> Option<(&'static str, &'static str)> {

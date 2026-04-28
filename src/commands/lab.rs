@@ -2319,6 +2319,12 @@ async fn spawn_minion(repo: &str, host: &str, issue_number: u64) -> Result<Child
     let mut cmd = tokio::process::Command::new(exe);
     cmd.arg("do")
         .arg(&issue_ref)
+        // Tells the worker to defer gru:failed labeling so lab's retry queue can fire.
+        // See labels::{GRU_RETRY_PARENT_ENV, GRU_RETRY_PARENT_VALUE}.
+        .env(
+            crate::labels::GRU_RETRY_PARENT_ENV,
+            crate::labels::GRU_RETRY_PARENT_VALUE,
+        )
         .env_remove("TMUX")
         .env_remove("TMUX_PANE");
 
@@ -2347,6 +2353,12 @@ async fn spawn_resume(minion_id: &str) -> Result<Child> {
     let mut cmd = tokio::process::Command::new(exe);
     cmd.arg("resume")
         .arg(minion_id)
+        // Explicitly remove GRU_RETRY_PARENT even if it was set in the shell that
+        // launched lab. Resume failures keep eager gru:failed labeling: lab's
+        // reap_children skips handle_failed_exit for resume children (spawn_meta: None),
+        // so deferring without a retry handler would leave the issue stuck at
+        // gru:in-progress. Wiring resume into the retry queue is a separate issue.
+        .env_remove(crate::labels::GRU_RETRY_PARENT_ENV)
         .env_remove("TMUX")
         .env_remove("TMUX_PANE");
 

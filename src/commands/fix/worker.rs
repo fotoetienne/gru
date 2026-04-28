@@ -1,7 +1,7 @@
 use super::agent::{resume_agent_session, run_agent_session};
 use super::helpers::{
-    try_mark_issue_blocked, try_mark_issue_failed, try_preserve_branch_work,
-    update_orchestration_phase,
+    label_eagerly_on_failure, try_mark_issue_blocked, try_mark_issue_failed,
+    try_preserve_branch_work, update_orchestration_phase,
 };
 use super::monitor::{monitor_ci_after_fix, monitor_pr_lifecycle};
 use super::pr::handle_pr_creation;
@@ -82,19 +82,31 @@ pub(crate) async fn run_agent_phase(
         Ok(result) => {
             if !result.status.success() {
                 update_orchestration_phase(&wt_ctx.minion_id, OrchestrationPhase::Failed).await;
-                if let Some(issue_num) = issue_ctx.issue_num {
-                    try_mark_issue_failed(
-                        &issue_ctx.host,
-                        &issue_ctx.owner,
-                        &issue_ctx.repo,
-                        issue_num,
-                    )
-                    .await;
+                if label_eagerly_on_failure() {
+                    if let Some(issue_num) = issue_ctx.issue_num {
+                        try_mark_issue_failed(
+                            &issue_ctx.host,
+                            &issue_ctx.owner,
+                            &issue_ctx.repo,
+                            issue_num,
+                        )
+                        .await;
+                    }
+                } else if let Some(issue_num) = issue_ctx.issue_num {
+                    log::debug!(
+                        "GRU_RETRY_PARENT=lab: deferring gru:failed for issue #{} — \
+                         lab's retry queue will decide",
+                        issue_num
+                    );
                 }
             }
             Ok(Some(result))
         }
         Err(e) if crate::agent_runner::is_stuck_or_timeout_error(&e) => {
+            // Stuck/timeout always applies gru:blocked immediately, regardless of
+            // GRU_RETRY_PARENT. Unlike transient exit failures (which lab can retry),
+            // a stuck minion needs human intervention — deferring the label would leave
+            // the issue in gru:in-progress with no live process.
             update_orchestration_phase(&wt_ctx.minion_id, OrchestrationPhase::Failed).await;
             log::error!("🚨 {:#}", e);
             if let Some(issue_num) = issue_ctx.issue_num {
