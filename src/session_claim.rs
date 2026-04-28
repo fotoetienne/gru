@@ -113,9 +113,10 @@ fn claim_session_in_registry(
 
     // Claim the session with the requested mode.
     // Clear archived_at so a resumed/attached minion is visible in `gru status`.
-    // When claim_pid is provided, stamp pid/pid_start_time atomically so no
-    // concurrent claimer can observe a `mode=<target>, pid=None` intermediate
-    // state (issue #864).
+    // When claim_pid is provided and orchestration_phase is non-terminal, stamp
+    // pid/pid_start_time atomically so no concurrent claimer can observe a
+    // `mode=<target>, pid=None` intermediate state (issue #864). Terminal-phase
+    // rows skip the PID stamp — see the guard below (issue #878).
     reg.update(&id, |i| {
         i.mode = target_mode.clone();
         i.last_activity = Utc::now();
@@ -592,7 +593,7 @@ mod tests {
     // --- issue #878: terminal-phase PID protection ---
 
     /// A Failed minion's pid/pid_start_time must not be overwritten by a
-    /// subsequent `reclaim_session_with_mode` call even when `claim_pid` is
+    /// subsequent `check_and_claim_session_with_dir` call even when `claim_pid` is
     /// provided.  Stamping a transient lab-parent PID onto a terminal row
     /// causes `is_running()` to return true, making a concurrent worker
     /// misclassify the dead minion as AlreadyRunning and exit code 3.
