@@ -92,11 +92,21 @@ pub(crate) async fn run_agent_phase(
                         )
                         .await;
                     }
+                } else if let Some(issue_num) = issue_ctx.issue_num {
+                    log::debug!(
+                        "GRU_RETRY_PARENT=lab: deferring gru:failed for issue #{} — \
+                         lab's retry queue will decide",
+                        issue_num
+                    );
                 }
             }
             Ok(Some(result))
         }
         Err(e) if crate::agent_runner::is_stuck_or_timeout_error(&e) => {
+            // Stuck/timeout always applies gru:blocked immediately, regardless of
+            // GRU_RETRY_PARENT. Unlike transient exit failures (which lab can retry),
+            // a stuck minion needs human intervention — deferring the label would leave
+            // the issue in gru:in-progress with no live process.
             update_orchestration_phase(&wt_ctx.minion_id, OrchestrationPhase::Failed).await;
             log::error!("🚨 {:#}", e);
             if let Some(issue_num) = issue_ctx.issue_num {

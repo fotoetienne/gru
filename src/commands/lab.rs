@@ -2319,9 +2319,12 @@ async fn spawn_minion(repo: &str, host: &str, issue_number: u64) -> Result<Child
     let mut cmd = tokio::process::Command::new(exe);
     cmd.arg("do")
         .arg(&issue_ref)
-        // GRU_RETRY_PARENT=lab tells the worker to defer gru:failed labeling so
-        // lab's retry queue can fire (see commands::fix::GRU_RETRY_PARENT_ENV).
-        .env("GRU_RETRY_PARENT", "lab")
+        // Tells the worker to defer gru:failed labeling so lab's retry queue can fire.
+        // See commands::fix::{GRU_RETRY_PARENT_ENV, GRU_RETRY_PARENT_VALUE}.
+        .env(
+            crate::commands::fix::GRU_RETRY_PARENT_ENV,
+            crate::commands::fix::GRU_RETRY_PARENT_VALUE,
+        )
         .env_remove("TMUX")
         .env_remove("TMUX_PANE");
 
@@ -2350,8 +2353,11 @@ async fn spawn_resume(minion_id: &str) -> Result<Child> {
     let mut cmd = tokio::process::Command::new(exe);
     cmd.arg("resume")
         .arg(minion_id)
-        // Match spawn_minion: defer gru:failed labeling so lab can control the outcome.
-        .env("GRU_RETRY_PARENT", "lab")
+        // Intentionally does NOT set GRU_RETRY_PARENT: resume failures keep eager
+        // gru:failed labeling. Lab's reap_children skips handle_failed_exit for
+        // resume children (spawn_meta: None), so deferring without a retry handler
+        // would leave the issue stuck at gru:in-progress. Wiring resume into the
+        // retry queue is a separate issue.
         .env_remove("TMUX")
         .env_remove("TMUX_PANE");
 
