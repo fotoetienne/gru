@@ -489,6 +489,7 @@ dependencies = [
  "serde_ignored",
  "serde_json",
  "serde_yml",
+ "temp-env",
  "tempfile",
  "tokio",
  "toml",
@@ -1051,6 +1052,15 @@ dependencies = [
  "proc-macro2",
  "quote",
  "unicode-ident",
+]
+
+[[package]]
+name = "temp-env"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "45107136c2ddf8c4b87453c02294fd0adf41751796e81e8ba3f7fd951977ab57"
+dependencies = [
+ "once_cell",
 ]
 
 [[package]]

@@ -2319,6 +2319,7 @@ async fn spawn_minion(repo: &str, host: &str, issue_number: u64) -> Result<Child
     let mut cmd = tokio::process::Command::new(exe);
     cmd.arg("do")
         .arg(&issue_ref)
+        .env("GRU_RETRY_PARENT", "lab")
         .env_remove("TMUX")
         .env_remove("TMUX_PANE");
 
