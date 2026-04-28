@@ -647,6 +647,8 @@ mod tests {
     #[tokio::test]
     async fn test_terminal_phase_non_stopped_with_dead_pid_not_stamped() {
         let tmp = tempdir().unwrap();
+        // PID 4,194,304 (2^22) exceeds Linux's PID_MAX_LIMIT and typical macOS
+        // pid_max, so it is guaranteed never to be assigned to a live process.
         let dead_pid = 4_194_304_u32;
         let info = MinionInfo {
             mode: MinionMode::Autonomous, // non-Stopped, as in the real crash
