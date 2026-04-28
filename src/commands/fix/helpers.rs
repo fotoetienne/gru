@@ -389,11 +389,20 @@ pub(crate) async fn cleanup_post_agent_failure(
     reason: &str,
 ) {
     if let Some(num) = issue_num {
-        let comment = format!(
-            "⚠️  Minion `{}` failed after the agent phase: {}\n\n\
-             Use `gru resume {}` to retry.",
-            minion_id, reason, minion_id
-        );
+        let comment = if label_eagerly_on_failure() {
+            format!(
+                "⚠️  Minion `{}` failed after the agent phase: {}\n\n\
+                 Use `gru resume {}` to retry.",
+                minion_id, reason, minion_id
+            )
+        } else {
+            format!(
+                "⚠️  Minion `{}` failed after the agent phase: {}\n\n\
+                 `gru lab` will retry automatically. To retry manually instead, \
+                 use `gru resume {}`.",
+                minion_id, reason, minion_id
+            )
+        };
         try_post_issue_comment(host, owner, repo, num, &comment).await;
         if label_eagerly_on_failure() {
             try_mark_issue_failed(host, owner, repo, num).await;
@@ -571,7 +580,7 @@ mod tests {
     }
 
     #[test]
-    fn test_post_agent_failure_comment_format() {
+    fn test_post_agent_failure_comment_format_standalone() {
         let minion_id = "M1gt";
         let reason = "PR creation failed: no PR was created";
         let comment = format!(
@@ -583,6 +592,23 @@ mod tests {
             comment,
             "⚠️  Minion `M1gt` failed after the agent phase: PR creation failed: no PR was created\n\n\
              Use `gru resume M1gt` to retry."
+        );
+    }
+
+    #[test]
+    fn test_post_agent_failure_comment_format_lab() {
+        let minion_id = "M1gt";
+        let reason = "PR creation failed: no PR was created";
+        let comment = format!(
+            "⚠️  Minion `{}` failed after the agent phase: {}\n\n\
+             `gru lab` will retry automatically. To retry manually instead, \
+             use `gru resume {}`.",
+            minion_id, reason, minion_id
+        );
+        assert_eq!(
+            comment,
+            "⚠️  Minion `M1gt` failed after the agent phase: PR creation failed: no PR was created\n\n\
+             `gru lab` will retry automatically. To retry manually instead, use `gru resume M1gt`."
         );
     }
 
