@@ -121,8 +121,16 @@ fn claim_session_in_registry(
         i.last_activity = Utc::now();
         i.archived_at = None;
         if let Some((pid, start_time)) = claim_pid {
-            i.pid = Some(pid);
-            i.pid_start_time = start_time;
+            // Never stamp a PID onto a terminal-phase row. Terminal rows (Failed,
+            // Completed) are historical records; stamping the transient lab-parent
+            // PID causes is_running() to return true for that PID. A subsequent
+            // worker for the same issue then sees mode=Autonomous with a live-looking
+            // PID and returns AlreadyRunning (exit code 3), which triggers the
+            // auto-recovery → gru:todo → re-pickup thrash loop (issue #878).
+            if !i.orchestration_phase.is_terminal() {
+                i.pid = Some(pid);
+                i.pid_start_time = start_time;
+            }
         }
     })?;
 
@@ -579,6 +587,134 @@ mod tests {
         assert_eq!(updated.mode, MinionMode::Autonomous);
         assert_eq!(updated.pid, Some(our_pid));
         assert_eq!(updated.pid_start_time, our_start);
+    }
+
+    // --- issue #878: terminal-phase PID protection ---
+
+    /// A Failed minion's pid/pid_start_time must not be overwritten by a
+    /// subsequent `reclaim_session_with_mode` call even when `claim_pid` is
+    /// provided.  Stamping a transient lab-parent PID onto a terminal row
+    /// causes `is_running()` to return true, making a concurrent worker
+    /// misclassify the dead minion as AlreadyRunning and exit code 3.
+    #[tokio::test]
+    async fn test_terminal_phase_pid_not_stamped() {
+        let tmp = tempdir().unwrap();
+        let info = MinionInfo {
+            mode: MinionMode::Stopped,
+            pid: None,
+            pid_start_time: None,
+            orchestration_phase: OrchestrationPhase::Failed,
+            ..test_minion_info()
+        };
+        register_minion(tmp.path(), "M001", info);
+
+        let our_pid = std::process::id();
+        let our_start = get_process_start_time(our_pid);
+
+        let result = check_and_claim_session_with_dir(
+            tmp.path(),
+            "M001",
+            MinionMode::Autonomous,
+            Some((our_pid, our_start)),
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            result.is_some(),
+            "claim should succeed for Stopped+Failed minion"
+        );
+
+        let updated = read_minion(tmp.path(), "M001").unwrap();
+        assert_eq!(updated.mode, MinionMode::Autonomous);
+        // PID must remain None — the terminal phase guard must have blocked the stamp.
+        assert_eq!(
+            updated.pid, None,
+            "pid must not be stamped on a terminal-phase row"
+        );
+        assert_eq!(
+            updated.pid_start_time, None,
+            "pid_start_time must not be stamped on a terminal-phase row"
+        );
+    }
+
+    /// Reproduce the exact crash scenario from issue #878: mode=Autonomous,
+    /// orchestration_phase=Failed, pid=Some(dead_pid). The stale-reset path
+    /// fires first (dead PID detected → mode reset to Stopped), then the claim
+    /// write runs. The terminal-phase guard must prevent the new PID from being
+    /// stamped even after the stale reset.
+    #[tokio::test]
+    async fn test_terminal_phase_non_stopped_with_dead_pid_not_stamped() {
+        let tmp = tempdir().unwrap();
+        let dead_pid = 4_194_304_u32;
+        let info = MinionInfo {
+            mode: MinionMode::Autonomous, // non-Stopped, as in the real crash
+            pid: Some(dead_pid),
+            pid_start_time: Some(1_000_000),
+            orchestration_phase: OrchestrationPhase::Failed,
+            ..test_minion_info()
+        };
+        register_minion(tmp.path(), "M001", info);
+
+        let our_pid = std::process::id();
+        let our_start = get_process_start_time(our_pid);
+
+        let result = check_and_claim_session_with_dir(
+            tmp.path(),
+            "M001",
+            MinionMode::Autonomous,
+            Some((our_pid, our_start)),
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            result.is_some(),
+            "claim should succeed after stale-reset of failed minion"
+        );
+        let updated = read_minion(tmp.path(), "M001").unwrap();
+        assert_eq!(
+            updated.pid, None,
+            "pid must not be stamped on a terminal-phase row after stale reset"
+        );
+        assert_eq!(updated.pid_start_time, None);
+    }
+
+    /// Completed minions are also terminal and must not have their PID stomped.
+    #[tokio::test]
+    async fn test_completed_phase_pid_not_stamped() {
+        let tmp = tempdir().unwrap();
+        let info = MinionInfo {
+            mode: MinionMode::Stopped,
+            pid: None,
+            pid_start_time: None,
+            orchestration_phase: OrchestrationPhase::Completed,
+            ..test_minion_info()
+        };
+        register_minion(tmp.path(), "M001", info);
+
+        let our_pid = std::process::id();
+        let our_start = get_process_start_time(our_pid);
+
+        let result = check_and_claim_session_with_dir(
+            tmp.path(),
+            "M001",
+            MinionMode::Autonomous,
+            Some((our_pid, our_start)),
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert!(result.is_some());
+        let updated = read_minion(tmp.path(), "M001").unwrap();
+        assert_eq!(
+            updated.pid, None,
+            "pid must not be stamped on a Completed-phase row"
+        );
+        assert_eq!(updated.pid_start_time, None);
     }
 
     /// Concurrent-claim race: two threads race to claim the same minion with
