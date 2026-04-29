@@ -234,14 +234,16 @@ pub(crate) trait AgentBackend: Send + Sync {
 
     /// Build a command for a CI fix invocation.
     ///
-    /// Unlike `build_oneshot_command` (which limits to a single turn), CI fix
-    /// requires multiple turns: read failure logs, locate offending code, edit,
-    /// run tests, and commit. The wall-clock timeout (`CI_FIX_TIMEOUT_SECS`) is
-    /// the primary bound.
+    /// CI fix requires multiple turns (read failure logs → locate offending
+    /// code → edit → run tests → commit). Backends intended for single-turn
+    /// utility tasks (such as merge-readiness judging) should use
+    /// `build_oneshot_command` instead; override this method when the backend
+    /// needs a qualitatively different invocation for multi-turn fix cycles.
     ///
-    /// The default implementation delegates to `build_oneshot_command`, so
-    /// backends that do not distinguish between oneshot and multi-turn CI fix
-    /// invocations do not need to override this method.
+    /// The default implementation delegates to `build_oneshot_command`. Backends
+    /// whose `build_oneshot_command` does not impose a single-turn limit do not
+    /// need to override this method. Backends that do impose such a limit
+    /// (and want CI fix to succeed) must override it here.
     fn build_ci_fix_command(&self, worktree_path: &Path, prompt_arg: &str) -> TokioCommand {
         self.build_oneshot_command(worktree_path, prompt_arg)
     }

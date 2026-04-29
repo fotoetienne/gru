@@ -110,7 +110,7 @@
 # installed somewhere other than your $PATH.
 # Can be set without [agent] above if you only need a binary override.
 # binary = "/usr/local/bin/claude"
-
+#
 # Maximum agent turns for CI fix invocations. When unset (the default),
 # there is no turn limit — the 20-minute wall-clock cap is the primary bound.
 # Set to a positive value to impose an explicit turn budget (e.g. 50).

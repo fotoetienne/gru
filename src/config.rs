@@ -738,6 +738,13 @@ impl LabConfig {
 
         config.validate_github_hosts()?;
 
+        if config.agent.claude.ci_fix_max_turns == Some(0) {
+            anyhow::bail!(
+                "agent.claude.ci_fix_max_turns must be a positive integer (got 0). \
+                 Remove the field to use no limit, or set it to a positive value."
+            );
+        }
+
         Ok(config)
     }
 
@@ -1202,6 +1209,39 @@ default = "aider"
         // Parsing succeeds (validation happens in AgentRegistry, not config parsing)
         let config = LabConfig::load(temp_file.path()).unwrap();
         assert_eq!(config.agent.default, "aider");
+    }
+
+    #[test]
+    fn test_ci_fix_max_turns_parses() {
+        let config_toml = "[agent.claude]\nci_fix_max_turns = 50\n";
+        let mut temp_file = NamedTempFile::new().unwrap();
+        temp_file.write_all(config_toml.as_bytes()).unwrap();
+        temp_file.flush().unwrap();
+
+        let config = LabConfig::load_partial(temp_file.path()).unwrap();
+        assert_eq!(config.agent.claude.ci_fix_max_turns, Some(50));
+    }
+
+    #[test]
+    fn test_ci_fix_max_turns_default_is_none() {
+        let config = LabConfig::default();
+        assert!(config.agent.claude.ci_fix_max_turns.is_none());
+    }
+
+    #[test]
+    fn test_ci_fix_max_turns_zero_is_rejected() {
+        let config_toml = "[agent.claude]\nci_fix_max_turns = 0\n";
+        let mut temp_file = NamedTempFile::new().unwrap();
+        temp_file.write_all(config_toml.as_bytes()).unwrap();
+        temp_file.flush().unwrap();
+
+        let result = LabConfig::load_partial(temp_file.path());
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("ci_fix_max_turns"),
+            "error should mention the field: {msg}"
+        );
     }
 
     #[test]
