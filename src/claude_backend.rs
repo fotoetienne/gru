@@ -38,6 +38,22 @@ pub(crate) struct ClaudeBackend {
 }
 
 impl ClaudeBackend {
+    /// Returns a command pre-configured with the flags common to all
+    /// non-interactive Claude invocations (print, text output, no permissions
+    /// prompt, piped stdio). Callers add turn limits and the prompt argument.
+    fn base_noninteractive_cmd(worktree_path: &Path) -> TokioCommand {
+        let mut cmd = TokioCommand::new("claude");
+        cmd.arg("--print")
+            .arg("--output-format")
+            .arg("text")
+            .arg("--dangerously-skip-permissions")
+            .current_dir(worktree_path)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::inherit())
+            .env_remove(crate::labels::GRU_RETRY_PARENT_ENV);
+        cmd
+    }
+
     /// Map a `ClaudeEvent` to an `AgentEvent`, using internal state to buffer
     /// tool invocations until their input JSON is complete.
     fn map_event(&self, event: &ClaudeEvent) -> Option<AgentEvent> {
@@ -194,41 +210,27 @@ impl AgentBackend for ClaudeBackend {
     }
 
     fn build_oneshot_command(&self, worktree_path: &Path, prompt_arg: &str) -> TokioCommand {
-        let mut cmd = TokioCommand::new("claude");
-        cmd.arg("--print")
-            .arg("--output-format")
-            .arg("text")
-            .arg("--max-turns")
-            .arg("1")
-            .arg("--dangerously-skip-permissions")
-            .arg(prompt_arg)
-            .current_dir(worktree_path)
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::inherit())
-            .env_remove(crate::labels::GRU_RETRY_PARENT_ENV);
+        let mut cmd = ClaudeBackend::base_noninteractive_cmd(worktree_path);
+        cmd.arg("--max-turns").arg("1").arg(prompt_arg);
         cmd
     }
 
     fn build_ci_fix_command(&self, worktree_path: &Path, prompt_arg: &str) -> TokioCommand {
-        let mut cmd = TokioCommand::new("claude");
-        cmd.arg("--print")
-            .arg("--output-format")
-            .arg("text")
-            .arg("--dangerously-skip-permissions");
+        let mut cmd = ClaudeBackend::base_noninteractive_cmd(worktree_path);
 
         // Apply a configurable turn limit if set; otherwise run unbounded,
         // relying on the CI_FIX_TIMEOUT_SECS wall-clock cap as the primary bound.
+        //
+        // TODO: tech debt — reading config from disk inside a command builder
+        // couples ClaudeBackend to the filesystem. Ideally ci_fix_max_turns would
+        // be injected at construction time (see issue #888 review comments).
         let max_turns =
             crate::config::try_load_config().and_then(|c| c.agent.claude.ci_fix_max_turns);
         if let Some(turns) = max_turns {
             cmd.arg("--max-turns").arg(turns.to_string());
         }
 
-        cmd.arg(prompt_arg)
-            .current_dir(worktree_path)
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::inherit())
-            .env_remove(crate::labels::GRU_RETRY_PARENT_ENV);
+        cmd.arg(prompt_arg);
         cmd
     }
 }

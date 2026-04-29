@@ -240,10 +240,14 @@ pub(crate) trait AgentBackend: Send + Sync {
     /// `build_oneshot_command` instead; override this method when the backend
     /// needs a qualitatively different invocation for multi-turn fix cycles.
     ///
-    /// The default implementation delegates to `build_oneshot_command`. Backends
-    /// whose `build_oneshot_command` does not impose a single-turn limit do not
-    /// need to override this method. Backends that do impose such a limit
-    /// (and want CI fix to succeed) must override it here.
+    /// The default implementation delegates to `build_oneshot_command`.
+    ///
+    /// **Implementor note:** If your `build_oneshot_command` imposes a
+    /// single-turn limit (e.g., `--max-turns 1`), you **must** override this
+    /// method — the default delegation will inherit that limit and CI fix
+    /// will always fail to make meaningful progress. Backends whose
+    /// `build_oneshot_command` does not impose such a limit may safely rely
+    /// on the default.
     fn build_ci_fix_command(&self, worktree_path: &Path, prompt_arg: &str) -> TokioCommand {
         self.build_oneshot_command(worktree_path, prompt_arg)
     }
