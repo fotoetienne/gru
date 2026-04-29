@@ -1158,7 +1158,6 @@ pub(crate) async fn monitor_and_fix_ci(
                     // Retrying after an agent error or no-commits: nothing was
                     // pushed, so post_push stays unchanged.
                     CiFixLoopAction::ContinueNoPush => continue,
-                    CiFixLoopAction::Break => break,
                     CiFixLoopAction::Return(val) => return Ok(val),
                 }
             }
@@ -1188,8 +1187,6 @@ enum CiFixLoopAction {
     /// Retrying but nothing was pushed (agent error or no new commits).
     /// `continue` without setting `post_push`.
     ContinueNoPush,
-    /// Push failed: `break` the outer loop.
-    Break,
     /// Escalated to human: return this value immediately.
     Return(bool),
 }
@@ -1518,7 +1515,10 @@ async fn run_ci_fix_attempt(
 
     if !push_output.status.success() {
         let stderr = String::from_utf8_lossy(&push_output.stderr);
-        eprintln!("⚠️  Push failed: {}", stderr);
+        eprintln!(
+            "⚠️  Push failed: {}",
+            sanitize_push_failure_stderr(stderr.trim())
+        );
         eprintln!("🚨 Escalating to human due to push failure");
         let reason = format_push_failure_reason(attempt, MAX_CI_FIX_ATTEMPTS, stderr.trim());
         return Ok(
