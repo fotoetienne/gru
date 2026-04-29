@@ -79,6 +79,13 @@ pub(crate) struct ClaudeAgentConfig {
     /// Override the binary path for Claude Code CLI
     #[serde(default)]
     pub(crate) binary: Option<String>,
+
+    /// Maximum agent turns for CI fix invocations.
+    /// `None` (the default) means no limit — the 20-minute wall-clock cap
+    /// (`CI_FIX_TIMEOUT_SECS`) is the primary bound. Set to a positive value
+    /// to impose an explicit turn limit (e.g., 50).
+    #[serde(default)]
+    pub(crate) ci_fix_max_turns: Option<u32>,
 }
 
 fn default_agent_name() -> String {

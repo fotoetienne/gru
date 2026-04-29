@@ -208,6 +208,29 @@ impl AgentBackend for ClaudeBackend {
             .env_remove(crate::labels::GRU_RETRY_PARENT_ENV);
         cmd
     }
+
+    fn build_ci_fix_command(&self, worktree_path: &Path, prompt_arg: &str) -> TokioCommand {
+        let mut cmd = TokioCommand::new("claude");
+        cmd.arg("--print")
+            .arg("--output-format")
+            .arg("text")
+            .arg("--dangerously-skip-permissions");
+
+        // Apply a configurable turn limit if set; otherwise run unbounded,
+        // relying on the CI_FIX_TIMEOUT_SECS wall-clock cap as the primary bound.
+        let max_turns =
+            crate::config::try_load_config().and_then(|c| c.agent.claude.ci_fix_max_turns);
+        if let Some(turns) = max_turns {
+            cmd.arg("--max-turns").arg(turns.to_string());
+        }
+
+        cmd.arg(prompt_arg)
+            .current_dir(worktree_path)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::inherit())
+            .env_remove(crate::labels::GRU_RETRY_PARENT_ENV);
+        cmd
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -416,6 +439,60 @@ mod tests {
         assert!(!args.contains(&"--session-id".as_ref()));
         assert!(!args.contains(&"--verbose".as_ref()));
         assert!(!args.contains(&"stream-json".as_ref()));
+    }
+
+    #[test]
+    fn test_build_ci_fix_command_no_max_turns_by_default() {
+        // Without config, ci_fix_max_turns is None so --max-turns should NOT appear.
+        let b = backend();
+        let path = std::path::PathBuf::from("/tmp/worktree");
+        let cmd = b.build_ci_fix_command(&path, "fix ci");
+        let inner = cmd.as_std();
+
+        assert_eq!(inner.get_program(), "claude");
+        let args: Vec<&std::ffi::OsStr> = inner.get_args().collect();
+        assert!(args.contains(&"--print".as_ref()));
+        assert!(args.contains(&"--dangerously-skip-permissions".as_ref()));
+        assert!(args.contains(&"fix ci".as_ref()));
+        // No --max-turns limit — CI fix needs multiple turns
+        assert!(!args.contains(&"--max-turns".as_ref()));
+    }
+
+    #[test]
+    fn test_build_ci_fix_command_respects_configured_max_turns() {
+        use crate::config::{set_test_config_path, LabConfig};
+        use std::io::Write;
+
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        writeln!(tmp, "[agent.claude]\nci_fix_max_turns = 42").unwrap();
+
+        let _guard = set_test_config_path(tmp.path().to_path_buf());
+
+        // Verify the config parses correctly
+        let config = LabConfig::load_partial(tmp.path()).unwrap();
+        assert_eq!(config.agent.claude.ci_fix_max_turns, Some(42));
+
+        let b = backend();
+        let path = std::path::PathBuf::from("/tmp/worktree");
+        let cmd = b.build_ci_fix_command(&path, "fix ci");
+        let inner = cmd.as_std();
+
+        let args: Vec<&std::ffi::OsStr> = inner.get_args().collect();
+        assert!(args.contains(&"--max-turns".as_ref()));
+        assert!(args.contains(&"42".as_ref()));
+    }
+
+    #[test]
+    fn test_build_ci_fix_command_oneshot_still_has_max_turns_1() {
+        // build_oneshot_command must still use --max-turns 1 (merge-readiness judge).
+        let b = backend();
+        let path = std::path::PathBuf::from("/tmp/worktree");
+        let cmd = b.build_oneshot_command(&path, "judge");
+        let inner = cmd.as_std();
+
+        let args: Vec<&std::ffi::OsStr> = inner.get_args().collect();
+        assert!(args.contains(&"--max-turns".as_ref()));
+        assert!(args.contains(&"1".as_ref()));
     }
 
     // ---- parse_event tests ----

@@ -716,7 +716,7 @@ pub(crate) async fn invoke_ci_fix(
     let prompt = build_ci_fix_prompt(failed_checks, attempt);
 
     let child = backend
-        .build_oneshot_command(worktree_path, &prompt)
+        .build_ci_fix_command(worktree_path, &prompt)
         .spawn()
         .with_context(|| format!("Agent backend '{}' failed to start", backend.name()))?;
 

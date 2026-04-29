@@ -218,8 +218,8 @@ pub(crate) trait AgentBackend: Send + Sync {
 
     /// Build a command for a one-shot utility task (no session tracking, text output).
     ///
-    /// Used for fire-and-forget invocations like CI fix and merge-readiness judge
-    /// where the caller just needs to run the agent once and capture its text output.
+    /// Used for fire-and-forget invocations like merge-readiness judge where the
+    /// caller just needs a single agent turn and plain-text output.
     ///
     /// `prompt_arg` is passed as a CLI argument to the underlying agent binary.
     /// Callers may either:
@@ -231,6 +231,20 @@ pub(crate) trait AgentBackend: Send + Sync {
     /// Backends must support the `"-"` stdin-sentinel convention.
     /// The command should produce plain-text output on stdout with piped stdio.
     fn build_oneshot_command(&self, worktree_path: &Path, prompt_arg: &str) -> TokioCommand;
+
+    /// Build a command for a CI fix invocation.
+    ///
+    /// Unlike `build_oneshot_command` (which limits to a single turn), CI fix
+    /// requires multiple turns: read failure logs, locate offending code, edit,
+    /// run tests, and commit. The wall-clock timeout (`CI_FIX_TIMEOUT_SECS`) is
+    /// the primary bound.
+    ///
+    /// The default implementation delegates to `build_oneshot_command`, so
+    /// backends that do not distinguish between oneshot and multi-turn CI fix
+    /// invocations do not need to override this method.
+    fn build_ci_fix_command(&self, worktree_path: &Path, prompt_arg: &str) -> TokioCommand {
+        self.build_oneshot_command(worktree_path, prompt_arg)
+    }
 }
 
 #[cfg(test)]
