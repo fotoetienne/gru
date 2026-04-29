@@ -532,7 +532,8 @@ pub(crate) fn build_ci_fix_prompt(
             check.name, failure_type, conclusion, duration
         ));
 
-        match &check.output {
+        let output_text = check.output.as_deref().filter(|s| !s.trim().is_empty());
+        match output_text {
             Some(output) => {
                 let truncated = smart_truncate(output, 10_000);
                 prompt.push_str(&format!("## Failure Output\n```\n{}\n```\n\n", truncated));
@@ -1840,6 +1841,43 @@ mod tests {
         assert!(
             prompt.contains("log-failed"),
             "prompt must mention --log-failed"
+        );
+    }
+
+    #[test]
+    fn test_build_ci_fix_prompt_empty_string_output_shows_fallback() {
+        // Some("") is treated the same as None — no empty fenced block.
+        let checks = vec![CheckRun {
+            name: "CI / test".to_string(),
+            status: CheckStatus::Completed,
+            conclusion: Some(CheckConclusion::Failure),
+            duration: None,
+            output: Some("".to_string()),
+        }];
+        let prompt = build_ci_fix_prompt(&checks, 1);
+        assert!(
+            prompt.contains("gh run view"),
+            "empty-string output must trigger fallback instructions"
+        );
+        assert!(
+            !prompt.contains("```\n\n```"),
+            "must not render an empty fenced block"
+        );
+    }
+
+    #[test]
+    fn test_build_ci_fix_prompt_whitespace_output_shows_fallback() {
+        let checks = vec![CheckRun {
+            name: "CI / test".to_string(),
+            status: CheckStatus::Completed,
+            conclusion: Some(CheckConclusion::Failure),
+            duration: None,
+            output: Some("   \n  ".to_string()),
+        }];
+        let prompt = build_ci_fix_prompt(&checks, 1);
+        assert!(
+            prompt.contains("gh run view"),
+            "whitespace-only output must trigger fallback instructions"
         );
     }
 
