@@ -284,10 +284,12 @@ fn safe_tail(s: &str, max_bytes: usize) -> &str {
         return s;
     }
     let start = s.len() - max_bytes;
-    // Advance to the next valid char boundary
-    match (start..s.len()).find(|&i| s.is_char_boundary(i)) {
+    // Advance to the next valid char boundary.
+    // Include s.len() in the range so a boundary is always found (s.len() is
+    // always a valid char boundary, making the None arm truly unreachable).
+    match (start..=s.len()).find(|&i| s.is_char_boundary(i)) {
         Some(boundary) => &s[boundary..],
-        None => "", // unreachable for valid UTF-8
+        None => "", // unreachable: s.len() is always a valid char boundary
     }
 }
 
@@ -686,7 +688,13 @@ async fn fetch_check_logs(
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let runs: Vec<serde_json::Value> = serde_json::from_str(&stdout).unwrap_or_default();
+    let runs: Vec<serde_json::Value> = match serde_json::from_str(&stdout) {
+        Ok(v) => v,
+        Err(e) => {
+            log::debug!("Failed to parse gh run list output: {}", e);
+            return Ok(None);
+        }
+    };
 
     // gh run list returns runs in most-recent-first order; we return the first
     // non-empty log found, so the agent sees the most recent failure.
@@ -1224,9 +1232,12 @@ async fn enrich_check_logs(
     branch: &str,
     failed_checks: &mut [CheckRun],
 ) {
-    let needs_enrichment = failed_checks
-        .iter()
-        .any(|c| c.output.is_none() || c.output.as_deref() == Some(""));
+    let needs_enrichment = failed_checks.iter().any(|c| {
+        c.output
+            .as_deref()
+            .map(|s| s.trim().is_empty())
+            .unwrap_or(true)
+    });
     if !needs_enrichment {
         return;
     }
@@ -1238,7 +1249,12 @@ async fn enrich_check_logs(
     // form of check-to-run mapping — the exact problem this approach was designed to avoid.
     if let Ok(Some(logs)) = fetch_check_logs(host, owner, repo, branch).await {
         for check in failed_checks.iter_mut() {
-            if check.output.is_none() || check.output.as_deref() == Some("") {
+            if check
+                .output
+                .as_deref()
+                .map(|s| s.trim().is_empty())
+                .unwrap_or(true)
+            {
                 check.output = Some(logs.clone());
             }
         }
@@ -2043,6 +2059,13 @@ mod tests {
     #[test]
     fn test_safe_tail_empty_string() {
         assert_eq!(safe_tail("", 10), "");
+    }
+
+    #[test]
+    fn test_safe_tail_zero_budget() {
+        // max_bytes=0: start==s.len(), range is start..=s.len() = [s.len()],
+        // which finds boundary s.len() and returns &s[s.len()..] = "".
+        assert_eq!(safe_tail("hello", 0), "");
     }
 
     // --- decide_ci_action tests ---
