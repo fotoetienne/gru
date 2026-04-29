@@ -845,8 +845,11 @@ pub(crate) async fn invoke_ci_fix(
 ) -> Result<i32> {
     let prompt = build_ci_fix_prompt(failed_checks, attempt, worktree_path);
 
-    let child = backend
-        .build_oneshot_command(worktree_path, &prompt)
+    let mut cmd = backend.build_ci_fix_command(worktree_path, &prompt);
+    // Ensure the agent process is killed if the wall-clock timeout fires;
+    // without this the child keeps running after wait_with_output is dropped.
+    cmd.kill_on_drop(true);
+    let child = cmd
         .spawn()
         .with_context(|| format!("Agent backend '{}' failed to start", backend.name()))?;
 

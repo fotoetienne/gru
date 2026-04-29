@@ -32,12 +32,45 @@ struct ToolBuffer {
 /// internally, emitting a single `AgentEvent::ToolUse` with a populated
 /// `input_summary` when `ContentBlockStop` arrives. This eliminates the UX
 /// regression of showing "Tool: Bash" instead of "Run: git status".
-#[derive(Default)]
 pub(crate) struct ClaudeBackend {
     tool_buffer: Mutex<Option<ToolBuffer>>,
+    /// Maximum agent turns for CI fix invocations. `None` means no limit.
+    ci_fix_max_turns: Option<u32>,
+}
+
+impl Default for ClaudeBackend {
+    fn default() -> Self {
+        Self {
+            tool_buffer: Mutex::new(None),
+            ci_fix_max_turns: None,
+        }
+    }
 }
 
 impl ClaudeBackend {
+    pub(crate) fn new(ci_fix_max_turns: Option<u32>) -> Self {
+        Self {
+            tool_buffer: Mutex::new(None),
+            ci_fix_max_turns,
+        }
+    }
+
+    /// Returns a command pre-configured with the flags common to all
+    /// non-interactive Claude invocations (print, text output, no permissions
+    /// prompt, piped stdio). Callers add turn limits and the prompt argument.
+    fn base_noninteractive_cmd(worktree_path: &Path) -> TokioCommand {
+        let mut cmd = TokioCommand::new("claude");
+        cmd.arg("--print")
+            .arg("--output-format")
+            .arg("text")
+            .arg("--dangerously-skip-permissions")
+            .current_dir(worktree_path)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::inherit())
+            .env_remove(crate::labels::GRU_RETRY_PARENT_ENV);
+        cmd
+    }
+
     /// Map a `ClaudeEvent` to an `AgentEvent`, using internal state to buffer
     /// tool invocations until their input JSON is complete.
     fn map_event(&self, event: &ClaudeEvent) -> Option<AgentEvent> {
@@ -194,18 +227,21 @@ impl AgentBackend for ClaudeBackend {
     }
 
     fn build_oneshot_command(&self, worktree_path: &Path, prompt_arg: &str) -> TokioCommand {
-        let mut cmd = TokioCommand::new("claude");
-        cmd.arg("--print")
-            .arg("--output-format")
-            .arg("text")
-            .arg("--max-turns")
-            .arg("1")
-            .arg("--dangerously-skip-permissions")
-            .arg(prompt_arg)
-            .current_dir(worktree_path)
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::inherit())
-            .env_remove(crate::labels::GRU_RETRY_PARENT_ENV);
+        let mut cmd = ClaudeBackend::base_noninteractive_cmd(worktree_path);
+        cmd.arg("--max-turns").arg("1").arg(prompt_arg);
+        cmd
+    }
+
+    fn build_ci_fix_command(&self, worktree_path: &Path, prompt_arg: &str) -> TokioCommand {
+        let mut cmd = ClaudeBackend::base_noninteractive_cmd(worktree_path);
+
+        // Apply a configurable turn limit if set; otherwise run unbounded,
+        // relying on the CI_FIX_TIMEOUT_SECS wall-clock cap as the primary bound.
+        if let Some(turns) = self.ci_fix_max_turns {
+            cmd.arg("--max-turns").arg(turns.to_string());
+        }
+
+        cmd.arg(prompt_arg);
         cmd
     }
 }
@@ -416,6 +452,50 @@ mod tests {
         assert!(!args.contains(&"--session-id".as_ref()));
         assert!(!args.contains(&"--verbose".as_ref()));
         assert!(!args.contains(&"stream-json".as_ref()));
+    }
+
+    #[test]
+    fn test_build_ci_fix_command_no_max_turns_by_default() {
+        // ClaudeBackend::default() has ci_fix_max_turns = None, so --max-turns
+        // must not appear. Hermetic: no ambient config is consulted.
+        let b = ClaudeBackend::default();
+        let path = std::path::PathBuf::from("/tmp/worktree");
+        let cmd = b.build_ci_fix_command(&path, "fix ci");
+        let inner = cmd.as_std();
+
+        assert_eq!(inner.get_program(), "claude");
+        let args: Vec<&std::ffi::OsStr> = inner.get_args().collect();
+        assert!(args.contains(&"--print".as_ref()));
+        assert!(args.contains(&"--dangerously-skip-permissions".as_ref()));
+        assert!(args.contains(&"fix ci".as_ref()));
+        // No --max-turns limit — CI fix needs multiple turns
+        assert!(!args.contains(&"--max-turns".as_ref()));
+    }
+
+    #[test]
+    fn test_build_ci_fix_command_respects_configured_max_turns() {
+        // Construct the backend directly with a turn limit — no filesystem I/O.
+        let b = ClaudeBackend::new(Some(42));
+        let path = std::path::PathBuf::from("/tmp/worktree");
+        let cmd = b.build_ci_fix_command(&path, "fix ci");
+        let inner = cmd.as_std();
+
+        let args: Vec<&std::ffi::OsStr> = inner.get_args().collect();
+        assert!(args.contains(&"--max-turns".as_ref()));
+        assert!(args.contains(&"42".as_ref()));
+    }
+
+    #[test]
+    fn test_build_ci_fix_command_oneshot_still_has_max_turns_1() {
+        // build_oneshot_command must still use --max-turns 1 (merge-readiness judge).
+        let b = backend();
+        let path = std::path::PathBuf::from("/tmp/worktree");
+        let cmd = b.build_oneshot_command(&path, "judge");
+        let inner = cmd.as_std();
+
+        let args: Vec<&std::ffi::OsStr> = inner.get_args().collect();
+        assert!(args.contains(&"--max-turns".as_ref()));
+        assert!(args.contains(&"1".as_ref()));
     }
 
     // ---- parse_event tests ----

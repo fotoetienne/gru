@@ -218,8 +218,8 @@ pub(crate) trait AgentBackend: Send + Sync {
 
     /// Build a command for a one-shot utility task (no session tracking, text output).
     ///
-    /// Used for fire-and-forget invocations like CI fix and merge-readiness judge
-    /// where the caller just needs to run the agent once and capture its text output.
+    /// Used for fire-and-forget invocations like merge-readiness judge where the
+    /// caller just needs a single agent turn and plain-text output.
     ///
     /// `prompt_arg` is passed as a CLI argument to the underlying agent binary.
     /// Callers may either:
@@ -231,6 +231,26 @@ pub(crate) trait AgentBackend: Send + Sync {
     /// Backends must support the `"-"` stdin-sentinel convention.
     /// The command should produce plain-text output on stdout with piped stdio.
     fn build_oneshot_command(&self, worktree_path: &Path, prompt_arg: &str) -> TokioCommand;
+
+    /// Build a command for a CI fix invocation.
+    ///
+    /// CI fix requires multiple turns (read failure logs → locate offending
+    /// code → edit → run tests → commit). Backends intended for single-turn
+    /// utility tasks (such as merge-readiness judging) should use
+    /// `build_oneshot_command` instead; override this method when the backend
+    /// needs a qualitatively different invocation for multi-turn fix cycles.
+    ///
+    /// The default implementation delegates to `build_oneshot_command`.
+    ///
+    /// **Implementor note:** If your `build_oneshot_command` imposes a
+    /// single-turn limit (e.g., `--max-turns 1`), you **must** override this
+    /// method — the default delegation will inherit that limit and CI fix
+    /// will always fail to make meaningful progress. Backends whose
+    /// `build_oneshot_command` does not impose such a limit may safely rely
+    /// on the default.
+    fn build_ci_fix_command(&self, worktree_path: &Path, prompt_arg: &str) -> TokioCommand {
+        self.build_oneshot_command(worktree_path, prompt_arg)
+    }
 }
 
 #[cfg(test)]

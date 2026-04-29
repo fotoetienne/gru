@@ -18,7 +18,11 @@ pub(crate) const DEFAULT_AGENT: &str = "claude";
 /// Returns an error with available agents listed if the name is unknown.
 pub(crate) fn resolve_backend(agent_name: &str) -> anyhow::Result<Box<dyn AgentBackend>> {
     match agent_name {
-        "claude" => Ok(Box::new(ClaudeBackend::default())),
+        "claude" => {
+            let ci_fix_max_turns =
+                crate::config::try_load_config().and_then(|c| c.agent.claude.ci_fix_max_turns);
+            Ok(Box::new(ClaudeBackend::new(ci_fix_max_turns)))
+        }
         "codex" => Ok(Box::new(CodexBackend)),
         unknown => {
             let available = AVAILABLE_AGENTS.join(", ");
