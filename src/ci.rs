@@ -1134,7 +1134,8 @@ async fn escalate_no_checks_after_push(
 
     let pr_sha = get_pr_head_sha_from_github(host, owner, repo, pr_number)
         .await
-        .unwrap_or(None);
+        .ok()
+        .flatten();
 
     let sha_note = match pr_sha.as_deref() {
         Some(s) if s == local_sha => format!(
@@ -1158,8 +1159,8 @@ async fn escalate_no_checks_after_push(
     };
 
     let reason = format!(
-        "A fix commit was pushed after attempt {attempt}, but no CI checks appeared within \
-         the {CI_WAIT_TIMEOUT_SECS}-second window.\n\n{sha_note}"
+        "A fix commit was pushed but no CI checks appeared within the \
+         {CI_WAIT_TIMEOUT_SECS}-second window.\n\n{sha_note}"
     );
 
     post_exhaustion_escalation_comment(host, owner, repo, pr_number, &reason, attempt, minion_id)
