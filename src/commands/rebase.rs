@@ -223,6 +223,10 @@ pub(crate) async fn fetch_base_branch(worktree_path: &Path, base_branch: &str) -
         .arg("-C")
         .arg(worktree_path)
         .args(&args)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_INDEX_FILE")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_COMMON_DIR")
         .output()
         .await
         .with_context(|| format!("Failed to execute git {}", args.join(" ")))?;
@@ -540,6 +544,10 @@ pub(crate) async fn is_up_to_date(worktree_path: &Path, base_branch: &str) -> Re
         .arg("-C")
         .arg(worktree_path)
         .args(["merge-base", "--is-ancestor", &remote_ref, "HEAD"])
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_INDEX_FILE")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_COMMON_DIR")
         .output()
         .await
         .context("Failed to check if branch is up-to-date")?;

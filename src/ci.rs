@@ -1,11 +1,14 @@
-use crate::agent::AgentBackend;
+use crate::agent::{AgentBackend, AgentEvent};
+use crate::agent_runner;
 use crate::github;
 use crate::labels;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
 use std::fmt;
 use std::path::Path;
 use std::process::Stdio;
+use std::sync::{Arc, Mutex};
 use tokio::process::Command;
 use tokio::time::{sleep, Duration};
 
@@ -943,35 +946,97 @@ pub(crate) async fn get_pr_number(
 
 /// Invokes the agent backend to fix CI failures in the given worktree.
 /// Returns the exit code from the agent process.
+///
+/// Stream events (tool calls, text output) are captured to `events.jsonl`
+/// inside `events_dir` so CI fix attempts are diagnosable after the fact.
+/// On failure, the last few significant events are also printed to stderr
+/// for immediate context without requiring the file to be opened.
 pub(crate) async fn invoke_ci_fix(
     backend: &dyn AgentBackend,
     worktree_path: &Path,
+    events_dir: &Path,
+    github_host: &str,
     failed_checks: &[CheckRun],
     attempt: u32,
 ) -> Result<i32> {
     let prompt = build_ci_fix_prompt(failed_checks, attempt, worktree_path);
+    let cmd = backend.build_ci_fix_command(worktree_path, &prompt, github_host);
+    let timeout_str = format!("{}s", CI_FIX_TIMEOUT_SECS);
 
-    let mut cmd = backend.build_ci_fix_command(worktree_path, &prompt);
-    // Ensure the agent process is killed if the wall-clock timeout fires;
-    // without this the child keeps running after wait_with_output is dropped.
-    cmd.kill_on_drop(true);
-    let child = cmd
-        .spawn()
-        .with_context(|| format!("Agent backend '{}' failed to start", backend.name()))?;
+    // Collect the last few significant events so we can print them on failure
+    // without requiring the caller to open events.jsonl.
+    let recent: Arc<Mutex<VecDeque<String>>> = Arc::new(Mutex::new(VecDeque::with_capacity(6)));
+    let recent_clone = recent.clone();
+    let callback = move |event: &AgentEvent| {
+        if let Some(summary) = summarize_ci_event(event) {
+            let mut buf = recent_clone.lock().unwrap_or_else(|e| e.into_inner());
+            if buf.len() >= 5 {
+                buf.pop_front();
+            }
+            buf.push_back(summary);
+        }
+    };
 
-    let fix_timeout = Duration::from_secs(CI_FIX_TIMEOUT_SECS);
-    let output = tokio::time::timeout(fix_timeout, child.wait_with_output())
-        .await
-        .map_err(|_| {
-            anyhow::anyhow!(
-                "{} CI fix timed out after {} seconds",
-                backend.name(),
-                CI_FIX_TIMEOUT_SECS
-            )
-        })?
-        .with_context(|| format!("Failed to wait for {} process", backend.name()))?;
+    let result = agent_runner::run_agent_with_stream_monitoring(
+        cmd,
+        backend,
+        events_dir,
+        Some(&timeout_str),
+        Some(callback),
+        None,
+    )
+    .await;
 
-    Ok(output.status.code().unwrap_or(128))
+    // Print recent events on any kind of failure for immediate triage.
+    let print_recent = |prefix: &str| {
+        let buf = recent.lock().unwrap_or_else(|e| e.into_inner());
+        if !buf.is_empty() {
+            eprintln!("{}Last events:", prefix);
+            for s in buf.iter() {
+                eprintln!("{}  {}", prefix, s);
+            }
+        }
+    };
+
+    match result {
+        Ok(run_result) => {
+            let code = run_result.status.code().unwrap_or(128);
+            if code != 0 {
+                eprintln!(
+                    "⚠️  CI fix agent exited with code {}. See {} for details.",
+                    code,
+                    events_dir.join("events.jsonl").display()
+                );
+                print_recent("    ");
+            }
+            Ok(code)
+        }
+        Err(e) => {
+            print_recent("    ");
+            Err(e)
+        }
+    }
+}
+
+/// Returns a one-line summary of diagnostically useful CI fix events,
+/// or `None` for events that don't add triage value (pings, text deltas, etc.).
+fn summarize_ci_event(event: &AgentEvent) -> Option<String> {
+    match event {
+        AgentEvent::ToolUse {
+            tool_name,
+            input_summary,
+            ..
+        } => {
+            let summary = input_summary.as_deref().unwrap_or(tool_name.as_str());
+            Some(format!("tool: {}", summary))
+        }
+        AgentEvent::Error { message } => Some(format!("error: {}", message)),
+        AgentEvent::MessageComplete {
+            stop_reason: Some(reason),
+            ..
+        } => Some(format!("stop: {}", reason)),
+        _ => None,
+    }
 }
 
 /// Posts an escalation comment on the PR when CI fixes are exhausted
@@ -1094,6 +1159,9 @@ async fn post_escalation_comment_body(
 /// 4. Escalate if all attempts fail
 ///
 /// Returns Ok(true) if CI passed (possibly after fixes), Ok(false) if escalated.
+///
+/// `events_dir` is the minion metadata directory where `events.jsonl` lives.
+/// Stream events from CI fix attempts are appended there alongside the main session events.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn monitor_and_fix_ci(
     backend: &dyn AgentBackend,
@@ -1103,6 +1171,7 @@ pub(crate) async fn monitor_and_fix_ci(
     pr_number: u64,
     branch: &str,
     worktree_path: &Path,
+    events_dir: &Path,
     minion_id: &str,
 ) -> Result<bool> {
     // Tracks whether a fix commit has already been pushed. When true, a
@@ -1179,6 +1248,7 @@ pub(crate) async fn monitor_and_fix_ci(
                     pr_number,
                     branch,
                     worktree_path,
+                    events_dir,
                     minion_id,
                     &head_sha,
                     failed_checks,
@@ -1480,6 +1550,7 @@ async fn run_ci_fix_attempt(
     pr_number: u64,
     branch: &str,
     worktree_path: &Path,
+    events_dir: &Path,
     minion_id: &str,
     head_sha: &str,
     mut failed_checks: Vec<CheckRun>,
@@ -1497,7 +1568,15 @@ async fn run_ci_fix_attempt(
         attempt,
         MAX_CI_FIX_ATTEMPTS
     );
-    let fix_result = invoke_ci_fix(backend, worktree_path, &failed_checks, attempt).await;
+    let fix_result = invoke_ci_fix(
+        backend,
+        worktree_path,
+        events_dir,
+        host,
+        &failed_checks,
+        attempt,
+    )
+    .await;
 
     match fix_result {
         Ok(exit_code) => {

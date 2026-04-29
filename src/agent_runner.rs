@@ -336,6 +336,17 @@ where
     }
     .await;
 
+    // Close our end of the stdout pipe so the child isn't blocked writing
+    // to a pipe with no reader, which would cause child.wait() to hang.
+    drop(reader);
+
+    // On stream error (timeout / stuck / stream-timeout), kill the child so it
+    // terminates promptly rather than running indefinitely after we've stopped
+    // consuming its output.
+    if stream_result.is_err() {
+        let _ = child.kill().await;
+    }
+
     // Always wait for the process
     let status = child.wait().await.context("Failed to wait for child")?;
 
