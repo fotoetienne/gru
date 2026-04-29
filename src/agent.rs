@@ -232,25 +232,14 @@ pub(crate) trait AgentBackend: Send + Sync {
     /// The command should produce plain-text output on stdout with piped stdio.
     fn build_oneshot_command(&self, worktree_path: &Path, prompt_arg: &str) -> TokioCommand;
 
-    /// Build a command for a CI fix invocation.
+    /// Builds a streaming command for a CI fix invocation.
     ///
-    /// CI fix requires multiple turns (read failure logs → locate offending
-    /// code → edit → run tests → commit). Backends intended for single-turn
-    /// utility tasks (such as merge-readiness judging) should use
-    /// `build_oneshot_command` instead; override this method when the backend
-    /// needs a qualitatively different invocation for multi-turn fix cycles.
-    ///
-    /// The default implementation delegates to `build_oneshot_command`.
-    ///
-    /// **Implementor note:** If your `build_oneshot_command` imposes a
-    /// single-turn limit (e.g., `--max-turns 1`), you **must** override this
-    /// method — the default delegation will inherit that limit and CI fix
-    /// will always fail to make meaningful progress. Backends whose
-    /// `build_oneshot_command` does not impose such a limit may safely rely
-    /// on the default.
-    fn build_ci_fix_command(&self, worktree_path: &Path, prompt_arg: &str) -> TokioCommand {
-        self.build_oneshot_command(worktree_path, prompt_arg)
-    }
+    /// Unlike `build_oneshot_command`, this command must produce a stream-json
+    /// event stream on stdout (the same format as `build_command`) so that
+    /// `run_agent_with_stream_monitoring` can capture tool calls and text to
+    /// `events.jsonl`. It does not require a session ID because CI fix
+    /// invocations are stateless one-shots.
+    fn build_ci_fix_command(&self, worktree_path: &Path, prompt: &str) -> TokioCommand;
 }
 
 #[cfg(test)]

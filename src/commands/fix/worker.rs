@@ -293,6 +293,7 @@ pub(crate) async fn monitor_pr_phase(
             &issue_ctx.repo,
             &wt_ctx.branch_name,
             &wt_ctx.checkout_path,
+            &wt_ctx.minion_dir,
             &wt_ctx.minion_id,
         )
         .await;

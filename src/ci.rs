@@ -1,4 +1,5 @@
 use crate::agent::AgentBackend;
+use crate::agent_runner;
 use crate::github;
 use crate::labels;
 use anyhow::{Context, Result};
@@ -907,35 +908,43 @@ pub(crate) async fn get_pr_number(
 
 /// Invokes the agent backend to fix CI failures in the given worktree.
 /// Returns the exit code from the agent process.
+///
+/// Stream events (tool calls, text output) are captured to `events.jsonl`
+/// inside `events_dir` so CI fix attempts are diagnosable after the fact.
 pub(crate) async fn invoke_ci_fix(
     backend: &dyn AgentBackend,
     worktree_path: &Path,
+    events_dir: &Path,
     failed_checks: &[CheckRun],
     attempt: u32,
 ) -> Result<i32> {
     let prompt = build_ci_fix_prompt(failed_checks, attempt, worktree_path);
+    let cmd = backend.build_ci_fix_command(worktree_path, &prompt);
+    let timeout_str = format!("{}s", CI_FIX_TIMEOUT_SECS);
 
-    let mut cmd = backend.build_ci_fix_command(worktree_path, &prompt);
-    // Ensure the agent process is killed if the wall-clock timeout fires;
-    // without this the child keeps running after wait_with_output is dropped.
-    cmd.kill_on_drop(true);
-    let child = cmd
-        .spawn()
-        .with_context(|| format!("Agent backend '{}' failed to start", backend.name()))?;
+    let result = agent_runner::run_agent_with_stream_monitoring(
+        cmd,
+        backend,
+        events_dir,
+        Some(&timeout_str),
+        None::<fn(&crate::agent::AgentEvent)>,
+        None,
+    )
+    .await;
 
-    let fix_timeout = Duration::from_secs(CI_FIX_TIMEOUT_SECS);
-    let output = tokio::time::timeout(fix_timeout, child.wait_with_output())
-        .await
-        .map_err(|_| {
-            anyhow::anyhow!(
-                "{} CI fix timed out after {} seconds",
-                backend.name(),
-                CI_FIX_TIMEOUT_SECS
-            )
-        })?
-        .with_context(|| format!("Failed to wait for {} process", backend.name()))?;
-
-    Ok(output.status.code().unwrap_or(128))
+    match result {
+        Ok(run_result) => {
+            let code = run_result.status.code().unwrap_or(128);
+            if code != 0 {
+                eprintln!(
+                    "⚠️  CI fix agent exited with code {}. See events.jsonl for details.",
+                    code
+                );
+            }
+            Ok(code)
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// Posts an escalation comment on the PR when CI fixes are exhausted
@@ -1058,6 +1067,9 @@ async fn post_escalation_comment_body(
 /// 4. Escalate if all attempts fail
 ///
 /// Returns Ok(true) if CI passed (possibly after fixes), Ok(false) if escalated.
+///
+/// `events_dir` is the minion metadata directory where `events.jsonl` lives.
+/// Stream events from CI fix attempts are appended there alongside the main session events.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn monitor_and_fix_ci(
     backend: &dyn AgentBackend,
@@ -1067,6 +1079,7 @@ pub(crate) async fn monitor_and_fix_ci(
     pr_number: u64,
     branch: &str,
     worktree_path: &Path,
+    events_dir: &Path,
     minion_id: &str,
 ) -> Result<bool> {
     // Tracks whether a fix commit has already been pushed. When true, a
@@ -1143,6 +1156,7 @@ pub(crate) async fn monitor_and_fix_ci(
                     pr_number,
                     branch,
                     worktree_path,
+                    events_dir,
                     minion_id,
                     &head_sha,
                     failed_checks,
@@ -1339,6 +1353,7 @@ async fn run_ci_fix_attempt(
     pr_number: u64,
     branch: &str,
     worktree_path: &Path,
+    events_dir: &Path,
     minion_id: &str,
     head_sha: &str,
     mut failed_checks: Vec<CheckRun>,
@@ -1356,7 +1371,8 @@ async fn run_ci_fix_attempt(
         attempt,
         MAX_CI_FIX_ATTEMPTS
     );
-    let fix_result = invoke_ci_fix(backend, worktree_path, &failed_checks, attempt).await;
+    let fix_result =
+        invoke_ci_fix(backend, worktree_path, events_dir, &failed_checks, attempt).await;
 
     match fix_result {
         Ok(exit_code) => {

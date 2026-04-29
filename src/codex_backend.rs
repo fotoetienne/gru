@@ -87,6 +87,10 @@ impl AgentBackend for CodexBackend {
             .stderr(std::process::Stdio::inherit());
         cmd
     }
+
+    fn build_ci_fix_command(&self, worktree_path: &Path, prompt: &str) -> TokioCommand {
+        build_codex_command(worktree_path, prompt)
+    }
 }
 
 // ---------------------------------------------------------------------------

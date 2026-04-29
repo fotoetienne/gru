@@ -244,6 +244,22 @@ impl AgentBackend for ClaudeBackend {
         cmd.arg(prompt_arg);
         cmd
     }
+
+    fn build_ci_fix_command(&self, worktree_path: &Path, prompt: &str) -> TokioCommand {
+        let mut cmd = TokioCommand::new("claude");
+        cmd.arg("--print")
+            .arg("--verbose")
+            .arg("--output-format")
+            .arg("stream-json")
+            .arg("--include-partial-messages")
+            .arg("--dangerously-skip-permissions")
+            .arg(prompt)
+            .current_dir(worktree_path)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::inherit())
+            .env_remove(crate::labels::GRU_RETRY_PARENT_ENV);
+        cmd
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -1299,6 +1299,7 @@ async fn handle_failed_checks(
         pr_num_u64,
         &ctx.wt_ctx.branch_name,
         &ctx.wt_ctx.checkout_path,
+        &ctx.wt_ctx.minion_dir,
         &ctx.wt_ctx.minion_id,
     )
     .await
@@ -1918,6 +1919,7 @@ pub(crate) async fn monitor_pr_lifecycle(
 
 /// Monitors CI after the initial fix and attempts auto-fixes if checks fail.
 /// Returns Ok(true) if CI passed, Ok(false) if escalated/failed.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn monitor_ci_after_fix(
     backend: &dyn AgentBackend,
     host: &str,
@@ -1925,6 +1927,7 @@ pub(crate) async fn monitor_ci_after_fix(
     repo: &str,
     branch: &str,
     worktree_path: &Path,
+    events_dir: &Path,
     minion_id: &str,
 ) -> Result<bool> {
     let pr_number = match ci::get_pr_number(host, owner, repo, branch, None).await? {
@@ -1976,6 +1979,7 @@ pub(crate) async fn monitor_ci_after_fix(
         pr_number,
         branch,
         worktree_path,
+        events_dir,
         minion_id,
     )
     .await
@@ -2033,6 +2037,14 @@ mod tests {
             &self,
             _worktree_path: &Path,
             _prompt_arg: &str,
+        ) -> tokio::process::Command {
+            tokio::process::Command::new("true")
+        }
+
+        fn build_ci_fix_command(
+            &self,
+            _worktree_path: &Path,
+            _prompt: &str,
         ) -> tokio::process::Command {
             tokio::process::Command::new("true")
         }
