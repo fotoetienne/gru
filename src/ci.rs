@@ -1167,10 +1167,18 @@ pub(crate) async fn monitor_and_fix_ci(
         }
     }
 
-    // Safety: decide_ci_action returns AttemptFix and RetryNextAttempt only when
+    // decide_ci_action returns AttemptFix and RetryNextAttempt only when
     // attempt < max_attempts, so the final iteration always hits an Escalate or Done
     // arm and returns before reaching here. The loop cannot exit normally.
-    unreachable!("all CiFixLoopAction arms either continue the loop or return early")
+    // If that invariant is ever violated, degrade gracefully instead of panicking.
+    debug_assert!(
+        false,
+        "all CiFixLoopAction arms should either continue the loop or return early"
+    );
+    eprintln!(
+        "warning: monitor_and_fix_ci exited its attempt loop unexpectedly; returning Ok(false)"
+    );
+    Ok(false)
 }
 
 /// Internal signal from `run_ci_fix_attempt` back to the main loop.
@@ -1330,14 +1338,80 @@ async fn escalate_exhaustion(
     CiFixLoopAction::Return(false)
 }
 
+/// Redacts sensitive content from `git push` stderr before posting to a PR.
+///
+/// Strips credential config values, redacts URL userinfo (user:pass@host),
+/// escapes backtick fences so they can't break the markdown code block, and
+/// truncates to a safe length.
+fn sanitize_push_failure_stderr(stderr: &str) -> String {
+    const MAX_CHARS: usize = 4000;
+
+    let sensitive_keys = [
+        "credential.helper",
+        "credential.username",
+        "credential.password",
+        "http.extraheader",
+        "core.askpass",
+        "git_askpass",
+    ];
+
+    let lines: Vec<String> = stderr
+        .lines()
+        .map(|line| {
+            let lower = line.to_ascii_lowercase();
+            if sensitive_keys.iter().any(|k| lower.contains(k)) {
+                "[REDACTED SENSITIVE GIT/AUTH CONFIG]".to_string()
+            } else {
+                // Redact userinfo in URLs (user[:pass]@host) and escape code fences
+                redact_url_userinfo(line).replace("```", "'''")
+            }
+        })
+        .collect();
+
+    let mut out = lines.join("\n");
+    if out.chars().count() > MAX_CHARS {
+        out = out.chars().take(MAX_CHARS).collect();
+        out.push_str("\n… [truncated]");
+    }
+    out
+}
+
+/// Redacts `user[:pass]@` userinfo from any URLs in `line`.
+fn redact_url_userinfo(line: &str) -> String {
+    let mut result = String::with_capacity(line.len());
+    let mut remaining = line;
+    loop {
+        let Some(scheme_idx) = remaining.find("://") else {
+            result.push_str(remaining);
+            break;
+        };
+        let scheme_end = scheme_idx + 3;
+        result.push_str(&remaining[..scheme_end]);
+        let after_scheme = &remaining[scheme_end..];
+        let authority_end = after_scheme
+            .find(&['/', '?', '#'][..])
+            .unwrap_or(after_scheme.len());
+        let authority = &after_scheme[..authority_end];
+        if let Some(at_idx) = authority.find('@') {
+            result.push_str("[REDACTED]@");
+            result.push_str(&authority[at_idx + 1..]);
+        } else {
+            result.push_str(authority);
+        }
+        remaining = &after_scheme[authority_end..];
+    }
+    result
+}
+
 /// Builds the escalation reason string for a push failure.
 /// Extracted as a pure function so it can be unit-tested independently.
 fn format_push_failure_reason(attempt: u32, max_attempts: u32, stderr: &str) -> String {
+    let sanitized = sanitize_push_failure_stderr(stderr);
     format!(
         "git push failed after CI fix (attempt {}/{}). \
          Push failures are not retried to avoid repeated conflicting pushes.\n\n\
          Push error:\n\n```\n{}\n```",
-        attempt, max_attempts, stderr
+        attempt, max_attempts, sanitized
     )
 }
 
@@ -2213,5 +2287,61 @@ mod tests {
         // The helper does not trim; callers are responsible for trimming stderr
         let reason = format_push_failure_reason(2, 2, "error: rejected  ");
         assert!(reason.contains("rejected  "));
+    }
+
+    #[test]
+    fn test_sanitize_push_failure_stderr_redacts_credential_helper() {
+        let input = "error: push failed\ncredential.helper=!secret\nfatal: authentication failed";
+        let out = sanitize_push_failure_stderr(input);
+        assert!(!out.contains("secret"));
+        assert!(out.contains("[REDACTED SENSITIVE GIT/AUTH CONFIG]"));
+        assert!(out.contains("push failed"));
+        assert!(out.contains("authentication failed"));
+    }
+
+    #[test]
+    fn test_sanitize_push_failure_stderr_redacts_http_extraheader() {
+        let input = "http.extraheader=Authorization: Bearer ghp_token123";
+        let out = sanitize_push_failure_stderr(input);
+        assert!(!out.contains("ghp_token123"));
+        assert!(out.contains("[REDACTED SENSITIVE GIT/AUTH CONFIG]"));
+    }
+
+    #[test]
+    fn test_sanitize_push_failure_stderr_escapes_code_fence() {
+        let input = "hint: ``` some output ```";
+        let out = sanitize_push_failure_stderr(input);
+        assert!(!out.contains("```"));
+        assert!(out.contains("'''"));
+    }
+
+    #[test]
+    fn test_sanitize_push_failure_stderr_truncates_long_input() {
+        let long = "x".repeat(5000);
+        let out = sanitize_push_failure_stderr(&long);
+        assert!(out.chars().count() <= 4020); // 4000 + "[truncated]" overhead
+        assert!(out.contains("[truncated]"));
+    }
+
+    #[test]
+    fn test_redact_url_userinfo_removes_credentials() {
+        let line = "remote: https://user:password@github.com/owner/repo.git";
+        let out = redact_url_userinfo(line);
+        assert!(!out.contains("user:password"));
+        assert!(out.contains("[REDACTED]@github.com"));
+    }
+
+    #[test]
+    fn test_redact_url_userinfo_leaves_plain_url_intact() {
+        let line = "remote: https://github.com/owner/repo.git";
+        let out = redact_url_userinfo(line);
+        assert_eq!(out, line);
+    }
+
+    #[test]
+    fn test_redact_url_userinfo_no_url() {
+        let line = "error: failed to push some refs";
+        let out = redact_url_userinfo(line);
+        assert_eq!(out, line);
     }
 }
