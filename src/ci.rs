@@ -315,10 +315,12 @@ fn smart_truncate(s: &str, max_bytes: usize) -> String {
     let half = max_bytes / 2;
     let head = safe_head(s, half);
     let tail = safe_tail(s, half);
+    let omitted = s.len() - head.len() - tail.len();
     format!(
-        "{}\n\n... (truncated {} bytes) ...\n\n{}",
+        "{}\n\n... (truncated {} {}) ...\n\n{}",
         head,
-        s.len() - head.len() - tail.len(),
+        omitted,
+        if omitted == 1 { "byte" } else { "bytes" },
         tail
     )
 }
@@ -685,9 +687,16 @@ async fn fetch_check_logs(
     let stdout = String::from_utf8_lossy(&output.stdout);
     let runs: Vec<serde_json::Value> = serde_json::from_str(&stdout).unwrap_or_default();
 
+    // gh run list returns runs in most-recent-first order; we return the first
+    // non-empty log found, so the agent sees the most recent failure.
     for run in &runs {
         let conclusion = run["conclusion"].as_str().unwrap_or("");
-        if conclusion != "failure" {
+        // Mirror what filter_failed_checks considers a failure.
+        let is_failed = matches!(
+            conclusion,
+            "failure" | "cancelled" | "timed_out" | "action_required"
+        );
+        if !is_failed {
             continue;
         }
         if let Some(run_id) = run["databaseId"].as_u64() {
@@ -1886,6 +1895,18 @@ mod tests {
         let result = safe_head(s, 2);
         assert!(s.starts_with(result));
         assert!(result.len() <= 2);
+    }
+
+    #[test]
+    fn test_safe_head_zero_budget() {
+        assert_eq!(safe_head("hello", 0), "");
+    }
+
+    #[test]
+    fn test_smart_truncate_zero_budget() {
+        // Exercises the half=0 path; must not panic.
+        let result = smart_truncate("hello world", 0);
+        assert!(result.contains("truncated"));
     }
 
     #[test]
