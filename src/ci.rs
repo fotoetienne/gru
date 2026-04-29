@@ -1167,6 +1167,9 @@ pub(crate) async fn monitor_and_fix_ci(
         }
     }
 
+    // Safety: decide_ci_action returns AttemptFix and RetryNextAttempt only when
+    // attempt < max_attempts, so the final iteration always hits an Escalate or Done
+    // arm and returns before reaching here. The loop cannot exit normally.
     unreachable!("all CiFixLoopAction arms either continue the loop or return early")
 }
 
@@ -1327,6 +1330,17 @@ async fn escalate_exhaustion(
     CiFixLoopAction::Return(false)
 }
 
+/// Builds the escalation reason string for a push failure.
+/// Extracted as a pure function so it can be unit-tested independently.
+fn format_push_failure_reason(attempt: u32, max_attempts: u32, stderr: &str) -> String {
+    format!(
+        "git push failed after CI fix (attempt {}/{}). \
+         Push failures are not retried to avoid repeated conflicting pushes.\n\n\
+         Push error:\n\n```\n{}\n```",
+        attempt, max_attempts, stderr
+    )
+}
+
 /// Run a single CI fix attempt: enrich logs, invoke Claude, check for new
 /// commits, and push. Returns a loop-control signal for the caller.
 #[allow(clippy::too_many_arguments)]
@@ -1432,13 +1446,7 @@ async fn run_ci_fix_attempt(
         let stderr = String::from_utf8_lossy(&push_output.stderr);
         eprintln!("⚠️  Push failed: {}", stderr);
         eprintln!("🚨 Escalating to human due to push failure");
-        let reason = format!(
-            "git push failed after CI fix (attempt {}/{}).\n\n\
-             Push error:\n\n```\n{}\n```",
-            attempt,
-            MAX_CI_FIX_ATTEMPTS,
-            stderr.trim()
-        );
+        let reason = format_push_failure_reason(attempt, MAX_CI_FIX_ATTEMPTS, stderr.trim());
         return Ok(
             escalate_exhaustion(host, owner, repo, pr_number, &reason, attempt, minion_id).await,
         );
@@ -2190,19 +2198,20 @@ mod tests {
     }
 
     #[test]
-    fn test_push_failure_reason_contains_error_and_attempt() {
+    fn test_format_push_failure_reason_includes_error_and_attempt() {
         let stderr = "error: failed to push some refs to 'origin'\nhint: Updates were rejected";
-        let attempt = 1u32;
-        let reason = format!(
-            "git push failed after CI fix (attempt {}/{}).\n\n\
-             Push error:\n\n```\n{}\n```",
-            attempt,
-            MAX_CI_FIX_ATTEMPTS,
-            stderr.trim()
-        );
+        let reason = format_push_failure_reason(1, 2, stderr);
         assert!(reason.contains("git push failed"));
         assert!(reason.contains("failed to push some refs"));
         assert!(reason.contains("Updates were rejected"));
-        assert!(reason.contains(&format!("attempt {}/{}", attempt, MAX_CI_FIX_ATTEMPTS)));
+        assert!(reason.contains("attempt 1/2"));
+        assert!(reason.contains("not retried"));
+    }
+
+    #[test]
+    fn test_format_push_failure_reason_trims_not_applied_by_helper() {
+        // The helper does not trim; callers are responsible for trimming stderr
+        let reason = format_push_failure_reason(2, 2, "error: rejected  ");
+        assert!(reason.contains("rejected  "));
     }
 }
