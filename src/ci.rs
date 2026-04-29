@@ -339,16 +339,15 @@ fn detect_repo_build_hints(worktree_path: &Path) -> Option<String> {
     }
 
     // justfile is language-agnostic and takes precedence over per-ecosystem manifests.
+    // Recipe names are not standardized, so tell the agent to list them rather than
+    // guessing names like `just test` that may not exist in this repo.
     let has_justfile = worktree_path.join("justfile").exists()
         || worktree_path.join("Justfile").exists()
         || worktree_path.join("JUSTFILE").exists();
     if has_justfile {
         return Some(
-            "Run the relevant checks locally before committing:\n\
-             - For test failures: `just test`\n\
-             - For build errors: `just build`\n\
-             - For lint errors: `just lint`\n\
-             - For format errors: `just fmt`"
+            "Run `just --list` to see available recipes, then run the relevant ones \
+             (e.g. test, build, lint, fmt) before committing."
                 .to_string(),
         );
     }
@@ -360,21 +359,27 @@ fn detect_repo_build_hints(worktree_path: &Path) -> Option<String> {
              - For test failures: `cargo test`\n\
              - For build errors: `cargo build`\n\
              - For lint errors: `cargo clippy`\n\
-             - For format errors: `cargo fmt --check`"
+             - For format errors: `cargo fmt`"
                 .to_string(),
         );
     }
 
-    // Node.js / JavaScript / TypeScript
+    // Node.js / JavaScript / TypeScript — detect package manager from lockfile
     if worktree_path.join("package.json").exists() {
-        return Some(
+        let pm = if worktree_path.join("pnpm-lock.yaml").exists() {
+            "pnpm"
+        } else if worktree_path.join("yarn.lock").exists() {
+            "yarn"
+        } else {
+            "npm"
+        };
+        return Some(format!(
             "Run the relevant checks locally before committing:\n\
-             - For test failures: `npm test`\n\
-             - For build errors: `npm run build`\n\
-             - For lint errors: `npm run lint`\n\
-             - For format errors: `npm run format`"
-                .to_string(),
-        );
+             - For test failures: `{pm} test`\n\
+             - For build errors: `{pm} run build`\n\
+             - For lint errors: `{pm} run lint`\n\
+             - For format errors: `{pm} run format`"
+        ));
     }
 
     // Python
@@ -399,6 +404,28 @@ fn detect_repo_build_hints(worktree_path: &Path) -> Option<String> {
              - For test failures: `./gradlew test`\n\
              - For build errors: `./gradlew build`\n\
              - For lint errors: `./gradlew lint`"
+                .to_string(),
+        );
+    }
+
+    // Maven (JVM)
+    if worktree_path.join("pom.xml").exists() {
+        return Some(
+            "Run the relevant checks locally before committing:\n\
+             - For test failures: `./mvnw test` (or `mvn test`)\n\
+             - For build errors: `./mvnw compile` (or `mvn compile`)"
+                .to_string(),
+        );
+    }
+
+    // Go
+    if worktree_path.join("go.mod").exists() {
+        return Some(
+            "Run the relevant checks locally before committing:\n\
+             - For test failures: `go test ./...`\n\
+             - For build errors: `go build ./...`\n\
+             - For lint errors: `go vet ./...`\n\
+             - For format errors: `gofmt -l .`"
                 .to_string(),
         );
     }
@@ -1415,7 +1442,7 @@ mod tests {
         assert!(prompt.contains("Test Suite"));
         assert!(prompt.contains("test failure"));
         assert!(prompt.contains("FAILED tests/test_auth.rs"));
-        assert!(prompt.contains("`just test`"));
+        assert!(prompt.contains("just --list"));
     }
 
     #[test]
@@ -1529,7 +1556,7 @@ mod tests {
         std::fs::write(dir.path().join("Justfile"), "").unwrap();
         std::fs::write(dir.path().join("Cargo.toml"), "").unwrap();
         let hints = detect_repo_build_hints(dir.path()).unwrap();
-        assert!(hints.contains("just test"));
+        assert!(hints.contains("just --list"));
         assert!(!hints.contains("cargo test"));
     }
 
@@ -1537,6 +1564,58 @@ mod tests {
     fn test_detect_repo_build_hints_none_for_unknown_repo() {
         let dir = tempfile::tempdir().unwrap();
         assert!(detect_repo_build_hints(dir.path()).is_none());
+    }
+
+    #[test]
+    fn test_detect_repo_build_hints_claude_md_beats_agents_md() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("CLAUDE.md"), "").unwrap();
+        std::fs::write(dir.path().join("AGENTS.md"), "").unwrap();
+        let hints = detect_repo_build_hints(dir.path()).unwrap();
+        assert!(hints.contains("CLAUDE.md"));
+        assert!(!hints.contains("AGENTS.md"));
+    }
+
+    #[test]
+    fn test_detect_repo_build_hints_node_pnpm() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("package.json"), "{}").unwrap();
+        std::fs::write(dir.path().join("pnpm-lock.yaml"), "").unwrap();
+        let hints = detect_repo_build_hints(dir.path()).unwrap();
+        assert!(hints.contains("`pnpm test`"));
+        assert!(!hints.contains("`npm test`"));
+    }
+
+    #[test]
+    fn test_detect_repo_build_hints_node_yarn() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("package.json"), "{}").unwrap();
+        std::fs::write(dir.path().join("yarn.lock"), "").unwrap();
+        let hints = detect_repo_build_hints(dir.path()).unwrap();
+        assert!(hints.contains("`yarn test`"));
+        assert!(!hints.contains("`npm test`"));
+    }
+
+    #[test]
+    fn test_detect_repo_build_hints_go() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("go.mod"),
+            "module example.com/foo\n\ngo 1.22",
+        )
+        .unwrap();
+        let hints = detect_repo_build_hints(dir.path()).unwrap();
+        assert!(hints.contains("go test ./..."));
+        assert!(!hints.contains("just"));
+    }
+
+    #[test]
+    fn test_detect_repo_build_hints_maven() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("pom.xml"), "<project/>").unwrap();
+        let hints = detect_repo_build_hints(dir.path()).unwrap();
+        assert!(hints.contains("mvnw") || hints.contains("mvn"));
+        assert!(!hints.contains("just"));
     }
 
     #[test]
