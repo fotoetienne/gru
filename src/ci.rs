@@ -270,6 +270,11 @@ pub(crate) fn decide_after_no_commits(attempt: u32, max_attempts: u32) -> CiFixA
     }
 }
 
+/// Returns the first 8 characters of a SHA for display purposes.
+fn short_sha(sha: &str) -> &str {
+    &sha[..8.min(sha.len())]
+}
+
 /// Returns the last `max_bytes` of a string, aligned to a UTF-8 char boundary.
 /// Safe for all UTF-8 content (won't panic on multi-byte characters).
 fn safe_tail(s: &str, max_bytes: usize) -> &str {
@@ -931,7 +936,7 @@ pub(crate) async fn monitor_and_fix_ci(
             "\n🔍 CI monitoring (attempt {}/{}) for commit {}...",
             attempt,
             MAX_CI_FIX_ATTEMPTS,
-            &head_sha[..8.min(head_sha.len())]
+            short_sha(&head_sha)
         );
 
         // Wait for CI to complete
@@ -999,10 +1004,14 @@ pub(crate) async fn monitor_and_fix_ci(
                 )
                 .await?;
                 match fix_result {
+                    // Push succeeded — next CI wait is post-push.
                     CiFixLoopAction::Continue => {
                         post_push = true;
                         continue;
                     }
+                    // Retrying after an agent error or no-commits: nothing was
+                    // pushed, so post_push stays unchanged.
+                    CiFixLoopAction::ContinueNoPush => continue,
                     CiFixLoopAction::Break => break,
                     CiFixLoopAction::Return(val) => return Ok(val),
                 }
@@ -1018,8 +1027,11 @@ pub(crate) async fn monitor_and_fix_ci(
 
 /// Internal signal from `run_ci_fix_attempt` back to the main loop.
 enum CiFixLoopAction {
-    /// Retry: `continue` the outer attempt loop.
+    /// Push succeeded: `continue` and set `post_push = true`.
     Continue,
+    /// Retrying but nothing was pushed (agent error or no new commits).
+    /// `continue` without setting `post_push`.
+    ContinueNoPush,
     /// Push failed: `break` the outer loop.
     Break,
     /// Escalated to human: return this value immediately.
@@ -1115,7 +1127,10 @@ async fn escalate_no_checks_after_push(
     attempt: u32,
     minion_id: &str,
 ) -> Result<bool> {
-    eprintln!("🚨 CI did not trigger after fix push, escalating to human");
+    eprintln!(
+        "🚨 CI did not trigger after fix push (attempt {}/{}), escalating to human",
+        attempt, MAX_CI_FIX_ATTEMPTS
+    );
 
     let pr_sha = get_pr_head_sha_from_github(host, owner, repo, pr_number)
         .await
@@ -1127,18 +1142,18 @@ async fn escalate_no_checks_after_push(
              but no CI checks appeared. Possible causes: workflow path filters excluded the \
              touched files, the PR is in draft state, the commit message contains `[skip ci]`, \
              or the required workflow was disabled.",
-            &local_sha[..8.min(local_sha.len())]
+            short_sha(local_sha)
         ),
         Some(s) => format!(
             "GitHub PR head SHA (`{}`) does not match the local commit (`{}`). \
              The push may not have registered on GitHub.",
-            &s[..8.min(s.len())],
-            &local_sha[..8.min(local_sha.len())]
+            short_sha(s),
+            short_sha(local_sha)
         ),
         None => format!(
             "Could not retrieve the PR head SHA from GitHub to compare with the \
              local commit (`{}`).",
-            &local_sha[..8.min(local_sha.len())]
+            short_sha(local_sha)
         ),
     };
 
@@ -1211,7 +1226,7 @@ async fn run_ci_fix_attempt(
         Err(e) => {
             eprintln!("⚠️  Agent CI fix failed: {}", e);
             match decide_after_no_commits(attempt, MAX_CI_FIX_ATTEMPTS) {
-                CiFixAction::RetryNextAttempt => return Ok(CiFixLoopAction::Continue),
+                CiFixAction::RetryNextAttempt => return Ok(CiFixLoopAction::ContinueNoPush),
                 CiFixAction::Escalate(_) => {
                     eprintln!(
                         "🚨 Max fix attempts ({}) reached with CI fix error, escalating to human",
@@ -1238,7 +1253,7 @@ async fn run_ci_fix_attempt(
     if new_sha == head_sha {
         eprintln!("⚠️  Agent made no new commits, cannot retry");
         match decide_after_no_commits(attempt, MAX_CI_FIX_ATTEMPTS) {
-            CiFixAction::RetryNextAttempt => return Ok(CiFixLoopAction::Continue),
+            CiFixAction::RetryNextAttempt => return Ok(CiFixLoopAction::ContinueNoPush),
             CiFixAction::Escalate(_) => {
                 eprintln!(
                     "🚨 Max fix attempts ({}) reached with no commits, escalating to human",
