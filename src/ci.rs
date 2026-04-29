@@ -215,18 +215,33 @@ pub(crate) enum EscalationReason {
     ChecksFailed,
     /// Fix attempt produced no new commits on the final attempt.
     NoCommits,
+    /// A fix was pushed but no CI checks appeared — CI may not have been triggered.
+    NoChecksAfterPush,
 }
 
 /// Decides what action to take after observing a CI result.
+///
+/// `post_push` indicates this is after a fix commit was pushed. In that case,
+/// `NoChecks` is treated as an escalation rather than success, because CI was
+/// previously running (it failed) and the absence of new checks means the fix
+/// commit may not have triggered CI at all.
 ///
 /// Pure function — no I/O, no side effects.
 pub(crate) fn decide_ci_action(
     ci_result: &CiResult,
     attempt: u32,
     max_attempts: u32,
+    post_push: bool,
 ) -> CiFixAction {
     match ci_result {
-        CiResult::AllPassed | CiResult::NoChecks => CiFixAction::Done,
+        CiResult::AllPassed => CiFixAction::Done,
+        CiResult::NoChecks => {
+            if post_push {
+                CiFixAction::Escalate(EscalationReason::NoChecksAfterPush)
+            } else {
+                CiFixAction::Done
+            }
+        }
         CiResult::Timeout => {
             if attempt >= max_attempts {
                 CiFixAction::Escalate(EscalationReason::Timeout)
@@ -659,6 +674,43 @@ pub(crate) async fn get_head_sha(worktree_path: &Path) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
+/// Retrieves the current head SHA of a PR from the GitHub API.
+///
+/// Returns `None` if the PR cannot be found or the request fails.
+pub(crate) async fn get_pr_head_sha_from_github(
+    host: &str,
+    owner: &str,
+    repo: &str,
+    pr_number: u64,
+) -> Result<Option<String>> {
+    let repo_full = github::repo_slug(owner, repo);
+    let pr_num_str = pr_number.to_string();
+    let output = github::gh_cli_command(host)
+        .args([
+            "pr",
+            "view",
+            &pr_num_str,
+            "--repo",
+            &repo_full,
+            "--json",
+            "headRefOid",
+            "--jq",
+            ".headRefOid",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .await
+        .context("Failed to query PR head SHA from GitHub")?;
+
+    if !output.status.success() {
+        return Ok(None);
+    }
+
+    let sha = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    Ok(if sha.is_empty() { None } else { Some(sha) })
+}
+
 /// Gets the PR number associated with the current branch
 /// Looks up a PR number for the given branch.
 ///
@@ -866,6 +918,11 @@ pub(crate) async fn monitor_and_fix_ci(
     worktree_path: &Path,
     minion_id: &str,
 ) -> Result<bool> {
+    // Tracks whether a fix commit has already been pushed. When true, a
+    // subsequent NoChecks result means CI did not trigger after the push
+    // (path filters, draft PR, skip-ci, etc.) rather than "no CI configured".
+    let mut post_push = false;
+
     for attempt in 1..=MAX_CI_FIX_ATTEMPTS {
         // Get the current HEAD SHA
         let head_sha = get_head_sha(worktree_path).await?;
@@ -880,7 +937,7 @@ pub(crate) async fn monitor_and_fix_ci(
         // Wait for CI to complete
         let ci_result = wait_for_ci(host, owner, repo, &head_sha).await?;
 
-        match decide_ci_action(&ci_result, attempt, MAX_CI_FIX_ATTEMPTS) {
+        match decide_ci_action(&ci_result, attempt, MAX_CI_FIX_ATTEMPTS, post_push) {
             CiFixAction::Done => {
                 match ci_result {
                     CiResult::AllPassed => eprintln!("✅ All CI checks passed!"),
@@ -916,6 +973,12 @@ pub(crate) async fn monitor_and_fix_ci(
                 )
                 .await;
             }
+            CiFixAction::Escalate(EscalationReason::NoChecksAfterPush) => {
+                return escalate_no_checks_after_push(
+                    host, owner, repo, pr_number, &head_sha, attempt, minion_id,
+                )
+                .await;
+            }
             CiFixAction::AttemptFix => {
                 let failed_checks = match ci_result {
                     CiResult::Failed(checks) => checks,
@@ -936,7 +999,10 @@ pub(crate) async fn monitor_and_fix_ci(
                 )
                 .await?;
                 match fix_result {
-                    CiFixLoopAction::Continue => continue,
+                    CiFixLoopAction::Continue => {
+                        post_push = true;
+                        continue;
+                    }
                     CiFixLoopAction::Break => break,
                     CiFixLoopAction::Return(val) => return Ok(val),
                 }
@@ -1032,6 +1098,58 @@ async fn escalate_checks_failed(
     )
     .await
     .unwrap_or_else(|e| eprintln!("⚠️  Failed to post escalation: {}", e));
+    Ok(false)
+}
+
+/// Escalate when a fix was pushed but no CI checks appeared afterward.
+///
+/// Queries the PR's current head SHA from GitHub to provide diagnostic
+/// information: if it differs from the local SHA the push may not have
+/// registered, which is a separate bug to investigate.
+async fn escalate_no_checks_after_push(
+    host: &str,
+    owner: &str,
+    repo: &str,
+    pr_number: u64,
+    local_sha: &str,
+    attempt: u32,
+    minion_id: &str,
+) -> Result<bool> {
+    eprintln!("🚨 CI did not trigger after fix push, escalating to human");
+
+    let pr_sha = get_pr_head_sha_from_github(host, owner, repo, pr_number)
+        .await
+        .unwrap_or(None);
+
+    let sha_note = match pr_sha.as_deref() {
+        Some(s) if s == local_sha => format!(
+            "GitHub PR head SHA matches the local commit (`{}`), so the push registered — \
+             but no CI checks appeared. Possible causes: workflow path filters excluded the \
+             touched files, the PR is in draft state, the commit message contains `[skip ci]`, \
+             or the required workflow was disabled.",
+            &local_sha[..8.min(local_sha.len())]
+        ),
+        Some(s) => format!(
+            "GitHub PR head SHA (`{}`) does not match the local commit (`{}`). \
+             The push may not have registered on GitHub.",
+            &s[..8.min(s.len())],
+            &local_sha[..8.min(local_sha.len())]
+        ),
+        None => format!(
+            "Could not retrieve the PR head SHA from GitHub to compare with the \
+             local commit (`{}`).",
+            &local_sha[..8.min(local_sha.len())]
+        ),
+    };
+
+    let reason = format!(
+        "A fix commit was pushed after attempt {attempt}, but no CI checks appeared within \
+         the {CI_WAIT_TIMEOUT_SECS}-second window.\n\n{sha_note}"
+    );
+
+    post_exhaustion_escalation_comment(host, owner, repo, pr_number, &reason, attempt, minion_id)
+        .await
+        .unwrap_or_else(|e| eprintln!("⚠️  Failed to post escalation: {}", e));
     Ok(false)
 }
 
@@ -1452,20 +1570,42 @@ mod tests {
     #[test]
     fn test_decide_ci_action_all_passed() {
         let result = CiResult::AllPassed;
-        assert_eq!(decide_ci_action(&result, 1, 2), CiFixAction::Done);
+        assert_eq!(decide_ci_action(&result, 1, 2, false), CiFixAction::Done);
     }
 
     #[test]
-    fn test_decide_ci_action_no_checks() {
+    fn test_decide_ci_action_no_checks_not_post_push() {
+        // NoChecks before any fix push → treat as "no CI configured", done.
         let result = CiResult::NoChecks;
-        assert_eq!(decide_ci_action(&result, 1, 2), CiFixAction::Done);
+        assert_eq!(decide_ci_action(&result, 1, 2, false), CiFixAction::Done);
+    }
+
+    #[test]
+    fn test_decide_ci_action_no_checks_post_push() {
+        // NoChecks after a fix was pushed → CI did not trigger, escalate.
+        let result = CiResult::NoChecks;
+        assert_eq!(
+            decide_ci_action(&result, 2, 2, true),
+            CiFixAction::Escalate(EscalationReason::NoChecksAfterPush)
+        );
+    }
+
+    #[test]
+    fn test_decide_ci_action_no_checks_post_push_non_final_attempt() {
+        // Even on a non-final attempt, NoChecks-after-push should escalate
+        // (retrying won't help if CI is not configured to trigger).
+        let result = CiResult::NoChecks;
+        assert_eq!(
+            decide_ci_action(&result, 1, 2, true),
+            CiFixAction::Escalate(EscalationReason::NoChecksAfterPush)
+        );
     }
 
     #[test]
     fn test_decide_ci_action_timeout_not_last_attempt() {
         let result = CiResult::Timeout;
         assert_eq!(
-            decide_ci_action(&result, 1, 2),
+            decide_ci_action(&result, 1, 2, false),
             CiFixAction::RetryNextAttempt
         );
     }
@@ -1474,7 +1614,7 @@ mod tests {
     fn test_decide_ci_action_timeout_last_attempt() {
         let result = CiResult::Timeout;
         assert_eq!(
-            decide_ci_action(&result, 2, 2),
+            decide_ci_action(&result, 2, 2, false),
             CiFixAction::Escalate(EscalationReason::Timeout)
         );
     }
@@ -1488,14 +1628,17 @@ mod tests {
             duration: None,
             output: None,
         }]);
-        assert_eq!(decide_ci_action(&result, 1, 2), CiFixAction::AttemptFix);
+        assert_eq!(
+            decide_ci_action(&result, 1, 2, false),
+            CiFixAction::AttemptFix
+        );
     }
 
     #[test]
     fn test_decide_ci_action_failed_last_attempt() {
         let result = CiResult::Failed(vec![]);
         assert_eq!(
-            decide_ci_action(&result, 2, 2),
+            decide_ci_action(&result, 2, 2, false),
             CiFixAction::Escalate(EscalationReason::ChecksFailed)
         );
     }
@@ -1505,13 +1648,13 @@ mod tests {
         // With max_attempts=1, first attempt is already the last
         let result = CiResult::Failed(vec![]);
         assert_eq!(
-            decide_ci_action(&result, 1, 1),
+            decide_ci_action(&result, 1, 1, false),
             CiFixAction::Escalate(EscalationReason::ChecksFailed)
         );
 
         let timeout = CiResult::Timeout;
         assert_eq!(
-            decide_ci_action(&timeout, 1, 1),
+            decide_ci_action(&timeout, 1, 1, false),
             CiFixAction::Escalate(EscalationReason::Timeout)
         );
     }
@@ -1520,7 +1663,7 @@ mod tests {
     fn test_decide_ci_action_passed_on_last_attempt() {
         // CI can pass on any attempt
         let result = CiResult::AllPassed;
-        assert_eq!(decide_ci_action(&result, 2, 2), CiFixAction::Done);
+        assert_eq!(decide_ci_action(&result, 2, 2, false), CiFixAction::Done);
     }
 
     // --- decide_after_no_commits tests ---
