@@ -967,9 +967,9 @@ pub(crate) async fn invoke_ci_fix(
             let code = run_result.status.code().unwrap_or(128);
             if code != 0 {
                 eprintln!(
-                    "⚠️  CI fix agent exited with code {}. See {}/events.jsonl for details.",
+                    "⚠️  CI fix agent exited with code {}. See {} for details.",
                     code,
-                    events_dir.display()
+                    events_dir.join("events.jsonl").display()
                 );
                 print_recent("    ");
             }

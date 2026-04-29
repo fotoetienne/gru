@@ -244,8 +244,11 @@ impl AgentBackend for ClaudeBackend {
             .arg("--output-format")
             .arg("stream-json")
             .arg("--include-partial-messages")
-            .arg("--dangerously-skip-permissions")
-            .arg(prompt)
+            .arg("--dangerously-skip-permissions");
+        if let Some(max_turns) = self.ci_fix_max_turns {
+            cmd.arg("--max-turns").arg(max_turns.to_string());
+        }
+        cmd.arg(prompt)
             .current_dir(worktree_path)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::inherit())
@@ -479,7 +482,7 @@ mod tests {
         assert!(args.contains(&"--include-partial-messages".as_ref()));
         assert!(args.contains(&"--dangerously-skip-permissions".as_ref()));
         assert!(args.contains(&"fix the CI".as_ref()));
-        // Should NOT have session-id or max-turns
+        // Should NOT have session-id; max-turns absent when ci_fix_max_turns is None
         assert!(!args.contains(&"--session-id".as_ref()));
         assert!(!args.contains(&"--max-turns".as_ref()));
         // Should NOT use text output format
@@ -489,6 +492,18 @@ mod tests {
         assert!(envs
             .iter()
             .any(|(k, v)| *k == "GH_HOST" && v.map(|v| v == "github.com").unwrap_or(false)));
+    }
+
+    #[test]
+    fn test_build_ci_fix_command_applies_max_turns() {
+        let b = ClaudeBackend::new(Some(10));
+        let path = std::path::PathBuf::from("/tmp/worktree");
+        let cmd = b.build_ci_fix_command(&path, "fix the CI", "github.com");
+        let inner = cmd.as_std();
+
+        let args: Vec<&std::ffi::OsStr> = inner.get_args().collect();
+        assert!(args.contains(&"--max-turns".as_ref()));
+        assert!(args.contains(&"10".as_ref()));
     }
 
     // ---- parse_event tests ----
