@@ -239,7 +239,15 @@ pub(crate) trait AgentBackend: Send + Sync {
     /// `run_agent_with_stream_monitoring` can capture tool calls and text to
     /// `events.jsonl`. It does not require a session ID because CI fix
     /// invocations are stateless one-shots.
-    fn build_ci_fix_command(&self, worktree_path: &Path, prompt: &str) -> TokioCommand;
+    ///
+    /// `github_host` is forwarded as `GH_HOST` so `gh` CLI calls inside the
+    /// agent target the correct GitHub Enterprise host.
+    fn build_ci_fix_command(
+        &self,
+        worktree_path: &Path,
+        prompt: &str,
+        github_host: &str,
+    ) -> TokioCommand;
 }
 
 #[cfg(test)]

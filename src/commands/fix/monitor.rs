@@ -2045,6 +2045,7 @@ mod tests {
             &self,
             _worktree_path: &Path,
             _prompt: &str,
+            _github_host: &str,
         ) -> tokio::process::Command {
             tokio::process::Command::new("true")
         }

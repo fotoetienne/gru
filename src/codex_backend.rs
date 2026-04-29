@@ -88,8 +88,15 @@ impl AgentBackend for CodexBackend {
         cmd
     }
 
-    fn build_ci_fix_command(&self, worktree_path: &Path, prompt: &str) -> TokioCommand {
-        build_codex_command(worktree_path, prompt)
+    fn build_ci_fix_command(
+        &self,
+        worktree_path: &Path,
+        prompt: &str,
+        github_host: &str,
+    ) -> TokioCommand {
+        let mut cmd = build_codex_command(worktree_path, prompt);
+        cmd.env("GH_HOST", github_host);
+        cmd
     }
 }
 

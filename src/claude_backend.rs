@@ -232,20 +232,12 @@ impl AgentBackend for ClaudeBackend {
         cmd
     }
 
-    fn build_ci_fix_command(&self, worktree_path: &Path, prompt_arg: &str) -> TokioCommand {
-        let mut cmd = ClaudeBackend::base_noninteractive_cmd(worktree_path);
-
-        // Apply a configurable turn limit if set; otherwise run unbounded,
-        // relying on the CI_FIX_TIMEOUT_SECS wall-clock cap as the primary bound.
-        if let Some(turns) = self.ci_fix_max_turns {
-            cmd.arg("--max-turns").arg(turns.to_string());
-        }
-
-        cmd.arg(prompt_arg);
-        cmd
-    }
-
-    fn build_ci_fix_command(&self, worktree_path: &Path, prompt: &str) -> TokioCommand {
+    fn build_ci_fix_command(
+        &self,
+        worktree_path: &Path,
+        prompt: &str,
+        github_host: &str,
+    ) -> TokioCommand {
         let mut cmd = TokioCommand::new("claude");
         cmd.arg("--print")
             .arg("--verbose")
@@ -257,6 +249,7 @@ impl AgentBackend for ClaudeBackend {
             .current_dir(worktree_path)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::inherit())
+            .env("GH_HOST", github_host)
             .env_remove(crate::labels::GRU_RETRY_PARENT_ENV);
         cmd
     }
@@ -471,47 +464,31 @@ mod tests {
     }
 
     #[test]
-    fn test_build_ci_fix_command_no_max_turns_by_default() {
-        // ClaudeBackend::default() has ci_fix_max_turns = None, so --max-turns
-        // must not appear. Hermetic: no ambient config is consulted.
-        let b = ClaudeBackend::default();
+    fn test_build_ci_fix_command_produces_expected_args() {
+        let b = backend();
         let path = std::path::PathBuf::from("/tmp/worktree");
-        let cmd = b.build_ci_fix_command(&path, "fix ci");
+        let cmd = b.build_ci_fix_command(&path, "fix the CI", "github.com");
         let inner = cmd.as_std();
 
         assert_eq!(inner.get_program(), "claude");
         let args: Vec<&std::ffi::OsStr> = inner.get_args().collect();
         assert!(args.contains(&"--print".as_ref()));
+        assert!(args.contains(&"--verbose".as_ref()));
+        assert!(args.contains(&"--output-format".as_ref()));
+        assert!(args.contains(&"stream-json".as_ref()));
+        assert!(args.contains(&"--include-partial-messages".as_ref()));
         assert!(args.contains(&"--dangerously-skip-permissions".as_ref()));
-        assert!(args.contains(&"fix ci".as_ref()));
-        // No --max-turns limit — CI fix needs multiple turns
+        assert!(args.contains(&"fix the CI".as_ref()));
+        // Should NOT have session-id or max-turns
+        assert!(!args.contains(&"--session-id".as_ref()));
         assert!(!args.contains(&"--max-turns".as_ref()));
-    }
-
-    #[test]
-    fn test_build_ci_fix_command_respects_configured_max_turns() {
-        // Construct the backend directly with a turn limit — no filesystem I/O.
-        let b = ClaudeBackend::new(Some(42));
-        let path = std::path::PathBuf::from("/tmp/worktree");
-        let cmd = b.build_ci_fix_command(&path, "fix ci");
-        let inner = cmd.as_std();
-
-        let args: Vec<&std::ffi::OsStr> = inner.get_args().collect();
-        assert!(args.contains(&"--max-turns".as_ref()));
-        assert!(args.contains(&"42".as_ref()));
-    }
-
-    #[test]
-    fn test_build_ci_fix_command_oneshot_still_has_max_turns_1() {
-        // build_oneshot_command must still use --max-turns 1 (merge-readiness judge).
-        let b = backend();
-        let path = std::path::PathBuf::from("/tmp/worktree");
-        let cmd = b.build_oneshot_command(&path, "judge");
-        let inner = cmd.as_std();
-
-        let args: Vec<&std::ffi::OsStr> = inner.get_args().collect();
-        assert!(args.contains(&"--max-turns".as_ref()));
-        assert!(args.contains(&"1".as_ref()));
+        // Should NOT use text output format
+        assert!(!args.contains(&"text".as_ref()));
+        // GH_HOST should be set
+        let envs: Vec<(&std::ffi::OsStr, Option<&std::ffi::OsStr>)> = inner.get_envs().collect();
+        assert!(envs
+            .iter()
+            .any(|(k, v)| *k == "GH_HOST" && v.map(|v| v == "github.com").unwrap_or(false)));
     }
 
     // ---- parse_event tests ----

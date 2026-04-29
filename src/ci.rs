@@ -915,11 +915,12 @@ pub(crate) async fn invoke_ci_fix(
     backend: &dyn AgentBackend,
     worktree_path: &Path,
     events_dir: &Path,
+    github_host: &str,
     failed_checks: &[CheckRun],
     attempt: u32,
 ) -> Result<i32> {
     let prompt = build_ci_fix_prompt(failed_checks, attempt, worktree_path);
-    let cmd = backend.build_ci_fix_command(worktree_path, &prompt);
+    let cmd = backend.build_ci_fix_command(worktree_path, &prompt, github_host);
     let timeout_str = format!("{}s", CI_FIX_TIMEOUT_SECS);
 
     let result = agent_runner::run_agent_with_stream_monitoring(
@@ -937,8 +938,9 @@ pub(crate) async fn invoke_ci_fix(
             let code = run_result.status.code().unwrap_or(128);
             if code != 0 {
                 eprintln!(
-                    "⚠️  CI fix agent exited with code {}. See events.jsonl for details.",
-                    code
+                    "⚠️  CI fix agent exited with code {}. See {}/events.jsonl for details.",
+                    code,
+                    events_dir.display()
                 );
             }
             Ok(code)
@@ -1371,8 +1373,15 @@ async fn run_ci_fix_attempt(
         attempt,
         MAX_CI_FIX_ATTEMPTS
     );
-    let fix_result =
-        invoke_ci_fix(backend, worktree_path, events_dir, &failed_checks, attempt).await;
+    let fix_result = invoke_ci_fix(
+        backend,
+        worktree_path,
+        events_dir,
+        host,
+        &failed_checks,
+        attempt,
+    )
+    .await;
 
     match fix_result {
         Ok(exit_code) => {
