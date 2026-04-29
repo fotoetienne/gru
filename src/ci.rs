@@ -1167,8 +1167,7 @@ pub(crate) async fn monitor_and_fix_ci(
         }
     }
 
-    // Reached when the fix attempt breaks the loop (e.g., git push failure).
-    Ok(false)
+    unreachable!("all CiFixLoopAction arms either continue the loop or return early")
 }
 
 /// Internal signal from `run_ci_fix_attempt` back to the main loop.
@@ -1432,7 +1431,17 @@ async fn run_ci_fix_attempt(
     if !push_output.status.success() {
         let stderr = String::from_utf8_lossy(&push_output.stderr);
         eprintln!("⚠️  Push failed: {}", stderr);
-        return Ok(CiFixLoopAction::Break);
+        eprintln!("🚨 Escalating to human due to push failure");
+        let reason = format!(
+            "git push failed after CI fix (attempt {}/{}).\n\n\
+             Push error:\n\n```\n{}\n```",
+            attempt,
+            MAX_CI_FIX_ATTEMPTS,
+            stderr.trim()
+        );
+        return Ok(
+            escalate_exhaustion(host, owner, repo, pr_number, &reason, attempt, minion_id).await,
+        );
     }
 
     // Wait for GitHub to register checks for the new commit
@@ -2178,5 +2187,22 @@ mod tests {
         let names: Vec<&str> = failed.iter().map(|c| c.name.as_str()).collect();
         assert!(names.contains(&"test"));
         assert!(names.contains(&"deploy"));
+    }
+
+    #[test]
+    fn test_push_failure_reason_contains_error_and_attempt() {
+        let stderr = "error: failed to push some refs to 'origin'\nhint: Updates were rejected";
+        let attempt = 1u32;
+        let reason = format!(
+            "git push failed after CI fix (attempt {}/{}).\n\n\
+             Push error:\n\n```\n{}\n```",
+            attempt,
+            MAX_CI_FIX_ATTEMPTS,
+            stderr.trim()
+        );
+        assert!(reason.contains("git push failed"));
+        assert!(reason.contains("failed to push some refs"));
+        assert!(reason.contains("Updates were rejected"));
+        assert!(reason.contains(&format!("attempt {}/{}", attempt, MAX_CI_FIX_ATTEMPTS)));
     }
 }
