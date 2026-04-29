@@ -32,12 +32,29 @@ struct ToolBuffer {
 /// internally, emitting a single `AgentEvent::ToolUse` with a populated
 /// `input_summary` when `ContentBlockStop` arrives. This eliminates the UX
 /// regression of showing "Tool: Bash" instead of "Run: git status".
-#[derive(Default)]
 pub(crate) struct ClaudeBackend {
     tool_buffer: Mutex<Option<ToolBuffer>>,
+    /// Maximum agent turns for CI fix invocations. `None` means no limit.
+    ci_fix_max_turns: Option<u32>,
+}
+
+impl Default for ClaudeBackend {
+    fn default() -> Self {
+        Self {
+            tool_buffer: Mutex::new(None),
+            ci_fix_max_turns: None,
+        }
+    }
 }
 
 impl ClaudeBackend {
+    pub(crate) fn new(ci_fix_max_turns: Option<u32>) -> Self {
+        Self {
+            tool_buffer: Mutex::new(None),
+            ci_fix_max_turns,
+        }
+    }
+
     /// Returns a command pre-configured with the flags common to all
     /// non-interactive Claude invocations (print, text output, no permissions
     /// prompt, piped stdio). Callers add turn limits and the prompt argument.
@@ -220,13 +237,7 @@ impl AgentBackend for ClaudeBackend {
 
         // Apply a configurable turn limit if set; otherwise run unbounded,
         // relying on the CI_FIX_TIMEOUT_SECS wall-clock cap as the primary bound.
-        //
-        // TODO: tech debt — reading config from disk inside a command builder
-        // couples ClaudeBackend to the filesystem. Ideally ci_fix_max_turns would
-        // be injected at construction time (see issue #888 review comments).
-        let max_turns =
-            crate::config::try_load_config().and_then(|c| c.agent.claude.ci_fix_max_turns);
-        if let Some(turns) = max_turns {
+        if let Some(turns) = self.ci_fix_max_turns {
             cmd.arg("--max-turns").arg(turns.to_string());
         }
 
@@ -445,8 +456,9 @@ mod tests {
 
     #[test]
     fn test_build_ci_fix_command_no_max_turns_by_default() {
-        // Without config, ci_fix_max_turns is None so --max-turns should NOT appear.
-        let b = backend();
+        // ClaudeBackend::default() has ci_fix_max_turns = None, so --max-turns
+        // must not appear. Hermetic: no ambient config is consulted.
+        let b = ClaudeBackend::default();
         let path = std::path::PathBuf::from("/tmp/worktree");
         let cmd = b.build_ci_fix_command(&path, "fix ci");
         let inner = cmd.as_std();
@@ -462,19 +474,8 @@ mod tests {
 
     #[test]
     fn test_build_ci_fix_command_respects_configured_max_turns() {
-        use crate::config::{set_test_config_path, LabConfig};
-        use std::io::Write;
-
-        let mut tmp = tempfile::NamedTempFile::new().unwrap();
-        writeln!(tmp, "[agent.claude]\nci_fix_max_turns = 42").unwrap();
-
-        let _guard = set_test_config_path(tmp.path().to_path_buf());
-
-        // Verify the config parses correctly
-        let config = LabConfig::load_partial(tmp.path()).unwrap();
-        assert_eq!(config.agent.claude.ci_fix_max_turns, Some(42));
-
-        let b = backend();
+        // Construct the backend directly with a turn limit — no filesystem I/O.
+        let b = ClaudeBackend::new(Some(42));
         let path = std::path::PathBuf::from("/tmp/worktree");
         let cmd = b.build_ci_fix_command(&path, "fix ci");
         let inner = cmd.as_std();

@@ -737,13 +737,7 @@ impl LabConfig {
             .with_context(|| format!("Failed to parse config file: {}", path.display()))?;
 
         config.validate_github_hosts()?;
-
-        if config.agent.claude.ci_fix_max_turns == Some(0) {
-            anyhow::bail!(
-                "agent.claude.ci_fix_max_turns must be a positive integer (got 0). \
-                 Remove the field to use no limit, or set it to a positive value."
-            );
-        }
+        config.validate_agent()?;
 
         Ok(config)
     }
@@ -791,6 +785,7 @@ impl LabConfig {
         }
 
         self.validate_github_hosts()?;
+        self.validate_agent()?;
 
         // Validate repo format and host name references
         for repo in &self.daemon.repos {
@@ -824,6 +819,20 @@ impl LabConfig {
             }
         }
 
+        Ok(())
+    }
+
+    /// Validate agent configuration.
+    ///
+    /// Runs in both `load()` and `load_partial()` because agent settings are
+    /// used by all commands, not just the daemon.
+    fn validate_agent(&self) -> Result<()> {
+        if self.agent.claude.ci_fix_max_turns == Some(0) {
+            anyhow::bail!(
+                "agent.claude.ci_fix_max_turns must be a positive integer (got 0). \
+                 Remove the field to use no limit, or set it to a positive value."
+            );
+        }
         Ok(())
     }
 
@@ -1229,13 +1238,31 @@ default = "aider"
     }
 
     #[test]
-    fn test_ci_fix_max_turns_zero_is_rejected() {
+    fn test_ci_fix_max_turns_zero_is_rejected_by_load_partial() {
         let config_toml = "[agent.claude]\nci_fix_max_turns = 0\n";
         let mut temp_file = NamedTempFile::new().unwrap();
         temp_file.write_all(config_toml.as_bytes()).unwrap();
         temp_file.flush().unwrap();
 
         let result = LabConfig::load_partial(temp_file.path());
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("ci_fix_max_turns"),
+            "error should mention the field: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_ci_fix_max_turns_zero_is_rejected_by_load() {
+        // gru lab uses LabConfig::load() — ensure it also rejects ci_fix_max_turns = 0.
+        let config_toml =
+            "[daemon]\nrepos = [\"owner/repo\"]\n\n[agent.claude]\nci_fix_max_turns = 0\n";
+        let mut temp_file = NamedTempFile::new().unwrap();
+        temp_file.write_all(config_toml.as_bytes()).unwrap();
+        temp_file.flush().unwrap();
+
+        let result = LabConfig::load(temp_file.path());
         assert!(result.is_err());
         let msg = format!("{}", result.unwrap_err());
         assert!(
