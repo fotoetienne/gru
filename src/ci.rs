@@ -1863,6 +1863,7 @@ mod tests {
     #[test]
     fn test_build_ci_fix_prompt_empty_string_output_shows_fallback() {
         // Some("") is treated the same as None — no empty fenced block.
+        let dir = tempfile::tempdir().unwrap();
         let checks = vec![CheckRun {
             name: "CI / test".to_string(),
             status: CheckStatus::Completed,
@@ -1870,7 +1871,7 @@ mod tests {
             duration: None,
             output: Some("".to_string()),
         }];
-        let prompt = build_ci_fix_prompt(&checks, 1);
+        let prompt = build_ci_fix_prompt(&checks, 1, dir.path());
         assert!(
             prompt.contains("gh run view"),
             "empty-string output must trigger fallback instructions"
@@ -1883,6 +1884,7 @@ mod tests {
 
     #[test]
     fn test_build_ci_fix_prompt_whitespace_output_shows_fallback() {
+        let dir = tempfile::tempdir().unwrap();
         let checks = vec![CheckRun {
             name: "CI / test".to_string(),
             status: CheckStatus::Completed,
@@ -1890,7 +1892,7 @@ mod tests {
             duration: None,
             output: Some("   \n  ".to_string()),
         }];
-        let prompt = build_ci_fix_prompt(&checks, 1);
+        let prompt = build_ci_fix_prompt(&checks, 1, dir.path());
         assert!(
             prompt.contains("gh run view"),
             "whitespace-only output must trigger fallback instructions"
