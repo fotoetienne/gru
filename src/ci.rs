@@ -319,8 +319,140 @@ pub(crate) fn classify_failure(check: &CheckRun) -> FailureType {
     FailureType::Other(name_lower)
 }
 
+/// Detects build/test/lint/format hints for the given worktree by inspecting
+/// documentation files and package manifests present in the repository root.
+///
+/// Returns `None` when no recognized artifacts are found so callers can omit
+/// the recipe block entirely rather than emitting gru-specific defaults.
+fn detect_repo_build_hints(worktree_path: &Path) -> Option<String> {
+    // CLAUDE.md / AGENTS.md take priority: the agent already has these in
+    // context, so just tell it where to look rather than trying to parse them.
+    if worktree_path.join("CLAUDE.md").exists() {
+        return Some(
+            "Check CLAUDE.md for the project's build, test, lint, and format commands.".to_string(),
+        );
+    }
+    if worktree_path.join("AGENTS.md").exists() {
+        return Some(
+            "Check AGENTS.md for the project's build, test, lint, and format commands.".to_string(),
+        );
+    }
+
+    // justfile is language-agnostic and takes precedence over per-ecosystem manifests.
+    // Recipe names are not standardized, so tell the agent to list them rather than
+    // guessing names like `just test` that may not exist in this repo.
+    let has_justfile = worktree_path.join("justfile").exists()
+        || worktree_path.join("Justfile").exists()
+        || worktree_path.join("JUSTFILE").exists();
+    if has_justfile {
+        return Some(
+            "Run `just --list` to see available recipes, then run the relevant ones (e.g. test, build, lint, fmt) before committing."
+                .to_string(),
+        );
+    }
+
+    // Rust
+    if worktree_path.join("Cargo.toml").exists() {
+        return Some(
+            "Run the relevant checks locally before committing:\n\
+             - For test failures: `cargo test`\n\
+             - For build errors: `cargo build`\n\
+             - For lint errors: `cargo clippy`\n\
+             - For format errors: `cargo fmt`"
+                .to_string(),
+        );
+    }
+
+    // Node.js / JavaScript / TypeScript — detect package manager from lockfile
+    if worktree_path.join("package.json").exists() {
+        let pm = if worktree_path.join("pnpm-lock.yaml").exists() {
+            "pnpm"
+        } else if worktree_path.join("yarn.lock").exists() {
+            "yarn"
+        } else {
+            "npm"
+        };
+        return Some(format!(
+            "Run the relevant checks locally before committing:\n\
+             - For test failures: `{pm} test`\n\
+             - For build errors: `{pm} run build`\n\
+             - For lint errors: `{pm} run lint`\n\
+             - For format errors: `{pm} run format`"
+        ));
+    }
+
+    // Python — point the agent at whichever config files are actually present
+    let has_pyproject = worktree_path.join("pyproject.toml").exists();
+    let has_setup_cfg = worktree_path.join("setup.cfg").exists();
+    let has_setup_py = worktree_path.join("setup.py").exists();
+    if has_pyproject || has_setup_cfg || has_setup_py {
+        let config_hint = match (has_pyproject, has_setup_cfg, has_setup_py) {
+            (true, true, _) => {
+                "check pyproject.toml or setup.cfg for the configured lint and format commands"
+            }
+            (true, false, true) => {
+                "check pyproject.toml or setup.py for the configured lint and format commands"
+            }
+            (true, false, false) => {
+                "check pyproject.toml for the configured lint and format commands"
+            }
+            (false, true, true) => {
+                "check setup.cfg or setup.py for the configured lint and format commands"
+            }
+            (false, true, false) => "check setup.cfg for the configured lint and format commands",
+            _ => "check setup.py for the configured lint and format commands",
+        };
+        return Some(format!(
+            "Run the relevant checks locally before committing:\n\
+             - For test failures: `pytest`\n\
+             - For lint/format errors: {config_hint}"
+        ));
+    }
+
+    // Gradle (JVM)
+    if worktree_path.join("build.gradle").exists()
+        || worktree_path.join("build.gradle.kts").exists()
+    {
+        return Some(
+            "Run the relevant checks locally before committing:\n\
+             - For test failures: `./gradlew test`\n\
+             - For build errors: `./gradlew build`\n\
+             - For lint errors: `./gradlew lint`"
+                .to_string(),
+        );
+    }
+
+    // Maven (JVM)
+    if worktree_path.join("pom.xml").exists() {
+        return Some(
+            "Run the relevant checks locally before committing:\n\
+             - For test failures: `./mvnw test` (or `mvn test`)\n\
+             - For build errors: `./mvnw compile` (or `mvn compile`)"
+                .to_string(),
+        );
+    }
+
+    // Go
+    if worktree_path.join("go.mod").exists() {
+        return Some(
+            "Run the relevant checks locally before committing:\n\
+             - For test failures: `go test ./...`\n\
+             - For build errors: `go build ./...`\n\
+             - For lint errors: `go vet ./...`\n\
+             - For format errors: `gofmt -l .`"
+                .to_string(),
+        );
+    }
+
+    None
+}
+
 /// Builds the CI failure prompt for the agent to fix the issue
-pub(crate) fn build_ci_fix_prompt(failed_checks: &[CheckRun], attempt: u32) -> String {
+pub(crate) fn build_ci_fix_prompt(
+    failed_checks: &[CheckRun],
+    attempt: u32,
+    worktree_path: &Path,
+) -> String {
     let mut prompt = format!(
         "Your PR's CI checks failed (attempt {}/{}). Please analyze the failure and fix it.\n\n",
         attempt, MAX_CI_FIX_ATTEMPTS
@@ -359,14 +491,12 @@ pub(crate) fn build_ci_fix_prompt(failed_checks: &[CheckRun], attempt: u32) -> S
         }
     }
 
-    prompt.push_str(
-        "Please fix the failing checks. Run the relevant checks locally before committing:\n",
-    );
-    prompt.push_str("- For test failures: `just test`\n");
-    prompt.push_str("- For build errors: `just build`\n");
-    prompt.push_str("- For lint errors: `just lint` or `just fix-clippy`\n");
-    prompt.push_str("- For format errors: `just fmt`\n");
-    prompt.push_str("\nAfter fixing, commit and push the changes.\n");
+    prompt.push_str("Please fix the failing checks.");
+    if let Some(hints) = detect_repo_build_hints(worktree_path) {
+        prompt.push(' ');
+        prompt.push_str(&hints);
+    }
+    prompt.push_str("\n\nAfter fixing, commit and push the changes.\n");
 
     prompt
 }
@@ -713,7 +843,7 @@ pub(crate) async fn invoke_ci_fix(
     failed_checks: &[CheckRun],
     attempt: u32,
 ) -> Result<i32> {
-    let prompt = build_ci_fix_prompt(failed_checks, attempt);
+    let prompt = build_ci_fix_prompt(failed_checks, attempt, worktree_path);
 
     let child = backend
         .build_oneshot_command(worktree_path, &prompt)
@@ -1311,6 +1441,8 @@ mod tests {
 
     #[test]
     fn test_build_ci_fix_prompt_single_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Justfile"), "").unwrap();
         let checks = vec![CheckRun {
             name: "Test Suite".to_string(),
             status: CheckStatus::Completed,
@@ -1319,16 +1451,17 @@ mod tests {
             output: Some("FAILED tests/test_auth.rs - test_invalid_token\n\nAssertionError: Expected None, got Some(Token { ... })".to_string()),
         }];
 
-        let prompt = build_ci_fix_prompt(&checks, 1);
+        let prompt = build_ci_fix_prompt(&checks, 1, dir.path());
         assert!(prompt.contains("attempt 1/2"));
         assert!(prompt.contains("Test Suite"));
         assert!(prompt.contains("test failure"));
         assert!(prompt.contains("FAILED tests/test_auth.rs"));
-        assert!(prompt.contains("`just test`"));
+        assert!(prompt.contains("just --list"));
     }
 
     #[test]
     fn test_build_ci_fix_prompt_multiple_failures() {
+        let dir = tempfile::tempdir().unwrap();
         let checks = vec![
             CheckRun {
                 name: "Build".to_string(),
@@ -1346,7 +1479,7 @@ mod tests {
             },
         ];
 
-        let prompt = build_ci_fix_prompt(&checks, 2);
+        let prompt = build_ci_fix_prompt(&checks, 2, dir.path());
         assert!(prompt.contains("attempt 2/2"));
         assert!(prompt.contains("Build"));
         assert!(prompt.contains("Lint"));
@@ -1354,6 +1487,7 @@ mod tests {
 
     #[test]
     fn test_build_ci_fix_prompt_truncates_long_output() {
+        let dir = tempfile::tempdir().unwrap();
         let long_output = "x".repeat(20_000);
         let checks = vec![CheckRun {
             name: "CI".to_string(),
@@ -1363,10 +1497,139 @@ mod tests {
             output: Some(long_output),
         }];
 
-        let prompt = build_ci_fix_prompt(&checks, 1);
+        let prompt = build_ci_fix_prompt(&checks, 1, dir.path());
         assert!(prompt.contains("truncated"));
         // The prompt should be significantly shorter than 20000 chars of output
         assert!(prompt.len() < 15_000);
+    }
+
+    #[test]
+    fn test_build_ci_fix_prompt_no_just_for_non_rust_repo() {
+        // A repo with only package.json should not get `just` commands
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("package.json"), "{}").unwrap();
+        let checks = vec![CheckRun {
+            name: "Test".to_string(),
+            status: CheckStatus::Completed,
+            conclusion: Some(CheckConclusion::Failure),
+            duration: None,
+            output: None,
+        }];
+
+        let prompt = build_ci_fix_prompt(&checks, 1, dir.path());
+        assert!(
+            !prompt.contains("just"),
+            "prompt should not mention `just` for a Node.js repo"
+        );
+        assert!(prompt.contains("npm test"));
+    }
+
+    #[test]
+    fn test_build_ci_fix_prompt_omits_recipes_when_no_manifest() {
+        // A repo with no recognized artifacts should omit the recipe block entirely
+        let dir = tempfile::tempdir().unwrap();
+        let checks = vec![CheckRun {
+            name: "CI".to_string(),
+            status: CheckStatus::Completed,
+            conclusion: Some(CheckConclusion::Failure),
+            duration: None,
+            output: None,
+        }];
+
+        let prompt = build_ci_fix_prompt(&checks, 1, dir.path());
+        assert!(!prompt.contains("just"));
+        assert!(!prompt.contains("cargo"));
+        assert!(!prompt.contains("npm"));
+        assert!(prompt.contains("Please fix the failing checks."));
+        assert!(prompt.contains("After fixing, commit and push"));
+    }
+
+    #[test]
+    fn test_detect_repo_build_hints_claude_md() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("CLAUDE.md"), "# Build\n`cargo test`").unwrap();
+        // Also put a Cargo.toml to ensure CLAUDE.md wins
+        std::fs::write(dir.path().join("Cargo.toml"), "").unwrap();
+        let hints = detect_repo_build_hints(dir.path()).unwrap();
+        assert!(hints.contains("CLAUDE.md"));
+        assert!(!hints.contains("cargo test"));
+    }
+
+    #[test]
+    fn test_detect_repo_build_hints_rust_no_justfile() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Cargo.toml"), "").unwrap();
+        let hints = detect_repo_build_hints(dir.path()).unwrap();
+        assert!(hints.contains("cargo test"));
+        assert!(!hints.contains("just"));
+    }
+
+    #[test]
+    fn test_detect_repo_build_hints_justfile_beats_cargo() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Justfile"), "").unwrap();
+        std::fs::write(dir.path().join("Cargo.toml"), "").unwrap();
+        let hints = detect_repo_build_hints(dir.path()).unwrap();
+        assert!(hints.contains("just --list"));
+        assert!(!hints.contains("cargo test"));
+    }
+
+    #[test]
+    fn test_detect_repo_build_hints_none_for_unknown_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(detect_repo_build_hints(dir.path()).is_none());
+    }
+
+    #[test]
+    fn test_detect_repo_build_hints_claude_md_beats_agents_md() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("CLAUDE.md"), "").unwrap();
+        std::fs::write(dir.path().join("AGENTS.md"), "").unwrap();
+        let hints = detect_repo_build_hints(dir.path()).unwrap();
+        assert!(hints.contains("CLAUDE.md"));
+        assert!(!hints.contains("AGENTS.md"));
+    }
+
+    #[test]
+    fn test_detect_repo_build_hints_node_pnpm() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("package.json"), "{}").unwrap();
+        std::fs::write(dir.path().join("pnpm-lock.yaml"), "").unwrap();
+        let hints = detect_repo_build_hints(dir.path()).unwrap();
+        assert!(hints.contains("`pnpm test`"));
+        assert!(!hints.contains("`npm test`"));
+    }
+
+    #[test]
+    fn test_detect_repo_build_hints_node_yarn() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("package.json"), "{}").unwrap();
+        std::fs::write(dir.path().join("yarn.lock"), "").unwrap();
+        let hints = detect_repo_build_hints(dir.path()).unwrap();
+        assert!(hints.contains("`yarn test`"));
+        assert!(!hints.contains("`npm test`"));
+    }
+
+    #[test]
+    fn test_detect_repo_build_hints_go() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("go.mod"),
+            "module example.com/foo\n\ngo 1.22",
+        )
+        .unwrap();
+        let hints = detect_repo_build_hints(dir.path()).unwrap();
+        assert!(hints.contains("go test ./..."));
+        assert!(!hints.contains("just"));
+    }
+
+    #[test]
+    fn test_detect_repo_build_hints_maven() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("pom.xml"), "<project/>").unwrap();
+        let hints = detect_repo_build_hints(dir.path()).unwrap();
+        assert!(hints.contains("mvnw") || hints.contains("mvn"));
+        assert!(!hints.contains("just"));
     }
 
     #[test]
