@@ -94,9 +94,7 @@ impl AgentBackend for CodexBackend {
         prompt: &str,
         github_host: &str,
     ) -> TokioCommand {
-        let mut cmd = build_codex_command(worktree_path, prompt);
-        cmd.env("GH_HOST", github_host);
-        cmd
+        self.build_command(worktree_path, &Uuid::nil(), prompt, github_host)
     }
 }
 
@@ -504,6 +502,28 @@ mod tests {
         assert!(args.contains(&"--full-auto".as_ref()));
         // "-" should NOT appear as an argument when using stdin sentinel
         assert!(!args.contains(&"-".as_ref()));
+    }
+
+    #[test]
+    fn test_build_ci_fix_command_produces_expected_args() {
+        let b = backend();
+        let path = std::path::PathBuf::from("/tmp/worktree");
+        let cmd = b.build_ci_fix_command(&path, "fix the CI", "github.example.com");
+        let inner = cmd.as_std();
+
+        assert_eq!(inner.get_program(), "codex");
+        let args: Vec<&std::ffi::OsStr> = inner.get_args().collect();
+        assert!(args.contains(&"exec".as_ref()));
+        assert!(args.contains(&"--json".as_ref()));
+        assert!(args.contains(&"--full-auto".as_ref()));
+        assert!(args.contains(&"fix the CI".as_ref()));
+        // GH_HOST must be set for GitHub Enterprise compatibility
+        let envs: Vec<_> = inner.get_envs().collect();
+        assert!(
+            envs.iter()
+                .any(|(k, v)| *k == "GH_HOST" && *v == Some("github.example.com".as_ref())),
+            "GH_HOST should be set on CI fix command"
+        );
     }
 
     // ---- parse_event tests ----
