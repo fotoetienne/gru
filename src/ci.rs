@@ -284,11 +284,47 @@ fn safe_tail(s: &str, max_bytes: usize) -> &str {
         return s;
     }
     let start = s.len() - max_bytes;
-    // Advance to the next valid char boundary
-    match (start..s.len()).find(|&i| s.is_char_boundary(i)) {
+    // Advance to the next valid char boundary.
+    // Include s.len() in the range so a boundary is always found (s.len() is
+    // always a valid char boundary, making the None arm truly unreachable).
+    match (start..=s.len()).find(|&i| s.is_char_boundary(i)) {
         Some(boundary) => &s[boundary..],
-        None => "",
+        None => "", // unreachable: s.len() is always a valid char boundary
     }
+}
+
+/// Returns the first `max_bytes` of a string, aligned to a UTF-8 char boundary.
+fn safe_head(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    // Retreat to the previous valid char boundary
+    match (0..=max_bytes).rev().find(|&i| s.is_char_boundary(i)) {
+        Some(boundary) => &s[..boundary],
+        None => "", // unreachable for valid UTF-8 (boundary 0 always exists)
+    }
+}
+
+/// Truncates long log output by keeping the head and tail, separated by a marker.
+///
+/// CI logs for test/build failures typically have the diagnostic output near the
+/// top (panic message, assertion failure) and summary noise at the end. Keeping
+/// both ends gives the agent the best chance of seeing the actual error.
+fn smart_truncate(s: &str, max_bytes: usize) -> String {
+    if s.len() <= max_bytes {
+        return s.to_owned();
+    }
+    let half = max_bytes / 2;
+    let head = safe_head(s, half);
+    let tail = safe_tail(s, half);
+    let omitted = s.len() - head.len() - tail.len();
+    format!(
+        "{}\n\n... (truncated {} {}) ...\n\n{}",
+        head,
+        omitted,
+        if omitted == 1 { "byte" } else { "bytes" },
+        tail
+    )
 }
 
 /// Classifies a CI failure based on the check name and output
@@ -498,18 +534,24 @@ pub(crate) fn build_ci_fix_prompt(
             check.name, failure_type, conclusion, duration
         ));
 
-        if let Some(output) = &check.output {
-            // Truncate very long output to avoid overwhelming the prompt
-            let truncated = if output.len() > 10_000 {
-                format!(
-                    "... (truncated, showing last ~10000 bytes) ...\n{}",
-                    safe_tail(output, 10_000)
-                )
-            } else {
-                output.clone()
-            };
-
-            prompt.push_str(&format!("## Failure Output\n```\n{}\n```\n\n", truncated));
+        let output_text = check.output.as_deref().filter(|s| !s.trim().is_empty());
+        match output_text {
+            Some(output) => {
+                let truncated = smart_truncate(output, 10_000);
+                prompt.push_str(&format!("## Failure Output\n```\n{}\n```\n\n", truncated));
+            }
+            None => {
+                prompt.push_str(
+                    "## Failure Output\n\
+                     _(Workflow logs could not be retrieved automatically.)_\n\
+                     Run the following to view the failure:\n\
+                     ```\n\
+                     BRANCH=$(git branch --show-current)\n\
+                     gh run list --branch \"$BRANCH\" --limit 5 --json databaseId,name,conclusion | cat\n\
+                     gh run view <run-id> --log-failed\n\
+                     ```\n\n",
+                );
+            }
         }
     }
 
@@ -608,17 +650,18 @@ pub(crate) async fn fetch_check_runs(
     Ok(checks)
 }
 
-/// Fetches the workflow run logs for a failed check to get more detailed output.
-/// Falls back gracefully if logs aren't available.
-pub(crate) async fn fetch_check_logs(
+/// Fetches failed workflow run logs for a branch.
+///
+/// Tries all recently-failed workflow runs on the branch and returns the first
+/// non-empty `--log-failed` output. Name-based matching is intentionally omitted:
+/// multi-job workflows produce check-run names like "CI / test" while the
+/// workflow run itself is named "CI", so substring matching fails reliably.
+async fn fetch_check_logs(
     host: &str,
     owner: &str,
     repo: &str,
-    check_name: &str,
-    pr_number: u64,
     branch: &str,
 ) -> Result<Option<String>> {
-    // Use gh to get the workflow run associated with this PR
     let repo_full = github::repo_slug(owner, repo);
 
     let output = github::gh_cli_command(host)
@@ -630,7 +673,7 @@ pub(crate) async fn fetch_check_logs(
             "--branch",
             branch,
             "--json",
-            "databaseId,name,conclusion,headBranch",
+            "databaseId,conclusion",
             "--limit",
             "10",
         ])
@@ -645,55 +688,48 @@ pub(crate) async fn fetch_check_logs(
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let runs: Vec<serde_json::Value> = serde_json::from_str(&stdout).unwrap_or_default();
+    let runs: Vec<serde_json::Value> = match serde_json::from_str(&stdout) {
+        Ok(v) => v,
+        Err(e) => {
+            log::debug!("Failed to parse gh run list output: {}", e);
+            return Ok(None);
+        }
+    };
 
-    // Find the failed run matching our check
+    // gh run list returns runs in most-recent-first order; we return the first
+    // non-empty log found, so the agent sees the most recent failure.
     for run in &runs {
-        let name = run["name"].as_str().unwrap_or("");
         let conclusion = run["conclusion"].as_str().unwrap_or("");
+        // Match what filter_failed_checks considers a failure (including stale).
+        let is_failed = matches!(
+            conclusion,
+            "failure" | "cancelled" | "timed_out" | "action_required" | "stale"
+        );
+        if !is_failed {
+            continue;
+        }
+        if let Some(run_id) = run["databaseId"].as_u64() {
+            let log_output = github::gh_cli_command(host)
+                .args([
+                    "run",
+                    "view",
+                    &run_id.to_string(),
+                    "--repo",
+                    &repo_full,
+                    "--log-failed",
+                ])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .await;
 
-        if name.to_lowercase().contains(&check_name.to_lowercase()) && conclusion == "failure" {
-            if let Some(run_id) = run["databaseId"].as_u64() {
-                // Try to get the logs for this run
-                let log_output = github::gh_cli_command(host)
-                    .args([
-                        "run",
-                        "view",
-                        &run_id.to_string(),
-                        "--repo",
-                        &repo_full,
-                        "--log-failed",
-                    ])
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .output()
-                    .await;
-
-                if let Ok(log_result) = log_output {
-                    if log_result.status.success() {
-                        let logs = String::from_utf8_lossy(&log_result.stdout).to_string();
-                        if !logs.is_empty() {
-                            return Ok(Some(logs));
-                        }
+            if let Ok(log_result) = log_output {
+                if log_result.status.success() {
+                    let logs = String::from_utf8_lossy(&log_result.stdout).to_string();
+                    if !logs.is_empty() {
+                        return Ok(Some(logs));
                     }
                 }
-            }
-        }
-    }
-
-    // Also try using gh pr checks to get status info
-    let pr_output = github::gh_cli_command(host)
-        .args(["pr", "checks", &pr_number.to_string(), "--repo", &repo_full])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .await;
-
-    if let Ok(pr_result) = pr_output {
-        if pr_result.status.success() || !pr_result.stdout.is_empty() {
-            let checks_output = String::from_utf8_lossy(&pr_result.stdout).to_string();
-            if !checks_output.is_empty() {
-                return Ok(Some(checks_output));
             }
         }
     }
@@ -968,7 +1004,7 @@ pub(crate) async fn post_escalation_comment(
         ));
 
         if let Some(output) = &check.output {
-            let truncated = safe_tail(output, 2000);
+            let truncated = smart_truncate(output, 2000);
             detail.push_str(&format!("```\n{}\n```\n", truncated));
         }
     }
@@ -1112,7 +1148,7 @@ pub(crate) async fn monitor_and_fix_ci(
                     CiResult::Failed(checks) => checks,
                     _ => unreachable!(),
                 };
-                enrich_check_logs(host, owner, repo, pr_number, branch, &mut failed_checks).await;
+                enrich_check_logs(host, owner, repo, branch, &mut failed_checks).await;
                 return escalate_checks_failed(
                     host,
                     owner,
@@ -1192,20 +1228,41 @@ enum CiFixLoopAction {
 }
 
 /// Enrich failed checks with detailed logs when output is missing.
+///
+/// Fetches `--log-failed` output once and applies it to all checks that have
+/// no output. A single fetch is sufficient because all failing jobs in a given
+/// workflow run appear in the same `gh run view --log-failed` output.
 async fn enrich_check_logs(
     host: &str,
     owner: &str,
     repo: &str,
-    pr_number: u64,
     branch: &str,
     failed_checks: &mut [CheckRun],
 ) {
-    for check in failed_checks.iter_mut() {
-        if check.output.is_none() || check.output.as_deref() == Some("") {
-            if let Ok(Some(logs)) =
-                fetch_check_logs(host, owner, repo, &check.name, pr_number, branch).await
+    let needs_enrichment = failed_checks.iter().any(|c| {
+        c.output
+            .as_deref()
+            .map(|s| s.trim().is_empty())
+            .unwrap_or(true)
+    });
+    if !needs_enrichment {
+        return;
+    }
+
+    // TODO: checks from different workflow runs (e.g., "CI / test" and "Deploy / lint")
+    // will each receive the same log blob from the first failed run. This can produce
+    // misleading output when failures span multiple workflows. A proper fix would map
+    // each check to its originating workflow run ID, but that requires restoring some
+    // form of check-to-run mapping — the exact problem this approach was designed to avoid.
+    if let Ok(Some(logs)) = fetch_check_logs(host, owner, repo, branch).await {
+        for check in failed_checks.iter_mut() {
+            if check
+                .output
+                .as_deref()
+                .map(|s| s.trim().is_empty())
+                .unwrap_or(true)
             {
-                check.output = Some(logs);
+                check.output = Some(logs.clone());
             }
         }
     }
@@ -1431,7 +1488,7 @@ async fn run_ci_fix_attempt(
     let check_names: Vec<&str> = failed_checks.iter().map(|c| c.name.as_str()).collect();
     eprintln!("❌ CI checks failed: {}", check_names.join(", "));
 
-    enrich_check_logs(host, owner, repo, pr_number, branch, &mut failed_checks).await;
+    enrich_check_logs(host, owner, repo, branch, &mut failed_checks).await;
 
     // Invoke agent to fix
     eprintln!(
@@ -1871,6 +1928,155 @@ mod tests {
     }
 
     #[test]
+    fn test_build_ci_fix_prompt_no_output_includes_fallback_instructions() {
+        // Regression: checks with empty output.* must still give the agent
+        // something actionable rather than a silent, empty failure block.
+        let dir = tempfile::tempdir().unwrap();
+        let checks = vec![CheckRun {
+            name: "CI / test".to_string(),
+            status: CheckStatus::Completed,
+            conclusion: Some(CheckConclusion::Failure),
+            duration: Some("1m 30s".to_string()),
+            output: None,
+        }];
+
+        let prompt = build_ci_fix_prompt(&checks, 1, dir.path());
+        assert!(
+            prompt.contains("gh run view"),
+            "prompt must mention gh run view"
+        );
+        assert!(
+            prompt.contains("log-failed"),
+            "prompt must mention --log-failed"
+        );
+    }
+
+    #[test]
+    fn test_build_ci_fix_prompt_empty_string_output_shows_fallback() {
+        // Some("") is treated the same as None — no empty fenced block.
+        let dir = tempfile::tempdir().unwrap();
+        let checks = vec![CheckRun {
+            name: "CI / test".to_string(),
+            status: CheckStatus::Completed,
+            conclusion: Some(CheckConclusion::Failure),
+            duration: None,
+            output: Some("".to_string()),
+        }];
+        let prompt = build_ci_fix_prompt(&checks, 1, dir.path());
+        assert!(
+            prompt.contains("gh run view"),
+            "empty-string output must trigger fallback instructions"
+        );
+        assert!(
+            !prompt.contains("```\n\n```"),
+            "must not render an empty fenced block"
+        );
+    }
+
+    #[test]
+    fn test_build_ci_fix_prompt_whitespace_output_shows_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let checks = vec![CheckRun {
+            name: "CI / test".to_string(),
+            status: CheckStatus::Completed,
+            conclusion: Some(CheckConclusion::Failure),
+            duration: None,
+            output: Some("   \n  ".to_string()),
+        }];
+        let prompt = build_ci_fix_prompt(&checks, 1, dir.path());
+        assert!(
+            prompt.contains("gh run view"),
+            "whitespace-only output must trigger fallback instructions"
+        );
+    }
+
+    #[test]
+    fn test_smart_truncate_short_string() {
+        let s = "short";
+        assert_eq!(smart_truncate(s, 100), "short");
+    }
+
+    #[test]
+    fn test_smart_truncate_exact_length() {
+        let s = "hello";
+        assert_eq!(smart_truncate(s, 5), "hello");
+    }
+
+    #[test]
+    fn test_smart_truncate_keeps_head_and_tail() {
+        // 20 'a's + 20 'b's = 40 chars; truncate to 20 keeps head(10) + tail(10)
+        let s = format!("{}{}", "a".repeat(20), "b".repeat(20));
+        let result = smart_truncate(&s, 20);
+        assert!(result.contains("aaa"), "should preserve head");
+        assert!(result.contains("bbb"), "should preserve tail");
+        assert!(
+            result.contains("truncated"),
+            "should include truncation marker"
+        );
+        // The full 40-char input must not appear verbatim in the result
+        assert!(!result.contains(&s), "full input must not appear verbatim");
+    }
+
+    #[test]
+    fn test_smart_truncate_diagnostic_at_top_preserved() {
+        // Simulates a panic message at the top followed by verbose noise below.
+        let head = "thread 'main' panicked at 'assertion failed', src/lib.rs:42\n";
+        let noise = "very noisy post-failure output\n".repeat(500);
+        let s = format!("{}{}", head, noise);
+        let result = smart_truncate(&s, 2_000);
+        assert!(
+            result.contains("panicked"),
+            "panic message from head must be preserved"
+        );
+    }
+
+    #[test]
+    fn test_safe_head_short_string() {
+        assert_eq!(safe_head("hello", 10), "hello");
+    }
+
+    #[test]
+    fn test_safe_head_truncates() {
+        assert_eq!(safe_head("hello world", 5), "hello");
+    }
+
+    #[test]
+    fn test_safe_head_multibyte_utf8() {
+        let s = "héllo";
+        // Should not panic even if max_bytes lands mid-char
+        let result = safe_head(s, 2);
+        assert!(s.starts_with(result));
+        assert!(result.len() <= 2);
+    }
+
+    #[test]
+    fn test_safe_head_zero_budget() {
+        assert_eq!(safe_head("hello", 0), "");
+    }
+
+    #[test]
+    fn test_smart_truncate_zero_budget() {
+        // Exercises the half=0 path; must not panic.
+        let result = smart_truncate("hello world", 0);
+        assert!(result.contains("truncated"));
+    }
+
+    #[test]
+    fn test_smart_truncate_odd_max_bytes() {
+        // Odd max_bytes: half = max_bytes / 2 (rounds down).
+        // The omitted count is derived from actual slice lengths, so the marker
+        // is always accurate regardless of rounding.
+        let s = "abcdefghij"; // 10 bytes
+        let result = smart_truncate(s, 7); // half = 3; head="abc", tail="hij"
+        assert!(result.contains('a'), "head must be preserved");
+        assert!(result.contains('j'), "tail must be preserved");
+        assert!(
+            result.contains("truncated"),
+            "must include truncation marker"
+        );
+    }
+
+    #[test]
     fn test_compute_duration() {
         assert_eq!(
             compute_duration(Some("2024-01-01T00:00:00Z"), Some("2024-01-01T00:02:34Z")),
@@ -1946,6 +2152,13 @@ mod tests {
     #[test]
     fn test_safe_tail_empty_string() {
         assert_eq!(safe_tail("", 10), "");
+    }
+
+    #[test]
+    fn test_safe_tail_zero_budget() {
+        // max_bytes=0: start==s.len(), range is start..=s.len() = [s.len()],
+        // which finds boundary s.len() and returns &s[s.len()..] = "".
+        assert_eq!(safe_tail("hello", 0), "");
     }
 
     // --- decide_ci_action tests ---
