@@ -1,12 +1,14 @@
-use crate::agent::AgentBackend;
+use crate::agent::{AgentBackend, AgentEvent};
 use crate::agent_runner;
 use crate::github;
 use crate::labels;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
 use std::fmt;
 use std::path::Path;
 use std::process::Stdio;
+use std::sync::{Arc, Mutex};
 use tokio::process::Command;
 use tokio::time::{sleep, Duration};
 
@@ -911,6 +913,8 @@ pub(crate) async fn get_pr_number(
 ///
 /// Stream events (tool calls, text output) are captured to `events.jsonl`
 /// inside `events_dir` so CI fix attempts are diagnosable after the fact.
+/// On failure, the last few significant events are also printed to stderr
+/// for immediate context without requiring the file to be opened.
 pub(crate) async fn invoke_ci_fix(
     backend: &dyn AgentBackend,
     worktree_path: &Path,
@@ -923,15 +927,40 @@ pub(crate) async fn invoke_ci_fix(
     let cmd = backend.build_ci_fix_command(worktree_path, &prompt, github_host);
     let timeout_str = format!("{}s", CI_FIX_TIMEOUT_SECS);
 
+    // Collect the last few significant events so we can print them on failure
+    // without requiring the caller to open events.jsonl.
+    let recent: Arc<Mutex<VecDeque<String>>> = Arc::new(Mutex::new(VecDeque::with_capacity(6)));
+    let recent_clone = recent.clone();
+    let callback = move |event: &AgentEvent| {
+        if let Some(summary) = summarize_ci_event(event) {
+            let mut buf = recent_clone.lock().unwrap_or_else(|e| e.into_inner());
+            if buf.len() >= 5 {
+                buf.pop_front();
+            }
+            buf.push_back(summary);
+        }
+    };
+
     let result = agent_runner::run_agent_with_stream_monitoring(
         cmd,
         backend,
         events_dir,
         Some(&timeout_str),
-        None::<fn(&crate::agent::AgentEvent)>,
+        Some(callback),
         None,
     )
     .await;
+
+    // Print recent events on any kind of failure for immediate triage.
+    let print_recent = |prefix: &str| {
+        let buf = recent.lock().unwrap_or_else(|e| e.into_inner());
+        if !buf.is_empty() {
+            eprintln!("{}Last events:", prefix);
+            for s in buf.iter() {
+                eprintln!("{}  {}", prefix, s);
+            }
+        }
+    };
 
     match result {
         Ok(run_result) => {
@@ -942,10 +971,35 @@ pub(crate) async fn invoke_ci_fix(
                     code,
                     events_dir.display()
                 );
+                print_recent("    ");
             }
             Ok(code)
         }
-        Err(e) => Err(e),
+        Err(e) => {
+            print_recent("    ");
+            Err(e)
+        }
+    }
+}
+
+/// Returns a one-line summary of diagnostically useful CI fix events,
+/// or `None` for events that don't add triage value (pings, text deltas, etc.).
+fn summarize_ci_event(event: &AgentEvent) -> Option<String> {
+    match event {
+        AgentEvent::ToolUse {
+            tool_name,
+            input_summary,
+            ..
+        } => {
+            let summary = input_summary.as_deref().unwrap_or(tool_name.as_str());
+            Some(format!("tool: {}", summary))
+        }
+        AgentEvent::Error { message } => Some(format!("error: {}", message)),
+        AgentEvent::MessageComplete {
+            stop_reason: Some(reason),
+            ..
+        } => Some(format!("stop: {}", reason)),
+        _ => None,
     }
 }
 
