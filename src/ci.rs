@@ -346,8 +346,7 @@ fn detect_repo_build_hints(worktree_path: &Path) -> Option<String> {
         || worktree_path.join("JUSTFILE").exists();
     if has_justfile {
         return Some(
-            "Run `just --list` to see available recipes, then run the relevant ones \
-             (e.g. test, build, lint, fmt) before committing."
+            "Run `just --list` to see available recipes, then run the relevant ones (e.g. test, build, lint, fmt) before committing."
                 .to_string(),
         );
     }
@@ -382,17 +381,32 @@ fn detect_repo_build_hints(worktree_path: &Path) -> Option<String> {
         ));
     }
 
-    // Python
-    if worktree_path.join("pyproject.toml").exists()
-        || worktree_path.join("setup.py").exists()
-        || worktree_path.join("setup.cfg").exists()
-    {
-        return Some(
+    // Python — point the agent at whichever config files are actually present
+    let has_pyproject = worktree_path.join("pyproject.toml").exists();
+    let has_setup_cfg = worktree_path.join("setup.cfg").exists();
+    let has_setup_py = worktree_path.join("setup.py").exists();
+    if has_pyproject || has_setup_cfg || has_setup_py {
+        let config_hint = match (has_pyproject, has_setup_cfg, has_setup_py) {
+            (true, true, _) => {
+                "check pyproject.toml or setup.cfg for the configured lint and format commands"
+            }
+            (true, false, true) => {
+                "check pyproject.toml or setup.py for the configured lint and format commands"
+            }
+            (true, false, false) => {
+                "check pyproject.toml for the configured lint and format commands"
+            }
+            (false, true, true) => {
+                "check setup.cfg or setup.py for the configured lint and format commands"
+            }
+            (false, true, false) => "check setup.cfg for the configured lint and format commands",
+            _ => "check setup.py for the configured lint and format commands",
+        };
+        return Some(format!(
             "Run the relevant checks locally before committing:\n\
              - For test failures: `pytest`\n\
-             - For lint/format errors: check pyproject.toml for the configured lint and format commands"
-                .to_string(),
-        );
+             - For lint/format errors: {config_hint}"
+        ));
     }
 
     // Gradle (JVM)
