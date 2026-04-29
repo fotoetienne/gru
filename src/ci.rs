@@ -270,9 +270,11 @@ pub(crate) fn decide_after_no_commits(attempt: u32, max_attempts: u32) -> CiFixA
     }
 }
 
-/// Returns the first 8 characters of a SHA for display purposes.
+/// Returns the first 8 characters of an ASCII hex SHA for display purposes.
+///
+/// Uses `str::get` so it never panics on unexpected non-ASCII input.
 fn short_sha(sha: &str) -> &str {
-    &sha[..8.min(sha.len())]
+    sha.get(..8).unwrap_or(sha)
 }
 
 /// Returns the last `max_bytes` of a string, aligned to a UTF-8 char boundary.
@@ -681,17 +683,21 @@ pub(crate) async fn get_head_sha(worktree_path: &Path) -> Result<String> {
 
 /// Retrieves the current head SHA of a PR from the GitHub API.
 ///
-/// Returns `None` if the PR cannot be found or the request fails.
+/// Returns `None` if the PR cannot be found, the `gh` CLI call fails, or the
+/// output is empty. Errors are logged as warnings before returning `None`.
+/// Uses the same `GH_TIMEOUT_SECS` timeout / `kill_on_drop` behavior as the
+/// rest of the codebase via `github::run_gh`.
 pub(crate) async fn get_pr_head_sha_from_github(
     host: &str,
     owner: &str,
     repo: &str,
     pr_number: u64,
-) -> Result<Option<String>> {
+) -> Option<String> {
     let repo_full = github::repo_slug(owner, repo);
     let pr_num_str = pr_number.to_string();
-    let output = github::gh_cli_command(host)
-        .args([
+    match github::run_gh(
+        host,
+        &[
             "pr",
             "view",
             &pr_num_str,
@@ -701,19 +707,26 @@ pub(crate) async fn get_pr_head_sha_from_github(
             "headRefOid",
             "--jq",
             ".headRefOid",
-        ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .await
-        .context("Failed to query PR head SHA from GitHub")?;
-
-    if !output.status.success() {
-        return Ok(None);
+        ],
+    )
+    .await
+    {
+        Ok(stdout) => {
+            let sha = stdout.trim().to_string();
+            if sha.is_empty() {
+                None
+            } else {
+                Some(sha)
+            }
+        }
+        Err(e) => {
+            eprintln!(
+                "⚠️  Could not retrieve PR #{} head SHA from GitHub ({}/{}): {}",
+                pr_number, owner, repo, e
+            );
+            None
+        }
     }
-
-    let sha = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    Ok(if sha.is_empty() { None } else { Some(sha) })
 }
 
 /// Gets the PR number associated with the current branch
@@ -1132,10 +1145,7 @@ async fn escalate_no_checks_after_push(
         attempt, MAX_CI_FIX_ATTEMPTS
     );
 
-    let pr_sha = get_pr_head_sha_from_github(host, owner, repo, pr_number)
-        .await
-        .ok()
-        .flatten();
+    let pr_sha = get_pr_head_sha_from_github(host, owner, repo, pr_number).await;
 
     let sha_note = match pr_sha.as_deref() {
         Some(s) if s == local_sha => format!(
