@@ -287,7 +287,7 @@ fn safe_tail(s: &str, max_bytes: usize) -> &str {
     // Advance to the next valid char boundary
     match (start..s.len()).find(|&i| s.is_char_boundary(i)) {
         Some(boundary) => &s[boundary..],
-        None => "",
+        None => "", // unreachable for valid UTF-8
     }
 }
 
@@ -299,7 +299,7 @@ fn safe_head(s: &str, max_bytes: usize) -> &str {
     // Retreat to the previous valid char boundary
     match (0..=max_bytes).rev().find(|&i| s.is_char_boundary(i)) {
         Some(boundary) => &s[..boundary],
-        None => "",
+        None => "", // unreachable for valid UTF-8 (boundary 0 always exists)
     }
 }
 
@@ -691,10 +691,10 @@ async fn fetch_check_logs(
     // non-empty log found, so the agent sees the most recent failure.
     for run in &runs {
         let conclusion = run["conclusion"].as_str().unwrap_or("");
-        // Mirror what filter_failed_checks considers a failure.
+        // Match what filter_failed_checks considers a failure (including stale).
         let is_failed = matches!(
             conclusion,
-            "failure" | "cancelled" | "timed_out" | "action_required"
+            "failure" | "cancelled" | "timed_out" | "action_required" | "stale"
         );
         if !is_failed {
             continue;
@@ -1230,6 +1230,11 @@ async fn enrich_check_logs(
         return;
     }
 
+    // TODO: checks from different workflow runs (e.g., "CI / test" and "Deploy / lint")
+    // will each receive the same log blob from the first failed run. This can produce
+    // misleading output when failures span multiple workflows. A proper fix would map
+    // each check to its originating workflow run ID, but that requires restoring some
+    // form of check-to-run mapping — the exact problem this approach was designed to avoid.
     if let Ok(Some(logs)) = fetch_check_logs(host, owner, repo, branch).await {
         for check in failed_checks.iter_mut() {
             if check.output.is_none() || check.output.as_deref() == Some("") {
@@ -1907,6 +1912,21 @@ mod tests {
         // Exercises the half=0 path; must not panic.
         let result = smart_truncate("hello world", 0);
         assert!(result.contains("truncated"));
+    }
+
+    #[test]
+    fn test_smart_truncate_odd_max_bytes() {
+        // Odd max_bytes: half = max_bytes / 2 (rounds down).
+        // The omitted count is derived from actual slice lengths, so the marker
+        // is always accurate regardless of rounding.
+        let s = "abcdefghij"; // 10 bytes
+        let result = smart_truncate(s, 7); // half = 3; head="abc", tail="hij"
+        assert!(result.contains('a'), "head must be preserved");
+        assert!(result.contains('j'), "tail must be preserved");
+        assert!(
+            result.contains("truncated"),
+            "must include truncation marker"
+        );
     }
 
     #[test]
