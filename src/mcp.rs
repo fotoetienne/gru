@@ -192,7 +192,7 @@ impl GruMcpServer {
     }
 }
 
-#[tool_handler]
+#[tool_handler(router = self.tool_router.clone())]
 impl ServerHandler for GruMcpServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(
