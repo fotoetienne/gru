@@ -248,10 +248,9 @@ pub(crate) fn split_github_url(url: &str) -> Option<GitUrlParts<'_>> {
     }
     let (scheme, rest) = if let Some(r) = url.strip_prefix("https://") {
         (GitUrlScheme::Https, r)
-    } else if let Some(r) = url.strip_prefix("http://") {
-        (GitUrlScheme::Http, r)
     } else {
-        return None;
+        let r = url.strip_prefix("http://")?;
+        (GitUrlScheme::Http, r)
     };
     // The authority runs up to the first path/query/fragment separator.
     let auth_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());

@@ -1,4 +1,4 @@
-# Gru
+# Gru 🍌
 
 [![CI](https://github.com/fotoetienne/gru/actions/workflows/ci.yml/badge.svg)](https://github.com/fotoetienne/gru/actions/workflows/ci.yml)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
@@ -12,7 +12,7 @@ Point it at an issue and it handles the rest: implementation, PR, code review, C
 
 Gru is **agent-agnostic**. It ships with backends for [Claude Code](https://github.com/anthropics/claude-code) and [OpenAI Codex](https://github.com/openai/codex), and its pluggable architecture makes it straightforward to add more.
 
-## Quick Start
+## 🚀 Quick Start
 
 ```bash
 # Install (macOS Apple Silicon — see Installation for other platforms)
@@ -26,7 +26,7 @@ gru init owner/repo
 gru do 42
 ```
 
-## Installation
+## 📦 Installation
 
 ### Prerequisites
 
@@ -70,7 +70,7 @@ The `gru` binary is installed to `~/.cargo/bin/gru`. Make sure `~/.cargo/bin` is
 
 For a detailed walkthrough, see [docs/GETTING_STARTED.md](docs/GETTING_STARTED.md).
 
-## Usage
+## 🛠️ Usage
 
 ### Work on Issues
 
@@ -167,7 +167,7 @@ M002     codex    owner/repo   #44    do    -     minion/issue-44-M002  working 
 
 See [docs/AGENTS.md](docs/AGENTS.md) for setup details and feature comparison.
 
-## Lab Mode
+## 🧪 Lab Mode
 
 Run Gru as a daemon that continuously polls for `gru:todo` issues and spawns Minions to work on them:
 
@@ -195,7 +195,7 @@ gru mcp uninstall    # Remove from ~/.claude.json
 
 Once installed, Claude Code sessions can query Minion status and read Gru guides without leaving the conversation.
 
-## Configuration
+## ⚙️ Configuration
 
 All configuration lives in `~/.gru/config.toml`. Everything is optional — Gru works out of the box with sensible defaults.
 
@@ -217,13 +217,13 @@ Key options: default agent backend, polling intervals, concurrency slots, merge 
 6. Review comments are forwarded to the agent for responses
 7. Labels (`gru:todo` → `gru:in-progress` → `gru:done` / `gru:failed`) track state on GitHub
 
-## Roadmap
+## 🗺️ Roadmap
 
 V1 is feature-complete: autonomous issue fixing, worktree isolation, lab mode, CI monitoring, PR lifecycle management, multi-agent backends, and Minion management.
 
 Future plans include multi-Lab coordination (V2), a web UI (V3), issue dependency graphs (V4), and multi-repo orchestration (V5). See [docs/DESIGN.md](docs/DESIGN.md) for the full architecture vision.
 
-## Contributing
+## 🤝 Contributing
 
 Contributions are welcome! See [CONTRIBUTING.md](CONTRIBUTING.md) for dev setup, build commands, testing, and PR workflow.
 
