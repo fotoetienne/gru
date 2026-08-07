@@ -1,4 +1,4 @@
-# Gru 🍌
+# Gru
 
 [![CI](https://github.com/fotoetienne/gru/actions/workflows/ci.yml/badge.svg)](https://github.com/fotoetienne/gru/actions/workflows/ci.yml)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
@@ -244,4 +244,4 @@ Contributions are welcome! See [CONTRIBUTING.md](CONTRIBUTING.md) for dev setup,
 
 ---
 
-<p align="center">made with love by <a href="https://github.com/fotoetienne/gru">gru</a></p>
+<p align="center">made with ❤️ by <a href="https://github.com/fotoetienne/gru">gru</a></p>
