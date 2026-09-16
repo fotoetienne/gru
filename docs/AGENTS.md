@@ -8,6 +8,7 @@ Gru uses a pluggable agent architecture. Each backend implements the `AgentBacke
 |---------|----------|------------|--------|
 | Claude Code | `claude` | `--agent claude` | Default |
 | OpenAI Codex | `codex` | `--agent codex` | Supported |
+| Netflix Pi | `pi` | `--agent pi` | Supported (internal) |
 
 ## Claude Code (default)
 
@@ -91,6 +92,35 @@ codex exec resume --last --json --full-auto "<prompt>"
 
 Note: Codex does not support interactive resume (`gru attach` will not work with Codex minions). Codex also ignores the `session_id` parameter — it relies on its own session persistence for both new and resumed sessions.
 
+## Netflix Pi
+
+Pi is Netflix's internal coding agent CLI (`pi`, npm `@netflix-internal/pi-agent`), installed via newt at `/opt/nflx/bin/pi`. It is already authenticated to internal model providers, so no separate API key is needed.
+
+### Install
+
+Install via newt (internal Netflix tooling). Not available outside Netflix.
+
+### Verify
+
+```bash
+pi --version
+pi --help
+```
+
+### How Gru Uses It
+
+Gru spawns Pi in headless mode with JSON output:
+
+```bash
+pi -p --mode json --session-id <uuid> "<prompt>"
+```
+
+Resume uses the same `--session-id` with a new prompt.
+
+Interactive resume (for `gru attach`) drops `-p` and `--mode json`, keeping `--session-id`, since Pi's TUI supports resuming a session with full history — unlike Codex.
+
+There is no `--dangerously-skip-permissions` equivalent for Pi; `bash` and `edit` tool calls run without approval prompts by default under `-p`.
+
 ## Selecting a Backend
 
 ### Per-command
@@ -116,15 +146,15 @@ The `--agent` flag always overrides the config default.
 
 ## Feature Comparison
 
-| Feature | Claude Code | Codex |
-|---------|-------------|-------|
-| Autonomous work (`gru do`) | Yes | Yes |
-| PR review (`gru review`) | Yes | Yes |
-| Custom prompts (`gru prompt`) | Yes | Yes |
-| Session resume (`gru resume`) | Yes | Yes (non-interactive) |
-| Interactive attach (`gru attach`) | Yes | No |
-| Token usage tracking | Yes | Yes |
-| Stream monitoring | Yes | Yes |
+| Feature | Claude Code | Codex | Pi |
+|---------|-------------|-------|----|
+| Autonomous work (`gru do`) | Yes | Yes | Yes |
+| PR review (`gru review`) | Yes | Yes | Yes |
+| Custom prompts (`gru prompt`) | Yes | Yes | Yes |
+| Session resume (`gru resume`) | Yes | Yes (non-interactive) | Yes |
+| Interactive attach (`gru attach`) | Yes | No | Yes |
+| Token usage tracking | Yes | Yes | Yes |
+| Stream monitoring | Yes | Yes | Yes |
 
 ## Adding a New Backend
 

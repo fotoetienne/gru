@@ -34,6 +34,7 @@ gru do 42
 - At least one agent backend:
   - [Claude Code](https://github.com/anthropics/claude-code) (default) — `npm install -g @anthropic-ai/claude-code`
   - [OpenAI Codex](https://github.com/openai/codex) (optional) — `npm install -g @openai/codex`
+  - Netflix Pi (optional, internal only) — see [docs/AGENTS.md](docs/AGENTS.md)
 
 ### Download a Prebuilt Binary
 

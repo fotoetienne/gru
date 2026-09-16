@@ -6,9 +6,10 @@
 use crate::agent::AgentBackend;
 use crate::claude_backend::ClaudeBackend;
 use crate::codex_backend::CodexBackend;
+use crate::pi_backend::PiBackend;
 
 /// Known agent backend names.
-pub(crate) const AVAILABLE_AGENTS: &[&str] = &["claude", "codex"];
+pub(crate) const AVAILABLE_AGENTS: &[&str] = &["claude", "codex", "pi"];
 
 /// Default agent name when none is specified.
 pub(crate) const DEFAULT_AGENT: &str = "claude";
@@ -28,6 +29,7 @@ fn construct_backend(
     match agent_name {
         "claude" => Some(Box::new(ClaudeBackend::new(ci_fix_max_turns, binary))),
         "codex" => Some(Box::new(CodexBackend)),
+        "pi" => Some(Box::new(PiBackend)),
         _ => None,
     }
 }
@@ -122,12 +124,18 @@ mod tests {
     }
 
     #[test]
+    fn test_resolve_pi() {
+        let backend = resolve_backend("pi").unwrap();
+        assert_eq!(backend.name(), "pi");
+    }
+
+    #[test]
     fn test_resolve_unknown_fails() {
         let result = resolve_backend("foo");
         assert!(result.is_err());
         let msg = format!("{}", result.err().unwrap());
         assert!(msg.contains("Unknown agent 'foo'"));
-        assert!(msg.contains("Available: claude, codex"));
+        assert!(msg.contains("Available: claude, codex, pi"));
     }
 
     #[test]

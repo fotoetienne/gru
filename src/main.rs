@@ -22,6 +22,7 @@ mod minion;
 mod minion_lock;
 mod minion_registry;
 mod minion_resolver;
+mod pi_backend;
 mod pr_monitor;
 mod pr_state;
 mod progress;
@@ -135,7 +136,7 @@ enum Commands {
 
         #[arg(
             long,
-            help = "Agent backend to use (claude, codex). Overrides config.toml agent.default (falls back to claude if unset)."
+            help = "Agent backend to use (claude, codex, pi). Overrides config.toml agent.default (falls back to claude if unset)."
         )]
         agent: Option<String>,
 
@@ -237,7 +238,7 @@ enum Commands {
 
         #[arg(
             long,
-            help = "Agent backend to use (e.g., 'claude'). Overrides config.toml default."
+            help = "Agent backend to use (claude, codex, pi). Overrides config.toml default."
         )]
         agent: Option<String>,
     },
@@ -394,7 +395,7 @@ enum Commands {
 
         #[arg(
             long,
-            help = "Agent backend to use (e.g., 'claude'). Overrides config.toml default."
+            help = "Agent backend to use (claude, codex, pi). Overrides config.toml default."
         )]
         agent: Option<String>,
     },
