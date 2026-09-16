@@ -862,6 +862,15 @@ impl LabConfig {
                  Remove the field to use no limit, or set it to a positive value."
             );
         }
+
+        if let Some(binary) = &self.agent.claude.binary {
+            if binary.trim().is_empty() {
+                anyhow::bail!(
+                    "agent.claude.binary must not be empty. Remove the field to use \
+                     \"claude\" (resolved via $PATH), or set it to a valid binary path."
+                );
+            }
+        }
         Ok(())
     }
 
@@ -1316,6 +1325,33 @@ default = "aider"
             msg.contains("ci_fix_max_turns"),
             "error should mention the field: {msg}"
         );
+    }
+
+    #[test]
+    fn test_empty_claude_binary_is_rejected_by_load_partial() {
+        let config_toml = "[agent.claude]\nbinary = \"\"\n";
+        let mut temp_file = NamedTempFile::new().unwrap();
+        temp_file.write_all(config_toml.as_bytes()).unwrap();
+        temp_file.flush().unwrap();
+
+        let result = LabConfig::load_partial(temp_file.path());
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("agent.claude.binary"),
+            "error should mention the field: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_whitespace_only_claude_binary_is_rejected() {
+        let config_toml = "[agent.claude]\nbinary = \"   \"\n";
+        let mut temp_file = NamedTempFile::new().unwrap();
+        temp_file.write_all(config_toml.as_bytes()).unwrap();
+        temp_file.flush().unwrap();
+
+        let result = LabConfig::load_partial(temp_file.path());
+        assert!(result.is_err());
     }
 
     #[test]
