@@ -247,6 +247,11 @@ impl Drop for TestConfigGuard {
 ///
 /// In test builds, checks for a thread-local path override set via
 /// [`set_test_config_path`] before falling back to the default path.
+///
+/// Also honors the `GRU_CONFIG_PATH` env var (see
+/// [`crate::labels::GRU_CONFIG_PATH_ENV`]) so that a `gru do`/`gru resume`
+/// process spawned by `gru lab --config <path>` resolves agent settings
+/// from the same config file lab used, instead of `~/.gru/config.toml`.
 pub(crate) fn try_load_config() -> Option<LabConfig> {
     #[cfg(test)]
     {
@@ -254,6 +259,9 @@ pub(crate) fn try_load_config() -> Option<LabConfig> {
         if let Some(path) = override_path {
             return load_or_warn(&path);
         }
+    }
+    if let Ok(path) = std::env::var(crate::labels::GRU_CONFIG_PATH_ENV) {
+        return load_or_warn(Path::new(&path));
     }
     let path = LabConfig::default_path().ok()?;
     load_or_warn(&path)
@@ -2147,6 +2155,34 @@ default = "codex"
         let _guard = super::set_test_config_path(temp_file.path().to_path_buf());
         let config = super::try_load_config().expect("should load from override path");
         assert_eq!(config.agent.default, "codex");
+    }
+
+    /// Guards mutation of the process-wide `GRU_CONFIG_PATH` env var. Safe under
+    /// `cargo nextest` (process-per-test isolation) but would race under plain
+    /// `cargo test`'s threaded runner if another test read env vars concurrently.
+    #[test]
+    fn test_gru_config_path_env_var_overrides_try_load() {
+        let config_toml = r#"
+[agent]
+default = "codex"
+"#;
+        let mut temp_file = NamedTempFile::new().unwrap();
+        temp_file.write_all(config_toml.as_bytes()).unwrap();
+        temp_file.flush().unwrap();
+
+        // SAFETY: cargo nextest runs each test in its own process, so mutating
+        // process env here doesn't race with other tests.
+        unsafe {
+            std::env::set_var(
+                crate::labels::GRU_CONFIG_PATH_ENV,
+                temp_file.path().as_os_str(),
+            );
+        }
+        let config = super::try_load_config().expect("should load from GRU_CONFIG_PATH");
+        assert_eq!(config.agent.default, "codex");
+        unsafe {
+            std::env::remove_var(crate::labels::GRU_CONFIG_PATH_ENV);
+        }
     }
 
     #[test]

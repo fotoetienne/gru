@@ -63,6 +63,13 @@ pub(crate) const GRU_RETRY_PARENT_ENV: &str = "GRU_RETRY_PARENT";
 /// Expected value of `GRU_RETRY_PARENT` when set by lab.
 pub(crate) const GRU_RETRY_PARENT_VALUE: &str = "lab";
 
+/// Set by `gru lab` on spawned `gru do`/`gru resume` children when the lab
+/// daemon was started with a non-default `--config <path>`. Makes the child
+/// process (and any worker it spawns in turn, via env inheritance) resolve
+/// `agent.default` and `[agent.claude]` settings from the same config file
+/// lab itself used, rather than silently falling back to `~/.gru/config.toml`.
+pub(crate) const GRU_CONFIG_PATH_ENV: &str = "GRU_CONFIG_PATH";
+
 /// Look up the color and description for a label by its canonical name.
 /// Returns `Some((color, description))` if found in `ALL_LABELS`.
 pub(crate) fn get_label_info(canonical: &str) -> Option<(&'static str, &'static str)> {

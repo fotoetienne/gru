@@ -71,7 +71,8 @@ impl ClaudeBackend {
             .current_dir(worktree_path)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::inherit())
-            .env_remove(crate::labels::GRU_RETRY_PARENT_ENV);
+            .env_remove(crate::labels::GRU_RETRY_PARENT_ENV)
+            .env_remove(crate::labels::GRU_CONFIG_PATH_ENV);
         cmd
     }
 
@@ -241,7 +242,8 @@ impl AgentBackend for ClaudeBackend {
             .stdout(std::process::Stdio::inherit())
             .stderr(std::process::Stdio::inherit())
             .env("GH_HOST", github_host)
-            .env_remove(crate::labels::GRU_RETRY_PARENT_ENV);
+            .env_remove(crate::labels::GRU_RETRY_PARENT_ENV)
+            .env_remove(crate::labels::GRU_CONFIG_PATH_ENV);
         Some(cmd)
     }
 
@@ -272,7 +274,8 @@ impl AgentBackend for ClaudeBackend {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::inherit())
             .env("GH_HOST", github_host)
-            .env_remove(crate::labels::GRU_RETRY_PARENT_ENV);
+            .env_remove(crate::labels::GRU_RETRY_PARENT_ENV)
+            .env_remove(crate::labels::GRU_CONFIG_PATH_ENV);
         cmd
     }
 }

@@ -12,7 +12,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::process::Child;
 use tokio::sync::Notify;
@@ -149,6 +149,24 @@ impl RecoveryTracker {
     }
 }
 
+/// Explicit `--config <path>` the lab daemon was started with, if any.
+///
+/// Set once near the start of `handle_lab` and read by `spawn_minion`/
+/// `spawn_resume` so spawned children set `GRU_CONFIG_PATH`, making them (and
+/// any worker they spawn in turn, via env inheritance) resolve agent settings
+/// from the same non-default config file lab used, instead of silently
+/// falling back to `~/.gru/config.toml`. `None` when lab used the default
+/// config path or no config file at all — in that case children already
+/// resolve to the same path on their own, so no env var is needed.
+static LAB_CONFIG_PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
+
+/// Returns the `--config` path lab was started with, for setting
+/// `GRU_CONFIG_PATH` on spawned children. `None` if `LAB_CONFIG_PATH` was
+/// never set (e.g. in tests that don't call `handle_lab`) or was set to `None`.
+fn lab_config_path() -> Option<&'static PathBuf> {
+    LAB_CONFIG_PATH.get().and_then(|p| p.as_ref())
+}
+
 /// Handles the lab daemon command
 pub(crate) async fn handle_lab(
     config_path: Option<PathBuf>,
@@ -158,6 +176,10 @@ pub(crate) async fn handle_lab(
     no_resume: bool,
     stop_minions: bool,
 ) -> Result<i32> {
+    // Record the explicit --config path (if any) so spawned children can be
+    // told to use the same file. Set once, before any spawning happens.
+    let _ = LAB_CONFIG_PATH.set(config_path.clone());
+
     // Load configuration
     let config = if let Some(path) = config_path {
         LabConfig::load(&path)?
@@ -2354,6 +2376,9 @@ async fn spawn_minion(
         )
         .env_remove("TMUX")
         .env_remove("TMUX_PANE");
+    if let Some(path) = lab_config_path() {
+        cmd.env(crate::labels::GRU_CONFIG_PATH_ENV, path);
+    }
 
     let child = spawn_background_cmd(
         cmd,
@@ -2392,6 +2417,9 @@ async fn spawn_resume(minion_id: &str) -> Result<Child> {
         .env_remove(crate::labels::GRU_RETRY_PARENT_ENV)
         .env_remove("TMUX")
         .env_remove("TMUX_PANE");
+    if let Some(path) = lab_config_path() {
+        cmd.env(crate::labels::GRU_CONFIG_PATH_ENV, path);
+    }
 
     let child = spawn_background_cmd(
         cmd,

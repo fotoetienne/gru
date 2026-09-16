@@ -135,7 +135,7 @@ enum Commands {
 
         #[arg(
             long,
-            help = "Agent backend to use (claude, codex). Defaults to claude."
+            help = "Agent backend to use (claude, codex). Overrides config.toml agent.default (falls back to claude if unset)."
         )]
         agent: Option<String>,
 
