@@ -248,6 +248,17 @@ pub(crate) trait AgentBackend: Send + Sync {
         prompt: &str,
         github_host: &str,
     ) -> TokioCommand;
+
+    /// Returns the CLI args this backend uses to bypass interactive permission
+    /// prompts (e.g. `["--dangerously-skip-permissions"]` for Claude Code).
+    ///
+    /// Used by `gru attach --yolo` to append the backend-appropriate flag
+    /// instead of hardcoding a Claude-specific one. Backends that have no
+    /// such flag (or execute autonomously by default) should return an empty
+    /// `Vec`, which is the default.
+    fn yolo_args(&self) -> Vec<&'static str> {
+        Vec::new()
+    }
 }
 
 #[cfg(test)]

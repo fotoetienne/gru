@@ -390,6 +390,11 @@ mod tests {
     }
 
     #[test]
+    fn test_yolo_args_empty() {
+        assert!(backend().yolo_args().is_empty());
+    }
+
+    #[test]
     fn test_build_command_produces_expected_args() {
         let b = backend();
         let path = std::path::PathBuf::from("/tmp/worktree");
