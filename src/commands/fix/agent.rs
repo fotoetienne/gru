@@ -207,30 +207,10 @@ async fn run_agent_session_inner(
             ..
         } = event
         {
-            match tool_name.as_str() {
-                // Edit/Write tools signal the implementing phase.
-                // "file_change" is the Codex backend equivalent of Edit/Write.
-                "Edit" | "Write" | "NotebookEdit" | "file_change"
-                    if previous_phase != MinionPhase::Implementing
-                        && previous_phase != MinionPhase::Testing =>
-                {
-                    callback_state
-                        .progress_tracker
-                        .set_phase(MinionPhase::Implementing);
-                }
-                // Bash tool with test-related commands signals the testing phase.
-                // "command" is the Codex backend equivalent of Bash.
-                // Only transition from Implementing (not Planning) to keep phases sequential.
-                "Bash" | "command" if previous_phase == MinionPhase::Implementing => {
-                    if let Some(ref summary) = input_summary {
-                        if is_test_command(summary) {
-                            callback_state
-                                .progress_tracker
-                                .set_phase(MinionPhase::Testing);
-                        }
-                    }
-                }
-                _ => {}
+            if let Some(next_phase) =
+                detect_phase_transition(tool_name, input_summary.as_deref(), previous_phase)
+            {
+                callback_state.progress_tracker.set_phase(next_phase);
             }
         }
 
@@ -407,6 +387,51 @@ async fn run_agent_session_inner(
     })
 }
 
+/// Checks whether a tool name signals the edit/write family across backends,
+/// e.g. Claude's `Edit`/`Write`/`NotebookEdit`, Codex's `file_change`, or
+/// Pi's lowercase `edit`/`write`. Matching is case-insensitive so any backend's
+/// casing convention is recognized without adding a literal per backend.
+fn is_edit_tool(tool_name: &str) -> bool {
+    matches!(
+        tool_name.to_ascii_lowercase().as_str(),
+        "edit" | "write" | "notebookedit" | "file_change"
+    )
+}
+
+/// Checks whether a tool name signals the shell-command family across backends,
+/// e.g. Claude's `Bash`, Codex's `command`, or Pi's lowercase `bash`.
+fn is_command_tool(tool_name: &str) -> bool {
+    matches!(tool_name.to_ascii_lowercase().as_str(), "bash" | "command")
+}
+
+/// Determines the phase transition (if any) implied by a tool-use event.
+///
+/// Returns `Some(next_phase)` when the tool name and current phase warrant a
+/// transition, or `None` when the event doesn't change the phase.
+fn detect_phase_transition(
+    tool_name: &str,
+    input_summary: Option<&str>,
+    previous_phase: MinionPhase,
+) -> Option<MinionPhase> {
+    if is_edit_tool(tool_name)
+        && previous_phase != MinionPhase::Implementing
+        && previous_phase != MinionPhase::Testing
+    {
+        return Some(MinionPhase::Implementing);
+    }
+
+    // Only transition from Implementing (not Planning) to keep phases sequential.
+    if is_command_tool(tool_name) && previous_phase == MinionPhase::Implementing {
+        if let Some(summary) = input_summary {
+            if is_test_command(summary) {
+                return Some(MinionPhase::Testing);
+            }
+        }
+    }
+
+    None
+}
+
 /// Checks whether a Bash tool input summary looks like a test command.
 ///
 /// Matches common test runners and invocations (e.g., `cargo test`, `just test`,
@@ -560,5 +585,134 @@ mod tests {
     fn test_is_test_command_empty_and_no_match() {
         assert!(!is_test_command(""));
         assert!(!is_test_command("Run: "));
+    }
+
+    #[test]
+    fn test_is_edit_tool_claude_names() {
+        assert!(is_edit_tool("Edit"));
+        assert!(is_edit_tool("Write"));
+        assert!(is_edit_tool("NotebookEdit"));
+    }
+
+    #[test]
+    fn test_is_edit_tool_codex_name() {
+        assert!(is_edit_tool("file_change"));
+    }
+
+    #[test]
+    fn test_is_edit_tool_pi_names_lowercase() {
+        assert!(is_edit_tool("edit"));
+        assert!(is_edit_tool("write"));
+    }
+
+    #[test]
+    fn test_is_edit_tool_non_matches() {
+        assert!(!is_edit_tool("Bash"));
+        assert!(!is_edit_tool("Read"));
+        assert!(!is_edit_tool("glob"));
+    }
+
+    #[test]
+    fn test_is_command_tool_names() {
+        assert!(is_command_tool("Bash"));
+        assert!(is_command_tool("command"));
+        assert!(is_command_tool("bash"));
+        assert!(!is_command_tool("Edit"));
+    }
+
+    #[test]
+    fn test_detect_phase_transition_claude_edit_starts_implementing() {
+        assert_eq!(
+            detect_phase_transition("Edit", None, MinionPhase::Planning),
+            Some(MinionPhase::Implementing)
+        );
+    }
+
+    #[test]
+    fn test_detect_phase_transition_codex_file_change_starts_implementing() {
+        assert_eq!(
+            detect_phase_transition("file_change", None, MinionPhase::Planning),
+            Some(MinionPhase::Implementing)
+        );
+    }
+
+    #[test]
+    fn test_detect_phase_transition_pi_edit_starts_implementing() {
+        assert_eq!(
+            detect_phase_transition("edit", None, MinionPhase::Planning),
+            Some(MinionPhase::Implementing)
+        );
+        assert_eq!(
+            detect_phase_transition("write", None, MinionPhase::Planning),
+            Some(MinionPhase::Implementing)
+        );
+    }
+
+    #[test]
+    fn test_detect_phase_transition_edit_no_op_once_implementing_or_testing() {
+        assert_eq!(
+            detect_phase_transition("Edit", None, MinionPhase::Implementing),
+            None
+        );
+        assert_eq!(
+            detect_phase_transition("edit", None, MinionPhase::Testing),
+            None
+        );
+    }
+
+    #[test]
+    fn test_detect_phase_transition_claude_bash_test_command_starts_testing() {
+        assert_eq!(
+            detect_phase_transition("Bash", Some("Run: cargo test"), MinionPhase::Implementing),
+            Some(MinionPhase::Testing)
+        );
+    }
+
+    #[test]
+    fn test_detect_phase_transition_codex_command_test_starts_testing() {
+        assert_eq!(
+            detect_phase_transition(
+                "command",
+                Some("Run: cargo test"),
+                MinionPhase::Implementing
+            ),
+            Some(MinionPhase::Testing)
+        );
+    }
+
+    #[test]
+    fn test_detect_phase_transition_pi_bash_lowercase_test_starts_testing() {
+        assert_eq!(
+            detect_phase_transition("bash", Some("Run: just test"), MinionPhase::Implementing),
+            Some(MinionPhase::Testing)
+        );
+    }
+
+    #[test]
+    fn test_detect_phase_transition_command_ignored_outside_implementing() {
+        assert_eq!(
+            detect_phase_transition("Bash", Some("Run: cargo test"), MinionPhase::Planning),
+            None
+        );
+    }
+
+    #[test]
+    fn test_detect_phase_transition_non_test_command_no_op() {
+        assert_eq!(
+            detect_phase_transition("Bash", Some("Run: git status"), MinionPhase::Implementing),
+            None
+        );
+    }
+
+    #[test]
+    fn test_detect_phase_transition_unknown_tool_no_op() {
+        assert_eq!(
+            detect_phase_transition("Read", None, MinionPhase::Planning),
+            None
+        );
+        assert_eq!(
+            detect_phase_transition("glob", None, MinionPhase::Planning),
+            None
+        );
     }
 }
