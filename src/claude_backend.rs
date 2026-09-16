@@ -162,6 +162,10 @@ impl AgentBackend for ClaudeBackend {
         "claude-code"
     }
 
+    fn yolo_args(&self) -> Vec<&'static str> {
+        vec!["--dangerously-skip-permissions"]
+    }
+
     fn build_command(
         &self,
         worktree_path: &Path,
@@ -351,6 +355,14 @@ mod tests {
     #[test]
     fn test_name() {
         assert_eq!(backend().name(), "claude-code");
+    }
+
+    #[test]
+    fn test_yolo_args() {
+        assert_eq!(
+            backend().yolo_args(),
+            vec!["--dangerously-skip-permissions"]
+        );
     }
 
     #[test]

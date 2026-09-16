@@ -201,7 +201,7 @@ pub(crate) async fn handle_attach(
         }
     };
     if yolo {
-        cmd.arg("--dangerously-skip-permissions");
+        cmd.args(backend.yolo_args());
     }
 
     // Acquire the per-minion advisory lock just before spawning. This is the
