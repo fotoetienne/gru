@@ -68,6 +68,19 @@ pub(crate) fn resolve_default_agent_name() -> String {
         .unwrap_or_else(|| DEFAULT_AGENT.to_string())
 }
 
+/// Resolves the Claude Code CLI binary path/name to invoke.
+///
+/// Used by entry points that spawn `claude` directly for a generic interactive
+/// session (`gru chat`, `gru pm`/`gru tpm`, and the legacy no-session-id
+/// `gru attach` fallback) rather than going through `resolve_backend`'s
+/// `ClaudeBackend`. Reads `[agent.claude] binary` from config, falling back to
+/// `"claude"` (resolved via `$PATH`) when unset or no config is present.
+pub(crate) fn configured_claude_binary() -> String {
+    crate::config::try_load_config()
+        .and_then(|c| c.agent.claude.binary)
+        .unwrap_or_else(|| "claude".to_string())
+}
+
 /// Resolves an agent name to a concrete `AgentBackend` implementation.
 ///
 /// Returns an error with available agents listed if the name is unknown.
@@ -153,5 +166,31 @@ mod tests {
         let _guard = crate::config::set_test_config_path(missing);
 
         assert_eq!(resolve_default_agent_name(), DEFAULT_AGENT);
+    }
+
+    #[test]
+    fn test_resolve_backend_forwards_configured_binary() {
+        use std::io::Write;
+        use uuid::Uuid;
+
+        let mut temp_file = tempfile::NamedTempFile::new().unwrap();
+        temp_file
+            .write_all(b"[agent.claude]\nbinary = \"/opt/tools/claude\"\n")
+            .unwrap();
+        temp_file.flush().unwrap();
+
+        let _guard = crate::config::set_test_config_path(temp_file.path().to_path_buf());
+
+        // Exercise resolve_backend() itself (not ClaudeBackend::new() directly) so
+        // this test fails if resolve_backend ever stops reading
+        // config.agent.claude.binary before constructing the backend.
+        let backend = resolve_backend("claude").unwrap();
+        let cmd = backend.build_command(
+            std::path::Path::new("/tmp/worktree"),
+            &Uuid::nil(),
+            "prompt",
+            "github.com",
+        );
+        assert_eq!(cmd.as_std().get_program(), "/opt/tools/claude");
     }
 }

@@ -68,9 +68,13 @@ async fn spawn_worker(
     if opts.force_new {
         cmd.arg("--force-new");
     }
-    if opts.agent_name != crate::agent_registry::DEFAULT_AGENT {
-        cmd.arg("--agent").arg(&opts.agent_name);
-    }
+    // Always forward the resolved agent name explicitly — the worker must not
+    // re-derive it from config, since `opts.agent_name` may already reflect an
+    // explicit `--agent` override or a config-resolved default that happens to
+    // equal the compile-time DEFAULT_AGENT, and the worker's own config lookup
+    // isn't guaranteed to agree (e.g. it re-reads ~/.gru/config.toml, which can
+    // have changed, or differ from a `gru lab --config <path>` the parent used).
+    cmd.arg("--agent").arg(&opts.agent_name);
     if opts.no_watch {
         cmd.arg("--no-watch");
     }

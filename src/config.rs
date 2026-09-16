@@ -2157,9 +2157,42 @@ default = "codex"
         assert_eq!(config.agent.default, "codex");
     }
 
-    /// Guards mutation of the process-wide `GRU_CONFIG_PATH` env var. Safe under
-    /// `cargo nextest` (process-per-test isolation) but would race under plain
-    /// `cargo test`'s threaded runner if another test read env vars concurrently.
+    /// Serializes tests that mutate the process-wide `GRU_CONFIG_PATH` env var.
+    /// Env vars are global to the process, so cargo test's threaded runner
+    /// (unlike cargo nextest's process-per-test model, which this repo's `just
+    /// test` uses) could otherwise interleave this with another test calling
+    /// `try_load_config()`. Holding this lock for the duration of the mutation
+    /// prevents that; pairing it with an RAII guard ensures the env var is
+    /// cleared even if the test panics mid-assertion.
+    static GRU_CONFIG_PATH_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct GruConfigPathEnvGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl GruConfigPathEnvGuard {
+        fn set(path: &Path) -> Self {
+            let lock = GRU_CONFIG_PATH_ENV_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            // SAFETY: the mutex above ensures no other thread in this process
+            // reads/writes env vars concurrently with this call.
+            unsafe {
+                std::env::set_var(crate::labels::GRU_CONFIG_PATH_ENV, path);
+            }
+            Self { _lock: lock }
+        }
+    }
+
+    impl Drop for GruConfigPathEnvGuard {
+        fn drop(&mut self) {
+            // SAFETY: still holding `_lock`, so no concurrent env access in this process.
+            unsafe {
+                std::env::remove_var(crate::labels::GRU_CONFIG_PATH_ENV);
+            }
+        }
+    }
+
     #[test]
     fn test_gru_config_path_env_var_overrides_try_load() {
         let config_toml = r#"
@@ -2170,19 +2203,9 @@ default = "codex"
         temp_file.write_all(config_toml.as_bytes()).unwrap();
         temp_file.flush().unwrap();
 
-        // SAFETY: cargo nextest runs each test in its own process, so mutating
-        // process env here doesn't race with other tests.
-        unsafe {
-            std::env::set_var(
-                crate::labels::GRU_CONFIG_PATH_ENV,
-                temp_file.path().as_os_str(),
-            );
-        }
+        let _env_guard = GruConfigPathEnvGuard::set(temp_file.path());
         let config = super::try_load_config().expect("should load from GRU_CONFIG_PATH");
         assert_eq!(config.agent.default, "codex");
-        unsafe {
-            std::env::remove_var(crate::labels::GRU_CONFIG_PATH_ENV);
-        }
     }
 
     #[test]

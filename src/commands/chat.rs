@@ -38,7 +38,7 @@ pub(crate) async fn handle_chat(repo_flag: Option<String>, verbose: bool) -> Res
     }
 
     // Build claude command for interactive mode (no --print, no --output-format)
-    let mut cmd = Command::new("claude");
+    let mut cmd = Command::new(crate::agent_registry::configured_claude_binary());
     cmd.arg("--system-prompt").arg(&system_prompt);
     cmd.current_dir(&work_dir)
         .stdin(Stdio::inherit())

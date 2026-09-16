@@ -9,7 +9,7 @@ use crate::tmux::TmuxGuard;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Local, Utc};
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -2342,6 +2342,42 @@ async fn spawn_background_cmd(
     Ok(child)
 }
 
+/// Builds the `gru do <issue_ref> --agent <agent_name>` command lab spawns for
+/// a Minion, without touching the filesystem or actually spawning it.
+///
+/// Split out from `spawn_minion` so the `--agent` and `GRU_CONFIG_PATH`
+/// handoff can be asserted on directly in tests, independent of process
+/// spawning and log-file setup.
+fn build_do_command(
+    exe: &Path,
+    issue_ref: &str,
+    agent_name: &str,
+    config_path: Option<&Path>,
+) -> tokio::process::Command {
+    // Remove TMUX/TMUX_PANE so the child doesn't inherit the lab's tmux session —
+    // otherwise TmuxGuard renames arbitrary windows in the parent's tmux.
+    let mut cmd = tokio::process::Command::new(exe);
+    cmd.arg("do")
+        .arg(issue_ref)
+        // Pass the configured default explicitly so the spawned `gru do` process
+        // is not left to re-derive it from ~/.gru/config.toml, which may differ
+        // from the config lab was started with (e.g. via `gru lab --config`).
+        .arg("--agent")
+        .arg(agent_name)
+        // Tells the worker to defer gru:failed labeling so lab's retry queue can fire.
+        // See labels::{GRU_RETRY_PARENT_ENV, GRU_RETRY_PARENT_VALUE}.
+        .env(
+            crate::labels::GRU_RETRY_PARENT_ENV,
+            crate::labels::GRU_RETRY_PARENT_VALUE,
+        )
+        .env_remove("TMUX")
+        .env_remove("TMUX_PANE");
+    if let Some(path) = config_path {
+        cmd.env(crate::labels::GRU_CONFIG_PATH_ENV, path);
+    }
+    cmd
+}
+
 /// Spawn a Minion to work on an issue using the `gru do` command.
 ///
 /// Returns the child process handle for lifecycle tracking.
@@ -2358,27 +2394,12 @@ async fn spawn_minion(
     let log_name = format_log_name(host, repo, issue_number);
     let (stdout_file, stderr_file, log_path) = setup_log_file(&log_name).await?;
 
-    // Remove TMUX/TMUX_PANE so the child doesn't inherit the lab's tmux session —
-    // otherwise TmuxGuard renames arbitrary windows in the parent's tmux.
-    let mut cmd = tokio::process::Command::new(exe);
-    cmd.arg("do")
-        .arg(&issue_ref)
-        // Pass the configured default explicitly so the spawned `gru do` process
-        // is not left to re-derive it from ~/.gru/config.toml, which may differ
-        // from the config lab was started with (e.g. via `gru lab --config`).
-        .arg("--agent")
-        .arg(agent_name)
-        // Tells the worker to defer gru:failed labeling so lab's retry queue can fire.
-        // See labels::{GRU_RETRY_PARENT_ENV, GRU_RETRY_PARENT_VALUE}.
-        .env(
-            crate::labels::GRU_RETRY_PARENT_ENV,
-            crate::labels::GRU_RETRY_PARENT_VALUE,
-        )
-        .env_remove("TMUX")
-        .env_remove("TMUX_PANE");
-    if let Some(path) = lab_config_path() {
-        cmd.env(crate::labels::GRU_CONFIG_PATH_ENV, path);
-    }
+    let cmd = build_do_command(
+        &exe,
+        &issue_ref,
+        agent_name,
+        lab_config_path().map(|p| p.as_path()),
+    );
 
     let child = spawn_background_cmd(
         cmd,
@@ -2393,17 +2414,14 @@ async fn spawn_minion(
     Ok(child)
 }
 
-/// Spawn a resume for an existing Minion using `gru resume <minion_id>`.
-/// Returns the child process handle for lifecycle tracking.
-///
-/// Deliberately does not take an `agent_name`/`--agent` argument: `gru resume`
-/// looks up the Minion's originally-recorded agent from the registry, not
-/// from config, so there's nothing here for `agent.default` to override.
-async fn spawn_resume(minion_id: &str) -> Result<Child> {
-    let exe = std::env::current_exe().context("Failed to get current executable path")?;
-    let log_name = format!("resume-{}.log", minion_id);
-    let (stdout_file, stderr_file, log_path) = setup_log_file(&log_name).await?;
-
+/// Builds the `gru resume <minion_id>` command lab spawns to resume a Minion,
+/// without touching the filesystem or actually spawning it. Split out from
+/// `spawn_resume` for the same testability reason as `build_do_command`.
+fn build_resume_command(
+    exe: &Path,
+    minion_id: &str,
+    config_path: Option<&Path>,
+) -> tokio::process::Command {
     // Remove TMUX/TMUX_PANE so the child doesn't inherit the lab's tmux session —
     // otherwise TmuxGuard renames arbitrary windows in the parent's tmux.
     let mut cmd = tokio::process::Command::new(exe);
@@ -2417,9 +2435,24 @@ async fn spawn_resume(minion_id: &str) -> Result<Child> {
         .env_remove(crate::labels::GRU_RETRY_PARENT_ENV)
         .env_remove("TMUX")
         .env_remove("TMUX_PANE");
-    if let Some(path) = lab_config_path() {
+    if let Some(path) = config_path {
         cmd.env(crate::labels::GRU_CONFIG_PATH_ENV, path);
     }
+    cmd
+}
+
+/// Spawn a resume for an existing Minion using `gru resume <minion_id>`.
+/// Returns the child process handle for lifecycle tracking.
+///
+/// Deliberately does not take an `agent_name`/`--agent` argument: `gru resume`
+/// looks up the Minion's originally-recorded agent from the registry, not
+/// from config, so there's nothing here for `agent.default` to override.
+async fn spawn_resume(minion_id: &str) -> Result<Child> {
+    let exe = std::env::current_exe().context("Failed to get current executable path")?;
+    let log_name = format!("resume-{}.log", minion_id);
+    let (stdout_file, stderr_file, log_path) = setup_log_file(&log_name).await?;
+
+    let cmd = build_resume_command(&exe, minion_id, lab_config_path().map(|p| p.as_path()));
 
     let child = spawn_background_cmd(
         cmd,
@@ -2943,6 +2976,53 @@ mod tests {
         let mut retry_queue = RetryQueue::new(3, 300);
         reap_children(&mut children, &mut retry_queue).await;
         assert!(children.is_empty());
+    }
+
+    // --- gru do / gru resume command construction (the lab -> worker handoff) ---
+
+    #[test]
+    fn test_build_do_command_forwards_non_claude_agent() {
+        let cmd = build_do_command(Path::new("/usr/local/bin/gru"), "42", "codex", None);
+        let inner = cmd.as_std();
+        let args: Vec<&std::ffi::OsStr> = inner.get_args().collect();
+        assert!(args.contains(&"--agent".as_ref()));
+        assert!(args.contains(&"codex".as_ref()));
+        // No explicit config path given → GRU_CONFIG_PATH must not be set.
+        assert!(!inner.get_envs().any(|(k, _)| k == "GRU_CONFIG_PATH"));
+    }
+
+    #[test]
+    fn test_build_do_command_sets_gru_config_path_when_given() {
+        let config_path = Path::new("/tmp/custom-gru-config.toml");
+        let cmd = build_do_command(
+            Path::new("/usr/local/bin/gru"),
+            "42",
+            "claude",
+            Some(config_path),
+        );
+        let inner = cmd.as_std();
+        let envs: Vec<(&std::ffi::OsStr, Option<&std::ffi::OsStr>)> = inner.get_envs().collect();
+        assert!(envs
+            .iter()
+            .any(|(k, v)| *k == "GRU_CONFIG_PATH" && *v == Some(config_path.as_os_str())));
+    }
+
+    #[test]
+    fn test_build_resume_command_sets_gru_config_path_when_given() {
+        let config_path = Path::new("/tmp/custom-gru-config.toml");
+        let cmd = build_resume_command(Path::new("/usr/local/bin/gru"), "M001", Some(config_path));
+        let inner = cmd.as_std();
+        let envs: Vec<(&std::ffi::OsStr, Option<&std::ffi::OsStr>)> = inner.get_envs().collect();
+        assert!(envs
+            .iter()
+            .any(|(k, v)| *k == "GRU_CONFIG_PATH" && *v == Some(config_path.as_os_str())));
+    }
+
+    #[test]
+    fn test_build_resume_command_omits_gru_config_path_by_default() {
+        let cmd = build_resume_command(Path::new("/usr/local/bin/gru"), "M001", None);
+        let inner = cmd.as_std();
+        assert!(!inner.get_envs().any(|(k, _)| k == "GRU_CONFIG_PATH"));
     }
 
     #[test]

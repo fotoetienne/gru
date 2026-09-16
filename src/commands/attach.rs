@@ -190,7 +190,7 @@ pub(crate) async fn handle_attach(
                     agent_name
                 );
             }
-            let mut c = Command::new("claude");
+            let mut c = Command::new(agent_registry::configured_claude_binary());
             c.arg("-r")
                 .current_dir(&checkout_path)
                 .stdin(Stdio::inherit())
