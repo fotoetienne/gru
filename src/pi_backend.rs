@@ -829,4 +829,16 @@ mod tests {
     fn test_format_pi_tool_summary_no_args() {
         assert_eq!(format_pi_tool_summary("bash", None), "Tool: bash");
     }
+
+    #[test]
+    fn test_format_pi_tool_summary_write_no_path_falls_back() {
+        let args = serde_json::json!({});
+        assert_eq!(format_pi_tool_summary("write", Some(&args)), "Write: file");
+    }
+
+    #[test]
+    fn test_format_pi_tool_summary_edit_no_path_falls_back() {
+        let args = serde_json::json!({});
+        assert_eq!(format_pi_tool_summary("edit", Some(&args)), "Edit: file");
+    }
 }
