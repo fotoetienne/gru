@@ -213,9 +213,12 @@ struct PiEvent {
     /// Lives on the event envelope, not nested inside `result`.
     #[serde(default, rename = "isError")]
     is_error: bool,
-    /// Present on `turn_end` events.
+    /// Present on `turn_end` events. Deserialized as a raw `Value` rather
+    /// than directly into `PiUsage` so a malformed/schema-drifting usage
+    /// object can't fail parsing of the whole event and drop the `turn_end`
+    /// signal — see `parse_usage`.
     #[serde(default)]
-    usage: Option<PiUsage>,
+    usage: Option<serde_json::Value>,
     /// Present on `error` / `turn_failed` events.
     #[serde(default)]
     message: Option<String>,
@@ -248,10 +251,6 @@ struct PiContentBlock {
 }
 
 /// Pi token usage from `turn_end` events.
-// TODO: if usage ever fails to deserialize (e.g. an unexpected negative
-// number), the whole `PiEvent` line fails to parse and the `turn_end`
-// signal itself is dropped, not just the usage stats. Verify against real
-// Pi output whether that's an acceptable risk once the CLI is available.
 #[derive(Debug, Deserialize)]
 struct PiUsage {
     #[serde(default)]
@@ -262,6 +261,17 @@ struct PiUsage {
     cache_read: Option<u64>,
     #[serde(default, rename = "cacheWrite")]
     cache_write: Option<u64>,
+}
+
+/// Parses a raw `usage` JSON value into `PiUsage`, tolerating malformed or
+/// schema-drifting shapes by returning `None` instead of propagating an
+/// error. This keeps a bad `usage` object from failing deserialization of
+/// the whole `turn_end` line — which would otherwise drop the
+/// `MessageComplete` signal the monitor/PR state logic uses as its
+/// turn-completion latch, leaving a successfully finished Pi turn looking
+/// incomplete.
+fn parse_usage(usage: Option<serde_json::Value>) -> Option<PiUsage> {
+    serde_json::from_value(usage?).ok()
 }
 
 /// Parse a single line of Pi JSONL output into normalized events.
@@ -334,7 +344,7 @@ fn parse_pi_event(line: &str) -> Vec<AgentEvent> {
         }
 
         "turn_end" => {
-            let usage = event.usage.map(|u| TokenUsage {
+            let usage = parse_usage(event.usage).map(|u| TokenUsage {
                 input_tokens: u.input,
                 output_tokens: u.output,
                 cache_read_input_tokens: u.cache_read,
@@ -774,6 +784,39 @@ mod tests {
     fn test_parse_event_turn_end_no_usage() {
         let b = backend();
         let line = r#"{"type":"turn_end"}"#;
+        let event = single(b.parse_events(line));
+        assert!(matches!(
+            event,
+            AgentEvent::MessageComplete {
+                stop_reason: Some(_),
+                usage: None,
+            }
+        ));
+    }
+
+    #[test]
+    fn test_parse_event_turn_end_malformed_usage_still_completes() {
+        // A malformed/schema-drifting usage object (e.g. a negative number
+        // where u64 is expected) must not fail deserialization of the whole
+        // turn_end line — the MessageComplete signal is the monitor's
+        // turn-completion latch, so it must still be emitted, just without
+        // usage stats.
+        let b = backend();
+        let line = r#"{"type":"turn_end","usage":{"input":-5,"output":500}}"#;
+        let event = single(b.parse_events(line));
+        assert!(matches!(
+            event,
+            AgentEvent::MessageComplete {
+                stop_reason: Some(_),
+                usage: None,
+            }
+        ));
+    }
+
+    #[test]
+    fn test_parse_event_turn_end_wrong_type_usage_still_completes() {
+        let b = backend();
+        let line = r#"{"type":"turn_end","usage":"unexpected string shape"}"#;
         let event = single(b.parse_events(line));
         assert!(matches!(
             event,
