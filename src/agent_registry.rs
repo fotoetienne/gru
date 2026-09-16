@@ -77,6 +77,8 @@ pub(crate) fn resolve_backend(agent_name: &str) -> anyhow::Result<Box<dyn AgentB
         anyhow::bail!("Unknown agent '{}'. Available: {}", agent_name, available);
     }
 
+    // Load config once and reuse it for both fields below — don't call
+    // try_load_config() a second time here.
     let config = if agent_name == "claude" {
         crate::config::try_load_config()
     } else {

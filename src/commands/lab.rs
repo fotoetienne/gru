@@ -2370,6 +2370,10 @@ async fn spawn_minion(
 
 /// Spawn a resume for an existing Minion using `gru resume <minion_id>`.
 /// Returns the child process handle for lifecycle tracking.
+///
+/// Deliberately does not take an `agent_name`/`--agent` argument: `gru resume`
+/// looks up the Minion's originally-recorded agent from the registry, not
+/// from config, so there's nothing here for `agent.default` to override.
 async fn spawn_resume(minion_id: &str) -> Result<Child> {
     let exe = std::env::current_exe().context("Failed to get current executable path")?;
     let log_name = format!("resume-{}.log", minion_id);
