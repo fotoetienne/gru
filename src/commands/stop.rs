@@ -405,4 +405,25 @@ mod tests {
             "should not match inside --shell"
         );
     }
+
+    #[test]
+    fn test_pgrep_pattern_does_not_match_agent_name_as_argument_value() {
+        // Real Gru workers are spawned as `gru do <issue> --worker <id>
+        // --agent pi` (see spawn_worker in commands/fix/mod.rs), so an
+        // unrelated process invoked with an argument that merely equals
+        // "pi"/"claude"/"codex" must not be mistaken for that executable.
+        let re = compile_pattern("/tmp/worktree");
+        assert!(!re.is_match("tool --agent pi /tmp/worktree"));
+        assert!(!re.is_match("some-runner --backend claude /tmp/worktree"));
+        assert!(!re.is_match("some-runner --backend codex /tmp/worktree"));
+    }
+
+    #[test]
+    fn test_pgrep_pattern_matches_gru_worker_with_agent_flag() {
+        // The real spawn_worker invocation shape: the gru worker itself
+        // (executable position) should still match even though "pi" also
+        // appears later as an --agent argument value.
+        let re = compile_pattern("/tmp/worktree");
+        assert!(re.is_match("/usr/local/bin/gru do 42 --worker M001 --agent pi /tmp/worktree"));
+    }
 }
