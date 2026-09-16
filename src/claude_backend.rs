@@ -247,9 +247,17 @@ impl AgentBackend for ClaudeBackend {
         Some(cmd)
     }
 
-    fn build_oneshot_command(&self, worktree_path: &Path, prompt_arg: &str) -> TokioCommand {
+    fn build_oneshot_command(
+        &self,
+        worktree_path: &Path,
+        prompt_arg: &str,
+        github_host: &str,
+    ) -> TokioCommand {
         let mut cmd = self.base_noninteractive_cmd(worktree_path);
-        cmd.arg("--max-turns").arg("1").arg(prompt_arg);
+        cmd.arg("--max-turns")
+            .arg("1")
+            .arg(prompt_arg)
+            .env("GH_HOST", github_host);
         cmd
     }
 
@@ -478,7 +486,7 @@ mod tests {
     fn test_build_oneshot_command_produces_expected_args() {
         let b = backend();
         let path = std::path::PathBuf::from("/tmp/worktree");
-        let cmd = b.build_oneshot_command(&path, "fix the tests");
+        let cmd = b.build_oneshot_command(&path, "fix the tests", "github.com");
         let inner = cmd.as_std();
 
         assert_eq!(inner.get_program(), "claude");
@@ -494,6 +502,13 @@ mod tests {
         assert!(!args.contains(&"--session-id".as_ref()));
         assert!(!args.contains(&"--verbose".as_ref()));
         assert!(!args.contains(&"stream-json".as_ref()));
+
+        let envs: Vec<_> = inner.get_envs().collect();
+        assert!(
+            envs.iter()
+                .any(|(k, v)| *k == "GH_HOST" && *v == Some("github.com".as_ref())),
+            "GH_HOST should be set on the oneshot command"
+        );
     }
 
     #[test]
@@ -563,7 +578,9 @@ mod tests {
             "/opt/tools/claude"
         );
         assert_eq!(
-            b.build_oneshot_command(&path, "p").as_std().get_program(),
+            b.build_oneshot_command(&path, "p", "github.com")
+                .as_std()
+                .get_program(),
             "/opt/tools/claude"
         );
         assert_eq!(

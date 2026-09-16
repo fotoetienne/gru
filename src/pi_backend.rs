@@ -82,8 +82,15 @@ impl AgentBackend for PiBackend {
         Some(cmd)
     }
 
-    fn build_oneshot_command(&self, worktree_path: &Path, prompt_arg: &str) -> TokioCommand {
-        build_pi_oneshot_command(worktree_path, prompt_arg)
+    fn build_oneshot_command(
+        &self,
+        worktree_path: &Path,
+        prompt_arg: &str,
+        github_host: &str,
+    ) -> TokioCommand {
+        let mut cmd = build_pi_oneshot_command(worktree_path, prompt_arg);
+        cmd.env("GH_HOST", github_host);
+        cmd
     }
 
     fn build_ci_fix_command(
@@ -513,20 +520,27 @@ mod tests {
     fn test_build_oneshot_command_produces_expected_args() {
         let b = backend();
         let path = std::path::PathBuf::from("/tmp/worktree");
-        let cmd = b.build_oneshot_command(&path, "fix the tests");
+        let cmd = b.build_oneshot_command(&path, "fix the tests", "github.com");
         let inner = cmd.as_std();
 
         assert_eq!(inner.get_program(), "pi");
         let args: Vec<&std::ffi::OsStr> = inner.get_args().collect();
         assert!(args.contains(&"-p".as_ref()));
         assert!(args.contains(&"fix the tests".as_ref()));
+
+        let envs: Vec<_> = inner.get_envs().collect();
+        assert!(
+            envs.iter()
+                .any(|(k, v)| *k == "GH_HOST" && *v == Some("github.com".as_ref())),
+            "GH_HOST should be set on the oneshot command"
+        );
     }
 
     #[test]
     fn test_build_oneshot_command_stdin_sentinel_omits_prompt_arg() {
         let b = backend();
         let path = std::path::PathBuf::from("/tmp/worktree");
-        let cmd = b.build_oneshot_command(&path, "-");
+        let cmd = b.build_oneshot_command(&path, "-", "github.com");
         let inner = cmd.as_std();
 
         assert_eq!(inner.get_program(), "pi");
@@ -534,6 +548,21 @@ mod tests {
         assert!(args.contains(&"-p".as_ref()));
         // "-" should NOT appear as an argument when using stdin sentinel
         assert!(!args.contains(&"-".as_ref()));
+    }
+
+    #[test]
+    fn test_build_oneshot_command_sets_ghe_host() {
+        let b = backend();
+        let path = std::path::PathBuf::from("/tmp/worktree");
+        let cmd = b.build_oneshot_command(&path, "fix the tests", "github.example.com");
+        let inner = cmd.as_std();
+
+        let envs: Vec<_> = inner.get_envs().collect();
+        assert!(
+            envs.iter()
+                .any(|(k, v)| *k == "GH_HOST" && *v == Some("github.example.com".as_ref())),
+            "GH_HOST should be set to the GHE host"
+        );
     }
 
     #[test]

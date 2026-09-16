@@ -74,7 +74,12 @@ impl AgentBackend for CodexBackend {
         None
     }
 
-    fn build_oneshot_command(&self, worktree_path: &Path, prompt_arg: &str) -> TokioCommand {
+    fn build_oneshot_command(
+        &self,
+        worktree_path: &Path,
+        prompt_arg: &str,
+        github_host: &str,
+    ) -> TokioCommand {
         let mut cmd = TokioCommand::new("codex");
         cmd.arg("exec").arg("--full-auto");
 
@@ -90,7 +95,8 @@ impl AgentBackend for CodexBackend {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::inherit())
             .env_remove(crate::labels::GRU_RETRY_PARENT_ENV)
-            .env_remove(crate::labels::GRU_CONFIG_PATH_ENV);
+            .env_remove(crate::labels::GRU_CONFIG_PATH_ENV)
+            .env("GH_HOST", github_host);
         cmd
     }
 
@@ -497,7 +503,7 @@ mod tests {
     fn test_build_oneshot_command_produces_expected_args() {
         let b = backend();
         let path = std::path::PathBuf::from("/tmp/worktree");
-        let cmd = b.build_oneshot_command(&path, "fix the tests");
+        let cmd = b.build_oneshot_command(&path, "fix the tests", "github.com");
         let inner = cmd.as_std();
 
         assert_eq!(inner.get_program(), "codex");
@@ -505,13 +511,20 @@ mod tests {
         assert!(args.contains(&"exec".as_ref()));
         assert!(args.contains(&"--full-auto".as_ref()));
         assert!(args.contains(&"fix the tests".as_ref()));
+
+        let envs: Vec<_> = inner.get_envs().collect();
+        assert!(
+            envs.iter()
+                .any(|(k, v)| *k == "GH_HOST" && *v == Some("github.com".as_ref())),
+            "GH_HOST should be set on the oneshot command"
+        );
     }
 
     #[test]
     fn test_build_oneshot_command_stdin_sentinel_omits_prompt_arg() {
         let b = backend();
         let path = std::path::PathBuf::from("/tmp/worktree");
-        let cmd = b.build_oneshot_command(&path, "-");
+        let cmd = b.build_oneshot_command(&path, "-", "github.com");
         let inner = cmd.as_std();
 
         assert_eq!(inner.get_program(), "codex");

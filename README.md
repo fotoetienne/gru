@@ -10,7 +10,7 @@ Point it at an issue and it handles the rest: implementation, PR, code review, C
 
 ![Animated terminal demo: running "gru do &lt;issue&gt;" — Gru fetches the issue, spawns an agent, and opens a PR autonomously](https://raw.githubusercontent.com/fotoetienne/gru/main/docs/demo.gif)
 
-Gru is **agent-agnostic**. It ships with backends for [Claude Code](https://github.com/anthropics/claude-code) and [OpenAI Codex](https://github.com/openai/codex), and its pluggable architecture makes it straightforward to add more.
+Gru is **agent-agnostic**. It ships with backends for [Claude Code](https://github.com/anthropics/claude-code), [OpenAI Codex](https://github.com/openai/codex), and Netflix Pi (internal only), and its pluggable architecture makes it straightforward to add more.
 
 ## 🚀 Quick Start
 
