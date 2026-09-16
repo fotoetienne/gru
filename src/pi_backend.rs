@@ -216,6 +216,10 @@ struct PiContentBlock {
 }
 
 /// Pi token usage from `turn_end` events.
+// TODO: if usage ever fails to deserialize (e.g. an unexpected negative
+// number), the whole `PiEvent` line fails to parse and the `turn_end`
+// signal itself is dropped, not just the usage stats. Verify against real
+// Pi output whether that's an acceptable risk once the CLI is available.
 #[derive(Debug, Deserialize)]
 struct PiUsage {
     #[serde(default)]
