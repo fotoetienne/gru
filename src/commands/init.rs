@@ -132,6 +132,7 @@ fn check_prerequisites() -> Result<i32> {
     // 2. Check for at least one agent backend
     let has_claude = check_binary("claude");
     let has_codex = check_binary("codex");
+    let has_pi = check_binary("pi");
 
     if has_claude {
         println!("  ✓ claude (Claude Code CLI)");
@@ -139,12 +140,16 @@ fn check_prerequisites() -> Result<i32> {
     if has_codex {
         println!("  ✓ codex (OpenAI Codex CLI)");
     }
-    if !has_claude && !has_codex {
-        println!("  ⚠ No agent backend found (claude or codex)");
+    if has_pi {
+        println!("  ✓ pi (Netflix Pi CLI)");
+    }
+    if !has_claude && !has_codex && !has_pi {
+        println!("  ⚠ No agent backend found (claude, codex, or pi)");
         println!(
             "    Install Claude Code: https://docs.anthropic.com/en/docs/claude-code/overview"
         );
         println!("    Install Codex: https://github.com/openai/codex");
+        println!("    Install Pi: internal Netflix tooling via newt");
     }
 
     if has_errors {
