@@ -92,7 +92,9 @@ impl AgentBackend for PiBackend {
         prompt: &str,
         github_host: &str,
     ) -> TokioCommand {
-        self.build_command(worktree_path, &Uuid::nil(), prompt, github_host)
+        let mut cmd = build_pi_ci_fix_command(worktree_path, prompt);
+        cmd.env("GH_HOST", github_host);
+        cmd
     }
 }
 
@@ -136,6 +138,24 @@ fn build_pi_interactive_command(worktree_path: &Path, session_id: &Uuid) -> Toki
     cmd
 }
 
+/// Builds a Pi command for a stateless CI-fix invocation.
+///
+/// Omits `--session-id` entirely (unlike `build_pi_command`) so repeated CI
+/// fixes in the same worktree never share Pi conversation history — CI-fix
+/// invocations must be stateless one-shots per the `AgentBackend` contract.
+fn build_pi_ci_fix_command(worktree_path: &Path, prompt: &str) -> TokioCommand {
+    let mut cmd = TokioCommand::new("pi");
+    cmd.arg("-p")
+        .arg("--mode")
+        .arg("json")
+        .arg(prompt)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::inherit())
+        .current_dir(worktree_path);
+    cmd
+}
+
 /// Builds a Pi command for a one-shot utility task (no session tracking).
 ///
 /// When `prompt_arg` is `"-"`, the prompt argument is omitted and stdin is
@@ -171,17 +191,21 @@ struct PiEvent {
     #[serde(default, rename = "assistantMessageEvent")]
     assistant_message_event: Option<PiAssistantMessageEvent>,
     /// Present on `tool_execution_start` and `tool_execution_end` events.
-    #[serde(default)]
-    id: Option<String>,
+    #[serde(default, rename = "toolCallId")]
+    tool_call_id: Option<String>,
     /// Present on `tool_execution_start` events.
-    #[serde(default)]
-    tool: Option<String>,
+    #[serde(default, rename = "toolName")]
+    tool_name: Option<String>,
     /// Present on `tool_execution_start` events; already-complete tool arguments.
     #[serde(default)]
     args: Option<serde_json::Value>,
     /// Present on `tool_execution_end` events.
     #[serde(default)]
     result: Option<PiToolResult>,
+    /// Present on `tool_execution_end` events; whether the tool call failed.
+    /// Lives on the event envelope, not nested inside `result`.
+    #[serde(default, rename = "isError")]
+    is_error: bool,
     /// Present on `turn_end` events.
     #[serde(default)]
     usage: Option<PiUsage>,
@@ -200,12 +224,13 @@ struct PiAssistantMessageEvent {
 }
 
 /// Result payload carried by `tool_execution_end`.
+///
+/// Note: `isError` lives on the `tool_execution_end` event envelope
+/// (`PiEvent::is_error`), not on this nested result.
 #[derive(Debug, Deserialize)]
 struct PiToolResult {
     #[serde(default)]
     content: Vec<PiContentBlock>,
-    #[serde(default, rename = "isError")]
-    is_error: bool,
 }
 
 /// A single content block within a tool result.
@@ -266,8 +291,10 @@ fn parse_pi_event(line: &str) -> Vec<AgentEvent> {
         }
 
         "tool_execution_start" => {
-            let tool_name = event.tool.unwrap_or_else(|| "unknown".to_string());
-            let tool_use_id = event.id.unwrap_or_else(|| Uuid::new_v4().to_string());
+            let tool_name = event.tool_name.unwrap_or_else(|| "unknown".to_string());
+            let tool_use_id = event
+                .tool_call_id
+                .unwrap_or_else(|| Uuid::new_v4().to_string());
             let input_summary = Some(format_pi_tool_summary(&tool_name, event.args.as_ref()));
             vec![AgentEvent::ToolUse {
                 tool_name,
@@ -277,19 +304,21 @@ fn parse_pi_event(line: &str) -> Vec<AgentEvent> {
         }
 
         "tool_execution_end" => {
-            let tool_use_id = event.id.unwrap_or_else(|| Uuid::new_v4().to_string());
-            let (content, is_error) = match event.result {
-                Some(result) => {
-                    let text = result
+            let tool_use_id = event
+                .tool_call_id
+                .unwrap_or_else(|| Uuid::new_v4().to_string());
+            let content = event
+                .result
+                .map(|result| {
+                    result
                         .content
                         .iter()
                         .filter_map(|block| block.text.as_deref())
                         .collect::<Vec<_>>()
-                        .join("");
-                    (text, result.is_error)
-                }
-                None => (String::new(), false),
-            };
+                        .join("")
+                })
+                .unwrap_or_default();
+            let is_error = event.is_error;
             vec![AgentEvent::ToolResult {
                 tool_use_id,
                 content,
@@ -520,6 +549,9 @@ mod tests {
         assert!(args.contains(&"--mode".as_ref()));
         assert!(args.contains(&"json".as_ref()));
         assert!(args.contains(&"fix the CI".as_ref()));
+        // Must be stateless — no --session-id, so repeated CI fixes in the
+        // same worktree never share Pi conversation history.
+        assert!(!args.contains(&"--session-id".as_ref()));
 
         let envs: Vec<_> = inner.get_envs().collect();
         assert!(
@@ -578,7 +610,7 @@ mod tests {
     #[test]
     fn test_parse_event_tool_execution_start_bash() {
         let b = backend();
-        let line = r#"{"type":"tool_execution_start","id":"tool_1","tool":"bash","args":{"command":"git status"}}"#;
+        let line = r#"{"type":"tool_execution_start","toolCallId":"tool_1","toolName":"bash","args":{"command":"git status"}}"#;
         let event = single(b.parse_events(line));
         match event {
             AgentEvent::ToolUse {
@@ -597,7 +629,7 @@ mod tests {
     #[test]
     fn test_parse_event_tool_execution_start_read() {
         let b = backend();
-        let line = r#"{"type":"tool_execution_start","id":"tool_2","tool":"read","args":{"path":"src/main.rs"}}"#;
+        let line = r#"{"type":"tool_execution_start","toolCallId":"tool_2","toolName":"read","args":{"path":"src/main.rs"}}"#;
         let event = single(b.parse_events(line));
         match event {
             AgentEvent::ToolUse {
@@ -615,7 +647,7 @@ mod tests {
     #[test]
     fn test_parse_event_tool_execution_start_write() {
         let b = backend();
-        let line = r#"{"type":"tool_execution_start","id":"tool_3","tool":"write","args":{"path":"out.txt"}}"#;
+        let line = r#"{"type":"tool_execution_start","toolCallId":"tool_3","toolName":"write","args":{"path":"out.txt"}}"#;
         let event = single(b.parse_events(line));
         match event {
             AgentEvent::ToolUse { input_summary, .. } => {
@@ -628,7 +660,7 @@ mod tests {
     #[test]
     fn test_parse_event_tool_execution_start_edit() {
         let b = backend();
-        let line = r#"{"type":"tool_execution_start","id":"tool_4","tool":"edit","args":{"path":"src/lib.rs"}}"#;
+        let line = r#"{"type":"tool_execution_start","toolCallId":"tool_4","toolName":"edit","args":{"path":"src/lib.rs"}}"#;
         let event = single(b.parse_events(line));
         match event {
             AgentEvent::ToolUse { input_summary, .. } => {
@@ -641,7 +673,7 @@ mod tests {
     #[test]
     fn test_parse_event_tool_execution_start_unknown_tool() {
         let b = backend();
-        let line = r#"{"type":"tool_execution_start","id":"tool_5","tool":"grep","args":{"pattern":"foo"}}"#;
+        let line = r#"{"type":"tool_execution_start","toolCallId":"tool_5","toolName":"grep","args":{"pattern":"foo"}}"#;
         let event = single(b.parse_events(line));
         match event {
             AgentEvent::ToolUse {
@@ -659,7 +691,7 @@ mod tests {
     #[test]
     fn test_parse_event_tool_execution_end_success() {
         let b = backend();
-        let line = r#"{"type":"tool_execution_end","id":"tool_1","result":{"content":[{"type":"text","text":"On branch main"}],"isError":false}}"#;
+        let line = r#"{"type":"tool_execution_end","toolCallId":"tool_1","result":{"content":[{"type":"text","text":"On branch main"}]},"isError":false}"#;
         let event = single(b.parse_events(line));
         match event {
             AgentEvent::ToolResult {
@@ -678,7 +710,7 @@ mod tests {
     #[test]
     fn test_parse_event_tool_execution_end_error() {
         let b = backend();
-        let line = r#"{"type":"tool_execution_end","id":"tool_1","result":{"content":[{"type":"text","text":"command not found"}],"isError":true}}"#;
+        let line = r#"{"type":"tool_execution_end","toolCallId":"tool_1","result":{"content":[{"type":"text","text":"command not found"}]},"isError":true}"#;
         let event = single(b.parse_events(line));
         match event {
             AgentEvent::ToolResult {
