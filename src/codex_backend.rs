@@ -88,7 +88,9 @@ impl AgentBackend for CodexBackend {
 
         cmd.current_dir(worktree_path)
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::inherit());
+            .stderr(std::process::Stdio::inherit())
+            .env_remove(crate::labels::GRU_RETRY_PARENT_ENV)
+            .env_remove(crate::labels::GRU_CONFIG_PATH_ENV);
         cmd
     }
 
@@ -119,7 +121,12 @@ fn build_codex_command(worktree_path: &Path, prompt: &str) -> TokioCommand {
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::inherit())
-        .current_dir(worktree_path);
+        .current_dir(worktree_path)
+        // Prevent GRU_RETRY_PARENT and GRU_CONFIG_PATH from leaking into Codex
+        // and any tools it spawns — these guards are meant for the direct gru
+        // do/resume process only (mirrors claude_runner.rs).
+        .env_remove(crate::labels::GRU_RETRY_PARENT_ENV)
+        .env_remove(crate::labels::GRU_CONFIG_PATH_ENV);
     cmd
 }
 
@@ -135,7 +142,9 @@ fn build_codex_resume_command(worktree_path: &Path, prompt: &str) -> TokioComman
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::inherit())
-        .current_dir(worktree_path);
+        .current_dir(worktree_path)
+        .env_remove(crate::labels::GRU_RETRY_PARENT_ENV)
+        .env_remove(crate::labels::GRU_CONFIG_PATH_ENV);
     cmd
 }
 

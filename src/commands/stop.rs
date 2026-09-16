@@ -166,10 +166,32 @@ pub(crate) async fn terminate_via_registry_pid(minion_id: &str, force: bool) -> 
     false
 }
 
+/// Returns the process-name alternatives `terminate_agent_in_worktree`'s
+/// `pgrep -f` pattern should match: every registered agent backend's process
+/// name(s) (see `AgentBackend::process_names`) plus the basename of
+/// `[agent.claude] binary` when a custom executable is configured (e.g.
+/// `/opt/tools/cc` contributes `cc`). Without the latter, `gru stop`/`gru
+/// attach` would silently fail to find or terminate the agent process when a
+/// non-default binary is configured.
+fn agent_process_match_names() -> Vec<String> {
+    let mut names = all_process_names();
+    let configured = crate::agent_registry::configured_claude_binary();
+    let basename = Path::new(&configured)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(&configured)
+        .to_string();
+    if !names.contains(&basename) {
+        names.push(escape_regex(&basename));
+    }
+    names
+}
+
 /// Terminates agent backend processes running in the specified worktree (legacy fallback).
 ///
 /// Uses `pgrep -f` with a pattern that matches the `gru` worker process plus every
 /// registered agent backend's process name(s) (see `AgentBackend::process_names`),
+/// or the configured `[agent.claude] binary` basename if set to something else,
 /// scoped to command lines that reference the worktree path. The path is
 /// regex-escaped to prevent metacharacters (e.g., `.`, `[`, `]`) from causing
 /// false matches.
@@ -184,7 +206,7 @@ pub(crate) async fn terminate_agent_in_worktree(
     force: bool,
 ) -> Result<usize> {
     let escaped_path = escape_regex(&worktree_path.to_string_lossy());
-    let mut names = all_process_names();
+    let mut names = agent_process_match_names();
     names.push("gru".to_string());
     let names_alternation = names.join("|");
     // Match a gru worker or any registered agent backend process referencing

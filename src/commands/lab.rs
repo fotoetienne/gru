@@ -2372,8 +2372,16 @@ fn build_do_command(
         )
         .env_remove("TMUX")
         .env_remove("TMUX_PANE");
-    if let Some(path) = config_path {
-        cmd.env(crate::labels::GRU_CONFIG_PATH_ENV, path);
+    match config_path {
+        Some(path) => {
+            cmd.env(crate::labels::GRU_CONFIG_PATH_ENV, path);
+        }
+        // Explicitly remove rather than leaving unset: lab's own process may have
+        // inherited GRU_CONFIG_PATH from its parent shell, and without an explicit
+        // --config it must not pass that along to a child it doesn't control.
+        None => {
+            cmd.env_remove(crate::labels::GRU_CONFIG_PATH_ENV);
+        }
     }
     cmd
 }
@@ -2435,8 +2443,14 @@ fn build_resume_command(
         .env_remove(crate::labels::GRU_RETRY_PARENT_ENV)
         .env_remove("TMUX")
         .env_remove("TMUX_PANE");
-    if let Some(path) = config_path {
-        cmd.env(crate::labels::GRU_CONFIG_PATH_ENV, path);
+    match config_path {
+        Some(path) => {
+            cmd.env(crate::labels::GRU_CONFIG_PATH_ENV, path);
+        }
+        // See build_do_command: don't leave a stale inherited value in place.
+        None => {
+            cmd.env_remove(crate::labels::GRU_CONFIG_PATH_ENV);
+        }
     }
     cmd
 }
@@ -2987,8 +3001,12 @@ mod tests {
         let args: Vec<&std::ffi::OsStr> = inner.get_args().collect();
         assert!(args.contains(&"--agent".as_ref()));
         assert!(args.contains(&"codex".as_ref()));
-        // No explicit config path given → GRU_CONFIG_PATH must not be set.
-        assert!(!inner.get_envs().any(|(k, _)| k == "GRU_CONFIG_PATH"));
+        // No explicit config path given → GRU_CONFIG_PATH must be explicitly
+        // removed (None), not merely absent, so a value inherited from lab's
+        // own environment isn't passed through to a child lab doesn't control.
+        assert!(inner
+            .get_envs()
+            .any(|(k, v)| k == "GRU_CONFIG_PATH" && v.is_none()));
     }
 
     #[test]
@@ -3022,7 +3040,11 @@ mod tests {
     fn test_build_resume_command_omits_gru_config_path_by_default() {
         let cmd = build_resume_command(Path::new("/usr/local/bin/gru"), "M001", None);
         let inner = cmd.as_std();
-        assert!(!inner.get_envs().any(|(k, _)| k == "GRU_CONFIG_PATH"));
+        // Explicitly removed (None), not merely absent — see build_do_command's
+        // equivalent test above for why that distinction matters.
+        assert!(inner
+            .get_envs()
+            .any(|(k, v)| k == "GRU_CONFIG_PATH" && v.is_none()));
     }
 
     #[test]

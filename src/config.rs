@@ -260,11 +260,24 @@ pub(crate) fn try_load_config() -> Option<LabConfig> {
             return load_or_warn(&path);
         }
     }
-    if let Some(path) = std::env::var_os(crate::labels::GRU_CONFIG_PATH_ENV) {
-        return load_or_warn(Path::new(&path));
-    }
-    let path = LabConfig::default_path().ok()?;
+    let env_override = std::env::var_os(crate::labels::GRU_CONFIG_PATH_ENV);
+    let path = resolve_config_path(env_override)?;
     load_or_warn(&path)
+}
+
+/// Picks the config path `try_load_config` should read: `env_override` (the
+/// `GRU_CONFIG_PATH` env var) when present, else the default `~/.gru/config.toml`.
+///
+/// Pulled out as a pure function, parameterized on the env var's value rather
+/// than reading `std::env::var_os` itself, so the `GRU_CONFIG_PATH` handoff is
+/// unit-testable without mutating the real process environment — env vars are
+/// process-global, and mutating them in a test would race under a threaded
+/// (non-nextest) test runner against any other test calling `try_load_config()`.
+fn resolve_config_path(env_override: Option<std::ffi::OsString>) -> Option<PathBuf> {
+    if let Some(path) = env_override {
+        return Some(PathBuf::from(path));
+    }
+    LabConfig::default_path().ok()
 }
 
 /// Loads config from `path` if it exists, logging any parse/validation error.
@@ -2157,55 +2170,27 @@ default = "codex"
         assert_eq!(config.agent.default, "codex");
     }
 
-    /// Serializes tests that mutate the process-wide `GRU_CONFIG_PATH` env var.
-    /// Env vars are global to the process, so cargo test's threaded runner
-    /// (unlike cargo nextest's process-per-test model, which this repo's `just
-    /// test` uses) could otherwise interleave this with another test calling
-    /// `try_load_config()`. Holding this lock for the duration of the mutation
-    /// prevents that; pairing it with an RAII guard ensures the env var is
-    /// cleared even if the test panics mid-assertion.
-    static GRU_CONFIG_PATH_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // `resolve_config_path` is tested directly below rather than by mutating
+    // the real `GRU_CONFIG_PATH` process env var: env vars are process-global,
+    // so a test that calls `std::env::set_var` could race under cargo test's
+    // threaded runner against any other test calling `try_load_config()`
+    // concurrently (this repo's `just test` uses cargo nextest, which is
+    // process-per-test and wouldn't have this problem, but `cargo test` is
+    // also supported). Parameterizing on the env var's value instead avoids
+    // touching shared process state at all.
 
-    struct GruConfigPathEnvGuard {
-        _lock: std::sync::MutexGuard<'static, ()>,
-    }
-
-    impl GruConfigPathEnvGuard {
-        fn set(path: &Path) -> Self {
-            let lock = GRU_CONFIG_PATH_ENV_LOCK
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            // SAFETY: the mutex above ensures no other thread in this process
-            // reads/writes env vars concurrently with this call.
-            unsafe {
-                std::env::set_var(crate::labels::GRU_CONFIG_PATH_ENV, path);
-            }
-            Self { _lock: lock }
-        }
-    }
-
-    impl Drop for GruConfigPathEnvGuard {
-        fn drop(&mut self) {
-            // SAFETY: still holding `_lock`, so no concurrent env access in this process.
-            unsafe {
-                std::env::remove_var(crate::labels::GRU_CONFIG_PATH_ENV);
-            }
-        }
+    #[test]
+    fn test_resolve_config_path_uses_env_override_when_present() {
+        let path = resolve_config_path(Some(std::ffi::OsString::from("/tmp/lab-config.toml")))
+            .expect("should resolve from the override");
+        assert_eq!(path, PathBuf::from("/tmp/lab-config.toml"));
     }
 
     #[test]
-    fn test_gru_config_path_env_var_overrides_try_load() {
-        let config_toml = r#"
-[agent]
-default = "codex"
-"#;
-        let mut temp_file = NamedTempFile::new().unwrap();
-        temp_file.write_all(config_toml.as_bytes()).unwrap();
-        temp_file.flush().unwrap();
-
-        let _env_guard = GruConfigPathEnvGuard::set(temp_file.path());
-        let config = super::try_load_config().expect("should load from GRU_CONFIG_PATH");
-        assert_eq!(config.agent.default, "codex");
+    fn test_resolve_config_path_falls_back_to_default_without_override() {
+        let path =
+            resolve_config_path(None).expect("should resolve the default ~/.gru/config.toml");
+        assert_eq!(path, LabConfig::default_path().unwrap());
     }
 
     #[test]
