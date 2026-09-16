@@ -260,7 +260,7 @@ pub(crate) fn try_load_config() -> Option<LabConfig> {
             return load_or_warn(&path);
         }
     }
-    if let Ok(path) = std::env::var(crate::labels::GRU_CONFIG_PATH_ENV) {
+    if let Some(path) = std::env::var_os(crate::labels::GRU_CONFIG_PATH_ENV) {
         return load_or_warn(Path::new(&path));
     }
     let path = LabConfig::default_path().ok()?;
