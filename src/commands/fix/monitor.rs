@@ -2000,6 +2000,10 @@ mod tests {
             "dummy"
         }
 
+        fn process_names(&self) -> &[&str] {
+            &["dummy"]
+        }
+
         fn build_command(
             &self,
             _worktree_path: &Path,

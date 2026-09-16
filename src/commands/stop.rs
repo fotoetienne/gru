@@ -1,3 +1,4 @@
+use crate::agent_registry::all_process_names;
 use crate::minion_registry::{is_process_alive_with_start_time, with_registry, MinionMode};
 use crate::minion_resolver;
 use anyhow::Result;
@@ -85,7 +86,7 @@ pub(crate) async fn handle_stop(id: String, force: bool) -> Result<i32> {
         );
     } else {
         // Fall back to pgrep scanning for legacy minions or if PID wasn't in registry
-        let terminated = terminate_claude_in_worktree(&checkout_path, force).await?;
+        let terminated = terminate_agent_in_worktree(&checkout_path, force).await?;
 
         if terminated > 0 {
             println!(
@@ -165,25 +166,32 @@ pub(crate) async fn terminate_via_registry_pid(minion_id: &str, force: bool) -> 
     false
 }
 
-/// Terminates Claude/Gru processes running in the specified worktree (legacy fallback).
+/// Terminates agent backend processes running in the specified worktree (legacy fallback).
 ///
-/// Uses `pgrep -f` with a pattern that matches only `claude` or `gru` processes
-/// whose command line references the worktree path. The path is regex-escaped to
-/// prevent metacharacters (e.g., `.`, `[`, `]`) from causing false matches.
+/// Uses `pgrep -f` with a pattern that matches the `gru` worker process plus every
+/// registered agent backend's process name(s) (see `AgentBackend::process_names`),
+/// scoped to command lines that reference the worktree path. The path is
+/// regex-escaped to prevent metacharacters (e.g., `.`, `[`, `]`) from causing
+/// false matches.
 ///
 /// Note: `pgrep -f` interprets the pattern as a POSIX extended regex. Paths containing
 /// unusual characters beyond what `escape_regex` handles may still produce unexpected
 /// matches, though this is unlikely with standard gru worktree paths.
 ///
 /// Returns the number of processes terminated.
-pub(crate) async fn terminate_claude_in_worktree(
+pub(crate) async fn terminate_agent_in_worktree(
     worktree_path: &Path,
     force: bool,
 ) -> Result<usize> {
     let escaped_path = escape_regex(&worktree_path.to_string_lossy());
-    // Match only claude or gru processes referencing this worktree (either order)
+    let mut names = all_process_names();
+    names.push("gru".to_string());
+    let names_alternation = names.join("|");
+    // Match a gru worker or any registered agent backend process referencing
+    // this worktree (either order).
     let pattern = format!(
-        "(claude|gru).*{path}|{path}.*(claude|gru)",
+        "({names}).*{path}|{path}.*({names})",
+        names = names_alternation,
         path = escaped_path
     );
 
@@ -252,19 +260,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_terminate_claude_in_worktree_nonexistent() {
+    async fn test_terminate_agent_in_worktree_nonexistent() {
         let temp_path = std::env::temp_dir().join("gru-stop-test-sigterm-no-match");
-        let result = terminate_claude_in_worktree(&temp_path, false).await;
+        let result = terminate_agent_in_worktree(&temp_path, false).await;
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), 0);
     }
 
     #[tokio::test]
-    async fn test_terminate_claude_in_worktree_force() {
+    async fn test_terminate_agent_in_worktree_force() {
         let temp_path = std::env::temp_dir().join("gru-stop-test-sigkill-no-match");
-        let result = terminate_claude_in_worktree(&temp_path, true).await;
+        let result = terminate_agent_in_worktree(&temp_path, true).await;
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), 0);
+    }
+
+    #[test]
+    fn test_all_process_names_covers_registered_backends() {
+        let names = all_process_names();
+        assert!(names.contains(&"claude".to_string()));
+        assert!(names.contains(&"codex".to_string()));
     }
 
     #[test]

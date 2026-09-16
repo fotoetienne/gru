@@ -13,6 +13,24 @@ const AVAILABLE_AGENTS: &[&str] = &["claude", "codex"];
 /// Default agent name when none is specified.
 pub(crate) const DEFAULT_AGENT: &str = "claude";
 
+/// Returns the process names declared by every registered agent backend.
+///
+/// Used to build a process-scan pattern (e.g., for `gru stop`'s fallback path)
+/// that covers all backends instead of hardcoding specific process names.
+pub(crate) fn all_process_names() -> Vec<String> {
+    AVAILABLE_AGENTS
+        .iter()
+        .filter_map(|name| resolve_backend(name).ok())
+        .flat_map(|backend| {
+            backend
+                .process_names()
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
 /// Resolves an agent name to a concrete `AgentBackend` implementation.
 ///
 /// Returns an error with available agents listed if the name is unknown.
