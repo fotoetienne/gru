@@ -595,6 +595,13 @@ mod tests {
     }
 
     #[test]
+    fn test_is_edit_tool_mixed_case() {
+        assert!(is_edit_tool("EDIT"));
+        assert!(is_edit_tool("eDiT"));
+        assert!(is_edit_tool("File_Change"));
+    }
+
+    #[test]
     fn test_is_edit_tool_codex_name() {
         assert!(is_edit_tool("file_change"));
     }
@@ -618,6 +625,13 @@ mod tests {
         assert!(is_command_tool("command"));
         assert!(is_command_tool("bash"));
         assert!(!is_command_tool("Edit"));
+    }
+
+    #[test]
+    fn test_is_command_tool_mixed_case() {
+        assert!(is_command_tool("BASH"));
+        assert!(is_command_tool("Command"));
+        assert!(is_command_tool("CoMmAnD"));
     }
 
     #[test]
