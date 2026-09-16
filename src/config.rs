@@ -827,6 +827,14 @@ impl LabConfig {
     /// Runs in both `load()` and `load_partial()` because agent settings are
     /// used by all commands, not just the daemon.
     fn validate_agent(&self) -> Result<()> {
+        if !crate::agent_registry::AVAILABLE_AGENTS.contains(&self.agent.default.as_str()) {
+            anyhow::bail!(
+                "Unknown agent.default '{}'. Available: {}",
+                self.agent.default,
+                crate::agent_registry::AVAILABLE_AGENTS.join(", ")
+            );
+        }
+
         if self.agent.claude.ci_fix_max_turns == Some(0) {
             anyhow::bail!(
                 "agent.claude.ci_fix_max_turns must be a positive integer (got 0). \
@@ -1209,15 +1217,33 @@ binary = "/usr/local/bin/claude"
 repos = ["owner/repo"]
 
 [agent]
+default = "codex"
+"#;
+        let mut temp_file = NamedTempFile::new().unwrap();
+        temp_file.write_all(config_toml.as_bytes()).unwrap();
+        temp_file.flush().unwrap();
+
+        let config = LabConfig::load(temp_file.path()).unwrap();
+        assert_eq!(config.agent.default, "codex");
+    }
+
+    #[test]
+    fn test_agent_config_unknown_default_rejected_by_load() {
+        let config_toml = r#"
+[daemon]
+repos = ["owner/repo"]
+
+[agent]
 default = "aider"
 "#;
         let mut temp_file = NamedTempFile::new().unwrap();
         temp_file.write_all(config_toml.as_bytes()).unwrap();
         temp_file.flush().unwrap();
 
-        // Parsing succeeds (validation happens in AgentRegistry, not config parsing)
-        let config = LabConfig::load(temp_file.path()).unwrap();
-        assert_eq!(config.agent.default, "aider");
+        let result = LabConfig::load(temp_file.path());
+        assert!(result.is_err());
+        let msg = format!("{}", result.err().unwrap());
+        assert!(msg.contains("Unknown agent.default 'aider'"), "{}", msg);
     }
 
     #[test]
@@ -2112,7 +2138,7 @@ default = "codex"
     fn test_set_test_config_path_overrides_try_load() {
         let config_toml = r#"
 [agent]
-default = "test-agent"
+default = "codex"
 "#;
         let mut temp_file = NamedTempFile::new().unwrap();
         temp_file.write_all(config_toml.as_bytes()).unwrap();
@@ -2120,7 +2146,29 @@ default = "test-agent"
 
         let _guard = super::set_test_config_path(temp_file.path().to_path_buf());
         let config = super::try_load_config().expect("should load from override path");
-        assert_eq!(config.agent.default, "test-agent");
+        assert_eq!(config.agent.default, "codex");
+    }
+
+    #[test]
+    fn test_validate_agent_rejects_unknown_default() {
+        let config_toml = r#"
+[agent]
+default = "test-agent"
+"#;
+        let mut temp_file = NamedTempFile::new().unwrap();
+        temp_file.write_all(config_toml.as_bytes()).unwrap();
+        temp_file.flush().unwrap();
+
+        let result = LabConfig::load_partial(temp_file.path());
+        assert!(result.is_err());
+        let msg = format!("{}", result.err().unwrap());
+        assert!(
+            msg.contains("Unknown agent.default 'test-agent'"),
+            "{}",
+            msg
+        );
+        assert!(msg.contains("claude"), "{}", msg);
+        assert!(msg.contains("codex"), "{}", msg);
     }
 
     #[test]
@@ -2179,7 +2227,7 @@ web_url = ""
 
     #[test]
     fn test_set_test_config_path_guard_clears_on_drop() {
-        let config_toml = "[agent]\ndefault = \"test-agent\"\n";
+        let config_toml = "[agent]\ndefault = \"codex\"\n";
         let mut temp_file = NamedTempFile::new().unwrap();
         temp_file.write_all(config_toml.as_bytes()).unwrap();
         temp_file.flush().unwrap();

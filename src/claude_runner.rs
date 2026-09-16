@@ -13,12 +13,13 @@ use uuid::Uuid;
 ///
 /// Creates a TokioCommand configured for non-interactive stream-json output.
 pub(crate) fn build_claude_command(
+    binary: &str,
     worktree_path: &Path,
     session_id: &Uuid,
     prompt: &str,
     github_host: &str,
 ) -> TokioCommand {
-    let mut cmd = TokioCommand::new("claude");
+    let mut cmd = TokioCommand::new(binary);
     cmd.arg("--print")
         .arg("--verbose")
         .arg("--session-id")
@@ -43,12 +44,13 @@ pub(crate) fn build_claude_command(
 ///
 /// Uses --resume instead of --session-id to avoid "session already in use" errors.
 pub(crate) fn build_claude_resume_command(
+    binary: &str,
     worktree_path: &Path,
     session_id: &Uuid,
     prompt: &str,
     github_host: &str,
 ) -> TokioCommand {
-    let mut cmd = TokioCommand::new("claude");
+    let mut cmd = TokioCommand::new(binary);
     cmd.arg("--print")
         .arg("--verbose")
         .arg("--resume")

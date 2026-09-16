@@ -1592,6 +1592,7 @@ async fn try_spawn_for_issue(
     ctx: &RepoContext<'_>,
     issue_number: u64,
     label: &str,
+    agent_name: &str,
     children: &mut Vec<SpawnedChild>,
 ) -> Result<bool> {
     // Remove any dead registry entries before claiming, so that stale entries
@@ -1612,7 +1613,7 @@ async fn try_spawn_for_issue(
     }
 
     // Successfully claimed, spawn Minion
-    match spawn_minion(&ctx.full, &ctx.host, issue_number).await {
+    match spawn_minion(&ctx.full, &ctx.host, issue_number, agent_name).await {
         Ok(child) => {
             // Write PID to registry immediately (if the subprocess has
             // already created the entry) to prevent duplicate spawns.
@@ -1792,7 +1793,15 @@ async fn spawn_for_candidate_issues(
                 continue;
             }
 
-            if try_spawn_for_issue(&ctx, candidate.number, label, children).await? {
+            if try_spawn_for_issue(
+                &ctx,
+                candidate.number,
+                label,
+                &config.agent.default,
+                children,
+            )
+            .await?
+            {
                 spawned += 1;
                 spawned_this_repo += 1;
                 *available -= 1;
@@ -1890,7 +1899,7 @@ async fn poll_and_spawn(
     }
 
     // Dispatch due retries first (continuation retries get priority over failure retries)
-    let mut spawned = dispatch_due_retries(retry_queue, children, &mut available).await?;
+    let mut spawned = dispatch_due_retries(config, retry_queue, children, &mut available).await?;
 
     if available == 0 {
         if spawned > 0 {
@@ -1967,6 +1976,7 @@ async fn poll_and_spawn(
 /// should branch on `entry.kind` and call `spawn_resume` for continuations.
 /// Returns the number of retries dispatched.
 async fn dispatch_due_retries(
+    config: &LabConfig,
     retry_queue: &mut RetryQueue,
     children: &mut Vec<SpawnedChild>,
     available: &mut usize,
@@ -2027,7 +2037,14 @@ async fn dispatch_due_retries(
             entry.reason
         );
 
-        match spawn_minion(&full_repo, &entry.host, entry.issue_number).await {
+        match spawn_minion(
+            &full_repo,
+            &entry.host,
+            entry.issue_number,
+            &config.agent.default,
+        )
+        .await
+        {
             Ok(child) => {
                 children.push(SpawnedChild {
                     child,
@@ -2306,7 +2323,12 @@ async fn spawn_background_cmd(
 /// Spawn a Minion to work on an issue using the `gru do` command.
 ///
 /// Returns the child process handle for lifecycle tracking.
-async fn spawn_minion(repo: &str, host: &str, issue_number: u64) -> Result<Child> {
+async fn spawn_minion(
+    repo: &str,
+    host: &str,
+    issue_number: u64,
+    agent_name: &str,
+) -> Result<Child> {
     let issue_ref = crate::github::build_issue_url_with_host(repo, host, issue_number)
         .with_context(|| format!("Invalid repo format: '{}'", repo))?;
 
@@ -2319,6 +2341,11 @@ async fn spawn_minion(repo: &str, host: &str, issue_number: u64) -> Result<Child
     let mut cmd = tokio::process::Command::new(exe);
     cmd.arg("do")
         .arg(&issue_ref)
+        // Pass the configured default explicitly so the spawned `gru do` process
+        // is not left to re-derive it from ~/.gru/config.toml, which may differ
+        // from the config lab was started with (e.g. via `gru lab --config`).
+        .arg("--agent")
+        .arg(agent_name)
         // Tells the worker to defer gru:failed labeling so lab's retry queue can fire.
         // See labels::{GRU_RETRY_PARENT_ENV, GRU_RETRY_PARENT_VALUE}.
         .env(
