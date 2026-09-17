@@ -310,7 +310,7 @@ async fn auto_stop_minion(minion_id: &str, worktree_path: &std::path::Path) -> R
 
     if !pid_terminated {
         // Legacy fallback: scan for processes via pgrep
-        super::stop::terminate_claude_in_worktree(worktree_path, false).await?;
+        super::stop::terminate_agent_in_worktree(worktree_path, false).await?;
     }
 
     // Wait for the process to actually exit (up to 10s), then hard-kill

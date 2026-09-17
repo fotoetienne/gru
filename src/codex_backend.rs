@@ -30,6 +30,10 @@ impl AgentBackend for CodexBackend {
         "codex"
     }
 
+    fn process_names(&self) -> &[&str] {
+        &["codex"]
+    }
+
     fn build_command(
         &self,
         worktree_path: &Path,

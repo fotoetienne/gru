@@ -166,6 +166,10 @@ impl AgentBackend for ClaudeBackend {
         vec!["--dangerously-skip-permissions"]
     }
 
+    fn process_names(&self) -> &[&str] {
+        &["claude"]
+    }
+
     fn build_command(
         &self,
         worktree_path: &Path,

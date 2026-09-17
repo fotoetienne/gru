@@ -169,6 +169,13 @@ pub(crate) trait AgentBackend: Send + Sync {
     /// Returns the human-readable name of this agent backend (e.g., "claude-code").
     fn name(&self) -> &str;
 
+    /// Returns the process name(s) to look for when scanning for this backend's
+    /// running processes (e.g., `["claude"]`, `["codex"]`).
+    ///
+    /// Used by `gru stop`'s process-scan fallback to build a `pgrep -f` pattern
+    /// that covers every registered backend rather than a hardcoded alternation.
+    fn process_names(&self) -> &[&str];
+
     /// Build the command to start a new agent session.
     ///
     /// `github_host` is set as `GH_HOST` on the spawned process so that
