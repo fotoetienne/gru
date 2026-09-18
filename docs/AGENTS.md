@@ -146,7 +146,7 @@ The `AgentBackend` trait (`src/agent.rs`) currently has nine methods:
 - `build_resume_command()` — required to implement (no default body); return `None` from it if the backend doesn't support resume, `Some(...)` otherwise
 - `build_interactive_resume_command()` — required to implement (no default body); return `None` from it to disable attach support
 - `build_oneshot_command()` — construct a single-turn, plain-text command (e.g. for the merge-readiness judge)
-- `build_ci_fix_command()` — construct a stream-json command for stateless CI-fix invocations
+- `build_ci_fix_command()` — construct a backend-specific streaming-event command (matching whatever format `parse_events()` expects, e.g. Claude's `stream-json` or Codex's JSONL) for stateless CI-fix invocations
 - `yolo_args()` — (optional) CLI args to bypass interactive permission prompts for `gru attach --yolo`; defaults to an empty `Vec`
 
 **Convention:** new trait methods should carry a default body so existing backends keep compiling without changes, as `yolo_args()` did when added in #911. `process_names()` broke this convention when added in #912 (no default body), which meant every existing backend had to be updated in the same change — do this deliberately, not by accident.
