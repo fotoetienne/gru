@@ -361,7 +361,7 @@ where
 }
 
 /// Accumulates token usage from an `AgentEvent` into a running total.
-fn accumulate_token_usage(total: &mut TokenUsage, event: &AgentEvent) {
+pub(crate) fn accumulate_token_usage(total: &mut TokenUsage, event: &AgentEvent) {
     match event {
         AgentEvent::Started { usage: Some(usage) } => {
             total.input_tokens += usage.input_tokens;

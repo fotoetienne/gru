@@ -323,7 +323,15 @@ fn parse_pi_event(line: &str, accumulated_usage: &Mutex<TokenUsage>) -> Vec<Agen
     };
 
     match event.event_type.as_str() {
-        "session" | "agent_start" => vec![AgentEvent::Started { usage: None }],
+        "session" | "agent_start" => {
+            // Reset accumulated usage at the start of each stream. The
+            // backend instance is reused across independent invocations
+            // (e.g. multiple CI-fix attempts driven by the same backend
+            // reference), so stale totals from a prior session/attempt must
+            // not leak into this one's `Finished` usage.
+            *accumulated_usage.lock().unwrap() = TokenUsage::default();
+            vec![AgentEvent::Started { usage: None }]
+        }
 
         "turn_start" => vec![AgentEvent::Thinking { text: None }],
 
@@ -986,24 +994,54 @@ mod tests {
 
     #[test]
     fn test_parse_event_agent_end_accumulates_turn_usage() {
+        // Exercise the full parse_events -> accumulate_token_usage path (not
+        // just the raw parser output) so a mismatch between what the parser
+        // emits and what the runner accumulates would be caught here.
+        use crate::agent_runner::accumulate_token_usage;
+
         let b = backend();
+        let mut total = TokenUsage::default();
+
+        for line in [
+            r#"{"type":"session"}"#,
+            r#"{"type":"turn_end","usage":{"input":1000,"output":500,"cacheRead":200,"cacheWrite":50}}"#,
+            r#"{"type":"turn_end","usage":{"input":2000,"output":300,"cacheRead":100}}"#,
+            r#"{"type":"agent_end"}"#,
+        ] {
+            for event in b.parse_events(line) {
+                accumulate_token_usage(&mut total, &event);
+            }
+        }
+
+        assert_eq!(total.input_tokens, 3000);
+        assert_eq!(total.output_tokens, 800);
+        assert_eq!(total.cache_creation_input_tokens, Some(50));
+        assert_eq!(total.cache_read_input_tokens, Some(300));
+    }
+
+    #[test]
+    fn test_session_start_resets_accumulated_usage_across_invocations() {
+        // The backend instance is reused across independent invocations
+        // (e.g. multiple CI-fix attempts share one `&dyn AgentBackend`), so a
+        // second stream's `session`/`agent_start` must not let the first
+        // stream's totals leak into the second stream's `Finished` usage.
+        let b = backend();
+
+        b.parse_events(r#"{"type":"session"}"#);
         b.parse_events(
             r#"{"type":"turn_end","usage":{"input":1000,"output":500,"cacheRead":200,"cacheWrite":50}}"#,
         );
-        b.parse_events(
-            r#"{"type":"turn_end","usage":{"input":2000,"output":300,"cacheRead":100}}"#,
-        );
+        b.parse_events(r#"{"type":"agent_end"}"#);
+
+        // New invocation reusing the same backend instance.
+        b.parse_events(r#"{"type":"agent_start"}"#);
         let event = single(b.parse_events(r#"{"type":"agent_end"}"#));
         match event {
             AgentEvent::Finished { usage } => {
                 let u = usage.unwrap();
-                assert_eq!(u.input_tokens, 3000);
-                assert_eq!(
-                    u.output_tokens, 0,
-                    "output already covered by MessageComplete"
-                );
-                assert_eq!(u.cache_creation_input_tokens, Some(50));
-                assert_eq!(u.cache_read_input_tokens, Some(300));
+                assert_eq!(u.input_tokens, 0, "must not leak prior invocation's totals");
+                assert_eq!(u.cache_creation_input_tokens, None);
+                assert_eq!(u.cache_read_input_tokens, None);
             }
             other => panic!("Expected Finished, got {:?}", other),
         }
