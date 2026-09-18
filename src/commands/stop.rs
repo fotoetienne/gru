@@ -168,17 +168,20 @@ pub(crate) async fn terminate_via_registry_pid(minion_id: &str, force: bool) -> 
 
 /// Returns the process-name alternatives `terminate_agent_in_worktree`'s
 /// `pgrep -f` pattern should match: every registered agent backend's process
-/// name(s) (see `AgentBackend::process_names`) plus the basename of
-/// `[agent.claude] binary` when a custom executable is configured (e.g.
-/// `/opt/tools/cc` contributes `cc`). Without the latter, `gru stop`/`gru
-/// attach` would silently fail to find or terminate the agent process when a
-/// non-default binary is configured.
+/// name(s) (see `AgentBackend::process_names`) plus the basename of any
+/// per-backend binary override when configured (e.g. `[agent.claude] binary =
+/// "/opt/tools/cc"` contributes `cc`; likewise `[agent.pi] binary`). Without
+/// these, `gru stop`/`gru attach` would silently fail to find or terminate
+/// the agent process when a non-default binary is configured.
 fn agent_process_match_names() -> Vec<String> {
-    build_process_match_names(&crate::agent_registry::configured_claude_binary())
+    build_process_match_names(&[
+        &crate::agent_registry::configured_claude_binary(),
+        &crate::agent_registry::configured_pi_binary(),
+    ])
 }
 
 /// Pure helper behind `agent_process_match_names`, parameterized on the
-/// configured binary string so the empty/whitespace-only skip logic is
+/// configured binary strings so the empty/whitespace-only skip logic is
 /// unit-testable without going through real config resolution.
 ///
 /// A basename that is empty (or all-whitespace, e.g. from a stray
@@ -186,17 +189,19 @@ fn agent_process_match_names() -> Vec<String> {
 /// than added, since an empty alternative in the `pgrep` pattern below would
 /// match every process — `validate_agent` rejects this at config-load time,
 /// but this is a defense-in-depth check for callers that bypass it.
-fn build_process_match_names(configured_binary: &str) -> Vec<String> {
+fn build_process_match_names(configured_binaries: &[&str]) -> Vec<String> {
     let mut names = all_process_names();
     names.push("gru".to_string());
-    let basename = Path::new(configured_binary)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or(configured_binary)
-        .trim()
-        .to_string();
-    if !basename.is_empty() && !names.contains(&basename) {
-        names.push(basename);
+    for configured_binary in configured_binaries {
+        let basename = Path::new(configured_binary)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(configured_binary)
+            .trim()
+            .to_string();
+        if !basename.is_empty() && !names.contains(&basename) {
+            names.push(basename);
+        }
     }
     names
 }
@@ -347,30 +352,38 @@ mod tests {
 
     #[test]
     fn test_build_process_match_names_defaults() {
-        let names = build_process_match_names("claude");
+        let names = build_process_match_names(&["claude", "pi"]);
         assert_eq!(names, vec!["claude", "codex", "pi", "gru"]);
     }
 
     #[test]
     fn test_build_process_match_names_adds_custom_binary_basename() {
-        let names = build_process_match_names("/opt/tools/cc");
+        let names = build_process_match_names(&["/opt/tools/cc", "pi"]);
         assert!(names.contains(&"cc".to_string()));
         assert_eq!(names.len(), 5);
     }
 
     #[test]
+    fn test_build_process_match_names_adds_custom_pi_binary_basename() {
+        let names = build_process_match_names(&["claude", "/opt/tools/pi-launcher"]);
+        assert!(names.contains(&"pi-launcher".to_string()));
+        assert_eq!(names.len(), 5);
+    }
+
+    #[test]
     fn test_build_process_match_names_skips_empty_binary() {
-        // An empty `[agent.claude] binary` should never contribute an empty
-        // alternative to the pgrep pattern — that would match every process.
-        // validate_agent() already rejects this at config-load time; this is
-        // the defense-in-depth check for callers that bypass it.
-        let names = build_process_match_names("");
+        // An empty `[agent.claude] binary`/`[agent.pi] binary` should never
+        // contribute an empty alternative to the pgrep pattern — that would
+        // match every process. validate_agent() already rejects this at
+        // config-load time; this is the defense-in-depth check for callers
+        // that bypass it.
+        let names = build_process_match_names(&["", ""]);
         assert_eq!(names, vec!["claude", "codex", "pi", "gru"]);
     }
 
     #[test]
     fn test_build_process_match_names_skips_whitespace_only_binary() {
-        let names = build_process_match_names("   ");
+        let names = build_process_match_names(&["   ", "   "]);
         assert_eq!(names, vec!["claude", "codex", "pi", "gru"]);
     }
 
@@ -378,7 +391,7 @@ mod tests {
     fn test_build_process_match_names_no_duplicate_for_default_name() {
         // Configured binary resolving to a name already in the default list
         // shouldn't produce a duplicate alternative.
-        let names = build_process_match_names("/usr/local/bin/gru");
+        let names = build_process_match_names(&["/usr/local/bin/gru", "pi"]);
         assert_eq!(names, vec!["claude", "codex", "pi", "gru"]);
     }
 
@@ -389,7 +402,7 @@ mod tests {
     /// ERE engine) rather than spawning a real process.
     #[test]
     fn test_exec_boundary_pattern_matches_token_not_substring() {
-        let names = build_process_match_names("sh").join("|");
+        let names = build_process_match_names(&["sh", "pi"]).join("|");
         let pattern = format!(r"(^|/)({names})([[:space:]]|$)");
         let re = regex::Regex::new(&pattern).unwrap();
 

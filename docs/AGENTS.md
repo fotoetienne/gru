@@ -109,12 +109,20 @@ a crash. If progress output is empty or tool calls never appear, compare your `p
 
 See [pi-mono](https://github.com/earendil-works/pi-mono) for install options (npm
 `@earendil-works/pi-coding-agent`). Some environments distribute Pi through a wrapper or
-internal package; Gru invokes whatever `pi` resolves to on `PATH`. There is currently no
-`[agent.pi]` config section — unlike Claude's `[agent.claude].binary`, Pi's binary path
-cannot be overridden and must be discoverable on `PATH`.
+internal package rather than a plain `pi` on `$PATH`; use `[agent.pi].binary` in
+`~/.gru/config.toml` to point Gru at it. Model selection can also optionally be driven
+from Gru's config — all of these keys live in the same `[agent.pi]` table:
 
-Authentication and model selection are Pi's concern, not Gru's: Gru passes no provider or
-model flags, so Pi uses whatever it is already configured for.
+```toml
+[agent.pi]
+binary = "/usr/local/bin/pi"
+model = "anthropic/claude-sonnet-5"   # "provider/id", optionally with a ":<thinking>" suffix
+thinking = "high"                     # off | minimal | low | medium | high | xhigh | max
+```
+
+Every key is optional and independent — set only the ones you need. Authentication
+belongs to Pi's own configuration, not Gru's — Gru does not manage provider credentials.
+When `model`/`thinking` are unset, Pi uses whatever it is already configured for.
 
 ### Verify
 
@@ -128,8 +136,11 @@ pi --help
 Gru spawns Pi in headless mode with JSON output:
 
 ```bash
-pi -p --mode json --session-id <uuid> "<prompt>"
+pi -p --mode json --session-id <uuid> [--model <model>] [--thinking <level>] "<prompt>"
 ```
+
+`--model`/`--thinking` are only added when `[agent.pi]` sets them in config, and are
+always placed before the prompt argument in case Pi's `-p` positional is greedy.
 
 Resume uses the same `--session-id` with a new prompt.
 

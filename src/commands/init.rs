@@ -132,7 +132,12 @@ fn check_prerequisites() -> Result<i32> {
     // 2. Check for at least one agent backend
     let has_claude = check_binary("claude");
     let has_codex = check_binary("codex");
-    let has_pi = check_binary("pi");
+    // Pi is commonly distributed through a launcher at a non-standard path
+    // (see docs/AGENTS.md); check whatever `[agent.pi].binary` resolves to,
+    // not just the literal `pi` on $PATH, so a Pi-only install with a custom
+    // binary path doesn't get misreported as "no agent backend found".
+    let pi_binary = crate::agent_registry::configured_pi_binary();
+    let has_pi = check_binary(&pi_binary);
 
     if has_claude {
         println!("  ✓ claude (Claude Code CLI)");
@@ -141,7 +146,7 @@ fn check_prerequisites() -> Result<i32> {
         println!("  ✓ codex (OpenAI Codex CLI)");
     }
     if has_pi {
-        println!("  ✓ pi (Pi CLI)");
+        println!("  ✓ {} (Pi CLI)", pi_binary);
     }
     if !has_claude && !has_codex && !has_pi {
         println!("  ⚠ No agent backend found (claude, codex, or pi)");
@@ -455,6 +460,25 @@ mod tests {
     fn test_check_binary_finds_common_tools() {
         assert!(check_binary("sh"));
         assert!(!check_binary("definitely-not-a-real-binary-xyz123"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_check_binary_resolves_absolute_path() {
+        // A configured `[agent.pi] binary` is commonly an absolute path to a
+        // launcher rather than a bare name on $PATH (see docs/AGENTS.md) —
+        // check_prerequisites() must be able to find it either way.
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("pi-launcher");
+        std::fs::write(&script, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(check_binary(script.to_str().unwrap()));
+        assert!(!check_binary(
+            dir.path().join("no-such-binary").to_str().unwrap()
+        ));
     }
 
     #[test]

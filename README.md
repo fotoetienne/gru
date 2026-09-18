@@ -147,9 +147,14 @@ Gru is not tied to any single AI backend. Use the `--agent` flag to switch:
 ```bash
 gru do 42                   # Claude Code (default)
 gru do 42 --agent codex     # OpenAI Codex
+gru do 42 --agent pi        # Pi
 gru review 42 --agent codex
 gru prompt my-prompt --agent codex
 ```
+
+Provider authentication and model selection for Pi are configured on Pi's own side, not
+Gru's — Gru optionally forwards `[agent.pi].model`/`.thinking` if set, but otherwise Pi
+uses whatever it is already configured for. See [docs/AGENTS.md](docs/AGENTS.md) for details.
 
 Set a default in `~/.gru/config.toml`:
 
