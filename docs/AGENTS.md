@@ -8,6 +8,7 @@ Gru uses a pluggable agent architecture. Each backend implements the `AgentBacke
 |---------|----------|------------|--------|
 | Claude Code | `claude` | `--agent claude` | Default |
 | OpenAI Codex | `codex` | `--agent codex` | Supported |
+| Pi | `pi` | `--agent pi` | Supported |
 
 ## Claude Code (default)
 
@@ -91,6 +92,51 @@ codex exec resume --last --json --full-auto "<prompt>"
 
 Note: Codex does not support interactive resume (`gru attach` will not work with Codex minions). Codex also ignores the `session_id` parameter — it relies on its own session persistence for both new and resumed sessions.
 
+## Pi
+
+[Pi](https://github.com/earendil-works/pi-mono) is a coding agent CLI (`pi`) with a pluggable
+provider model — it supports many model providers, configured on the Pi side rather than by Gru.
+
+This backend's event parsing (`src/pi_backend.rs`) was implemented and verified against a
+particular Pi distribution's JSON event schema (`session`/`agent_start`, `turn_start`,
+`tool_execution_start`/`_end` with `toolCallId`/`toolName`, `turn_end` usage, etc.). If your
+`pi` resolves to a build with a different event shape, unrecognized lines are silently
+skipped rather than erroring — so a mismatch shows up as missing tool/progress tracking, not
+a crash. If progress output is empty or tool calls never appear, compare your `pi`'s
+`--mode json` output against the event names above.
+
+### Install
+
+See [pi-mono](https://github.com/earendil-works/pi-mono) for install options (npm
+`@earendil-works/pi-coding-agent`). Some environments distribute Pi through a wrapper or
+internal package; Gru invokes whatever `pi` resolves to on `PATH`. There is currently no
+`[agent.pi]` config section — unlike Claude's `[agent.claude].binary`, Pi's binary path
+cannot be overridden and must be discoverable on `PATH`.
+
+Authentication and model selection are Pi's concern, not Gru's: Gru passes no provider or
+model flags, so Pi uses whatever it is already configured for.
+
+### Verify
+
+```bash
+pi --version
+pi --help
+```
+
+### How Gru Uses It
+
+Gru spawns Pi in headless mode with JSON output:
+
+```bash
+pi -p --mode json --session-id <uuid> "<prompt>"
+```
+
+Resume uses the same `--session-id` with a new prompt.
+
+Interactive resume (for `gru attach`) drops `-p` and `--mode json`, keeping `--session-id`, since Pi's TUI supports resuming a session with full history — unlike Codex.
+
+There is no `--dangerously-skip-permissions` equivalent for Pi; `bash` and `edit` tool calls run without approval prompts by default under `-p`.
+
 ## Selecting a Backend
 
 ### Per-command
@@ -116,15 +162,15 @@ The `--agent` flag always overrides the config default.
 
 ## Feature Comparison
 
-| Feature | Claude Code | Codex |
-|---------|-------------|-------|
-| Autonomous work (`gru do`) | Yes | Yes |
-| PR review (`gru review`) | Yes | Yes |
-| Custom prompts (`gru prompt`) | Yes | Yes |
-| Session resume (`gru resume`) | Yes | Yes (non-interactive) |
-| Interactive attach (`gru attach`) | Yes | No |
-| Token usage tracking | Yes | Yes |
-| Stream monitoring | Yes | Yes |
+| Feature | Claude Code | Codex | Pi |
+|---------|-------------|-------|----|
+| Autonomous work (`gru do`) | Yes | Yes | Yes |
+| PR review (`gru review`) | Yes | Yes | Yes |
+| Custom prompts (`gru prompt`) | Yes | Yes | Yes |
+| Session resume (`gru resume`) | Yes | Yes (non-interactive) | Yes |
+| Interactive attach (`gru attach`) | Yes | No | Yes |
+| Token usage tracking | Yes | Yes | Yes |
+| Stream monitoring | Yes | Yes | Yes |
 
 ## Adding a New Backend
 

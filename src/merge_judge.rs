@@ -821,8 +821,9 @@ async fn invoke_judge_cli_raw(
     backend: &dyn AgentBackend,
     worktree_path: &std::path::Path,
     prompt: &str,
+    github_host: &str,
 ) -> Result<String> {
-    let mut cmd = backend.build_oneshot_command(worktree_path, "-");
+    let mut cmd = backend.build_oneshot_command(worktree_path, "-", github_host);
     cmd.stdin(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
 
@@ -962,7 +963,7 @@ pub(crate) async fn evaluate(
         confidence_threshold,
     );
 
-    let raw_response = match invoke_judge_cli_raw(backend, worktree_path, &prompt).await {
+    let raw_response = match invoke_judge_cli_raw(backend, worktree_path, &prompt, host).await {
         Ok(text) => text,
         Err(e) => {
             log::warn!("Judge CLI invocation failed: {}", e);

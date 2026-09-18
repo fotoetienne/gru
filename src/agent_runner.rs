@@ -375,7 +375,19 @@ fn accumulate_token_usage(total: &mut TokenUsage, event: &AgentEvent) {
         AgentEvent::MessageComplete {
             usage: Some(usage), ..
         } => {
+            // Some backends (e.g. Codex, Pi) report input and cache tokens
+            // on the turn-completion event rather than a separate Started
+            // event; Claude Code always reports 0/None for those fields
+            // here, so accumulating them unconditionally is safe for all
+            // backends.
+            total.input_tokens += usage.input_tokens;
             total.output_tokens += usage.output_tokens;
+            if let Some(cache_creation) = usage.cache_creation_input_tokens {
+                *total.cache_creation_input_tokens.get_or_insert(0) += cache_creation;
+            }
+            if let Some(cache_read) = usage.cache_read_input_tokens {
+                *total.cache_read_input_tokens.get_or_insert(0) += cache_read;
+            }
         }
         AgentEvent::Finished {
             usage: Some(usage), ..
@@ -480,6 +492,28 @@ mod tests {
         };
         accumulate_token_usage(&mut total, &event);
         assert_eq!(total.output_tokens, 500);
+    }
+
+    #[test]
+    fn test_accumulate_token_usage_message_complete_full_usage() {
+        // Backends like Codex and Pi report input/cache tokens on the same
+        // turn-completion event as output tokens, rather than a separate
+        // Started event. Regression test for under-reporting these fields.
+        let mut total = TokenUsage::default();
+        let event = AgentEvent::MessageComplete {
+            stop_reason: Some("end_turn".to_string()),
+            usage: Some(TokenUsage {
+                input_tokens: 1000,
+                output_tokens: 500,
+                cache_creation_input_tokens: Some(50),
+                cache_read_input_tokens: Some(200),
+            }),
+        };
+        accumulate_token_usage(&mut total, &event);
+        assert_eq!(total.input_tokens, 1000);
+        assert_eq!(total.output_tokens, 500);
+        assert_eq!(total.cache_creation_input_tokens, Some(50));
+        assert_eq!(total.cache_read_input_tokens, Some(200));
     }
 
     #[test]

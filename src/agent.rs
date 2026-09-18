@@ -237,7 +237,15 @@ pub(crate) trait AgentBackend: Send + Sync {
     ///
     /// Backends must support the `"-"` stdin-sentinel convention.
     /// The command should produce plain-text output on stdout with piped stdio.
-    fn build_oneshot_command(&self, worktree_path: &Path, prompt_arg: &str) -> TokioCommand;
+    ///
+    /// `github_host` is forwarded as `GH_HOST` so `gh` CLI calls inside the
+    /// agent target the correct GitHub Enterprise host.
+    fn build_oneshot_command(
+        &self,
+        worktree_path: &Path,
+        prompt_arg: &str,
+        github_host: &str,
+    ) -> TokioCommand;
 
     /// Builds a streaming command for a CI fix invocation.
     ///

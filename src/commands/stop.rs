@@ -348,14 +348,14 @@ mod tests {
     #[test]
     fn test_build_process_match_names_defaults() {
         let names = build_process_match_names("claude");
-        assert_eq!(names, vec!["claude", "codex", "gru"]);
+        assert_eq!(names, vec!["claude", "codex", "pi", "gru"]);
     }
 
     #[test]
     fn test_build_process_match_names_adds_custom_binary_basename() {
         let names = build_process_match_names("/opt/tools/cc");
         assert!(names.contains(&"cc".to_string()));
-        assert_eq!(names.len(), 4);
+        assert_eq!(names.len(), 5);
     }
 
     #[test]
@@ -365,13 +365,13 @@ mod tests {
         // validate_agent() already rejects this at config-load time; this is
         // the defense-in-depth check for callers that bypass it.
         let names = build_process_match_names("");
-        assert_eq!(names, vec!["claude", "codex", "gru"]);
+        assert_eq!(names, vec!["claude", "codex", "pi", "gru"]);
     }
 
     #[test]
     fn test_build_process_match_names_skips_whitespace_only_binary() {
         let names = build_process_match_names("   ");
-        assert_eq!(names, vec!["claude", "codex", "gru"]);
+        assert_eq!(names, vec!["claude", "codex", "pi", "gru"]);
     }
 
     #[test]
@@ -379,7 +379,7 @@ mod tests {
         // Configured binary resolving to a name already in the default list
         // shouldn't produce a duplicate alternative.
         let names = build_process_match_names("/usr/local/bin/gru");
-        assert_eq!(names, vec!["claude", "codex", "gru"]);
+        assert_eq!(names, vec!["claude", "codex", "pi", "gru"]);
     }
 
     /// The anchored `(^|/)(names)([[:space:]]|$)` pattern this module builds
