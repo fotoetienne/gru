@@ -375,19 +375,7 @@ fn accumulate_token_usage(total: &mut TokenUsage, event: &AgentEvent) {
         AgentEvent::MessageComplete {
             usage: Some(usage), ..
         } => {
-            // Some backends (e.g. Codex, Pi) report input and cache tokens
-            // on the turn-completion event rather than a separate Started
-            // event; Claude Code always reports 0/None for those fields
-            // here, so accumulating them unconditionally is safe for all
-            // backends.
-            total.input_tokens += usage.input_tokens;
             total.output_tokens += usage.output_tokens;
-            if let Some(cache_creation) = usage.cache_creation_input_tokens {
-                *total.cache_creation_input_tokens.get_or_insert(0) += cache_creation;
-            }
-            if let Some(cache_read) = usage.cache_read_input_tokens {
-                *total.cache_read_input_tokens.get_or_insert(0) += cache_read;
-            }
         }
         AgentEvent::Finished {
             usage: Some(usage), ..
@@ -495,10 +483,11 @@ mod tests {
     }
 
     #[test]
-    fn test_accumulate_token_usage_message_complete_full_usage() {
-        // Backends like Codex and Pi report input/cache tokens on the same
-        // turn-completion event as output tokens, rather than a separate
-        // Started event. Regression test for under-reporting these fields.
+    fn test_accumulate_token_usage_message_complete_ignores_input_and_cache() {
+        // MessageComplete only ever contributes output_tokens. Backends that
+        // report input/cache usage per-turn (Codex, Pi) must surface session
+        // totals via `Finished` instead of here, to avoid double-counting
+        // when a turn's usage is also folded into a backend's running total.
         let mut total = TokenUsage::default();
         let event = AgentEvent::MessageComplete {
             stop_reason: Some("end_turn".to_string()),
@@ -510,8 +499,56 @@ mod tests {
             }),
         };
         accumulate_token_usage(&mut total, &event);
-        assert_eq!(total.input_tokens, 1000);
+        assert_eq!(total.input_tokens, 0);
         assert_eq!(total.output_tokens, 500);
+        assert_eq!(total.cache_creation_input_tokens, None);
+        assert_eq!(total.cache_read_input_tokens, None);
+    }
+
+    #[test]
+    fn test_accumulate_token_usage_no_double_count_message_complete_and_finished() {
+        // Simulates a Pi/Codex-style session: each turn emits MessageComplete
+        // with per-turn output tokens, and the backend reports accumulated
+        // input/cache totals (output left at 0) once in a final `Finished`
+        // event. The combined total must equal the true sum, not double it.
+        let mut total = TokenUsage::default();
+
+        accumulate_token_usage(
+            &mut total,
+            &AgentEvent::MessageComplete {
+                stop_reason: Some("end_turn".to_string()),
+                usage: Some(TokenUsage {
+                    input_tokens: 1000,
+                    output_tokens: 500,
+                    ..Default::default()
+                }),
+            },
+        );
+        accumulate_token_usage(
+            &mut total,
+            &AgentEvent::MessageComplete {
+                stop_reason: Some("end_turn".to_string()),
+                usage: Some(TokenUsage {
+                    input_tokens: 2000,
+                    output_tokens: 300,
+                    ..Default::default()
+                }),
+            },
+        );
+        accumulate_token_usage(
+            &mut total,
+            &AgentEvent::Finished {
+                usage: Some(TokenUsage {
+                    input_tokens: 3000,
+                    output_tokens: 0,
+                    cache_creation_input_tokens: Some(50),
+                    cache_read_input_tokens: Some(200),
+                }),
+            },
+        );
+
+        assert_eq!(total.input_tokens, 3000);
+        assert_eq!(total.output_tokens, 800);
         assert_eq!(total.cache_creation_input_tokens, Some(50));
         assert_eq!(total.cache_read_input_tokens, Some(200));
     }

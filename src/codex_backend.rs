@@ -9,12 +9,14 @@
 //! - `turn.completed` → `AgentEvent::MessageComplete` (with token usage)
 //! - `turn.failed` → `AgentEvent::Error`
 //! - `item.started` / `item.completed` → `AgentEvent::ToolUse` / `AgentEvent::ToolResult`
+//! - `thread.completed` → `AgentEvent::Finished` (with accumulated session usage)
 //! - `error` → `AgentEvent::Error`
 
 use crate::agent::{AgentBackend, AgentEvent, TokenUsage};
 use crate::display_utils::{shorten_path, truncate_string};
 use serde::Deserialize;
 use std::path::Path;
+use std::sync::Mutex;
 use tokio::process::Command as TokioCommand;
 use uuid::Uuid;
 
@@ -22,8 +24,17 @@ use uuid::Uuid;
 ///
 /// Implements `AgentBackend` by spawning `codex exec --json --full-auto`
 /// and parsing the resulting JSONL event stream.
+///
+/// Codex reports input and cache token counts per-turn on `turn.completed`
+/// rather than once at session start, so this backend accumulates them
+/// across the session and reports the totals in the `Finished` event at
+/// `thread.completed` (output tokens are already accumulated by the caller
+/// from each turn's `MessageComplete`, so `Finished` reports
+/// `output_tokens: 0` to avoid double-counting).
 #[derive(Default)]
-pub(crate) struct CodexBackend;
+pub(crate) struct CodexBackend {
+    accumulated_usage: Mutex<TokenUsage>,
+}
 
 impl AgentBackend for CodexBackend {
     fn name(&self) -> &str {
@@ -47,7 +58,9 @@ impl AgentBackend for CodexBackend {
     }
 
     fn parse_events(&self, line: &str) -> Vec<AgentEvent> {
-        parse_codex_event(line.trim()).into_iter().collect()
+        parse_codex_event(line.trim(), &self.accumulated_usage)
+            .into_iter()
+            .collect()
     }
 
     fn build_resume_command(
@@ -220,7 +233,7 @@ struct CodexError {
 }
 
 /// Parse a single line of Codex JSONL output into an `AgentEvent`.
-fn parse_codex_event(line: &str) -> Option<AgentEvent> {
+fn parse_codex_event(line: &str, accumulated_usage: &Mutex<TokenUsage>) -> Option<AgentEvent> {
     if line.is_empty() {
         return None;
     }
@@ -239,9 +252,23 @@ fn parse_codex_event(line: &str) -> Option<AgentEvent> {
                 cache_read_input_tokens: u.cached_input_tokens,
                 ..Default::default()
             });
+            if let Some(u) = &usage {
+                let mut accumulated = accumulated_usage.lock().unwrap();
+                accumulated.input_tokens += u.input_tokens;
+                if let Some(cache_read) = u.cache_read_input_tokens {
+                    *accumulated.cache_read_input_tokens.get_or_insert(0) += cache_read;
+                }
+            }
             Some(AgentEvent::MessageComplete {
                 stop_reason: Some("end_turn".to_string()),
                 usage,
+            })
+        }
+
+        "thread.completed" => {
+            let totals = accumulated_usage.lock().unwrap().clone();
+            Some(AgentEvent::Finished {
+                usage: Some(totals),
             })
         }
 
@@ -389,7 +416,7 @@ mod tests {
     use super::*;
 
     fn backend() -> CodexBackend {
-        CodexBackend
+        CodexBackend::default()
     }
 
     /// Assert that parse_events returns exactly one event and return it.
@@ -604,6 +631,46 @@ mod tests {
                 usage: None,
             }
         ));
+    }
+
+    #[test]
+    fn test_parse_event_thread_completed_no_turns() {
+        let b = backend();
+        let line = r#"{"type":"thread.completed"}"#;
+        let event = single(b.parse_events(line));
+        match event {
+            AgentEvent::Finished { usage } => {
+                let u = usage.unwrap();
+                assert_eq!(u.input_tokens, 0);
+                assert_eq!(u.output_tokens, 0);
+                assert_eq!(u.cache_read_input_tokens, None);
+            }
+            other => panic!("Expected Finished, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_event_thread_completed_accumulates_turn_usage() {
+        let b = backend();
+        b.parse_events(
+            r#"{"type":"turn.completed","usage":{"input_tokens":1000,"output_tokens":500,"cached_input_tokens":200}}"#,
+        );
+        b.parse_events(
+            r#"{"type":"turn.completed","usage":{"input_tokens":2000,"output_tokens":300,"cached_input_tokens":100}}"#,
+        );
+        let event = single(b.parse_events(r#"{"type":"thread.completed"}"#));
+        match event {
+            AgentEvent::Finished { usage } => {
+                let u = usage.unwrap();
+                assert_eq!(u.input_tokens, 3000);
+                assert_eq!(
+                    u.output_tokens, 0,
+                    "output already covered by MessageComplete"
+                );
+                assert_eq!(u.cache_read_input_tokens, Some(300));
+            }
+            other => panic!("Expected Finished, got {:?}", other),
+        }
     }
 
     #[test]

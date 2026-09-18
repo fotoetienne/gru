@@ -22,6 +22,7 @@ use crate::agent::{AgentBackend, AgentEvent, TokenUsage};
 use crate::display_utils::{shorten_path, truncate_string};
 use serde::Deserialize;
 use std::path::Path;
+use std::sync::Mutex;
 use tokio::process::Command as TokioCommand;
 use uuid::Uuid;
 
@@ -29,6 +30,13 @@ use uuid::Uuid;
 ///
 /// Implements `AgentBackend` by spawning `pi -p --mode json` and parsing the
 /// resulting JSONL event stream.
+///
+/// Pi reports input and cache token counts per-turn on `turn_end` rather
+/// than once at session start, so this backend accumulates them across the
+/// session and reports the totals in the `Finished` event at `agent_end`
+/// (output tokens are already accumulated by the caller from each turn's
+/// `MessageComplete`, so `Finished` reports `output_tokens: 0` to avoid
+/// double-counting).
 pub(crate) struct PiBackend {
     /// Path or name of the Pi CLI binary to invoke (`agent.pi.binary` in config).
     binary: String,
@@ -37,6 +45,7 @@ pub(crate) struct PiBackend {
     model: Option<String>,
     /// Thinking effort to pass via `--thinking` (`agent.pi.thinking` in config).
     thinking: Option<String>,
+    accumulated_usage: Mutex<TokenUsage>,
 }
 
 impl Default for PiBackend {
@@ -45,6 +54,7 @@ impl Default for PiBackend {
             binary: "pi".to_string(),
             model: None,
             thinking: None,
+            accumulated_usage: Mutex::new(TokenUsage::default()),
         }
     }
 }
@@ -59,6 +69,7 @@ impl PiBackend {
             binary: binary.unwrap_or_else(|| "pi".to_string()),
             model,
             thinking,
+            accumulated_usage: Mutex::new(TokenUsage::default()),
         }
     }
 
@@ -109,7 +120,7 @@ impl AgentBackend for PiBackend {
     }
 
     fn parse_events(&self, line: &str) -> Vec<AgentEvent> {
-        parse_pi_event(line.trim())
+        parse_pi_event(line.trim(), &self.accumulated_usage)
     }
 
     fn build_resume_command(
@@ -301,7 +312,7 @@ fn parse_usage(usage: Option<serde_json::Value>) -> Option<PiUsage> {
 /// Silently ignores lines that aren't recognized JSON events. This matters
 /// when Pi is invoked through a launcher or wrapper that prints its own
 /// non-JSON preamble to stdout ahead of the event stream.
-fn parse_pi_event(line: &str) -> Vec<AgentEvent> {
+fn parse_pi_event(line: &str, accumulated_usage: &Mutex<TokenUsage>) -> Vec<AgentEvent> {
     if line.is_empty() {
         return Vec::new();
     }
@@ -372,13 +383,28 @@ fn parse_pi_event(line: &str) -> Vec<AgentEvent> {
                 cache_read_input_tokens: u.cache_read,
                 cache_creation_input_tokens: u.cache_write,
             });
+            if let Some(u) = &usage {
+                let mut accumulated = accumulated_usage.lock().unwrap();
+                accumulated.input_tokens += u.input_tokens;
+                if let Some(cache_creation) = u.cache_creation_input_tokens {
+                    *accumulated.cache_creation_input_tokens.get_or_insert(0) += cache_creation;
+                }
+                if let Some(cache_read) = u.cache_read_input_tokens {
+                    *accumulated.cache_read_input_tokens.get_or_insert(0) += cache_read;
+                }
+            }
             vec![AgentEvent::MessageComplete {
                 stop_reason: Some("end_turn".to_string()),
                 usage,
             }]
         }
 
-        "agent_end" => vec![AgentEvent::Finished { usage: None }],
+        "agent_end" => {
+            let totals = accumulated_usage.lock().unwrap().clone();
+            vec![AgentEvent::Finished {
+                usage: Some(totals),
+            }]
+        }
 
         "turn_failed" | "error" => {
             let message = event
@@ -942,11 +968,45 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_event_agent_end() {
+    fn test_parse_event_agent_end_no_turns() {
         let b = backend();
         let line = r#"{"type":"agent_end"}"#;
         let event = single(b.parse_events(line));
-        assert!(matches!(event, AgentEvent::Finished { usage: None }));
+        match event {
+            AgentEvent::Finished { usage } => {
+                let u = usage.unwrap();
+                assert_eq!(u.input_tokens, 0);
+                assert_eq!(u.output_tokens, 0);
+                assert_eq!(u.cache_creation_input_tokens, None);
+                assert_eq!(u.cache_read_input_tokens, None);
+            }
+            other => panic!("Expected Finished, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_event_agent_end_accumulates_turn_usage() {
+        let b = backend();
+        b.parse_events(
+            r#"{"type":"turn_end","usage":{"input":1000,"output":500,"cacheRead":200,"cacheWrite":50}}"#,
+        );
+        b.parse_events(
+            r#"{"type":"turn_end","usage":{"input":2000,"output":300,"cacheRead":100}}"#,
+        );
+        let event = single(b.parse_events(r#"{"type":"agent_end"}"#));
+        match event {
+            AgentEvent::Finished { usage } => {
+                let u = usage.unwrap();
+                assert_eq!(u.input_tokens, 3000);
+                assert_eq!(
+                    u.output_tokens, 0,
+                    "output already covered by MessageComplete"
+                );
+                assert_eq!(u.cache_creation_input_tokens, Some(50));
+                assert_eq!(u.cache_read_input_tokens, Some(300));
+            }
+            other => panic!("Expected Finished, got {:?}", other),
+        }
     }
 
     #[test]

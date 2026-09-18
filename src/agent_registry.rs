@@ -39,7 +39,7 @@ fn construct_backend(agent_name: &str, overrides: AgentOverrides) -> Option<Box<
             overrides.claude_ci_fix_max_turns,
             overrides.claude_binary,
         ))),
-        "codex" => Some(Box::new(CodexBackend)),
+        "codex" => Some(Box::new(CodexBackend::default())),
         "pi" => Some(Box::new(PiBackend::new(
             overrides.pi_binary,
             overrides.pi_model,
