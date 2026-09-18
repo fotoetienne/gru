@@ -377,10 +377,12 @@ fn parse_pi_event(line: &str) -> Vec<AgentEvent> {
 /// `format_tool_summary` in `claude_backend.rs` but using Pi's lowercase
 /// tool names (`read`, `bash`, `edit`, `write`, …).
 fn format_pi_tool_summary(tool_name: &str, args: Option<&serde_json::Value>) -> String {
-    let args = match args {
-        Some(v) => v,
-        None => return format!("Tool: {}", tool_name),
-    };
+    // A missing `args` payload falls through to each arm's own "not
+    // present" branch (e.g. "Run: bash command") via `Value::get` returning
+    // `None` on `Value::Null`, rather than short-circuiting every known
+    // tool to the generic "Tool: {name}" fallback.
+    let empty = serde_json::Value::Null;
+    let args = args.unwrap_or(&empty);
 
     match tool_name {
         "bash" => {
@@ -931,7 +933,14 @@ mod tests {
 
     #[test]
     fn test_format_pi_tool_summary_no_args() {
-        assert_eq!(format_pi_tool_summary("bash", None), "Tool: bash");
+        // A missing args payload for a known tool still falls back to the
+        // tool-specific phrasing rather than the generic "Tool: {name}".
+        assert_eq!(format_pi_tool_summary("bash", None), "Run: bash command");
+    }
+
+    #[test]
+    fn test_format_pi_tool_summary_no_args_unknown_tool() {
+        assert_eq!(format_pi_tool_summary("grep", None), "Tool: grep");
     }
 
     #[test]
