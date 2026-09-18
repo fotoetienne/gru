@@ -76,6 +76,18 @@ pub(crate) enum AgentEvent {
         /// Error message
         message: String,
     },
+    /// Reports which provider/model actually served a turn.
+    ///
+    /// Emitted by backends (e.g. Pi) that let the underlying CLI resolve its
+    /// own model rather than having Gru pin one — see `pi_backend.rs` for the
+    /// rationale. This is purely informational so `events.jsonl` records
+    /// which model did the work; it has no effect on execution.
+    ModelInfo {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+    },
     /// Keepalive / heartbeat signal
     Ping,
 }
@@ -521,6 +533,33 @@ mod tests {
             message: "Something went wrong".to_string(),
         };
         let json = serde_json::to_string(&event).unwrap();
+        let deserialized: AgentEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(event, deserialized);
+    }
+
+    #[test]
+    fn test_agent_event_model_info_roundtrip() {
+        let event = AgentEvent::ModelInfo {
+            provider: Some("nflx-openai".to_string()),
+            model: Some("gpt-5.6-sol".to_string()),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let deserialized: AgentEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(event, deserialized);
+    }
+
+    #[test]
+    fn test_agent_event_model_info_none_fields_omitted() {
+        let event = AgentEvent::ModelInfo {
+            provider: None,
+            model: None,
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["type"], "model_info");
+        assert!(value.get("provider").is_none());
+        assert!(value.get("model").is_none());
+
         let deserialized: AgentEvent = serde_json::from_str(&json).unwrap();
         assert_eq!(event, deserialized);
     }

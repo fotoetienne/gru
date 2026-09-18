@@ -7,16 +7,31 @@
 //! Pi event types:
 //! - `session` / `agent_start` → `AgentEvent::Started`
 //! - `turn_start` → `AgentEvent::Thinking`
+//! - `message_start` → `AgentEvent::ModelInfo`
 //! - `message_update` (`assistantMessageEvent.type == "text_delta"`) → `AgentEvent::TextDelta`
 //! - `tool_execution_start` → `AgentEvent::ToolUse`
 //! - `tool_execution_end` → `AgentEvent::ToolResult`
-//! - `turn_end` → `AgentEvent::MessageComplete`
+//! - `turn_end` → `AgentEvent::MessageComplete` (plus `AgentEvent::ModelInfo`
+//!   when the event also carries `provider`/`model`)
 //! - `agent_end` → `AgentEvent::Finished`
 //! - `turn_failed` / `error` → `AgentEvent::Error`
 //!
 //! Unlike Codex, Pi supports interactive session resume (needed by `gru attach`)
 //! and has no `--dangerously-skip-permissions` equivalent — autonomous tool use
 //! is the default under `-p`.
+//!
+//! ## Model selection is intentionally Pi's decision, not Gru's
+//!
+//! `PiBackend` passes `--model`/`--thinking` only when `[agent.pi]` sets
+//! them (see `apply_model_flags`). With no config it passes neither and lets
+//! Pi resolve its own default — Pi's provider/model is pluggable, so "the
+//! default" varies by machine and Pi version, not a fixed value Gru could
+//! usefully pin. Pi users have already configured Pi for their own needs;
+//! having Gru override that would be surprising. Do not "fix" this by
+//! defaulting `model`/`thinking` to a hardcoded value — instead, the actual
+//! provider/model Pi used is captured from `message_start` events (see
+//! `AgentEvent::ModelInfo`) so `events.jsonl` still records which model did
+//! the work, without Gru forcing a choice.
 
 use crate::agent::{AgentBackend, AgentEvent, TokenUsage};
 use crate::display_utils::{shorten_path, truncate_string};
@@ -270,9 +285,39 @@ struct PiEvent {
     /// signal — see `parse_usage`.
     #[serde(default)]
     usage: Option<serde_json::Value>,
-    /// Present on `error` / `turn_failed` events.
+    /// Present on `error` / `turn_failed` events as a plain string, and on
+    /// `message_start` events as a `{role, provider, model, ...}` object —
+    /// hence `Value` rather than `String`; see `parse_pi_event` for the
+    /// per-event-type interpretation.
     #[serde(default)]
-    message: Option<String>,
+    message: Option<serde_json::Value>,
+    /// Present at the top level on `turn_end` events (alongside `usage`).
+    /// `message_start` instead nests these under `message` — see
+    /// `extract_provider_model`.
+    #[serde(default)]
+    provider: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
+}
+
+/// Extracts `provider`/`model` from wherever a given Pi event puts them:
+/// top-level fields (`turn_end`) or nested under `message` (`message_start`).
+fn extract_provider_model(event: &PiEvent) -> (Option<String>, Option<String>) {
+    if event.provider.is_some() || event.model.is_some() {
+        return (event.provider.clone(), event.model.clone());
+    }
+    let Some(message) = &event.message else {
+        return (None, None);
+    };
+    let provider = message
+        .get("provider")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let model = message
+        .get("model")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    (provider, model)
 }
 
 /// Nested assistant message event carried by `message_update`.
@@ -349,6 +394,14 @@ fn parse_pi_event(line: &str, accumulated_usage: &Mutex<TokenUsage>) -> Vec<Agen
 
         "turn_start" => vec![AgentEvent::Thinking { text: None }],
 
+        "message_start" => {
+            let (provider, model) = extract_provider_model(&event);
+            if provider.is_none() && model.is_none() {
+                return Vec::new();
+            }
+            vec![AgentEvent::ModelInfo { provider, model }]
+        }
+
         "message_update" => {
             let Some(ame) = event.assistant_message_event else {
                 return Vec::new();
@@ -399,6 +452,7 @@ fn parse_pi_event(line: &str, accumulated_usage: &Mutex<TokenUsage>) -> Vec<Agen
         }
 
         "turn_end" => {
+            let (provider, model) = extract_provider_model(&event);
             let usage = parse_usage(event.usage).map(|u| TokenUsage {
                 input_tokens: u.input,
                 output_tokens: u.output,
@@ -415,10 +469,15 @@ fn parse_pi_event(line: &str, accumulated_usage: &Mutex<TokenUsage>) -> Vec<Agen
                     *accumulated.cache_read_input_tokens.get_or_insert(0) += cache_read;
                 }
             }
-            vec![AgentEvent::MessageComplete {
+            let mut events = Vec::with_capacity(2);
+            if provider.is_some() || model.is_some() {
+                events.push(AgentEvent::ModelInfo { provider, model });
+            }
+            events.push(AgentEvent::MessageComplete {
                 stop_reason: Some("end_turn".to_string()),
                 usage,
-            }]
+            });
+            events
         }
 
         "agent_end" => {
@@ -431,7 +490,10 @@ fn parse_pi_event(line: &str, accumulated_usage: &Mutex<TokenUsage>) -> Vec<Agen
         "turn_failed" | "error" => {
             let message = event
                 .message
-                .unwrap_or_else(|| "Pi agent error".to_string());
+                .as_ref()
+                .and_then(|v| v.as_str())
+                .unwrap_or("Pi agent error")
+                .to_string();
             vec![AgentEvent::Error { message }]
         }
 
@@ -948,6 +1010,21 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_event_turn_end_with_provider_and_model() {
+        let b = backend();
+        let line = r#"{"type":"turn_end","provider":"nflx-openai","model":"gpt-5.6-sol","usage":{"input":1000,"output":500}}"#;
+        let events = b.parse_events(line);
+        assert_eq!(
+            events[0],
+            AgentEvent::ModelInfo {
+                provider: Some("nflx-openai".to_string()),
+                model: Some("gpt-5.6-sol".to_string()),
+            }
+        );
+        assert!(matches!(events[1], AgentEvent::MessageComplete { .. }));
+    }
+
+    #[test]
     fn test_parse_event_turn_end_no_usage() {
         let b = backend();
         let line = r#"{"type":"turn_end"}"#;
@@ -1172,10 +1249,37 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_event_message_start_captures_provider_and_model() {
+        let b = backend();
+        let line = r#"{"type":"message_start","message":{"role":"assistant","api":"openai-responses","provider":"nflx-openai","model":"gpt-5.6-sol"}}"#;
+        let event = single(b.parse_events(line));
+        assert_eq!(
+            event,
+            AgentEvent::ModelInfo {
+                provider: Some("nflx-openai".to_string()),
+                model: Some("gpt-5.6-sol".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_event_message_start_no_provider_or_model_ignored() {
+        let b = backend();
+        let line = r#"{"type":"message_start","message":{"role":"assistant"}}"#;
+        assert!(b.parse_events(line).is_empty());
+    }
+
+    #[test]
+    fn test_parse_event_message_start_missing_message_ignored() {
+        let b = backend();
+        let line = r#"{"type":"message_start"}"#;
+        assert!(b.parse_events(line).is_empty());
+    }
+
+    #[test]
     fn test_parse_event_ignored_types() {
         let b = backend();
         for event_type in [
-            "message_start",
             "message_end",
             "entry_appended",
             "agent_settled",

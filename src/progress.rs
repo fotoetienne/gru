@@ -268,6 +268,9 @@ impl ProgressDisplay {
                 self.print_event(&format!("[{}] Error: {}", timestamp, error_text));
                 log::error!("{}", error_text);
             }
+            AgentEvent::ModelInfo { .. } => {
+                // Informational only; recorded in events.jsonl, nothing to display.
+            }
             AgentEvent::Ping => {
                 // Keepalive ping - no action needed, spinner ticks below
             }
