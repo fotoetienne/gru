@@ -97,15 +97,24 @@ Note: Codex does not support interactive resume (`gru attach` will not work with
 [Pi](https://github.com/earendil-works/pi-mono) is a coding agent CLI (`pi`) with a pluggable
 provider model — it supports many model providers, configured on the Pi side rather than by Gru.
 
+This backend's event parsing (`src/pi_backend.rs`) was implemented and verified against a
+particular Pi distribution's JSON event schema (`session`/`agent_start`, `turn_start`,
+`tool_execution_start`/`_end` with `toolCallId`/`toolName`, `turn_end` usage, etc.). If your
+`pi` resolves to a build with a different event shape, unrecognized lines are silently
+skipped rather than erroring — so a mismatch shows up as missing tool/progress tracking, not
+a crash. Confirm your installed `pi --version` matches what this backend expects before
+relying on rich progress output.
+
 ### Install
 
 See [pi-mono](https://github.com/earendil-works/pi-mono) for install options (npm
 `@earendil-works/pi-coding-agent`). Some environments distribute Pi through a wrapper or
-internal package; Gru invokes whatever `pi` resolves to on `PATH`, and the binary path can be
-overridden in config if it lives elsewhere.
+internal package; Gru invokes whatever `pi` resolves to on `PATH`. There is currently no
+`[agent.pi]` config section — unlike Claude's `[agent.claude].binary`, Pi's binary path
+cannot be overridden and must be discoverable on `PATH`.
 
 Authentication and model selection are Pi's concern, not Gru's: Gru passes no provider or
-model flags unless `[agent.pi]` sets them, so Pi uses whatever it is already configured for.
+model flags, so Pi uses whatever it is already configured for.
 
 ### Verify
 
