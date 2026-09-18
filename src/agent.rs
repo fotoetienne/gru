@@ -465,6 +465,33 @@ mod tests {
     }
 
     #[test]
+    fn test_agent_event_model_info_roundtrip() {
+        let event = AgentEvent::ModelInfo {
+            provider: Some("nflx-openai".to_string()),
+            model: Some("gpt-5.6-sol".to_string()),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let deserialized: AgentEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(event, deserialized);
+    }
+
+    #[test]
+    fn test_agent_event_model_info_none_fields_omitted() {
+        let event = AgentEvent::ModelInfo {
+            provider: None,
+            model: None,
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["type"], "model_info");
+        assert!(value.get("provider").is_none());
+        assert!(value.get("model").is_none());
+
+        let deserialized: AgentEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(event, deserialized);
+    }
+
+    #[test]
     fn test_agent_event_ping_roundtrip() {
         let event = AgentEvent::Ping;
         let json = serde_json::to_string(&event).unwrap();
