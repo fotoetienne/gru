@@ -112,7 +112,12 @@ impl AgentBackend for PiBackend {
             .arg("--mode")
             .arg("json")
             .arg("--session-id")
-            .arg(session_id.to_string());
+            .arg(session_id.to_string())
+            // Pi already withholds project-local trust by default, but pass
+            // this explicitly so a future change to Pi's default can't
+            // silently start executing repo-supplied extensions/skills from
+            // a freshly-cloned worktree.
+            .arg("--no-approve");
         self.apply_model_flags(&mut cmd);
         apply_pi_stdio(cmd.arg(prompt), worktree_path);
         cmd.env("GH_HOST", github_host);
@@ -142,7 +147,10 @@ impl AgentBackend for PiBackend {
     ) -> Option<TokioCommand> {
         // Pi supports interactive resume: drop -p, keep --session-id.
         let mut cmd = TokioCommand::new(&self.binary);
-        cmd.arg("--session-id").arg(session_id.to_string());
+        cmd.arg("--session-id")
+            .arg(session_id.to_string())
+            // Locks in the safe default; see build_command for rationale.
+            .arg("--no-approve");
         self.apply_model_flags(&mut cmd);
         cmd.current_dir(worktree_path)
             .stdin(std::process::Stdio::inherit())
@@ -164,7 +172,8 @@ impl AgentBackend for PiBackend {
         github_host: &str,
     ) -> TokioCommand {
         let mut cmd = TokioCommand::new(&self.binary);
-        cmd.arg("-p");
+        // Locks in the safe default; see build_command for rationale.
+        cmd.arg("-p").arg("--no-approve");
         self.apply_model_flags(&mut cmd);
 
         if prompt_arg == "-" {
@@ -194,7 +203,8 @@ impl AgentBackend for PiBackend {
         github_host: &str,
     ) -> TokioCommand {
         let mut cmd = TokioCommand::new(&self.binary);
-        cmd.arg("-p").arg("--mode").arg("json");
+        // Locks in the safe default; see build_command for rationale.
+        cmd.arg("-p").arg("--mode").arg("json").arg("--no-approve");
         self.apply_model_flags(&mut cmd);
         apply_pi_stdio(cmd.arg(prompt), worktree_path);
         cmd.env("GH_HOST", github_host);
@@ -569,6 +579,7 @@ mod tests {
         assert!(args.contains(&"json".as_ref()));
         assert!(args.contains(&"--session-id".as_ref()));
         assert!(args.contains(&session_id.to_string().as_ref()));
+        assert!(args.contains(&"--no-approve".as_ref()));
         assert!(args.contains(&"fix the bug".as_ref()));
         assert_eq!(*args.last().unwrap(), std::ffi::OsStr::new("fix the bug"));
 
@@ -609,6 +620,7 @@ mod tests {
         let args: Vec<&std::ffi::OsStr> = inner.get_args().collect();
         assert!(args.contains(&"--session-id".as_ref()));
         assert!(args.contains(&session_id.to_string().as_ref()));
+        assert!(args.contains(&"--no-approve".as_ref()));
         assert!(args.contains(&"continue".as_ref()));
 
         let envs: Vec<_> = inner.get_envs().collect();
@@ -631,6 +643,7 @@ mod tests {
         let args: Vec<&std::ffi::OsStr> = inner.get_args().collect();
         assert!(args.contains(&"--session-id".as_ref()));
         assert!(args.contains(&session_id.to_string().as_ref()));
+        assert!(args.contains(&"--no-approve".as_ref()));
         // Interactive mode should NOT have -p or --mode json
         assert!(!args.contains(&"-p".as_ref()));
         assert!(!args.contains(&"--mode".as_ref()));
@@ -651,6 +664,7 @@ mod tests {
         assert_eq!(inner.get_program(), "pi");
         let args: Vec<&std::ffi::OsStr> = inner.get_args().collect();
         assert!(args.contains(&"-p".as_ref()));
+        assert!(args.contains(&"--no-approve".as_ref()));
         assert!(args.contains(&"fix the tests".as_ref()));
 
         let envs: Vec<_> = inner.get_envs().collect();
@@ -702,6 +716,7 @@ mod tests {
         assert!(args.contains(&"-p".as_ref()));
         assert!(args.contains(&"--mode".as_ref()));
         assert!(args.contains(&"json".as_ref()));
+        assert!(args.contains(&"--no-approve".as_ref()));
         assert!(args.contains(&"fix the CI".as_ref()));
         // Must be stateless — no --session-id, so repeated CI fixes in the
         // same worktree never share Pi conversation history.

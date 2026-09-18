@@ -602,6 +602,39 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_all_command_builders_remove_gru_worker_env_vars() {
+        // GRU_RETRY_PARENT and GRU_CONFIG_PATH must not leak from the worker
+        // process into Codex or its tool subprocesses, matching the
+        // env_remove calls in claude_backend.rs and pi_backend.rs.
+        // Command::env_remove surfaces as (key, None) in get_envs().
+        let assert_removed = |cmd: &tokio::process::Command| {
+            let envs: Vec<_> = cmd.as_std().get_envs().collect();
+            assert!(
+                envs.iter()
+                    .any(|(k, v)| *k == crate::labels::GRU_RETRY_PARENT_ENV && v.is_none()),
+                "GRU_RETRY_PARENT should be removed"
+            );
+            assert!(
+                envs.iter()
+                    .any(|(k, v)| *k == crate::labels::GRU_CONFIG_PATH_ENV && v.is_none()),
+                "GRU_CONFIG_PATH should be removed"
+            );
+        };
+
+        let b = backend();
+        let path = std::path::PathBuf::from("/tmp/worktree");
+        let session_id = Uuid::nil();
+
+        assert_removed(&b.build_command(&path, &session_id, "fix the bug", "github.com"));
+        assert_removed(
+            &b.build_resume_command(&path, &session_id, "continue", "github.com")
+                .unwrap(),
+        );
+        assert_removed(&b.build_oneshot_command(&path, "fix the tests", "github.com"));
+        assert_removed(&b.build_ci_fix_command(&path, "fix the CI", "github.com"));
+    }
+
     // ---- parse_event tests ----
 
     #[test]
