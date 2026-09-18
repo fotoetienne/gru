@@ -46,12 +46,12 @@ use uuid::Uuid;
 /// Implements `AgentBackend` by spawning `pi -p --mode json` and parsing the
 /// resulting JSONL event stream.
 ///
-/// Pi reports input and cache token counts per-turn on `turn_end` rather
-/// than once at session start, so this backend accumulates them across the
-/// session and reports the totals in the `Finished` event at `agent_end`
-/// (output tokens are already accumulated by the caller from each turn's
-/// `MessageComplete`, so `Finished` reports `output_tokens: 0` to avoid
-/// double-counting).
+/// Pi reports input and cache token counts, plus dollar cost, per-turn on
+/// `turn_end` rather than once at session start, so this backend accumulates
+/// them across the session and reports the totals in the `Finished` event at
+/// `agent_end` (output tokens are already accumulated by the caller from
+/// each turn's `MessageComplete`, so `Finished` reports `output_tokens: 0`
+/// to avoid double-counting).
 pub(crate) struct PiBackend {
     /// Path or name of the Pi CLI binary to invoke (`agent.pi.binary` in config).
     binary: String,
