@@ -1,8 +1,8 @@
-//! Netflix Pi CLI backend implementation for the `AgentBackend` trait.
+//! Pi CLI backend implementation for the `AgentBackend` trait.
 //!
-//! Implements the `AgentBackend` interface for Pi (`pi`, npm
-//! `@netflix-internal/pi-agent`), mapping its JSONL streaming output
-//! (`pi -p --mode json`) to normalized `AgentEvent`s.
+//! Implements the `AgentBackend` interface for [Pi](https://github.com/earendil-works/pi-mono)
+//! (`pi`, npm `@earendil-works/pi-coding-agent`), mapping its JSONL streaming
+//! output (`pi -p --mode json`) to normalized `AgentEvent`s.
 //!
 //! Pi event types:
 //! - `session` / `agent_start` → `AgentEvent::Started`
@@ -25,7 +25,7 @@ use std::path::Path;
 use tokio::process::Command as TokioCommand;
 use uuid::Uuid;
 
-/// Netflix Pi CLI backend.
+/// Pi CLI backend.
 ///
 /// Implements `AgentBackend` by spawning `pi -p --mode json` and parsing the
 /// resulting JSONL event stream.
@@ -288,9 +288,9 @@ fn parse_usage(usage: Option<serde_json::Value>) -> Option<PiUsage> {
 
 /// Parse a single line of Pi JSONL output into normalized events.
 ///
-/// Silently ignores lines that aren't recognized JSON events, including the
-/// non-JSON preamble the newt shim prints to stdout before the event stream
-/// (e.g. "Using existing agent-beach…").
+/// Silently ignores lines that aren't recognized JSON events. This matters
+/// when Pi is invoked through a launcher or wrapper that prints its own
+/// non-JSON preamble to stdout ahead of the event stream.
 fn parse_pi_event(line: &str) -> Vec<AgentEvent> {
     if line.is_empty() {
         return Vec::new();
@@ -955,11 +955,15 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_event_newt_shim_preamble_lines() {
+    fn test_parse_event_wrapper_preamble_lines() {
+        // Launchers and wrappers may print their own status lines to stdout
+        // before Pi's event stream begins; these must be skipped, not parsed.
         let b = backend();
-        assert!(b.parse_events("Using existing agent-beach…").is_empty());
         assert!(b
-            .parse_events("Using existing Netflix Pi distribution package…")
+            .parse_events("Using existing sandbox at /path/to/sandbox")
+            .is_empty());
+        assert!(b
+            .parse_events("Using existing distribution package: npm:some-pi-package")
             .is_empty());
     }
 

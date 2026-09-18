@@ -8,7 +8,7 @@ Gru uses a pluggable agent architecture. Each backend implements the `AgentBacke
 |---------|----------|------------|--------|
 | Claude Code | `claude` | `--agent claude` | Default |
 | OpenAI Codex | `codex` | `--agent codex` | Supported |
-| Netflix Pi | `pi` | `--agent pi` | Supported (internal) |
+| Pi | `pi` | `--agent pi` | Supported |
 
 ## Claude Code (default)
 
@@ -92,13 +92,20 @@ codex exec resume --last --json --full-auto "<prompt>"
 
 Note: Codex does not support interactive resume (`gru attach` will not work with Codex minions). Codex also ignores the `session_id` parameter — it relies on its own session persistence for both new and resumed sessions.
 
-## Netflix Pi
+## Pi
 
-Pi is Netflix's internal coding agent CLI (`pi`, npm `@netflix-internal/pi-agent`), installed via newt at `/opt/nflx/bin/pi`. It is already authenticated to internal model providers, so no separate API key is needed.
+[Pi](https://github.com/earendil-works/pi-mono) is a coding agent CLI (`pi`) with a pluggable
+provider model — it supports many model providers, configured on the Pi side rather than by Gru.
 
 ### Install
 
-Install via newt (internal Netflix tooling). Not available outside Netflix.
+See [pi-mono](https://github.com/earendil-works/pi-mono) for install options (npm
+`@earendil-works/pi-coding-agent`). Some environments distribute Pi through a wrapper or
+internal package; Gru invokes whatever `pi` resolves to on `PATH`, and the binary path can be
+overridden in config if it lives elsewhere.
+
+Authentication and model selection are Pi's concern, not Gru's: Gru passes no provider or
+model flags unless `[agent.pi]` sets them, so Pi uses whatever it is already configured for.
 
 ### Verify
 

@@ -141,7 +141,7 @@ fn check_prerequisites() -> Result<i32> {
         println!("  ✓ codex (OpenAI Codex CLI)");
     }
     if has_pi {
-        println!("  ✓ pi (Netflix Pi CLI)");
+        println!("  ✓ pi (Pi CLI)");
     }
     if !has_claude && !has_codex && !has_pi {
         println!("  ⚠ No agent backend found (claude, codex, or pi)");
@@ -149,7 +149,7 @@ fn check_prerequisites() -> Result<i32> {
             "    Install Claude Code: https://docs.anthropic.com/en/docs/claude-code/overview"
         );
         println!("    Install Codex: https://github.com/openai/codex");
-        println!("    Install Pi: internal Netflix tooling via newt");
+        println!("    Install Pi: https://github.com/earendil-works/pi-mono");
     }
 
     if has_errors {
