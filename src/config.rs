@@ -62,6 +62,10 @@ pub(crate) struct AgentConfig {
     /// Claude-specific configuration ([agent.claude] in TOML)
     #[serde(default)]
     pub(crate) claude: ClaudeAgentConfig,
+
+    /// Pi-specific configuration ([agent.pi] in TOML)
+    #[serde(default)]
+    pub(crate) pi: PiAgentConfig,
 }
 
 impl Default for AgentConfig {
@@ -69,6 +73,7 @@ impl Default for AgentConfig {
         Self {
             default: default_agent_name(),
             claude: ClaudeAgentConfig::default(),
+            pi: PiAgentConfig::default(),
         }
     }
 }
@@ -90,6 +95,31 @@ pub(crate) struct ClaudeAgentConfig {
 
 fn default_agent_name() -> String {
     "claude".to_string()
+}
+
+/// Thinking effort levels accepted by Pi's `--thinking` flag.
+pub(crate) const PI_THINKING_LEVELS: &[&str] =
+    &["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+
+/// Pi-specific agent configuration.
+///
+/// A `binary` override matters more for Pi than for Claude, since some
+/// environments distribute Pi through a launcher at a non-standard path
+/// rather than a plain `pi` on `$PATH`.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub(crate) struct PiAgentConfig {
+    /// Override the binary path for the Pi CLI.
+    #[serde(default)]
+    pub(crate) binary: Option<String>,
+
+    /// Model to pass via `--model`. Supports Pi's `provider/id` format and
+    /// the `:<thinking>` suffix (e.g. `anthropic/claude-sonnet-5:high`).
+    #[serde(default)]
+    pub(crate) model: Option<String>,
+
+    /// Thinking effort to pass via `--thinking`. One of `PI_THINKING_LEVELS`.
+    #[serde(default)]
+    pub(crate) thinking: Option<String>,
 }
 
 /// Daemon configuration
@@ -871,6 +901,35 @@ impl LabConfig {
                 );
             }
         }
+
+        if let Some(binary) = &self.agent.pi.binary {
+            if binary.trim().is_empty() {
+                anyhow::bail!(
+                    "agent.pi.binary must not be empty. Remove the field to use \
+                     \"pi\" (resolved via $PATH), or set it to a valid binary path."
+                );
+            }
+        }
+
+        if let Some(model) = &self.agent.pi.model {
+            if model.trim().is_empty() {
+                anyhow::bail!(
+                    "agent.pi.model must not be empty. Remove the field to let Pi \
+                     use its own configured default, or set it to a valid \
+                     \"provider/id\" (optionally with a \":<thinking>\" suffix)."
+                );
+            }
+        }
+
+        if let Some(thinking) = &self.agent.pi.thinking {
+            if !PI_THINKING_LEVELS.contains(&thinking.as_str()) {
+                anyhow::bail!(
+                    "agent.pi.thinking must be one of: {}. Got '{}'.",
+                    PI_THINKING_LEVELS.join(", "),
+                    thinking
+                );
+            }
+        }
         Ok(())
     }
 
@@ -1238,6 +1297,95 @@ binary = "/usr/local/bin/claude"
             config.agent.claude.binary.as_deref(),
             Some("/usr/local/bin/claude")
         );
+    }
+
+    #[test]
+    fn test_agent_config_pi_section_absent() {
+        let config = LabConfig::default();
+        assert!(config.agent.pi.binary.is_none());
+        assert!(config.agent.pi.model.is_none());
+        assert!(config.agent.pi.thinking.is_none());
+    }
+
+    #[test]
+    fn test_agent_config_pi_section_parses() {
+        let config_toml = r#"
+[daemon]
+repos = ["owner/repo"]
+
+[agent.pi]
+binary = "/opt/tools/pi"
+model = "anthropic/claude-sonnet-5:high"
+thinking = "high"
+"#;
+        let mut temp_file = NamedTempFile::new().unwrap();
+        temp_file.write_all(config_toml.as_bytes()).unwrap();
+        temp_file.flush().unwrap();
+
+        let config = LabConfig::load(temp_file.path()).unwrap();
+        assert_eq!(config.agent.pi.binary.as_deref(), Some("/opt/tools/pi"));
+        assert_eq!(
+            config.agent.pi.model.as_deref(),
+            Some("anthropic/claude-sonnet-5:high")
+        );
+        assert_eq!(config.agent.pi.thinking.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn test_agent_pi_binary_empty_is_rejected() {
+        let config_toml = "[agent.pi]\nbinary = \"\"\n";
+        let mut temp_file = NamedTempFile::new().unwrap();
+        temp_file.write_all(config_toml.as_bytes()).unwrap();
+        temp_file.flush().unwrap();
+
+        let result = LabConfig::load_partial(temp_file.path());
+        assert!(result.is_err());
+        let msg = format!("{}", result.err().unwrap());
+        assert!(msg.contains("agent.pi.binary"), "{}", msg);
+    }
+
+    #[test]
+    fn test_agent_pi_model_empty_is_rejected() {
+        let config_toml = "[agent.pi]\nmodel = \"\"\n";
+        let mut temp_file = NamedTempFile::new().unwrap();
+        temp_file.write_all(config_toml.as_bytes()).unwrap();
+        temp_file.flush().unwrap();
+
+        let result = LabConfig::load_partial(temp_file.path());
+        assert!(result.is_err());
+        let msg = format!("{}", result.err().unwrap());
+        assert!(msg.contains("agent.pi.model"), "{}", msg);
+    }
+
+    #[test]
+    fn test_agent_pi_thinking_invalid_is_rejected() {
+        let config_toml = "[agent.pi]\nthinking = \"extreme\"\n";
+        let mut temp_file = NamedTempFile::new().unwrap();
+        temp_file.write_all(config_toml.as_bytes()).unwrap();
+        temp_file.flush().unwrap();
+
+        let result = LabConfig::load_partial(temp_file.path());
+        assert!(result.is_err());
+        let msg = format!("{}", result.err().unwrap());
+        assert!(msg.contains("agent.pi.thinking"), "{}", msg);
+    }
+
+    #[test]
+    fn test_agent_pi_thinking_valid_levels_accepted() {
+        for level in PI_THINKING_LEVELS {
+            let config_toml = format!("[agent.pi]\nthinking = \"{}\"\n", level);
+            let mut temp_file = NamedTempFile::new().unwrap();
+            temp_file.write_all(config_toml.as_bytes()).unwrap();
+            temp_file.flush().unwrap();
+
+            let result = LabConfig::load_partial(temp_file.path());
+            assert!(
+                result.is_ok(),
+                "level {} should be accepted: {:?}",
+                level,
+                result.err()
+            );
+        }
     }
 
     #[test]

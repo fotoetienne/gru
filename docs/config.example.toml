@@ -100,7 +100,7 @@
 # Configure which AI agent Gru delegates coding work to.
 
 # [agent]
-# Which backend to use by default. Options: "claude", "codex"
+# Which backend to use by default. Options: "claude", "codex", "pi"
 # Can be overridden per-run with `gru do 42 --agent codex`.
 # For codex setup details, see docs/AGENTS.md.
 # default = "claude"
@@ -115,6 +115,21 @@
 # there is no turn limit — the 20-minute wall-clock cap is the primary bound.
 # Set to a positive value to impose an explicit turn budget (e.g. 50).
 # ci_fix_max_turns = 50
+
+# [agent.pi]
+# Override the Pi CLI binary path. This matters more for Pi than for Claude,
+# since some environments distribute Pi through a launcher at a
+# non-standard path rather than a plain `pi` on $PATH.
+# binary = "/usr/local/bin/pi"
+#
+# Model to pass via `--model`. Supports Pi's "provider/id" format and a
+# ":<thinking>" suffix (e.g. "anthropic/claude-sonnet-5:high"). Provider
+# auth and model selection are otherwise Pi's own concern, not Gru's.
+# model = "anthropic/claude-sonnet-5"
+#
+# Thinking effort to pass via `--thinking`. One of: off, minimal, low,
+# medium, high, xhigh, max.
+# thinking = "high"
 
 # ─────────────────────────────────────────────────────────────────────
 # Merge readiness

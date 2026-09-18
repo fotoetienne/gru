@@ -112,6 +112,7 @@ git commit --no-verify
 - `src/agent_runner.rs` - Generic agent execution and monitoring (backend-agnostic)
 - `src/claude_backend.rs` - Claude Code CLI backend implementation (implements AgentBackend)
 - `src/codex_backend.rs` - OpenAI Codex CLI backend implementation (implements AgentBackend)
+- `src/pi_backend.rs` - Pi CLI backend implementation (implements AgentBackend)
 - `src/minion.rs` - Minion ID generation (monotonic counter, base36 format: M000, M001, etc.)
 - `src/minion_registry.rs` - Persistent Minion tracking (`~/.gru/state/minions.json` with file locking)
 - `src/minion_resolver.rs` - Resolve Minion by ID, issue number, or PR number
@@ -184,7 +185,7 @@ claude --print \
 **Multi-Agent Architecture:**
 - Pluggable agent backends via the `AgentBackend` trait (`src/agent.rs`)
 - `AgentRegistry` resolves agent names to backend implementations
-- Built-in backends: Claude Code CLI (`claude_backend.rs`), OpenAI Codex CLI (`codex_backend.rs`)
+- Built-in backends: Claude Code CLI (`claude_backend.rs`), OpenAI Codex CLI (`codex_backend.rs`), Pi CLI (`pi_backend.rs`)
 - `AgentRunner` provides backend-agnostic execution and monitoring
 
 **Timeout & Stuck Detection** (constants in `agent_runner.rs`):

@@ -29,8 +29,52 @@ use uuid::Uuid;
 ///
 /// Implements `AgentBackend` by spawning `pi -p --mode json` and parsing the
 /// resulting JSONL event stream.
-#[derive(Default)]
-pub(crate) struct PiBackend;
+pub(crate) struct PiBackend {
+    /// Path or name of the Pi CLI binary to invoke (`agent.pi.binary` in config).
+    binary: String,
+    /// Model to pass via `--model` (`agent.pi.model` in config). `None` lets
+    /// Pi use its own configured default.
+    model: Option<String>,
+    /// Thinking effort to pass via `--thinking` (`agent.pi.thinking` in config).
+    thinking: Option<String>,
+}
+
+impl Default for PiBackend {
+    fn default() -> Self {
+        Self {
+            binary: "pi".to_string(),
+            model: None,
+            thinking: None,
+        }
+    }
+}
+
+impl PiBackend {
+    pub(crate) fn new(
+        binary: Option<String>,
+        model: Option<String>,
+        thinking: Option<String>,
+    ) -> Self {
+        Self {
+            binary: binary.unwrap_or_else(|| "pi".to_string()),
+            model,
+            thinking,
+        }
+    }
+
+    /// Appends `--model`/`--thinking` flags (in that order) to `cmd` when
+    /// configured. Must be called *before* the prompt argument is added —
+    /// Pi's `-p <prompt>` positional could otherwise swallow trailing flags
+    /// as part of the prompt text.
+    fn apply_model_flags(&self, cmd: &mut TokioCommand) {
+        if let Some(model) = &self.model {
+            cmd.arg("--model").arg(model);
+        }
+        if let Some(thinking) = &self.thinking {
+            cmd.arg("--thinking").arg(thinking);
+        }
+    }
+}
 
 impl AgentBackend for PiBackend {
     fn name(&self) -> &str {
@@ -41,6 +85,10 @@ impl AgentBackend for PiBackend {
         &["pi"]
     }
 
+    /// Uses `pi -p --mode json --session-id <uuid> [--model ...] [--thinking ...]
+    /// <prompt>` for autonomous headless execution with JSONL streaming output.
+    /// There is no `--dangerously-skip-permissions` equivalent for Pi; `bash`
+    /// and `edit` tools run without approval prompts by default under `-p`.
     fn build_command(
         &self,
         worktree_path: &Path,
@@ -48,7 +96,14 @@ impl AgentBackend for PiBackend {
         prompt: &str,
         github_host: &str,
     ) -> TokioCommand {
-        let mut cmd = build_pi_command(worktree_path, session_id, prompt);
+        let mut cmd = TokioCommand::new(&self.binary);
+        cmd.arg("-p")
+            .arg("--mode")
+            .arg("json")
+            .arg("--session-id")
+            .arg(session_id.to_string());
+        self.apply_model_flags(&mut cmd);
+        apply_pi_stdio(cmd.arg(prompt), worktree_path);
         cmd.env("GH_HOST", github_host);
         cmd
     }
@@ -65,9 +120,7 @@ impl AgentBackend for PiBackend {
         github_host: &str,
     ) -> Option<TokioCommand> {
         // Pi resumes a session by passing the same --session-id with a new prompt.
-        let mut cmd = build_pi_command(worktree_path, session_id, prompt);
-        cmd.env("GH_HOST", github_host);
-        Some(cmd)
+        Some(self.build_command(worktree_path, session_id, prompt, github_host))
     }
 
     fn build_interactive_resume_command(
@@ -77,53 +130,72 @@ impl AgentBackend for PiBackend {
         github_host: &str,
     ) -> Option<TokioCommand> {
         // Pi supports interactive resume: drop -p, keep --session-id.
-        let mut cmd = build_pi_interactive_command(worktree_path, session_id);
+        let mut cmd = TokioCommand::new(&self.binary);
+        cmd.arg("--session-id").arg(session_id.to_string());
+        self.apply_model_flags(&mut cmd);
+        cmd.current_dir(worktree_path)
+            .stdin(std::process::Stdio::inherit())
+            .stdout(std::process::Stdio::inherit())
+            .stderr(std::process::Stdio::inherit())
+            .env_remove(crate::labels::GRU_RETRY_PARENT_ENV)
+            .env_remove(crate::labels::GRU_CONFIG_PATH_ENV);
         cmd.env("GH_HOST", github_host);
         Some(cmd)
     }
 
+    /// When `prompt_arg` is `"-"`, the prompt argument is omitted and stdin is
+    /// piped instead — `pi -p -` emits nothing, so the sentinel must not be
+    /// passed as a literal argument.
     fn build_oneshot_command(
         &self,
         worktree_path: &Path,
         prompt_arg: &str,
         github_host: &str,
     ) -> TokioCommand {
-        let mut cmd = build_pi_oneshot_command(worktree_path, prompt_arg);
+        let mut cmd = TokioCommand::new(&self.binary);
+        cmd.arg("-p");
+        self.apply_model_flags(&mut cmd);
+
+        if prompt_arg == "-" {
+            cmd.stdin(std::process::Stdio::piped());
+        } else {
+            cmd.arg(prompt_arg);
+            cmd.stdin(std::process::Stdio::null());
+        }
+
+        cmd.current_dir(worktree_path)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::inherit())
+            .env_remove(crate::labels::GRU_RETRY_PARENT_ENV)
+            .env_remove(crate::labels::GRU_CONFIG_PATH_ENV);
         cmd.env("GH_HOST", github_host);
         cmd
     }
 
+    /// Omits `--session-id` entirely (unlike `build_command`) so repeated CI
+    /// fixes in the same worktree never share Pi conversation history —
+    /// CI-fix invocations must be stateless one-shots per the `AgentBackend`
+    /// contract.
     fn build_ci_fix_command(
         &self,
         worktree_path: &Path,
         prompt: &str,
         github_host: &str,
     ) -> TokioCommand {
-        let mut cmd = build_pi_ci_fix_command(worktree_path, prompt);
+        let mut cmd = TokioCommand::new(&self.binary);
+        cmd.arg("-p").arg("--mode").arg("json");
+        self.apply_model_flags(&mut cmd);
+        apply_pi_stdio(cmd.arg(prompt), worktree_path);
         cmd.env("GH_HOST", github_host);
         cmd
     }
 }
 
-// ---------------------------------------------------------------------------
-// Command builders
-// ---------------------------------------------------------------------------
-
-/// Builds a Pi command for a new or resumed session.
-///
-/// Uses `pi -p --mode json --session-id <uuid> <prompt>` for autonomous
-/// headless execution with JSONL streaming output. There is no
-/// `--dangerously-skip-permissions` equivalent for Pi; `bash` and `edit`
-/// tools run without approval prompts by default under `-p`.
-fn build_pi_command(worktree_path: &Path, session_id: &Uuid, prompt: &str) -> TokioCommand {
-    let mut cmd = TokioCommand::new("pi");
-    cmd.arg("-p")
-        .arg("--mode")
-        .arg("json")
-        .arg("--session-id")
-        .arg(session_id.to_string())
-        .arg(prompt)
-        .stdin(std::process::Stdio::null())
+/// Applies the stdio/cwd/env settings shared by `-p --mode json` invocations
+/// that pass a prompt as a positional argument (`build_command` and
+/// `build_ci_fix_command`).
+fn apply_pi_stdio(cmd: &mut TokioCommand, worktree_path: &Path) {
+    cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::inherit())
         .current_dir(worktree_path)
@@ -133,68 +205,6 @@ fn build_pi_command(worktree_path: &Path, session_id: &Uuid, prompt: &str) -> To
         // worker config instead of behaving as a standalone invocation.
         .env_remove(crate::labels::GRU_RETRY_PARENT_ENV)
         .env_remove(crate::labels::GRU_CONFIG_PATH_ENV);
-    cmd
-}
-
-/// Builds a Pi command for interactive session resume (used by `gru attach`).
-///
-/// Drops `-p` and `--mode json` in favor of Pi's interactive TUI, which shows
-/// prior history for the given session ID.
-fn build_pi_interactive_command(worktree_path: &Path, session_id: &Uuid) -> TokioCommand {
-    let mut cmd = TokioCommand::new("pi");
-    cmd.arg("--session-id")
-        .arg(session_id.to_string())
-        .current_dir(worktree_path)
-        .stdin(std::process::Stdio::inherit())
-        .stdout(std::process::Stdio::inherit())
-        .stderr(std::process::Stdio::inherit())
-        .env_remove(crate::labels::GRU_RETRY_PARENT_ENV)
-        .env_remove(crate::labels::GRU_CONFIG_PATH_ENV);
-    cmd
-}
-
-/// Builds a Pi command for a stateless CI-fix invocation.
-///
-/// Omits `--session-id` entirely (unlike `build_pi_command`) so repeated CI
-/// fixes in the same worktree never share Pi conversation history — CI-fix
-/// invocations must be stateless one-shots per the `AgentBackend` contract.
-fn build_pi_ci_fix_command(worktree_path: &Path, prompt: &str) -> TokioCommand {
-    let mut cmd = TokioCommand::new("pi");
-    cmd.arg("-p")
-        .arg("--mode")
-        .arg("json")
-        .arg(prompt)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::inherit())
-        .current_dir(worktree_path)
-        .env_remove(crate::labels::GRU_RETRY_PARENT_ENV)
-        .env_remove(crate::labels::GRU_CONFIG_PATH_ENV);
-    cmd
-}
-
-/// Builds a Pi command for a one-shot utility task (no session tracking).
-///
-/// When `prompt_arg` is `"-"`, the prompt argument is omitted and stdin is
-/// piped instead — `pi -p -` emits nothing, so the sentinel must not be
-/// passed as a literal argument.
-fn build_pi_oneshot_command(worktree_path: &Path, prompt_arg: &str) -> TokioCommand {
-    let mut cmd = TokioCommand::new("pi");
-    cmd.arg("-p");
-
-    if prompt_arg == "-" {
-        cmd.stdin(std::process::Stdio::piped());
-    } else {
-        cmd.arg(prompt_arg);
-        cmd.stdin(std::process::Stdio::null());
-    }
-
-    cmd.current_dir(worktree_path)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::inherit())
-        .env_remove(crate::labels::GRU_RETRY_PARENT_ENV)
-        .env_remove(crate::labels::GRU_CONFIG_PATH_ENV);
-    cmd
 }
 
 // ---------------------------------------------------------------------------
@@ -434,7 +444,7 @@ mod tests {
     use super::*;
 
     fn backend() -> PiBackend {
-        PiBackend
+        PiBackend::default()
     }
 
     /// Assert that parse_events returns exactly one event and return it.
@@ -451,6 +461,59 @@ mod tests {
     #[test]
     fn test_name() {
         assert_eq!(backend().name(), "pi");
+    }
+
+    #[test]
+    fn test_configured_binary_is_used() {
+        let b = PiBackend::new(Some("/opt/tools/pi".to_string()), None, None);
+        let path = std::path::PathBuf::from("/tmp/worktree");
+        let session_id = Uuid::nil();
+        let cmd = b.build_command(&path, &session_id, "fix the bug", "github.com");
+        assert_eq!(cmd.as_std().get_program(), "/opt/tools/pi");
+    }
+
+    #[test]
+    fn test_configured_model_and_thinking_are_appended() {
+        let b = PiBackend::new(
+            None,
+            Some("anthropic/claude-sonnet-5".to_string()),
+            Some("high".to_string()),
+        );
+        let path = std::path::PathBuf::from("/tmp/worktree");
+        let session_id = Uuid::nil();
+        let cmd = b.build_command(&path, &session_id, "fix the bug", "github.com");
+        let inner = cmd.as_std();
+        let args: Vec<&std::ffi::OsStr> = inner.get_args().collect();
+        assert!(args.contains(&"--model".as_ref()));
+        assert!(args.contains(&"anthropic/claude-sonnet-5".as_ref()));
+        assert!(args.contains(&"--thinking".as_ref()));
+        assert!(args.contains(&"high".as_ref()));
+
+        // --model/--thinking must precede the positional prompt: if Pi's `-p`
+        // takes a greedy/trailing positional, flags placed after the prompt
+        // would be silently absorbed into the prompt text instead of parsed.
+        assert_eq!(*args.last().unwrap(), std::ffi::OsStr::new("fix the bug"));
+        let model_pos = args
+            .iter()
+            .position(|a| *a == std::ffi::OsStr::new("--model"))
+            .unwrap();
+        let prompt_pos = args.len() - 1;
+        assert!(
+            model_pos < prompt_pos,
+            "--model must come before the prompt argument"
+        );
+    }
+
+    #[test]
+    fn test_no_model_flags_when_unconfigured() {
+        let b = backend();
+        let path = std::path::PathBuf::from("/tmp/worktree");
+        let session_id = Uuid::nil();
+        let cmd = b.build_command(&path, &session_id, "fix the bug", "github.com");
+        let inner = cmd.as_std();
+        let args: Vec<&std::ffi::OsStr> = inner.get_args().collect();
+        assert!(!args.contains(&"--model".as_ref()));
+        assert!(!args.contains(&"--thinking".as_ref()));
     }
 
     #[test]
