@@ -11,7 +11,8 @@
 //! - `message_update` (`assistantMessageEvent.type == "text_delta"`) → `AgentEvent::TextDelta`
 //! - `tool_execution_start` → `AgentEvent::ToolUse`
 //! - `tool_execution_end` → `AgentEvent::ToolResult`
-//! - `turn_end` → `AgentEvent::MessageComplete`
+//! - `turn_end` → `AgentEvent::MessageComplete` (plus `AgentEvent::ModelInfo`
+//!   when the event also carries `provider`/`model`)
 //! - `agent_end` → `AgentEvent::Finished`
 //! - `turn_failed` / `error` → `AgentEvent::Error`
 //!
@@ -290,6 +291,33 @@ struct PiEvent {
     /// per-event-type interpretation.
     #[serde(default)]
     message: Option<serde_json::Value>,
+    /// Present at the top level on `turn_end` events (alongside `usage`).
+    /// `message_start` instead nests these under `message` — see
+    /// `extract_provider_model`.
+    #[serde(default)]
+    provider: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
+}
+
+/// Extracts `provider`/`model` from wherever a given Pi event puts them:
+/// top-level fields (`turn_end`) or nested under `message` (`message_start`).
+fn extract_provider_model(event: &PiEvent) -> (Option<String>, Option<String>) {
+    if event.provider.is_some() || event.model.is_some() {
+        return (event.provider.clone(), event.model.clone());
+    }
+    let Some(message) = &event.message else {
+        return (None, None);
+    };
+    let provider = message
+        .get("provider")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let model = message
+        .get("model")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    (provider, model)
 }
 
 /// Nested assistant message event carried by `message_update`.
@@ -367,17 +395,7 @@ fn parse_pi_event(line: &str, accumulated_usage: &Mutex<TokenUsage>) -> Vec<Agen
         "turn_start" => vec![AgentEvent::Thinking { text: None }],
 
         "message_start" => {
-            let Some(message) = event.message else {
-                return Vec::new();
-            };
-            let provider = message
-                .get("provider")
-                .and_then(|v| v.as_str())
-                .map(str::to_string);
-            let model = message
-                .get("model")
-                .and_then(|v| v.as_str())
-                .map(str::to_string);
+            let (provider, model) = extract_provider_model(&event);
             if provider.is_none() && model.is_none() {
                 return Vec::new();
             }
@@ -434,6 +452,7 @@ fn parse_pi_event(line: &str, accumulated_usage: &Mutex<TokenUsage>) -> Vec<Agen
         }
 
         "turn_end" => {
+            let (provider, model) = extract_provider_model(&event);
             let usage = parse_usage(event.usage).map(|u| TokenUsage {
                 input_tokens: u.input,
                 output_tokens: u.output,
@@ -450,10 +469,15 @@ fn parse_pi_event(line: &str, accumulated_usage: &Mutex<TokenUsage>) -> Vec<Agen
                     *accumulated.cache_read_input_tokens.get_or_insert(0) += cache_read;
                 }
             }
-            vec![AgentEvent::MessageComplete {
+            let mut events = Vec::with_capacity(2);
+            if provider.is_some() || model.is_some() {
+                events.push(AgentEvent::ModelInfo { provider, model });
+            }
+            events.push(AgentEvent::MessageComplete {
                 stop_reason: Some("end_turn".to_string()),
                 usage,
-            }]
+            });
+            events
         }
 
         "agent_end" => {
@@ -983,6 +1007,21 @@ mod tests {
             }
             other => panic!("Expected MessageComplete, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_parse_event_turn_end_with_provider_and_model() {
+        let b = backend();
+        let line = r#"{"type":"turn_end","provider":"nflx-openai","model":"gpt-5.6-sol","usage":{"input":1000,"output":500}}"#;
+        let events = b.parse_events(line);
+        assert_eq!(
+            events[0],
+            AgentEvent::ModelInfo {
+                provider: Some("nflx-openai".to_string()),
+                model: Some("gpt-5.6-sol".to_string()),
+            }
+        );
+        assert!(matches!(events[1], AgentEvent::MessageComplete { .. }));
     }
 
     #[test]
