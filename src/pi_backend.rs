@@ -807,6 +807,20 @@ mod tests {
     }
 
     #[test]
+    fn test_sanitize_oneshot_output_all_preamble_yields_empty() {
+        let b = backend();
+        let raw = "Using existing sandbox at /path/to/sandbox\n\
+                   Using existing distribution package: npm:@earendil-works/pi-coding-agent";
+        assert_eq!(b.sanitize_oneshot_output(raw), "");
+    }
+
+    #[test]
+    fn test_sanitize_oneshot_output_empty_input() {
+        let b = backend();
+        assert_eq!(b.sanitize_oneshot_output(""), "");
+    }
+
+    #[test]
     fn test_sanitize_oneshot_output_only_strips_leading_preamble_lines() {
         let b = backend();
         // A legitimate answer that merely mentions the phrase mid-output
