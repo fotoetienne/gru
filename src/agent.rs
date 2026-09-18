@@ -164,9 +164,24 @@ impl TokenUsage {
             format_token_count(self.output_tokens)
         );
         match self.cost {
-            Some(cost) => format!("{} (${:.4})", base, cost),
+            Some(cost) => format!("{} ({})", base, format_cost(cost)),
             None => base,
         }
+    }
+}
+
+/// Format a dollar cost, widening precision beyond the usual 4 decimals so a
+/// small-but-nonzero cost (Pi can report category costs as low as
+/// `0.000012`) never rounds down to a misleading "$0.0000".
+fn format_cost(cost: f64) -> String {
+    let mut decimals = 4;
+    loop {
+        let formatted = format!("{:.*}", decimals, cost);
+        let rounds_to_zero = formatted.parse::<f64>().unwrap_or(0.0) == 0.0;
+        if cost == 0.0 || !rounds_to_zero || decimals >= 10 {
+            return format!("${}", formatted);
+        }
+        decimals += 2;
     }
 }
 
@@ -721,6 +736,30 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(usage.display_compact(), "1.0k in / 500 out");
+    }
+
+    #[test]
+    fn test_token_usage_display_compact_small_nonzero_cost_not_rounded_to_zero() {
+        // A cost this small would round to "$0.0000" at the usual 4 decimals,
+        // making a real non-zero session cost look like zero.
+        let usage = TokenUsage {
+            input_tokens: 10,
+            output_tokens: 5,
+            cost: Some(0.000012),
+            ..Default::default()
+        };
+        assert_eq!(usage.display_compact(), "10 in / 5 out ($0.000012)");
+    }
+
+    #[test]
+    fn test_token_usage_display_compact_zero_cost() {
+        let usage = TokenUsage {
+            input_tokens: 10,
+            output_tokens: 5,
+            cost: Some(0.0),
+            ..Default::default()
+        };
+        assert_eq!(usage.display_compact(), "10 in / 5 out ($0.0000)");
     }
 
     #[test]

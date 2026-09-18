@@ -363,10 +363,15 @@ struct PiUsage {
 
 /// Dollar cost breakdown nested under a Pi `usage` object. Only the `total`
 /// is surfaced today; per-category costs aren't tracked separately.
+///
+/// `total` is `Option` rather than defaulting to `0.0`: a `cost` object
+/// present without a valid `total` (schema drift) must not fabricate a real
+/// `Some(0.0)` cost — `TokenUsage.cost` should stay `None` in that case, same
+/// as when `cost` is absent entirely.
 #[derive(Debug, Deserialize)]
 struct PiCost {
     #[serde(default)]
-    total: f64,
+    total: Option<f64>,
 }
 
 /// Parses a raw `usage` JSON value into `PiUsage`, tolerating malformed or
@@ -468,7 +473,7 @@ fn parse_pi_event(line: &str, accumulated_usage: &Mutex<TokenUsage>) -> Vec<Agen
                 output_tokens: u.output,
                 cache_read_input_tokens: u.cache_read,
                 cache_creation_input_tokens: u.cache_write,
-                cost: u.cost.map(|c| c.total),
+                cost: u.cost.and_then(|c| c.total),
             });
             if let Some(u) = &usage {
                 let mut accumulated = accumulated_usage.lock().unwrap();
@@ -1043,8 +1048,9 @@ mod tests {
     fn test_parse_event_turn_end_with_malformed_cost_object_degrades_gracefully() {
         // A `cost` object present but missing `total` (schema drift) must
         // not fail parsing of the whole `usage` object and drop input/
-        // output/cache tokens along with it — it should just default to 0.0
-        // the same way other malformed-but-present usage subfields do.
+        // output/cache tokens along with it. It also must not fabricate a
+        // fake `Some(0.0)` cost — `cost` should stay `None`, same as when
+        // the `cost` object is absent entirely.
         let b = backend();
         let line = r#"{"type":"turn_end","usage":{"input":1000,"output":500,"cost":{}}}"#;
         let event = single(b.parse_events(line));
@@ -1053,7 +1059,7 @@ mod tests {
                 let u = usage.unwrap();
                 assert_eq!(u.input_tokens, 1000);
                 assert_eq!(u.output_tokens, 500);
-                assert_eq!(u.cost, Some(0.0));
+                assert_eq!(u.cost, None);
             }
             other => panic!("Expected MessageComplete, got {:?}", other),
         }
