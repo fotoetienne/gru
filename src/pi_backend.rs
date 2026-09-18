@@ -204,6 +204,10 @@ impl AgentBackend for PiBackend {
     fn final_usage(&self) -> Option<TokenUsage> {
         Some(self.accumulated_usage.lock().unwrap().clone())
     }
+
+    fn reset_usage(&self) {
+        *self.accumulated_usage.lock().unwrap() = TokenUsage::default();
+    }
 }
 
 /// Applies the stdio/cwd/env settings shared by `-p --mode json` invocations
@@ -327,15 +331,11 @@ fn parse_pi_event(line: &str, accumulated_usage: &Mutex<TokenUsage>) -> Vec<Agen
     };
 
     match event.event_type.as_str() {
-        "session" | "agent_start" => {
-            // Reset accumulated usage at the start of each stream. The
-            // backend instance is reused across independent invocations
-            // (e.g. multiple CI-fix attempts driven by the same backend
-            // reference), so stale totals from a prior session/attempt must
-            // not leak into this one's `Finished` usage.
-            *accumulated_usage.lock().unwrap() = TokenUsage::default();
-            vec![AgentEvent::Started { usage: None }]
-        }
+        // Usage accumulation is reset once per invocation via
+        // `AgentBackend::reset_usage()` (called by the runner before the
+        // process is spawned), not here — a startup failure could exit
+        // before this event ever arrives.
+        "session" | "agent_start" => vec![AgentEvent::Started { usage: None }],
 
         "turn_start" => vec![AgentEvent::Thinking { text: None }],
 
@@ -1024,11 +1024,14 @@ mod tests {
     }
 
     #[test]
-    fn test_session_start_resets_accumulated_usage_across_invocations() {
+    fn test_reset_usage_clears_accumulated_usage_across_invocations() {
         // The backend instance is reused across independent invocations
-        // (e.g. multiple CI-fix attempts share one `&dyn AgentBackend`), so a
-        // second stream's `session`/`agent_start` must not let the first
-        // stream's totals leak into the second stream's `Finished` usage.
+        // (e.g. multiple CI-fix attempts share one `&dyn AgentBackend`).
+        // `run_agent_with_stream_monitoring` calls `reset_usage()` before
+        // spawning each new invocation's process — not on `session`/
+        // `agent_start`, since a startup failure could exit before that
+        // event ever arrives — so this must clear totals left over from a
+        // prior invocation regardless of what that invocation emitted.
         let b = backend();
 
         b.parse_events(r#"{"type":"session"}"#);
@@ -1038,6 +1041,7 @@ mod tests {
         b.parse_events(r#"{"type":"agent_end"}"#);
 
         // New invocation reusing the same backend instance.
+        b.reset_usage();
         b.parse_events(r#"{"type":"agent_start"}"#);
         let event = single(b.parse_events(r#"{"type":"agent_end"}"#));
         match event {
@@ -1049,6 +1053,35 @@ mod tests {
             }
             other => panic!("Expected Finished, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_reset_usage_clears_state_even_if_prior_invocation_never_started() {
+        // If a process from a prior invocation exited before ever emitting
+        // `session`/`agent_start` (e.g. a startup failure with no JSON
+        // stdout), its accumulated usage from a still-earlier invocation
+        // could linger. `reset_usage()` must clear it regardless, since the
+        // runner calls it unconditionally before spawning — it cannot rely
+        // on `session`/`agent_start` having fired for the invocation being
+        // reset.
+        let b = backend();
+
+        b.parse_events(r#"{"type":"session"}"#);
+        b.parse_events(
+            r#"{"type":"turn_end","usage":{"input":1000,"output":500,"cacheRead":200,"cacheWrite":50}}"#,
+        );
+        // Invocation 1 ends here (crashed before "agent_end").
+
+        // Invocation 2 starts: runner resets, but this process fails before
+        // ever emitting "session"/"agent_start" or any usage-bearing event.
+        b.reset_usage();
+
+        // Invocation 3 starts: runner resets again.
+        b.reset_usage();
+        let usage = b.final_usage().unwrap();
+        assert_eq!(usage.input_tokens, 0, "must not leak invocation 1's totals");
+        assert_eq!(usage.cache_creation_input_tokens, None);
+        assert_eq!(usage.cache_read_input_tokens, None);
     }
 
     #[test]

@@ -211,6 +211,16 @@ where
     // but forcing it here prevents silent failures from misconfigured commands.
     cmd.stdout(std::process::Stdio::piped());
 
+    // Clear any usage accumulated by a prior invocation before spawning
+    // this one. A backend instance is reused across independent
+    // invocations (e.g. `ci.rs`'s CI-fix retry loop), and this must happen
+    // unconditionally here rather than relying on a stream-start event
+    // (e.g. Pi's `session`/`agent_start`, Codex's `thread.started`): if the
+    // new process exits before ever emitting that event — a startup or
+    // auth failure with no JSON stdout — the previous invocation's totals
+    // would otherwise leak into this one's `final_usage()` result below.
+    backend.reset_usage();
+
     // Spawn the command
     let mut child = cmd
         .spawn()
@@ -842,6 +852,10 @@ mod tests {
         fn final_usage(&self) -> Option<TokenUsage> {
             Some(self.accumulated.lock().unwrap().clone())
         }
+
+        fn reset_usage(&self) {
+            *self.accumulated.lock().unwrap() = TokenUsage::default();
+        }
     }
 
     #[tokio::test]
@@ -877,5 +891,53 @@ mod tests {
             "output still comes from per-turn MessageComplete"
         );
         assert_eq!(result.token_usage.cache_read_input_tokens, Some(300));
+    }
+
+    #[tokio::test]
+    async fn test_run_agent_resets_usage_before_next_invocation() {
+        // A backend instance is reused across independent invocations
+        // (e.g. ci.rs's CI-fix retry loop). run_agent_with_stream_monitoring
+        // must clear accumulated usage before spawning each invocation's
+        // process — unconditionally, not by relying on a stream-start event
+        // that a crashed/no-output process might never emit — so a second,
+        // usage-free invocation doesn't inherit the first invocation's totals.
+        let backend = NoFinishedEventBackend {
+            accumulated: std::sync::Mutex::new(TokenUsage::default()),
+        };
+        let events_dir = tempfile::tempdir().unwrap();
+
+        let mut first_cmd = TokioCommand::new("sh");
+        first_cmd.arg("-c").arg("printf '1000,500,200\\n'");
+        let first = run_agent_with_stream_monitoring(
+            first_cmd,
+            &backend,
+            events_dir.path(),
+            None,
+            None::<fn(&AgentEvent)>,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(first.token_usage.input_tokens, 1000);
+
+        // Second invocation's process produces no usage-bearing output at
+        // all (e.g. it failed before emitting anything recognizable).
+        let mut second_cmd = TokioCommand::new("sh");
+        second_cmd.arg("-c").arg("true");
+        let second = run_agent_with_stream_monitoring(
+            second_cmd,
+            &backend,
+            events_dir.path(),
+            None,
+            None::<fn(&AgentEvent)>,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            second.token_usage.input_tokens, 0,
+            "must not inherit the first invocation's totals"
+        );
     }
 }

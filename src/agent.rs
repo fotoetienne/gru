@@ -295,6 +295,24 @@ pub(crate) trait AgentBackend: Send + Sync {
     fn final_usage(&self) -> Option<TokenUsage> {
         None
     }
+
+    /// Clears any usage totals accumulated internally by the backend from a
+    /// prior invocation.
+    ///
+    /// `run_agent_with_stream_monitoring` calls this once, unconditionally,
+    /// before spawning the process for a new invocation. A backend instance
+    /// is reused across independent invocations (e.g. `src/ci.rs`'s CI-fix
+    /// retry loop drives multiple attempts through the same
+    /// `&dyn AgentBackend`), so relying solely on a stream-start event
+    /// (e.g. Pi's `session`/`agent_start`, Codex's `thread.started`) to
+    /// reset state is not safe: if a new process exits before ever emitting
+    /// that event (a startup or auth failure with no JSON stdout), the
+    /// previous invocation's totals would otherwise leak into
+    /// `final_usage()`'s result for this one.
+    ///
+    /// No-op by default; backends without per-turn accumulation (e.g.
+    /// Claude Code) don't need to override this.
+    fn reset_usage(&self) {}
 }
 
 #[cfg(test)]
