@@ -110,22 +110,18 @@ a crash. If progress output is empty or tool calls never appear, compare your `p
 See [pi-mono](https://github.com/earendil-works/pi-mono) for install options (npm
 `@earendil-works/pi-coding-agent`). Some environments distribute Pi through a wrapper or
 internal package rather than a plain `pi` on `$PATH`; use `[agent.pi].binary` in
-`~/.gru/config.toml` to point Gru at it:
+`~/.gru/config.toml` to point Gru at it. Model selection can also optionally be driven
+from Gru's config — all of these keys live in the same `[agent.pi]` table:
 
 ```toml
 [agent.pi]
 binary = "/usr/local/bin/pi"
-```
-
-Authentication belongs to Pi's own configuration, not Gru's — Gru does not manage
-provider credentials. Model selection can optionally be driven from Gru's config:
-
-```toml
-[agent.pi]
 model = "anthropic/claude-sonnet-5"   # "provider/id", optionally with a ":<thinking>" suffix
 thinking = "high"                     # off | minimal | low | medium | high | xhigh | max
 ```
 
+Every key is optional and independent — set only the ones you need. Authentication
+belongs to Pi's own configuration, not Gru's — Gru does not manage provider credentials.
 When `model`/`thinking` are unset, Pi uses whatever it is already configured for.
 
 ### Verify
