@@ -7,6 +7,7 @@
 //! Pi event types:
 //! - `session` / `agent_start` → `AgentEvent::Started`
 //! - `turn_start` → `AgentEvent::Thinking`
+//! - `message_start` → `AgentEvent::ModelInfo`
 //! - `message_update` (`assistantMessageEvent.type == "text_delta"`) → `AgentEvent::TextDelta`
 //! - `tool_execution_start` → `AgentEvent::ToolUse`
 //! - `tool_execution_end` → `AgentEvent::ToolResult`
@@ -17,6 +18,19 @@
 //! Unlike Codex, Pi supports interactive session resume (needed by `gru attach`)
 //! and has no `--dangerously-skip-permissions` equivalent — autonomous tool use
 //! is the default under `-p`.
+//!
+//! ## Model selection is intentionally Pi's decision, not Gru's
+//!
+//! `PiBackend` passes `--model`/`--thinking` only when `[agent.pi]` sets
+//! them (see `apply_model_flags`). With no config it passes neither and lets
+//! Pi resolve its own default — Pi's provider/model is pluggable, so "the
+//! default" varies by machine and Pi version, not a fixed value Gru could
+//! usefully pin. Pi users have already configured Pi for their own needs;
+//! having Gru override that would be surprising. Do not "fix" this by
+//! defaulting `model`/`thinking` to a hardcoded value — instead, the actual
+//! provider/model Pi used is captured from `message_start` events (see
+//! `AgentEvent::ModelInfo`) so `events.jsonl` still records which model did
+//! the work, without Gru forcing a choice.
 
 use crate::agent::{AgentBackend, AgentEvent, TokenUsage};
 use crate::display_utils::{shorten_path, truncate_string};
@@ -270,9 +284,12 @@ struct PiEvent {
     /// signal — see `parse_usage`.
     #[serde(default)]
     usage: Option<serde_json::Value>,
-    /// Present on `error` / `turn_failed` events.
+    /// Present on `error` / `turn_failed` events as a plain string, and on
+    /// `message_start` events as a `{role, provider, model, ...}` object —
+    /// hence `Value` rather than `String`; see `parse_pi_event` for the
+    /// per-event-type interpretation.
     #[serde(default)]
-    message: Option<String>,
+    message: Option<serde_json::Value>,
 }
 
 /// Nested assistant message event carried by `message_update`.
@@ -348,6 +365,24 @@ fn parse_pi_event(line: &str, accumulated_usage: &Mutex<TokenUsage>) -> Vec<Agen
         "session" | "agent_start" => vec![AgentEvent::Started { usage: None }],
 
         "turn_start" => vec![AgentEvent::Thinking { text: None }],
+
+        "message_start" => {
+            let Some(message) = event.message else {
+                return Vec::new();
+            };
+            let provider = message
+                .get("provider")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            let model = message
+                .get("model")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            if provider.is_none() && model.is_none() {
+                return Vec::new();
+            }
+            vec![AgentEvent::ModelInfo { provider, model }]
+        }
 
         "message_update" => {
             let Some(ame) = event.assistant_message_event else {
@@ -431,7 +466,10 @@ fn parse_pi_event(line: &str, accumulated_usage: &Mutex<TokenUsage>) -> Vec<Agen
         "turn_failed" | "error" => {
             let message = event
                 .message
-                .unwrap_or_else(|| "Pi agent error".to_string());
+                .as_ref()
+                .and_then(|v| v.as_str())
+                .unwrap_or("Pi agent error")
+                .to_string();
             vec![AgentEvent::Error { message }]
         }
 
@@ -1172,10 +1210,37 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_event_message_start_captures_provider_and_model() {
+        let b = backend();
+        let line = r#"{"type":"message_start","message":{"role":"assistant","api":"openai-responses","provider":"nflx-openai","model":"gpt-5.6-sol"}}"#;
+        let event = single(b.parse_events(line));
+        assert_eq!(
+            event,
+            AgentEvent::ModelInfo {
+                provider: Some("nflx-openai".to_string()),
+                model: Some("gpt-5.6-sol".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_event_message_start_no_provider_or_model_ignored() {
+        let b = backend();
+        let line = r#"{"type":"message_start","message":{"role":"assistant"}}"#;
+        assert!(b.parse_events(line).is_empty());
+    }
+
+    #[test]
+    fn test_parse_event_message_start_missing_message_ignored() {
+        let b = backend();
+        let line = r#"{"type":"message_start"}"#;
+        assert!(b.parse_events(line).is_empty());
+    }
+
+    #[test]
     fn test_parse_event_ignored_types() {
         let b = backend();
         for event_type in [
-            "message_start",
             "message_end",
             "entry_appended",
             "agent_settled",

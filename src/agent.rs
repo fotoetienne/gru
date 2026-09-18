@@ -76,6 +76,18 @@ pub(crate) enum AgentEvent {
         /// Error message
         message: String,
     },
+    /// Reports which provider/model actually served a turn.
+    ///
+    /// Emitted by backends (e.g. Pi) that let the underlying CLI resolve its
+    /// own model rather than having Gru pin one — see `pi_backend.rs` for the
+    /// rationale. This is purely informational so `events.jsonl` records
+    /// which model did the work; it has no effect on execution.
+    ModelInfo {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+    },
     /// Keepalive / heartbeat signal
     Ping,
 }
