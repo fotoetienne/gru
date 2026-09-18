@@ -408,6 +408,9 @@ pub(crate) fn accumulate_token_usage(total: &mut TokenUsage, event: &AgentEvent)
             if let Some(cache_read) = usage.cache_read_input_tokens {
                 *total.cache_read_input_tokens.get_or_insert(0) += cache_read;
             }
+            if let Some(cost) = usage.cost {
+                *total.cost.get_or_insert(0.0) += cost;
+            }
         }
         AgentEvent::MessageComplete {
             usage: Some(usage), ..
@@ -426,6 +429,9 @@ pub(crate) fn accumulate_token_usage(total: &mut TokenUsage, event: &AgentEvent)
             }
             if let Some(cache_read) = usage.cache_read_input_tokens {
                 *total.cache_read_input_tokens.get_or_insert(0) += cache_read;
+            }
+            if let Some(cost) = usage.cost {
+                *total.cost.get_or_insert(0.0) += cost;
             }
         }
         _ => {}
@@ -496,12 +502,14 @@ mod tests {
                 output_tokens: 0,
                 cache_creation_input_tokens: Some(200),
                 cache_read_input_tokens: Some(100),
+                cost: Some(0.01),
             }),
         };
         accumulate_token_usage(&mut total, &event);
         assert_eq!(total.input_tokens, 1000);
         assert_eq!(total.cache_creation_input_tokens, Some(200));
         assert_eq!(total.cache_read_input_tokens, Some(100));
+        assert_eq!(total.cost, Some(0.01));
     }
 
     #[test]
@@ -533,6 +541,7 @@ mod tests {
                 output_tokens: 500,
                 cache_creation_input_tokens: Some(50),
                 cache_read_input_tokens: Some(200),
+                cost: Some(0.01),
             }),
         };
         accumulate_token_usage(&mut total, &event);
@@ -540,6 +549,7 @@ mod tests {
         assert_eq!(total.output_tokens, 500);
         assert_eq!(total.cache_creation_input_tokens, None);
         assert_eq!(total.cache_read_input_tokens, None);
+        assert_eq!(total.cost, None);
     }
 
     #[test]
@@ -580,6 +590,7 @@ mod tests {
                     output_tokens: 0,
                     cache_creation_input_tokens: Some(50),
                     cache_read_input_tokens: Some(200),
+                    cost: Some(0.05),
                 }),
             },
         );
@@ -588,6 +599,7 @@ mod tests {
         assert_eq!(total.output_tokens, 800);
         assert_eq!(total.cache_creation_input_tokens, Some(50));
         assert_eq!(total.cache_read_input_tokens, Some(200));
+        assert_eq!(total.cost, Some(0.05));
     }
 
     #[test]
@@ -661,6 +673,7 @@ mod tests {
                     output_tokens: 2000,
                     cache_creation_input_tokens: Some(300),
                     cache_read_input_tokens: Some(100),
+                    cost: Some(0.02),
                 }),
             },
         );
@@ -668,6 +681,7 @@ mod tests {
         assert_eq!(total.output_tokens, 2000);
         assert_eq!(total.cache_creation_input_tokens, Some(300));
         assert_eq!(total.cache_read_input_tokens, Some(100));
+        assert_eq!(total.cost, Some(0.02));
     }
 
     #[test]
@@ -810,6 +824,7 @@ mod tests {
                     output_tokens: output,
                     cache_creation_input_tokens: None,
                     cache_read_input_tokens: Some(cache_read),
+                    ..Default::default()
                 }),
             }]
         }

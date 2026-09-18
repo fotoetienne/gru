@@ -142,6 +142,11 @@ pub(crate) struct TokenUsage {
     pub(crate) cache_creation_input_tokens: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) cache_read_input_tokens: Option<u64>,
+    /// Accumulated dollar cost, when the backend reports it (currently only
+    /// Pi). `None` means the backend does not report cost, not zero cost —
+    /// callers must not render `$0.00` for backends that omit this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) cost: Option<f64>,
 }
 
 impl TokenUsage {
@@ -151,12 +156,17 @@ impl TokenUsage {
     }
 
     /// Format as a compact display string (e.g., "12.3k in / 4.5k out").
+    /// Appends accumulated cost (e.g., "$0.0088") when the backend reports it.
     pub(crate) fn display_compact(&self) -> String {
-        format!(
+        let base = format!(
             "{} in / {} out",
             format_token_count(self.input_tokens),
             format_token_count(self.output_tokens)
-        )
+        );
+        match self.cost {
+            Some(cost) => format!("{} (${:.4})", base, cost),
+            None => base,
+        }
     }
 }
 
@@ -494,6 +504,7 @@ mod tests {
                 output_tokens: 500,
                 cache_creation_input_tokens: Some(100),
                 cache_read_input_tokens: Some(200),
+                cost: None,
             }),
         };
         let json = serde_json::to_string(&event).unwrap();
@@ -520,6 +531,7 @@ mod tests {
                 output_tokens: 2000,
                 cache_creation_input_tokens: None,
                 cache_read_input_tokens: None,
+                cost: None,
             }),
         };
         let json = serde_json::to_string(&event).unwrap();
@@ -656,6 +668,7 @@ mod tests {
             output_tokens: 500,
             cache_creation_input_tokens: Some(100),
             cache_read_input_tokens: Some(200),
+            cost: Some(0.0088),
         };
         let json = serde_json::to_string(&usage).unwrap();
         let deserialized: TokenUsage = serde_json::from_str(&json).unwrap();
@@ -671,6 +684,7 @@ mod tests {
         assert_eq!(usage.output_tokens, 50);
         assert_eq!(usage.cache_creation_input_tokens, None);
         assert_eq!(usage.cache_read_input_tokens, None);
+        assert_eq!(usage.cost, None);
     }
 
     #[test]
@@ -685,6 +699,28 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert!(value.get("cache_creation_input_tokens").is_none());
         assert!(value.get("cache_read_input_tokens").is_none());
+        assert!(value.get("cost").is_none());
+    }
+
+    #[test]
+    fn test_token_usage_display_compact_with_cost() {
+        let usage = TokenUsage {
+            input_tokens: 1000,
+            output_tokens: 500,
+            cost: Some(0.0088216),
+            ..Default::default()
+        };
+        assert_eq!(usage.display_compact(), "1.0k in / 500 out ($0.0088)");
+    }
+
+    #[test]
+    fn test_token_usage_display_compact_without_cost() {
+        let usage = TokenUsage {
+            input_tokens: 1000,
+            output_tokens: 500,
+            ..Default::default()
+        };
+        assert_eq!(usage.display_compact(), "1.0k in / 500 out");
     }
 
     #[test]
