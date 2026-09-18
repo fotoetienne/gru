@@ -211,6 +211,16 @@ where
     // but forcing it here prevents silent failures from misconfigured commands.
     cmd.stdout(std::process::Stdio::piped());
 
+    // Clear any usage accumulated by a prior invocation before spawning
+    // this one. A backend instance is reused across independent
+    // invocations (e.g. `ci.rs`'s CI-fix retry loop), and this must happen
+    // unconditionally here rather than relying on a stream-start event
+    // (e.g. Pi's `session`/`agent_start`, Codex's `thread.started`): if the
+    // new process exits before ever emitting that event — a startup or
+    // auth failure with no JSON stdout — the previous invocation's totals
+    // would otherwise leak into this one's `final_usage()` result below.
+    backend.reset_usage();
+
     // Spawn the command
     let mut child = cmd
         .spawn()
@@ -243,6 +253,13 @@ where
 
     // Accumulate token usage across the session
     let mut token_usage = TokenUsage::default();
+
+    // Tracks whether the backend ever emitted `Finished { usage: Some(_) }`
+    // during the stream. If it never does (e.g. because a backend's
+    // inferred session-end marker never fires in the real CLI), we fall
+    // back to `backend.final_usage()` below so accumulated input/cache
+    // totals aren't silently lost.
+    let mut got_finished_usage = false;
 
     // Process stream output asynchronously with timeout and error handling
     let stream_result: Result<()> = async {
@@ -322,6 +339,10 @@ where
                 // Log the event to events.jsonl
                 log_event(events_dir, &event).await?;
 
+                if matches!(event, AgentEvent::Finished { usage: Some(_) }) {
+                    got_finished_usage = true;
+                }
+
                 // Accumulate token usage from events
                 accumulate_token_usage(&mut token_usage, &event);
 
@@ -335,6 +356,20 @@ where
         Ok(())
     }
     .await;
+
+    // If the backend never surfaced a `Finished { usage: Some(_) }` event
+    // (e.g. Codex's inferred `thread.completed` session-end marker doesn't
+    // match the real CLI's output, or the stream ended abnormally before
+    // reaching it), recover whatever usage the backend accumulated
+    // internally rather than silently reporting zero input/cache tokens.
+    if !got_finished_usage {
+        if let Some(usage) = backend.final_usage() {
+            accumulate_token_usage(
+                &mut token_usage,
+                &AgentEvent::Finished { usage: Some(usage) },
+            );
+        }
+    }
 
     // Close our end of the stdout pipe so the child isn't blocked writing
     // to a pipe with no reader, which would cause child.wait() to hang.
@@ -361,7 +396,7 @@ where
 }
 
 /// Accumulates token usage from an `AgentEvent` into a running total.
-fn accumulate_token_usage(total: &mut TokenUsage, event: &AgentEvent) {
+pub(crate) fn accumulate_token_usage(total: &mut TokenUsage, event: &AgentEvent) {
     match event {
         AgentEvent::Started { usage: Some(usage) } => {
             total.input_tokens += usage.input_tokens;
@@ -375,19 +410,7 @@ fn accumulate_token_usage(total: &mut TokenUsage, event: &AgentEvent) {
         AgentEvent::MessageComplete {
             usage: Some(usage), ..
         } => {
-            // Some backends (e.g. Codex, Pi) report input and cache tokens
-            // on the turn-completion event rather than a separate Started
-            // event; Claude Code always reports 0/None for those fields
-            // here, so accumulating them unconditionally is safe for all
-            // backends.
-            total.input_tokens += usage.input_tokens;
             total.output_tokens += usage.output_tokens;
-            if let Some(cache_creation) = usage.cache_creation_input_tokens {
-                *total.cache_creation_input_tokens.get_or_insert(0) += cache_creation;
-            }
-            if let Some(cache_read) = usage.cache_read_input_tokens {
-                *total.cache_read_input_tokens.get_or_insert(0) += cache_read;
-            }
         }
         AgentEvent::Finished {
             usage: Some(usage), ..
@@ -495,10 +518,11 @@ mod tests {
     }
 
     #[test]
-    fn test_accumulate_token_usage_message_complete_full_usage() {
-        // Backends like Codex and Pi report input/cache tokens on the same
-        // turn-completion event as output tokens, rather than a separate
-        // Started event. Regression test for under-reporting these fields.
+    fn test_accumulate_token_usage_message_complete_ignores_input_and_cache() {
+        // MessageComplete only ever contributes output_tokens. Backends that
+        // report input/cache usage per-turn (Codex, Pi) must surface session
+        // totals via `Finished` instead of here, to avoid double-counting
+        // when a turn's usage is also folded into a backend's running total.
         let mut total = TokenUsage::default();
         let event = AgentEvent::MessageComplete {
             stop_reason: Some("end_turn".to_string()),
@@ -510,8 +534,56 @@ mod tests {
             }),
         };
         accumulate_token_usage(&mut total, &event);
-        assert_eq!(total.input_tokens, 1000);
+        assert_eq!(total.input_tokens, 0);
         assert_eq!(total.output_tokens, 500);
+        assert_eq!(total.cache_creation_input_tokens, None);
+        assert_eq!(total.cache_read_input_tokens, None);
+    }
+
+    #[test]
+    fn test_accumulate_token_usage_no_double_count_message_complete_and_finished() {
+        // Simulates a Pi/Codex-style session: each turn emits MessageComplete
+        // with per-turn output tokens, and the backend reports accumulated
+        // input/cache totals (output left at 0) once in a final `Finished`
+        // event. The combined total must equal the true sum, not double it.
+        let mut total = TokenUsage::default();
+
+        accumulate_token_usage(
+            &mut total,
+            &AgentEvent::MessageComplete {
+                stop_reason: Some("end_turn".to_string()),
+                usage: Some(TokenUsage {
+                    input_tokens: 1000,
+                    output_tokens: 500,
+                    ..Default::default()
+                }),
+            },
+        );
+        accumulate_token_usage(
+            &mut total,
+            &AgentEvent::MessageComplete {
+                stop_reason: Some("end_turn".to_string()),
+                usage: Some(TokenUsage {
+                    input_tokens: 2000,
+                    output_tokens: 300,
+                    ..Default::default()
+                }),
+            },
+        );
+        accumulate_token_usage(
+            &mut total,
+            &AgentEvent::Finished {
+                usage: Some(TokenUsage {
+                    input_tokens: 3000,
+                    output_tokens: 0,
+                    cache_creation_input_tokens: Some(50),
+                    cache_read_input_tokens: Some(200),
+                }),
+            },
+        );
+
+        assert_eq!(total.input_tokens, 3000);
+        assert_eq!(total.output_tokens, 800);
         assert_eq!(total.cache_creation_input_tokens, Some(50));
         assert_eq!(total.cache_read_input_tokens, Some(200));
     }
@@ -684,6 +756,188 @@ mod tests {
         assert_eq!(
             classify_inactivity(INACTIVITY_STUCK_SECS),
             InactivityState::Stuck
+        );
+    }
+
+    /// Stub backend simulating a CLI (like Codex, if `thread.completed` turns
+    /// out not to be real) that reports per-turn input/cache usage via
+    /// `MessageComplete` but exits without ever emitting a `Finished` event.
+    /// Used to verify `run_agent_with_stream_monitoring`'s EOF fallback to
+    /// `backend.final_usage()`.
+    struct NoFinishedEventBackend {
+        accumulated: std::sync::Mutex<TokenUsage>,
+    }
+
+    impl AgentBackend for NoFinishedEventBackend {
+        fn name(&self) -> &str {
+            "no-finished-event"
+        }
+
+        fn process_names(&self) -> &[&str] {
+            &[]
+        }
+
+        fn build_command(
+            &self,
+            _worktree_path: &Path,
+            _session_id: &uuid::Uuid,
+            _prompt: &str,
+            _github_host: &str,
+        ) -> TokioCommand {
+            unimplemented!("not exercised by this test")
+        }
+
+        fn parse_events(&self, line: &str) -> Vec<AgentEvent> {
+            // Lines are "<input>,<output>,<cache_read>" — every "turn" adds
+            // to internal state but only ever returns a MessageComplete,
+            // never a Finished, mirroring a CLI whose real terminal event
+            // doesn't match what the backend guessed.
+            let parts: Vec<u64> = line.split(',').filter_map(|p| p.parse().ok()).collect();
+            let [input, output, cache_read] = parts[..] else {
+                return Vec::new();
+            };
+            {
+                let mut acc = self.accumulated.lock().unwrap();
+                acc.input_tokens += input;
+                *acc.cache_read_input_tokens.get_or_insert(0) += cache_read;
+            }
+            vec![AgentEvent::MessageComplete {
+                stop_reason: Some("end_turn".to_string()),
+                usage: Some(TokenUsage {
+                    input_tokens: input,
+                    output_tokens: output,
+                    cache_creation_input_tokens: None,
+                    cache_read_input_tokens: Some(cache_read),
+                }),
+            }]
+        }
+
+        fn build_resume_command(
+            &self,
+            _worktree_path: &Path,
+            _session_id: &uuid::Uuid,
+            _prompt: &str,
+            _github_host: &str,
+        ) -> Option<TokioCommand> {
+            None
+        }
+
+        fn build_interactive_resume_command(
+            &self,
+            _worktree_path: &Path,
+            _session_id: &uuid::Uuid,
+            _github_host: &str,
+        ) -> Option<TokioCommand> {
+            None
+        }
+
+        fn build_oneshot_command(
+            &self,
+            _worktree_path: &Path,
+            _prompt_arg: &str,
+            _github_host: &str,
+        ) -> TokioCommand {
+            unimplemented!("not exercised by this test")
+        }
+
+        fn build_ci_fix_command(
+            &self,
+            _worktree_path: &Path,
+            _prompt: &str,
+            _github_host: &str,
+        ) -> TokioCommand {
+            unimplemented!("not exercised by this test")
+        }
+
+        fn final_usage(&self) -> Option<TokenUsage> {
+            Some(self.accumulated.lock().unwrap().clone())
+        }
+
+        fn reset_usage(&self) {
+            *self.accumulated.lock().unwrap() = TokenUsage::default();
+        }
+    }
+
+    #[tokio::test]
+    async fn test_run_agent_recovers_usage_via_final_usage_on_eof() {
+        // Simulates a backend whose inferred session-end event never
+        // fires in the real CLI (the concern raised on #914/#927 about
+        // Codex's `thread.completed`): the process exits cleanly after
+        // emitting per-turn usage but no `Finished` event. Without the
+        // `final_usage()` fallback, input/cache totals would be lost.
+        let backend = NoFinishedEventBackend {
+            accumulated: std::sync::Mutex::new(TokenUsage::default()),
+        };
+
+        let mut cmd = TokioCommand::new("sh");
+        cmd.arg("-c").arg("printf '1000,500,200\\n2000,300,100\\n'");
+
+        let events_dir = tempfile::tempdir().unwrap();
+
+        let result = run_agent_with_stream_monitoring(
+            cmd,
+            &backend,
+            events_dir.path(),
+            None,
+            None::<fn(&AgentEvent)>,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.token_usage.input_tokens, 3000);
+        assert_eq!(
+            result.token_usage.output_tokens, 800,
+            "output still comes from per-turn MessageComplete"
+        );
+        assert_eq!(result.token_usage.cache_read_input_tokens, Some(300));
+    }
+
+    #[tokio::test]
+    async fn test_run_agent_resets_usage_before_next_invocation() {
+        // A backend instance is reused across independent invocations
+        // (e.g. ci.rs's CI-fix retry loop). run_agent_with_stream_monitoring
+        // must clear accumulated usage before spawning each invocation's
+        // process — unconditionally, not by relying on a stream-start event
+        // that a crashed/no-output process might never emit — so a second,
+        // usage-free invocation doesn't inherit the first invocation's totals.
+        let backend = NoFinishedEventBackend {
+            accumulated: std::sync::Mutex::new(TokenUsage::default()),
+        };
+        let events_dir = tempfile::tempdir().unwrap();
+
+        let mut first_cmd = TokioCommand::new("sh");
+        first_cmd.arg("-c").arg("printf '1000,500,200\\n'");
+        let first = run_agent_with_stream_monitoring(
+            first_cmd,
+            &backend,
+            events_dir.path(),
+            None,
+            None::<fn(&AgentEvent)>,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(first.token_usage.input_tokens, 1000);
+
+        // Second invocation's process produces no usage-bearing output at
+        // all (e.g. it failed before emitting anything recognizable).
+        let mut second_cmd = TokioCommand::new("sh");
+        second_cmd.arg("-c").arg("true");
+        let second = run_agent_with_stream_monitoring(
+            second_cmd,
+            &backend,
+            events_dir.path(),
+            None,
+            None::<fn(&AgentEvent)>,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            second.token_usage.input_tokens, 0,
+            "must not inherit the first invocation's totals"
         );
     }
 }

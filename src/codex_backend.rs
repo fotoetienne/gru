@@ -9,12 +9,14 @@
 //! - `turn.completed` → `AgentEvent::MessageComplete` (with token usage)
 //! - `turn.failed` → `AgentEvent::Error`
 //! - `item.started` / `item.completed` → `AgentEvent::ToolUse` / `AgentEvent::ToolResult`
+//! - `thread.completed` → `AgentEvent::Finished` (with accumulated session usage)
 //! - `error` → `AgentEvent::Error`
 
 use crate::agent::{AgentBackend, AgentEvent, TokenUsage};
 use crate::display_utils::{shorten_path, truncate_string};
 use serde::Deserialize;
 use std::path::Path;
+use std::sync::Mutex;
 use tokio::process::Command as TokioCommand;
 use uuid::Uuid;
 
@@ -22,8 +24,17 @@ use uuid::Uuid;
 ///
 /// Implements `AgentBackend` by spawning `codex exec --json --full-auto`
 /// and parsing the resulting JSONL event stream.
+///
+/// Codex reports input and cache token counts per-turn on `turn.completed`
+/// rather than once at session start, so this backend accumulates them
+/// across the session and reports the totals in the `Finished` event at
+/// `thread.completed` (output tokens are already accumulated by the caller
+/// from each turn's `MessageComplete`, so `Finished` reports
+/// `output_tokens: 0` to avoid double-counting).
 #[derive(Default)]
-pub(crate) struct CodexBackend;
+pub(crate) struct CodexBackend {
+    accumulated_usage: Mutex<TokenUsage>,
+}
 
 impl AgentBackend for CodexBackend {
     fn name(&self) -> &str {
@@ -47,7 +58,9 @@ impl AgentBackend for CodexBackend {
     }
 
     fn parse_events(&self, line: &str) -> Vec<AgentEvent> {
-        parse_codex_event(line.trim()).into_iter().collect()
+        parse_codex_event(line.trim(), &self.accumulated_usage)
+            .into_iter()
+            .collect()
     }
 
     fn build_resume_command(
@@ -107,6 +120,14 @@ impl AgentBackend for CodexBackend {
         github_host: &str,
     ) -> TokioCommand {
         self.build_command(worktree_path, &Uuid::nil(), prompt, github_host)
+    }
+
+    fn final_usage(&self) -> Option<TokenUsage> {
+        Some(self.accumulated_usage.lock().unwrap().clone())
+    }
+
+    fn reset_usage(&self) {
+        *self.accumulated_usage.lock().unwrap() = TokenUsage::default();
     }
 }
 
@@ -220,7 +241,7 @@ struct CodexError {
 }
 
 /// Parse a single line of Codex JSONL output into an `AgentEvent`.
-fn parse_codex_event(line: &str) -> Option<AgentEvent> {
+fn parse_codex_event(line: &str, accumulated_usage: &Mutex<TokenUsage>) -> Option<AgentEvent> {
     if line.is_empty() {
         return None;
     }
@@ -228,6 +249,10 @@ fn parse_codex_event(line: &str) -> Option<AgentEvent> {
     let event: CodexEvent = serde_json::from_str(line).ok()?;
 
     match event.event_type.as_str() {
+        // Usage accumulation is reset once per invocation via
+        // `AgentBackend::reset_usage()` (called by the runner before the
+        // process is spawned), not here — a startup failure could exit
+        // before this event ever arrives.
         "thread.started" => Some(AgentEvent::Started { usage: None }),
 
         "turn.started" => Some(AgentEvent::Thinking { text: None }),
@@ -239,9 +264,29 @@ fn parse_codex_event(line: &str) -> Option<AgentEvent> {
                 cache_read_input_tokens: u.cached_input_tokens,
                 ..Default::default()
             });
+            if let Some(u) = &usage {
+                let mut accumulated = accumulated_usage.lock().unwrap();
+                accumulated.input_tokens += u.input_tokens;
+                if let Some(cache_read) = u.cache_read_input_tokens {
+                    *accumulated.cache_read_input_tokens.get_or_insert(0) += cache_read;
+                }
+            }
             Some(AgentEvent::MessageComplete {
                 stop_reason: Some("end_turn".to_string()),
                 usage,
+            })
+        }
+
+        // TODO: verify `thread.completed` against real Codex CLI output once
+        // available — inferred as the terminal counterpart to `thread.started`
+        // but not yet confirmed against an actual `codex exec --json` session
+        // (see `turn.failed` above for the same class of open verification).
+        // If the real event name/shape differs, Codex input/cache totals
+        // silently stay at zero since unrecognized types fall through to `_ => None`.
+        "thread.completed" => {
+            let totals = accumulated_usage.lock().unwrap().clone();
+            Some(AgentEvent::Finished {
+                usage: Some(totals),
             })
         }
 
@@ -389,7 +434,7 @@ mod tests {
     use super::*;
 
     fn backend() -> CodexBackend {
-        CodexBackend
+        CodexBackend::default()
     }
 
     /// Assert that parse_events returns exactly one event and return it.
@@ -604,6 +649,132 @@ mod tests {
                 usage: None,
             }
         ));
+    }
+
+    #[test]
+    fn test_parse_event_thread_completed_no_turns() {
+        let b = backend();
+        let line = r#"{"type":"thread.completed"}"#;
+        let event = single(b.parse_events(line));
+        match event {
+            AgentEvent::Finished { usage } => {
+                let u = usage.unwrap();
+                assert_eq!(u.input_tokens, 0);
+                assert_eq!(u.output_tokens, 0);
+                assert_eq!(u.cache_read_input_tokens, None);
+            }
+            other => panic!("Expected Finished, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_event_thread_completed_accumulates_turn_usage() {
+        // Exercise the full parse_events -> accumulate_token_usage path (not
+        // just the raw parser output) so a mismatch between what the parser
+        // emits and what the runner accumulates would be caught here.
+        use crate::agent_runner::accumulate_token_usage;
+
+        let b = backend();
+        let mut total = TokenUsage::default();
+
+        for line in [
+            r#"{"type":"thread.started","thread_id":"thread_abc123"}"#,
+            r#"{"type":"turn.completed","usage":{"input_tokens":1000,"output_tokens":500,"cached_input_tokens":200}}"#,
+            r#"{"type":"turn.completed","usage":{"input_tokens":2000,"output_tokens":300,"cached_input_tokens":100}}"#,
+            r#"{"type":"thread.completed"}"#,
+        ] {
+            for event in b.parse_events(line) {
+                accumulate_token_usage(&mut total, &event);
+            }
+        }
+
+        assert_eq!(total.input_tokens, 3000);
+        assert_eq!(total.output_tokens, 800);
+        assert_eq!(total.cache_read_input_tokens, Some(300));
+    }
+
+    #[test]
+    fn test_reset_usage_clears_accumulated_usage_across_invocations() {
+        // The backend instance is reused across independent invocations
+        // (e.g. multiple CI-fix attempts share one `&dyn AgentBackend`).
+        // `run_agent_with_stream_monitoring` calls `reset_usage()` before
+        // spawning each new invocation's process — not on `thread.started`,
+        // since a startup/auth failure could exit before that event ever
+        // arrives — so this must clear totals left over from a prior
+        // invocation regardless of what that invocation emitted.
+        let b = backend();
+
+        b.parse_events(r#"{"type":"thread.started","thread_id":"thread_1"}"#);
+        b.parse_events(
+            r#"{"type":"turn.completed","usage":{"input_tokens":1000,"output_tokens":500,"cached_input_tokens":200}}"#,
+        );
+        b.parse_events(r#"{"type":"thread.completed"}"#);
+
+        // New invocation reusing the same backend instance.
+        b.reset_usage();
+        b.parse_events(r#"{"type":"thread.started","thread_id":"thread_2"}"#);
+        let event = single(b.parse_events(r#"{"type":"thread.completed"}"#));
+        match event {
+            AgentEvent::Finished { usage } => {
+                let u = usage.unwrap();
+                assert_eq!(u.input_tokens, 0, "must not leak prior invocation's totals");
+                assert_eq!(u.cache_read_input_tokens, None);
+            }
+            other => panic!("Expected Finished, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_reset_usage_clears_state_even_if_prior_invocation_never_started() {
+        // If a process from a prior invocation exited before ever emitting
+        // `thread.started` (e.g. a startup/auth failure with no JSON
+        // stdout), its accumulated usage from a still-earlier invocation
+        // could linger. `reset_usage()` must clear it regardless, since the
+        // runner calls it unconditionally before spawning — it cannot rely
+        // on `thread.started` having fired for the invocation being reset.
+        let b = backend();
+
+        b.parse_events(r#"{"type":"thread.started","thread_id":"thread_1"}"#);
+        b.parse_events(
+            r#"{"type":"turn.completed","usage":{"input_tokens":1000,"output_tokens":500,"cached_input_tokens":200}}"#,
+        );
+        // Invocation 1 ends here (crashed before "thread.completed").
+
+        // Invocation 2 starts: runner resets, but this process fails before
+        // ever emitting "thread.started" or any usage-bearing event.
+        b.reset_usage();
+
+        // Invocation 3 starts: runner resets again.
+        b.reset_usage();
+        let usage = b.final_usage().unwrap();
+        assert_eq!(usage.input_tokens, 0, "must not leak invocation 1's totals");
+        assert_eq!(usage.cache_read_input_tokens, None);
+    }
+
+    #[test]
+    fn test_final_usage_recovers_totals_without_thread_completed() {
+        // If the real Codex CLI never emits `thread.completed` (unverified
+        // — see the TODO on that match arm), the stream ends (EOF) without
+        // a `Finished` event to read totals from. `final_usage()` is the
+        // fallback `run_agent_with_stream_monitoring` calls in that case so
+        // input/cache totals aren't silently lost.
+        let b = backend();
+        b.parse_events(r#"{"type":"thread.started","thread_id":"thread_abc123"}"#);
+        b.parse_events(
+            r#"{"type":"turn.completed","usage":{"input_tokens":1000,"output_tokens":500,"cached_input_tokens":200}}"#,
+        );
+        b.parse_events(
+            r#"{"type":"turn.completed","usage":{"input_tokens":2000,"output_tokens":300,"cached_input_tokens":100}}"#,
+        );
+        // No "thread.completed" line.
+
+        let usage = b.final_usage().unwrap();
+        assert_eq!(usage.input_tokens, 3000);
+        assert_eq!(
+            usage.output_tokens, 0,
+            "output already covered by MessageComplete"
+        );
+        assert_eq!(usage.cache_read_input_tokens, Some(300));
     }
 
     #[test]

@@ -22,6 +22,7 @@ use crate::agent::{AgentBackend, AgentEvent, TokenUsage};
 use crate::display_utils::{shorten_path, truncate_string};
 use serde::Deserialize;
 use std::path::Path;
+use std::sync::Mutex;
 use tokio::process::Command as TokioCommand;
 use uuid::Uuid;
 
@@ -29,6 +30,13 @@ use uuid::Uuid;
 ///
 /// Implements `AgentBackend` by spawning `pi -p --mode json` and parsing the
 /// resulting JSONL event stream.
+///
+/// Pi reports input and cache token counts per-turn on `turn_end` rather
+/// than once at session start, so this backend accumulates them across the
+/// session and reports the totals in the `Finished` event at `agent_end`
+/// (output tokens are already accumulated by the caller from each turn's
+/// `MessageComplete`, so `Finished` reports `output_tokens: 0` to avoid
+/// double-counting).
 pub(crate) struct PiBackend {
     /// Path or name of the Pi CLI binary to invoke (`agent.pi.binary` in config).
     binary: String,
@@ -37,6 +45,7 @@ pub(crate) struct PiBackend {
     model: Option<String>,
     /// Thinking effort to pass via `--thinking` (`agent.pi.thinking` in config).
     thinking: Option<String>,
+    accumulated_usage: Mutex<TokenUsage>,
 }
 
 impl Default for PiBackend {
@@ -45,6 +54,7 @@ impl Default for PiBackend {
             binary: "pi".to_string(),
             model: None,
             thinking: None,
+            accumulated_usage: Mutex::new(TokenUsage::default()),
         }
     }
 }
@@ -59,6 +69,7 @@ impl PiBackend {
             binary: binary.unwrap_or_else(|| "pi".to_string()),
             model,
             thinking,
+            accumulated_usage: Mutex::new(TokenUsage::default()),
         }
     }
 
@@ -109,7 +120,7 @@ impl AgentBackend for PiBackend {
     }
 
     fn parse_events(&self, line: &str) -> Vec<AgentEvent> {
-        parse_pi_event(line.trim())
+        parse_pi_event(line.trim(), &self.accumulated_usage)
     }
 
     fn build_resume_command(
@@ -188,6 +199,14 @@ impl AgentBackend for PiBackend {
         apply_pi_stdio(cmd.arg(prompt), worktree_path);
         cmd.env("GH_HOST", github_host);
         cmd
+    }
+
+    fn final_usage(&self) -> Option<TokenUsage> {
+        Some(self.accumulated_usage.lock().unwrap().clone())
+    }
+
+    fn reset_usage(&self) {
+        *self.accumulated_usage.lock().unwrap() = TokenUsage::default();
     }
 }
 
@@ -301,7 +320,7 @@ fn parse_usage(usage: Option<serde_json::Value>) -> Option<PiUsage> {
 /// Silently ignores lines that aren't recognized JSON events. This matters
 /// when Pi is invoked through a launcher or wrapper that prints its own
 /// non-JSON preamble to stdout ahead of the event stream.
-fn parse_pi_event(line: &str) -> Vec<AgentEvent> {
+fn parse_pi_event(line: &str, accumulated_usage: &Mutex<TokenUsage>) -> Vec<AgentEvent> {
     if line.is_empty() {
         return Vec::new();
     }
@@ -312,6 +331,10 @@ fn parse_pi_event(line: &str) -> Vec<AgentEvent> {
     };
 
     match event.event_type.as_str() {
+        // Usage accumulation is reset once per invocation via
+        // `AgentBackend::reset_usage()` (called by the runner before the
+        // process is spawned), not here — a startup failure could exit
+        // before this event ever arrives.
         "session" | "agent_start" => vec![AgentEvent::Started { usage: None }],
 
         "turn_start" => vec![AgentEvent::Thinking { text: None }],
@@ -372,13 +395,28 @@ fn parse_pi_event(line: &str) -> Vec<AgentEvent> {
                 cache_read_input_tokens: u.cache_read,
                 cache_creation_input_tokens: u.cache_write,
             });
+            if let Some(u) = &usage {
+                let mut accumulated = accumulated_usage.lock().unwrap();
+                accumulated.input_tokens += u.input_tokens;
+                if let Some(cache_creation) = u.cache_creation_input_tokens {
+                    *accumulated.cache_creation_input_tokens.get_or_insert(0) += cache_creation;
+                }
+                if let Some(cache_read) = u.cache_read_input_tokens {
+                    *accumulated.cache_read_input_tokens.get_or_insert(0) += cache_read;
+                }
+            }
             vec![AgentEvent::MessageComplete {
                 stop_reason: Some("end_turn".to_string()),
                 usage,
             }]
         }
 
-        "agent_end" => vec![AgentEvent::Finished { usage: None }],
+        "agent_end" => {
+            let totals = accumulated_usage.lock().unwrap().clone();
+            vec![AgentEvent::Finished {
+                usage: Some(totals),
+            }]
+        }
 
         "turn_failed" | "error" => {
             let message = event
@@ -942,11 +980,134 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_event_agent_end() {
+    fn test_parse_event_agent_end_no_turns() {
         let b = backend();
         let line = r#"{"type":"agent_end"}"#;
         let event = single(b.parse_events(line));
-        assert!(matches!(event, AgentEvent::Finished { usage: None }));
+        match event {
+            AgentEvent::Finished { usage } => {
+                let u = usage.unwrap();
+                assert_eq!(u.input_tokens, 0);
+                assert_eq!(u.output_tokens, 0);
+                assert_eq!(u.cache_creation_input_tokens, None);
+                assert_eq!(u.cache_read_input_tokens, None);
+            }
+            other => panic!("Expected Finished, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_event_agent_end_accumulates_turn_usage() {
+        // Exercise the full parse_events -> accumulate_token_usage path (not
+        // just the raw parser output) so a mismatch between what the parser
+        // emits and what the runner accumulates would be caught here.
+        use crate::agent_runner::accumulate_token_usage;
+
+        let b = backend();
+        let mut total = TokenUsage::default();
+
+        for line in [
+            r#"{"type":"session"}"#,
+            r#"{"type":"turn_end","usage":{"input":1000,"output":500,"cacheRead":200,"cacheWrite":50}}"#,
+            r#"{"type":"turn_end","usage":{"input":2000,"output":300,"cacheRead":100}}"#,
+            r#"{"type":"agent_end"}"#,
+        ] {
+            for event in b.parse_events(line) {
+                accumulate_token_usage(&mut total, &event);
+            }
+        }
+
+        assert_eq!(total.input_tokens, 3000);
+        assert_eq!(total.output_tokens, 800);
+        assert_eq!(total.cache_creation_input_tokens, Some(50));
+        assert_eq!(total.cache_read_input_tokens, Some(300));
+    }
+
+    #[test]
+    fn test_reset_usage_clears_accumulated_usage_across_invocations() {
+        // The backend instance is reused across independent invocations
+        // (e.g. multiple CI-fix attempts share one `&dyn AgentBackend`).
+        // `run_agent_with_stream_monitoring` calls `reset_usage()` before
+        // spawning each new invocation's process — not on `session`/
+        // `agent_start`, since a startup failure could exit before that
+        // event ever arrives — so this must clear totals left over from a
+        // prior invocation regardless of what that invocation emitted.
+        let b = backend();
+
+        b.parse_events(r#"{"type":"session"}"#);
+        b.parse_events(
+            r#"{"type":"turn_end","usage":{"input":1000,"output":500,"cacheRead":200,"cacheWrite":50}}"#,
+        );
+        b.parse_events(r#"{"type":"agent_end"}"#);
+
+        // New invocation reusing the same backend instance.
+        b.reset_usage();
+        b.parse_events(r#"{"type":"agent_start"}"#);
+        let event = single(b.parse_events(r#"{"type":"agent_end"}"#));
+        match event {
+            AgentEvent::Finished { usage } => {
+                let u = usage.unwrap();
+                assert_eq!(u.input_tokens, 0, "must not leak prior invocation's totals");
+                assert_eq!(u.cache_creation_input_tokens, None);
+                assert_eq!(u.cache_read_input_tokens, None);
+            }
+            other => panic!("Expected Finished, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_reset_usage_clears_state_even_if_prior_invocation_never_started() {
+        // If a process from a prior invocation exited before ever emitting
+        // `session`/`agent_start` (e.g. a startup failure with no JSON
+        // stdout), its accumulated usage from a still-earlier invocation
+        // could linger. `reset_usage()` must clear it regardless, since the
+        // runner calls it unconditionally before spawning — it cannot rely
+        // on `session`/`agent_start` having fired for the invocation being
+        // reset.
+        let b = backend();
+
+        b.parse_events(r#"{"type":"session"}"#);
+        b.parse_events(
+            r#"{"type":"turn_end","usage":{"input":1000,"output":500,"cacheRead":200,"cacheWrite":50}}"#,
+        );
+        // Invocation 1 ends here (crashed before "agent_end").
+
+        // Invocation 2 starts: runner resets, but this process fails before
+        // ever emitting "session"/"agent_start" or any usage-bearing event.
+        b.reset_usage();
+
+        // Invocation 3 starts: runner resets again.
+        b.reset_usage();
+        let usage = b.final_usage().unwrap();
+        assert_eq!(usage.input_tokens, 0, "must not leak invocation 1's totals");
+        assert_eq!(usage.cache_creation_input_tokens, None);
+        assert_eq!(usage.cache_read_input_tokens, None);
+    }
+
+    #[test]
+    fn test_final_usage_recovers_totals_without_agent_end() {
+        // If the stream ends (EOF) without an `agent_end` line — e.g. the
+        // process is killed by stuck-detection, or crashes mid-session —
+        // the runner has no `Finished` event to read totals from.
+        // `final_usage()` is the fallback that recovers them.
+        let b = backend();
+        b.parse_events(r#"{"type":"session"}"#);
+        b.parse_events(
+            r#"{"type":"turn_end","usage":{"input":1000,"output":500,"cacheRead":200,"cacheWrite":50}}"#,
+        );
+        b.parse_events(
+            r#"{"type":"turn_end","usage":{"input":2000,"output":300,"cacheRead":100}}"#,
+        );
+        // No "agent_end" line.
+
+        let usage = b.final_usage().unwrap();
+        assert_eq!(usage.input_tokens, 3000);
+        assert_eq!(
+            usage.output_tokens, 0,
+            "output already covered by MessageComplete"
+        );
+        assert_eq!(usage.cache_creation_input_tokens, Some(50));
+        assert_eq!(usage.cache_read_input_tokens, Some(300));
     }
 
     #[test]

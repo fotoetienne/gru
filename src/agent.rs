@@ -274,6 +274,45 @@ pub(crate) trait AgentBackend: Send + Sync {
     fn yolo_args(&self) -> Vec<&'static str> {
         Vec::new()
     }
+
+    /// Returns any session usage totals accumulated internally by the
+    /// backend that were never surfaced through a `Finished` event.
+    ///
+    /// Backends that report input/cache token usage per-turn (rather than
+    /// once via `Started`) accumulate those totals internally and normally
+    /// flush them in a `Finished` event tied to a backend-specific
+    /// session-end marker (e.g. Codex's inferred `thread.completed`). If
+    /// the stream ends (EOF) without that marker ever appearing — because
+    /// the real CLI doesn't emit it, or emits something else — the caller
+    /// has no other way to recover those totals. `run_agent_with_stream_monitoring`
+    /// calls this once the stream loop exits, and folds the result into the
+    /// final token usage if no `Finished { usage: Some(_) }` was already
+    /// observed, so a wrong session-end event name degrades to "still
+    /// accurate, just recovered a different way" instead of "silently zero".
+    ///
+    /// Returns `None` by default; backends without per-turn accumulation
+    /// (e.g. Claude Code) don't need to override this.
+    fn final_usage(&self) -> Option<TokenUsage> {
+        None
+    }
+
+    /// Clears any usage totals accumulated internally by the backend from a
+    /// prior invocation.
+    ///
+    /// `run_agent_with_stream_monitoring` calls this once, unconditionally,
+    /// before spawning the process for a new invocation. A backend instance
+    /// is reused across independent invocations (e.g. `src/ci.rs`'s CI-fix
+    /// retry loop drives multiple attempts through the same
+    /// `&dyn AgentBackend`), so relying solely on a stream-start event
+    /// (e.g. Pi's `session`/`agent_start`, Codex's `thread.started`) to
+    /// reset state is not safe: if a new process exits before ever emitting
+    /// that event (a startup or auth failure with no JSON stdout), the
+    /// previous invocation's totals would otherwise leak into
+    /// `final_usage()`'s result for this one.
+    ///
+    /// No-op by default; backends without per-turn accumulation (e.g.
+    /// Claude Code) don't need to override this.
+    fn reset_usage(&self) {}
 }
 
 #[cfg(test)]
