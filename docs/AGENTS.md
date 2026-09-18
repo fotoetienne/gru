@@ -133,7 +133,7 @@ To add a new agent backend:
 1. Create `src/<name>_backend.rs` implementing the `AgentBackend` trait from `src/agent.rs`
 2. Register it in `src/agent_registry.rs`:
    - Add the name to `AVAILABLE_AGENTS`
-   - Add a matching arm in `construct_backend()` — this is the single source of truth that both `resolve_backend()` and `all_process_names()` route through. **A name added to `AVAILABLE_AGENTS` without a `construct_backend` arm compiles fine but fails silently**: `resolve_backend()` will report the agent as unknown, and `all_process_names()` (used by `gru stop`'s process-scan fallback) will silently drop that backend's process names via its `filter_map`, with no compile error either way.
+   - Add a matching arm in `construct_backend()` — this is the single source of truth that both `resolve_backend()` and `all_process_names()` route through. **A name added to `AVAILABLE_AGENTS` without a `construct_backend` arm compiles fine but breaks at runtime in two different ways, neither of which is a clean error**: `resolve_backend()` passes the `AVAILABLE_AGENTS` check and then panics on the `.expect()` around `construct_backend`'s `None` result, while `all_process_names()` (used by `gru stop`'s process-scan fallback) silently drops that backend's process names via its `filter_map` with no error at all. No compile error either way.
 3. Map the backend's output format to `AgentEvent` variants in `parse_events()`
 
 The `AgentBackend` trait (`src/agent.rs`) currently has nine methods:
