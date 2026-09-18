@@ -420,4 +420,28 @@ mod tests {
             "should not match inside --shell"
         );
     }
+
+    /// Regression test for a relative `binary = "./codex-wrapper"`-style
+    /// override: `file_name()` only strips through the *last* `/` in a path,
+    /// so whatever remains before the basename either ends in `/` (any path
+    /// with a directory component, including `./x`, `../x`, `bin/x`) or is
+    /// empty (a bare name, covered by the `^` anchor) — there's no relative
+    /// form where the character immediately preceding the basename is
+    /// neither `/` nor start-of-string. Confirmed against a real `pgrep -f`
+    /// invocation against a script literally named `./codex-wrapper`.
+    #[test]
+    fn test_exec_boundary_pattern_matches_relative_dot_slash_override() {
+        let names = build_process_match_names(&["claude", "/tmp/wt/./codex-wrapper"]).join("|");
+        let pattern = format!(r"(^|/)({names})([[:space:]]|$)");
+        let re = regex::Regex::new(&pattern).unwrap();
+
+        assert!(
+            re.is_match("./codex-wrapper exec --json --full-auto fix the bug"),
+            "should match the literal ./-prefixed relative binary as invoked"
+        );
+        assert!(
+            re.is_match("../codex-wrapper exec --json --full-auto fix the bug"),
+            "should match a ../-prefixed relative binary the same way"
+        );
+    }
 }
