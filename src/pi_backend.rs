@@ -126,7 +126,13 @@ fn build_pi_command(worktree_path: &Path, session_id: &Uuid, prompt: &str) -> To
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::inherit())
-        .current_dir(worktree_path);
+        .current_dir(worktree_path)
+        // Prevent GRU_RETRY_PARENT and GRU_CONFIG_PATH from leaking into Pi
+        // and its tool subprocesses, which would let a `gru` command Pi
+        // invokes incorrectly defer failure labeling or load the lab's
+        // worker config instead of behaving as a standalone invocation.
+        .env_remove(crate::labels::GRU_RETRY_PARENT_ENV)
+        .env_remove(crate::labels::GRU_CONFIG_PATH_ENV);
     cmd
 }
 
@@ -141,7 +147,9 @@ fn build_pi_interactive_command(worktree_path: &Path, session_id: &Uuid) -> Toki
         .current_dir(worktree_path)
         .stdin(std::process::Stdio::inherit())
         .stdout(std::process::Stdio::inherit())
-        .stderr(std::process::Stdio::inherit());
+        .stderr(std::process::Stdio::inherit())
+        .env_remove(crate::labels::GRU_RETRY_PARENT_ENV)
+        .env_remove(crate::labels::GRU_CONFIG_PATH_ENV);
     cmd
 }
 
@@ -159,7 +167,9 @@ fn build_pi_ci_fix_command(worktree_path: &Path, prompt: &str) -> TokioCommand {
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::inherit())
-        .current_dir(worktree_path);
+        .current_dir(worktree_path)
+        .env_remove(crate::labels::GRU_RETRY_PARENT_ENV)
+        .env_remove(crate::labels::GRU_CONFIG_PATH_ENV);
     cmd
 }
 
@@ -181,7 +191,9 @@ fn build_pi_oneshot_command(worktree_path: &Path, prompt_arg: &str) -> TokioComm
 
     cmd.current_dir(worktree_path)
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::inherit());
+        .stderr(std::process::Stdio::inherit())
+        .env_remove(crate::labels::GRU_RETRY_PARENT_ENV)
+        .env_remove(crate::labels::GRU_CONFIG_PATH_ENV);
     cmd
 }
 
@@ -600,6 +612,43 @@ mod tests {
                 .any(|(k, v)| *k == "GH_HOST" && *v == Some("github.example.com".as_ref())),
             "GH_HOST should be set on CI fix command"
         );
+    }
+
+    #[test]
+    fn test_all_command_builders_remove_gru_worker_env_vars() {
+        // GRU_RETRY_PARENT and GRU_CONFIG_PATH must not leak from the
+        // worker process into Pi (or its tool subprocesses), matching the
+        // env_remove calls in claude_backend.rs and codex_backend.rs.
+        // Command::env_remove surfaces as (key, None) in get_envs().
+        let assert_removed = |cmd: &tokio::process::Command| {
+            let envs: Vec<_> = cmd.as_std().get_envs().collect();
+            assert!(
+                envs.iter()
+                    .any(|(k, v)| *k == crate::labels::GRU_RETRY_PARENT_ENV && v.is_none()),
+                "GRU_RETRY_PARENT should be removed"
+            );
+            assert!(
+                envs.iter()
+                    .any(|(k, v)| *k == crate::labels::GRU_CONFIG_PATH_ENV && v.is_none()),
+                "GRU_CONFIG_PATH should be removed"
+            );
+        };
+
+        let b = backend();
+        let path = std::path::PathBuf::from("/tmp/worktree");
+        let session_id = Uuid::nil();
+
+        assert_removed(&b.build_command(&path, &session_id, "prompt", "github.com"));
+        assert_removed(
+            &b.build_resume_command(&path, &session_id, "prompt", "github.com")
+                .unwrap(),
+        );
+        assert_removed(
+            &b.build_interactive_resume_command(&path, &session_id, "github.com")
+                .unwrap(),
+        );
+        assert_removed(&b.build_oneshot_command(&path, "prompt", "github.com"));
+        assert_removed(&b.build_ci_fix_command(&path, "prompt", "github.com"));
     }
 
     // ---- parse_event tests ----
