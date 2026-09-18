@@ -131,12 +131,20 @@ The `--agent` flag always overrides the config default.
 To add a new agent backend:
 
 1. Create `src/<name>_backend.rs` implementing the `AgentBackend` trait from `src/agent.rs`
-2. Register it in `src/agent_registry.rs` (add to `AVAILABLE_AGENTS` and the match in `resolve_backend`)
+2. Register it in `src/agent_registry.rs`:
+   - Add the name to `AVAILABLE_AGENTS`
+   - Add a matching arm in `construct_backend()` — this is the single source of truth that both `resolve_backend()` and `all_process_names()` route through. **A name added to `AVAILABLE_AGENTS` without a `construct_backend` arm compiles fine but fails silently**: `resolve_backend()` will report the agent as unknown, and `all_process_names()` (used by `gru stop`'s process-scan fallback) will silently drop that backend's process names via its `filter_map`, with no compile error either way.
 3. Map the backend's output format to `AgentEvent` variants in `parse_events()`
 
-The `AgentBackend` trait requires:
+The `AgentBackend` trait (`src/agent.rs`) currently has nine methods:
 - `name()` — human-readable identifier
+- `process_names()` — process name(s) to match for `gru stop`'s pgrep fallback
 - `build_command()` — construct the CLI command for a new session
 - `parse_events()` — convert stdout lines to normalized `AgentEvent`s
 - `build_resume_command()` — (optional) construct command to resume a session
 - `build_interactive_resume_command()` — (optional) construct command for `gru attach`; return `None` to disable attach support
+- `build_oneshot_command()` — construct a single-turn, plain-text command (e.g. for the merge-readiness judge)
+- `build_ci_fix_command()` — construct a stream-json command for stateless CI-fix invocations
+- `yolo_args()` — (optional) CLI args to bypass interactive permission prompts for `gru attach --yolo`; defaults to an empty `Vec`
+
+**Convention:** new trait methods should carry a default body so existing backends keep compiling without changes, as `yolo_args()` did when added in #911. `process_names()` broke this convention when added in #912 (no default body), which meant every existing backend had to be updated in the same change — do this deliberately, not by accident.
