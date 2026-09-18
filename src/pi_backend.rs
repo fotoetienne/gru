@@ -46,12 +46,12 @@ use uuid::Uuid;
 /// Implements `AgentBackend` by spawning `pi -p --mode json` and parsing the
 /// resulting JSONL event stream.
 ///
-/// Pi reports input and cache token counts per-turn on `turn_end` rather
-/// than once at session start, so this backend accumulates them across the
-/// session and reports the totals in the `Finished` event at `agent_end`
-/// (output tokens are already accumulated by the caller from each turn's
-/// `MessageComplete`, so `Finished` reports `output_tokens: 0` to avoid
-/// double-counting).
+/// Pi reports input and cache token counts, plus dollar cost, per-turn on
+/// `turn_end` rather than once at session start, so this backend accumulates
+/// them across the session and reports the totals in the `Finished` event at
+/// `agent_end` (output tokens are already accumulated by the caller from
+/// each turn's `MessageComplete`, so `Finished` reports `output_tokens: 0`
+/// to avoid double-counting).
 pub(crate) struct PiBackend {
     /// Path or name of the Pi CLI binary to invoke (`agent.pi.binary` in config).
     binary: String,
@@ -357,6 +357,21 @@ struct PiUsage {
     cache_read: Option<u64>,
     #[serde(default, rename = "cacheWrite")]
     cache_write: Option<u64>,
+    #[serde(default)]
+    cost: Option<PiCost>,
+}
+
+/// Dollar cost breakdown nested under a Pi `usage` object. Only the `total`
+/// is surfaced today; per-category costs aren't tracked separately.
+///
+/// `total` is `Option` rather than defaulting to `0.0`: a `cost` object
+/// present without a valid `total` (schema drift) must not fabricate a real
+/// `Some(0.0)` cost — `TokenUsage.cost` should stay `None` in that case, same
+/// as when `cost` is absent entirely.
+#[derive(Debug, Deserialize)]
+struct PiCost {
+    #[serde(default)]
+    total: Option<f64>,
 }
 
 /// Parses a raw `usage` JSON value into `PiUsage`, tolerating malformed or
@@ -458,6 +473,7 @@ fn parse_pi_event(line: &str, accumulated_usage: &Mutex<TokenUsage>) -> Vec<Agen
                 output_tokens: u.output,
                 cache_read_input_tokens: u.cache_read,
                 cache_creation_input_tokens: u.cache_write,
+                cost: u.cost.and_then(|c| c.total),
             });
             if let Some(u) = &usage {
                 let mut accumulated = accumulated_usage.lock().unwrap();
@@ -467,6 +483,9 @@ fn parse_pi_event(line: &str, accumulated_usage: &Mutex<TokenUsage>) -> Vec<Agen
                 }
                 if let Some(cache_read) = u.cache_read_input_tokens {
                     *accumulated.cache_read_input_tokens.get_or_insert(0) += cache_read;
+                }
+                if let Some(cost) = u.cost {
+                    *accumulated.cost.get_or_insert(0.0) += cost;
                 }
             }
             let mut events = Vec::with_capacity(2);
@@ -994,7 +1013,7 @@ mod tests {
     #[test]
     fn test_parse_event_turn_end_with_usage() {
         let b = backend();
-        let line = r#"{"type":"turn_end","usage":{"input":1000,"output":500,"cacheRead":200,"cacheWrite":50},"cost":{"total":0.01}}"#;
+        let line = r#"{"type":"turn_end","usage":{"input":1000,"output":500,"cacheRead":200,"cacheWrite":50,"cost":{"total":0.01}}}"#;
         let event = single(b.parse_events(line));
         match event {
             AgentEvent::MessageComplete { stop_reason, usage } => {
@@ -1004,6 +1023,43 @@ mod tests {
                 assert_eq!(u.output_tokens, 500);
                 assert_eq!(u.cache_read_input_tokens, Some(200));
                 assert_eq!(u.cache_creation_input_tokens, Some(50));
+                assert_eq!(u.cost, Some(0.01));
+            }
+            other => panic!("Expected MessageComplete, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_event_turn_end_without_cost() {
+        // Cost is absent from the usage object on backends/providers that
+        // don't report it — must not be conjured as Some(0.0).
+        let b = backend();
+        let line = r#"{"type":"turn_end","usage":{"input":1000,"output":500}}"#;
+        let event = single(b.parse_events(line));
+        match event {
+            AgentEvent::MessageComplete { usage, .. } => {
+                assert_eq!(usage.unwrap().cost, None);
+            }
+            other => panic!("Expected MessageComplete, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_event_turn_end_with_malformed_cost_object_degrades_gracefully() {
+        // A `cost` object present but missing `total` (schema drift) must
+        // not fail parsing of the whole `usage` object and drop input/
+        // output/cache tokens along with it. It also must not fabricate a
+        // fake `Some(0.0)` cost — `cost` should stay `None`, same as when
+        // the `cost` object is absent entirely.
+        let b = backend();
+        let line = r#"{"type":"turn_end","usage":{"input":1000,"output":500,"cost":{}}}"#;
+        let event = single(b.parse_events(line));
+        match event {
+            AgentEvent::MessageComplete { usage, .. } => {
+                let u = usage.unwrap();
+                assert_eq!(u.input_tokens, 1000);
+                assert_eq!(u.output_tokens, 500);
+                assert_eq!(u.cost, None);
             }
             other => panic!("Expected MessageComplete, got {:?}", other),
         }
@@ -1100,8 +1156,8 @@ mod tests {
 
         for line in [
             r#"{"type":"session"}"#,
-            r#"{"type":"turn_end","usage":{"input":1000,"output":500,"cacheRead":200,"cacheWrite":50}}"#,
-            r#"{"type":"turn_end","usage":{"input":2000,"output":300,"cacheRead":100}}"#,
+            r#"{"type":"turn_end","usage":{"input":1000,"output":500,"cacheRead":200,"cacheWrite":50,"cost":{"total":0.005}}}"#,
+            r#"{"type":"turn_end","usage":{"input":2000,"output":300,"cacheRead":100,"cost":{"total":0.003}}}"#,
             r#"{"type":"agent_end"}"#,
         ] {
             for event in b.parse_events(line) {
@@ -1113,6 +1169,8 @@ mod tests {
         assert_eq!(total.output_tokens, 800);
         assert_eq!(total.cache_creation_input_tokens, Some(50));
         assert_eq!(total.cache_read_input_tokens, Some(300));
+        // Float accumulation is approximate; don't assert exact equality.
+        assert!((total.cost.unwrap() - 0.008).abs() < 1e-9);
     }
 
     #[test]
@@ -1128,7 +1186,7 @@ mod tests {
 
         b.parse_events(r#"{"type":"session"}"#);
         b.parse_events(
-            r#"{"type":"turn_end","usage":{"input":1000,"output":500,"cacheRead":200,"cacheWrite":50}}"#,
+            r#"{"type":"turn_end","usage":{"input":1000,"output":500,"cacheRead":200,"cacheWrite":50,"cost":{"total":0.01}}}"#,
         );
         b.parse_events(r#"{"type":"agent_end"}"#);
 
@@ -1142,6 +1200,7 @@ mod tests {
                 assert_eq!(u.input_tokens, 0, "must not leak prior invocation's totals");
                 assert_eq!(u.cache_creation_input_tokens, None);
                 assert_eq!(u.cache_read_input_tokens, None);
+                assert_eq!(u.cost, None, "must not leak prior invocation's cost");
             }
             other => panic!("Expected Finished, got {:?}", other),
         }
