@@ -854,7 +854,8 @@ async fn invoke_judge_cli_raw(
         );
     }
 
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    let raw_stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    Ok(backend.sanitize_oneshot_output(&raw_stdout))
 }
 
 /// Parse the judge's JSON response from potentially noisy LLM output.

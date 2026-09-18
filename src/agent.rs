@@ -391,6 +391,18 @@ pub(crate) trait AgentBackend: Send + Sync {
     /// No-op by default; backends without per-turn accumulation (e.g.
     /// Claude Code) don't need to override this.
     fn reset_usage(&self) {}
+
+    /// Sanitizes raw stdout from `build_oneshot_command` before a consumer
+    /// (e.g. `merge_judge.rs`) treats it as the agent's plain-text answer.
+    ///
+    /// `build_oneshot_command` documents plain-text stdout, but a backend
+    /// invoked through a launcher/wrapper may have bootstrap chatter written
+    /// to stdout ahead of the real output (see `PiBackend`, which overrides
+    /// this to strip it). Identity by default — Claude and Codex are invoked
+    /// directly and their stdout is already clean.
+    fn sanitize_oneshot_output(&self, raw: &str) -> String {
+        raw.to_string()
+    }
 }
 
 #[cfg(test)]

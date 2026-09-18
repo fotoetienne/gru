@@ -233,6 +233,39 @@ impl AgentBackend for PiBackend {
     fn reset_usage(&self) {
         *self.accumulated_usage.lock().unwrap() = TokenUsage::default();
     }
+
+    /// Some environments invoke Pi through a launcher/wrapper that writes its
+    /// own bootstrap lines to stdout before Pi's real output, e.g.:
+    ///
+    /// ```text
+    /// Using existing sandbox at /path/to/sandbox
+    /// Using existing distribution package: npm:<some-pi-package>
+    /// ```
+    ///
+    /// These lines have no bearing on Pi's own output format, so only a
+    /// fixed set of known launcher-preamble prefixes is stripped, and only
+    /// while they appear contiguously at the very start of stdout — this
+    /// avoids discarding legitimate Pi output that happens to start with a
+    /// similar-looking line further down.
+    fn sanitize_oneshot_output(&self, raw: &str) -> String {
+        const LAUNCHER_PREAMBLE_PREFIXES: &[&str] = &[
+            "Using existing sandbox at ",
+            "Using existing distribution package: ",
+        ];
+
+        let mut lines: Vec<&str> = raw.lines().collect();
+        while let Some(first) = lines.first() {
+            if LAUNCHER_PREAMBLE_PREFIXES
+                .iter()
+                .any(|prefix| first.starts_with(prefix))
+            {
+                lines.remove(0);
+            } else {
+                break;
+            }
+        }
+        lines.join("\n")
+    }
 }
 
 /// Applies the stdio/cwd/env settings shared by `-p --mode json` invocations
@@ -753,6 +786,36 @@ mod tests {
             envs.iter()
                 .any(|(k, v)| *k == "GH_HOST" && *v == Some("github.com".as_ref())),
             "GH_HOST should be set on the oneshot command"
+        );
+    }
+
+    #[test]
+    fn test_sanitize_oneshot_output_strips_launcher_preamble() {
+        let b = backend();
+        let raw = "Using existing sandbox at /path/to/sandbox\n\
+                   Using existing distribution package: npm:@earendil-works/pi-coding-agent\n\
+                   {\"confidence\": 8, \"action\": \"merge\"}";
+        let sanitized = b.sanitize_oneshot_output(raw);
+        assert_eq!(sanitized, "{\"confidence\": 8, \"action\": \"merge\"}");
+    }
+
+    #[test]
+    fn test_sanitize_oneshot_output_preserves_output_without_preamble() {
+        let b = backend();
+        let raw = "{\"confidence\": 8, \"action\": \"merge\"}";
+        assert_eq!(b.sanitize_oneshot_output(raw), raw);
+    }
+
+    #[test]
+    fn test_sanitize_oneshot_output_only_strips_leading_preamble_lines() {
+        let b = backend();
+        // A legitimate answer that merely mentions the phrase mid-output
+        // must survive untouched once real content has started.
+        let raw = "Using existing sandbox at /path/to/sandbox\n\
+                   The agent reported: Using existing sandbox at /other/path";
+        assert_eq!(
+            b.sanitize_oneshot_output(raw),
+            "The agent reported: Using existing sandbox at /other/path"
         );
     }
 
