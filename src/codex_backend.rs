@@ -265,6 +265,12 @@ fn parse_codex_event(line: &str, accumulated_usage: &Mutex<TokenUsage>) -> Optio
             })
         }
 
+        // TODO: verify `thread.completed` against real Codex CLI output once
+        // available — inferred as the terminal counterpart to `thread.started`
+        // but not yet confirmed against an actual `codex exec --json` session
+        // (see `turn.failed` above for the same class of open verification).
+        // If the real event name/shape differs, Codex input/cache totals
+        // silently stay at zero since unrecognized types fall through to `_ => None`.
         "thread.completed" => {
             let totals = accumulated_usage.lock().unwrap().clone();
             Some(AgentEvent::Finished {
