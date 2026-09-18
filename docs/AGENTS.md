@@ -137,7 +137,7 @@ To add a new agent backend:
    - Add the name to `AVAILABLE_AGENTS`
    - Add a matching arm in `construct_backend()` — this is the single source of truth that both `resolve_backend()` and `all_process_names()` route through. **A name added to `AVAILABLE_AGENTS` without a `construct_backend` arm compiles fine but breaks at runtime in two different ways, neither of which is a clean error**: `resolve_backend()` passes the `AVAILABLE_AGENTS` check and then panics on the `.expect()` around `construct_backend`'s `None` result, while `all_process_names()` (used by `gru stop`'s process-scan fallback) silently drops that backend's process names via its `filter_map` with no error at all. No compile error either way.
 4. Map the backend's output format to `AgentEvent` variants in `parse_events()`
-5. Update the hard-coded `--agent` help strings in `src/main.rs` (e.g. `"Agent backend to use (claude, codex). Defaults to claude."` on the `do` command, plus the `review`/`prompt` command help) — these aren't derived from `AVAILABLE_AGENTS`, so a new backend added without touching them leaves `--help` output stale
+5. Update the `do` command's `--agent` help string in `src/main.rs` (`"Agent backend to use (claude, codex). Defaults to claude."`) — it enumerates backends by name but isn't derived from `AVAILABLE_AGENTS`, so a new backend added without touching it leaves `--help` output stale. The `review`/`prompt` commands' help (`"Agent backend to use (e.g., 'claude')."`) is a non-exhaustive example, not an enumeration, so it doesn't need updating for each new backend
 
 The `AgentBackend` trait (`src/agent.rs`) currently has nine methods:
 - `name()` — human-readable identifier
