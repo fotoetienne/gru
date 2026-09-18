@@ -121,6 +121,10 @@ impl AgentBackend for CodexBackend {
     ) -> TokioCommand {
         self.build_command(worktree_path, &Uuid::nil(), prompt, github_host)
     }
+
+    fn final_usage(&self) -> Option<TokenUsage> {
+        Some(self.accumulated_usage.lock().unwrap().clone())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -714,6 +718,32 @@ mod tests {
             }
             other => panic!("Expected Finished, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_final_usage_recovers_totals_without_thread_completed() {
+        // If the real Codex CLI never emits `thread.completed` (unverified
+        // — see the TODO on that match arm), the stream ends (EOF) without
+        // a `Finished` event to read totals from. `final_usage()` is the
+        // fallback `run_agent_with_stream_monitoring` calls in that case so
+        // input/cache totals aren't silently lost.
+        let b = backend();
+        b.parse_events(r#"{"type":"thread.started","thread_id":"thread_abc123"}"#);
+        b.parse_events(
+            r#"{"type":"turn.completed","usage":{"input_tokens":1000,"output_tokens":500,"cached_input_tokens":200}}"#,
+        );
+        b.parse_events(
+            r#"{"type":"turn.completed","usage":{"input_tokens":2000,"output_tokens":300,"cached_input_tokens":100}}"#,
+        );
+        // No "thread.completed" line.
+
+        let usage = b.final_usage().unwrap();
+        assert_eq!(usage.input_tokens, 3000);
+        assert_eq!(
+            usage.output_tokens, 0,
+            "output already covered by MessageComplete"
+        );
+        assert_eq!(usage.cache_read_input_tokens, Some(300));
     }
 
     #[test]

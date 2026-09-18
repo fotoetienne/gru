@@ -200,6 +200,10 @@ impl AgentBackend for PiBackend {
         cmd.env("GH_HOST", github_host);
         cmd
     }
+
+    fn final_usage(&self) -> Option<TokenUsage> {
+        Some(self.accumulated_usage.lock().unwrap().clone())
+    }
 }
 
 /// Applies the stdio/cwd/env settings shared by `-p --mode json` invocations
@@ -1045,6 +1049,32 @@ mod tests {
             }
             other => panic!("Expected Finished, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_final_usage_recovers_totals_without_agent_end() {
+        // If the stream ends (EOF) without an `agent_end` line — e.g. the
+        // process is killed by stuck-detection, or crashes mid-session —
+        // the runner has no `Finished` event to read totals from.
+        // `final_usage()` is the fallback that recovers them.
+        let b = backend();
+        b.parse_events(r#"{"type":"session"}"#);
+        b.parse_events(
+            r#"{"type":"turn_end","usage":{"input":1000,"output":500,"cacheRead":200,"cacheWrite":50}}"#,
+        );
+        b.parse_events(
+            r#"{"type":"turn_end","usage":{"input":2000,"output":300,"cacheRead":100}}"#,
+        );
+        // No "agent_end" line.
+
+        let usage = b.final_usage().unwrap();
+        assert_eq!(usage.input_tokens, 3000);
+        assert_eq!(
+            usage.output_tokens, 0,
+            "output already covered by MessageComplete"
+        );
+        assert_eq!(usage.cache_creation_input_tokens, Some(50));
+        assert_eq!(usage.cache_read_input_tokens, Some(300));
     }
 
     #[test]
