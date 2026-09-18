@@ -102,8 +102,8 @@ particular Pi distribution's JSON event schema (`session`/`agent_start`, `turn_s
 `tool_execution_start`/`_end` with `toolCallId`/`toolName`, `turn_end` usage, etc.). If your
 `pi` resolves to a build with a different event shape, unrecognized lines are silently
 skipped rather than erroring — so a mismatch shows up as missing tool/progress tracking, not
-a crash. Confirm your installed `pi --version` matches what this backend expects before
-relying on rich progress output.
+a crash. If progress output is empty or tool calls never appear, compare your `pi`'s
+`--mode json` output against the event names above.
 
 ### Install
 
