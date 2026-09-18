@@ -247,6 +247,11 @@ impl Drop for TestConfigGuard {
 ///
 /// In test builds, checks for a thread-local path override set via
 /// [`set_test_config_path`] before falling back to the default path.
+///
+/// Also honors the `GRU_CONFIG_PATH` env var (see
+/// [`crate::labels::GRU_CONFIG_PATH_ENV`]) so that a `gru do`/`gru resume`
+/// process spawned by `gru lab --config <path>` resolves agent settings
+/// from the same config file lab used, instead of `~/.gru/config.toml`.
 pub(crate) fn try_load_config() -> Option<LabConfig> {
     #[cfg(test)]
     {
@@ -255,8 +260,24 @@ pub(crate) fn try_load_config() -> Option<LabConfig> {
             return load_or_warn(&path);
         }
     }
-    let path = LabConfig::default_path().ok()?;
+    let env_override = std::env::var_os(crate::labels::GRU_CONFIG_PATH_ENV);
+    let path = resolve_config_path(env_override)?;
     load_or_warn(&path)
+}
+
+/// Picks the config path `try_load_config` should read: `env_override` (the
+/// `GRU_CONFIG_PATH` env var) when present, else the default `~/.gru/config.toml`.
+///
+/// Pulled out as a pure function, parameterized on the env var's value rather
+/// than reading `std::env::var_os` itself, so the `GRU_CONFIG_PATH` handoff is
+/// unit-testable without mutating the real process environment — env vars are
+/// process-global, and mutating them in a test would race under a threaded
+/// (non-nextest) test runner against any other test calling `try_load_config()`.
+fn resolve_config_path(env_override: Option<std::ffi::OsString>) -> Option<PathBuf> {
+    if let Some(path) = env_override {
+        return Some(PathBuf::from(path));
+    }
+    LabConfig::default_path().ok()
 }
 
 /// Loads config from `path` if it exists, logging any parse/validation error.
@@ -827,11 +848,28 @@ impl LabConfig {
     /// Runs in both `load()` and `load_partial()` because agent settings are
     /// used by all commands, not just the daemon.
     fn validate_agent(&self) -> Result<()> {
+        if !crate::agent_registry::AVAILABLE_AGENTS.contains(&self.agent.default.as_str()) {
+            anyhow::bail!(
+                "Unknown agent.default '{}'. Available: {}",
+                self.agent.default,
+                crate::agent_registry::AVAILABLE_AGENTS.join(", ")
+            );
+        }
+
         if self.agent.claude.ci_fix_max_turns == Some(0) {
             anyhow::bail!(
                 "agent.claude.ci_fix_max_turns must be a positive integer (got 0). \
                  Remove the field to use no limit, or set it to a positive value."
             );
+        }
+
+        if let Some(binary) = &self.agent.claude.binary {
+            if binary.trim().is_empty() {
+                anyhow::bail!(
+                    "agent.claude.binary must not be empty. Remove the field to use \
+                     \"claude\" (resolved via $PATH), or set it to a valid binary path."
+                );
+            }
         }
         Ok(())
     }
@@ -1209,15 +1247,33 @@ binary = "/usr/local/bin/claude"
 repos = ["owner/repo"]
 
 [agent]
+default = "codex"
+"#;
+        let mut temp_file = NamedTempFile::new().unwrap();
+        temp_file.write_all(config_toml.as_bytes()).unwrap();
+        temp_file.flush().unwrap();
+
+        let config = LabConfig::load(temp_file.path()).unwrap();
+        assert_eq!(config.agent.default, "codex");
+    }
+
+    #[test]
+    fn test_agent_config_unknown_default_rejected_by_load() {
+        let config_toml = r#"
+[daemon]
+repos = ["owner/repo"]
+
+[agent]
 default = "aider"
 "#;
         let mut temp_file = NamedTempFile::new().unwrap();
         temp_file.write_all(config_toml.as_bytes()).unwrap();
         temp_file.flush().unwrap();
 
-        // Parsing succeeds (validation happens in AgentRegistry, not config parsing)
-        let config = LabConfig::load(temp_file.path()).unwrap();
-        assert_eq!(config.agent.default, "aider");
+        let result = LabConfig::load(temp_file.path());
+        assert!(result.is_err());
+        let msg = format!("{}", result.err().unwrap());
+        assert!(msg.contains("Unknown agent.default 'aider'"), "{}", msg);
     }
 
     #[test]
@@ -1269,6 +1325,33 @@ default = "aider"
             msg.contains("ci_fix_max_turns"),
             "error should mention the field: {msg}"
         );
+    }
+
+    #[test]
+    fn test_empty_claude_binary_is_rejected_by_load_partial() {
+        let config_toml = "[agent.claude]\nbinary = \"\"\n";
+        let mut temp_file = NamedTempFile::new().unwrap();
+        temp_file.write_all(config_toml.as_bytes()).unwrap();
+        temp_file.flush().unwrap();
+
+        let result = LabConfig::load_partial(temp_file.path());
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("agent.claude.binary"),
+            "error should mention the field: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_whitespace_only_claude_binary_is_rejected() {
+        let config_toml = "[agent.claude]\nbinary = \"   \"\n";
+        let mut temp_file = NamedTempFile::new().unwrap();
+        temp_file.write_all(config_toml.as_bytes()).unwrap();
+        temp_file.flush().unwrap();
+
+        let result = LabConfig::load_partial(temp_file.path());
+        assert!(result.is_err());
     }
 
     #[test]
@@ -2112,7 +2195,7 @@ default = "codex"
     fn test_set_test_config_path_overrides_try_load() {
         let config_toml = r#"
 [agent]
-default = "test-agent"
+default = "codex"
 "#;
         let mut temp_file = NamedTempFile::new().unwrap();
         temp_file.write_all(config_toml.as_bytes()).unwrap();
@@ -2120,7 +2203,52 @@ default = "test-agent"
 
         let _guard = super::set_test_config_path(temp_file.path().to_path_buf());
         let config = super::try_load_config().expect("should load from override path");
-        assert_eq!(config.agent.default, "test-agent");
+        assert_eq!(config.agent.default, "codex");
+    }
+
+    // `resolve_config_path` is tested directly below rather than by mutating
+    // the real `GRU_CONFIG_PATH` process env var: env vars are process-global,
+    // so a test that calls `std::env::set_var` could race under cargo test's
+    // threaded runner against any other test calling `try_load_config()`
+    // concurrently (this repo's `just test` uses cargo nextest, which is
+    // process-per-test and wouldn't have this problem, but `cargo test` is
+    // also supported). Parameterizing on the env var's value instead avoids
+    // touching shared process state at all.
+
+    #[test]
+    fn test_resolve_config_path_uses_env_override_when_present() {
+        let path = resolve_config_path(Some(std::ffi::OsString::from("/tmp/lab-config.toml")))
+            .expect("should resolve from the override");
+        assert_eq!(path, PathBuf::from("/tmp/lab-config.toml"));
+    }
+
+    #[test]
+    fn test_resolve_config_path_falls_back_to_default_without_override() {
+        let path =
+            resolve_config_path(None).expect("should resolve the default ~/.gru/config.toml");
+        assert_eq!(path, LabConfig::default_path().unwrap());
+    }
+
+    #[test]
+    fn test_validate_agent_rejects_unknown_default() {
+        let config_toml = r#"
+[agent]
+default = "test-agent"
+"#;
+        let mut temp_file = NamedTempFile::new().unwrap();
+        temp_file.write_all(config_toml.as_bytes()).unwrap();
+        temp_file.flush().unwrap();
+
+        let result = LabConfig::load_partial(temp_file.path());
+        assert!(result.is_err());
+        let msg = format!("{}", result.err().unwrap());
+        assert!(
+            msg.contains("Unknown agent.default 'test-agent'"),
+            "{}",
+            msg
+        );
+        assert!(msg.contains("claude"), "{}", msg);
+        assert!(msg.contains("codex"), "{}", msg);
     }
 
     #[test]
@@ -2179,7 +2307,7 @@ web_url = ""
 
     #[test]
     fn test_set_test_config_path_guard_clears_on_drop() {
-        let config_toml = "[agent]\ndefault = \"test-agent\"\n";
+        let config_toml = "[agent]\ndefault = \"codex\"\n";
         let mut temp_file = NamedTempFile::new().unwrap();
         temp_file.write_all(config_toml.as_bytes()).unwrap();
         temp_file.flush().unwrap();

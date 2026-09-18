@@ -36,6 +36,8 @@ pub(crate) struct ClaudeBackend {
     tool_buffer: Mutex<Option<ToolBuffer>>,
     /// Maximum agent turns for CI fix invocations. `None` means no limit.
     ci_fix_max_turns: Option<u32>,
+    /// Path or name of the Claude Code CLI binary to invoke (`agent.claude.binary` in config).
+    binary: String,
 }
 
 impl Default for ClaudeBackend {
@@ -43,23 +45,25 @@ impl Default for ClaudeBackend {
         Self {
             tool_buffer: Mutex::new(None),
             ci_fix_max_turns: None,
+            binary: "claude".to_string(),
         }
     }
 }
 
 impl ClaudeBackend {
-    pub(crate) fn new(ci_fix_max_turns: Option<u32>) -> Self {
+    pub(crate) fn new(ci_fix_max_turns: Option<u32>, binary: Option<String>) -> Self {
         Self {
             tool_buffer: Mutex::new(None),
             ci_fix_max_turns,
+            binary: binary.unwrap_or_else(|| "claude".to_string()),
         }
     }
 
     /// Returns a command pre-configured with the flags common to all
     /// non-interactive Claude invocations (print, text output, no permissions
     /// prompt, piped stdio). Callers add turn limits and the prompt argument.
-    fn base_noninteractive_cmd(worktree_path: &Path) -> TokioCommand {
-        let mut cmd = TokioCommand::new("claude");
+    fn base_noninteractive_cmd(&self, worktree_path: &Path) -> TokioCommand {
+        let mut cmd = TokioCommand::new(&self.binary);
         cmd.arg("--print")
             .arg("--output-format")
             .arg("text")
@@ -67,7 +71,8 @@ impl ClaudeBackend {
             .current_dir(worktree_path)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::inherit())
-            .env_remove(crate::labels::GRU_RETRY_PARENT_ENV);
+            .env_remove(crate::labels::GRU_RETRY_PARENT_ENV)
+            .env_remove(crate::labels::GRU_CONFIG_PATH_ENV);
         cmd
     }
 
@@ -177,7 +182,13 @@ impl AgentBackend for ClaudeBackend {
         prompt: &str,
         github_host: &str,
     ) -> TokioCommand {
-        claude_runner::build_claude_command(worktree_path, session_id, prompt, github_host)
+        claude_runner::build_claude_command(
+            &self.binary,
+            worktree_path,
+            session_id,
+            prompt,
+            github_host,
+        )
     }
 
     fn parse_events(&self, line: &str) -> Vec<AgentEvent> {
@@ -209,6 +220,7 @@ impl AgentBackend for ClaudeBackend {
         github_host: &str,
     ) -> Option<TokioCommand> {
         Some(claude_runner::build_claude_resume_command(
+            &self.binary,
             worktree_path,
             session_id,
             prompt,
@@ -222,7 +234,7 @@ impl AgentBackend for ClaudeBackend {
         session_id: &Uuid,
         github_host: &str,
     ) -> Option<TokioCommand> {
-        let mut cmd = TokioCommand::new("claude");
+        let mut cmd = TokioCommand::new(&self.binary);
         cmd.arg("--resume")
             .arg(session_id.to_string())
             .current_dir(worktree_path)
@@ -230,12 +242,13 @@ impl AgentBackend for ClaudeBackend {
             .stdout(std::process::Stdio::inherit())
             .stderr(std::process::Stdio::inherit())
             .env("GH_HOST", github_host)
-            .env_remove(crate::labels::GRU_RETRY_PARENT_ENV);
+            .env_remove(crate::labels::GRU_RETRY_PARENT_ENV)
+            .env_remove(crate::labels::GRU_CONFIG_PATH_ENV);
         Some(cmd)
     }
 
     fn build_oneshot_command(&self, worktree_path: &Path, prompt_arg: &str) -> TokioCommand {
-        let mut cmd = ClaudeBackend::base_noninteractive_cmd(worktree_path);
+        let mut cmd = self.base_noninteractive_cmd(worktree_path);
         cmd.arg("--max-turns").arg("1").arg(prompt_arg);
         cmd
     }
@@ -246,7 +259,7 @@ impl AgentBackend for ClaudeBackend {
         prompt: &str,
         github_host: &str,
     ) -> TokioCommand {
-        let mut cmd = TokioCommand::new("claude");
+        let mut cmd = TokioCommand::new(&self.binary);
         cmd.arg("--print")
             .arg("--verbose")
             .arg("--output-format")
@@ -261,7 +274,8 @@ impl AgentBackend for ClaudeBackend {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::inherit())
             .env("GH_HOST", github_host)
-            .env_remove(crate::labels::GRU_RETRY_PARENT_ENV);
+            .env_remove(crate::labels::GRU_RETRY_PARENT_ENV)
+            .env_remove(crate::labels::GRU_CONFIG_PATH_ENV);
         cmd
     }
 }
@@ -512,7 +526,7 @@ mod tests {
 
     #[test]
     fn test_build_ci_fix_command_applies_max_turns() {
-        let b = ClaudeBackend::new(Some(10));
+        let b = ClaudeBackend::new(Some(10), None);
         let path = std::path::PathBuf::from("/tmp/worktree");
         let cmd = b.build_ci_fix_command(&path, "fix the CI", "github.com");
         let inner = cmd.as_std();
@@ -520,6 +534,44 @@ mod tests {
         let args: Vec<&std::ffi::OsStr> = inner.get_args().collect();
         assert!(args.contains(&"--max-turns".as_ref()));
         assert!(args.contains(&"10".as_ref()));
+    }
+
+    #[test]
+    fn test_binary_override_used_for_all_commands() {
+        let b = ClaudeBackend::new(None, Some("/opt/tools/claude".to_string()));
+        let path = std::path::PathBuf::from("/tmp/worktree");
+        let session_id = Uuid::nil();
+
+        assert_eq!(
+            b.build_command(&path, &session_id, "p", "github.com")
+                .as_std()
+                .get_program(),
+            "/opt/tools/claude"
+        );
+        assert_eq!(
+            b.build_resume_command(&path, &session_id, "p", "github.com")
+                .unwrap()
+                .as_std()
+                .get_program(),
+            "/opt/tools/claude"
+        );
+        assert_eq!(
+            b.build_interactive_resume_command(&path, &session_id, "github.com")
+                .unwrap()
+                .as_std()
+                .get_program(),
+            "/opt/tools/claude"
+        );
+        assert_eq!(
+            b.build_oneshot_command(&path, "p").as_std().get_program(),
+            "/opt/tools/claude"
+        );
+        assert_eq!(
+            b.build_ci_fix_command(&path, "p", "github.com")
+                .as_std()
+                .get_program(),
+            "/opt/tools/claude"
+        );
     }
 
     // ---- parse_event tests ----

@@ -166,13 +166,54 @@ pub(crate) async fn terminate_via_registry_pid(minion_id: &str, force: bool) -> 
     false
 }
 
+/// Returns the process-name alternatives `terminate_agent_in_worktree`'s
+/// `pgrep -f` pattern should match: every registered agent backend's process
+/// name(s) (see `AgentBackend::process_names`) plus the basename of
+/// `[agent.claude] binary` when a custom executable is configured (e.g.
+/// `/opt/tools/cc` contributes `cc`). Without the latter, `gru stop`/`gru
+/// attach` would silently fail to find or terminate the agent process when a
+/// non-default binary is configured.
+fn agent_process_match_names() -> Vec<String> {
+    build_process_match_names(&crate::agent_registry::configured_claude_binary())
+}
+
+/// Pure helper behind `agent_process_match_names`, parameterized on the
+/// configured binary string so the empty/whitespace-only skip logic is
+/// unit-testable without going through real config resolution.
+///
+/// A basename that is empty (or all-whitespace, e.g. from a stray
+/// `binary = "   "` that slipped past config validation) is skipped rather
+/// than added, since an empty alternative in the `pgrep` pattern below would
+/// match every process — `validate_agent` rejects this at config-load time,
+/// but this is a defense-in-depth check for callers that bypass it.
+fn build_process_match_names(configured_binary: &str) -> Vec<String> {
+    let mut names = all_process_names();
+    names.push("gru".to_string());
+    let basename = Path::new(configured_binary)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(configured_binary)
+        .trim()
+        .to_string();
+    if !basename.is_empty() && !names.contains(&basename) {
+        names.push(basename);
+    }
+    names
+}
+
 /// Terminates agent backend processes running in the specified worktree (legacy fallback).
 ///
 /// Uses `pgrep -f` with a pattern that matches the `gru` worker process plus every
 /// registered agent backend's process name(s) (see `AgentBackend::process_names`),
-/// scoped to command lines that reference the worktree path. The path is
-/// regex-escaped to prevent metacharacters (e.g., `.`, `[`, `]`) from causing
-/// false matches.
+/// or the configured `[agent.claude] binary` basename if set to something else,
+/// whose command line references the worktree path. Each name is regex-escaped
+/// and anchored to a path/token boundary (`(^|/)name([[:space:]]|$)`) so it must
+/// appear as a whole executable-name token — e.g. a configured binary named `sh`
+/// matches only `.../sh` or `sh <args>`, not `bash` or `--shell` — rather than as
+/// an arbitrary substring of the command line, which combined with an unanchored
+/// match could otherwise cause `gru stop` to terminate unrelated processes. The
+/// worktree path is separately regex-escaped for the same reason (metacharacters
+/// like `.`, `[`, `]` in the path shouldn't be interpreted as regex syntax).
 ///
 /// Note: `pgrep -f` interprets the pattern as a POSIX extended regex. Paths containing
 /// unusual characters beyond what `escape_regex` handles may still produce unexpected
@@ -184,16 +225,18 @@ pub(crate) async fn terminate_agent_in_worktree(
     force: bool,
 ) -> Result<usize> {
     let escaped_path = escape_regex(&worktree_path.to_string_lossy());
-    let mut names = all_process_names();
-    names.push("gru".to_string());
-    let names_alternation = names.join("|");
+    let names = agent_process_match_names();
+    let names_alternation = names
+        .iter()
+        .map(|n| escape_regex(n))
+        .collect::<Vec<_>>()
+        .join("|");
+    // Anchor each name to a path/token boundary so e.g. "sh" doesn't match
+    // inside "bash" or an unrelated argument — see doc comment above.
+    let exec = format!("(^|/)({names_alternation})([[:space:]]|$)");
     // Match a gru worker or any registered agent backend process referencing
     // this worktree (either order).
-    let pattern = format!(
-        "({names}).*{path}|{path}.*({names})",
-        names = names_alternation,
-        path = escaped_path
-    );
+    let pattern = format!("{exec}.*{path}|{path}.*{exec}", path = escaped_path);
 
     let output = match Command::new("pgrep").args(["-f", &pattern]).output().await {
         Ok(o) => o,
@@ -300,5 +343,66 @@ mod tests {
     fn test_send_signal_nonexistent_pid() {
         // High PID that doesn't exist
         assert!(!send_signal(4_194_304, libc::SIGTERM));
+    }
+
+    #[test]
+    fn test_build_process_match_names_defaults() {
+        let names = build_process_match_names("claude");
+        assert_eq!(names, vec!["claude", "codex", "gru"]);
+    }
+
+    #[test]
+    fn test_build_process_match_names_adds_custom_binary_basename() {
+        let names = build_process_match_names("/opt/tools/cc");
+        assert!(names.contains(&"cc".to_string()));
+        assert_eq!(names.len(), 4);
+    }
+
+    #[test]
+    fn test_build_process_match_names_skips_empty_binary() {
+        // An empty `[agent.claude] binary` should never contribute an empty
+        // alternative to the pgrep pattern — that would match every process.
+        // validate_agent() already rejects this at config-load time; this is
+        // the defense-in-depth check for callers that bypass it.
+        let names = build_process_match_names("");
+        assert_eq!(names, vec!["claude", "codex", "gru"]);
+    }
+
+    #[test]
+    fn test_build_process_match_names_skips_whitespace_only_binary() {
+        let names = build_process_match_names("   ");
+        assert_eq!(names, vec!["claude", "codex", "gru"]);
+    }
+
+    #[test]
+    fn test_build_process_match_names_no_duplicate_for_default_name() {
+        // Configured binary resolving to a name already in the default list
+        // shouldn't produce a duplicate alternative.
+        let names = build_process_match_names("/usr/local/bin/gru");
+        assert_eq!(names, vec!["claude", "codex", "gru"]);
+    }
+
+    /// The anchored `(^|/)(names)([[:space:]]|$)` pattern this module builds
+    /// must match a configured binary only as a whole executable-name token —
+    /// not as a substring of an unrelated command or argument. Exercises the
+    /// regex directly (via the `regex` crate, standing in for `pgrep`'s POSIX
+    /// ERE engine) rather than spawning a real process.
+    #[test]
+    fn test_exec_boundary_pattern_matches_token_not_substring() {
+        let names = build_process_match_names("sh").join("|");
+        let pattern = format!(r"(^|/)({names})([[:space:]]|$)");
+        let re = regex::Regex::new(&pattern).unwrap();
+
+        assert!(re.is_match("/bin/sh -c foo"), "should match a full path");
+        assert!(re.is_match("sh -c foo"), "should match a bare token");
+        assert!(!re.is_match("bash -c foo"), "should not match inside bash");
+        assert!(
+            !re.is_match("/usr/bin/ssh user@host"),
+            "should not match inside ssh"
+        );
+        assert!(
+            !re.is_match("echo --shell"),
+            "should not match inside --shell"
+        );
     }
 }

@@ -9,10 +9,10 @@ use crate::tmux::TmuxGuard;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Local, Utc};
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::process::Child;
 use tokio::sync::Notify;
@@ -149,6 +149,24 @@ impl RecoveryTracker {
     }
 }
 
+/// Explicit `--config <path>` the lab daemon was started with, if any.
+///
+/// Set once near the start of `handle_lab` and read by `spawn_minion`/
+/// `spawn_resume` so spawned children set `GRU_CONFIG_PATH`, making them (and
+/// any worker they spawn in turn, via env inheritance) resolve agent settings
+/// from the same non-default config file lab used, instead of silently
+/// falling back to `~/.gru/config.toml`. `None` when lab used the default
+/// config path or no config file at all — in that case children already
+/// resolve to the same path on their own, so no env var is needed.
+static LAB_CONFIG_PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
+
+/// Returns the `--config` path lab was started with, for setting
+/// `GRU_CONFIG_PATH` on spawned children. `None` if `LAB_CONFIG_PATH` was
+/// never set (e.g. in tests that don't call `handle_lab`) or was set to `None`.
+fn lab_config_path() -> Option<&'static PathBuf> {
+    LAB_CONFIG_PATH.get().and_then(|p| p.as_ref())
+}
+
 /// Handles the lab daemon command
 pub(crate) async fn handle_lab(
     config_path: Option<PathBuf>,
@@ -158,6 +176,10 @@ pub(crate) async fn handle_lab(
     no_resume: bool,
     stop_minions: bool,
 ) -> Result<i32> {
+    // Record the explicit --config path (if any) so spawned children can be
+    // told to use the same file. Set once, before any spawning happens.
+    let _ = LAB_CONFIG_PATH.set(config_path.clone());
+
     // Load configuration
     let config = if let Some(path) = config_path {
         LabConfig::load(&path)?
@@ -1592,6 +1614,7 @@ async fn try_spawn_for_issue(
     ctx: &RepoContext<'_>,
     issue_number: u64,
     label: &str,
+    agent_name: &str,
     children: &mut Vec<SpawnedChild>,
 ) -> Result<bool> {
     // Remove any dead registry entries before claiming, so that stale entries
@@ -1612,7 +1635,7 @@ async fn try_spawn_for_issue(
     }
 
     // Successfully claimed, spawn Minion
-    match spawn_minion(&ctx.full, &ctx.host, issue_number).await {
+    match spawn_minion(&ctx.full, &ctx.host, issue_number, agent_name).await {
         Ok(child) => {
             // Write PID to registry immediately (if the subprocess has
             // already created the entry) to prevent duplicate spawns.
@@ -1792,7 +1815,15 @@ async fn spawn_for_candidate_issues(
                 continue;
             }
 
-            if try_spawn_for_issue(&ctx, candidate.number, label, children).await? {
+            if try_spawn_for_issue(
+                &ctx,
+                candidate.number,
+                label,
+                &config.agent.default,
+                children,
+            )
+            .await?
+            {
                 spawned += 1;
                 spawned_this_repo += 1;
                 *available -= 1;
@@ -1890,7 +1921,7 @@ async fn poll_and_spawn(
     }
 
     // Dispatch due retries first (continuation retries get priority over failure retries)
-    let mut spawned = dispatch_due_retries(retry_queue, children, &mut available).await?;
+    let mut spawned = dispatch_due_retries(config, retry_queue, children, &mut available).await?;
 
     if available == 0 {
         if spawned > 0 {
@@ -1967,6 +1998,7 @@ async fn poll_and_spawn(
 /// should branch on `entry.kind` and call `spawn_resume` for continuations.
 /// Returns the number of retries dispatched.
 async fn dispatch_due_retries(
+    config: &LabConfig,
     retry_queue: &mut RetryQueue,
     children: &mut Vec<SpawnedChild>,
     available: &mut usize,
@@ -2027,7 +2059,14 @@ async fn dispatch_due_retries(
             entry.reason
         );
 
-        match spawn_minion(&full_repo, &entry.host, entry.issue_number).await {
+        match spawn_minion(
+            &full_repo,
+            &entry.host,
+            entry.issue_number,
+            &config.agent.default,
+        )
+        .await
+        {
             Ok(child) => {
                 children.push(SpawnedChild {
                     child,
@@ -2303,22 +2342,28 @@ async fn spawn_background_cmd(
     Ok(child)
 }
 
-/// Spawn a Minion to work on an issue using the `gru do` command.
+/// Builds the `gru do <issue_ref> --agent <agent_name>` command lab spawns for
+/// a Minion, without touching the filesystem or actually spawning it.
 ///
-/// Returns the child process handle for lifecycle tracking.
-async fn spawn_minion(repo: &str, host: &str, issue_number: u64) -> Result<Child> {
-    let issue_ref = crate::github::build_issue_url_with_host(repo, host, issue_number)
-        .with_context(|| format!("Invalid repo format: '{}'", repo))?;
-
-    let exe = std::env::current_exe().context("Failed to get current executable path")?;
-    let log_name = format_log_name(host, repo, issue_number);
-    let (stdout_file, stderr_file, log_path) = setup_log_file(&log_name).await?;
-
+/// Split out from `spawn_minion` so the `--agent` and `GRU_CONFIG_PATH`
+/// handoff can be asserted on directly in tests, independent of process
+/// spawning and log-file setup.
+fn build_do_command(
+    exe: &Path,
+    issue_ref: &str,
+    agent_name: &str,
+    config_path: Option<&Path>,
+) -> tokio::process::Command {
     // Remove TMUX/TMUX_PANE so the child doesn't inherit the lab's tmux session —
     // otherwise TmuxGuard renames arbitrary windows in the parent's tmux.
     let mut cmd = tokio::process::Command::new(exe);
     cmd.arg("do")
-        .arg(&issue_ref)
+        .arg(issue_ref)
+        // Pass the configured default explicitly so the spawned `gru do` process
+        // is not left to re-derive it from ~/.gru/config.toml, which may differ
+        // from the config lab was started with (e.g. via `gru lab --config`).
+        .arg("--agent")
+        .arg(agent_name)
         // Tells the worker to defer gru:failed labeling so lab's retry queue can fire.
         // See labels::{GRU_RETRY_PARENT_ENV, GRU_RETRY_PARENT_VALUE}.
         .env(
@@ -2327,6 +2372,42 @@ async fn spawn_minion(repo: &str, host: &str, issue_number: u64) -> Result<Child
         )
         .env_remove("TMUX")
         .env_remove("TMUX_PANE");
+    match config_path {
+        Some(path) => {
+            cmd.env(crate::labels::GRU_CONFIG_PATH_ENV, path);
+        }
+        // Explicitly remove rather than leaving unset: lab's own process may have
+        // inherited GRU_CONFIG_PATH from its parent shell, and without an explicit
+        // --config it must not pass that along to a child it doesn't control.
+        None => {
+            cmd.env_remove(crate::labels::GRU_CONFIG_PATH_ENV);
+        }
+    }
+    cmd
+}
+
+/// Spawn a Minion to work on an issue using the `gru do` command.
+///
+/// Returns the child process handle for lifecycle tracking.
+async fn spawn_minion(
+    repo: &str,
+    host: &str,
+    issue_number: u64,
+    agent_name: &str,
+) -> Result<Child> {
+    let issue_ref = crate::github::build_issue_url_with_host(repo, host, issue_number)
+        .with_context(|| format!("Invalid repo format: '{}'", repo))?;
+
+    let exe = std::env::current_exe().context("Failed to get current executable path")?;
+    let log_name = format_log_name(host, repo, issue_number);
+    let (stdout_file, stderr_file, log_path) = setup_log_file(&log_name).await?;
+
+    let cmd = build_do_command(
+        &exe,
+        &issue_ref,
+        agent_name,
+        lab_config_path().map(|p| p.as_path()),
+    );
 
     let child = spawn_background_cmd(
         cmd,
@@ -2341,13 +2422,14 @@ async fn spawn_minion(repo: &str, host: &str, issue_number: u64) -> Result<Child
     Ok(child)
 }
 
-/// Spawn a resume for an existing Minion using `gru resume <minion_id>`.
-/// Returns the child process handle for lifecycle tracking.
-async fn spawn_resume(minion_id: &str) -> Result<Child> {
-    let exe = std::env::current_exe().context("Failed to get current executable path")?;
-    let log_name = format!("resume-{}.log", minion_id);
-    let (stdout_file, stderr_file, log_path) = setup_log_file(&log_name).await?;
-
+/// Builds the `gru resume <minion_id>` command lab spawns to resume a Minion,
+/// without touching the filesystem or actually spawning it. Split out from
+/// `spawn_resume` for the same testability reason as `build_do_command`.
+fn build_resume_command(
+    exe: &Path,
+    minion_id: &str,
+    config_path: Option<&Path>,
+) -> tokio::process::Command {
     // Remove TMUX/TMUX_PANE so the child doesn't inherit the lab's tmux session —
     // otherwise TmuxGuard renames arbitrary windows in the parent's tmux.
     let mut cmd = tokio::process::Command::new(exe);
@@ -2361,6 +2443,30 @@ async fn spawn_resume(minion_id: &str) -> Result<Child> {
         .env_remove(crate::labels::GRU_RETRY_PARENT_ENV)
         .env_remove("TMUX")
         .env_remove("TMUX_PANE");
+    match config_path {
+        Some(path) => {
+            cmd.env(crate::labels::GRU_CONFIG_PATH_ENV, path);
+        }
+        // See build_do_command: don't leave a stale inherited value in place.
+        None => {
+            cmd.env_remove(crate::labels::GRU_CONFIG_PATH_ENV);
+        }
+    }
+    cmd
+}
+
+/// Spawn a resume for an existing Minion using `gru resume <minion_id>`.
+/// Returns the child process handle for lifecycle tracking.
+///
+/// Deliberately does not take an `agent_name`/`--agent` argument: `gru resume`
+/// looks up the Minion's originally-recorded agent from the registry, not
+/// from config, so there's nothing here for `agent.default` to override.
+async fn spawn_resume(minion_id: &str) -> Result<Child> {
+    let exe = std::env::current_exe().context("Failed to get current executable path")?;
+    let log_name = format!("resume-{}.log", minion_id);
+    let (stdout_file, stderr_file, log_path) = setup_log_file(&log_name).await?;
+
+    let cmd = build_resume_command(&exe, minion_id, lab_config_path().map(|p| p.as_path()));
 
     let child = spawn_background_cmd(
         cmd,
@@ -2884,6 +2990,61 @@ mod tests {
         let mut retry_queue = RetryQueue::new(3, 300);
         reap_children(&mut children, &mut retry_queue).await;
         assert!(children.is_empty());
+    }
+
+    // --- gru do / gru resume command construction (the lab -> worker handoff) ---
+
+    #[test]
+    fn test_build_do_command_forwards_non_claude_agent() {
+        let cmd = build_do_command(Path::new("/usr/local/bin/gru"), "42", "codex", None);
+        let inner = cmd.as_std();
+        let args: Vec<&std::ffi::OsStr> = inner.get_args().collect();
+        assert!(args.contains(&"--agent".as_ref()));
+        assert!(args.contains(&"codex".as_ref()));
+        // No explicit config path given → GRU_CONFIG_PATH must be explicitly
+        // removed (None), not merely absent, so a value inherited from lab's
+        // own environment isn't passed through to a child lab doesn't control.
+        assert!(inner
+            .get_envs()
+            .any(|(k, v)| k == "GRU_CONFIG_PATH" && v.is_none()));
+    }
+
+    #[test]
+    fn test_build_do_command_sets_gru_config_path_when_given() {
+        let config_path = Path::new("/tmp/custom-gru-config.toml");
+        let cmd = build_do_command(
+            Path::new("/usr/local/bin/gru"),
+            "42",
+            "claude",
+            Some(config_path),
+        );
+        let inner = cmd.as_std();
+        let envs: Vec<(&std::ffi::OsStr, Option<&std::ffi::OsStr>)> = inner.get_envs().collect();
+        assert!(envs
+            .iter()
+            .any(|(k, v)| *k == "GRU_CONFIG_PATH" && *v == Some(config_path.as_os_str())));
+    }
+
+    #[test]
+    fn test_build_resume_command_sets_gru_config_path_when_given() {
+        let config_path = Path::new("/tmp/custom-gru-config.toml");
+        let cmd = build_resume_command(Path::new("/usr/local/bin/gru"), "M001", Some(config_path));
+        let inner = cmd.as_std();
+        let envs: Vec<(&std::ffi::OsStr, Option<&std::ffi::OsStr>)> = inner.get_envs().collect();
+        assert!(envs
+            .iter()
+            .any(|(k, v)| *k == "GRU_CONFIG_PATH" && *v == Some(config_path.as_os_str())));
+    }
+
+    #[test]
+    fn test_build_resume_command_omits_gru_config_path_by_default() {
+        let cmd = build_resume_command(Path::new("/usr/local/bin/gru"), "M001", None);
+        let inner = cmd.as_std();
+        // Explicitly removed (None), not merely absent — see build_do_command's
+        // equivalent test above for why that distinction matters.
+        assert!(inner
+            .get_envs()
+            .any(|(k, v)| k == "GRU_CONFIG_PATH" && v.is_none()));
     }
 
     #[test]

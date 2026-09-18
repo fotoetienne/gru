@@ -46,7 +46,7 @@ async fn launch_skill_session(
     // Strip YAML frontmatter from the skill content (delimited by --- lines)
     let system_prompt = strip_frontmatter(skill_content);
 
-    let mut cmd = Command::new("claude");
+    let mut cmd = Command::new(crate::agent_registry::configured_claude_binary());
     cmd.arg("--system-prompt").arg(system_prompt);
 
     if let Some(ref p) = prompt {

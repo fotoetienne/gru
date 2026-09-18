@@ -135,7 +135,7 @@ enum Commands {
 
         #[arg(
             long,
-            help = "Agent backend to use (claude, codex). Defaults to claude."
+            help = "Agent backend to use (claude, codex). Overrides config.toml agent.default (falls back to claude if unset)."
         )]
         agent: Option<String>,
 
@@ -477,7 +477,7 @@ async fn main() {
             ignore_deps,
             worker,
         } => {
-            let agent_name = agent.unwrap_or_else(|| agent_registry::DEFAULT_AGENT.to_string());
+            let agent_name = agent.unwrap_or_else(agent_registry::resolve_default_agent_name);
             fix::handle_fix(
                 &issue,
                 fix::FixOptions {
@@ -511,7 +511,7 @@ async fn main() {
             lines,
         } => tail::handle_tail(id, no_follow, raw, lines, cli.quiet).await,
         Commands::Review { pr, agent } => {
-            let agent_name = agent.unwrap_or_else(|| agent_registry::DEFAULT_AGENT.to_string());
+            let agent_name = agent.unwrap_or_else(agent_registry::resolve_default_agent_name);
             review::handle_review(pr, &agent_name).await
         }
         Commands::Rebase {
@@ -552,7 +552,7 @@ async fn main() {
             if info {
                 prompt::handle_prompt_info(&prompt).await
             } else {
-                let agent_name = agent.unwrap_or_else(|| agent_registry::DEFAULT_AGENT.to_string());
+                let agent_name = agent.unwrap_or_else(agent_registry::resolve_default_agent_name);
                 prompt::handle_prompt(
                     &prompt,
                     prompt::PromptOptions {
