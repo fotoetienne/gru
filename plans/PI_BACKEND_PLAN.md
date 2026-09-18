@@ -6,19 +6,24 @@
 
 ## Summary
 
-Add Netflix Pi (`pi`, npm `@netflix-internal/pi-agent`) as a third `AgentBackend`
-alongside Claude Code and Codex, so Minions can run `gru do 42 --agent pi`.
+Add [Pi](https://github.com/earendil-works/pi-mono) (`pi`, npm
+`@earendil-works/pi-coding-agent`) as a third `AgentBackend` alongside Claude Code and
+Codex, so Minions can run `gru do 42 --agent pi`.
 
-Pi is a good fit for Netflix-internal work: it ships authenticated against internal
-model providers (no separate API key to manage), reads `AGENTS.md` and `CLAUDE.md`
-for project context, and — unlike Codex — supports interactive session resume, which
-`gru attach` needs. Note that provider *authentication* being solved does not settle
-provider *selection*: see work item 3.
+Pi fits Gru well: it has a pluggable provider model, so authentication and model choice
+live in Pi's own configuration rather than in Gru; it reads `AGENTS.md` and `CLAUDE.md`
+for project context; and — unlike Codex — it supports interactive session resume, which
+`gru attach` needs.
+
+Nothing in this plan should assume a particular Pi distribution. Some environments ship
+Pi through a launcher or an internal package at a non-standard path; Gru invokes whatever
+`pi` resolves to on `PATH`, with the path overridable via config (#922). Where a probe
+result below reflects one specific install, it is called out as such.
 
 ## Decision: direct integration, not ACP
 
 Pi does not speak the Agent Client Protocol. Verified against the installed bundle
-(`@netflix-internal/pi-agent` 0.88.1): no `agent-client-protocol` dependency and no
+(0.88.1): no `agent-client-protocol` dependency and no
 ACP strings anywhere in the package. Its `--mode rpc` is Pi's own JSON-RPC surface,
 unrelated to ACP.
 
@@ -54,7 +59,7 @@ transport under the existing trait, exactly as the PRD planned.
 
 ## Verified Pi capabilities
 
-Probed against `/opt/nflx/bin/pi` (newt shim) on 2026-09-16:
+Probed against an installed `pi` 0.88.1 on 2026-09-16, invoked through a launcher:
 
 | Gru requirement | Pi invocation | Notes |
 |---|---|---|
@@ -89,10 +94,11 @@ Ignored: `message_start`, `message_end`, `entry_appended`, `agent_settled`,
 `tool_execution_update`, `toolcall_delta` (argument fragments — `tool_execution_start`
 already carries the complete args).
 
-The newt shim prints exactly two non-JSON lines to **stdout** ahead of the stream
-(`Using existing agent-beach…`, `Using existing Netflix Pi distribution package…`);
-the rest of its `INFO --- newt runtime context ---` block goes to stderr.
-`parse_events` skips unrecognized lines by contract, so the streaming paths are fine.
+When Pi is invoked through a launcher, that launcher may print its own non-JSON status
+lines to **stdout** ahead of the event stream — the probed install emitted exactly two,
+with the rest of its diagnostics going to stderr. `parse_events` skips unrecognized lines
+by contract, so the streaming paths are unaffected; the plain-text one-shot path is not
+(#908).
 
 ## Work breakdown
 
@@ -120,10 +126,10 @@ Item 1 is implemented; the rest are open. Each maps to a GitHub issue.
    Claude and Codex report no cost, and `None` must mean "not reported" rather than zero.
 
 3. **Model selection stays with Pi** (#915). `pi --help` documents `--provider` as
-   defaulting to `google`, but that is not what a Netflix install does: the
-   `netflix-provider` plugin auto-discovers Netflix models, and a probe run resolved to
-   `nflx-openai/gpt-5.6-sol`. `pi --list-models` also exposes `nflx-anthropic/claude-opus-5`
-   and the sonnet-5 line, so running Pi on Claude models is possible.
+   defaulting to `google`, but that is not reliable: Pi's providers are pluggable, and a
+   provider plugin can register its own catalog and default. On the probed install, a run
+   resolved to a completely different provider and model than the documented default, and
+   `pi --list-models` exposed several provider namespaces including Claude models.
 
    Decision: do **not** pin a model. Pi users have already configured Pi, and overriding
    that would surprise them. Gru passes `--model`/`--thinking` only when `[agent.pi]` sets
@@ -143,10 +149,11 @@ Item 1 is implemented; the rest are open. Each maps to a GitHub issue.
    default already withholds it; pass `--no-approve` explicitly so a future change to
    Pi's default cannot silently start executing repo-supplied extensions.
 
-5. **`GRU_RETRY_PARENT` env leak.** `claude_runner.rs:37,66` and
-   `claude_backend.rs:224,256` call `.env_remove(GRU_RETRY_PARENT_ENV)` on every
-   command; Codex and PR #913's Pi backend do not. Nested `gru` calls made from the
-   agent's own `bash` tool will therefore defer `gru:failed` labeling.
+5. **`GRU_RETRY_PARENT` env leak — resolved.** `claude_runner.rs` and
+   `claude_backend.rs` strip `GRU_RETRY_PARENT_ENV` (and, since #920,
+   `GRU_CONFIG_PATH_ENV`) from every command they build. PR #913's Pi backend did not,
+   until a review pass added both to all four Pi builders. #916 is therefore down to
+   passing `--no-approve`.
 
 6. **`config.agent.default` is dead config, so `gru lab` can only ever run Claude.**
    (#918. Note the scope: make a *user-configured* default effective. Claude remains
@@ -181,7 +188,10 @@ Item 1 is implemented; the rest are open. Each maps to a GitHub issue.
   rejected: Claude reports input in `Started` *and* emits `MessageComplete` with usage,
   so that path risks silently double-counting Claude.
 - **`[agent.<name>] binary` will be honored**, not removed (#922). It matters most for Pi,
-  whose newt shim path varies by host. Split out of #918 so PR #920 can land as-is.
+  whose launcher path varies by host. Split out of #918 so PR #920 can land as-is.
+  Partly done already: #920 implemented the pattern for Claude (`ClaudeBackend` carries a
+  binary field, validated in `config.rs`), so #922 extends it to Codex and Pi rather than
+  building it.
 - **`plans/MULTI_AGENT_PRD.md` is now tracked.** It was untracked while `CLAUDE.md`, #352,
   and this plan all cited it, so a minion working #919 correctly refused to edit a file it
   could not see.
@@ -236,8 +246,9 @@ did not.
 
 ## Non-goals
 
-- Converting `gru chat` and `gru pm` off their hardcoded `claude` invocation
-  (`chat.rs:41`, `pm.rs:49`). Human-facing utilities, not Minion execution.
+- ~~Converting `gru chat` and `gru pm` off their hardcoded `claude` invocation.~~
+  Resolved incidentally by #920, which routed both through
+  `agent_registry::configured_claude_binary()`.
 - `gru rebase` resolving the Minion's real backend. `rebase.rs:821` hardcodes
   `DEFAULT_AGENT`, so a Pi Minion's conflict resolution runs under Claude — as it
   already does for Codex. Acceptable for now, stated so it is not mistaken for an oversight.
@@ -263,7 +274,7 @@ did not.
 
 ## Risk
 
-Pi is a fast-moving internal package, so the JSON event schema may churn. The mitigation
+Pi is a fast-moving package, so the JSON event schema may churn. The mitigation
 of fixture tests plus skip-unknown-events does **not** cover a renamed field: if
 `message_update.assistantMessageEvent` changes shape, the backend goes silent rather than
 erroring, and the Minion trips the 15-minute stuck detector instead of failing loudly.
