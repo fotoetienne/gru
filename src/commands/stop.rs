@@ -170,13 +170,15 @@ pub(crate) async fn terminate_via_registry_pid(minion_id: &str, force: bool) -> 
 /// `pgrep -f` pattern should match: every registered agent backend's process
 /// name(s) (see `AgentBackend::process_names`) plus the basename of any
 /// per-backend binary override when configured (e.g. `[agent.claude] binary =
-/// "/opt/tools/cc"` contributes `cc`; likewise `[agent.pi] binary`). Without
-/// these, `gru stop`/`gru attach` would silently fail to find or terminate
-/// the agent process when a non-default binary is configured.
+/// "/opt/tools/cc"` contributes `cc`; likewise `[agent.pi] binary` and
+/// `[agent.codex] binary`). Without these, `gru stop`/`gru attach` would
+/// silently fail to find or terminate the agent process when a non-default
+/// binary is configured.
 fn agent_process_match_names() -> Vec<String> {
     build_process_match_names(&[
         &crate::agent_registry::configured_claude_binary(),
         &crate::agent_registry::configured_pi_binary(),
+        &crate::agent_registry::configured_codex_binary(),
     ])
 }
 

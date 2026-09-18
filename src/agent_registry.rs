@@ -25,6 +25,7 @@ struct AgentOverrides {
     pi_binary: Option<String>,
     pi_model: Option<String>,
     pi_thinking: Option<String>,
+    codex_binary: Option<String>,
 }
 
 /// Constructs a backend for `agent_name` with the given per-backend config overrides.
@@ -39,7 +40,7 @@ fn construct_backend(agent_name: &str, overrides: AgentOverrides) -> Option<Box<
             overrides.claude_ci_fix_max_turns,
             overrides.claude_binary,
         ))),
-        "codex" => Some(Box::new(CodexBackend::default())),
+        "codex" => Some(Box::new(CodexBackend::new(overrides.codex_binary))),
         "pi" => Some(Box::new(PiBackend::new(
             overrides.pi_binary,
             overrides.pi_model,
@@ -111,6 +112,20 @@ pub(crate) fn configured_pi_binary() -> String {
         .unwrap_or_else(|| "pi".to_string())
 }
 
+/// Resolves the Codex CLI binary path/name to invoke.
+///
+/// Mirrors `configured_claude_binary`/`configured_pi_binary` so a custom
+/// `[agent.codex] binary` basename is included in `gru stop`'s `pgrep -f`
+/// fallback pattern (`src/commands/stop.rs`) — without it, a non-default
+/// binary's process wouldn't be found or terminated. Reads `[agent.codex]
+/// binary` from config, falling back to `"codex"` (resolved via `$PATH`)
+/// when unset or no config is present.
+pub(crate) fn configured_codex_binary() -> String {
+    crate::config::try_load_config()
+        .and_then(|c| c.agent.codex.binary)
+        .unwrap_or_else(|| "codex".to_string())
+}
+
 /// Resolves an agent name to a concrete `AgentBackend` implementation.
 ///
 /// Returns an error with available agents listed if the name is unknown.
@@ -122,7 +137,7 @@ pub(crate) fn resolve_backend(agent_name: &str) -> anyhow::Result<Box<dyn AgentB
 
     // Load config once and reuse it for every field below — don't call
     // try_load_config() a second time here.
-    let config = if agent_name == "claude" || agent_name == "pi" {
+    let config = if agent_name == "claude" || agent_name == "pi" || agent_name == "codex" {
         crate::config::try_load_config()
     } else {
         None
@@ -134,7 +149,8 @@ pub(crate) fn resolve_backend(agent_name: &str) -> anyhow::Result<Box<dyn AgentB
         claude_binary: config.as_ref().and_then(|c| c.agent.claude.binary.clone()),
         pi_binary: config.as_ref().and_then(|c| c.agent.pi.binary.clone()),
         pi_model: config.as_ref().and_then(|c| c.agent.pi.model.clone()),
-        pi_thinking: config.and_then(|c| c.agent.pi.thinking),
+        pi_thinking: config.as_ref().and_then(|c| c.agent.pi.thinking.clone()),
+        codex_binary: config.and_then(|c| c.agent.codex.binary),
     };
     Ok(construct_backend(agent_name, overrides)
         .expect("agent_name validated against AVAILABLE_AGENTS above"))
@@ -264,5 +280,31 @@ mod tests {
         assert!(args.contains(&"anthropic/claude-sonnet-5".as_ref()));
         assert!(args.contains(&"--thinking".as_ref()));
         assert!(args.contains(&"high".as_ref()));
+    }
+
+    #[test]
+    fn test_resolve_backend_forwards_configured_codex_binary() {
+        use std::io::Write;
+        use uuid::Uuid;
+
+        let mut temp_file = tempfile::NamedTempFile::new().unwrap();
+        temp_file
+            .write_all(b"[agent.codex]\nbinary = \"/opt/tools/codex\"\n")
+            .unwrap();
+        temp_file.flush().unwrap();
+
+        let _guard = crate::config::set_test_config_path(temp_file.path().to_path_buf());
+
+        // Exercise resolve_backend() itself (not CodexBackend::new() directly) so
+        // this test fails if resolve_backend ever stops reading
+        // config.agent.codex.binary before constructing the backend.
+        let backend = resolve_backend("codex").unwrap();
+        let cmd = backend.build_command(
+            std::path::Path::new("/tmp/worktree"),
+            &Uuid::nil(),
+            "prompt",
+            "github.com",
+        );
+        assert_eq!(cmd.as_std().get_program(), "/opt/tools/codex");
     }
 }

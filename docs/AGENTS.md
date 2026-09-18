@@ -92,6 +92,13 @@ codex exec resume --last --json --full-auto "<prompt>"
 
 Note: Codex does not support interactive resume (`gru attach` will not work with Codex minions). Codex also ignores the `session_id` parameter — it relies on its own session persistence for both new and resumed sessions.
 
+Optionally override the binary path in `~/.gru/config.toml`:
+
+```toml
+[agent.codex]
+binary = "/usr/local/bin/codex"
+```
+
 ## Pi
 
 [Pi](https://github.com/earendil-works/pi-mono) is a coding agent CLI (`pi`) with a pluggable

@@ -31,9 +31,28 @@ use uuid::Uuid;
 /// `thread.completed` (output tokens are already accumulated by the caller
 /// from each turn's `MessageComplete`, so `Finished` reports
 /// `output_tokens: 0` to avoid double-counting).
-#[derive(Default)]
 pub(crate) struct CodexBackend {
     accumulated_usage: Mutex<TokenUsage>,
+    /// Path or name of the Codex CLI binary to invoke (`agent.codex.binary` in config).
+    binary: String,
+}
+
+impl Default for CodexBackend {
+    fn default() -> Self {
+        Self {
+            accumulated_usage: Mutex::default(),
+            binary: "codex".to_string(),
+        }
+    }
+}
+
+impl CodexBackend {
+    pub(crate) fn new(binary: Option<String>) -> Self {
+        Self {
+            accumulated_usage: Mutex::default(),
+            binary: binary.unwrap_or_else(|| "codex".to_string()),
+        }
+    }
 }
 
 impl AgentBackend for CodexBackend {
@@ -52,7 +71,7 @@ impl AgentBackend for CodexBackend {
         prompt: &str,
         github_host: &str,
     ) -> TokioCommand {
-        let mut cmd = build_codex_command(worktree_path, prompt);
+        let mut cmd = build_codex_command(&self.binary, worktree_path, prompt);
         cmd.env("GH_HOST", github_host);
         cmd
     }
@@ -72,7 +91,7 @@ impl AgentBackend for CodexBackend {
     ) -> Option<TokioCommand> {
         // Codex supports resume via `codex exec resume --last "prompt"`
         // but it relies on its own session persistence, not Gru's session ID.
-        let mut cmd = build_codex_resume_command(worktree_path, prompt);
+        let mut cmd = build_codex_resume_command(&self.binary, worktree_path, prompt);
         cmd.env("GH_HOST", github_host);
         Some(cmd)
     }
@@ -93,7 +112,7 @@ impl AgentBackend for CodexBackend {
         prompt_arg: &str,
         github_host: &str,
     ) -> TokioCommand {
-        let mut cmd = TokioCommand::new("codex");
+        let mut cmd = TokioCommand::new(&self.binary);
         cmd.arg("exec").arg("--full-auto");
 
         // When prompt_arg is "-", callers stream the actual prompt via stdin.
@@ -139,8 +158,8 @@ impl AgentBackend for CodexBackend {
 ///
 /// Uses `codex exec --json --full-auto` for autonomous headless execution
 /// with JSONL streaming output.
-fn build_codex_command(worktree_path: &Path, prompt: &str) -> TokioCommand {
-    let mut cmd = TokioCommand::new("codex");
+fn build_codex_command(binary: &str, worktree_path: &Path, prompt: &str) -> TokioCommand {
+    let mut cmd = TokioCommand::new(binary);
     cmd.arg("exec")
         .arg("--json")
         .arg("--full-auto")
@@ -158,8 +177,8 @@ fn build_codex_command(worktree_path: &Path, prompt: &str) -> TokioCommand {
 }
 
 /// Builds a Codex command to resume the most recent session.
-fn build_codex_resume_command(worktree_path: &Path, prompt: &str) -> TokioCommand {
-    let mut cmd = TokioCommand::new("codex");
+fn build_codex_resume_command(binary: &str, worktree_path: &Path, prompt: &str) -> TokioCommand {
+    let mut cmd = TokioCommand::new(binary);
     cmd.arg("exec")
         .arg("resume")
         .arg("--last")
@@ -451,6 +470,52 @@ mod tests {
     #[test]
     fn test_name() {
         assert_eq!(backend().name(), "codex");
+    }
+
+    #[test]
+    fn test_binary_override_used_for_all_commands() {
+        let b = CodexBackend::new(Some("/opt/tools/codex".to_string()));
+        let path = std::path::PathBuf::from("/tmp/worktree");
+        let session_id = Uuid::nil();
+
+        assert_eq!(
+            b.build_command(&path, &session_id, "p", "github.com")
+                .as_std()
+                .get_program(),
+            "/opt/tools/codex"
+        );
+        assert_eq!(
+            b.build_resume_command(&path, &session_id, "p", "github.com")
+                .unwrap()
+                .as_std()
+                .get_program(),
+            "/opt/tools/codex"
+        );
+        assert_eq!(
+            b.build_oneshot_command(&path, "p", "github.com")
+                .as_std()
+                .get_program(),
+            "/opt/tools/codex"
+        );
+        assert_eq!(
+            b.build_ci_fix_command(&path, "p", "github.com")
+                .as_std()
+                .get_program(),
+            "/opt/tools/codex"
+        );
+    }
+
+    #[test]
+    fn test_binary_falls_back_to_codex_when_unset() {
+        let b = CodexBackend::new(None);
+        let path = std::path::PathBuf::from("/tmp/worktree");
+        let session_id = Uuid::nil();
+        assert_eq!(
+            b.build_command(&path, &session_id, "p", "github.com")
+                .as_std()
+                .get_program(),
+            "codex"
+        );
     }
 
     #[test]

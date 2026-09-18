@@ -45,10 +45,14 @@ pub(crate) async fn handle_chat(repo_flag: Option<String>, verbose: bool) -> Res
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
 
-    let mut child = cmd.spawn().context(
-        "Failed to start claude. Is Claude CLI installed and in your PATH?\n\
-         See: https://claude.com/claude-code",
-    )?;
+    let program = cmd.as_std().get_program().to_string_lossy().into_owned();
+    let mut child = cmd.spawn().with_context(|| {
+        format!(
+            "Failed to start claude binary '{program}'. Check that it's installed and in \
+             your PATH (see: https://claude.com/claude-code), or if you've overridden \
+             [agent.claude] binary in config.toml, that the path is correct and executable."
+        )
+    })?;
 
     let status = child_process::wait_with_ctrlc_handling(&mut child).await?;
 
