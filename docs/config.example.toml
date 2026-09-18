@@ -129,6 +129,8 @@
 #
 # Thinking effort to pass via `--thinking`. One of: off, minimal, low,
 # medium, high, xhigh, max.
+# If `model` also carries a ":<thinking>" suffix, it must match this value
+# (or be omitted) — Gru rejects the config if they disagree.
 # thinking = "high"
 
 # ─────────────────────────────────────────────────────────────────────

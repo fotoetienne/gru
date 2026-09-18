@@ -930,6 +930,24 @@ impl LabConfig {
                 );
             }
         }
+
+        // `model` may carry its own ":<thinking>" suffix (e.g.
+        // "anthropic/claude-sonnet-5:high"). If `thinking` is also set and
+        // disagrees, Gru would pass both `--model provider/id:X` and
+        // `--thinking Y` to Pi with no defined precedence between them —
+        // reject the ambiguity instead of leaving it to Pi to guess.
+        if let (Some(model), Some(thinking)) = (&self.agent.pi.model, &self.agent.pi.thinking) {
+            if let Some((_, model_suffix)) = model.rsplit_once(':') {
+                if PI_THINKING_LEVELS.contains(&model_suffix) && model_suffix != thinking {
+                    anyhow::bail!(
+                        "agent.pi.model's \":<thinking>\" suffix ('{}') conflicts with \
+                         agent.pi.thinking ('{}'). Set only one, or make them match.",
+                        model_suffix,
+                        thinking
+                    );
+                }
+            }
+        }
         Ok(())
     }
 
@@ -1386,6 +1404,47 @@ thinking = "high"
                 result.err()
             );
         }
+    }
+
+    #[test]
+    fn test_agent_pi_model_thinking_suffix_conflict_is_rejected() {
+        let config_toml =
+            "[agent.pi]\nmodel = \"anthropic/claude-sonnet-5:high\"\nthinking = \"low\"\n";
+        let mut temp_file = NamedTempFile::new().unwrap();
+        temp_file.write_all(config_toml.as_bytes()).unwrap();
+        temp_file.flush().unwrap();
+
+        let result = LabConfig::load_partial(temp_file.path());
+        assert!(result.is_err());
+        let msg = format!("{}", result.err().unwrap());
+        assert!(msg.contains("agent.pi.model"), "{}", msg);
+        assert!(msg.contains("agent.pi.thinking"), "{}", msg);
+    }
+
+    #[test]
+    fn test_agent_pi_model_thinking_suffix_matching_is_accepted() {
+        let config_toml =
+            "[agent.pi]\nmodel = \"anthropic/claude-sonnet-5:high\"\nthinking = \"high\"\n";
+        let mut temp_file = NamedTempFile::new().unwrap();
+        temp_file.write_all(config_toml.as_bytes()).unwrap();
+        temp_file.flush().unwrap();
+
+        let result = LabConfig::load_partial(temp_file.path());
+        assert!(result.is_ok(), "{:?}", result.err());
+    }
+
+    #[test]
+    fn test_agent_pi_model_without_thinking_suffix_ignores_thinking_check() {
+        // "provider/id" with no ":<thinking>" suffix — the ':' check must not
+        // misfire on a plain model string that happens to contain no colon,
+        // nor treat an unrelated colon-suffix (not a thinking level) as a conflict.
+        let config_toml = "[agent.pi]\nmodel = \"anthropic/claude-sonnet-5\"\nthinking = \"low\"\n";
+        let mut temp_file = NamedTempFile::new().unwrap();
+        temp_file.write_all(config_toml.as_bytes()).unwrap();
+        temp_file.flush().unwrap();
+
+        let result = LabConfig::load_partial(temp_file.path());
+        assert!(result.is_ok(), "{:?}", result.err());
     }
 
     #[test]
