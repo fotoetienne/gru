@@ -816,7 +816,9 @@ fn truncate_if_needed(s: &str, max_bytes: usize) -> String {
 }
 
 /// Invoke the LLM judge via the agent backend, passing the prompt via stdin.
-/// Returns the raw response text on success (even if not parseable as JSON).
+/// Returns the response text — passed through `backend.sanitize_oneshot_output`
+/// to strip any backend-specific wrapper preamble — on success (even if not
+/// parseable as JSON).
 async fn invoke_judge_cli_raw(
     backend: &dyn AgentBackend,
     worktree_path: &std::path::Path,

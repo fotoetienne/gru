@@ -253,18 +253,26 @@ impl AgentBackend for PiBackend {
             "Using existing distribution package: ",
         ];
 
-        let mut lines: Vec<&str> = raw.lines().collect();
-        while let Some(first) = lines.first() {
+        // Walk forward through `raw` one line at a time, advancing `rest`
+        // past each matching leading line, rather than collecting into a
+        // `Vec` and calling `remove(0)` (quadratic) or rebuilding via
+        // `lines().join("\n")` (which normalizes line endings and drops a
+        // trailing newline even when nothing matched). This keeps the
+        // untouched remainder byte-for-byte identical to the input.
+        let mut rest = raw;
+        loop {
+            let line_end = rest.find('\n').map_or(rest.len(), |i| i + 1);
+            let line = rest[..line_end].trim_end_matches(['\n', '\r']);
             if LAUNCHER_PREAMBLE_PREFIXES
                 .iter()
-                .any(|prefix| first.starts_with(prefix))
+                .any(|prefix| line.starts_with(prefix))
             {
-                lines.remove(0);
+                rest = &rest[line_end..];
             } else {
                 break;
             }
         }
-        lines.join("\n")
+        rest.to_string()
     }
 }
 
@@ -818,6 +826,20 @@ mod tests {
     fn test_sanitize_oneshot_output_empty_input() {
         let b = backend();
         assert_eq!(b.sanitize_oneshot_output(""), "");
+    }
+
+    #[test]
+    fn test_sanitize_oneshot_output_preserves_trailing_newline_when_no_preamble() {
+        let b = backend();
+        let raw = "{\"confidence\": 8, \"action\": \"merge\"}\n";
+        assert_eq!(b.sanitize_oneshot_output(raw), raw);
+    }
+
+    #[test]
+    fn test_sanitize_oneshot_output_preserves_trailing_newline_after_preamble() {
+        let b = backend();
+        let raw = "Using existing sandbox at /path/to/sandbox\n{\"confidence\": 8}\n";
+        assert_eq!(b.sanitize_oneshot_output(raw), "{\"confidence\": 8}\n");
     }
 
     #[test]
