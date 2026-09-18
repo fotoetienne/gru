@@ -97,6 +97,20 @@ pub(crate) fn configured_claude_binary() -> String {
         .unwrap_or_else(|| "claude".to_string())
 }
 
+/// Resolves the Pi CLI binary path/name to invoke.
+///
+/// Used by `gru stop`'s legacy fallback matching (`src/commands/stop.rs`) so a
+/// custom `[agent.pi] binary` basename is included in the `pgrep -f` pattern —
+/// mirrors `configured_claude_binary` for the same reason: without it, a
+/// non-default binary's process wouldn't be found or terminated. Reads
+/// `[agent.pi] binary` from config, falling back to `"pi"` (resolved via
+/// `$PATH`) when unset or no config is present.
+pub(crate) fn configured_pi_binary() -> String {
+    crate::config::try_load_config()
+        .and_then(|c| c.agent.pi.binary)
+        .unwrap_or_else(|| "pi".to_string())
+}
+
 /// Resolves an agent name to a concrete `AgentBackend` implementation.
 ///
 /// Returns an error with available agents listed if the name is unknown.

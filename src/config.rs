@@ -650,6 +650,17 @@ impl LabConfig {
 # # Override the Claude Code CLI binary path
 # binary = "/usr/local/bin/claude"
 
+# [agent.pi]
+# # Override the Pi CLI binary path (matters more for Pi than Claude, since
+# # some environments distribute it through a launcher at a non-standard path)
+# binary = "/usr/local/bin/pi"
+#
+# # Model to pass via --model ("provider/id", optionally with a ":<thinking>" suffix)
+# model = "anthropic/claude-sonnet-5"
+#
+# # Thinking effort to pass via --thinking: off, minimal, low, medium, high, xhigh, max
+# thinking = "high"
+
 # [merge]
 # # Confidence threshold (1-10) for the merge-readiness judge (default: 8)
 # confidence_threshold = 8
@@ -1319,7 +1330,16 @@ binary = "/usr/local/bin/claude"
 
     #[test]
     fn test_agent_config_pi_section_absent() {
-        let config = LabConfig::default();
+        // Load a minimal TOML file with no [agent.pi] section through the
+        // real deserialization path (rather than constructing AgentConfig
+        // directly) so this test actually exercises `#[serde(default)]`
+        // filling in PiAgentConfig, not just the Default impl.
+        let config_toml = "[daemon]\nrepos = [\"owner/repo\"]\n";
+        let mut temp_file = NamedTempFile::new().unwrap();
+        temp_file.write_all(config_toml.as_bytes()).unwrap();
+        temp_file.flush().unwrap();
+
+        let config = LabConfig::load(temp_file.path()).unwrap();
         assert!(config.agent.pi.binary.is_none());
         assert!(config.agent.pi.model.is_none());
         assert!(config.agent.pi.thinking.is_none());
