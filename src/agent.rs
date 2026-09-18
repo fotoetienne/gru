@@ -159,6 +159,47 @@ fn format_token_count(count: u64) -> String {
     }
 }
 
+/// Builds an actionable message for a failed `TokioCommand::spawn()` on an
+/// agent backend's command, naming the exact binary path that was attempted
+/// and the `[agent.<name>]` config key that controls it — a bare OS error
+/// ("No such file or directory") gives no hint that the culprit is a
+/// misconfigured binary override (e.g. a relative or nonexistent path)
+/// rather than a missing PATH install.
+///
+/// Must be called with `cmd` *before* `spawn()` consumes it. `context_suffix`
+/// is appended to the failure headline (e.g. `"for merge judge"`); pass `""`
+/// for the plain "Failed to start ... agent binary '...'." form.
+///
+/// `process_names()[0]` doubles as the config section name for every
+/// built-in backend (claude/pi/codex) — unlike `backend.name()`, which for
+/// Claude is the display name "claude-code", not the config key "claude".
+pub(crate) fn spawn_error_context(
+    backend: &dyn AgentBackend,
+    cmd: &TokioCommand,
+    context_suffix: &str,
+) -> String {
+    let program = cmd.as_std().get_program().to_string_lossy().into_owned();
+    let config_key = backend
+        .process_names()
+        .first()
+        .copied()
+        .unwrap_or(backend.name());
+    let suffix = if context_suffix.is_empty() {
+        String::new()
+    } else {
+        format!(" {context_suffix}")
+    };
+    format!(
+        "Failed to start {} agent binary '{}'{}. Check that it exists, is executable, \
+         and (if relative) is resolvable from the current directory — see [agent.{}] \
+         binary in config.toml if you've overridden it.",
+        backend.name(),
+        program,
+        suffix,
+        config_key
+    )
+}
+
 /// Trait abstracting agent backend interaction.
 ///
 /// Implementations of this trait allow Gru to work with different agent CLIs
@@ -318,6 +359,38 @@ pub(crate) trait AgentBackend: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_spawn_error_context_uses_config_key_not_display_name() {
+        // ClaudeBackend::name() returns "claude-code", but the config
+        // section is [agent.claude] — the message must use the latter.
+        let backend = crate::claude_backend::ClaudeBackend::new(
+            None,
+            Some("/opt/tools/does-not-exist".to_string()),
+        );
+        let cmd = backend.build_oneshot_command(
+            std::path::Path::new("/tmp/worktree"),
+            "prompt",
+            "github.com",
+        );
+        let msg = spawn_error_context(&backend, &cmd, "");
+        assert!(msg.contains("claude-code"), "{msg}");
+        assert!(msg.contains("/opt/tools/does-not-exist"), "{msg}");
+        assert!(msg.contains("[agent.claude] binary"), "{msg}");
+    }
+
+    #[test]
+    fn test_spawn_error_context_appends_suffix() {
+        let backend = crate::codex_backend::CodexBackend::new(None);
+        let cmd = backend.build_oneshot_command(
+            std::path::Path::new("/tmp/worktree"),
+            "prompt",
+            "github.com",
+        );
+        let msg = spawn_error_context(&backend, &cmd, "for merge judge");
+        assert!(msg.contains("for merge judge"), "{msg}");
+        assert!(msg.contains("[agent.codex] binary"), "{msg}");
+    }
 
     #[test]
     fn test_agent_event_started_roundtrip() {

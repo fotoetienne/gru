@@ -235,13 +235,15 @@ pub(crate) async fn handle_attach(
     };
 
     // Spawn agent process (not exec - we need to update registry after exit)
+    let program = cmd.as_std().get_program().to_string_lossy().into_owned();
     let mut child = match cmd.spawn() {
         Ok(child) => child,
         Err(e) => {
             revert_if_claimed().await;
             return Err(e).context(format!(
-                "Failed to start agent '{}'. Is the CLI installed and in your PATH?",
-                agent_name
+                "Failed to start agent '{agent_name}' binary '{program}'. Check that it's \
+                 installed and in your PATH, or if you've overridden [agent.{agent_name}] \
+                 binary in config.toml, that the path is correct and executable."
             ));
         }
     };

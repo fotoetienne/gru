@@ -66,6 +66,10 @@ pub(crate) struct AgentConfig {
     /// Pi-specific configuration ([agent.pi] in TOML)
     #[serde(default)]
     pub(crate) pi: PiAgentConfig,
+
+    /// Codex-specific configuration ([agent.codex] in TOML)
+    #[serde(default)]
+    pub(crate) codex: CodexAgentConfig,
 }
 
 impl Default for AgentConfig {
@@ -74,6 +78,7 @@ impl Default for AgentConfig {
             default: default_agent_name(),
             claude: ClaudeAgentConfig::default(),
             pi: PiAgentConfig::default(),
+            codex: CodexAgentConfig::default(),
         }
     }
 }
@@ -120,6 +125,14 @@ pub(crate) struct PiAgentConfig {
     /// Thinking effort to pass via `--thinking`. One of `PI_THINKING_LEVELS`.
     #[serde(default)]
     pub(crate) thinking: Option<String>,
+}
+
+/// Codex-specific agent configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub(crate) struct CodexAgentConfig {
+    /// Override the binary path for the Codex CLI.
+    #[serde(default)]
+    pub(crate) binary: Option<String>,
 }
 
 /// Daemon configuration
@@ -661,6 +674,10 @@ impl LabConfig {
 # # Thinking effort to pass via --thinking: off, minimal, low, medium, high, xhigh, max
 # thinking = "high"
 
+# [agent.codex]
+# # Override the Codex CLI binary path
+# binary = "/usr/local/bin/codex"
+
 # [merge]
 # # Confidence threshold (1-10) for the merge-readiness judge (default: 8)
 # confidence_threshold = 8
@@ -918,6 +935,15 @@ impl LabConfig {
                 anyhow::bail!(
                     "agent.pi.binary must not be empty. Remove the field to use \
                      \"pi\" (resolved via $PATH), or set it to a valid binary path."
+                );
+            }
+        }
+
+        if let Some(binary) = &self.agent.codex.binary {
+            if binary.trim().is_empty() {
+                anyhow::bail!(
+                    "agent.codex.binary must not be empty. Remove the field to use \
+                     \"codex\" (resolved via $PATH), or set it to a valid binary path."
                 );
             }
         }
@@ -1367,6 +1393,53 @@ thinking = "high"
             Some("anthropic/claude-sonnet-5:high")
         );
         assert_eq!(config.agent.pi.thinking.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn test_agent_config_codex_section_absent() {
+        // Load a minimal TOML file with no [agent.codex] section through the
+        // real deserialization path so this test exercises `#[serde(default)]`
+        // filling in CodexAgentConfig, not just the Default impl.
+        let config_toml = "[daemon]\nrepos = [\"owner/repo\"]\n";
+        let mut temp_file = NamedTempFile::new().unwrap();
+        temp_file.write_all(config_toml.as_bytes()).unwrap();
+        temp_file.flush().unwrap();
+
+        let config = LabConfig::load(temp_file.path()).unwrap();
+        assert!(config.agent.codex.binary.is_none());
+    }
+
+    #[test]
+    fn test_agent_config_codex_section_parses() {
+        let config_toml = r#"
+[daemon]
+repos = ["owner/repo"]
+
+[agent.codex]
+binary = "/opt/tools/codex"
+"#;
+        let mut temp_file = NamedTempFile::new().unwrap();
+        temp_file.write_all(config_toml.as_bytes()).unwrap();
+        temp_file.flush().unwrap();
+
+        let config = LabConfig::load(temp_file.path()).unwrap();
+        assert_eq!(
+            config.agent.codex.binary.as_deref(),
+            Some("/opt/tools/codex")
+        );
+    }
+
+    #[test]
+    fn test_agent_codex_binary_empty_is_rejected() {
+        let config_toml = "[agent.codex]\nbinary = \"\"\n";
+        let mut temp_file = NamedTempFile::new().unwrap();
+        temp_file.write_all(config_toml.as_bytes()).unwrap();
+        temp_file.flush().unwrap();
+
+        let result = LabConfig::load_partial(temp_file.path());
+        assert!(result.is_err());
+        let msg = format!("{}", result.err().unwrap());
+        assert!(msg.contains("agent.codex.binary"), "{}", msg);
     }
 
     #[test]

@@ -130,20 +130,22 @@ fn check_prerequisites() -> Result<i32> {
     }
 
     // 2. Check for at least one agent backend
-    let has_claude = check_binary("claude");
-    let has_codex = check_binary("codex");
-    // Pi is commonly distributed through a launcher at a non-standard path
-    // (see docs/AGENTS.md); check whatever `[agent.pi].binary` resolves to,
-    // not just the literal `pi` on $PATH, so a Pi-only install with a custom
-    // binary path doesn't get misreported as "no agent backend found".
+    // All three backends support a `[agent.<name>].binary` override (see
+    // docs/AGENTS.md); check whatever that resolves to, not just the literal
+    // `claude`/`codex`/`pi` on $PATH, so a custom-path-only install doesn't
+    // get misreported as "no agent backend found".
+    let claude_binary = crate::agent_registry::configured_claude_binary();
+    let has_claude = check_binary(&claude_binary);
+    let codex_binary = crate::agent_registry::configured_codex_binary();
+    let has_codex = check_binary(&codex_binary);
     let pi_binary = crate::agent_registry::configured_pi_binary();
     let has_pi = check_binary(&pi_binary);
 
     if has_claude {
-        println!("  ✓ claude (Claude Code CLI)");
+        println!("  ✓ {} (Claude Code CLI)", claude_binary);
     }
     if has_codex {
-        println!("  ✓ codex (OpenAI Codex CLI)");
+        println!("  ✓ {} (OpenAI Codex CLI)", codex_binary);
     }
     if has_pi {
         println!("  ✓ {} (Pi CLI)", pi_binary);

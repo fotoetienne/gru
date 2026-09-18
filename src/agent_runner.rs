@@ -221,10 +221,12 @@ where
     // would otherwise leak into this one's `final_usage()` result below.
     backend.reset_usage();
 
-    // Spawn the command
+    // Spawn the command. Error context captured before spawn() consumes any
+    // borrow of `cmd` — see `agent::spawn_error_context` for why this names
+    // the exact binary/config key rather than surfacing a bare OS error.
     let mut child = cmd
         .spawn()
-        .with_context(|| format!("{} command not found or failed to start", backend.name()))?;
+        .with_context(|| crate::agent::spawn_error_context(backend, &cmd, ""))?;
 
     // Report the child PID to the caller if a callback was provided.
     if let Some(callback) = on_spawn {

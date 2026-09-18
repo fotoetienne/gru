@@ -133,6 +133,11 @@
 # (or be omitted) — Gru rejects the config if they disagree.
 # thinking = "high"
 
+# [agent.codex]
+# Override the Codex CLI binary path. Useful if codex is
+# installed somewhere other than your $PATH.
+# binary = "/usr/local/bin/codex"
+
 # ─────────────────────────────────────────────────────────────────────
 # Merge readiness
 # ─────────────────────────────────────────────────────────────────────
