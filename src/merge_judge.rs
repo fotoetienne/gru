@@ -827,12 +827,9 @@ async fn invoke_judge_cli_raw(
     cmd.stdin(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
 
-    let mut child = cmd.spawn().with_context(|| {
-        format!(
-            "Failed to spawn agent backend '{}' for merge judge",
-            backend.name()
-        )
-    })?;
+    let mut child = cmd
+        .spawn()
+        .with_context(|| crate::agent::spawn_error_context(backend, &cmd, "for merge judge"))?;
 
     // Write prompt to stdin.
     if let Some(mut stdin) = child.stdin.take() {

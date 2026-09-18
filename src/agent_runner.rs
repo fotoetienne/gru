@@ -221,30 +221,12 @@ where
     // would otherwise leak into this one's `final_usage()` result below.
     backend.reset_usage();
 
-    // Spawn the command. Captured before spawn() consumes any borrow, so the
-    // error message can name the exact binary that failed to start — a bare
-    // `os error 2` ("No such file or directory") gives no hint that the
-    // culprit is a misconfigured [agent.<name>] binary override (e.g. a
-    // relative or nonexistent path) rather than a missing PATH install.
-    let program = cmd.as_std().get_program().to_string_lossy().into_owned();
-    // `process_names()[0]` doubles as the `[agent.<name>]` config section name
-    // for every built-in backend (claude/pi/codex) — unlike `backend.name()`,
-    // which for Claude is the display name "claude-code", not the config key.
-    let config_key = backend
-        .process_names()
-        .first()
-        .copied()
-        .unwrap_or(backend.name());
-    let mut child = cmd.spawn().with_context(|| {
-        format!(
-            "Failed to start {} agent binary '{}'. Check that it exists, is executable, \
-             and (if relative) is resolvable from the current directory — see \
-             [agent.{}] binary in config.toml if you've overridden it.",
-            backend.name(),
-            program,
-            config_key
-        )
-    })?;
+    // Spawn the command. Error context captured before spawn() consumes any
+    // borrow of `cmd` — see `agent::spawn_error_context` for why this names
+    // the exact binary/config key rather than surfacing a bare OS error.
+    let mut child = cmd
+        .spawn()
+        .with_context(|| crate::agent::spawn_error_context(backend, &cmd, ""))?;
 
     // Report the child PID to the caller if a callback was provided.
     if let Some(callback) = on_spawn {
