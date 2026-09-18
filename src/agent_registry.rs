@@ -149,6 +149,9 @@ pub(crate) fn resolve_backend(agent_name: &str) -> anyhow::Result<Box<dyn AgentB
         claude_binary: config.as_ref().and_then(|c| c.agent.claude.binary.clone()),
         pi_binary: config.as_ref().and_then(|c| c.agent.pi.binary.clone()),
         pi_model: config.as_ref().and_then(|c| c.agent.pi.model.clone()),
+        // Clones (rather than moves out of `config`) because `codex_binary`
+        // below still needs `config` — don't change this to `.and_then(...)`
+        // without also reordering, or it won't compile.
         pi_thinking: config.as_ref().and_then(|c| c.agent.pi.thinking.clone()),
         codex_binary: config.and_then(|c| c.agent.codex.binary),
     };
