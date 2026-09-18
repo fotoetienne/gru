@@ -365,6 +365,7 @@ struct PiUsage {
 /// is surfaced today; per-category costs aren't tracked separately.
 #[derive(Debug, Deserialize)]
 struct PiCost {
+    #[serde(default)]
     total: f64,
 }
 
@@ -1033,6 +1034,26 @@ mod tests {
         match event {
             AgentEvent::MessageComplete { usage, .. } => {
                 assert_eq!(usage.unwrap().cost, None);
+            }
+            other => panic!("Expected MessageComplete, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_event_turn_end_with_malformed_cost_object_degrades_gracefully() {
+        // A `cost` object present but missing `total` (schema drift) must
+        // not fail parsing of the whole `usage` object and drop input/
+        // output/cache tokens along with it — it should just default to 0.0
+        // the same way other malformed-but-present usage subfields do.
+        let b = backend();
+        let line = r#"{"type":"turn_end","usage":{"input":1000,"output":500,"cost":{}}}"#;
+        let event = single(b.parse_events(line));
+        match event {
+            AgentEvent::MessageComplete { usage, .. } => {
+                let u = usage.unwrap();
+                assert_eq!(u.input_tokens, 1000);
+                assert_eq!(u.output_tokens, 500);
+                assert_eq!(u.cost, Some(0.0));
             }
             other => panic!("Expected MessageComplete, got {:?}", other),
         }
