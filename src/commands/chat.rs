@@ -86,18 +86,13 @@ async fn detect_project_context(
                 // repo's remote is only a valid signal when it belongs to that
                 // same owner (one owner lives on one instance). Both can come
                 // up empty, in which case GH_HOST is left untouched.
-                let host = match crate::github::configured_host_for_owner(owner, None) {
-                    Some(host) => Some(host),
-                    None => {
-                        let (host, unknown) = host_from_matching_remote(&repo_root, owner).await;
-                        if host.is_none() {
-                            // Both sources are exhausted, so an unrecognised
-                            // remote for this owner is worth reporting.
-                            git::warn_unknown_remotes(&unknown);
-                        }
-                        host
-                    }
-                };
+                let host = host_for_repo_flag(
+                    &repo_root,
+                    owner,
+                    crate::github::configured_host_for_owner(owner, None),
+                    super::resume::inherited_gh_host(),
+                )
+                .await;
                 return Some((repo_root, owner.to_string(), name.to_string(), host));
             }
             _ => {
@@ -114,9 +109,45 @@ async fn detect_project_context(
     context_from_repo_root(repo_root).await
 }
 
+/// Host for a `--repo owner/repo` run: configured host, then the checkout's
+/// remotes if they belong to that owner, then an inherited `GH_HOST`.
+///
+/// Takes the configured and inherited hosts as parameters so it can be tested
+/// without the developer's own config or `GH_HOST` leaking in. Only the dead
+/// end — nothing configured, no matching remote, nothing inherited — warrants
+/// the unrecognised-host warning: an inherited host is what the child session
+/// would have used anyway, so reporting it as a configuration gap is noise.
+async fn host_for_repo_flag(
+    repo_root: &Path,
+    owner: &str,
+    configured: Option<String>,
+    inherited: Option<String>,
+) -> Option<String> {
+    if let Some(host) = configured {
+        return Some(host);
+    }
+    let (host, unknown) = host_from_matching_remote(repo_root, owner).await;
+    let host = super::resume::host_fallback(host, inherited);
+    if host.is_none() {
+        git::warn_unknown_remotes(&unknown);
+    }
+    host
+}
+
 /// Owner, repo, and host for a checkout, from its remotes.
+///
+/// Reads the inherited `GH_HOST` for the warning decision; see
+/// [`context_from_remotes`].
 async fn context_from_repo_root(
     repo_root: PathBuf,
+) -> Option<(PathBuf, String, String, Option<String>)> {
+    context_from_remotes(repo_root, super::resume::inherited_gh_host()).await
+}
+
+/// Owner, repo, and host for a checkout, from its remotes.
+async fn context_from_remotes(
+    repo_root: PathBuf,
+    inherited: Option<String>,
 ) -> Option<(PathBuf, String, String, Option<String>)> {
     let host_registry = crate::config::load_host_registry();
     let (candidates, unknown) =
@@ -132,12 +163,16 @@ async fn context_from_repo_root(
 
     // Nothing resolved to a host, but a repo-shaped remote on an unconfigured
     // GHES still names the project. Keep that context — the owner/repo is all
-    // the in-repo prompt needs — and leave GH_HOST unresolved rather than
-    // dropping the user into the no-repo onboarding prompt. The warning still
-    // tells them which host to configure.
-    git::warn_unknown_remotes(&unknown);
+    // the in-repo prompt needs — rather than dropping the user into the no-repo
+    // onboarding prompt. An inherited `GH_HOST` settles the routing (the child
+    // would have inherited it regardless), so only its absence is a genuine
+    // configuration gap worth warning about.
+    let host = super::resume::host_fallback(None, inherited);
+    if host.is_none() {
+        git::warn_unknown_remotes(&unknown);
+    }
     let fallback = unknown.into_iter().next()?;
-    Some((repo_root, fallback.owner, fallback.repo, None))
+    Some((repo_root, fallback.owner, fallback.repo, host))
 }
 
 /// Host from the current checkout's remotes, but only if they point at `owner`.
@@ -435,7 +470,7 @@ mod tests {
         // unknown, so GH_HOST stays inherited.
         let dir =
             repo_with_remotes(&[("origin", "https://code.corp.example.com/acme/widgets.git")]);
-        let (_, owner, repo, host) = context_from_repo_root(dir.path().to_path_buf())
+        let (_, owner, repo, host) = context_from_remotes(dir.path().to_path_buf(), None)
             .await
             .expect("an unconfigured GHES remote should still name the project");
         assert_eq!(owner, "acme");
@@ -446,7 +481,7 @@ mod tests {
     #[tokio::test]
     async fn test_context_from_repo_root_resolves_known_host() {
         let dir = repo_with_remotes(&[("origin", "https://github.com/acme/widgets.git")]);
-        let (_, owner, repo, host) = context_from_repo_root(dir.path().to_path_buf())
+        let (_, owner, repo, host) = context_from_remotes(dir.path().to_path_buf(), None)
             .await
             .expect("a github.com remote should resolve");
         assert_eq!(owner, "acme");
@@ -455,9 +490,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_context_from_remotes_keeps_inherited_host() {
+        // An unconfigured GHES remote with GH_HOST already exported: the child
+        // would inherit that host anyway, so it is reported as the resolved
+        // host rather than warned about as a configuration gap.
+        let dir =
+            repo_with_remotes(&[("origin", "https://code.corp.example.com/acme/widgets.git")]);
+        let (_, owner, repo, host) = context_from_remotes(
+            dir.path().to_path_buf(),
+            Some("code.corp.example.com".to_string()),
+        )
+        .await
+        .expect("an unconfigured GHES remote should still name the project");
+        assert_eq!(owner, "acme");
+        assert_eq!(repo, "widgets");
+        assert_eq!(host, Some("code.corp.example.com".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_host_for_repo_flag_uses_inherited_host() {
+        // --repo names an owner with no configured host and no matching
+        // remote; the inherited GH_HOST is what the session would use, so it
+        // wins over leaving the host unresolved.
+        let dir = repo_with_remotes(&[("origin", "https://github.com/someone/other.git")]);
+        assert_eq!(
+            host_for_repo_flag(
+                dir.path(),
+                "corp",
+                None,
+                Some("ghe.example.com".to_string())
+            )
+            .await,
+            Some("ghe.example.com".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_host_for_repo_flag_prefers_matching_remote_over_inherited() {
+        // A remote belonging to the requested owner is a stronger signal than
+        // whatever the shell happens to export.
+        let dir =
+            repo_with_remotes(&[("origin", "https://github.corp.example.com/corp/other.git")]);
+        assert_eq!(
+            host_for_repo_flag(
+                dir.path(),
+                "corp",
+                None,
+                Some("ghe.example.com".to_string())
+            )
+            .await,
+            Some("github.corp.example.com".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_host_for_repo_flag_without_any_source() {
+        let dir = repo_with_remotes(&[("origin", "https://github.com/someone/other.git")]);
+        assert_eq!(
+            host_for_repo_flag(dir.path(), "corp", None, None).await,
+            None
+        );
+        // A blank GH_HOST is not a host.
+        assert_eq!(
+            host_for_repo_flag(dir.path(), "corp", None, Some("  ".to_string())).await,
+            None
+        );
+    }
+
+    #[tokio::test]
     async fn test_context_from_repo_root_without_remotes() {
         let dir = repo_with_remotes(&[]);
-        assert!(context_from_repo_root(dir.path().to_path_buf())
+        assert!(context_from_remotes(dir.path().to_path_buf(), None)
             .await
             .is_none());
     }
@@ -470,11 +573,10 @@ mod tests {
         let (_, owner, repo, host) = result.expect("--repo flag should produce context");
         assert_eq!(owner, "myowner");
         assert_eq!(repo, "myrepo");
-        // Host is never taken from --repo itself, and the surrounding
-        // checkout's remote only counts when it belongs to the requested
-        // owner. "myowner" isn't this repo's owner and isn't configured, so
-        // nothing resolves and GH_HOST is left inherited.
-        assert_eq!(host, None);
+        // Host resolution isn't asserted here: it legitimately depends on the
+        // ambient config and `GH_HOST`, which this test can't control. The
+        // `host_for_repo_flag` tests cover it with both supplied explicitly.
+        let _ = host;
     }
 
     #[tokio::test]

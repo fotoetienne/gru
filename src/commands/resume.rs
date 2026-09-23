@@ -514,7 +514,7 @@ pub(crate) async fn resolve_child_host_from_worktree(
     }
     let fallback = host_fallback(
         crate::github::configured_host_for_owner(owner, None),
-        std::env::var("GH_HOST").ok(),
+        inherited_gh_host(),
     );
     if fallback.is_none() {
         crate::git::warn_unknown_remotes(&unknown);
@@ -522,15 +522,24 @@ pub(crate) async fn resolve_child_host_from_worktree(
     fallback
 }
 
-/// Fallback order once remotes yield nothing: configured host, then an
-/// inherited `GH_HOST`. An owner explicitly configured on public GitHub
-/// counts as configured, so it wins over an inherited `GH_HOST` pointing at
-/// some unrelated GHES.
+/// Fallback order once the higher-priority source yields nothing: `resolved`,
+/// then an inherited `GH_HOST`. An owner explicitly configured on public
+/// GitHub counts as resolved, so it wins over an inherited `GH_HOST` pointing
+/// at some unrelated GHES. A blank inherited value is treated as unset.
 ///
-/// Split out from [`resolve_child_host_from_worktree`] so it can be tested
-/// without mutating the process-global `GH_HOST`.
-fn host_fallback(configured: Option<String>, inherited: Option<String>) -> Option<String> {
-    configured.or_else(|| inherited.filter(|h| !h.trim().is_empty()))
+/// Shared with `gru chat`, and split out from
+/// [`resolve_child_host_from_worktree`] so it can be tested without mutating
+/// the process-global `GH_HOST`.
+pub(crate) fn host_fallback(resolved: Option<String>, inherited: Option<String>) -> Option<String> {
+    resolved.or_else(|| inherited.filter(|h| !h.trim().is_empty()))
+}
+
+/// The inherited `GH_HOST`, if the environment set one.
+///
+/// The single read of the variable, so callers stay testable by taking the
+/// value as a parameter.
+pub(crate) fn inherited_gh_host() -> Option<String> {
+    std::env::var("GH_HOST").ok()
 }
 
 /// Applies a child-routing host, as resolved by
