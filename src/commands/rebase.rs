@@ -820,7 +820,11 @@ pub(crate) async fn run_agent_rebase(
 ) -> Result<i32> {
     let backend = agent_registry::resolve_backend(agent_registry::DEFAULT_AGENT)?;
     let session_id = Uuid::new_v4();
-    let github_host = super::resume::resolve_child_host_from_worktree(checkout_path, "").await;
+    // The worktree may carry remotes for several owners (a fork's `origin`
+    // plus an `upstream`), so scope host selection to the owner whose repo
+    // this workspace belongs to.
+    let owner = crate::workspace::owner_from_work_path(checkout_path).unwrap_or_default();
+    let github_host = super::resume::resolve_child_host_from_worktree(checkout_path, &owner).await;
 
     let prompt = REBASE_PROMPT_TEMPLATE.replace("<BASE_BRANCH>", base_branch);
     let mut cmd = backend.build_command(

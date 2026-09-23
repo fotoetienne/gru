@@ -315,6 +315,27 @@ impl Drop for TestWorkspaceGuard {
     }
 }
 
+/// Extracts the repo owner from a path inside the work tree.
+///
+/// Minion workspaces live at `<work>/<owner>/<repo>/<branch>/...`, so the
+/// first component below the work root names the owner. Returns `None` for
+/// any path outside the work root (an ad-hoc `gru prompt` run from an
+/// arbitrary CWD, say), which callers treat as "no owner in mind".
+pub(crate) fn owner_from_work_path(path: &Path) -> Option<String> {
+    let work = Workspace::global().ok()?;
+    owner_from_work_root(work.work(), path)
+}
+
+/// Pure half of [`owner_from_work_path`], so it can be tested without
+/// depending on the process's real workspace location.
+fn owner_from_work_root(work_root: &Path, path: &Path) -> Option<String> {
+    let owner = path.strip_prefix(work_root).ok()?.components().next()?;
+    match owner {
+        std::path::Component::Normal(owner) => Some(owner.to_str()?.to_string()),
+        _ => None,
+    }
+}
+
 /// Resolves the checkout path from a minion directory.
 ///
 /// Prefers `minion_dir/checkout` only if it looks like a Git worktree
@@ -418,6 +439,34 @@ mod tests {
         // Dots in minion IDs should be allowed
         assert!(ws.archive_dir("minion-1.2.3").is_ok());
         assert!(ws.archive_dir("v2.0").is_ok());
+    }
+
+    #[test]
+    fn test_owner_from_work_root_extracts_owner() {
+        assert_eq!(
+            super::owner_from_work_root(
+                Path::new("/home/u/.gru/work"),
+                Path::new("/home/u/.gru/work/acme/widgets/minion/issue-42-M001/checkout"),
+            ),
+            Some("acme".to_string())
+        );
+    }
+
+    #[test]
+    fn test_owner_from_work_root_outside_work_tree() {
+        // An ad-hoc run from some other directory has no owner to filter by.
+        assert_eq!(
+            super::owner_from_work_root(Path::new("/home/u/.gru/work"), Path::new("/tmp/scratch")),
+            None
+        );
+        // The work root itself names no owner either.
+        assert_eq!(
+            super::owner_from_work_root(
+                Path::new("/home/u/.gru/work"),
+                Path::new("/home/u/.gru/work")
+            ),
+            None
+        );
     }
 
     #[test]
