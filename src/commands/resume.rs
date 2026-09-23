@@ -489,96 +489,15 @@ pub(crate) async fn resolve_host_from_worktree(
 
 /// Resolve the GitHub host for a worktree by inspecting its git remotes.
 ///
-/// `origin` wins when it points at a GitHub-style remote, but a repo whose
-/// GitHub remote is named something else (`upstream`, a fork layout where
-/// `origin` is a non-GitHub mirror) is still resolved rather than silently
-/// falling back to github.com. Registry-known hosts are preferred over
-/// hosts merely extracted from a URL, so a GHES `upstream` beats a
-/// non-GitHub `origin` but never a github.com `origin`.
-///
-/// Returns `None` when no remote yields a host (no remotes, not a git repo,
-/// or only remotes whose URLs aren't GitHub-shaped).
+/// Thin wrapper over [`crate::git::resolve_github_repo_from_remotes`] that
+/// keeps only the host. Returns `None` when no remote yields a GitHub repo, so
+/// callers that set `GH_HOST` on a child process can leave an inherited value
+/// alone instead of overriding it with a guess.
 pub(crate) async fn resolve_host_from_remotes(checkout_path: &std::path::Path) -> Option<String> {
     let host_registry = crate::config::load_host_registry();
-
-    let mut registry_host: Option<String> = None;
-    let mut origin_unknown_host: Option<String> = None;
-    let mut other_unknown_host: Option<String> = None;
-
-    for (name, url) in list_remotes(checkout_path).await {
-        // Registry-validated parse first: it confirms the URL really is a
-        // GitHub-style remote on a host we know about.
-        if let Ok((host, _, _)) = crate::git::parse_github_remote(&url, &host_registry) {
-            if name == "origin" {
-                return Some(host);
-            }
-            registry_host.get_or_insert(host);
-        } else if let Some(host) = extract_host_from_remote_url(&url) {
-            // Valid URL on a host that isn't in the registry (an unconfigured
-            // GHES instance); keep it as a weaker candidate so we don't
-            // wrongly default to github.com.
-            if name == "origin" {
-                origin_unknown_host.get_or_insert(host);
-            } else {
-                other_unknown_host.get_or_insert(host);
-            }
-        }
-    }
-
-    registry_host.or(origin_unknown_host).or(other_unknown_host)
-}
-
-/// List a worktree's remotes as `(name, url)` pairs, deduped by name.
-///
-/// Returns an empty list when the path isn't a git repo or `git` fails.
-async fn list_remotes(checkout_path: &std::path::Path) -> Vec<(String, String)> {
-    let output = tokio::process::Command::new("git")
-        .args(["remote", "-v"])
-        .current_dir(checkout_path)
-        .output()
-        .await;
-
-    let Ok(output) = output else {
-        return Vec::new();
-    };
-    if !output.status.success() {
-        return Vec::new();
-    }
-
-    let mut remotes: Vec<(String, String)> = Vec::new();
-    // Each line: <name> <url> (fetch|push) — fetch and push repeat the name.
-    for line in String::from_utf8_lossy(&output.stdout).lines() {
-        let mut parts = line.split_whitespace();
-        if let (Some(name), Some(url)) = (parts.next(), parts.next()) {
-            if !remotes.iter().any(|(n, _)| n == name) {
-                remotes.push((name.to_string(), url.to_string()));
-            }
-        }
-    }
-    remotes
-}
-
-/// Extract the hostname from a git remote URL without requiring it to be in the
-/// known hosts registry. Supports HTTPS (`https://host/...`) and SSH (`git@host:...`).
-fn extract_host_from_remote_url(url: &str) -> Option<String> {
-    if let Some(rest) = url
-        .strip_prefix("https://")
-        .or_else(|| url.strip_prefix("http://"))
-    {
-        // https://host/owner/repo.git -> host
-        rest.split('/')
-            .next()
-            .map(|h| h.to_string())
-            .filter(|h| !h.is_empty())
-    } else if let Some(rest) = url.strip_prefix("git@") {
-        // git@host:owner/repo.git -> host
-        rest.split(':')
-            .next()
-            .map(|h| h.to_string())
-            .filter(|h| !h.is_empty())
-    } else {
-        None
-    }
+    crate::git::resolve_github_repo_from_remotes(checkout_path, &host_registry)
+        .await
+        .map(|(host, _, _)| host)
 }
 
 #[cfg(test)]
@@ -622,6 +541,42 @@ mod tests {
         assert_eq!(
             resolve_host_from_worktree(dir.path(), "owner").await,
             "github.com"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_resolve_host_ignores_non_github_only_repo() {
+        // A GitLab-only repo must not have its host exported as GH_HOST just
+        // because the URL shape is valid; fall back to the config heuristic.
+        let dir =
+            repo_with_remotes(&[("origin", "https://gitlab.example.com/owner/repo.git")]).await;
+        assert_eq!(resolve_host_from_remotes(dir.path()).await, None);
+        assert_eq!(
+            resolve_host_from_worktree(dir.path(), "owner").await,
+            "github.com"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_resolve_host_uses_push_url_when_fetch_is_a_mirror() {
+        // `origin` fetches from a non-GitHub mirror but pushes to GHES; the
+        // push URL must still be considered.
+        let dir =
+            repo_with_remotes(&[("origin", "https://gitlab.example.com/owner/repo.git")]).await;
+        std::process::Command::new("git")
+            .args([
+                "remote",
+                "set-url",
+                "--push",
+                "origin",
+                "https://github.corp.example.com/owner/repo.git",
+            ])
+            .current_dir(dir.path())
+            .output()
+            .expect("git");
+        assert_eq!(
+            resolve_host_from_remotes(dir.path()).await.as_deref(),
+            Some("github.corp.example.com")
         );
     }
 
@@ -682,36 +637,6 @@ mod tests {
 
         let err_msg = format!("{:#}", result.unwrap_err());
         assert!(err_msg.contains("Could not resolve ID"));
-    }
-
-    #[test]
-    fn test_extract_host_from_remote_url_https() {
-        assert_eq!(
-            extract_host_from_remote_url("https://github.example.com/owner/repo.git"),
-            Some("github.example.com".to_string())
-        );
-        assert_eq!(
-            extract_host_from_remote_url("https://github.com/owner/repo.git"),
-            Some("github.com".to_string())
-        );
-    }
-
-    #[test]
-    fn test_extract_host_from_remote_url_ssh() {
-        assert_eq!(
-            extract_host_from_remote_url("git@github.example.com:owner/repo.git"),
-            Some("github.example.com".to_string())
-        );
-        assert_eq!(
-            extract_host_from_remote_url("git@github.com:owner/repo.git"),
-            Some("github.com".to_string())
-        );
-    }
-
-    #[test]
-    fn test_extract_host_from_remote_url_invalid() {
-        assert_eq!(extract_host_from_remote_url("not-a-url"), None);
-        assert_eq!(extract_host_from_remote_url(""), None);
     }
 
     #[test]

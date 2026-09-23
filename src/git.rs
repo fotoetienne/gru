@@ -206,6 +206,123 @@ pub(crate) async fn get_github_remote(host_registry: &HostRegistry) -> Result<St
     })
 }
 
+/// Heuristic test for a hostname that looks like a GitHub Enterprise Server
+/// instance which simply isn't in the configured host registry.
+///
+/// A syntactically valid remote URL says nothing about the forge behind it —
+/// GitLab and Bitbucket remotes have the same shape — so an unrecognised host
+/// can't be assumed to be GitHub. Unconfigured GHES instances are, however,
+/// overwhelmingly named `github.<corp>` or `ghe[s].<corp>`, so requiring one of
+/// those labels distinguishes them from an arbitrary forge without needing a
+/// network round trip. Anything else should be added to `[github_hosts]` in
+/// config.toml to be recognised.
+pub(crate) fn looks_like_github_host(host: &str) -> bool {
+    host.split('.')
+        .any(|label| matches!(label, "github" | "ghe" | "ghes"))
+}
+
+/// Parses a remote URL on a host that isn't in the registry but looks like a
+/// GHES instance, returning `(host, owner, repo)`.
+///
+/// The counterpart to [`parse_github_remote`] for unconfigured hosts. Returns
+/// `None` when the URL isn't GitHub-shaped or the host fails
+/// [`looks_like_github_host`].
+pub(crate) fn parse_github_like_remote(url: &str) -> Option<(String, String, String)> {
+    let parts = split_github_url(url)?;
+    if !looks_like_github_host(parts.host) {
+        return None;
+    }
+    let (owner, repo) = split_owner_repo(parts.rest)?;
+    Some((parts.host.to_string(), owner, repo))
+}
+
+/// Splits the path part of a remote URL into `(owner, repo)`.
+fn split_owner_repo(rest: &str) -> Option<(String, String)> {
+    let path = rest
+        .trim_start_matches('/')
+        .trim_end_matches(".git")
+        .trim_end_matches('/');
+    let mut segs = path.split('/').filter(|s| !s.is_empty());
+    let owner = segs.next()?;
+    let repo = segs.next()?;
+    Some((owner.to_string(), repo.to_string()))
+}
+
+/// Lists a repository's remotes as `(name, url)` pairs.
+///
+/// `git remote -v` emits a separate line per fetch and push URL, and a remote
+/// can fetch from a mirror while pushing to the real GitHub repo, so both URLs
+/// are kept — only exact duplicate pairs are collapsed.
+///
+/// Returns an empty list when `dir` isn't a git repo or `git` fails.
+pub(crate) async fn list_remotes(dir: &Path) -> Vec<(String, String)> {
+    let output = Command::new("git")
+        .args(["remote", "-v"])
+        .current_dir(dir)
+        .output()
+        .await;
+
+    let Ok(output) = output else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+
+    let mut remotes: Vec<(String, String)> = Vec::new();
+    // Each line: <name> <url> (fetch|push)
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let mut parts = line.split_whitespace();
+        if let (Some(name), Some(url)) = (parts.next(), parts.next()) {
+            let pair = (name.to_string(), url.to_string());
+            if !remotes.contains(&pair) {
+                remotes.push(pair);
+            }
+        }
+    }
+    remotes
+}
+
+/// Resolves `(host, owner, repo)` for a repository by inspecting its remotes.
+///
+/// `origin` wins when it points at a GitHub remote, but a repo whose GitHub
+/// remote is named something else (`upstream`, or a fork layout where `origin`
+/// is a non-GitHub mirror) still resolves. Registry-configured hosts rank above
+/// hosts merely recognised by [`looks_like_github_host`], so a configured GHES
+/// `upstream` beats a plausible-looking `origin` but never a configured
+/// `origin`.
+///
+/// Returns `None` when no remote yields a GitHub repo, in which case callers
+/// must not guess a host — see `resume::resolve_host_from_remotes`.
+pub(crate) async fn resolve_github_repo_from_remotes(
+    dir: &Path,
+    host_registry: &HostRegistry,
+) -> Option<(String, String, String)> {
+    let mut configured_other: Option<(String, String, String)> = None;
+    let mut likely_origin: Option<(String, String, String)> = None;
+    let mut likely_other: Option<(String, String, String)> = None;
+
+    for (name, url) in list_remotes(dir).await {
+        let is_origin = name == "origin";
+        // A registry-validated parse confirms both the URL shape and that the
+        // host is one we've been told about.
+        if let Ok(parsed) = parse_github_remote(&url, host_registry) {
+            if is_origin {
+                return Some(parsed);
+            }
+            configured_other.get_or_insert(parsed);
+        } else if let Some(parsed) = parse_github_like_remote(&url) {
+            if is_origin {
+                likely_origin.get_or_insert(parsed);
+            } else {
+                likely_other.get_or_insert(parsed);
+            }
+        }
+    }
+
+    configured_other.or(likely_origin).or(likely_other)
+}
+
 /// Supported URL schemes for GitHub remotes and web URLs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum GitUrlScheme {
@@ -1281,6 +1398,51 @@ impl GitRepo {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn test_looks_like_github_host() {
+        // Unconfigured GHES instances conventionally carry a github/ghe label.
+        assert!(looks_like_github_host("github.com"));
+        assert!(looks_like_github_host("github.corp.example.com"));
+        assert!(looks_like_github_host("ghe.example.com"));
+        assert!(looks_like_github_host("ghes.example.com"));
+        // Other forges (and hosts that merely contain the substring) must not
+        // be mistaken for GitHub and exported as GH_HOST.
+        assert!(!looks_like_github_host("gitlab.example.com"));
+        assert!(!looks_like_github_host("bitbucket.org"));
+        assert!(!looks_like_github_host("git.example.com"));
+        assert!(!looks_like_github_host("notgithub.example.com"));
+    }
+
+    #[test]
+    fn test_parse_github_like_remote() {
+        assert_eq!(
+            parse_github_like_remote("https://github.corp.example.com/acme/widgets.git"),
+            Some((
+                "github.corp.example.com".to_string(),
+                "acme".to_string(),
+                "widgets".to_string()
+            ))
+        );
+        assert_eq!(
+            parse_github_like_remote("git@ghe.example.com:acme/widgets.git"),
+            Some((
+                "ghe.example.com".to_string(),
+                "acme".to_string(),
+                "widgets".to_string()
+            ))
+        );
+        // Wrong forge, missing repo segment, and unparseable URLs all decline.
+        assert_eq!(
+            parse_github_like_remote("https://gitlab.example.com/acme/widgets.git"),
+            None
+        );
+        assert_eq!(
+            parse_github_like_remote("https://github.corp.example.com/acme"),
+            None
+        );
+        assert_eq!(parse_github_like_remote("not-a-url"), None);
+    }
     use super::*;
     use crate::config::{GhHostConfig, LabConfig};
     use std::env;

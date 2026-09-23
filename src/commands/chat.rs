@@ -96,11 +96,14 @@ async fn detect_project_context(
         }
     }
 
-    // Try to detect from current directory
+    // Try to detect from current directory. This uses the same remote
+    // resolution as `gru pm`/`gru tpm` (rather than registry-only matching) so
+    // a repo on an unconfigured GHES instance keeps its project context
+    // instead of silently falling back to the no-repo onboarding prompt.
     let repo_root = git::detect_git_repo().await.ok()?;
     let host_registry = crate::config::load_host_registry();
-    let remote_url = git::get_github_remote(&host_registry).await.ok()?;
-    let (host, owner, repo_name) = git::parse_github_remote(&remote_url, &host_registry).ok()?;
+    let (host, owner, repo_name) =
+        git::resolve_github_repo_from_remotes(&repo_root, &host_registry).await?;
     Some((repo_root, owner, repo_name, Some(host)))
 }
 
