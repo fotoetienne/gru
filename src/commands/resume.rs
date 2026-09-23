@@ -512,7 +512,9 @@ pub(crate) async fn resolve_child_host_from_worktree(
 }
 
 /// Fallback order once remotes yield nothing: configured host, then an
-/// inherited `GH_HOST`.
+/// inherited `GH_HOST`. An owner explicitly configured on public GitHub
+/// counts as configured, so it wins over an inherited `GH_HOST` pointing at
+/// some unrelated GHES.
 ///
 /// Split out from [`resolve_child_host_from_worktree`] so it can be tested
 /// without mutating the process-global `GH_HOST`.
@@ -723,6 +725,19 @@ mod tests {
         assert_eq!(
             resolve_host_from_worktree(dir.path(), "").await,
             "github.com"
+        );
+    }
+
+    #[test]
+    fn test_child_host_prefers_explicit_github_com_over_inherited() {
+        // `configured_host_for_owner` reports an explicitly configured public
+        // owner as Some("github.com"), so the inherited value must not win.
+        assert_eq!(
+            host_fallback(
+                Some("github.com".to_string()),
+                Some("ghes.example.com".to_string())
+            ),
+            Some("github.com".to_string())
         );
     }
 

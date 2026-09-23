@@ -46,6 +46,11 @@ pub(crate) fn infer_github_host(owner: &str, config: Option<&crate::config::LabC
 /// Callers that set `GH_HOST` on a child process should prefer this: a `None`
 /// lets them leave an inherited `GH_HOST` alone rather than overriding a
 /// GHES-only user's shell environment with a guess.
+///
+/// An owner configured on public GitHub yields `Some("github.com")`, not
+/// `None`: that is an explicit mapping, and collapsing it into "unconfigured"
+/// would let a checkout remote or an inherited `GH_HOST` for some GHES
+/// outrank it.
 pub(crate) fn configured_host_for_owner(
     owner: &str,
     config: Option<&crate::config::LabConfig>,
@@ -69,7 +74,7 @@ pub(crate) fn configured_host_for_owner(
         {
             // GitHub owner names are case-insensitive, and `owner` comes
             // straight from a user-typed `--repo` value.
-            if repo_owner.eq_ignore_ascii_case(owner) && host != "github.com" {
+            if repo_owner.eq_ignore_ascii_case(owner) {
                 return Some(host);
             }
         }
@@ -1776,6 +1781,27 @@ mod tests {
         assert_eq!(configured_host_for_owner("unknown", Some(&cfg)), None);
         // An empty owner can never match an entry, so don't even try.
         assert_eq!(configured_host_for_owner("", Some(&cfg)), None);
+    }
+
+    #[test]
+    fn test_configured_host_for_owner_keeps_explicit_github_com() {
+        use crate::config::LabConfig;
+
+        // An owner configured on public GitHub is configured, not unknown:
+        // returning None here would let a GHES checkout remote or an
+        // inherited GH_HOST outrank the explicit mapping.
+        let cfg = LabConfig {
+            daemon: crate::config::DaemonConfig {
+                repos: vec!["corp/project".to_string()],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(
+            configured_host_for_owner("corp", Some(&cfg)).as_deref(),
+            Some("github.com")
+        );
+        assert_eq!(configured_host_for_owner("other", Some(&cfg)), None);
     }
 
     // --- IssueInfo deserialization tests ---
