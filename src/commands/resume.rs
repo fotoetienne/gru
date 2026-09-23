@@ -473,27 +473,31 @@ async fn discover_pr_by_branch(
 /// Resolve the GitHub host for a worktree, for Gru's own API calls.
 ///
 /// Order: the repo's remotes (filtered to `owner`), then a configured host for
-/// `owner`, then an inherited `GH_HOST`, and only then github.com. Use this
-/// where a host is required. Callers that only route a child agent process
-/// want [`resolve_child_host_from_worktree`], which stops at `None` instead of
-/// defaulting to github.com.
+/// `owner`, then github.com. An inherited `GH_HOST` is deliberately *not*
+/// consulted: this host targets Gru's own API calls, and a shell-level
+/// `GH_HOST` left over from an unrelated GHES would silently retarget them.
+/// Use this where a host is required. Callers that only route a child agent
+/// process want [`resolve_child_host_from_worktree`], where inheriting is the
+/// right answer because the child would have inherited it anyway.
 pub(crate) async fn resolve_host_from_worktree(
     checkout_path: &std::path::Path,
     owner: &str,
 ) -> String {
-    resolve_child_host_from_worktree(checkout_path, owner)
-        .await
-        .unwrap_or_else(|| "github.com".to_string())
+    match resolve_host_from_remotes(checkout_path, owner).await {
+        Some(host) => host,
+        None => crate::github::configured_host_for_owner(owner, None)
+            .unwrap_or_else(|| "github.com".to_string()),
+    }
 }
 
 /// Resolve the `GH_HOST` to hand a child agent process, or `None`.
 ///
-/// Same order as [`resolve_host_from_worktree`] minus the github.com default:
-/// when the remotes, config, and the environment all come up empty, the repo
-/// is on an unconfigured GHES that [`resolve_host_from_remotes`] has already
-/// warned about, and sending the child to github.com would silently retarget
-/// its `gh` calls. `None` means "leave `GH_HOST` unset" — see
-/// [`apply_child_host`].
+/// Remotes, then a configured host for `owner`, then an inherited `GH_HOST`.
+/// Unlike [`resolve_host_from_worktree`] there is no github.com default: when
+/// all three come up empty the repo is on an unconfigured GHES that
+/// [`resolve_host_from_remotes`] has already warned about, and sending the
+/// child to github.com would silently retarget its `gh` calls. `None` means
+/// "leave `GH_HOST` unset" — see [`apply_child_host`].
 pub(crate) async fn resolve_child_host_from_worktree(
     checkout_path: &std::path::Path,
     owner: &str,
@@ -684,6 +688,18 @@ mod tests {
     async fn test_resolve_host_no_remotes_resolves_nothing() {
         let dir = repo_with_remotes(&[]).await;
         assert_eq!(resolve_host_from_remotes(dir.path(), "").await, None);
+    }
+
+    #[tokio::test]
+    async fn test_resolve_host_from_worktree_ignores_inherited_gh_host() {
+        // This host targets Gru's own API calls, so a shell-level GH_HOST for
+        // an unrelated instance must not retarget them. Deterministic whether
+        // or not the test machine exports GH_HOST, since it is never read.
+        let dir = repo_with_remotes(&[]).await;
+        assert_eq!(
+            resolve_host_from_worktree(dir.path(), "unconfigured-owner").await,
+            "github.com"
+        );
     }
 
     #[tokio::test]
