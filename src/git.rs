@@ -450,11 +450,8 @@ fn rank_github_remotes(
         // A registry-validated parse confirms both the URL shape and that the
         // host is one we've been told about.
         if let Ok((host, owner, repo)) = parse_github_remote(url, host_registry) {
-            let parsed = RemoteRepo {
-                host: with_remote_port(host, url),
-                owner,
-                repo,
-            };
+            // Already port-aware: `parse_github_remote` re-attaches the port itself.
+            let parsed = RemoteRepo { host, owner, repo };
             if is_origin {
                 push(&mut configured_origin, parsed);
             } else {
@@ -627,6 +624,12 @@ fn url_matches_any_host(url: &str, hosts: &[String]) -> bool {
 /// Matches against every API host and every configured `web_url` host in
 /// `host_registry`. The returned host is always the canonical API host, even
 /// when the input used a web UI hostname.
+///
+/// An explicit port is preserved when the URL's host *is* that canonical API
+/// host, so callers routing `gh` through the result (`GH_HOST`) reach the same
+/// authority git does. A web UI host canonicalizes to a different name whose
+/// port can't be inferred from the web URL's, so those stay unported — see
+/// [`with_remote_port`].
 pub(crate) fn parse_github_remote(
     url: &str,
     host_registry: &HostRegistry,
@@ -652,7 +655,11 @@ pub(crate) fn parse_github_remote(
     let canonical = host_registry
         .canonical_host(parts.host)
         .expect("matched host is always resolvable");
-    Ok((canonical, segs[0].to_string(), segs[1].to_string()))
+    Ok((
+        with_remote_port(canonical, url),
+        segs[0].to_string(),
+        segs[1].to_string(),
+    ))
 }
 
 /// Represents a single entry from `git worktree list --porcelain` output.
@@ -2141,8 +2148,22 @@ mod tests {
             &hosts_with_ghe(),
         )
         .unwrap();
-        assert_eq!(result.0, "ghe.example.com");
+        // The port is part of the authority `gh` needs, so it survives.
+        assert_eq!(result.0, "ghe.example.com:8443");
         assert_eq!(result.1, "netflix");
+        assert_eq!(result.2, "service");
+    }
+
+    #[test]
+    fn test_parse_github_remote_web_url_with_port_stays_unported() {
+        // The web UI's port says nothing about the API host's, so it is dropped.
+        let result = parse_github_remote(
+            "https://github.netflix.net:8443/corp/service.git",
+            &hosts_with_web_url(),
+        )
+        .unwrap();
+        assert_eq!(result.0, "git.netflix.net");
+        assert_eq!(result.1, "corp");
         assert_eq!(result.2, "service");
     }
 
