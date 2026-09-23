@@ -470,6 +470,23 @@ async fn discover_pr_by_branch(
     }
 }
 
+/// Resolve the GitHub host for a worktree, falling back to config and then
+/// `github.com`.
+///
+/// Use this when a host is required. Callers that set `GH_HOST` on a child
+/// process should prefer [`resolve_host_from_remotes`] plus
+/// [`crate::github::configured_host_for_owner`], so an unresolvable host
+/// leaves the inherited `GH_HOST` alone instead of overriding it with a guess.
+pub(crate) async fn resolve_host_from_worktree(
+    checkout_path: &std::path::Path,
+    owner: &str,
+) -> String {
+    match resolve_host_from_remotes(checkout_path).await {
+        Some(host) => host,
+        None => crate::github::infer_github_host(owner, None),
+    }
+}
+
 /// Resolve the GitHub host for a worktree by inspecting its git remotes.
 ///
 /// `origin` wins when it points at a GitHub-style remote, but a repo whose
@@ -479,11 +496,9 @@ async fn discover_pr_by_branch(
 /// hosts merely extracted from a URL, so a GHES `upstream` beats a
 /// non-GitHub `origin` but never a github.com `origin`.
 ///
-/// Falls back to config-based `infer_github_host` if no remote yields a host.
-pub(crate) async fn resolve_host_from_worktree(
-    checkout_path: &std::path::Path,
-    owner: &str,
-) -> String {
+/// Returns `None` when no remote yields a host (no remotes, not a git repo,
+/// or only remotes whose URLs aren't GitHub-shaped).
+pub(crate) async fn resolve_host_from_remotes(checkout_path: &std::path::Path) -> Option<String> {
     let host_registry = crate::config::load_host_registry();
 
     let mut registry_host: Option<String> = None;
@@ -495,7 +510,7 @@ pub(crate) async fn resolve_host_from_worktree(
         // GitHub-style remote on a host we know about.
         if let Ok((host, _, _)) = crate::git::parse_github_remote(&url, &host_registry) {
             if name == "origin" {
-                return host;
+                return Some(host);
             }
             registry_host.get_or_insert(host);
         } else if let Some(host) = extract_host_from_remote_url(&url) {
@@ -510,11 +525,7 @@ pub(crate) async fn resolve_host_from_worktree(
         }
     }
 
-    registry_host
-        .or(origin_unknown_host)
-        .or(other_unknown_host)
-        // Fallback to config-based heuristic
-        .unwrap_or_else(|| crate::github::infer_github_host(owner, None))
+    registry_host.or(origin_unknown_host).or(other_unknown_host)
 }
 
 /// List a worktree's remotes as `(name, url)` pairs, deduped by name.

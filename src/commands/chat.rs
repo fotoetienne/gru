@@ -31,9 +31,11 @@ pub(crate) async fn handle_chat(
         None => {
             let cwd = std::env::current_dir().context("Failed to determine current directory")?;
             let prompt = build_no_repo_prompt();
-            // No repo to read a remote from; the config heuristic falls back
-            // to github.com when nothing else matches.
-            (cwd, prompt, crate::github::infer_github_host("", None))
+            // No repo and no owner, so there's no signal to resolve a host
+            // from. Leave GH_HOST alone: a GHES-only user may have it
+            // exported in their shell, and guessing github.com would
+            // silently retarget their `gh` calls.
+            (cwd, prompt, None)
         }
     };
 
@@ -43,7 +45,7 @@ pub(crate) async fn handle_chat(
 
     let backend = crate::agent_registry::resolve_backend(agent_name)?;
     let mut cmd = backend
-        .build_interactive_command(&work_dir, &system_prompt, None, &github_host)
+        .build_interactive_command(&work_dir, &system_prompt, None, github_host.as_deref())
         .ok_or_else(|| crate::agent_registry::interactive_unsupported_error("chat", agent_name))?;
 
     let mut child = cmd.spawn().with_context(|| {
@@ -59,12 +61,13 @@ pub(crate) async fn handle_chat(
 ///
 /// The host is resolved from the repo's git remote so `gh` calls the agent
 /// makes during the session hit the right GitHub Enterprise instance rather
-/// than defaulting to github.com.
+/// than defaulting to github.com. It is `None` when nothing resolved it, so
+/// the caller leaves an inherited `GH_HOST` in place.
 ///
 /// Returns None if not in a git repo or can't determine GitHub remote.
 async fn detect_project_context(
     repo_flag: Option<String>,
-) -> Option<(PathBuf, String, String, String)> {
+) -> Option<(PathBuf, String, String, Option<String>)> {
     // If --repo flag provided as owner/repo, override owner/name but still
     // resolve the repo root from the current git repository when possible.
     if let Some(repo) = repo_flag {
@@ -75,9 +78,13 @@ async fn detect_project_context(
                     Ok(root) => root,
                     Err(_) => std::env::current_dir().ok()?,
                 };
-                // --repo carries no host, so fall back to the remote (and
-                // then to the owner-based config heuristic).
-                let host = super::resume::resolve_host_from_worktree(&repo_root, owner).await;
+                // --repo carries no host, so fall back to the remote and then
+                // to the owner-based config heuristic. Both can come up empty,
+                // in which case GH_HOST is left untouched.
+                let host = match super::resume::resolve_host_from_remotes(&repo_root).await {
+                    Some(host) => Some(host),
+                    None => crate::github::configured_host_for_owner(owner, None),
+                };
                 return Some((repo_root, owner.to_string(), name.to_string(), host));
             }
             _ => {
@@ -94,7 +101,7 @@ async fn detect_project_context(
     let host_registry = crate::config::load_host_registry();
     let remote_url = git::get_github_remote(&host_registry).await.ok()?;
     let (host, owner, repo_name) = git::parse_github_remote(&remote_url, &host_registry).ok()?;
-    Some((repo_root, owner, repo_name, host))
+    Some((repo_root, owner, repo_name, Some(host)))
 }
 
 /// Builds the system prompt for in-repo context.
@@ -294,8 +301,10 @@ mod tests {
         let (_, owner, repo, host) = result.expect("--repo flag should produce context");
         assert_eq!(owner, "myowner");
         assert_eq!(repo, "myrepo");
-        // Host comes from the git remote, never from --repo itself.
-        assert!(!host.is_empty());
+        // Host comes from the git remote, never from --repo itself. This repo's
+        // remote is on github.com, which is also what the owner-based fallback
+        // would produce, so the assertion holds either way.
+        assert_eq!(host.as_deref(), Some("github.com"));
     }
 
     #[tokio::test]

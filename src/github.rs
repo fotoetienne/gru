@@ -37,6 +37,24 @@ pub(crate) fn repo_slug(owner: &str, repo: &str) -> String {
 ///
 /// Returns the appropriate GitHub hostname
 pub(crate) fn infer_github_host(owner: &str, config: Option<&crate::config::LabConfig>) -> String {
+    configured_host_for_owner(owner, config).unwrap_or_else(|| "github.com".to_string())
+}
+
+/// Like [`infer_github_host`], but returns `None` when nothing matches instead
+/// of guessing `github.com`.
+///
+/// Callers that set `GH_HOST` on a child process should prefer this: a `None`
+/// lets them leave an inherited `GH_HOST` alone rather than overriding a
+/// GHES-only user's shell environment with a guess.
+pub(crate) fn configured_host_for_owner(
+    owner: &str,
+    config: Option<&crate::config::LabConfig>,
+) -> Option<String> {
+    // An empty owner can never match a config entry, so don't load the config.
+    if owner.is_empty() {
+        return None;
+    }
+
     // Check daemon.repos config for an explicit host for this owner
     let loaded = if config.is_none() {
         crate::config::try_load_config()
@@ -44,19 +62,18 @@ pub(crate) fn infer_github_host(owner: &str, config: Option<&crate::config::LabC
         None
     };
     let cfg = config.or(loaded.as_ref());
-    if let Some(cfg) = cfg {
-        for repo_spec in &cfg.daemon.repos {
-            if let Some((host, repo_owner, _repo)) =
-                crate::config::parse_repo_entry_with_hosts(repo_spec, &cfg.github_hosts)
-            {
-                if repo_owner == owner && host != "github.com" {
-                    return host;
-                }
+    let cfg = cfg?;
+    for repo_spec in &cfg.daemon.repos {
+        if let Some((host, repo_owner, _repo)) =
+            crate::config::parse_repo_entry_with_hosts(repo_spec, &cfg.github_hosts)
+        {
+            if repo_owner == owner && host != "github.com" {
+                return Some(host);
             }
         }
     }
 
-    "github.com".to_string()
+    None
 }
 
 /// Creates a pre-configured `tokio::process::Command` for the `gh` CLI.
@@ -1729,6 +1746,16 @@ mod tests {
         );
         // Owner not in config -> falls back to github.com
         assert_eq!(infer_github_host("unknown", Some(&cfg)), "github.com");
+
+        // The Option variant distinguishes "matched" from "guessed", so callers
+        // setting GH_HOST can leave an inherited value alone.
+        assert_eq!(
+            configured_host_for_owner("acme", Some(&cfg)).as_deref(),
+            Some("github.corp.example.com")
+        );
+        assert_eq!(configured_host_for_owner("unknown", Some(&cfg)), None);
+        // An empty owner can never match an entry, so don't even try.
+        assert_eq!(configured_host_for_owner("", Some(&cfg)), None);
     }
 
     // --- IssueInfo deserialization tests ---

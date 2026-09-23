@@ -324,9 +324,12 @@ pub(crate) trait AgentBackend: Send + Sync {
     /// an argument terminator (`--`) so prompts that look like flags (e.g. `-h`)
     /// aren't parsed as CLI options.
     ///
-    /// `github_host` must be exported as `GH_HOST` (as the resume variant does)
-    /// so `gh` calls the agent makes during the session target the right
-    /// GitHub Enterprise instance instead of defaulting to github.com.
+    /// `github_host`, when `Some`, must be exported as `GH_HOST` (as the resume
+    /// variant does) so `gh` calls the agent makes during the session target the
+    /// right GitHub Enterprise instance instead of defaulting to github.com. A
+    /// `None` means no host could be resolved and the variable must be left
+    /// untouched, so an inherited `GH_HOST` survives rather than being
+    /// overridden by a guess.
     ///
     /// Returns `None` if the backend has no interactive entry point (Codex).
     fn build_interactive_command(
@@ -334,7 +337,7 @@ pub(crate) trait AgentBackend: Send + Sync {
         cwd: &Path,
         system_prompt: &str,
         initial_prompt: Option<&str>,
-        github_host: &str,
+        github_host: Option<&str>,
     ) -> Option<TokioCommand>;
 
     /// Build a command for a one-shot utility task (no session tracking, text output).
@@ -493,14 +496,11 @@ mod tests {
         // `gru chat` is the first-run path: a missing binary most often means
         // the CLI was never installed, so the message must point somewhere.
         let backend = crate::claude_backend::ClaudeBackend::new(None, None, None);
-        let cmd = backend
-            .build_interactive_command(
-                std::path::Path::new("/tmp/project"),
-                "sys",
-                None,
-                "github.com",
-            )
-            .unwrap();
+        let cmd = backend.build_oneshot_command(
+            std::path::Path::new("/tmp/project"),
+            "prompt",
+            "github.com",
+        );
         let msg = spawn_error_context(&backend, &cmd, "for gru chat");
         assert!(msg.contains("https://claude.com/claude-code"), "{msg}");
 

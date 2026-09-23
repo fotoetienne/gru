@@ -272,7 +272,7 @@ impl AgentBackend for ClaudeBackend {
         cwd: &Path,
         system_prompt: &str,
         initial_prompt: Option<&str>,
-        github_host: &str,
+        github_host: Option<&str>,
     ) -> Option<TokioCommand> {
         let mut cmd = TokioCommand::new(&self.binary);
         cmd.arg("--system-prompt").arg(system_prompt);
@@ -287,13 +287,17 @@ impl AgentBackend for ClaudeBackend {
             .stdin(std::process::Stdio::inherit())
             .stdout(std::process::Stdio::inherit())
             .stderr(std::process::Stdio::inherit())
-            .env("GH_HOST", github_host)
             // Same scrub as build_interactive_resume_command: a user-facing
             // session must not inherit the gru->worker handshake vars, or a
             // `gru do` launched from inside it would defer gru:failed
             // labeling to a retry queue that isn't watching it.
             .env_remove(crate::labels::GRU_RETRY_PARENT_ENV)
             .env_remove(crate::labels::GRU_CONFIG_PATH_ENV);
+        // Only override GH_HOST when a host was actually resolved; otherwise an
+        // inherited GH_HOST (a GHES-only user's shell) must survive.
+        if let Some(host) = github_host {
+            cmd.env("GH_HOST", host);
+        }
         Some(cmd)
     }
 
@@ -540,7 +544,7 @@ mod tests {
         let b = backend();
         let path = std::path::PathBuf::from("/tmp/project");
         let cmd = b
-            .build_interactive_command(&path, "you are a PM", None, "github.com")
+            .build_interactive_command(&path, "you are a PM", None, Some("github.com"))
             .expect("claude supports interactive sessions");
         let inner = cmd.as_std();
 
@@ -575,11 +579,27 @@ mod tests {
     }
 
     #[test]
+    fn test_build_interactive_command_leaves_gh_host_alone_when_unresolved() {
+        // A `None` host means nothing resolved one; overriding GH_HOST would
+        // silently retarget a GHES-only user's inherited shell value.
+        let b = backend();
+        let path = std::path::PathBuf::from("/tmp/project");
+        let cmd = b
+            .build_interactive_command(&path, "you are a PM", None, None)
+            .expect("Claude supports interactive sessions");
+        let envs: Vec<_> = cmd.as_std().get_envs().collect();
+        assert!(
+            !envs.iter().any(|(k, _)| *k == "GH_HOST"),
+            "GH_HOST should be neither set nor removed"
+        );
+    }
+
+    #[test]
     fn test_build_interactive_command_initial_prompt_after_terminator() {
         let b = ClaudeBackend::new(None, None, Some("claude-opus-5-5".to_string()));
         let path = std::path::PathBuf::from("/tmp/project");
         let cmd = b
-            .build_interactive_command(&path, "sys", Some("-h"), "github.com")
+            .build_interactive_command(&path, "sys", Some("-h"), Some("github.com"))
             .unwrap();
         let args: Vec<String> = cmd
             .as_std()

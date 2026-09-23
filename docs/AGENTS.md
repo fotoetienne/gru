@@ -45,7 +45,7 @@ Interactive sessions (`gru chat`, `gru pm`, `gru tpm`) use:
 
 ```bash
 claude --system-prompt "<role/project prompt>" [--model <model>] [-- "<initial prompt>"]
-# with GH_HOST set from the repo's git remote
+# with GH_HOST set from the repo's git remote (left inherited if unresolved)
 ```
 
 ### How Gru Uses It
@@ -170,7 +170,7 @@ Fresh interactive sessions (`gru chat`, `gru pm`, `gru tpm`) use Pi's TUI with a
 
 ```bash
 pi --system-prompt "<role/project prompt>" --no-approve [--model <model>] [--thinking <level>] [-- "<initial prompt>"]
-# with GH_HOST set from the repo's git remote
+# with GH_HOST set from the repo's git remote (left inherited if unresolved)
 ```
 
 There is no `--dangerously-skip-permissions` equivalent for Pi; `bash` and `edit` tool calls run without approval prompts by default under `-p`.
