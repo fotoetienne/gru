@@ -179,6 +179,10 @@ impl AgentBackend for ClaudeBackend {
         "claude-code"
     }
 
+    fn install_url(&self) -> Option<&'static str> {
+        Some("https://claude.com/claude-code")
+    }
+
     fn yolo_args(&self) -> Vec<&'static str> {
         vec!["--dangerously-skip-permissions"]
     }
@@ -281,7 +285,13 @@ impl AgentBackend for ClaudeBackend {
         cmd.current_dir(cwd)
             .stdin(std::process::Stdio::inherit())
             .stdout(std::process::Stdio::inherit())
-            .stderr(std::process::Stdio::inherit());
+            .stderr(std::process::Stdio::inherit())
+            // Same scrub as build_interactive_resume_command: a user-facing
+            // session must not inherit the gru->worker handshake vars, or a
+            // `gru do` launched from inside it would defer gru:failed
+            // labeling to a retry queue that isn't watching it.
+            .env_remove(crate::labels::GRU_RETRY_PARENT_ENV)
+            .env_remove(crate::labels::GRU_CONFIG_PATH_ENV);
         Some(cmd)
     }
 
@@ -540,6 +550,19 @@ mod tests {
         assert!(!args.contains(&"--output-format".as_ref()));
         assert!(!args.contains(&"stream-json".as_ref()));
         assert_eq!(inner.get_current_dir(), Some(path.as_path()));
+
+        // The gru->worker handshake vars must not leak into a user-facing
+        // session; env_remove surfaces as (key, None) in get_envs().
+        let envs: Vec<_> = inner.get_envs().collect();
+        for key in [
+            crate::labels::GRU_RETRY_PARENT_ENV,
+            crate::labels::GRU_CONFIG_PATH_ENV,
+        ] {
+            assert!(
+                envs.iter().any(|(k, v)| *k == key && v.is_none()),
+                "{key} should be removed"
+            );
+        }
     }
 
     #[test]

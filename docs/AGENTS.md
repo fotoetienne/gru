@@ -224,8 +224,10 @@ To add a new agent backend:
    - Add a matching arm in `construct_backend()` — this is the single source of truth that both `resolve_backend()` and `all_process_names()` route through. **A name added to `AVAILABLE_AGENTS` without a `construct_backend` arm compiles fine but breaks at runtime in two different ways, neither of which is a clean error**: `resolve_backend()` passes the `AVAILABLE_AGENTS` check and then panics on the `.expect()` around `construct_backend`'s `None` result, while `all_process_names()` (used by `gru stop`'s process-scan fallback) silently drops that backend's process names via its `filter_map` with no error at all. No compile error either way.
 4. Map the backend's output format to `AgentEvent` variants in `parse_events()`
 5. Update the `do` command's `--agent` help string in `src/main.rs` (`"Agent backend to use (claude, codex). Defaults to claude."`) — it enumerates backends by name but isn't derived from `AVAILABLE_AGENTS`, so a new backend added without touching it leaves `--help` output stale. The `review`/`prompt` commands' help (`"Agent backend to use (e.g., 'claude')."`) is a non-exhaustive example, not an enumeration, so it doesn't need updating for each new backend
+6. If the backend supports interactive sessions, update the three `--agent` help strings for `chat`/`pm`/`tpm` in `src/main.rs` (they enumerate `"(claude, pi)"`) and the suggestion list in `interactive_unsupported_error()` (`src/agent_registry.rs`). Like the `do` command's help, all four are hand-maintained rather than derived from a capability query
+7. (Optional) Implement `install_url()` so a "binary not found" spawn failure points at install instructions
 
-The `AgentBackend` trait (`src/agent.rs`) currently has twelve methods:
+The `AgentBackend` trait (`src/agent.rs`) currently has thirteen methods:
 - `name()` — human-readable identifier
 - `process_names()` — process name(s) to match for `gru stop`'s pgrep fallback
 - `build_command()` — construct the CLI command for a new session
@@ -237,6 +239,7 @@ The `AgentBackend` trait (`src/agent.rs`) currently has twelve methods:
 - `build_ci_fix_command()` — construct a backend-specific streaming-event command (matching whatever format `parse_events()` expects, e.g. Claude's `stream-json` or Codex's JSONL) for stateless CI-fix invocations
 - `yolo_args()` — (optional) CLI args to bypass interactive permission prompts for `gru attach --yolo`; defaults to an empty `Vec`
 - `final_usage()` — (optional) recover backend-internal accumulated usage on stream EOF when no `Finished { usage: Some(_) }` was seen; defaults to `None`. See the token usage convention below (#914)
+- `install_url()` — (optional) where to install the backend's CLI; appended to `spawn_error_context`'s message so a missing binary points at install docs. Defaults to `None`
 - `reset_usage()` — (optional) clear backend-internal accumulated usage; called unconditionally by the runner before spawning each new invocation's process. No-op by default. See the token usage convention below (#914)
 
 **Convention:** new trait methods should carry a default body so existing backends keep compiling without changes, as `yolo_args()` did when added in #911. `process_names()` broke this convention when added in #912 (no default body), which meant every existing backend had to be updated in the same change — do this deliberately, not by accident.

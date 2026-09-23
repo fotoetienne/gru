@@ -210,6 +210,10 @@ fn format_token_count(count: u64) -> String {
 /// `process_names()[0]` doubles as the config section name for every
 /// built-in backend (claude/pi/codex) — unlike `backend.name()`, which for
 /// Claude is the display name "claude-code", not the config key "claude".
+///
+/// When the backend supplies an `install_url()`, it is appended as an install
+/// pointer: the most likely reason a first-run user hits this is that the CLI
+/// isn't installed at all, and a config-key hint alone doesn't help them.
 pub(crate) fn spawn_error_context(
     backend: &dyn AgentBackend,
     cmd: &TokioCommand,
@@ -226,14 +230,19 @@ pub(crate) fn spawn_error_context(
     } else {
         format!(" {context_suffix}")
     };
+    let install_hint = match backend.install_url() {
+        Some(url) => format!(" If it isn't installed yet, see {url}."),
+        None => String::new(),
+    };
     format!(
         "Failed to start {} agent binary '{}'{}. Check that it exists, is executable, \
          and (if relative) is resolvable from the current directory — see [agent.{}] \
-         binary in config.toml if you've overridden it.",
+         binary in config.toml if you've overridden it.{}",
         backend.name(),
         program,
         suffix,
-        config_key
+        config_key,
+        install_hint
     )
 }
 
@@ -375,6 +384,16 @@ pub(crate) trait AgentBackend: Send + Sync {
         Vec::new()
     }
 
+    /// (Optional) Where a user can install this backend's CLI.
+    ///
+    /// Appended to `spawn_error_context`'s message so a "binary not found"
+    /// failure points somewhere useful — this matters most on the first-run
+    /// paths (`gru chat`, `gru init`) where the CLI may simply be absent.
+    /// Defaults to `None` (no install pointer).
+    fn install_url(&self) -> Option<&'static str> {
+        None
+    }
+
     /// Returns any session usage totals accumulated internally by the
     /// backend that were never surfaced through a `Finished` event.
     ///
@@ -462,6 +481,27 @@ mod tests {
         let msg = spawn_error_context(&backend, &cmd, "for merge judge");
         assert!(msg.contains("for merge judge"), "{msg}");
         assert!(msg.contains("[agent.codex] binary"), "{msg}");
+    }
+
+    #[test]
+    fn test_spawn_error_context_includes_install_url() {
+        // `gru chat` is the first-run path: a missing binary most often means
+        // the CLI was never installed, so the message must point somewhere.
+        let backend = crate::claude_backend::ClaudeBackend::new(None, None, None);
+        let cmd = backend
+            .build_interactive_command(std::path::Path::new("/tmp/project"), "sys", None)
+            .unwrap();
+        let msg = spawn_error_context(&backend, &cmd, "for gru chat");
+        assert!(msg.contains("https://claude.com/claude-code"), "{msg}");
+
+        let codex = crate::codex_backend::CodexBackend::new(None);
+        let cmd = codex.build_oneshot_command(
+            std::path::Path::new("/tmp/worktree"),
+            "prompt",
+            "github.com",
+        );
+        let msg = spawn_error_context(&codex, &cmd, "");
+        assert!(msg.contains("https://github.com/openai/codex"), "{msg}");
     }
 
     #[test]

@@ -199,8 +199,18 @@ impl AgentBackend for PiBackend {
         cmd.current_dir(cwd)
             .stdin(std::process::Stdio::inherit())
             .stdout(std::process::Stdio::inherit())
-            .stderr(std::process::Stdio::inherit());
+            .stderr(std::process::Stdio::inherit())
+            // Same scrub as build_interactive_resume_command: a user-facing
+            // session must not inherit the gru->worker handshake vars, or a
+            // `gru do` launched from inside it would defer gru:failed
+            // labeling to a retry queue that isn't watching it.
+            .env_remove(crate::labels::GRU_RETRY_PARENT_ENV)
+            .env_remove(crate::labels::GRU_CONFIG_PATH_ENV);
         Some(cmd)
+    }
+
+    fn install_url(&self) -> Option<&'static str> {
+        Some("https://github.com/earendil-works/pi-mono")
     }
 
     /// When `prompt_arg` is `"-"`, the prompt argument is omitted and stdin is
@@ -1017,6 +1027,10 @@ mod tests {
         );
         assert_removed(
             &b.build_interactive_resume_command(&path, &session_id, "github.com")
+                .unwrap(),
+        );
+        assert_removed(
+            &b.build_interactive_command(&path, "you are a PM", None)
                 .unwrap(),
         );
         assert_removed(&b.build_oneshot_command(&path, "prompt", "github.com"));

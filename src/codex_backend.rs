@@ -106,6 +106,10 @@ impl AgentBackend for CodexBackend {
         None
     }
 
+    fn install_url(&self) -> Option<&'static str> {
+        Some("https://github.com/openai/codex")
+    }
+
     fn build_interactive_command(
         &self,
         _cwd: &Path,
