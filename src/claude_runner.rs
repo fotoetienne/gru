@@ -18,6 +18,7 @@ pub(crate) fn build_claude_command(
     session_id: &Uuid,
     prompt: &str,
     github_host: &str,
+    model: Option<&str>,
 ) -> TokioCommand {
     let mut cmd = TokioCommand::new(binary);
     cmd.arg("--print")
@@ -27,8 +28,11 @@ pub(crate) fn build_claude_command(
         .arg("--output-format")
         .arg("stream-json")
         .arg("--include-partial-messages")
-        .arg("--dangerously-skip-permissions")
-        .arg(prompt)
+        .arg("--dangerously-skip-permissions");
+    if let Some(model) = model {
+        cmd.arg("--model").arg(model);
+    }
+    cmd.arg(prompt)
         .stdin(std::process::Stdio::inherit())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::inherit())
@@ -51,6 +55,7 @@ pub(crate) fn build_claude_resume_command(
     session_id: &Uuid,
     prompt: &str,
     github_host: &str,
+    model: Option<&str>,
 ) -> TokioCommand {
     let mut cmd = TokioCommand::new(binary);
     cmd.arg("--print")
@@ -60,8 +65,11 @@ pub(crate) fn build_claude_resume_command(
         .arg("--output-format")
         .arg("stream-json")
         .arg("--include-partial-messages")
-        .arg("--dangerously-skip-permissions")
-        .arg(prompt)
+        .arg("--dangerously-skip-permissions");
+    if let Some(model) = model {
+        cmd.arg("--model").arg(model);
+    }
+    cmd.arg(prompt)
         .stdin(std::process::Stdio::inherit())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::inherit())

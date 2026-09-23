@@ -115,6 +115,10 @@
 # there is no turn limit — the 20-minute wall-clock cap is the primary bound.
 # Set to a positive value to impose an explicit turn budget (e.g. 50).
 # ci_fix_max_turns = 50
+#
+# Model to pass via `--model` (e.g. "claude-opus-5-5" or "sonnet"). When
+# unset (the default), the Claude Code CLI picks its own default.
+# model = "claude-opus-5-5"
 
 # [agent.pi]
 # Override the Pi CLI binary path. This matters more for Pi than for Claude,

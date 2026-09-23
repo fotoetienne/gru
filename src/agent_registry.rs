@@ -22,6 +22,7 @@ pub(crate) const DEFAULT_AGENT: &str = "claude";
 struct AgentOverrides {
     claude_ci_fix_max_turns: Option<u32>,
     claude_binary: Option<String>,
+    claude_model: Option<String>,
     pi_binary: Option<String>,
     pi_model: Option<String>,
     pi_thinking: Option<String>,
@@ -39,6 +40,7 @@ fn construct_backend(agent_name: &str, overrides: AgentOverrides) -> Option<Box<
         "claude" => Some(Box::new(ClaudeBackend::new(
             overrides.claude_ci_fix_max_turns,
             overrides.claude_binary,
+            overrides.claude_model,
         ))),
         "codex" => Some(Box::new(CodexBackend::new(overrides.codex_binary))),
         "pi" => Some(Box::new(PiBackend::new(
@@ -147,6 +149,7 @@ pub(crate) fn resolve_backend(agent_name: &str) -> anyhow::Result<Box<dyn AgentB
             .as_ref()
             .and_then(|c| c.agent.claude.ci_fix_max_turns),
         claude_binary: config.as_ref().and_then(|c| c.agent.claude.binary.clone()),
+        claude_model: config.as_ref().and_then(|c| c.agent.claude.model.clone()),
         pi_binary: config.as_ref().and_then(|c| c.agent.pi.binary.clone()),
         pi_model: config.as_ref().and_then(|c| c.agent.pi.model.clone()),
         // Clones (rather than moves out of `config`) because `codex_binary`
@@ -252,6 +255,32 @@ mod tests {
             "github.com",
         );
         assert_eq!(cmd.as_std().get_program(), "/opt/tools/claude");
+    }
+
+    #[test]
+    fn test_resolve_backend_forwards_configured_claude_model() {
+        use std::io::Write;
+        use uuid::Uuid;
+
+        let mut temp_file = tempfile::NamedTempFile::new().unwrap();
+        temp_file
+            .write_all(b"[agent.claude]\nmodel = \"claude-opus-5-5\"\n")
+            .unwrap();
+        temp_file.flush().unwrap();
+
+        let _guard = crate::config::set_test_config_path(temp_file.path().to_path_buf());
+
+        let backend = resolve_backend("claude").unwrap();
+        let cmd = backend.build_command(
+            std::path::Path::new("/tmp/worktree"),
+            &Uuid::nil(),
+            "prompt",
+            "github.com",
+        );
+        let inner = cmd.as_std();
+        let args: Vec<&std::ffi::OsStr> = inner.get_args().collect();
+        assert!(args.contains(&"--model".as_ref()));
+        assert!(args.contains(&"claude-opus-5-5".as_ref()));
     }
 
     #[test]
