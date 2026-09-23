@@ -237,7 +237,9 @@ pub(crate) fn parse_github_like_remote(url: &str) -> Option<(String, String, Str
         return None;
     }
     let (owner, repo) = split_owner_repo(parts.rest)?;
-    Some((parts.host.to_string(), owner, repo))
+    // Lowercased: DNS is case-insensitive, and this host becomes a `GH_HOST`
+    // value and a dedupe key, so one spelling keeps both consistent.
+    Some((parts.host.to_ascii_lowercase(), owner, repo))
 }
 
 /// Splits the path part of a remote URL into `(owner, repo)`.
@@ -395,12 +397,13 @@ pub(crate) fn warn_unknown_remotes(unknown: &[UnknownRemote]) {
 /// non-default port (`https://ghe.example.com:8443/owner/repo.git`) needs the
 /// port to survive resolution — otherwise requests go to 443 on the same name.
 ///
-/// Only applies when `host` is the URL's own hostname. A registry match on a
-/// `web_url` canonicalizes to a different API host, and that host's port can't
-/// be inferred from the web URL's, so it is left as configured.
+/// Only applies when `host` is the URL's own hostname, compared case-insensitively
+/// (the resolved host carries the configured spelling, the URL may not). A
+/// registry match on a `web_url` canonicalizes to a different API host, and that
+/// host's port can't be inferred from the web URL's, so it is left as configured.
 fn with_remote_port(host: String, url: &str) -> String {
     match split_github_url(url) {
-        Some(parts) if parts.host == host => match parts.port {
+        Some(parts) if parts.host.eq_ignore_ascii_case(&host) => match parts.port {
             Some(port) => format!("{host}:{port}"),
             None => host,
         },
@@ -480,7 +483,8 @@ fn unknown_remote(url: &str) -> Option<UnknownRemote> {
     let parts = split_github_url(url)?;
     let (owner, repo) = split_owner_repo(parts.rest)?;
     Some(UnknownRemote {
-        host: parts.host.to_string(),
+        // Lowercased so `HOST` and `host` warn once, not twice.
+        host: parts.host.to_ascii_lowercase(),
         owner,
         repo,
     })
@@ -572,7 +576,7 @@ fn url_matches_any_host(url: &str, hosts: &[String]) -> bool {
     let Some(parts) = split_github_url(url) else {
         return false;
     };
-    hosts.iter().any(|h| h == parts.host)
+    hosts.iter().any(|h| h.eq_ignore_ascii_case(parts.host))
 }
 
 /// Parses a GitHub remote URL to extract host, owner, and repo name.
@@ -595,7 +599,7 @@ pub(crate) fn parse_github_remote(
         split_github_url(url).ok_or_else(|| anyhow::anyhow!("Not a GitHub URL: {}", url))?;
 
     let url_hosts = host_registry.all_url_hosts();
-    if !url_hosts.iter().any(|h| h == parts.host) {
+    if !url_hosts.iter().any(|h| h.eq_ignore_ascii_case(parts.host)) {
         anyhow::bail!("Not a GitHub URL: {}", url);
     }
 
@@ -1749,13 +1753,60 @@ mod tests {
     #[test]
     fn test_rank_github_remotes_host_heuristic_is_case_insensitive() {
         // DNS labels are case-insensitive, so an uppercase remote must not be
-        // reported as an unknown host.
+        // reported as an unknown host. The resolved host is lowercased: it ends
+        // up as a `GH_HOST` value, and one spelling keeps dedupe honest.
         let (candidates, unrecognized) = rank_github_remotes(
             &remotes(&[("origin", "https://GHE.example.com/org/repo.git")]),
             &default_hosts(),
         );
-        assert_eq!(candidates, vec![repo("GHE.example.com", "org", "repo")]);
+        assert_eq!(candidates, vec![repo("ghe.example.com", "org", "repo")]);
         assert!(unrecognized.is_empty());
+    }
+
+    #[test]
+    fn test_rank_github_remotes_registry_match_is_case_insensitive() {
+        // A configured host must be recognised however the remote spells it,
+        // and resolve to the *configured* spelling — otherwise chat/pm leave
+        // GH_HOST unset and child routing picks the wrong fallback.
+        let mut config = LabConfig::default();
+        config.github_hosts.insert(
+            "corp".to_string(),
+            GhHostConfig {
+                host: "code.corp.example.com".to_string(),
+                web_url: None,
+            },
+        );
+        let registry = HostRegistry::from_config(&config);
+
+        let (candidates, unrecognized) = rank_github_remotes(
+            &remotes(&[("origin", "https://CODE.CORP.EXAMPLE.COM/org/repo.git")]),
+            &registry,
+        );
+        assert_eq!(
+            candidates,
+            vec![repo("code.corp.example.com", "org", "repo")]
+        );
+        assert!(unrecognized.is_empty());
+
+        // Port preservation compares the canonical host to the URL's, so it has
+        // to be case-insensitive too or the `:port` is silently dropped.
+        let (candidates, _) = rank_github_remotes(
+            &remotes(&[("origin", "https://CODE.CORP.EXAMPLE.COM:8443/org/repo.git")]),
+            &registry,
+        );
+        assert_eq!(
+            candidates,
+            vec![repo("code.corp.example.com:8443", "org", "repo")]
+        );
+    }
+
+    #[test]
+    fn test_parse_github_remote_matches_host_case_insensitively() {
+        let (host, owner, name) =
+            parse_github_remote("https://GITHUB.COM/Owner/Repo.git", &default_hosts()).unwrap();
+        assert_eq!(host, "github.com");
+        assert_eq!(owner, "Owner");
+        assert_eq!(name, "Repo");
     }
 
     #[test]

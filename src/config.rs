@@ -538,7 +538,7 @@ impl HostRegistry {
         let mut result: Vec<String> = self.hosts.keys().cloned().collect();
         for web_url in self.hosts.values().flatten() {
             if let Some(host) = web_url_to_host(web_url) {
-                if !result.iter().any(|h| h == &host) {
+                if !result.iter().any(|h| h.eq_ignore_ascii_case(&host)) {
                     result.push(host);
                 }
             }
@@ -551,14 +551,19 @@ impl HostRegistry {
     /// If `host` is already a known API host, returns it. If it matches a
     /// configured `web_url` hostname, returns the associated API host. Returns
     /// `None` when `host` is unknown.
+    ///
+    /// Matching is case-insensitive, since DNS names are: a remote written as
+    /// `CODE.CORP.EXAMPLE.COM` refers to a configured `code.corp.example.com`.
+    /// The *configured* spelling is always returned, so everything downstream
+    /// (registry lookups, `GH_HOST` values) sees one canonical form.
     pub(crate) fn canonical_host(&self, host: &str) -> Option<String> {
-        if self.hosts.contains_key(host) {
-            return Some(host.to_string());
+        if let Some(api_host) = self.hosts.keys().find(|h| h.eq_ignore_ascii_case(host)) {
+            return Some(api_host.clone());
         }
         for (api_host, web_url_opt) in &self.hosts {
             if let Some(web_url) = web_url_opt {
                 if let Some(web_host) = web_url_to_host(web_url) {
-                    if web_host == host {
+                    if web_host.eq_ignore_ascii_case(host) {
                         return Some(api_host.clone());
                     }
                 }
@@ -2010,6 +2015,35 @@ repos = ["owner/repo1", "ghe.example.com/org/svc1", "ghe.example.com/org/svc2"]
         );
         // Unknown hosts return None
         assert_eq!(registry.canonical_host("unknown.example.com"), None);
+    }
+
+    #[test]
+    fn test_canonical_host_is_case_insensitive() {
+        // DNS names are case-insensitive, so a remote spelled in any case must
+        // resolve — and always to the configured spelling, so downstream
+        // GH_HOST values and registry lookups agree.
+        let mut config = LabConfig::default();
+        config.github_hosts.insert(
+            "netflix".to_string(),
+            GhHostConfig {
+                host: "git.netflix.net".to_string(),
+                web_url: Some("https://github.netflix.net".to_string()),
+            },
+        );
+        let registry = HostRegistry::from_config(&config);
+
+        assert_eq!(
+            registry.canonical_host("GIT.NETFLIX.NET").as_deref(),
+            Some("git.netflix.net")
+        );
+        assert_eq!(
+            registry.canonical_host("GitHub.Netflix.Net").as_deref(),
+            Some("git.netflix.net")
+        );
+        assert_eq!(
+            registry.canonical_host("GitHub.com").as_deref(),
+            Some("github.com")
+        );
     }
 
     #[test]
