@@ -49,7 +49,7 @@ async fn launch_skill_session(
     // session target the right GitHub Enterprise instance. No owner hint is
     // available here, so the remote URL is the only signal — and if it yields
     // nothing, GH_HOST is left as inherited rather than guessed at.
-    let github_host = super::resume::resolve_host_from_remotes(&repo_root).await;
+    let github_host = super::resume::resolve_host_from_remotes(&repo_root, "").await;
 
     let backend = crate::agent_registry::resolve_backend(agent_name)?;
     let mut cmd = backend

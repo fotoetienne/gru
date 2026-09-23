@@ -820,10 +820,16 @@ pub(crate) async fn run_agent_rebase(
 ) -> Result<i32> {
     let backend = agent_registry::resolve_backend(agent_registry::DEFAULT_AGENT)?;
     let session_id = Uuid::new_v4();
-    let github_host = super::resume::resolve_host_from_worktree(checkout_path, "").await;
+    let github_host = super::resume::resolve_child_host_from_worktree(checkout_path, "").await;
 
     let prompt = REBASE_PROMPT_TEMPLATE.replace("<BASE_BRANCH>", base_branch);
-    let cmd = backend.build_command(checkout_path, &session_id, &prompt, &github_host);
+    let mut cmd = backend.build_command(
+        checkout_path,
+        &session_id,
+        &prompt,
+        github_host.as_deref().unwrap_or_default(),
+    );
+    super::resume::apply_child_host(&mut cmd, github_host.as_deref());
 
     let effective_timeout = Some(timeout.unwrap_or(DEFAULT_CONFLICT_TIMEOUT));
     let result = run_agent_with_stream_monitoring(

@@ -781,18 +781,24 @@ async fn register_and_run_agent(
     // Ad-hoc prompt without --issue or --pr: resolve from worktree git remote
     // so GHE repos are handled correctly.
     let github_host_owned;
-    let github_host = if let Some(h) = fetched.host.as_deref().or(fetched.pr_host.as_deref()) {
-        h
+    let github_host: Option<&str> = if let Some(h) =
+        fetched.host.as_deref().or(fetched.pr_host.as_deref())
+    {
+        Some(h)
     } else {
-        github_host_owned = super::resume::resolve_host_from_worktree(&ws.run_dir, "").await;
-        &github_host_owned
+        // Nothing resolved means an unconfigured host, already warned
+        // about: leave GH_HOST unset rather than sending the child to
+        // github.com.
+        github_host_owned = super::resume::resolve_child_host_from_worktree(&ws.run_dir, "").await;
+        github_host_owned.as_deref()
     };
     let mut cmd = backend.build_command(
         &ws.run_dir,
         cfg.session_id,
         cfg.rendered_prompt,
-        github_host,
+        github_host.unwrap_or_default(),
     );
+    super::resume::apply_child_host(&mut cmd, github_host);
     cmd.env("GRU_WORKSPACE", cfg.minion_id);
 
     // Record child PID on spawn; mode is already set to Autonomous at registration.

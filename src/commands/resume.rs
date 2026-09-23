@@ -470,20 +470,36 @@ async fn discover_pr_by_branch(
     }
 }
 
-/// Resolve the GitHub host for a worktree.
+/// Resolve the GitHub host for a worktree, for Gru's own API calls.
 ///
-/// Order: the repo's own remotes, then a configured host for `owner`, then an
-/// inherited `GH_HOST`, and only then github.com. The inherited value outranks
-/// the default because an unresolvable host means an unconfigured GHES (which
-/// [`crate::git::resolve_github_repo_from_remotes`] has already warned about),
-/// and the user's own environment is a better answer than silently retargeting
-/// `gh` calls at github.com.
+/// Order: the repo's remotes (filtered to `owner`), then a configured host for
+/// `owner`, then an inherited `GH_HOST`, and only then github.com. Use this
+/// where a host is required. Callers that only route a child agent process
+/// want [`resolve_child_host_from_worktree`], which stops at `None` instead of
+/// defaulting to github.com.
 pub(crate) async fn resolve_host_from_worktree(
     checkout_path: &std::path::Path,
     owner: &str,
 ) -> String {
-    match resolve_host_from_remotes(checkout_path).await {
-        Some(host) => host,
+    resolve_child_host_from_worktree(checkout_path, owner)
+        .await
+        .unwrap_or_else(|| "github.com".to_string())
+}
+
+/// Resolve the `GH_HOST` to hand a child agent process, or `None`.
+///
+/// Same order as [`resolve_host_from_worktree`] minus the github.com default:
+/// when the remotes, config, and the environment all come up empty, the repo
+/// is on an unconfigured GHES that [`resolve_host_from_remotes`] has already
+/// warned about, and sending the child to github.com would silently retarget
+/// its `gh` calls. `None` means "leave `GH_HOST` unset" — see
+/// [`apply_child_host`].
+pub(crate) async fn resolve_child_host_from_worktree(
+    checkout_path: &std::path::Path,
+    owner: &str,
+) -> Option<String> {
+    match resolve_host_from_remotes(checkout_path, owner).await {
+        Some(host) => Some(host),
         None => host_fallback(
             crate::github::configured_host_for_owner(owner, None),
             std::env::var("GH_HOST").ok(),
@@ -492,27 +508,44 @@ pub(crate) async fn resolve_host_from_worktree(
 }
 
 /// Fallback order once remotes yield nothing: configured host, then an
-/// inherited `GH_HOST`, then github.com.
+/// inherited `GH_HOST`.
 ///
-/// Split out from [`resolve_host_from_worktree`] so it can be tested without
-/// mutating the process-global `GH_HOST`.
-fn host_fallback(configured: Option<String>, inherited: Option<String>) -> String {
-    configured
-        .or_else(|| inherited.filter(|h| !h.trim().is_empty()))
-        .unwrap_or_else(|| "github.com".to_string())
+/// Split out from [`resolve_child_host_from_worktree`] so it can be tested
+/// without mutating the process-global `GH_HOST`.
+fn host_fallback(configured: Option<String>, inherited: Option<String>) -> Option<String> {
+    configured.or_else(|| inherited.filter(|h| !h.trim().is_empty()))
+}
+
+/// Applies a child-routing host, as resolved by
+/// [`resolve_child_host_from_worktree`], to an already-built command.
+///
+/// `None` means nothing — not the remotes, not config, not the environment —
+/// identified a host, so the child is left with no `GH_HOST` rather than one
+/// pointing at the wrong instance.
+pub(crate) fn apply_child_host(cmd: &mut tokio::process::Command, host: Option<&str>) {
+    match host {
+        Some(host) => {
+            cmd.env("GH_HOST", host);
+        }
+        None => {
+            cmd.env_remove("GH_HOST");
+        }
+    }
 }
 
 /// Resolve the GitHub host for a worktree by inspecting its git remotes.
 ///
-/// Thin wrapper over [`crate::git::resolve_github_repo_from_remotes`] that
-/// keeps only the host. Returns `None` when no remote yields a GitHub repo, so
-/// callers that set `GH_HOST` on a child process can leave an inherited value
-/// alone instead of overriding it with a guess.
-pub(crate) async fn resolve_host_from_remotes(checkout_path: &std::path::Path) -> Option<String> {
+/// Thin wrapper over [`crate::git::resolve_github_host_for_owner`]: candidates
+/// are filtered by `owner` (pass `""` when the caller has no repo in mind).
+/// Returns `None` when no remote yields a GitHub repo, so callers that set
+/// `GH_HOST` on a child process can leave an inherited value alone instead of
+/// overriding it with a guess.
+pub(crate) async fn resolve_host_from_remotes(
+    checkout_path: &std::path::Path,
+    owner: &str,
+) -> Option<String> {
     let host_registry = crate::config::load_host_registry();
-    crate::git::resolve_github_repo_from_remotes(checkout_path, &host_registry)
-        .await
-        .map(|repo| repo.host)
+    crate::git::resolve_github_host_for_owner(checkout_path, &host_registry, owner).await
 }
 
 #[cfg(test)]
@@ -526,7 +559,7 @@ mod tests {
                 Some("ghe.example.com".to_string()),
                 Some("github.com".to_string())
             ),
-            "ghe.example.com"
+            Some("ghe.example.com".to_string())
         );
     }
 
@@ -536,14 +569,16 @@ mod tests {
         // a better answer than retargeting their agent at github.com.
         assert_eq!(
             host_fallback(None, Some("code.corp.example.com".to_string())),
-            "code.corp.example.com"
+            Some("code.corp.example.com".to_string())
         );
     }
 
     #[test]
-    fn test_host_fallback_defaults_when_nothing_inherited() {
-        assert_eq!(host_fallback(None, None), "github.com");
-        assert_eq!(host_fallback(None, Some("   ".to_string())), "github.com");
+    fn test_host_fallback_yields_nothing_when_nothing_inherited() {
+        // No host anywhere: child routing leaves GH_HOST unset rather than
+        // retargeting the agent at github.com.
+        assert_eq!(host_fallback(None, None), None);
+        assert_eq!(host_fallback(None, Some("   ".to_string())), None);
     }
 
     /// Init a git repo with the given `(remote_name, url)` pairs.
@@ -592,11 +627,7 @@ mod tests {
         // because the URL shape is valid; fall back to the config heuristic.
         let dir =
             repo_with_remotes(&[("origin", "https://gitlab.example.com/owner/repo.git")]).await;
-        assert_eq!(resolve_host_from_remotes(dir.path()).await, None);
-        assert_eq!(
-            resolve_host_from_worktree(dir.path(), "owner").await,
-            "github.com"
-        );
+        assert_eq!(resolve_host_from_remotes(dir.path(), "owner").await, None);
     }
 
     #[tokio::test]
@@ -617,7 +648,9 @@ mod tests {
             .output()
             .expect("git");
         assert_eq!(
-            resolve_host_from_remotes(dir.path()).await.as_deref(),
+            resolve_host_from_remotes(dir.path(), "owner")
+                .await
+                .as_deref(),
             Some("github.corp.example.com")
         );
     }
@@ -648,12 +681,49 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_resolve_host_no_remotes_falls_back_to_heuristic() {
+    async fn test_resolve_host_no_remotes_resolves_nothing() {
         let dir = repo_with_remotes(&[]).await;
+        assert_eq!(resolve_host_from_remotes(dir.path(), "").await, None);
+    }
+
+    #[tokio::test]
+    async fn test_resolve_host_filters_candidates_by_owner() {
+        // The globally ranked winner (`origin`) belongs to another owner, so
+        // resuming work for `corp` must follow `upstream` to corp's instance
+        // rather than exporting GH_HOST=github.com.
+        let dir = repo_with_remotes(&[
+            ("origin", "https://github.com/someone/other.git"),
+            (
+                "upstream",
+                "https://github.corp.example.com/corp/project.git",
+            ),
+        ])
+        .await;
+        assert_eq!(
+            resolve_host_from_worktree(dir.path(), "corp").await,
+            "github.corp.example.com"
+        );
+        // An empty owner means no repo in mind, so the global winner stands.
         assert_eq!(
             resolve_host_from_worktree(dir.path(), "").await,
-            crate::github::infer_github_host("", None)
+            "github.com"
         );
+    }
+
+    #[test]
+    fn test_apply_child_host_unsets_when_unresolved() {
+        let mut cmd = tokio::process::Command::new("true");
+        apply_child_host(&mut cmd, Some("ghe.example.com"));
+        let set: Vec<_> = cmd.as_std().get_envs().collect();
+        assert!(set.contains(&(
+            std::ffi::OsStr::new("GH_HOST"),
+            Some(std::ffi::OsStr::new("ghe.example.com"))
+        )));
+
+        let mut cmd = tokio::process::Command::new("true");
+        apply_child_host(&mut cmd, None);
+        let set: Vec<_> = cmd.as_std().get_envs().collect();
+        assert!(set.contains(&(std::ffi::OsStr::new("GH_HOST"), None)));
     }
 
     #[tokio::test]

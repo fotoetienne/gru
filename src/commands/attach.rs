@@ -152,7 +152,8 @@ pub(crate) async fn handle_attach(
         .as_deref()
         .and_then(|r| r.split('/').next())
         .unwrap_or("");
-    let github_host = super::resume::resolve_host_from_worktree(&checkout_path, owner_hint).await;
+    let github_host =
+        super::resume::resolve_child_host_from_worktree(&checkout_path, owner_hint).await;
 
     // Build command for interactive mode via the resolved backend
     let mut cmd = match &session_id {
@@ -169,9 +170,12 @@ pub(crate) async fn handle_attach(
             match backend.build_interactive_resume_command(
                 &checkout_path,
                 &session_uuid,
-                &github_host,
+                github_host.as_deref().unwrap_or_default(),
             ) {
-                Some(c) => c,
+                Some(mut c) => {
+                    super::resume::apply_child_host(&mut c, github_host.as_deref());
+                    c
+                }
                 None => {
                     revert_if_claimed().await;
                     anyhow::bail!(
@@ -200,8 +204,8 @@ pub(crate) async fn handle_attach(
             c.current_dir(&checkout_path)
                 .stdin(Stdio::inherit())
                 .stdout(Stdio::inherit())
-                .stderr(Stdio::inherit())
-                .env("GH_HOST", &github_host);
+                .stderr(Stdio::inherit());
+            super::resume::apply_child_host(&mut c, github_host.as_deref());
             c
         }
     };

@@ -217,8 +217,12 @@ pub(crate) async fn get_github_remote(host_registry: &HostRegistry) -> Result<St
 /// network round trip. Anything else should be added to `[github_hosts]` in
 /// config.toml to be recognised.
 pub(crate) fn looks_like_github_host(host: &str) -> bool {
-    host.split('.')
-        .any(|label| matches!(label, "github" | "ghe" | "ghes"))
+    // DNS labels are case-insensitive, so `GHE.example.com` must match too.
+    host.split('.').any(|label| {
+        label.eq_ignore_ascii_case("github")
+            || label.eq_ignore_ascii_case("ghe")
+            || label.eq_ignore_ascii_case("ghes")
+    })
 }
 
 /// Parses a remote URL on a host that isn't in the registry but looks like a
@@ -337,6 +341,39 @@ pub(crate) async fn resolve_github_repo_from_remotes(
     let resolved = candidates.into_iter().next();
     if resolved.is_none() {
         warn_unknown_remotes(&unknown);
+    }
+    resolved
+}
+
+/// Resolves the GitHub host for `owner` from a repository's remotes.
+///
+/// Filters the ranked candidates by owner rather than taking the global
+/// winner: a worktree whose `origin` is `github.com/someone/other` must still
+/// resolve `corp`'s instance from an `upstream` at
+/// `github.corp.example.com/corp/project`. An empty `owner` means the caller
+/// has no repo in mind, so the global winner stands.
+///
+/// Any unknown-host warning is scoped the same way — a remote on an
+/// unrecognised host belonging to a different owner is not this call's
+/// configuration gap.
+pub(crate) async fn resolve_github_host_for_owner(
+    dir: &Path,
+    host_registry: &HostRegistry,
+    owner: &str,
+) -> Option<String> {
+    let (candidates, unknown) = github_repo_candidates_from_remotes(dir, host_registry).await;
+    let matches_owner =
+        |candidate_owner: &str| owner.is_empty() || candidate_owner.eq_ignore_ascii_case(owner);
+    let resolved = candidates
+        .into_iter()
+        .find(|candidate| matches_owner(&candidate.owner))
+        .map(|candidate| candidate.host);
+    if resolved.is_none() {
+        let relevant: Vec<UnknownRemote> = unknown
+            .into_iter()
+            .filter(|remote| matches_owner(&remote.owner))
+            .collect();
+        warn_unknown_remotes(&relevant);
     }
     resolved
 }
@@ -1713,6 +1750,18 @@ mod tests {
         );
         assert_eq!(candidates, vec![repo("github.com", "acme", "widgets")]);
         assert_eq!(unrecognized, vec![unknown("code.corp.example.com", "acme")]);
+    }
+
+    #[test]
+    fn test_rank_github_remotes_host_heuristic_is_case_insensitive() {
+        // DNS labels are case-insensitive, so an uppercase remote must not be
+        // reported as an unknown host.
+        let (candidates, unrecognized) = rank_github_remotes(
+            &remotes(&[("origin", "https://GHE.example.com/org/repo.git")]),
+            &default_hosts(),
+        );
+        assert_eq!(candidates, vec![repo("GHE.example.com", "org", "repo")]);
+        assert!(unrecognized.is_empty());
     }
 
     #[test]

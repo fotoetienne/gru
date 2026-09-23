@@ -121,25 +121,7 @@ async fn detect_project_context(
 /// from inside a github.com checkout must not resolve `GH_HOST=github.com`.
 async fn host_from_matching_remote(repo_root: &Path, owner: &str) -> Option<String> {
     let host_registry = crate::config::load_host_registry();
-    let (candidates, unknown) =
-        git::github_repo_candidates_from_remotes(repo_root, &host_registry).await;
-    // Filter every candidate by the requested owner rather than looking only at
-    // the globally ranked winner: an `origin` on github.com must not hide an
-    // `upstream` that actually points at the requested owner's instance.
-    let matched = candidates
-        .into_iter()
-        .find(|candidate| candidate.owner.eq_ignore_ascii_case(owner))
-        .map(|candidate| candidate.host);
-    if matched.is_none() {
-        // Only warn about skipped remotes that belong to the owner we wanted;
-        // an unrecognised host for some other owner is not this run's problem.
-        let relevant: Vec<git::UnknownRemote> = unknown
-            .into_iter()
-            .filter(|remote| remote.owner.eq_ignore_ascii_case(owner))
-            .collect();
-        git::warn_unknown_remotes(&relevant);
-    }
-    matched
+    git::resolve_github_host_for_owner(repo_root, &host_registry, owner).await
 }
 
 /// Builds the system prompt for in-repo context.
