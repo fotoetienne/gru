@@ -23,6 +23,8 @@ pub(crate) async fn handle_chat(
 ) -> Result<i32> {
     let _tmux_guard = TmuxGuard::new("gru:chat");
 
+    let backend = crate::agent_registry::resolve_backend(agent_name)?;
+
     let (work_dir, system_prompt, github_host) = match detect_project_context(repo_flag).await {
         Some((repo_root, owner, repo_name, host)) => {
             let prompt = build_in_repo_prompt(&repo_root, &owner, &repo_name).await;
@@ -30,7 +32,7 @@ pub(crate) async fn handle_chat(
         }
         None => {
             let cwd = std::env::current_dir().context("Failed to determine current directory")?;
-            let prompt = build_no_repo_prompt();
+            let prompt = build_no_repo_prompt(backend.name());
             // No repo and no owner, so there's no signal to resolve a host
             // from. Leave GH_HOST alone: a GHES-only user may have it
             // exported in their shell, and guessing github.com would
@@ -43,7 +45,6 @@ pub(crate) async fn handle_chat(
         eprintln!("Working directory: {}", work_dir.display());
     }
 
-    let backend = crate::agent_registry::resolve_backend(agent_name)?;
     let mut cmd = backend
         .build_interactive_command(&work_dir, &system_prompt, None, github_host.as_deref())
         .ok_or_else(|| crate::agent_registry::interactive_unsupported_error("chat", agent_name))?;
@@ -177,7 +178,12 @@ async fn build_in_repo_prompt(repo_root: &Path, owner: &str, repo_name: &str) ->
 }
 
 /// Builds the system prompt for when no repo is detected.
-fn build_no_repo_prompt() -> String {
+///
+/// Takes the backend's name so the onboarding explanation describes the agent
+/// the user actually chose: `gru chat --agent pi` spawns Pi sessions, and
+/// telling that user their Minions are Claude Code sessions is simply wrong.
+fn build_no_repo_prompt(agent_name: &str) -> String {
+    format!(
     "You are a Gru assistant. The user is not currently in a project directory.\n\
      \n\
      Help them get started with Gru:\n\
@@ -187,13 +193,13 @@ fn build_no_repo_prompt() -> String {
      - Walk them through their first task: `gru do <issue#>`\n\
      \n\
      Key concepts:\n\
-     - Gru spawns \"Minions\" — autonomous Claude Code sessions that work on GitHub issues\n\
+     - Gru spawns \"Minions\" — autonomous {agent_name} sessions that work on GitHub issues\n\
      - Each Minion works in an isolated git worktree\n\
      - Minions claim issues, implement fixes, create PRs, and respond to reviews\n\
      - GitHub labels drive the workflow: `gru:todo` → `gru:in-progress` → `gru:done`\n\
      \n\
      Be friendly and helpful. This may be their first time using Gru."
-        .to_string()
+    )
 }
 
 /// Loads up to `CLAUDE_MD_READ_LIMIT` bytes of CLAUDE.md from the repo root.
@@ -310,11 +316,20 @@ mod tests {
 
     #[test]
     fn test_build_no_repo_prompt_contains_key_info() {
-        let prompt = build_no_repo_prompt();
+        let prompt = build_no_repo_prompt("claude-code");
         assert!(prompt.contains("Gru assistant"));
         assert!(prompt.contains("gru init"));
         assert!(prompt.contains("gru do"));
         assert!(prompt.contains("config.toml"));
+    }
+
+    #[test]
+    fn test_build_no_repo_prompt_names_selected_agent() {
+        // The onboarding prompt explains what a Minion is, so it has to name
+        // the agent the user picked rather than assuming Claude Code.
+        let prompt = build_no_repo_prompt("pi");
+        assert!(prompt.contains("autonomous pi sessions"));
+        assert!(!prompt.contains("Claude Code"));
     }
 
     #[tokio::test]

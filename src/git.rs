@@ -490,6 +490,16 @@ fn unknown_remote(url: &str) -> Option<UnknownRemote> {
     })
 }
 
+/// Checks that a URL authority's port is a real TCP port.
+///
+/// `gh` takes `GH_HOST` as a URL authority, so anything carried into it has to
+/// be dialable: digits only, in 1..=65535. Rejects `:not-a-port`, `:0`,
+/// `:99999`, and `:80 ` alike — `str::parse` would accept none of those as a
+/// usable port, and a silently wrong authority fails every later API call.
+fn valid_port(port: &str) -> bool {
+    matches!(port.parse::<u16>(), Ok(p) if p != 0)
+}
+
 /// Supported URL schemes for GitHub remotes and web URLs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum GitUrlScheme {
@@ -520,7 +530,8 @@ pub(crate) struct GitUrlParts<'a> {
 ///
 /// Accepts `https://<host>[:port]/<rest>`, `http://<host>[:port]/<rest>`, and
 /// SSH (`git@<host>:<rest>`). Returns `None` for URLs with an unsupported
-/// scheme, HTTP userinfo (`https://user@host/...`), or an empty hostname.
+/// scheme, HTTP userinfo (`https://user@host/...`), an empty hostname, or a
+/// malformed port (see [`valid_port`]).
 pub(crate) fn split_github_url(url: &str) -> Option<GitUrlParts<'_>> {
     if let Some(rest) = url.strip_prefix("git@") {
         let (host, path) = rest.split_once(':')?;
@@ -549,9 +560,17 @@ pub(crate) fn split_github_url(url: &str) -> Option<GitUrlParts<'_>> {
     if authority.contains('@') {
         return None;
     }
-    // Split optional `:port` off the authority.
+    // Split optional `:port` off the authority. A non-empty suffix that isn't a
+    // valid port means the URL is malformed: reject it rather than carrying
+    // `host:not-a-port` into `GH_HOST`, where it would break every `gh` call.
     let (host, port) = match authority.split_once(':') {
-        Some((h, p)) if !p.is_empty() => (h, Some(p)),
+        Some((h, p)) if !p.is_empty() => {
+            if !valid_port(p) {
+                return None;
+            }
+            (h, Some(p))
+        }
+        // A trailing bare `:` carries no port; the authority is just the host.
         Some((h, _)) => (h, None),
         None => (authority, None),
     };
@@ -2218,6 +2237,32 @@ mod tests {
             with_remote_port("github.com".to_string(), "not-a-url"),
             "github.com"
         );
+    }
+
+    #[test]
+    fn test_split_github_url_rejects_malformed_port() {
+        // `GH_HOST` is a URL authority, so a bogus port must not ride along:
+        // `github.com:not-a-port` would break every `gh` call downstream.
+        assert!(split_github_url("https://github.com:not-a-port/acme/repo.git").is_none());
+        assert!(split_github_url("https://github.com:8443x/acme/repo.git").is_none());
+        assert!(split_github_url("https://github.com:0/acme/repo.git").is_none());
+        assert!(split_github_url("https://github.com:99999/acme/repo.git").is_none());
+        assert!(split_github_url("https://github.com:-1/acme/repo.git").is_none());
+        // The largest valid port still parses.
+        let parts = split_github_url("https://ghe.example.com:65535/owner/repo").unwrap();
+        assert_eq!(parts.port, Some("65535"));
+    }
+
+    #[test]
+    fn test_rank_github_remotes_skips_malformed_port() {
+        // A remote with an unusable authority is not a usable GitHub remote:
+        // it neither resolves nor gets reported as a configurable host.
+        let (candidates, unrecognized) = rank_github_remotes(
+            &remotes(&[("origin", "https://github.com:not-a-port/acme/repo.git")]),
+            &default_hosts(),
+        );
+        assert!(candidates.is_empty());
+        assert!(unrecognized.is_empty());
     }
 
     #[test]
