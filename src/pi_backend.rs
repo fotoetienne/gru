@@ -185,6 +185,7 @@ impl AgentBackend for PiBackend {
         cwd: &Path,
         system_prompt: &str,
         initial_prompt: Option<&str>,
+        github_host: &str,
     ) -> Option<TokioCommand> {
         let mut cmd = TokioCommand::new(&self.binary);
         cmd.arg("--system-prompt")
@@ -200,6 +201,7 @@ impl AgentBackend for PiBackend {
             .stdin(std::process::Stdio::inherit())
             .stdout(std::process::Stdio::inherit())
             .stderr(std::process::Stdio::inherit())
+            .env("GH_HOST", github_host)
             // Same scrub as build_interactive_resume_command: a user-facing
             // session must not inherit the gru->worker handshake vars, or a
             // `gru do` launched from inside it would defer gru:failed
@@ -817,7 +819,7 @@ mod tests {
         let b = backend();
         let path = std::path::PathBuf::from("/tmp/project");
         let cmd = b
-            .build_interactive_command(&path, "you are a PM", None)
+            .build_interactive_command(&path, "you are a PM", None, "github.com")
             .expect("pi supports interactive sessions");
         let inner = cmd.as_std();
 
@@ -834,6 +836,14 @@ mod tests {
         assert!(!args.iter().any(|a| a == "-p"));
         assert!(!args.iter().any(|a| a == "--mode"));
         assert_eq!(inner.get_current_dir(), Some(path.as_path()));
+
+        // GH_HOST must reach the session so `gh` targets the right instance.
+        let envs: Vec<_> = cmd.as_std().get_envs().collect();
+        assert!(
+            envs.iter()
+                .any(|(k, v)| *k == "GH_HOST" && *v == Some("github.com".as_ref())),
+            "GH_HOST should be set"
+        );
     }
 
     #[test]
@@ -841,7 +851,7 @@ mod tests {
         let b = PiBackend::new(None, Some("anthropic/claude-sonnet-5".to_string()), None);
         let path = std::path::PathBuf::from("/tmp/project");
         let cmd = b
-            .build_interactive_command(&path, "sys", Some("-h"))
+            .build_interactive_command(&path, "sys", Some("-h"), "github.com")
             .unwrap();
         let args: Vec<String> = cmd
             .as_std()
@@ -1030,7 +1040,7 @@ mod tests {
                 .unwrap(),
         );
         assert_removed(
-            &b.build_interactive_command(&path, "you are a PM", None)
+            &b.build_interactive_command(&path, "you are a PM", None, "github.com")
                 .unwrap(),
         );
         assert_removed(&b.build_oneshot_command(&path, "prompt", "github.com"));

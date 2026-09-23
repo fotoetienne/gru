@@ -45,9 +45,14 @@ async fn launch_skill_session(
     // Strip YAML frontmatter from the skill content (delimited by --- lines)
     let system_prompt = strip_frontmatter(skill_content);
 
+    // Resolve the host from the repo's git remote so `gh` calls inside the
+    // session target the right GitHub Enterprise instance. No owner hint is
+    // available here, so the remote URL is the only signal.
+    let github_host = super::resume::resolve_host_from_worktree(&repo_root, "").await;
+
     let backend = crate::agent_registry::resolve_backend(agent_name)?;
     let mut cmd = backend
-        .build_interactive_command(&repo_root, system_prompt, prompt.as_deref())
+        .build_interactive_command(&repo_root, system_prompt, prompt.as_deref(), &github_host)
         .ok_or_else(|| {
             crate::agent_registry::interactive_unsupported_error(role_name, agent_name)
         })?;

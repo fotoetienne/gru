@@ -45,6 +45,7 @@ Interactive sessions (`gru chat`, `gru pm`, `gru tpm`) use:
 
 ```bash
 claude --system-prompt "<role/project prompt>" [--model <model>] [-- "<initial prompt>"]
+# with GH_HOST set from the repo's git remote
 ```
 
 ### How Gru Uses It
@@ -169,6 +170,7 @@ Fresh interactive sessions (`gru chat`, `gru pm`, `gru tpm`) use Pi's TUI with a
 
 ```bash
 pi --system-prompt "<role/project prompt>" --no-approve [--model <model>] [--thinking <level>] [-- "<initial prompt>"]
+# with GH_HOST set from the repo's git remote
 ```
 
 There is no `--dangerously-skip-permissions` equivalent for Pi; `bash` and `edit` tool calls run without approval prompts by default under `-p`.
@@ -234,7 +236,7 @@ The `AgentBackend` trait (`src/agent.rs`) currently has fourteen methods:
 - `parse_events()` — convert stdout lines to normalized `AgentEvent`s
 - `build_resume_command()` — required to implement (no default body); return `None` from it if the backend doesn't support resume, `Some(...)` otherwise
 - `build_interactive_resume_command()` — required to implement (no default body); return `None` from it to disable attach support
-- `build_interactive_command()` — required to implement (no default body, deliberately mirroring `build_interactive_resume_command` so a new backend has to make an explicit choice); construct a fresh interactive session with a custom system prompt for `gru chat`/`gru pm`/`gru tpm`, or return `None` to opt out (callers then surface an actionable error naming the command and agent). If you implement it, also update the suggested-agent list in `interactive_unsupported_error()` (`src/agent_registry.rs`) — like the `do` command's `--agent` help, it enumerates backends by hand rather than deriving them
+- `build_interactive_command()` — required to implement (no default body, deliberately mirroring `build_interactive_resume_command` so a new backend has to make an explicit choice); construct a fresh interactive session with a custom system prompt (and `GH_HOST`) for `gru chat`/`gru pm`/`gru tpm`, or return `None` to opt out (callers then surface an actionable error naming the command and agent). If you implement it, also update the suggested-agent list in `interactive_unsupported_error()` (`src/agent_registry.rs`) — like the `do` command's `--agent` help, it enumerates backends by hand rather than deriving them
 - `build_oneshot_command()` — construct a single-turn, plain-text command (e.g. for the merge-readiness judge)
 - `build_ci_fix_command()` — construct a backend-specific streaming-event command (matching whatever format `parse_events()` expects, e.g. Claude's `stream-json` or Codex's JSONL) for stateless CI-fix invocations
 - `yolo_args()` — (optional) CLI args to bypass interactive permission prompts for `gru attach --yolo`; defaults to an empty `Vec`

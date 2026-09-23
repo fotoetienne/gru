@@ -2042,6 +2042,7 @@ mod tests {
             _cwd: &Path,
             _system_prompt: &str,
             _initial_prompt: Option<&str>,
+            _github_host: &str,
         ) -> Option<tokio::process::Command> {
             None
         }
