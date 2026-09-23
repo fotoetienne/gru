@@ -302,6 +302,9 @@ pub(crate) struct UnknownRemote {
     /// suggestion, and registry matching compares port-stripped hostnames.
     pub(crate) host: String,
     pub(crate) owner: String,
+    /// Kept so a caller can still name the project (`gru chat`'s in-repo
+    /// prompt) even though the host stayed unresolved.
+    pub(crate) repo: String,
 }
 
 /// Ranked GitHub repos from a repository's remotes, best candidate first.
@@ -323,26 +326,6 @@ pub(crate) async fn github_repo_candidates_from_remotes(
     host_registry: &HostRegistry,
 ) -> (Vec<RemoteRepo>, Vec<UnknownRemote>) {
     rank_github_remotes(&list_remotes(dir).await, host_registry)
-}
-
-/// Resolves the single best `(host, owner, repo)` for a repository.
-///
-/// Returns `None` when no remote yields a GitHub repo, in which case callers
-/// must not guess a host — see `resume::resolve_host_from_remotes`. When
-/// nothing resolves but the repo does have remotes on unrecognised hosts, a
-/// warning names them, so a GHES instance whose hostname follows no convention
-/// (`code.corp.example.com`) surfaces as a configuration gap instead of
-/// silently degrading to `github.com`.
-pub(crate) async fn resolve_github_repo_from_remotes(
-    dir: &Path,
-    host_registry: &HostRegistry,
-) -> Option<RemoteRepo> {
-    let (candidates, unknown) = github_repo_candidates_from_remotes(dir, host_registry).await;
-    let resolved = candidates.into_iter().next();
-    if resolved.is_none() {
-        warn_unknown_remotes(&unknown);
-    }
-    resolved
 }
 
 /// Resolves the GitHub host for `owner` from a repository's remotes.
@@ -495,10 +478,11 @@ fn rank_github_remotes(
 /// skipped remote was one it actually wanted.
 fn unknown_remote(url: &str) -> Option<UnknownRemote> {
     let parts = split_github_url(url)?;
-    let (owner, _repo) = split_owner_repo(parts.rest)?;
+    let (owner, repo) = split_owner_repo(parts.rest)?;
     Some(UnknownRemote {
         host: parts.host.to_string(),
         owner,
+        repo,
     })
 }
 
@@ -1645,10 +1629,11 @@ mod tests {
         }
     }
 
-    fn unknown(host: &str, owner: &str) -> UnknownRemote {
+    fn unknown(host: &str, owner: &str, name: &str) -> UnknownRemote {
         UnknownRemote {
             host: host.to_string(),
             owner: owner.to_string(),
+            repo: name.to_string(),
         }
     }
 
@@ -1661,7 +1646,10 @@ mod tests {
             &default_hosts(),
         );
         assert!(candidates.is_empty());
-        assert_eq!(unrecognized, vec![unknown("code.corp.example.com", "acme")]);
+        assert_eq!(
+            unrecognized,
+            vec![unknown("code.corp.example.com", "acme", "widgets")]
+        );
     }
 
     #[test]
@@ -1734,7 +1722,10 @@ mod tests {
             )]),
             &default_hosts(),
         );
-        assert_eq!(unrecognized, vec![unknown("code.corp.example.com", "acme")]);
+        assert_eq!(
+            unrecognized,
+            vec![unknown("code.corp.example.com", "acme", "widgets")]
+        );
     }
 
     #[test]
@@ -1749,7 +1740,10 @@ mod tests {
             &default_hosts(),
         );
         assert_eq!(candidates, vec![repo("github.com", "acme", "widgets")]);
-        assert_eq!(unrecognized, vec![unknown("code.corp.example.com", "acme")]);
+        assert_eq!(
+            unrecognized,
+            vec![unknown("code.corp.example.com", "acme", "widgets")]
+        );
     }
 
     #[test]
@@ -1798,7 +1792,10 @@ mod tests {
             &default_hosts(),
         );
         assert!(candidates.is_empty());
-        assert_eq!(unrecognized, vec![unknown("code.corp.example.com", "acme")]);
+        assert_eq!(
+            unrecognized,
+            vec![unknown("code.corp.example.com", "acme", "widgets")]
+        );
     }
     use super::*;
     use crate::config::{GhHostConfig, LabConfig};

@@ -100,19 +100,35 @@ async fn detect_project_context(
         }
     }
 
-    // Try to detect from current directory. This uses the same remote
-    // resolution as `gru pm`/`gru tpm` (rather than registry-only matching) so
-    // a repo on an unconfigured GHES instance keeps its project context
-    // instead of silently falling back to the no-repo onboarding prompt.
+    // Try to detect from current directory.
     let repo_root = git::detect_git_repo().await.ok()?;
+    context_from_repo_root(repo_root).await
+}
+
+/// Owner, repo, and host for a checkout, from its remotes.
+async fn context_from_repo_root(
+    repo_root: PathBuf,
+) -> Option<(PathBuf, String, String, Option<String>)> {
     let host_registry = crate::config::load_host_registry();
-    let resolved = git::resolve_github_repo_from_remotes(&repo_root, &host_registry).await?;
-    Some((
-        repo_root,
-        resolved.owner,
-        resolved.repo,
-        Some(resolved.host),
-    ))
+    let (candidates, unknown) =
+        git::github_repo_candidates_from_remotes(&repo_root, &host_registry).await;
+    if let Some(resolved) = candidates.into_iter().next() {
+        return Some((
+            repo_root,
+            resolved.owner,
+            resolved.repo,
+            Some(resolved.host),
+        ));
+    }
+
+    // Nothing resolved to a host, but a repo-shaped remote on an unconfigured
+    // GHES still names the project. Keep that context — the owner/repo is all
+    // the in-repo prompt needs — and leave GH_HOST unresolved rather than
+    // dropping the user into the no-repo onboarding prompt. The warning still
+    // tells them which host to configure.
+    git::warn_unknown_remotes(&unknown);
+    let fallback = unknown.into_iter().next()?;
+    Some((repo_root, fallback.owner, fallback.repo, None))
 }
 
 /// Host from the current checkout's remotes, but only if they point at `owner`.
@@ -376,6 +392,41 @@ mod tests {
         assert!(content.len() <= CLAUDE_MD_READ_LIMIT);
 
         let _ = tokio::fs::remove_dir_all(&tmp).await;
+    }
+
+    #[tokio::test]
+    async fn test_context_from_repo_root_keeps_unconfigured_ghes_context() {
+        // Regression: an unconfigured GHES remote used to resolve no host and
+        // therefore no context at all, dropping `gru chat` into the no-repo
+        // onboarding prompt. The project is still named; only the host is
+        // unknown, so GH_HOST stays inherited.
+        let dir =
+            repo_with_remotes(&[("origin", "https://code.corp.example.com/acme/widgets.git")]);
+        let (_, owner, repo, host) = context_from_repo_root(dir.path().to_path_buf())
+            .await
+            .expect("an unconfigured GHES remote should still name the project");
+        assert_eq!(owner, "acme");
+        assert_eq!(repo, "widgets");
+        assert_eq!(host, None);
+    }
+
+    #[tokio::test]
+    async fn test_context_from_repo_root_resolves_known_host() {
+        let dir = repo_with_remotes(&[("origin", "https://github.com/acme/widgets.git")]);
+        let (_, owner, repo, host) = context_from_repo_root(dir.path().to_path_buf())
+            .await
+            .expect("a github.com remote should resolve");
+        assert_eq!(owner, "acme");
+        assert_eq!(repo, "widgets");
+        assert_eq!(host, Some("github.com".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_context_from_repo_root_without_remotes() {
+        let dir = repo_with_remotes(&[]);
+        assert!(context_from_repo_root(dir.path().to_path_buf())
+            .await
+            .is_none());
     }
 
     #[tokio::test]
