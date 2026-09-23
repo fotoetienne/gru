@@ -470,39 +470,81 @@ async fn discover_pr_by_branch(
     }
 }
 
-/// Resolve the GitHub host for a worktree by inspecting its git remote.
-/// Falls back to extracting the host directly from the remote URL, then to
-/// config-based `infer_github_host` if neither approach succeeds.
+/// Resolve the GitHub host for a worktree by inspecting its git remotes.
+///
+/// `origin` wins when it points at a GitHub-style remote, but a repo whose
+/// GitHub remote is named something else (`upstream`, a fork layout where
+/// `origin` is a non-GitHub mirror) is still resolved rather than silently
+/// falling back to github.com. Registry-known hosts are preferred over
+/// hosts merely extracted from a URL, so a GHES `upstream` beats a
+/// non-GitHub `origin` but never a github.com `origin`.
+///
+/// Falls back to config-based `infer_github_host` if no remote yields a host.
 pub(crate) async fn resolve_host_from_worktree(
     checkout_path: &std::path::Path,
     owner: &str,
 ) -> String {
     let host_registry = crate::config::load_host_registry();
 
-    // Try to get the host from the worktree's git remote
-    let output = tokio::process::Command::new("git")
-        .args(["remote", "get-url", "origin"])
-        .current_dir(checkout_path)
-        .output()
-        .await;
+    let mut registry_host: Option<String> = None;
+    let mut origin_unknown_host: Option<String> = None;
+    let mut other_unknown_host: Option<String> = None;
 
-    if let Ok(output) = output {
-        if output.status.success() {
-            let remote_url = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            // First try the full parser (validates against known hosts)
-            if let Ok((host, _, _)) = crate::git::parse_github_remote(&remote_url, &host_registry) {
+    for (name, url) in list_remotes(checkout_path).await {
+        // Registry-validated parse first: it confirms the URL really is a
+        // GitHub-style remote on a host we know about.
+        if let Ok((host, _, _)) = crate::git::parse_github_remote(&url, &host_registry) {
+            if name == "origin" {
                 return host;
             }
-            // If the remote URL is valid but the host isn't in the registry,
-            // extract the host directly so we don't wrongly default to github.com.
-            if let Some(host) = extract_host_from_remote_url(&remote_url) {
-                return host;
+            registry_host.get_or_insert(host);
+        } else if let Some(host) = extract_host_from_remote_url(&url) {
+            // Valid URL on a host that isn't in the registry (an unconfigured
+            // GHES instance); keep it as a weaker candidate so we don't
+            // wrongly default to github.com.
+            if name == "origin" {
+                origin_unknown_host.get_or_insert(host);
+            } else {
+                other_unknown_host.get_or_insert(host);
             }
         }
     }
 
-    // Fallback to config-based heuristic
-    crate::github::infer_github_host(owner, None)
+    registry_host
+        .or(origin_unknown_host)
+        .or(other_unknown_host)
+        // Fallback to config-based heuristic
+        .unwrap_or_else(|| crate::github::infer_github_host(owner, None))
+}
+
+/// List a worktree's remotes as `(name, url)` pairs, deduped by name.
+///
+/// Returns an empty list when the path isn't a git repo or `git` fails.
+async fn list_remotes(checkout_path: &std::path::Path) -> Vec<(String, String)> {
+    let output = tokio::process::Command::new("git")
+        .args(["remote", "-v"])
+        .current_dir(checkout_path)
+        .output()
+        .await;
+
+    let Ok(output) = output else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+
+    let mut remotes: Vec<(String, String)> = Vec::new();
+    // Each line: <name> <url> (fetch|push) — fetch and push repeat the name.
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let mut parts = line.split_whitespace();
+        if let (Some(name), Some(url)) = (parts.next(), parts.next()) {
+            if !remotes.iter().any(|(n, _)| n == name) {
+                remotes.push((name.to_string(), url.to_string()));
+            }
+        }
+    }
+    remotes
 }
 
 /// Extract the hostname from a git remote URL without requiring it to be in the
@@ -531,6 +573,80 @@ fn extract_host_from_remote_url(url: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Init a git repo with the given `(remote_name, url)` pairs.
+    async fn repo_with_remotes(remotes: &[(&str, &str)]) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let run = |args: Vec<&str>| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir.path())
+                .output()
+                .expect("git")
+        };
+        run(vec!["init", "--quiet"]);
+        for (name, url) in remotes {
+            run(vec!["remote", "add", name, url]);
+        }
+        dir
+    }
+
+    #[tokio::test]
+    async fn test_resolve_host_prefers_origin() {
+        let dir = repo_with_remotes(&[
+            ("origin", "https://github.com/owner/repo.git"),
+            ("upstream", "https://ghes.example.com/owner/repo.git"),
+        ])
+        .await;
+        assert_eq!(
+            resolve_host_from_worktree(dir.path(), "owner").await,
+            "github.com"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_resolve_host_uses_non_origin_remote() {
+        // No origin at all: the GitHub remote is named `upstream`.
+        let dir = repo_with_remotes(&[("upstream", "git@github.com:owner/repo.git")]).await;
+        assert_eq!(
+            resolve_host_from_worktree(dir.path(), "owner").await,
+            "github.com"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_resolve_host_skips_non_github_origin() {
+        // origin is a non-GitHub mirror; the registry-known remote wins.
+        let dir = repo_with_remotes(&[
+            ("origin", "https://gitlab.example.com/owner/repo.git"),
+            ("github", "https://github.com/owner/repo.git"),
+        ])
+        .await;
+        assert_eq!(
+            resolve_host_from_worktree(dir.path(), "owner").await,
+            "github.com"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_resolve_host_falls_back_to_unknown_origin_host() {
+        // Unconfigured GHES instance: not in the registry, but still better
+        // than defaulting to github.com.
+        let dir = repo_with_remotes(&[("origin", "https://ghes.example.com/owner/repo.git")]).await;
+        assert_eq!(
+            resolve_host_from_worktree(dir.path(), "owner").await,
+            "ghes.example.com"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_resolve_host_no_remotes_falls_back_to_heuristic() {
+        let dir = repo_with_remotes(&[]).await;
+        assert_eq!(
+            resolve_host_from_worktree(dir.path(), "").await,
+            crate::github::infer_github_host("", None)
+        );
+    }
 
     #[tokio::test]
     async fn test_handle_resume_with_invalid_id() {
