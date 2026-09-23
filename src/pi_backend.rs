@@ -177,6 +177,32 @@ impl AgentBackend for PiBackend {
         Some(cmd)
     }
 
+    /// Pi's TUI accepts the same two things a fresh interactive session needs:
+    /// `--system-prompt <text>` and positional messages after `--`
+    /// (`pi [options] [--] [@files...] [messages...]`).
+    fn build_interactive_command(
+        &self,
+        cwd: &Path,
+        system_prompt: &str,
+        initial_prompt: Option<&str>,
+    ) -> Option<TokioCommand> {
+        let mut cmd = TokioCommand::new(&self.binary);
+        cmd.arg("--system-prompt")
+            .arg(system_prompt)
+            // Locks in the safe default; see build_command for rationale.
+            .arg("--no-approve");
+        self.apply_model_flags(&mut cmd);
+        if let Some(prompt) = initial_prompt {
+            // Argument terminator so prompts like "-h" aren't parsed as flags.
+            cmd.arg("--").arg(prompt);
+        }
+        cmd.current_dir(cwd)
+            .stdin(std::process::Stdio::inherit())
+            .stdout(std::process::Stdio::inherit())
+            .stderr(std::process::Stdio::inherit());
+        Some(cmd)
+    }
+
     /// When `prompt_arg` is `"-"`, the prompt argument is omitted and stdin is
     /// piped instead — `pi -p -` emits nothing, so the sentinel must not be
     /// passed as a literal argument.
@@ -774,6 +800,56 @@ mod tests {
         assert!(envs
             .iter()
             .any(|(k, v)| *k == "GH_HOST" && *v == Some("github.com".as_ref())));
+    }
+
+    #[test]
+    fn test_build_interactive_command_shape() {
+        let b = backend();
+        let path = std::path::PathBuf::from("/tmp/project");
+        let cmd = b
+            .build_interactive_command(&path, "you are a PM", None)
+            .expect("pi supports interactive sessions");
+        let inner = cmd.as_std();
+
+        assert_eq!(inner.get_program(), "pi");
+        let args: Vec<String> = inner
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            args,
+            vec!["--system-prompt", "you are a PM", "--no-approve"]
+        );
+        // Interactive mode must not request headless/streaming output.
+        assert!(!args.iter().any(|a| a == "-p"));
+        assert!(!args.iter().any(|a| a == "--mode"));
+        assert_eq!(inner.get_current_dir(), Some(path.as_path()));
+    }
+
+    #[test]
+    fn test_build_interactive_command_initial_prompt_after_terminator() {
+        let b = PiBackend::new(None, Some("anthropic/claude-sonnet-5".to_string()), None);
+        let path = std::path::PathBuf::from("/tmp/project");
+        let cmd = b
+            .build_interactive_command(&path, "sys", Some("-h"))
+            .unwrap();
+        let args: Vec<String> = cmd
+            .as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            args,
+            vec![
+                "--system-prompt",
+                "sys",
+                "--no-approve",
+                "--model",
+                "anthropic/claude-sonnet-5",
+                "--",
+                "-h"
+            ]
+        );
     }
 
     #[test]

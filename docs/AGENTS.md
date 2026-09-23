@@ -41,6 +41,12 @@ Both keys are optional and independent. When `model` is unset, the Claude Code C
 own default. `model` applies to every Claude invocation Gru makes, including `gru chat` and
 `gru pm`/`gru tpm`, not just `gru do`/`gru lab`.
 
+Interactive sessions (`gru chat`, `gru pm`, `gru tpm`) use:
+
+```bash
+claude --system-prompt "<role/project prompt>" [--model <model>] [-- "<initial prompt>"]
+```
+
 ### How Gru Uses It
 
 Gru spawns Claude Code in non-interactive mode with stream JSON output:
@@ -96,7 +102,7 @@ Resume support uses:
 codex exec resume --last --json --full-auto "<prompt>"
 ```
 
-Note: Codex does not support interactive resume (`gru attach` will not work with Codex minions). Codex also ignores the `session_id` parameter — it relies on its own session persistence for both new and resumed sessions.
+Note: Codex does not support interactive sessions. `gru attach` will not work with Codex minions, and `gru chat`/`gru pm`/`gru tpm --agent codex` fail with an explanatory error rather than spawning anything — the Codex CLI has no interactive entry point that accepts a custom system prompt. Codex also ignores the `session_id` parameter — it relies on its own session persistence for both new and resumed sessions.
 
 Optionally override the binary path in `~/.gru/config.toml`:
 
@@ -159,6 +165,12 @@ Resume uses the same `--session-id` with a new prompt.
 
 Interactive resume (for `gru attach`) drops `-p` and `--mode json`, keeping `--session-id`, since Pi's TUI supports resuming a session with full history — unlike Codex.
 
+Fresh interactive sessions (`gru chat`, `gru pm`, `gru tpm`) use Pi's TUI with a custom system prompt:
+
+```bash
+pi --system-prompt "<role/project prompt>" --no-approve [--model <model>] [--thinking <level>] [-- "<initial prompt>"]
+```
+
 There is no `--dangerously-skip-permissions` equivalent for Pi; `bash` and `edit` tool calls run without approval prompts by default under `-p`.
 
 ## Selecting a Backend
@@ -171,6 +183,9 @@ Use the `--agent` flag on any command that spawns an agent:
 gru do 42 --agent codex
 gru review 42 --agent codex
 gru prompt my-prompt --agent codex
+gru chat --agent pi
+gru pm --agent pi "write a PRD for hooks"
+gru tpm --agent pi
 ```
 
 ### As default
@@ -193,6 +208,7 @@ The `--agent` flag always overrides the config default.
 | Custom prompts (`gru prompt`) | Yes | Yes | Yes |
 | Session resume (`gru resume`) | Yes | Yes (non-interactive) | Yes |
 | Interactive attach (`gru attach`) | Yes | No | Yes |
+| Interactive sessions (`gru chat`, `gru pm`, `gru tpm`) | Yes | No | Yes |
 | Token usage tracking | Yes | Yes | Yes |
 | Stream monitoring | Yes | Yes | Yes |
 
@@ -209,13 +225,14 @@ To add a new agent backend:
 4. Map the backend's output format to `AgentEvent` variants in `parse_events()`
 5. Update the `do` command's `--agent` help string in `src/main.rs` (`"Agent backend to use (claude, codex). Defaults to claude."`) — it enumerates backends by name but isn't derived from `AVAILABLE_AGENTS`, so a new backend added without touching it leaves `--help` output stale. The `review`/`prompt` commands' help (`"Agent backend to use (e.g., 'claude')."`) is a non-exhaustive example, not an enumeration, so it doesn't need updating for each new backend
 
-The `AgentBackend` trait (`src/agent.rs`) currently has eleven methods:
+The `AgentBackend` trait (`src/agent.rs`) currently has twelve methods:
 - `name()` — human-readable identifier
 - `process_names()` — process name(s) to match for `gru stop`'s pgrep fallback
 - `build_command()` — construct the CLI command for a new session
 - `parse_events()` — convert stdout lines to normalized `AgentEvent`s
 - `build_resume_command()` — required to implement (no default body); return `None` from it if the backend doesn't support resume, `Some(...)` otherwise
 - `build_interactive_resume_command()` — required to implement (no default body); return `None` from it to disable attach support
+- `build_interactive_command()` — required to implement (no default body, deliberately mirroring `build_interactive_resume_command` so a new backend has to make an explicit choice); construct a fresh interactive session with a custom system prompt for `gru chat`/`gru pm`/`gru tpm`, or return `None` to opt out (callers then surface an actionable error naming the command and agent). If you implement it, also update the suggested-agent list in `interactive_unsupported_error()` (`src/agent_registry.rs`) — like the `do` command's `--agent` help, it enumerates backends by hand rather than deriving them
 - `build_oneshot_command()` — construct a single-turn, plain-text command (e.g. for the merge-readiness judge)
 - `build_ci_fix_command()` — construct a backend-specific streaming-event command (matching whatever format `parse_events()` expects, e.g. Claude's `stream-json` or Codex's JSONL) for stateless CI-fix invocations
 - `yolo_args()` — (optional) CLI args to bypass interactive permission prompts for `gru attach --yolo`; defaults to an empty `Vec`

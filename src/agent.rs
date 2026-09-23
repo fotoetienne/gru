@@ -301,6 +301,28 @@ pub(crate) trait AgentBackend: Send + Sync {
         github_host: &str,
     ) -> Option<TokioCommand>;
 
+    /// Build the command to start a *fresh* interactive session with a custom
+    /// system prompt.
+    ///
+    /// Unlike `build_interactive_resume_command` (which reattaches to an existing
+    /// session), this starts a new session for the user-facing REPL commands
+    /// `gru chat`, `gru pm`, and `gru tpm`. The command must use inherited stdio
+    /// and must not request headless/streaming output (no `--print`, no
+    /// stream-json), since the agent's own TUI takes over the terminal.
+    ///
+    /// `system_prompt` carries the role/project context. `initial_prompt`, when
+    /// `Some`, becomes the session's first user message and must be passed after
+    /// an argument terminator (`--`) so prompts that look like flags (e.g. `-h`)
+    /// aren't parsed as CLI options.
+    ///
+    /// Returns `None` if the backend has no interactive entry point (Codex).
+    fn build_interactive_command(
+        &self,
+        cwd: &Path,
+        system_prompt: &str,
+        initial_prompt: Option<&str>,
+    ) -> Option<TokioCommand>;
+
     /// Build a command for a one-shot utility task (no session tracking, text output).
     ///
     /// Used for fire-and-forget invocations like merge-readiness judge where the

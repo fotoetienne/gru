@@ -1,6 +1,4 @@
 use anyhow::{Context, Result};
-use std::process::Stdio;
-use tokio::process::Command;
 
 use crate::commands::child_process;
 use crate::git;
@@ -13,23 +11,24 @@ const PM_SKILL: &str = include_str!("../../.claude/skills/product-manager/SKILL.
 const TPM_SKILL: &str = include_str!("../../.claude/skills/project-manager/SKILL.md");
 
 /// Handles the `gru pm` command — interactive PM session.
-pub async fn handle_pm(prompt: Option<String>, verbose: bool) -> Result<i32> {
-    launch_skill_session("pm", PM_SKILL, prompt, verbose).await
+pub async fn handle_pm(prompt: Option<String>, agent_name: &str, verbose: bool) -> Result<i32> {
+    launch_skill_session("pm", PM_SKILL, prompt, agent_name, verbose).await
 }
 
 /// Handles the `gru tpm` command — interactive TPM session.
-pub async fn handle_tpm(prompt: Option<String>, verbose: bool) -> Result<i32> {
-    launch_skill_session("tpm", TPM_SKILL, prompt, verbose).await
+pub async fn handle_tpm(prompt: Option<String>, agent_name: &str, verbose: bool) -> Result<i32> {
+    launch_skill_session("tpm", TPM_SKILL, prompt, agent_name, verbose).await
 }
 
-/// Launches an interactive Claude session with the given skill as the system prompt.
+/// Launches an interactive agent session with the given skill as the system prompt.
 ///
-/// When `prompt` is `Some`, passes it as a positional argument to claude so it
-/// becomes the first message in the interactive session.
+/// When `prompt` is `Some`, the backend passes it after `--` so it becomes the
+/// first message in the interactive session.
 async fn launch_skill_session(
     role_name: &str,
     skill_content: &str,
     prompt: Option<String>,
+    agent_name: &str,
     verbose: bool,
 ) -> Result<i32> {
     let _tmux_guard = TmuxGuard::new(&format!("gru:{role_name}"));
@@ -46,29 +45,15 @@ async fn launch_skill_session(
     // Strip YAML frontmatter from the skill content (delimited by --- lines)
     let system_prompt = strip_frontmatter(skill_content);
 
-    let mut cmd = Command::new(crate::agent_registry::configured_claude_binary());
-    cmd.arg("--system-prompt").arg(system_prompt);
-    if let Some(model) = crate::agent_registry::configured_claude_model() {
-        cmd.arg("--model").arg(model);
-    }
+    let backend = crate::agent_registry::resolve_backend(agent_name)?;
+    let mut cmd = backend
+        .build_interactive_command(&repo_root, system_prompt, prompt.as_deref())
+        .ok_or_else(|| {
+            crate::agent_registry::interactive_unsupported_error(role_name, agent_name)
+        })?;
 
-    if let Some(ref p) = prompt {
-        // Use argument terminator so prompts like "-h" are not treated as CLI flags
-        cmd.arg("--").arg(p);
-    }
-
-    cmd.current_dir(&repo_root)
-        .stdin(Stdio::inherit())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit());
-
-    let program = cmd.as_std().get_program().to_string_lossy().into_owned();
     let mut child = cmd.spawn().with_context(|| {
-        format!(
-            "Failed to start claude binary '{program}'. Check that it's installed and in \
-             your PATH (see: https://claude.com/claude-code), or if you've overridden \
-             [agent.claude] binary in config.toml, that the path is correct and executable."
-        )
+        crate::agent::spawn_error_context(backend.as_ref(), &cmd, &format!("for gru {role_name}"))
     })?;
 
     let status = child_process::wait_with_ctrlc_handling(&mut child).await?;
