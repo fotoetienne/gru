@@ -100,6 +100,17 @@ pub(crate) fn configured_claude_binary() -> String {
         .unwrap_or_else(|| "claude".to_string())
 }
 
+/// Resolves the configured Claude Code model override, if any.
+///
+/// Mirrors `configured_claude_binary` for the same direct-launch entry points
+/// (`gru chat`, `gru pm`/`gru tpm`, and the legacy no-session-id `gru attach`
+/// fallback) that spawn `claude` directly rather than through `ClaudeBackend`.
+/// Reads `[agent.claude] model` from config; `None` when unset or no config
+/// is present, letting the Claude Code CLI use its own default.
+pub(crate) fn configured_claude_model() -> Option<String> {
+    crate::config::try_load_config().and_then(|c| c.agent.claude.model)
+}
+
 /// Resolves the Pi CLI binary path/name to invoke.
 ///
 /// Used by `gru stop`'s legacy fallback matching (`src/commands/stop.rs`) so a

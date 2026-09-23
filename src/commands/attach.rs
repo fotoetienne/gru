@@ -191,8 +191,11 @@ pub(crate) async fn handle_attach(
                 );
             }
             let mut c = Command::new(agent_registry::configured_claude_binary());
-            c.arg("-r")
-                .current_dir(&checkout_path)
+            c.arg("-r");
+            if let Some(model) = agent_registry::configured_claude_model() {
+                c.arg("--model").arg(model);
+            }
+            c.current_dir(&checkout_path)
                 .stdin(Stdio::inherit())
                 .stdout(Stdio::inherit())
                 .stderr(Stdio::inherit())
