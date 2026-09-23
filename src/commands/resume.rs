@@ -483,32 +483,43 @@ pub(crate) async fn resolve_host_from_worktree(
     checkout_path: &std::path::Path,
     owner: &str,
 ) -> String {
-    match resolve_host_from_remotes(checkout_path, owner).await {
-        Some(host) => host,
-        None => crate::github::configured_host_for_owner(owner, None)
-            .unwrap_or_else(|| "github.com".to_string()),
+    let (resolved, unknown) = resolve_host_from_remotes(checkout_path, owner).await;
+    if let Some(host) = resolved {
+        return host;
     }
+    if let Some(host) = crate::github::configured_host_for_owner(owner, None) {
+        return host;
+    }
+    // Only now is an unrecognised remote actually a problem: nothing else
+    // named a host, so github.com is a guess that may be wrong.
+    crate::git::warn_unknown_remotes(&unknown);
+    "github.com".to_string()
 }
 
 /// Resolve the `GH_HOST` to hand a child agent process, or `None`.
 ///
 /// Remotes, then a configured host for `owner`, then an inherited `GH_HOST`.
 /// Unlike [`resolve_host_from_worktree`] there is no github.com default: when
-/// all three come up empty the repo is on an unconfigured GHES that
-/// [`resolve_host_from_remotes`] has already warned about, and sending the
-/// child to github.com would silently retarget its `gh` calls. `None` means
-/// "leave `GH_HOST` unset" — see [`apply_child_host`].
+/// all three come up empty the repo is on an unconfigured GHES, and sending
+/// the child to github.com would silently retarget its `gh` calls. `None`
+/// means "leave `GH_HOST` unset" — see [`apply_child_host`] — and only that
+/// dead end warrants the unrecognised-host warning.
 pub(crate) async fn resolve_child_host_from_worktree(
     checkout_path: &std::path::Path,
     owner: &str,
 ) -> Option<String> {
-    match resolve_host_from_remotes(checkout_path, owner).await {
-        Some(host) => Some(host),
-        None => host_fallback(
-            crate::github::configured_host_for_owner(owner, None),
-            std::env::var("GH_HOST").ok(),
-        ),
+    let (resolved, unknown) = resolve_host_from_remotes(checkout_path, owner).await;
+    if resolved.is_some() {
+        return resolved;
     }
+    let fallback = host_fallback(
+        crate::github::configured_host_for_owner(owner, None),
+        std::env::var("GH_HOST").ok(),
+    );
+    if fallback.is_none() {
+        crate::git::warn_unknown_remotes(&unknown);
+    }
+    fallback
 }
 
 /// Fallback order once remotes yield nothing: configured host, then an
@@ -543,13 +554,18 @@ pub(crate) fn apply_child_host(cmd: &mut tokio::process::Command, host: Option<&
 ///
 /// Thin wrapper over [`crate::git::resolve_github_host_for_owner`]: candidates
 /// are filtered by `owner` (pass `""` when the caller has no repo in mind).
-/// Returns `None` when no remote yields a GitHub repo, so callers that set
+/// The host is `None` when no remote yields a GitHub repo, so callers that set
 /// `GH_HOST` on a child process can leave an inherited value alone instead of
 /// overriding it with a guess.
+///
+/// The unrecognised-host remotes come back with it rather than being warned
+/// about here: the caller may still resolve a host from config or the
+/// environment, and should only report the configuration gap once it has run
+/// out of options. See [`crate::git::warn_unknown_remotes`].
 pub(crate) async fn resolve_host_from_remotes(
     checkout_path: &std::path::Path,
     owner: &str,
-) -> Option<String> {
+) -> (Option<String>, Vec<crate::git::UnknownRemote>) {
     let host_registry = crate::config::load_host_registry();
     crate::git::resolve_github_host_for_owner(checkout_path, &host_registry, owner).await
 }
@@ -633,7 +649,7 @@ mod tests {
         // because the URL shape is valid; fall back to the config heuristic.
         let dir =
             repo_with_remotes(&[("origin", "https://gitlab.example.com/owner/repo.git")]).await;
-        assert_eq!(resolve_host_from_remotes(dir.path(), "owner").await, None);
+        assert_eq!(resolve_host_from_remotes(dir.path(), "owner").await.0, None);
     }
 
     #[tokio::test]
@@ -656,6 +672,7 @@ mod tests {
         assert_eq!(
             resolve_host_from_remotes(dir.path(), "owner")
                 .await
+                .0
                 .as_deref(),
             Some("github.corp.example.com")
         );
@@ -687,9 +704,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_resolve_host_returns_unknown_remotes_instead_of_warning() {
+        // The warning belongs to whoever runs out of options: remotes are only
+        // the first source, so an unrecognised host comes back to the caller to
+        // report after the configured-host and inherited-GH_HOST fallbacks.
+        let dir =
+            repo_with_remotes(&[("origin", "https://code.corp.example.com/acme/widgets.git")])
+                .await;
+        let (host, unknown) = resolve_host_from_remotes(dir.path(), "acme").await;
+        assert_eq!(host, None);
+        assert_eq!(unknown.len(), 1);
+        assert_eq!(unknown[0].host, "code.corp.example.com");
+
+        // Nothing to report once a host resolves.
+        let dir = repo_with_remotes(&[("origin", "https://github.com/acme/widgets.git")]).await;
+        let (host, unknown) = resolve_host_from_remotes(dir.path(), "acme").await;
+        assert_eq!(host.as_deref(), Some("github.com"));
+        assert!(unknown.is_empty());
+    }
+
+    #[tokio::test]
     async fn test_resolve_host_no_remotes_resolves_nothing() {
         let dir = repo_with_remotes(&[]).await;
-        assert_eq!(resolve_host_from_remotes(dir.path(), "").await, None);
+        assert_eq!(resolve_host_from_remotes(dir.path(), "").await.0, None);
     }
 
     #[tokio::test]

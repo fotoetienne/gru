@@ -338,14 +338,19 @@ pub(crate) async fn github_repo_candidates_from_remotes(
 /// `github.corp.example.com/corp/project`. An empty `owner` means the caller
 /// has no repo in mind, so the global winner stands.
 ///
-/// Any unknown-host warning is scoped the same way — a remote on an
-/// unrecognised host belonging to a different owner is not this call's
-/// configuration gap.
+/// Returns the unrecognised-host remotes alongside the result, already scoped
+/// to `owner` — a remote belonging to a different owner is not this call's
+/// configuration gap. Warning is left to the caller via
+/// [`warn_unknown_remotes`], because remotes are only the first source: a
+/// configured host for the owner or an inherited `GH_HOST` may still settle
+/// the question, and telling the user to configure a host they have already
+/// resolved another way is just noise. The list is empty when a host resolved
+/// here, so a caller can warn unconditionally on its own dead end.
 pub(crate) async fn resolve_github_host_for_owner(
     dir: &Path,
     host_registry: &HostRegistry,
     owner: &str,
-) -> Option<String> {
+) -> (Option<String>, Vec<UnknownRemote>) {
     let (candidates, unknown) = github_repo_candidates_from_remotes(dir, host_registry).await;
     let matches_owner =
         |candidate_owner: &str| owner.is_empty() || candidate_owner.eq_ignore_ascii_case(owner);
@@ -353,14 +358,14 @@ pub(crate) async fn resolve_github_host_for_owner(
         .into_iter()
         .find(|candidate| matches_owner(&candidate.owner))
         .map(|candidate| candidate.host);
-    if resolved.is_none() {
-        let relevant: Vec<UnknownRemote> = unknown
-            .into_iter()
-            .filter(|remote| matches_owner(&remote.owner))
-            .collect();
-        warn_unknown_remotes(&relevant);
+    if resolved.is_some() {
+        return (resolved, Vec::new());
     }
-    resolved
+    let relevant: Vec<UnknownRemote> = unknown
+        .into_iter()
+        .filter(|remote| matches_owner(&remote.owner))
+        .collect();
+    (None, relevant)
 }
 
 /// Warns that repo-shaped remotes were skipped because their host is neither
@@ -368,7 +373,9 @@ pub(crate) async fn resolve_github_host_for_owner(
 /// it. No-op when there is nothing to report.
 ///
 /// Callers own the timing: warning before an owner filter has run would flag
-/// remotes that were never wanted in the first place.
+/// remotes that were never wanted in the first place, and warning before the
+/// configured-host and inherited-`GH_HOST` fallbacks have been tried would
+/// demand configuration for a host that ends up resolved anyway.
 pub(crate) fn warn_unknown_remotes(unknown: &[UnknownRemote]) {
     let mut hosts: Vec<&str> = Vec::new();
     for remote in unknown {

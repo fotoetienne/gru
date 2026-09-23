@@ -88,7 +88,15 @@ async fn detect_project_context(
                 // up empty, in which case GH_HOST is left untouched.
                 let host = match crate::github::configured_host_for_owner(owner, None) {
                     Some(host) => Some(host),
-                    None => host_from_matching_remote(&repo_root, owner).await,
+                    None => {
+                        let (host, unknown) = host_from_matching_remote(&repo_root, owner).await;
+                        if host.is_none() {
+                            // Both sources are exhausted, so an unrecognised
+                            // remote for this owner is worth reporting.
+                            git::warn_unknown_remotes(&unknown);
+                        }
+                        host
+                    }
                 };
                 return Some((repo_root, owner.to_string(), name.to_string(), host));
             }
@@ -136,7 +144,13 @@ async fn context_from_repo_root(
 ///
 /// Guards the `--repo owner/repo` path: running `gru chat --repo corp/project`
 /// from inside a github.com checkout must not resolve `GH_HOST=github.com`.
-async fn host_from_matching_remote(repo_root: &Path, owner: &str) -> Option<String> {
+///
+/// Returns the owner's unrecognised-host remotes too; the caller warns about
+/// them only after its own fallbacks have come up empty.
+async fn host_from_matching_remote(
+    repo_root: &Path,
+    owner: &str,
+) -> (Option<String>, Vec<git::UnknownRemote>) {
     let host_registry = crate::config::load_host_registry();
     git::resolve_github_host_for_owner(repo_root, &host_registry, owner).await
 }
@@ -271,7 +285,7 @@ mod tests {
         // Regression: `gru chat --repo corp/project` from inside a github.com
         // checkout must not resolve that checkout's host for `corp`.
         let dir = repo_with_remotes(&[("origin", "https://github.com/someone/other.git")]);
-        assert_eq!(host_from_matching_remote(dir.path(), "corp").await, None);
+        assert_eq!(host_from_matching_remote(dir.path(), "corp").await.0, None);
     }
 
     #[tokio::test]
@@ -286,7 +300,7 @@ mod tests {
             ),
         ]);
         assert_eq!(
-            host_from_matching_remote(dir.path(), "corp").await,
+            host_from_matching_remote(dir.path(), "corp").await.0,
             Some("github.corp.example.com".to_string())
         );
     }
@@ -298,12 +312,12 @@ mod tests {
         let dir =
             repo_with_remotes(&[("origin", "https://github.corp.example.com/corp/other.git")]);
         assert_eq!(
-            host_from_matching_remote(dir.path(), "corp").await,
+            host_from_matching_remote(dir.path(), "corp").await.0,
             Some("github.corp.example.com".to_string())
         );
         // Owner comparison is case-insensitive, as GitHub owners are.
         assert_eq!(
-            host_from_matching_remote(dir.path(), "Corp").await,
+            host_from_matching_remote(dir.path(), "Corp").await.0,
             Some("github.corp.example.com".to_string())
         );
     }
@@ -311,7 +325,7 @@ mod tests {
     #[tokio::test]
     async fn test_host_from_matching_remote_without_remotes() {
         let dir = repo_with_remotes(&[]);
-        assert_eq!(host_from_matching_remote(dir.path(), "corp").await, None);
+        assert_eq!(host_from_matching_remote(dir.path(), "corp").await.0, None);
     }
 
     #[test]
