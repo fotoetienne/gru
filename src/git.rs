@@ -321,6 +321,25 @@ pub(crate) async fn resolve_github_repo_from_remotes(
     resolved
 }
 
+/// Re-attaches an explicit `:port` from `url` to a resolved `host`.
+///
+/// `gh` uses `GH_HOST` as a URL authority, so a GHES instance served on a
+/// non-default port (`https://ghe.example.com:8443/owner/repo.git`) needs the
+/// port to survive resolution — otherwise requests go to 443 on the same name.
+///
+/// Only applies when `host` is the URL's own hostname. A registry match on a
+/// `web_url` canonicalizes to a different API host, and that host's port can't
+/// be inferred from the web URL's, so it is left as configured.
+fn with_remote_port(host: String, url: &str) -> String {
+    match split_github_url(url) {
+        Some(parts) if parts.host == host => match parts.port {
+            Some(port) => format!("{host}:{port}"),
+            None => host,
+        },
+        _ => host,
+    }
+}
+
 /// Picks the best GitHub remote from `(name, url)` pairs.
 ///
 /// Returns the winning `(host, owner, repo)`, or — when nothing resolves — the
@@ -341,12 +360,14 @@ fn rank_github_remotes(
         let is_origin = name == "origin";
         // A registry-validated parse confirms both the URL shape and that the
         // host is one we've been told about.
-        if let Ok(parsed) = parse_github_remote(url, host_registry) {
+        if let Ok((host, owner, repo)) = parse_github_remote(url, host_registry) {
+            let parsed = (with_remote_port(host, url), owner, repo);
             if is_origin {
                 return (Some(parsed), Vec::new());
             }
             configured_other.get_or_insert(parsed);
-        } else if let Some(parsed) = parse_github_like_remote(url) {
+        } else if let Some((host, owner, repo)) = parse_github_like_remote(url) {
+            let parsed = (with_remote_port(host, url), owner, repo);
             if is_origin {
                 likely_origin.get_or_insert(parsed);
             } else {
@@ -373,6 +394,8 @@ fn rank_github_remotes(
 fn unconfigured_host(url: &str) -> Option<String> {
     let parts = split_github_url(url)?;
     split_owner_repo(parts.rest)?;
+    // Port-free: this feeds the `host = "..."` config suggestion, and registry
+    // host matching compares against the hostname with the port stripped.
     Some(parts.host.to_string())
 }
 
@@ -384,22 +407,25 @@ pub(crate) enum GitUrlScheme {
     Ssh,
 }
 
-/// A GitHub-style URL split into scheme, hostname, and remainder.
+/// A GitHub-style URL split into scheme, hostname, port, and remainder.
 ///
 /// The hostname has any `:port` suffix stripped so callers can compare it
-/// directly to configured host names.
+/// directly to configured host names; the port is kept separately for callers
+/// that need to rebuild an authority (see [`with_remote_port`]).
 #[derive(Debug, Clone)]
 pub(crate) struct GitUrlParts<'a> {
     pub(crate) scheme: GitUrlScheme,
     /// Hostname with any port stripped.
     pub(crate) host: &'a str,
+    /// Explicit port from the URL's authority, if it had one.
+    pub(crate) port: Option<&'a str>,
     /// Everything after the authority. For HTTPS/HTTP URLs this includes the
     /// leading `/` (e.g. `/owner/repo.git`); for SSH (`git@host:path`) it's
     /// the path with no leading slash.
     pub(crate) rest: &'a str,
 }
 
-/// Splits a URL into scheme, hostname (port stripped), and remainder.
+/// Splits a URL into scheme, hostname (port stripped), port, and remainder.
 ///
 /// Accepts `https://<host>[:port]/<rest>`, `http://<host>[:port]/<rest>`, and
 /// SSH (`git@<host>:<rest>`). Returns `None` for URLs with an unsupported
@@ -413,6 +439,8 @@ pub(crate) fn split_github_url(url: &str) -> Option<GitUrlParts<'_>> {
         return Some(GitUrlParts {
             scheme: GitUrlScheme::Ssh,
             host,
+            // scp-like SSH syntax has no port: the part after `:` is the path.
+            port: None,
             rest: path,
         });
     }
@@ -430,17 +458,19 @@ pub(crate) fn split_github_url(url: &str) -> Option<GitUrlParts<'_>> {
     if authority.contains('@') {
         return None;
     }
-    // Strip optional `:port` from the authority.
-    let host = authority
-        .split_once(':')
-        .map(|(h, _)| h)
-        .unwrap_or(authority);
+    // Split optional `:port` off the authority.
+    let (host, port) = match authority.split_once(':') {
+        Some((h, p)) if !p.is_empty() => (h, Some(p)),
+        Some((h, _)) => (h, None),
+        None => (authority, None),
+    };
     if host.is_empty() {
         return None;
     }
     Some(GitUrlParts {
         scheme,
         host,
+        port,
         rest: path,
     })
 }
@@ -1542,6 +1572,73 @@ mod tests {
     }
 
     #[test]
+    fn test_rank_github_remotes_preserves_explicit_port() {
+        // `gh` uses GH_HOST as a URL authority, so a GHES on :8443 must keep
+        // the port through resolution — both via the registry and the
+        // GitHub-identifiable heuristic.
+        let (resolved, _) = rank_github_remotes(
+            &remotes(&[("origin", "https://ghe.example.com:8443/acme/widgets.git")]),
+            &hosts_with_ghe(),
+        );
+        assert_eq!(
+            resolved,
+            Some((
+                "ghe.example.com:8443".to_string(),
+                "acme".to_string(),
+                "widgets".to_string()
+            ))
+        );
+
+        let (resolved, _) = rank_github_remotes(
+            &remotes(&[(
+                "origin",
+                "https://github.corp.example.com:8443/acme/widgets.git",
+            )]),
+            &default_hosts(),
+        );
+        assert_eq!(
+            resolved,
+            Some((
+                "github.corp.example.com:8443".to_string(),
+                "acme".to_string(),
+                "widgets".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn test_rank_github_remotes_leaves_web_url_match_unported() {
+        // A `web_url` match canonicalizes to the API host, whose port can't be
+        // inferred from the web URL's, so the configured host stands.
+        let (resolved, _) = rank_github_remotes(
+            &remotes(&[("origin", "https://github.netflix.net:8443/acme/widgets.git")]),
+            &hosts_with_web_url(),
+        );
+        assert_eq!(
+            resolved,
+            Some((
+                "git.netflix.net".to_string(),
+                "acme".to_string(),
+                "widgets".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn test_rank_github_remotes_unrecognized_host_reported_without_port() {
+        // The reported host feeds a `host = "..."` config suggestion, which is
+        // matched against the port-stripped hostname.
+        let (_, unrecognized) = rank_github_remotes(
+            &remotes(&[(
+                "origin",
+                "https://code.corp.example.com:8443/acme/widgets.git",
+            )]),
+            &default_hosts(),
+        );
+        assert_eq!(unrecognized, vec!["code.corp.example.com".to_string()]);
+    }
+
+    #[test]
     fn test_rank_github_remotes_no_warning_when_resolved() {
         // An unrecognised mirror alongside a usable GitHub remote isn't a
         // configuration gap, so it shouldn't be reported.
@@ -1876,6 +1973,7 @@ mod tests {
         let parts = split_github_url("https://github.com/owner/repo.git").unwrap();
         assert_eq!(parts.scheme, GitUrlScheme::Https);
         assert_eq!(parts.host, "github.com");
+        assert_eq!(parts.port, None);
         assert_eq!(parts.rest, "/owner/repo.git");
     }
 
@@ -1884,6 +1982,7 @@ mod tests {
         let parts = split_github_url("https://ghe.example.com:8443/owner/repo").unwrap();
         assert_eq!(parts.scheme, GitUrlScheme::Https);
         assert_eq!(parts.host, "ghe.example.com");
+        assert_eq!(parts.port, Some("8443"));
         assert_eq!(parts.rest, "/owner/repo");
     }
 
@@ -1899,6 +1998,8 @@ mod tests {
         let parts = split_github_url("git@github.com:owner/repo.git").unwrap();
         assert_eq!(parts.scheme, GitUrlScheme::Ssh);
         assert_eq!(parts.host, "github.com");
+        // scp-like syntax: the text after `:` is a path, never a port.
+        assert_eq!(parts.port, None);
         assert_eq!(parts.rest, "owner/repo.git");
     }
 
@@ -1907,6 +2008,41 @@ mod tests {
         let parts = split_github_url("https://github.com").unwrap();
         assert_eq!(parts.host, "github.com");
         assert_eq!(parts.rest, "");
+    }
+
+    #[test]
+    fn test_split_github_url_empty_port_is_none() {
+        let parts = split_github_url("https://ghe.example.com:/owner/repo").unwrap();
+        assert_eq!(parts.host, "ghe.example.com");
+        assert_eq!(parts.port, None);
+    }
+
+    #[test]
+    fn test_with_remote_port() {
+        assert_eq!(
+            with_remote_port(
+                "ghe.example.com".to_string(),
+                "https://ghe.example.com:8443/o/r.git"
+            ),
+            "ghe.example.com:8443"
+        );
+        assert_eq!(
+            with_remote_port("github.com".to_string(), "https://github.com/o/r.git"),
+            "github.com"
+        );
+        // Host differs from the URL's (a `web_url` canonicalization): the
+        // URL's port says nothing about the API host's.
+        assert_eq!(
+            with_remote_port(
+                "git.netflix.net".to_string(),
+                "https://github.netflix.net:8443/o/r.git"
+            ),
+            "git.netflix.net"
+        );
+        assert_eq!(
+            with_remote_port("github.com".to_string(), "not-a-url"),
+            "github.com"
+        );
     }
 
     #[test]
