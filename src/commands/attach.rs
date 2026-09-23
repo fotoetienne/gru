@@ -145,12 +145,15 @@ pub(crate) async fn handle_attach(
     println!("📂 Workspace: {}", checkout_path.display());
 
     // Resolve the GitHub host from the worktree's git remote so spawned
-    // processes can target the correct GHE instance without discovery.
+    // processes can target the correct GHE instance without discovery. This
+    // only routes the child, so an inherited GH_HOST beats defaulting to
+    // github.com when nothing resolves.
     let owner_hint = repo_str
         .as_deref()
         .and_then(|r| r.split('/').next())
         .unwrap_or("");
-    let github_host = super::resume::resolve_host_from_worktree(&checkout_path, owner_hint).await;
+    let github_host =
+        super::resume::resolve_child_host_from_worktree(&checkout_path, owner_hint).await;
 
     // Build command for interactive mode via the resolved backend
     let mut cmd = match &session_id {

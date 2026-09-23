@@ -487,6 +487,40 @@ pub(crate) async fn resolve_host_from_worktree(
     }
 }
 
+/// Resolve the `GH_HOST` to hand a child agent process for a worktree.
+///
+/// Like [`resolve_host_from_worktree`], but an inherited `GH_HOST` outranks the
+/// `github.com` default. When neither the remotes nor config identify a host —
+/// an unconfigured GHES, which [`crate::git::resolve_github_repo_from_remotes`]
+/// has already warned about — the user's own environment is a better answer
+/// than github.com, which would silently retarget the agent's `gh` calls at
+/// the wrong instance. Use this wherever the host is only used to route a
+/// child process; callers that need a host for Gru's own API calls (and have a
+/// real owner to infer from) want [`resolve_host_from_worktree`].
+pub(crate) async fn resolve_child_host_from_worktree(
+    checkout_path: &std::path::Path,
+    owner: &str,
+) -> String {
+    match resolve_host_from_remotes(checkout_path).await {
+        Some(host) => host,
+        None => child_host_fallback(
+            crate::github::configured_host_for_owner(owner, None),
+            std::env::var("GH_HOST").ok(),
+        ),
+    }
+}
+
+/// Fallback order once remotes yield nothing: configured host, then an
+/// inherited `GH_HOST`, then github.com.
+///
+/// Split out from [`resolve_child_host_from_worktree`] so it can be tested
+/// without mutating the process-global `GH_HOST`.
+fn child_host_fallback(configured: Option<String>, inherited: Option<String>) -> String {
+    configured
+        .or_else(|| inherited.filter(|h| !h.trim().is_empty()))
+        .unwrap_or_else(|| "github.com".to_string())
+}
+
 /// Resolve the GitHub host for a worktree by inspecting its git remotes.
 ///
 /// Thin wrapper over [`crate::git::resolve_github_repo_from_remotes`] that
@@ -503,6 +537,36 @@ pub(crate) async fn resolve_host_from_remotes(checkout_path: &std::path::Path) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_child_host_fallback_prefers_configured_host() {
+        assert_eq!(
+            child_host_fallback(
+                Some("ghe.example.com".to_string()),
+                Some("github.com".to_string())
+            ),
+            "ghe.example.com"
+        );
+    }
+
+    #[test]
+    fn test_child_host_fallback_preserves_inherited_host() {
+        // An unconfigured GHES resolves to nothing; the user's own GH_HOST is
+        // a better answer than retargeting their agent at github.com.
+        assert_eq!(
+            child_host_fallback(None, Some("code.corp.example.com".to_string())),
+            "code.corp.example.com"
+        );
+    }
+
+    #[test]
+    fn test_child_host_fallback_defaults_when_nothing_inherited() {
+        assert_eq!(child_host_fallback(None, None), "github.com");
+        assert_eq!(
+            child_host_fallback(None, Some("   ".to_string())),
+            "github.com"
+        );
+    }
 
     /// Init a git repo with the given `(remote_name, url)` pairs.
     async fn repo_with_remotes(remotes: &[(&str, &str)]) -> tempfile::TempDir {

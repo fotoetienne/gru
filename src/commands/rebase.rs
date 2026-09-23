@@ -820,7 +820,7 @@ pub(crate) async fn run_agent_rebase(
 ) -> Result<i32> {
     let backend = agent_registry::resolve_backend(agent_registry::DEFAULT_AGENT)?;
     let session_id = Uuid::new_v4();
-    let github_host = super::resume::resolve_host_from_worktree(checkout_path, "").await;
+    let github_host = super::resume::resolve_child_host_from_worktree(checkout_path, "").await;
 
     let prompt = REBASE_PROMPT_TEMPLATE.replace("<BASE_BRANCH>", base_branch);
     let cmd = backend.build_command(checkout_path, &session_id, &prompt, &github_host);

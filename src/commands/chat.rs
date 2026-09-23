@@ -78,12 +78,16 @@ async fn detect_project_context(
                     Ok(root) => root,
                     Err(_) => std::env::current_dir().ok()?,
                 };
-                // --repo carries no host, so fall back to the remote and then
-                // to the owner-based config heuristic. Both can come up empty,
-                // in which case GH_HOST is left untouched.
-                let host = match super::resume::resolve_host_from_remotes(&repo_root).await {
+                // --repo carries no host, so it has to be inferred — but the
+                // flag names a repo that may live on a different instance
+                // than the checkout we happen to be standing in. A configured
+                // host for the requested owner therefore wins, and the current
+                // repo's remote is only a valid signal when it belongs to that
+                // same owner (one owner lives on one instance). Both can come
+                // up empty, in which case GH_HOST is left untouched.
+                let host = match crate::github::configured_host_for_owner(owner, None) {
                     Some(host) => Some(host),
-                    None => crate::github::configured_host_for_owner(owner, None),
+                    None => host_from_matching_remote(&repo_root, owner).await,
                 };
                 return Some((repo_root, owner.to_string(), name.to_string(), host));
             }
@@ -105,6 +109,17 @@ async fn detect_project_context(
     let (host, owner, repo_name) =
         git::resolve_github_repo_from_remotes(&repo_root, &host_registry).await?;
     Some((repo_root, owner, repo_name, Some(host)))
+}
+
+/// Host from the current checkout's remotes, but only if they point at `owner`.
+///
+/// Guards the `--repo owner/repo` path: running `gru chat --repo corp/project`
+/// from inside a github.com checkout must not resolve `GH_HOST=github.com`.
+async fn host_from_matching_remote(repo_root: &Path, owner: &str) -> Option<String> {
+    let host_registry = crate::config::load_host_registry();
+    let (host, remote_owner, _) =
+        git::resolve_github_repo_from_remotes(repo_root, &host_registry).await?;
+    remote_owner.eq_ignore_ascii_case(owner).then_some(host)
 }
 
 /// Builds the system prompt for in-repo context.
@@ -210,6 +225,54 @@ fn is_utf8_char_boundary(b: u8) -> bool {
 mod tests {
     use super::*;
 
+    /// Git repo with the given `(name, url)` remotes, for host resolution tests.
+    fn repo_with_remotes(remotes: &[(&str, &str)]) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let run = |args: Vec<&str>| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir.path())
+                .output()
+                .expect("git")
+        };
+        run(vec!["init", "--quiet"]);
+        for (name, url) in remotes {
+            run(vec!["remote", "add", name, url]);
+        }
+        dir
+    }
+
+    #[tokio::test]
+    async fn test_host_from_matching_remote_ignores_other_owners_repo() {
+        // Regression: `gru chat --repo corp/project` from inside a github.com
+        // checkout must not resolve that checkout's host for `corp`.
+        let dir = repo_with_remotes(&[("origin", "https://github.com/someone/other.git")]);
+        assert_eq!(host_from_matching_remote(dir.path(), "corp").await, None);
+    }
+
+    #[tokio::test]
+    async fn test_host_from_matching_remote_uses_same_owners_remote() {
+        // Same owner means the same instance, so the remote's host applies
+        // even when --repo names a different repo under it.
+        let dir =
+            repo_with_remotes(&[("origin", "https://github.corp.example.com/corp/other.git")]);
+        assert_eq!(
+            host_from_matching_remote(dir.path(), "corp").await,
+            Some("github.corp.example.com".to_string())
+        );
+        // Owner comparison is case-insensitive, as GitHub owners are.
+        assert_eq!(
+            host_from_matching_remote(dir.path(), "Corp").await,
+            Some("github.corp.example.com".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_host_from_matching_remote_without_remotes() {
+        let dir = repo_with_remotes(&[]);
+        assert_eq!(host_from_matching_remote(dir.path(), "corp").await, None);
+    }
+
     #[test]
     fn test_build_no_repo_prompt_contains_key_info() {
         let prompt = build_no_repo_prompt();
@@ -304,10 +367,11 @@ mod tests {
         let (_, owner, repo, host) = result.expect("--repo flag should produce context");
         assert_eq!(owner, "myowner");
         assert_eq!(repo, "myrepo");
-        // Host comes from the git remote, never from --repo itself. This repo's
-        // remote is on github.com, which is also what the owner-based fallback
-        // would produce, so the assertion holds either way.
-        assert_eq!(host.as_deref(), Some("github.com"));
+        // Host is never taken from --repo itself, and the surrounding
+        // checkout's remote only counts when it belongs to the requested
+        // owner. "myowner" isn't this repo's owner and isn't configured, so
+        // nothing resolves and GH_HOST is left inherited.
+        assert_eq!(host, None);
     }
 
     #[tokio::test]
