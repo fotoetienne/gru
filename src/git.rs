@@ -293,34 +293,87 @@ pub(crate) async fn list_remotes(dir: &Path) -> Vec<(String, String)> {
 /// `origin`.
 ///
 /// Returns `None` when no remote yields a GitHub repo, in which case callers
-/// must not guess a host — see `resume::resolve_host_from_remotes`.
+/// must not guess a host — see `resume::resolve_host_from_remotes`. When
+/// nothing resolves but the repo does have remotes on unrecognised hosts, a
+/// warning names them, so a GHES instance whose hostname follows no convention
+/// (`code.corp.example.com`) surfaces as a configuration gap instead of
+/// silently degrading to `github.com`.
 pub(crate) async fn resolve_github_repo_from_remotes(
     dir: &Path,
     host_registry: &HostRegistry,
 ) -> Option<(String, String, String)> {
+    let remotes = list_remotes(dir).await;
+    let (resolved, unrecognized) = rank_github_remotes(&remotes, host_registry);
+
+    if resolved.is_none() && !unrecognized.is_empty() {
+        eprintln!(
+            "⚠️  Could not determine a GitHub host from this repo's remotes.\n\
+             \x20   Unrecognised host(s): {}\n\
+             \x20   If that is a GitHub Enterprise instance, add it to config.toml so \
+             gh targets it:\n\
+             \x20     [github_hosts.corp]\n\
+             \x20     host = \"{}\"",
+            unrecognized.join(", "),
+            unrecognized[0]
+        );
+    }
+
+    resolved
+}
+
+/// Picks the best GitHub remote from `(name, url)` pairs.
+///
+/// Returns the winning `(host, owner, repo)`, or — when nothing resolves — the
+/// hosts of any remotes that were repo-shaped URLs on hosts we can neither
+/// validate nor recognise, so the caller can report them. The two are mutually
+/// exclusive: an unrecognised mirror alongside a usable GitHub remote is not a
+/// configuration gap worth reporting.
+fn rank_github_remotes(
+    remotes: &[(String, String)],
+    host_registry: &HostRegistry,
+) -> (Option<(String, String, String)>, Vec<String>) {
     let mut configured_other: Option<(String, String, String)> = None;
     let mut likely_origin: Option<(String, String, String)> = None;
     let mut likely_other: Option<(String, String, String)> = None;
+    let mut unrecognized: Vec<String> = Vec::new();
 
-    for (name, url) in list_remotes(dir).await {
+    for (name, url) in remotes {
         let is_origin = name == "origin";
         // A registry-validated parse confirms both the URL shape and that the
         // host is one we've been told about.
-        if let Ok(parsed) = parse_github_remote(&url, host_registry) {
+        if let Ok(parsed) = parse_github_remote(url, host_registry) {
             if is_origin {
-                return Some(parsed);
+                return (Some(parsed), Vec::new());
             }
             configured_other.get_or_insert(parsed);
-        } else if let Some(parsed) = parse_github_like_remote(&url) {
+        } else if let Some(parsed) = parse_github_like_remote(url) {
             if is_origin {
                 likely_origin.get_or_insert(parsed);
             } else {
                 likely_other.get_or_insert(parsed);
             }
+        } else if let Some(host) = unconfigured_host(url) {
+            if !unrecognized.contains(&host) {
+                unrecognized.push(host);
+            }
         }
     }
 
-    configured_other.or(likely_origin).or(likely_other)
+    match configured_other.or(likely_origin).or(likely_other) {
+        Some(parsed) => (Some(parsed), Vec::new()),
+        None => (None, unrecognized),
+    }
+}
+
+/// Hostname of a remote that is repo-shaped but on an unrecognised host.
+///
+/// Used only to build the warning above: the host could belong to GitHub
+/// Enterprise or to an unrelated forge, and there's no way to tell without
+/// configuration, so it is reported rather than used.
+fn unconfigured_host(url: &str) -> Option<String> {
+    let parts = split_github_url(url)?;
+    split_owner_repo(parts.rest)?;
+    Some(parts.host.to_string())
 }
 
 /// Supported URL schemes for GitHub remotes and web URLs.
@@ -1442,6 +1495,86 @@ mod tests {
             None
         );
         assert_eq!(parse_github_like_remote("not-a-url"), None);
+    }
+
+    fn remotes(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(n, u)| (n.to_string(), u.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn test_rank_github_remotes_reports_unrecognized_hosts() {
+        // A GHES instance whose hostname follows no convention can't be
+        // validated, but it must be reported rather than silently dropped.
+        let (resolved, unrecognized) = rank_github_remotes(
+            &remotes(&[("origin", "https://code.corp.example.com/acme/widgets.git")]),
+            &default_hosts(),
+        );
+        assert_eq!(resolved, None);
+        assert_eq!(unrecognized, vec!["code.corp.example.com".to_string()]);
+    }
+
+    #[test]
+    fn test_rank_github_remotes_configuring_host_resolves_it() {
+        let mut config = LabConfig::default();
+        config.github_hosts.insert(
+            "corp".to_string(),
+            GhHostConfig {
+                host: "code.corp.example.com".to_string(),
+                web_url: None,
+            },
+        );
+        let (resolved, unrecognized) = rank_github_remotes(
+            &remotes(&[("origin", "https://code.corp.example.com/acme/widgets.git")]),
+            &HostRegistry::from_config(&config),
+        );
+        assert_eq!(
+            resolved,
+            Some((
+                "code.corp.example.com".to_string(),
+                "acme".to_string(),
+                "widgets".to_string()
+            ))
+        );
+        assert!(unrecognized.is_empty());
+    }
+
+    #[test]
+    fn test_rank_github_remotes_no_warning_when_resolved() {
+        // An unrecognised mirror alongside a usable GitHub remote isn't a
+        // configuration gap, so it shouldn't be reported.
+        let (resolved, unrecognized) = rank_github_remotes(
+            &remotes(&[
+                ("origin", "https://code.corp.example.com/acme/widgets.git"),
+                ("upstream", "https://github.com/acme/widgets.git"),
+            ]),
+            &default_hosts(),
+        );
+        assert_eq!(
+            resolved,
+            Some((
+                "github.com".to_string(),
+                "acme".to_string(),
+                "widgets".to_string()
+            ))
+        );
+        assert!(unrecognized.is_empty());
+    }
+
+    #[test]
+    fn test_rank_github_remotes_dedupes_and_skips_non_repo_urls() {
+        let (resolved, unrecognized) = rank_github_remotes(
+            &remotes(&[
+                ("origin", "https://code.corp.example.com/acme/widgets.git"),
+                ("origin", "git@code.corp.example.com:acme/widgets.git"),
+                ("weird", "https://code.corp.example.com/acme"),
+            ]),
+            &default_hosts(),
+        );
+        assert_eq!(resolved, None);
+        assert_eq!(unrecognized, vec!["code.corp.example.com".to_string()]);
     }
     use super::*;
     use crate::config::{GhHostConfig, LabConfig};
