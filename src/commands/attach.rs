@@ -152,8 +152,7 @@ pub(crate) async fn handle_attach(
         .as_deref()
         .and_then(|r| r.split('/').next())
         .unwrap_or("");
-    let github_host =
-        super::resume::resolve_child_host_from_worktree(&checkout_path, owner_hint).await;
+    let github_host = super::resume::resolve_host_from_worktree(&checkout_path, owner_hint).await;
 
     // Build command for interactive mode via the resolved backend
     let mut cmd = match &session_id {

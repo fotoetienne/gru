@@ -67,7 +67,9 @@ pub(crate) fn configured_host_for_owner(
         if let Some((host, repo_owner, _repo)) =
             crate::config::parse_repo_entry_with_hosts(repo_spec, &cfg.github_hosts)
         {
-            if repo_owner == owner && host != "github.com" {
+            // GitHub owner names are case-insensitive, and `owner` comes
+            // straight from a user-typed `--repo` value.
+            if repo_owner.eq_ignore_ascii_case(owner) && host != "github.com" {
                 return Some(host);
             }
         }
@@ -1705,6 +1707,24 @@ mod tests {
     }
 
     // --- infer_github_host tests ---
+
+    #[test]
+    fn test_configured_host_for_owner_is_case_insensitive() {
+        // `--repo Corp/project` must still select corp's configured host.
+        let mut cfg = crate::config::LabConfig::default();
+        cfg.github_hosts.insert(
+            "corp".to_string(),
+            crate::config::GhHostConfig {
+                host: "code.corp.example.com".to_string(),
+                web_url: None,
+            },
+        );
+        cfg.daemon.repos = vec!["code.corp.example.com/corp/project".to_string()];
+        assert_eq!(
+            configured_host_for_owner("Corp", Some(&cfg)),
+            Some("code.corp.example.com".to_string())
+        );
+    }
 
     #[test]
     fn test_infer_github_host_public_owner() {

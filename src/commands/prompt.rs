@@ -784,7 +784,7 @@ async fn register_and_run_agent(
     let github_host = if let Some(h) = fetched.host.as_deref().or(fetched.pr_host.as_deref()) {
         h
     } else {
-        github_host_owned = super::resume::resolve_child_host_from_worktree(&ws.run_dir, "").await;
+        github_host_owned = super::resume::resolve_host_from_worktree(&ws.run_dir, "").await;
         &github_host_owned
     };
     let mut cmd = backend.build_command(

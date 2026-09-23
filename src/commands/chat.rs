@@ -106,9 +106,13 @@ async fn detect_project_context(
     // instead of silently falling back to the no-repo onboarding prompt.
     let repo_root = git::detect_git_repo().await.ok()?;
     let host_registry = crate::config::load_host_registry();
-    let (host, owner, repo_name) =
-        git::resolve_github_repo_from_remotes(&repo_root, &host_registry).await?;
-    Some((repo_root, owner, repo_name, Some(host)))
+    let resolved = git::resolve_github_repo_from_remotes(&repo_root, &host_registry).await?;
+    Some((
+        repo_root,
+        resolved.owner,
+        resolved.repo,
+        Some(resolved.host),
+    ))
 }
 
 /// Host from the current checkout's remotes, but only if they point at `owner`.
@@ -117,9 +121,25 @@ async fn detect_project_context(
 /// from inside a github.com checkout must not resolve `GH_HOST=github.com`.
 async fn host_from_matching_remote(repo_root: &Path, owner: &str) -> Option<String> {
     let host_registry = crate::config::load_host_registry();
-    let (host, remote_owner, _) =
-        git::resolve_github_repo_from_remotes(repo_root, &host_registry).await?;
-    remote_owner.eq_ignore_ascii_case(owner).then_some(host)
+    let (candidates, unknown) =
+        git::github_repo_candidates_from_remotes(repo_root, &host_registry).await;
+    // Filter every candidate by the requested owner rather than looking only at
+    // the globally ranked winner: an `origin` on github.com must not hide an
+    // `upstream` that actually points at the requested owner's instance.
+    let matched = candidates
+        .into_iter()
+        .find(|candidate| candidate.owner.eq_ignore_ascii_case(owner))
+        .map(|candidate| candidate.host);
+    if matched.is_none() {
+        // Only warn about skipped remotes that belong to the owner we wanted;
+        // an unrecognised host for some other owner is not this run's problem.
+        let relevant: Vec<git::UnknownRemote> = unknown
+            .into_iter()
+            .filter(|remote| remote.owner.eq_ignore_ascii_case(owner))
+            .collect();
+        git::warn_unknown_remotes(&relevant);
+    }
+    matched
 }
 
 /// Builds the system prompt for in-repo context.
@@ -248,6 +268,23 @@ mod tests {
         // checkout must not resolve that checkout's host for `corp`.
         let dir = repo_with_remotes(&[("origin", "https://github.com/someone/other.git")]);
         assert_eq!(host_from_matching_remote(dir.path(), "corp").await, None);
+    }
+
+    #[tokio::test]
+    async fn test_host_from_matching_remote_scans_all_remotes() {
+        // The globally ranked winner (`origin`) belongs to another owner, but
+        // `upstream` points at the requested owner's instance and must win.
+        let dir = repo_with_remotes(&[
+            ("origin", "https://github.com/someone/other.git"),
+            (
+                "upstream",
+                "https://github.corp.example.com/corp/project.git",
+            ),
+        ]);
+        assert_eq!(
+            host_from_matching_remote(dir.path(), "corp").await,
+            Some("github.corp.example.com".to_string())
+        );
     }
 
     #[tokio::test]
