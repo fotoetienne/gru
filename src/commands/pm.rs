@@ -45,17 +45,11 @@ async fn launch_skill_session(
     // Strip YAML frontmatter from the skill content (delimited by --- lines)
     let system_prompt = strip_frontmatter(skill_content);
 
-    // Resolve the host from the repo's git remote so `gh` calls inside the
-    // session target the right GitHub Enterprise instance. No owner hint is
-    // available here, so the remote URL is the only signal — and if it yields
-    // nothing, GH_HOST is left as inherited rather than guessed at.
-    let (github_host, unknown_remotes) =
-        super::resume::resolve_host_from_remotes(&repo_root, "").await;
-    if github_host.is_none() {
-        // No other source to try here, so an unrecognised remote is a real
-        // configuration gap worth naming.
-        crate::git::warn_unknown_remotes(&unknown_remotes);
-    }
+    // Resolve the host for the child session so `gh` calls inside it target the
+    // right GitHub Enterprise instance. No owner hint is available here, so the
+    // remote URL is the first signal, then configured hosts, then an inherited
+    // GH_HOST; `None` means leave GH_HOST alone rather than guess at it.
+    let github_host = super::resume::resolve_child_host_from_worktree(&repo_root, "").await;
 
     let backend = crate::agent_registry::resolve_backend(agent_name)?;
     let mut cmd = backend

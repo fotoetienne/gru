@@ -610,6 +610,10 @@ mod tests {
             std::process::Command::new("git")
                 .args(args)
                 .current_dir(dir.path())
+                // Keep an inherited GIT_DIR (e.g. running under a git hook)
+                // from redirecting these commands at the real repo.
+                .env_remove("GIT_DIR")
+                .env_remove("GIT_WORK_TREE")
                 .output()
                 .expect("git")
         };
@@ -667,6 +671,8 @@ mod tests {
                 "https://github.corp.example.com/owner/repo.git",
             ])
             .current_dir(dir.path())
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
             .output()
             .expect("git");
         assert_eq!(

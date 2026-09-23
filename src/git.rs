@@ -265,6 +265,11 @@ pub(crate) async fn list_remotes(dir: &Path) -> Vec<(String, String)> {
     let output = Command::new("git")
         .args(["remote", "-v"])
         .current_dir(dir)
+        // An inherited GIT_DIR/GIT_WORK_TREE (gru run from a git hook, or from
+        // `git rebase -x`) outranks `current_dir` and would list some other
+        // repo's remotes. `dir` is the repo we were asked about.
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
         .output()
         .await;
 
@@ -470,6 +475,11 @@ fn rank_github_remotes(
             if !unknown.contains(&remote) {
                 unknown.push(remote);
             }
+        } else {
+            // Not repo-shaped at all, or malformed enough that we can't even
+            // name a host (e.g. an invalid port). Nothing actionable to warn
+            // about, but leave a trace so an ignored remote is explicable.
+            log::debug!("Skipping unparseable git remote '{name}': {url}");
         }
     }
 
