@@ -96,6 +96,11 @@ pub(crate) struct ClaudeAgentConfig {
     /// to impose an explicit turn limit (e.g., 50).
     #[serde(default)]
     pub(crate) ci_fix_max_turns: Option<u32>,
+
+    /// Model to pass via `--model` (e.g. `"claude-opus-5-5"` or `"sonnet"`).
+    /// `None` (the default) lets the Claude Code CLI pick its own default.
+    #[serde(default)]
+    pub(crate) model: Option<String>,
 }
 
 fn default_agent_name() -> String {
@@ -662,6 +667,9 @@ impl LabConfig {
 # [agent.claude]
 # # Override the Claude Code CLI binary path
 # binary = "/usr/local/bin/claude"
+#
+# # Model to pass via --model (e.g. "claude-opus-5-5" or "sonnet")
+# model = "claude-opus-5-5"
 
 # [agent.pi]
 # # Override the Pi CLI binary path (matters more for Pi than Claude, since
@@ -926,6 +934,16 @@ impl LabConfig {
                 anyhow::bail!(
                     "agent.claude.binary must not be empty. Remove the field to use \
                      \"claude\" (resolved via $PATH), or set it to a valid binary path."
+                );
+            }
+        }
+
+        if let Some(model) = &self.agent.claude.model {
+            if model.trim().is_empty() {
+                anyhow::bail!(
+                    "agent.claude.model must not be empty. Remove the field to let \
+                     the Claude Code CLI use its own default, or set it to a valid \
+                     model name."
                 );
             }
         }
@@ -1453,6 +1471,19 @@ binary = "/opt/tools/codex"
         assert!(result.is_err());
         let msg = format!("{}", result.err().unwrap());
         assert!(msg.contains("agent.pi.binary"), "{}", msg);
+    }
+
+    #[test]
+    fn test_agent_claude_model_empty_is_rejected() {
+        let config_toml = "[agent.claude]\nmodel = \"\"\n";
+        let mut temp_file = NamedTempFile::new().unwrap();
+        temp_file.write_all(config_toml.as_bytes()).unwrap();
+        temp_file.flush().unwrap();
+
+        let result = LabConfig::load_partial(temp_file.path());
+        assert!(result.is_err());
+        let msg = format!("{}", result.err().unwrap());
+        assert!(msg.contains("agent.claude.model"), "{}", msg);
     }
 
     #[test]

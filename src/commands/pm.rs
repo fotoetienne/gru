@@ -48,6 +48,9 @@ async fn launch_skill_session(
 
     let mut cmd = Command::new(crate::agent_registry::configured_claude_binary());
     cmd.arg("--system-prompt").arg(system_prompt);
+    if let Some(model) = crate::agent_registry::configured_claude_model() {
+        cmd.arg("--model").arg(model);
+    }
 
     if let Some(ref p) = prompt {
         // Use argument terminator so prompts like "-h" are not treated as CLI flags

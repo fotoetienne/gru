@@ -38,6 +38,9 @@ pub(crate) struct ClaudeBackend {
     ci_fix_max_turns: Option<u32>,
     /// Path or name of the Claude Code CLI binary to invoke (`agent.claude.binary` in config).
     binary: String,
+    /// Model to pass via `--model` (`agent.claude.model` in config). `None` lets
+    /// the Claude Code CLI use its own default.
+    model: Option<String>,
 }
 
 impl Default for ClaudeBackend {
@@ -46,16 +49,22 @@ impl Default for ClaudeBackend {
             tool_buffer: Mutex::new(None),
             ci_fix_max_turns: None,
             binary: "claude".to_string(),
+            model: None,
         }
     }
 }
 
 impl ClaudeBackend {
-    pub(crate) fn new(ci_fix_max_turns: Option<u32>, binary: Option<String>) -> Self {
+    pub(crate) fn new(
+        ci_fix_max_turns: Option<u32>,
+        binary: Option<String>,
+        model: Option<String>,
+    ) -> Self {
         Self {
             tool_buffer: Mutex::new(None),
             ci_fix_max_turns,
             binary: binary.unwrap_or_else(|| "claude".to_string()),
+            model,
         }
     }
 
@@ -67,8 +76,11 @@ impl ClaudeBackend {
         cmd.arg("--print")
             .arg("--output-format")
             .arg("text")
-            .arg("--dangerously-skip-permissions")
-            .current_dir(worktree_path)
+            .arg("--dangerously-skip-permissions");
+        if let Some(model) = &self.model {
+            cmd.arg("--model").arg(model);
+        }
+        cmd.current_dir(worktree_path)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::inherit())
             .env_remove(crate::labels::GRU_RETRY_PARENT_ENV)
@@ -188,6 +200,7 @@ impl AgentBackend for ClaudeBackend {
             session_id,
             prompt,
             github_host,
+            self.model.as_deref(),
         )
     }
 
@@ -225,6 +238,7 @@ impl AgentBackend for ClaudeBackend {
             session_id,
             prompt,
             github_host,
+            self.model.as_deref(),
         ))
     }
 
@@ -235,9 +249,11 @@ impl AgentBackend for ClaudeBackend {
         github_host: &str,
     ) -> Option<TokioCommand> {
         let mut cmd = TokioCommand::new(&self.binary);
-        cmd.arg("--resume")
-            .arg(session_id.to_string())
-            .current_dir(worktree_path)
+        cmd.arg("--resume").arg(session_id.to_string());
+        if let Some(model) = &self.model {
+            cmd.arg("--model").arg(model);
+        }
+        cmd.current_dir(worktree_path)
             .stdin(std::process::Stdio::inherit())
             .stdout(std::process::Stdio::inherit())
             .stderr(std::process::Stdio::inherit())
@@ -276,6 +292,9 @@ impl AgentBackend for ClaudeBackend {
             .arg("--dangerously-skip-permissions");
         if let Some(max_turns) = self.ci_fix_max_turns {
             cmd.arg("--max-turns").arg(max_turns.to_string());
+        }
+        if let Some(model) = &self.model {
+            cmd.arg("--model").arg(model);
         }
         cmd.arg(prompt)
             .current_dir(worktree_path)
@@ -541,7 +560,7 @@ mod tests {
 
     #[test]
     fn test_build_ci_fix_command_applies_max_turns() {
-        let b = ClaudeBackend::new(Some(10), None);
+        let b = ClaudeBackend::new(Some(10), None, None);
         let path = std::path::PathBuf::from("/tmp/worktree");
         let cmd = b.build_ci_fix_command(&path, "fix the CI", "github.com");
         let inner = cmd.as_std();
@@ -553,7 +572,7 @@ mod tests {
 
     #[test]
     fn test_binary_override_used_for_all_commands() {
-        let b = ClaudeBackend::new(None, Some("/opt/tools/claude".to_string()));
+        let b = ClaudeBackend::new(None, Some("/opt/tools/claude".to_string()), None);
         let path = std::path::PathBuf::from("/tmp/worktree");
         let session_id = Uuid::nil();
 
@@ -589,6 +608,41 @@ mod tests {
                 .get_program(),
             "/opt/tools/claude"
         );
+    }
+
+    #[test]
+    fn test_model_override_applied_to_all_commands() {
+        let b = ClaudeBackend::new(None, None, Some("claude-opus-5-5".to_string()));
+        let path = std::path::PathBuf::from("/tmp/worktree");
+        let session_id = Uuid::nil();
+
+        let assert_has_model = |cmd: &TokioCommand| {
+            let args: Vec<&std::ffi::OsStr> = cmd.as_std().get_args().collect();
+            assert!(args.contains(&"--model".as_ref()));
+            assert!(args.contains(&"claude-opus-5-5".as_ref()));
+        };
+
+        assert_has_model(&b.build_command(&path, &session_id, "p", "github.com"));
+        assert_has_model(
+            &b.build_resume_command(&path, &session_id, "p", "github.com")
+                .unwrap(),
+        );
+        assert_has_model(
+            &b.build_interactive_resume_command(&path, &session_id, "github.com")
+                .unwrap(),
+        );
+        assert_has_model(&b.build_oneshot_command(&path, "p", "github.com"));
+        assert_has_model(&b.build_ci_fix_command(&path, "p", "github.com"));
+    }
+
+    #[test]
+    fn test_no_model_override_omits_flag() {
+        let b = backend();
+        let path = std::path::PathBuf::from("/tmp/worktree");
+        let session_id = Uuid::nil();
+        let cmd = b.build_command(&path, &session_id, "p", "github.com");
+        let args: Vec<&std::ffi::OsStr> = cmd.as_std().get_args().collect();
+        assert!(!args.contains(&"--model".as_ref()));
     }
 
     // ---- parse_event tests ----

@@ -416,6 +416,7 @@ mod tests {
         let backend = crate::claude_backend::ClaudeBackend::new(
             None,
             Some("/opt/tools/does-not-exist".to_string()),
+            None,
         );
         let cmd = backend.build_oneshot_command(
             std::path::Path::new("/tmp/worktree"),

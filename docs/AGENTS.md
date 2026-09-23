@@ -29,19 +29,24 @@ claude --help
 
 ### Configure
 
-No configuration is required — Gru uses Claude Code by default. Optionally override the binary path in `~/.gru/config.toml`:
+No configuration is required — Gru uses Claude Code by default. Optionally override the binary path or model in `~/.gru/config.toml`:
 
 ```toml
 [agent.claude]
 binary = "/usr/local/bin/claude"
+model = "claude-opus-5-5"   # e.g. "claude-opus-5-5" or "sonnet"
 ```
+
+Both keys are optional and independent. When `model` is unset, the Claude Code CLI uses its
+own default. `model` applies to every Claude invocation Gru makes, including `gru chat` and
+`gru pm`/`gru tpm`, not just `gru do`/`gru lab`.
 
 ### How Gru Uses It
 
 Gru spawns Claude Code in non-interactive mode with stream JSON output:
 
 ```bash
-claude --print --verbose --session-id <uuid> --output-format stream-json --dangerously-skip-permissions --include-partial-messages "<prompt>"
+claude --print --verbose --session-id <uuid> --output-format stream-json --dangerously-skip-permissions --include-partial-messages [--model <model>] "<prompt>"
 ```
 
 Key flags:
@@ -50,6 +55,7 @@ Key flags:
 - `--output-format stream-json` — real-time event stream
 - `--dangerously-skip-permissions` — autonomous operation
 - `--session-id <uuid>` — maintain context across resumes
+- `--model <model>` — only added when `[agent.claude]` sets `model` in config
 
 ## OpenAI Codex
 
