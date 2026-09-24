@@ -1125,7 +1125,7 @@ impl LabConfig {
                 anyhow::bail!(
                     "[github_hosts.{}]: 'host' value '{}' must not include a port — a host's \
                      identity is portless. Put the port in the repository's git remote URL \
-                     (e.g. https://{}/owner/repo) and gru carries it through to GH_HOST.",
+                     (e.g. https://{}/owner/repo), which is where gru reads it from.",
                     name,
                     gh_host.host,
                     gh_host.host
