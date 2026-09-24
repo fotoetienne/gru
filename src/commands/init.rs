@@ -403,6 +403,14 @@ async fn detect_current_repo() -> Result<(String, String, String)> {
     let (host, owner, repo) = parse_github_remote(&remote_url, &host_registry)
         .context("Could not parse GitHub owner/repo from remote URL")?;
 
+    // `parse_github_remote` returns the host's *identity*, which is portless
+    // by design. Everything init does with this value next has to actually
+    // reach the instance — the `gh` auth check, the label and issue calls, the
+    // bare clone URL — so hand back the endpoint form instead. The port is
+    // stripped again by `build_repo_entry` before anything is persisted, so
+    // config entries stay portless.
+    let host = crate::git::remote_gh_host(&remote_url, &host_registry).unwrap_or(host);
+
     println!("  Detected: {}/{}", owner, repo);
 
     Ok((owner, repo, host))
@@ -536,6 +544,29 @@ mod tests {
     /// round-trip that a ported host broke: the entry was written, but
     /// `HostRegistry::from_config` then failed to match the very remote it
     /// came from and every `gru do` reported "no GitHub remote".
+    /// `gru init` in a ported checkout must reach the instance *and* persist a
+    /// portless entry — the two halves of the same remote, used differently.
+    #[test]
+    fn detected_endpoint_keeps_the_port_while_the_entry_drops_it() {
+        let hosts = HashMap::from([("ghe".to_string(), host("ghe.example.com"))]);
+        let config = LabConfig {
+            github_hosts: hosts.clone(),
+            ..Default::default()
+        };
+        let registry = crate::config::HostRegistry::from_config(&config);
+        let remote_url = "https://ghe.example.com:8443/acme/widgets.git";
+
+        // What detect_current_repo hands to check_auth_via_cli and the clone.
+        let endpoint = crate::git::remote_gh_host(remote_url, &registry).unwrap();
+        assert_eq!(endpoint, "ghe.example.com:8443");
+
+        // What lands in daemon.repos.
+        let (_identity, owner, repo) =
+            crate::git::parse_github_remote(remote_url, &registry).unwrap();
+        let entry = build_repo_entry(&endpoint, &owner, &repo, &hosts).unwrap();
+        assert_eq!(entry, "ghe:acme/widgets");
+    }
+
     fn assert_round_trips(remote_url: &str, hosts: &HashMap<String, GhHostConfig>) {
         let mut config = LabConfig {
             github_hosts: hosts.clone(),
