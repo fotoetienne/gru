@@ -817,6 +817,32 @@ mod tests {
     }
 
     #[test]
+    fn test_build_interactive_command_sets_gh_host() {
+        let b = backend();
+        let path = std::path::PathBuf::from("/tmp/project");
+        let cmd = b
+            .build_interactive_command(&path, "sys", None, Some("ghe.example.com"))
+            .expect("pi supports interactive sessions");
+        let envs: Vec<_> = cmd.as_std().get_envs().collect();
+        assert!(envs
+            .iter()
+            .any(|(k, v)| *k == "GH_HOST" && *v == Some("ghe.example.com".as_ref())));
+    }
+
+    #[test]
+    fn test_build_interactive_command_without_host_leaves_gh_host_unset() {
+        let b = backend();
+        let path = std::path::PathBuf::from("/tmp/project");
+        let cmd = b
+            .build_interactive_command(&path, "sys", None, None)
+            .expect("pi supports interactive sessions");
+        // Not even as a removal: an unresolved host must leave whatever the
+        // user's environment already says alone.
+        let envs: Vec<_> = cmd.as_std().get_envs().collect();
+        assert!(!envs.iter().any(|(k, _)| *k == "GH_HOST"));
+    }
+
+    #[test]
     fn test_build_interactive_command_shape() {
         let b = backend();
         let path = std::path::PathBuf::from("/tmp/project");

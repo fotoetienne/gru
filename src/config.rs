@@ -509,8 +509,22 @@ pub(crate) fn parse_repo_entry_with_hosts(
     }
 }
 
+/// How specifically a `daemon.repos` entry matched the repo being resolved.
+///
+/// The distinction matters to callers weighing config against other evidence:
+/// an entry naming the exact repo is the user stating this repo's host, while
+/// an owner-only match is an inference from a *sibling* repo that may well live
+/// somewhere else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HostMatch {
+    /// An entry naming this exact `owner/repo`.
+    Exact,
+    /// An entry naming this owner, but a different (or unspecified) repo.
+    OwnerOnly,
+}
+
 /// Looks up the host configured for `owner` (optionally narrowed to `repo`)
-/// in `daemon.repos`.
+/// in `daemon.repos`, along with how specifically the entry matched.
 ///
 /// An exact `owner/repo` match wins over an owner-only match, so a config that
 /// lists both `acme/widgets` (github.com) and `ghe.example.com/acme/tools`
@@ -518,13 +532,15 @@ pub(crate) fn parse_repo_entry_with_hosts(
 /// case-insensitively, matching GitHub's own handling.
 ///
 /// A `daemon.repos` entry is an explicit statement by the user, including when
-/// it resolves to `github.com` — callers treat this as outranking any host
-/// guessed from a checkout's remotes or inherited from the environment.
+/// it resolves to `github.com`. Callers treat a [`HostMatch::Exact`] result as
+/// outranking any host guessed from a checkout's remotes or inherited from the
+/// environment; a [`HostMatch::OwnerOnly`] result is weaker evidence than the
+/// repo's own remote.
 pub(crate) fn configured_host_for_repo(
     config: &LabConfig,
     owner: &str,
     repo: Option<&str>,
-) -> Option<String> {
+) -> Option<(String, HostMatch)> {
     let mut owner_match: Option<String> = None;
     for entry in &config.daemon.repos {
         let Some((entry_host, entry_owner, entry_repo)) =
@@ -537,14 +553,14 @@ pub(crate) fn configured_host_for_repo(
         }
         if let Some(repo) = repo {
             if entry_repo.eq_ignore_ascii_case(repo) {
-                return Some(entry_host.to_ascii_lowercase());
+                return Some((entry_host.to_ascii_lowercase(), HostMatch::Exact));
             }
         }
         if owner_match.is_none() {
             owner_match = Some(entry_host.to_ascii_lowercase());
         }
     }
-    owner_match
+    owner_match.map(|host| (host, HostMatch::OwnerOnly))
 }
 
 /// Registry of known GitHub hosts, built from config.
@@ -1266,11 +1282,11 @@ mod tests {
         let config = config_with_ghe(&["ghe:acme/tools", "acme/widgets"]);
         assert_eq!(
             configured_host_for_repo(&config, "acme", Some("widgets")),
-            Some("github.com".to_string())
+            Some(("github.com".to_string(), HostMatch::Exact))
         );
         assert_eq!(
             configured_host_for_repo(&config, "acme", Some("tools")),
-            Some("ghe.example.com".to_string())
+            Some(("ghe.example.com".to_string(), HostMatch::Exact))
         );
     }
 
@@ -1279,7 +1295,7 @@ mod tests {
         let config = config_with_ghe(&["ghe:acme/tools"]);
         assert_eq!(
             configured_host_for_repo(&config, "acme", Some("unlisted")),
-            Some("ghe.example.com".to_string())
+            Some(("ghe.example.com".to_string(), HostMatch::OwnerOnly))
         );
         assert_eq!(configured_host_for_repo(&config, "other", None), None);
     }
@@ -1289,7 +1305,7 @@ mod tests {
         let config = config_with_ghe(&["ghe:Acme/Tools"]);
         assert_eq!(
             configured_host_for_repo(&config, "aCME", Some("tOOLS")),
-            Some("ghe.example.com".to_string())
+            Some(("ghe.example.com".to_string(), HostMatch::Exact))
         );
     }
 
