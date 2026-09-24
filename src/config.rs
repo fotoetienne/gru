@@ -1115,6 +1115,22 @@ impl LabConfig {
             if gh_host.host.is_empty() {
                 anyhow::bail!("[github_hosts.{}]: 'host' must not be empty", name);
             }
+            // A port here would silently never match anything: `split_github_url`
+            // strips the port off a remote's authority before comparing, so a
+            // `host = "ghe.example.com:8443"` entry would be invisible to
+            // `all_url_hosts` and `parse_github_remote`. Reject it loudly and
+            // say where the port does belong, rather than normalizing it away
+            // and leaving the user's stated port with no effect.
+            if gh_host.host.contains(':') {
+                anyhow::bail!(
+                    "[github_hosts.{}]: 'host' value '{}' must not include a port — a host's \
+                     identity is portless. Put the port in the repository's git remote URL \
+                     (e.g. https://{}/owner/repo) and gru carries it through to GH_HOST.",
+                    name,
+                    gh_host.host,
+                    gh_host.host
+                );
+            }
             if !gh_host.host.contains('.') {
                 anyhow::bail!(
                     "[github_hosts.{}]: 'host' value '{}' does not look like a hostname (no dot)",
@@ -2317,6 +2333,24 @@ repos = ["owner/repo1", "ghe.example.com/org/svc1", "ghe.example.com/org/svc2"]
         config.daemon.repos = vec!["owner/repo".to_string()];
         let err = config.validate().unwrap_err();
         assert!(err.to_string().contains("does not look like a hostname"));
+    }
+
+    #[test]
+    fn test_validate_github_host_rejects_port() {
+        let mut config = LabConfig::default();
+        config.github_hosts.insert(
+            "ghe".to_string(),
+            GhHostConfig {
+                host: "ghe.example.com:8443".to_string(),
+                web_url: None,
+            },
+        );
+        config.daemon.repos = vec!["ghe:owner/repo".to_string()];
+        let err = config.validate().unwrap_err().to_string();
+        // A ported entry would never match a remote, so it must not load
+        // quietly — and the message has to say where the port does go.
+        assert!(err.contains("must not include a port"), "{err}");
+        assert!(err.contains("remote URL"), "{err}");
     }
 
     #[test]

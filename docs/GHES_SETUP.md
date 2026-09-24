@@ -84,6 +84,8 @@ host = "github.netflix.com"
 
 The name (`netflix` in this example) is your shorthand — you'll use it when referencing repos.
 
+`host` is a bare hostname and must **not** include a port; Gru rejects the config if it does. A host's identity is portless, and a port written here would never match your repos' remotes. If your instance is served on a non-default port, put it in the git remote URL (`https://github.netflix.com:8443/myteam/myapp`) — Gru reads it from there and carries it through to `GH_HOST`.
+
 ### Optional: `web_url`
 
 If the GHES web UI lives on a different domain than the API/git host (uncommon), set `web_url`. Note that `host` is a bare hostname while `web_url` is a full URL including scheme:
