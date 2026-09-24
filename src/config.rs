@@ -583,15 +583,20 @@ impl HostRegistry {
 
         // Hostnames are stored lowercased so lookups can be case-insensitive
         // (DNS is); `canonical_host` lowercases its input to match.
-        // Always include github.com
-        hosts.insert("github.com".to_string(), None);
-
-        // Add hosts from [github_hosts.*] sections
+        //
+        // Configured entries go in first so that one naming github.com — in
+        // any casing — keeps its `web_url` instead of losing it to the
+        // built-in default below. Seeding github.com first would silently
+        // discard it, which is exactly the kind of quiet loss the
+        // case-insensitive keys are meant to prevent.
         for gh_host in config.github_hosts.values() {
             hosts
                 .entry(gh_host.host.to_ascii_lowercase())
                 .or_insert_with(|| gh_host.web_url.clone());
         }
+
+        // github.com is always recognized, configured or not.
+        hosts.entry("github.com".to_string()).or_insert(None);
 
         // Add hosts from legacy daemon.repos entries (host/owner/repo format)
         for repo in &config.daemon.repos {
@@ -2154,6 +2159,29 @@ repos = ["owner/repo1", "ghe.example.com/org/svc1", "ghe.example.com/org/svc2"]
         assert_eq!(
             hosts,
             vec!["git.netflix.net", "github.com", "github.netflix.net"]
+        );
+    }
+
+    #[test]
+    fn test_configured_github_com_entry_keeps_its_web_url() {
+        let mut config = LabConfig::default();
+        // Cased differently on purpose: the built-in github.com default must
+        // not shadow a configured entry just because the two are spelled
+        // differently but resolve to the same host.
+        config.github_hosts.insert(
+            "gh".to_string(),
+            GhHostConfig {
+                host: "GitHub.com".to_string(),
+                web_url: Some("https://ui.github.com".to_string()),
+            },
+        );
+        let registry = HostRegistry::from_config(&config);
+        let mut hosts = registry.all_url_hosts();
+        hosts.sort();
+        assert_eq!(hosts, vec!["github.com", "ui.github.com"]);
+        assert_eq!(
+            registry.canonical_host("ui.github.com").as_deref(),
+            Some("github.com")
         );
     }
 
