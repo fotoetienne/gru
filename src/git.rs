@@ -293,6 +293,11 @@ pub(crate) fn split_github_url(url: &str) -> Option<GitUrlParts<'_>> {
     }
     // Split an optional `:port` off the authority. The port is carried
     // separately so host comparisons stay portless.
+    //
+    // A bracketed IPv6 literal (`[2001:db8::1]:8443`) is out of scope: the
+    // first colon lands inside the brackets, the digit check below fails, and
+    // the URL is rejected. GitHub remotes are hostnames in practice, and
+    // rejecting is safer than truncating a host at the wrong colon.
     let (host, port) = match authority.split_once(':') {
         Some((h, p)) => {
             // Reject a malformed port rather than treating `host:` or
@@ -1412,6 +1417,13 @@ mod tests {
         let parts = split_github_url("https://ghe.example.com:8443/foo/bar.git").unwrap();
         assert_eq!(parts.host, "ghe.example.com");
         assert_eq!(parts.port, Some("8443"));
+    }
+
+    #[test]
+    fn test_split_github_url_rejects_bracketed_ipv6_literal() {
+        // Documents the out-of-scope behavior: rejected, never truncated at
+        // the wrong colon.
+        assert!(split_github_url("https://[2001:db8::1]:8443/foo/bar.git").is_none());
     }
 
     #[test]
