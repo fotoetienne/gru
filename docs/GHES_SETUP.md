@@ -44,6 +44,15 @@ gh auth status
 
 Gru sets `GH_HOST` on every `gh` CLI invocation, so the correct host is always targeted — you don't need to worry about which is the "default".
 
+Interactive sessions (`gru chat`, `gru pm`, `gru tpm`) get `GH_HOST` too, so `gh` run *inside* a session hits the same instance. The host is resolved in this order:
+
+1. A `daemon.repos` entry for the owner (an exact `owner/repo` entry wins over an owner-only one). Because you wrote it down, it outranks everything else — including when it resolves to `github.com` and the checkout's remote points elsewhere.
+2. A git remote in the checkout belonging to that same owner. An explicit port (`https://ghe.example.com:8443/...`) is carried through to `GH_HOST`.
+3. A `GH_HOST` already exported in your environment.
+4. Any recognized remote, when no owner could be determined.
+
+If none of these identify a host, Gru leaves `GH_HOST` unset and `gh` applies its own configuration.
+
 ### Token scope requirements
 
 Your token needs the following scopes:

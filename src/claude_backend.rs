@@ -272,6 +272,7 @@ impl AgentBackend for ClaudeBackend {
         cwd: &Path,
         system_prompt: &str,
         initial_prompt: Option<&str>,
+        github_host: Option<&str>,
     ) -> Option<TokioCommand> {
         let mut cmd = TokioCommand::new(&self.binary);
         cmd.arg("--system-prompt").arg(system_prompt);
@@ -292,6 +293,9 @@ impl AgentBackend for ClaudeBackend {
             // labeling to a retry queue that isn't watching it.
             .env_remove(crate::labels::GRU_RETRY_PARENT_ENV)
             .env_remove(crate::labels::GRU_CONFIG_PATH_ENV);
+        if let Some(host) = github_host {
+            cmd.env("GH_HOST", host);
+        }
         Some(cmd)
     }
 
@@ -538,7 +542,7 @@ mod tests {
         let b = backend();
         let path = std::path::PathBuf::from("/tmp/project");
         let cmd = b
-            .build_interactive_command(&path, "you are a PM", None)
+            .build_interactive_command(&path, "you are a PM", None, None)
             .expect("claude supports interactive sessions");
         let inner = cmd.as_std();
 
@@ -570,7 +574,7 @@ mod tests {
         let b = ClaudeBackend::new(None, None, Some("claude-opus-5-5".to_string()));
         let path = std::path::PathBuf::from("/tmp/project");
         let cmd = b
-            .build_interactive_command(&path, "sys", Some("-h"))
+            .build_interactive_command(&path, "sys", Some("-h"), None)
             .unwrap();
         let args: Vec<String> = cmd
             .as_std()

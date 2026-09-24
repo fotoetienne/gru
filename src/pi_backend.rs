@@ -185,6 +185,7 @@ impl AgentBackend for PiBackend {
         cwd: &Path,
         system_prompt: &str,
         initial_prompt: Option<&str>,
+        github_host: Option<&str>,
     ) -> Option<TokioCommand> {
         let mut cmd = TokioCommand::new(&self.binary);
         cmd.arg("--system-prompt")
@@ -206,6 +207,9 @@ impl AgentBackend for PiBackend {
             // labeling to a retry queue that isn't watching it.
             .env_remove(crate::labels::GRU_RETRY_PARENT_ENV)
             .env_remove(crate::labels::GRU_CONFIG_PATH_ENV);
+        if let Some(host) = github_host {
+            cmd.env("GH_HOST", host);
+        }
         Some(cmd)
     }
 
@@ -817,7 +821,7 @@ mod tests {
         let b = backend();
         let path = std::path::PathBuf::from("/tmp/project");
         let cmd = b
-            .build_interactive_command(&path, "you are a PM", None)
+            .build_interactive_command(&path, "you are a PM", None, None)
             .expect("pi supports interactive sessions");
         let inner = cmd.as_std();
 
@@ -841,7 +845,7 @@ mod tests {
         let b = PiBackend::new(None, Some("anthropic/claude-sonnet-5".to_string()), None);
         let path = std::path::PathBuf::from("/tmp/project");
         let cmd = b
-            .build_interactive_command(&path, "sys", Some("-h"))
+            .build_interactive_command(&path, "sys", Some("-h"), None)
             .unwrap();
         let args: Vec<String> = cmd
             .as_std()
@@ -1030,7 +1034,7 @@ mod tests {
                 .unwrap(),
         );
         assert_removed(
-            &b.build_interactive_command(&path, "you are a PM", None)
+            &b.build_interactive_command(&path, "you are a PM", None, None)
                 .unwrap(),
         );
         assert_removed(&b.build_oneshot_command(&path, "prompt", "github.com"));

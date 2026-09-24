@@ -23,15 +23,15 @@ pub(crate) async fn handle_chat(
 ) -> Result<i32> {
     let _tmux_guard = TmuxGuard::new("gru:chat");
 
-    let (work_dir, system_prompt) = match detect_project_context(repo_flag).await {
+    let (work_dir, system_prompt, target) = match detect_project_context(repo_flag).await {
         Some((repo_root, owner, repo_name)) => {
             let prompt = build_in_repo_prompt(&repo_root, &owner, &repo_name).await;
-            (repo_root, prompt)
+            (repo_root, prompt, Some((owner, repo_name)))
         }
         None => {
             let cwd = std::env::current_dir().context("Failed to determine current directory")?;
             let prompt = build_no_repo_prompt();
-            (cwd, prompt)
+            (cwd, prompt, None)
         }
     };
 
@@ -39,9 +39,24 @@ pub(crate) async fn handle_chat(
         eprintln!("Working directory: {}", work_dir.display());
     }
 
+    // Route `gh` inside the session at the same host the user is working
+    // against; without this a GHES user's `gh` silently falls back to
+    // github.com.
+    let github_host = crate::gh_host::resolve_interactive_gh_host(
+        target.as_ref().map(|(owner, _)| owner.as_str()),
+        target.as_ref().map(|(_, repo)| repo.as_str()),
+    )
+    .await;
+    if verbose {
+        match &github_host {
+            Some(host) => eprintln!("GitHub host: {host}"),
+            None => eprintln!("GitHub host: unresolved (leaving GH_HOST unset)"),
+        }
+    }
+
     let backend = crate::agent_registry::resolve_backend(agent_name)?;
     let mut cmd = backend
-        .build_interactive_command(&work_dir, &system_prompt, None)
+        .build_interactive_command(&work_dir, &system_prompt, None, github_host.as_deref())
         .ok_or_else(|| crate::agent_registry::interactive_unsupported_error("chat", agent_name))?;
 
     let mut child = cmd.spawn().with_context(|| {

@@ -10,6 +10,7 @@ mod config;
 mod dependencies;
 mod display_utils;
 mod file_lock;
+mod gh_host;
 mod git;
 mod github;
 mod graphql;

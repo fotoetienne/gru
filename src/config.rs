@@ -424,6 +424,19 @@ fn default_auto_recovery_window_hours() -> u64 {
     DEFAULT_AUTO_RECOVERY_WINDOW_HOURS
 }
 
+/// Strips a trailing `:<port>` from a hostname.
+///
+/// A port belongs to a URL, never to a host's identity: config lookups,
+/// `HostRegistry` membership and remote matching all compare portless hosts.
+/// Returns `host` unchanged when the suffix after `:` isn't all digits, so an
+/// IPv6-ish or otherwise unexpected value is left alone rather than truncated.
+pub(crate) fn strip_host_port(host: &str) -> &str {
+    match host.rsplit_once(':') {
+        Some((h, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => h,
+        _ => host,
+    }
+}
+
 /// Parse a repo entry from the config into `(host, owner, repo)`.
 ///
 /// Accepts three formats:
@@ -478,6 +491,14 @@ pub(crate) fn parse_repo_entry_with_hosts(
             if host.is_empty() || owner.is_empty() || repo.is_empty() {
                 return None;
             }
+            // Tolerate a stray `:port` written by an older Gru: the port is not
+            // part of a host's identity, and an entry like
+            // `ghe.example.com:8443/owner/repo` would otherwise never match the
+            // remote it was derived from. See `strip_host_port`.
+            let host = strip_host_port(host);
+            if host.is_empty() {
+                return None;
+            }
             // Require the first segment to look like a hostname (contains a dot)
             if !host.contains('.') {
                 return None;
@@ -486,6 +507,44 @@ pub(crate) fn parse_repo_entry_with_hosts(
         }
         _ => None,
     }
+}
+
+/// Looks up the host configured for `owner` (optionally narrowed to `repo`)
+/// in `daemon.repos`.
+///
+/// An exact `owner/repo` match wins over an owner-only match, so a config that
+/// lists both `acme/widgets` (github.com) and `ghe.example.com/acme/tools`
+/// resolves each repo to its own host. Owner and repo are compared
+/// case-insensitively, matching GitHub's own handling.
+///
+/// A `daemon.repos` entry is an explicit statement by the user, including when
+/// it resolves to `github.com` — callers treat this as outranking any host
+/// guessed from a checkout's remotes or inherited from the environment.
+pub(crate) fn configured_host_for_repo(
+    config: &LabConfig,
+    owner: &str,
+    repo: Option<&str>,
+) -> Option<String> {
+    let mut owner_match: Option<String> = None;
+    for entry in &config.daemon.repos {
+        let Some((entry_host, entry_owner, entry_repo)) =
+            parse_repo_entry_with_hosts(entry, &config.github_hosts)
+        else {
+            continue;
+        };
+        if !entry_owner.eq_ignore_ascii_case(owner) {
+            continue;
+        }
+        if let Some(repo) = repo {
+            if entry_repo.eq_ignore_ascii_case(repo) {
+                return Some(entry_host.to_ascii_lowercase());
+            }
+        }
+        if owner_match.is_none() {
+            owner_match = Some(entry_host.to_ascii_lowercase());
+        }
+    }
+    owner_match
 }
 
 /// Registry of known GitHub hosts, built from config.
@@ -506,20 +565,22 @@ impl HostRegistry {
     pub(crate) fn from_config(config: &LabConfig) -> Self {
         let mut hosts: HashMap<String, Option<String>> = HashMap::new();
 
+        // Hostnames are stored lowercased so lookups can be case-insensitive
+        // (DNS is); `canonical_host` lowercases its input to match.
         // Always include github.com
         hosts.insert("github.com".to_string(), None);
 
         // Add hosts from [github_hosts.*] sections
         for gh_host in config.github_hosts.values() {
             hosts
-                .entry(gh_host.host.clone())
+                .entry(gh_host.host.to_ascii_lowercase())
                 .or_insert_with(|| gh_host.web_url.clone());
         }
 
         // Add hosts from legacy daemon.repos entries (host/owner/repo format)
         for repo in &config.daemon.repos {
             if let Some((host, _, _)) = parse_repo_entry_with_hosts(repo, &config.github_hosts) {
-                hosts.entry(host).or_insert(None);
+                hosts.entry(host.to_ascii_lowercase()).or_insert(None);
             }
         }
 
@@ -538,7 +599,8 @@ impl HostRegistry {
         let mut result: Vec<String> = self.hosts.keys().cloned().collect();
         for web_url in self.hosts.values().flatten() {
             if let Some(host) = web_url_to_host(web_url) {
-                if !result.iter().any(|h| h == &host) {
+                let host = host.to_ascii_lowercase();
+                if !result.iter().any(|h| h.eq_ignore_ascii_case(&host)) {
                     result.push(host);
                 }
             }
@@ -552,13 +614,14 @@ impl HostRegistry {
     /// configured `web_url` hostname, returns the associated API host. Returns
     /// `None` when `host` is unknown.
     pub(crate) fn canonical_host(&self, host: &str) -> Option<String> {
-        if self.hosts.contains_key(host) {
-            return Some(host.to_string());
+        let needle = host.to_ascii_lowercase();
+        if let Some((known, _)) = self.hosts.get_key_value(&needle) {
+            return Some(known.clone());
         }
         for (api_host, web_url_opt) in &self.hosts {
             if let Some(web_url) = web_url_opt {
                 if let Some(web_host) = web_url_to_host(web_url) {
-                    if web_host == host {
+                    if web_host.eq_ignore_ascii_case(&needle) {
                         return Some(api_host.clone());
                     }
                 }
@@ -1148,6 +1211,87 @@ mod tests {
     use super::*;
     use std::io::Write;
     use tempfile::NamedTempFile;
+
+    fn config_with_ghe(repos: &[&str]) -> LabConfig {
+        let mut config = LabConfig::default();
+        config.github_hosts.insert(
+            "ghe".to_string(),
+            GhHostConfig {
+                host: "ghe.example.com".to_string(),
+                web_url: None,
+            },
+        );
+        config.daemon.repos = repos.iter().map(|r| r.to_string()).collect();
+        config
+    }
+
+    #[test]
+    fn test_strip_host_port() {
+        assert_eq!(strip_host_port("ghe.example.com:8443"), "ghe.example.com");
+        assert_eq!(strip_host_port("ghe.example.com"), "ghe.example.com");
+        // Non-numeric or empty suffixes are left alone rather than truncated.
+        assert_eq!(strip_host_port("ghe.example.com:"), "ghe.example.com:");
+        assert_eq!(strip_host_port("ghe.example.com:x1"), "ghe.example.com:x1");
+    }
+
+    #[test]
+    fn test_parse_repo_entry_tolerates_corrupted_ported_entry() {
+        let hosts = HashMap::new();
+        assert_eq!(
+            parse_repo_entry_with_hosts("ghe.example.com:8443/owner/repo", &hosts),
+            Some((
+                "ghe.example.com".to_string(),
+                "owner".to_string(),
+                "repo".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn test_canonical_host_is_case_insensitive() {
+        let registry = HostRegistry::from_config(&config_with_ghe(&[]));
+        assert_eq!(
+            registry.canonical_host("GHE.Example.COM"),
+            Some("ghe.example.com".to_string())
+        );
+        assert_eq!(
+            registry.canonical_host("GitHub.com"),
+            Some("github.com".to_string())
+        );
+        assert_eq!(registry.canonical_host("gitlab.com"), None);
+    }
+
+    #[test]
+    fn test_configured_host_for_repo_prefers_exact_repo() {
+        let config = config_with_ghe(&["ghe:acme/tools", "acme/widgets"]);
+        assert_eq!(
+            configured_host_for_repo(&config, "acme", Some("widgets")),
+            Some("github.com".to_string())
+        );
+        assert_eq!(
+            configured_host_for_repo(&config, "acme", Some("tools")),
+            Some("ghe.example.com".to_string())
+        );
+    }
+
+    #[test]
+    fn test_configured_host_for_repo_falls_back_to_owner_match() {
+        let config = config_with_ghe(&["ghe:acme/tools"]);
+        assert_eq!(
+            configured_host_for_repo(&config, "acme", Some("unlisted")),
+            Some("ghe.example.com".to_string())
+        );
+        assert_eq!(configured_host_for_repo(&config, "other", None), None);
+    }
+
+    #[test]
+    fn test_configured_host_for_repo_is_case_insensitive() {
+        let config = config_with_ghe(&["ghe:Acme/Tools"]);
+        assert_eq!(
+            configured_host_for_repo(&config, "aCME", Some("tOOLS")),
+            Some("ghe.example.com".to_string())
+        );
+    }
 
     #[test]
     fn test_parse_valid_config() {
