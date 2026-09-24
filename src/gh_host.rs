@@ -35,7 +35,9 @@ pub(crate) struct ResolvedHost {
 ///
 /// 1. **A `daemon.repos` entry naming this exact `owner/repo`.** The user wrote
 ///    this repo's host down, so it beats anything inferred — including when it
-///    says `github.com` and the checkout's remote points somewhere else.
+///    says `github.com` and the checkout's remote points somewhere else. The
+///    entry is portless by construction, so an explicit port is taken from a
+///    remote for the same owner pointing at that same host.
 /// 2. **A remote belonging to the same owner.** When the session targets
 ///    `acme/widgets` and a remote is `https://ghe.example.com/acme/widgets`,
 ///    that remote identifies the host. Remotes for *other* owners are not
@@ -65,10 +67,14 @@ pub(crate) fn resolve_gh_host(
     if let Some(owner) = owner {
         let configured = config::configured_host_for_repo(config, owner, repo);
 
-        // 1. An entry naming this exact repo.
+        // 1. An entry naming this exact repo. The entry settles the host's
+        //    *identity*; a remote can still supply the endpoint port, which
+        //    the entry deliberately doesn't carry.
         if let Some((host, HostMatch::Exact)) = &configured {
+            let host = configured_host_with_port(host_registry, owner, host, remotes)
+                .unwrap_or_else(|| host.clone());
             return Some(ResolvedHost {
-                host: host.clone(),
+                host,
                 source: HostSource::Config,
             });
         }
@@ -111,6 +117,42 @@ pub(crate) fn resolve_gh_host(
         }
     }
 
+    None
+}
+
+/// Recovers the endpoint port that a configured host entry cannot carry.
+///
+/// `daemon.repos` entries are portless on purpose — a port belongs to a URL,
+/// not to a host's identity, and letting one in is what corrupted configs in
+/// the first place. But `GH_HOST` is an address `gh` has to reach, so when the
+/// checkout has a remote for the same owner pointing at the same host on an
+/// explicit port, that port is the endpoint the entry is naming. Remotes for
+/// *other* owners are ignored here for the same reason step 2 ignores them: an
+/// unrelated checkout must not decide where a named `--repo` lives.
+fn configured_host_with_port(
+    host_registry: &HostRegistry,
+    owner: &str,
+    configured: &str,
+    remotes: &[String],
+) -> Option<String> {
+    for url in remotes {
+        let Ok((_host, remote_owner, _repo)) = git::parse_github_remote(url, host_registry) else {
+            continue;
+        };
+        if !remote_owner.eq_ignore_ascii_case(owner) {
+            continue;
+        }
+        let Some(remote_host) = git::remote_gh_host(url, host_registry) else {
+            continue;
+        };
+        // Only a *ported* remote for this same host has anything to add; a
+        // remote on a different host says nothing about the configured one.
+        if config::strip_host_port(&remote_host).eq_ignore_ascii_case(configured)
+            && !remote_host.eq_ignore_ascii_case(configured)
+        {
+            return Some(remote_host);
+        }
+    }
     None
 }
 
@@ -260,6 +302,70 @@ mod tests {
         .unwrap();
 
         assert_eq!(resolved.host, "github.com");
+        assert_eq!(resolved.source, HostSource::Config);
+    }
+
+    #[test]
+    fn exact_config_entry_takes_the_port_from_a_matching_remote() {
+        let mut config = ghe_config();
+        config.daemon.repos = vec!["ghe:acme/tools".to_string()];
+        let registry = HostRegistry::from_config(&config);
+
+        // The entry settles identity; the remote supplies the endpoint port
+        // that the entry is portless by construction.
+        let resolved = resolve_gh_host(
+            &config,
+            &registry,
+            Some("acme"),
+            Some("tools"),
+            &["https://ghe.example.com:8443/acme/tools.git".to_string()],
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(resolved.host, "ghe.example.com:8443");
+        assert_eq!(resolved.source, HostSource::Config);
+    }
+
+    #[test]
+    fn exact_config_entry_ignores_a_port_from_another_host() {
+        let mut config = ghe_config();
+        config.daemon.repos = vec!["acme/tools".to_string()];
+        let registry = HostRegistry::from_config(&config);
+
+        // The entry says github.com; a ported GHE remote must not graft its
+        // port onto a host it doesn't belong to.
+        let resolved = resolve_gh_host(
+            &config,
+            &registry,
+            Some("acme"),
+            Some("tools"),
+            &["https://ghe.example.com:8443/acme/tools.git".to_string()],
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(resolved.host, "github.com");
+        assert_eq!(resolved.source, HostSource::Config);
+    }
+
+    #[test]
+    fn exact_config_entry_ignores_a_port_from_another_owners_remote() {
+        let mut config = ghe_config();
+        config.daemon.repos = vec!["ghe:acme/tools".to_string()];
+        let registry = HostRegistry::from_config(&config);
+
+        let resolved = resolve_gh_host(
+            &config,
+            &registry,
+            Some("acme"),
+            Some("tools"),
+            &["https://ghe.example.com:8443/other/thing.git".to_string()],
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(resolved.host, "ghe.example.com");
         assert_eq!(resolved.source, HostSource::Config);
     }
 
