@@ -85,6 +85,12 @@ enum Commands {
         #[arg(long, help = "Repository context as 'owner/repo'")]
         repo: Option<String>,
 
+        #[arg(
+            long,
+            help = "Agent backend to use (claude, pi). Overrides config.toml default. Codex has no interactive mode."
+        )]
+        agent: Option<String>,
+
         #[arg(short, long, help = "Show additional context information")]
         verbose: bool,
     },
@@ -93,6 +99,12 @@ enum Commands {
         #[arg(help = "Optional prompt to start the session with")]
         prompt: Option<String>,
 
+        #[arg(
+            long,
+            help = "Agent backend to use (claude, pi). Overrides config.toml default. Codex has no interactive mode."
+        )]
+        agent: Option<String>,
+
         #[arg(short, long, help = "Show additional context information")]
         verbose: bool,
     },
@@ -100,6 +112,12 @@ enum Commands {
     Tpm {
         #[arg(help = "Optional prompt to start the session with")]
         prompt: Option<String>,
+
+        #[arg(
+            long,
+            help = "Agent backend to use (claude, pi). Overrides config.toml default. Codex has no interactive mode."
+        )]
+        agent: Option<String>,
 
         #[arg(short, long, help = "Show additional context information")]
         verbose: bool,
@@ -461,9 +479,30 @@ async fn main() {
         Commands::Init { repo, host } => {
             init::handle_init(repo.unwrap_or_else(|| ".".to_string()), host).await
         }
-        Commands::Chat { repo, verbose } => chat::handle_chat(repo, verbose).await,
-        Commands::Pm { prompt, verbose } => pm::handle_pm(prompt, verbose).await,
-        Commands::Tpm { prompt, verbose } => pm::handle_tpm(prompt, verbose).await,
+        Commands::Chat {
+            repo,
+            agent,
+            verbose,
+        } => {
+            let agent_name = agent.unwrap_or_else(agent_registry::resolve_default_agent_name);
+            chat::handle_chat(repo, &agent_name, verbose).await
+        }
+        Commands::Pm {
+            prompt,
+            agent,
+            verbose,
+        } => {
+            let agent_name = agent.unwrap_or_else(agent_registry::resolve_default_agent_name);
+            pm::handle_pm(prompt, &agent_name, verbose).await
+        }
+        Commands::Tpm {
+            prompt,
+            agent,
+            verbose,
+        } => {
+            let agent_name = agent.unwrap_or_else(agent_registry::resolve_default_agent_name);
+            pm::handle_tpm(prompt, &agent_name, verbose).await
+        }
         Commands::Do {
             issue,
             timeout,

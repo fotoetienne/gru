@@ -2037,6 +2037,15 @@ mod tests {
             None
         }
 
+        fn build_interactive_command(
+            &self,
+            _cwd: &Path,
+            _system_prompt: &str,
+            _initial_prompt: Option<&str>,
+        ) -> Option<tokio::process::Command> {
+            None
+        }
+
         fn build_oneshot_command(
             &self,
             _worktree_path: &Path,

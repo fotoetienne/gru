@@ -89,10 +89,10 @@ pub(crate) fn resolve_default_agent_name() -> String {
 
 /// Resolves the Claude Code CLI binary path/name to invoke.
 ///
-/// Used by entry points that spawn `claude` directly for a generic interactive
-/// session (`gru chat`, `gru pm`/`gru tpm`, and the legacy no-session-id
-/// `gru attach` fallback) rather than going through `resolve_backend`'s
-/// `ClaudeBackend`. Reads `[agent.claude] binary` from config, falling back to
+/// Used by the entry points that still reference `claude` directly rather than
+/// going through `resolve_backend`'s `ClaudeBackend`: the legacy no-session-id
+/// `gru attach` fallback, `gru init`'s doctor check, and `gru stop`'s `pgrep -f`
+/// pattern. Reads `[agent.claude] binary` from config, falling back to
 /// `"claude"` (resolved via `$PATH`) when unset or no config is present.
 pub(crate) fn configured_claude_binary() -> String {
     crate::config::try_load_config()
@@ -102,9 +102,9 @@ pub(crate) fn configured_claude_binary() -> String {
 
 /// Resolves the configured Claude Code model override, if any.
 ///
-/// Mirrors `configured_claude_binary` for the same direct-launch entry points
-/// (`gru chat`, `gru pm`/`gru tpm`, and the legacy no-session-id `gru attach`
-/// fallback) that spawn `claude` directly rather than through `ClaudeBackend`.
+/// Mirrors `configured_claude_binary` for the legacy no-session-id `gru attach`
+/// fallback, which spawns `claude` directly rather than through
+/// `ClaudeBackend`.
 /// Reads `[agent.claude] model` from config; `None` when unset or no config
 /// is present, letting the Claude Code CLI use its own default.
 pub(crate) fn configured_claude_model() -> Option<String> {
@@ -137,6 +137,21 @@ pub(crate) fn configured_codex_binary() -> String {
     crate::config::try_load_config()
         .and_then(|c| c.agent.codex.binary)
         .unwrap_or_else(|| "codex".to_string())
+}
+
+/// Builds the error for an agent that has no interactive entry point.
+///
+/// Used by the REPL commands (`gru chat`, `gru pm`, `gru tpm`) when the
+/// resolved backend returns `None` from
+/// `AgentBackend::build_interactive_command`, so the user gets an actionable
+/// message naming both the command and the agent instead of a spawn failure.
+pub(crate) fn interactive_unsupported_error(command: &str, agent_name: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "Agent '{}' does not support interactive sessions, so `gru {}` cannot run with it. \
+         Use `--agent claude` or `--agent pi`, or change [agent] default in config.toml.",
+        agent_name,
+        command
+    )
 }
 
 /// Resolves an agent name to a concrete `AgentBackend` implementation.
@@ -193,6 +208,13 @@ mod tests {
     fn test_resolve_pi() {
         let backend = resolve_backend("pi").unwrap();
         assert_eq!(backend.name(), "pi");
+    }
+
+    #[test]
+    fn test_interactive_unsupported_error_names_command_and_agent() {
+        let msg = interactive_unsupported_error("tpm", "codex").to_string();
+        assert!(msg.contains("codex"), "{msg}");
+        assert!(msg.contains("gru tpm"), "{msg}");
     }
 
     #[test]

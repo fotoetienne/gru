@@ -210,6 +210,10 @@ fn format_token_count(count: u64) -> String {
 /// `process_names()[0]` doubles as the config section name for every
 /// built-in backend (claude/pi/codex) — unlike `backend.name()`, which for
 /// Claude is the display name "claude-code", not the config key "claude".
+///
+/// When the backend supplies an `install_url()`, it is appended as an install
+/// pointer: the most likely reason a first-run user hits this is that the CLI
+/// isn't installed at all, and a config-key hint alone doesn't help them.
 pub(crate) fn spawn_error_context(
     backend: &dyn AgentBackend,
     cmd: &TokioCommand,
@@ -226,14 +230,19 @@ pub(crate) fn spawn_error_context(
     } else {
         format!(" {context_suffix}")
     };
+    let install_hint = match backend.install_url() {
+        Some(url) => format!(" If it isn't installed yet, see {url}."),
+        None => String::new(),
+    };
     format!(
         "Failed to start {} agent binary '{}'{}. Check that it exists, is executable, \
          and (if relative) is resolvable from the current directory — see [agent.{}] \
-         binary in config.toml if you've overridden it.",
+         binary in config.toml if you've overridden it.{}",
         backend.name(),
         program,
         suffix,
-        config_key
+        config_key,
+        install_hint
     )
 }
 
@@ -301,6 +310,28 @@ pub(crate) trait AgentBackend: Send + Sync {
         github_host: &str,
     ) -> Option<TokioCommand>;
 
+    /// Build the command to start a *fresh* interactive session with a custom
+    /// system prompt.
+    ///
+    /// Unlike `build_interactive_resume_command` (which reattaches to an existing
+    /// session), this starts a new session for the user-facing REPL commands
+    /// `gru chat`, `gru pm`, and `gru tpm`. The command must use inherited stdio
+    /// and must not request headless/streaming output (no `--print`, no
+    /// stream-json), since the agent's own TUI takes over the terminal.
+    ///
+    /// `system_prompt` carries the role/project context. `initial_prompt`, when
+    /// `Some`, becomes the session's first user message and must be passed after
+    /// an argument terminator (`--`) so prompts that look like flags (e.g. `-h`)
+    /// aren't parsed as CLI options.
+    ///
+    /// Returns `None` if the backend has no interactive entry point (Codex).
+    fn build_interactive_command(
+        &self,
+        cwd: &Path,
+        system_prompt: &str,
+        initial_prompt: Option<&str>,
+    ) -> Option<TokioCommand>;
+
     /// Build a command for a one-shot utility task (no session tracking, text output).
     ///
     /// Used for fire-and-forget invocations like merge-readiness judge where the
@@ -351,6 +382,16 @@ pub(crate) trait AgentBackend: Send + Sync {
     /// `Vec`, which is the default.
     fn yolo_args(&self) -> Vec<&'static str> {
         Vec::new()
+    }
+
+    /// (Optional) Where a user can install this backend's CLI.
+    ///
+    /// Appended to `spawn_error_context`'s message so a "binary not found"
+    /// failure points somewhere useful — this matters most on the first-run
+    /// paths (`gru chat`, `gru init`) where the CLI may simply be absent.
+    /// Defaults to `None` (no install pointer).
+    fn install_url(&self) -> Option<&'static str> {
+        None
     }
 
     /// Returns any session usage totals accumulated internally by the
@@ -440,6 +481,27 @@ mod tests {
         let msg = spawn_error_context(&backend, &cmd, "for merge judge");
         assert!(msg.contains("for merge judge"), "{msg}");
         assert!(msg.contains("[agent.codex] binary"), "{msg}");
+    }
+
+    #[test]
+    fn test_spawn_error_context_includes_install_url() {
+        // `gru chat` is the first-run path: a missing binary most often means
+        // the CLI was never installed, so the message must point somewhere.
+        let backend = crate::claude_backend::ClaudeBackend::new(None, None, None);
+        let cmd = backend
+            .build_interactive_command(std::path::Path::new("/tmp/project"), "sys", None)
+            .unwrap();
+        let msg = spawn_error_context(&backend, &cmd, "for gru chat");
+        assert!(msg.contains("https://claude.com/claude-code"), "{msg}");
+
+        let codex = crate::codex_backend::CodexBackend::new(None);
+        let cmd = codex.build_oneshot_command(
+            std::path::Path::new("/tmp/worktree"),
+            "prompt",
+            "github.com",
+        );
+        let msg = spawn_error_context(&codex, &cmd, "");
+        assert!(msg.contains("https://github.com/openai/codex"), "{msg}");
     }
 
     #[test]

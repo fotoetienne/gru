@@ -150,6 +150,9 @@ gru do 42 --agent codex     # OpenAI Codex
 gru do 42 --agent pi        # Pi
 gru review 42 --agent codex
 gru prompt my-prompt --agent codex
+gru chat --agent pi         # Interactive sessions: claude or pi (codex has no TUI entry point)
+gru pm --agent pi
+gru tpm --agent pi
 ```
 
 Provider authentication and model selection for Pi are configured on Pi's own side, not

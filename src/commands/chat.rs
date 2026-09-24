@@ -1,8 +1,6 @@
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use tokio::io::AsyncReadExt;
-use tokio::process::Command;
 
 use crate::commands::child_process;
 use crate::git;
@@ -15,10 +13,14 @@ const CLAUDE_MD_READ_LIMIT: usize = 8192;
 
 /// Handles the `gru chat` command.
 ///
-/// Spawns an interactive Claude session with project context.
+/// Spawns an interactive agent session with project context.
 /// When run inside a git repo, includes project context (CLAUDE.md, Gru tool descriptions).
 /// When run outside a repo, spawns a general Gru onboarding assistant.
-pub(crate) async fn handle_chat(repo_flag: Option<String>, verbose: bool) -> Result<i32> {
+pub(crate) async fn handle_chat(
+    repo_flag: Option<String>,
+    agent_name: &str,
+    verbose: bool,
+) -> Result<i32> {
     let _tmux_guard = TmuxGuard::new("gru:chat");
 
     let (work_dir, system_prompt) = match detect_project_context(repo_flag).await {
@@ -37,24 +39,13 @@ pub(crate) async fn handle_chat(repo_flag: Option<String>, verbose: bool) -> Res
         eprintln!("Working directory: {}", work_dir.display());
     }
 
-    // Build claude command for interactive mode (no --print, no --output-format)
-    let mut cmd = Command::new(crate::agent_registry::configured_claude_binary());
-    cmd.arg("--system-prompt").arg(&system_prompt);
-    if let Some(model) = crate::agent_registry::configured_claude_model() {
-        cmd.arg("--model").arg(model);
-    }
-    cmd.current_dir(&work_dir)
-        .stdin(Stdio::inherit())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit());
+    let backend = crate::agent_registry::resolve_backend(agent_name)?;
+    let mut cmd = backend
+        .build_interactive_command(&work_dir, &system_prompt, None)
+        .ok_or_else(|| crate::agent_registry::interactive_unsupported_error("chat", agent_name))?;
 
-    let program = cmd.as_std().get_program().to_string_lossy().into_owned();
     let mut child = cmd.spawn().with_context(|| {
-        format!(
-            "Failed to start claude binary '{program}'. Check that it's installed and in \
-             your PATH (see: https://claude.com/claude-code), or if you've overridden \
-             [agent.claude] binary in config.toml, that the path is correct and executable."
-        )
+        crate::agent::spawn_error_context(backend.as_ref(), &cmd, "for gru chat")
     })?;
 
     let status = child_process::wait_with_ctrlc_handling(&mut child).await?;

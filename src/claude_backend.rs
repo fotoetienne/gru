@@ -179,6 +179,10 @@ impl AgentBackend for ClaudeBackend {
         "claude-code"
     }
 
+    fn install_url(&self) -> Option<&'static str> {
+        Some("https://claude.com/claude-code")
+    }
+
     fn yolo_args(&self) -> Vec<&'static str> {
         vec!["--dangerously-skip-permissions"]
     }
@@ -258,6 +262,34 @@ impl AgentBackend for ClaudeBackend {
             .stdout(std::process::Stdio::inherit())
             .stderr(std::process::Stdio::inherit())
             .env("GH_HOST", github_host)
+            .env_remove(crate::labels::GRU_RETRY_PARENT_ENV)
+            .env_remove(crate::labels::GRU_CONFIG_PATH_ENV);
+        Some(cmd)
+    }
+
+    fn build_interactive_command(
+        &self,
+        cwd: &Path,
+        system_prompt: &str,
+        initial_prompt: Option<&str>,
+    ) -> Option<TokioCommand> {
+        let mut cmd = TokioCommand::new(&self.binary);
+        cmd.arg("--system-prompt").arg(system_prompt);
+        if let Some(model) = &self.model {
+            cmd.arg("--model").arg(model);
+        }
+        if let Some(prompt) = initial_prompt {
+            // Argument terminator so prompts like "-h" aren't parsed as flags.
+            cmd.arg("--").arg(prompt);
+        }
+        cmd.current_dir(cwd)
+            .stdin(std::process::Stdio::inherit())
+            .stdout(std::process::Stdio::inherit())
+            .stderr(std::process::Stdio::inherit())
+            // Same scrub as build_interactive_resume_command: a user-facing
+            // session must not inherit the gru->worker handshake vars, or a
+            // `gru do` launched from inside it would defer gru:failed
+            // labeling to a retry queue that isn't watching it.
             .env_remove(crate::labels::GRU_RETRY_PARENT_ENV)
             .env_remove(crate::labels::GRU_CONFIG_PATH_ENV);
         Some(cmd)
@@ -499,6 +531,63 @@ mod tests {
         assert!(!args.contains(&"--print".as_ref()));
         assert!(!args.contains(&"--output-format".as_ref()));
         assert!(!args.contains(&"stream-json".as_ref()));
+    }
+
+    #[test]
+    fn test_build_interactive_command_shape() {
+        let b = backend();
+        let path = std::path::PathBuf::from("/tmp/project");
+        let cmd = b
+            .build_interactive_command(&path, "you are a PM", None)
+            .expect("claude supports interactive sessions");
+        let inner = cmd.as_std();
+
+        assert_eq!(inner.get_program(), "claude");
+        let args: Vec<&std::ffi::OsStr> = inner.get_args().collect();
+        assert_eq!(args, vec!["--system-prompt", "you are a PM"]);
+        // Interactive mode must not request headless/streaming output.
+        assert!(!args.contains(&"--print".as_ref()));
+        assert!(!args.contains(&"--output-format".as_ref()));
+        assert!(!args.contains(&"stream-json".as_ref()));
+        assert_eq!(inner.get_current_dir(), Some(path.as_path()));
+
+        // The gru->worker handshake vars must not leak into a user-facing
+        // session; env_remove surfaces as (key, None) in get_envs().
+        let envs: Vec<_> = inner.get_envs().collect();
+        for key in [
+            crate::labels::GRU_RETRY_PARENT_ENV,
+            crate::labels::GRU_CONFIG_PATH_ENV,
+        ] {
+            assert!(
+                envs.iter().any(|(k, v)| *k == key && v.is_none()),
+                "{key} should be removed"
+            );
+        }
+    }
+
+    #[test]
+    fn test_build_interactive_command_initial_prompt_after_terminator() {
+        let b = ClaudeBackend::new(None, None, Some("claude-opus-5-5".to_string()));
+        let path = std::path::PathBuf::from("/tmp/project");
+        let cmd = b
+            .build_interactive_command(&path, "sys", Some("-h"))
+            .unwrap();
+        let args: Vec<String> = cmd
+            .as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            args,
+            vec![
+                "--system-prompt",
+                "sys",
+                "--model",
+                "claude-opus-5-5",
+                "--",
+                "-h"
+            ]
+        );
     }
 
     #[test]

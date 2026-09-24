@@ -106,6 +106,21 @@ impl AgentBackend for CodexBackend {
         None
     }
 
+    fn install_url(&self) -> Option<&'static str> {
+        Some("https://github.com/openai/codex")
+    }
+
+    fn build_interactive_command(
+        &self,
+        _cwd: &Path,
+        _system_prompt: &str,
+        _initial_prompt: Option<&str>,
+    ) -> Option<TokioCommand> {
+        // Codex CLI has no interactive entry point that accepts a custom
+        // system prompt, so `gru chat`/`pm`/`tpm` are unsupported here.
+        None
+    }
+
     fn build_oneshot_command(
         &self,
         worktree_path: &Path,
@@ -606,6 +621,15 @@ mod tests {
         let id = Uuid::nil();
         assert!(b
             .build_interactive_resume_command(&path, &id, "github.com")
+            .is_none());
+    }
+
+    #[test]
+    fn test_build_interactive_command_unsupported() {
+        let b = backend();
+        let path = std::path::PathBuf::from("/tmp/project");
+        assert!(b
+            .build_interactive_command(&path, "you are a PM", Some("hi"))
             .is_none());
     }
 
