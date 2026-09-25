@@ -138,6 +138,11 @@ pub(crate) struct CodexAgentConfig {
     /// Override the binary path for the Codex CLI.
     #[serde(default)]
     pub(crate) binary: Option<String>,
+
+    /// Model to pass via `-m` (e.g. `"gpt-6-sol"`). `None` (the default)
+    /// lets Codex use the default from its own `~/.codex/config.toml`.
+    #[serde(default)]
+    pub(crate) model: Option<String>,
 }
 
 /// Daemon configuration
@@ -685,6 +690,9 @@ impl LabConfig {
 # [agent.codex]
 # # Override the Codex CLI binary path
 # binary = "/usr/local/bin/codex"
+#
+# # Model to pass via -m (defaults to Codex's own ~/.codex/config.toml setting)
+# model = "gpt-6-sol"
 
 # [merge]
 # # Confidence threshold (1-10) for the merge-readiness judge (default: 8)
@@ -962,6 +970,16 @@ impl LabConfig {
                 anyhow::bail!(
                     "agent.codex.binary must not be empty. Remove the field to use \
                      \"codex\" (resolved via $PATH), or set it to a valid binary path."
+                );
+            }
+        }
+
+        if let Some(model) = &self.agent.codex.model {
+            if model.trim().is_empty() {
+                anyhow::bail!(
+                    "agent.codex.model must not be empty. Remove the field to let \
+                     Codex use the default from its own config, or set it to a valid \
+                     model name."
                 );
             }
         }
@@ -1425,6 +1443,7 @@ thinking = "high"
 
         let config = LabConfig::load(temp_file.path()).unwrap();
         assert!(config.agent.codex.binary.is_none());
+        assert!(config.agent.codex.model.is_none());
     }
 
     #[test]
@@ -1435,6 +1454,7 @@ repos = ["owner/repo"]
 
 [agent.codex]
 binary = "/opt/tools/codex"
+model = "gpt-6-sol"
 "#;
         let mut temp_file = NamedTempFile::new().unwrap();
         temp_file.write_all(config_toml.as_bytes()).unwrap();
@@ -1445,6 +1465,7 @@ binary = "/opt/tools/codex"
             config.agent.codex.binary.as_deref(),
             Some("/opt/tools/codex")
         );
+        assert_eq!(config.agent.codex.model.as_deref(), Some("gpt-6-sol"));
     }
 
     #[test]
@@ -1458,6 +1479,19 @@ binary = "/opt/tools/codex"
         assert!(result.is_err());
         let msg = format!("{}", result.err().unwrap());
         assert!(msg.contains("agent.codex.binary"), "{}", msg);
+    }
+
+    #[test]
+    fn test_agent_codex_model_empty_is_rejected() {
+        let config_toml = "[agent.codex]\nmodel = \"\"\n";
+        let mut temp_file = NamedTempFile::new().unwrap();
+        temp_file.write_all(config_toml.as_bytes()).unwrap();
+        temp_file.flush().unwrap();
+
+        let result = LabConfig::load_partial(temp_file.path());
+        assert!(result.is_err());
+        let msg = format!("{}", result.err().unwrap());
+        assert!(msg.contains("agent.codex.model"), "{}", msg);
     }
 
     #[test]
