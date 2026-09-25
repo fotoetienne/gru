@@ -193,7 +193,14 @@ pub(crate) async fn handle_review(pr_arg: Option<String>, agent_name: &str) -> R
     let head_sha = ci::get_head_sha(&checkout_path).await;
     let (host_ref, owner_ref, repo_ref, pr_ref) = (&host, &owner, &repo, &pr_num);
     if let Some(notice) = existing_review_notice(head_sha, |sha| async move {
-        github::has_gru_review_for_sha(host_ref, owner_ref, repo_ref, pr_ref, &sha).await
+        // The notice is informational, so lookup failures are logged at debug
+        // level rather than surfaced as warnings.
+        github::check_gru_review_for_sha(host_ref, owner_ref, repo_ref, pr_ref, &sha)
+            .await
+            .unwrap_or_else(|e| {
+                log::debug!("Existing-review lookup failed: {:#}", e);
+                false
+            })
     })
     .await
     {
@@ -524,7 +531,7 @@ async fn fetch_pr_details(owner: &str, repo: &str, host: &str, pr_num: u64) -> R
 /// Returns the notice to print when HEAD already has a review from this gh account.
 ///
 /// Fails open: returns `None` if HEAD can't be resolved, without calling
-/// `has_review`. `has_review` itself fails open (returns `false` on API errors).
+/// `has_review`. The caller's `has_review` should return `false` on lookup errors.
 async fn existing_review_notice<F, Fut>(head_sha: Result<String>, has_review: F) -> Option<String>
 where
     F: FnOnce(String) -> Fut,
@@ -634,7 +641,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_existing_review_notice_when_not_reviewed() {
-        // Also covers API errors: has_gru_review_for_sha returns false on failure.
+        // Also covers lookup errors: the caller maps them to false.
         let notice = existing_review_notice(Ok("abc123".to_string()), |_| async { false }).await;
         assert!(notice.is_none());
     }

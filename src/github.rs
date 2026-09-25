@@ -1528,37 +1528,36 @@ pub(crate) async fn has_gru_review_for_sha(
     pr_number: &str,
     head_sha: &str,
 ) -> bool {
-    // Get the authenticated user login; fail open on error.
+    match check_gru_review_for_sha(host, owner, repo, pr_number, head_sha).await {
+        Ok(exists) => exists,
+        Err(e) => {
+            log::warn!("⚠️  Review dedup check failed (proceeding): {:#}", e);
+            false
+        }
+    }
+}
+
+/// Like [`has_gru_review_for_sha`], but returns lookup errors to the caller
+/// instead of logging a warning and failing open.
+pub(crate) async fn check_gru_review_for_sha(
+    host: &str,
+    owner: &str,
+    repo: &str,
+    pr_number: &str,
+    head_sha: &str,
+) -> Result<bool> {
     // TODO: the authenticated user is stable for the lifetime of a process; a
     // OnceLock<String> or a caller-supplied parameter could avoid this extra
     // `gh api user` call on each invocation. Not worth the complexity at V1
     // call frequency (once per monitor_pr_lifecycle entry and once per explicit
-    // `gru review`), but revisit if has_gru_review_for_sha ever gets hot-path
-    // callers.
-    let gh_user = match get_authenticated_user(host).await {
-        Ok(u) => u,
-        Err(e) => {
-            log::warn!(
-                "⚠️  Could not get authenticated user for review dedup check: {}",
-                e
-            );
-            return false;
-        }
-    };
-
-    // Fetch all reviews; fail open on error.
-    let reviews = match list_pr_reviews(host, owner, repo, pr_number).await {
-        Ok(r) => r,
-        Err(e) => {
-            log::warn!(
-                "⚠️  Could not fetch PR reviews for dedup check (proceeding): {}",
-                e
-            );
-            return false;
-        }
-    };
-
-    review_exists_for_sha(&reviews, &gh_user, head_sha)
+    // `gru review`), but revisit if this ever gets hot-path callers.
+    let gh_user = get_authenticated_user(host)
+        .await
+        .context("Could not get authenticated user")?;
+    let reviews = list_pr_reviews(host, owner, repo, pr_number)
+        .await
+        .context("Could not fetch PR reviews")?;
+    Ok(review_exists_for_sha(&reviews, &gh_user, head_sha))
 }
 
 /// Pure helper: given a list of reviews, a user login, and a SHA, determine
