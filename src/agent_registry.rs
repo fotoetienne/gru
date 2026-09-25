@@ -16,8 +16,8 @@ pub(crate) const DEFAULT_AGENT: &str = "claude";
 
 /// Per-backend config overrides threaded through `construct_backend`.
 ///
-/// Fields are ignored by backends that don't use them (e.g. `pi_model` is
-/// ignored when constructing the `claude` backend).
+/// Fields are ignored by backends that don't use them (e.g. `pi_model` and
+/// `codex_model` are ignored when constructing the `claude` backend).
 #[derive(Default)]
 struct AgentOverrides {
     claude_ci_fix_max_turns: Option<u32>,
@@ -397,7 +397,10 @@ mod tests {
         );
         let inner = cmd.as_std();
         let args: Vec<&std::ffi::OsStr> = inner.get_args().collect();
-        assert!(args.contains(&"-m".as_ref()));
-        assert!(args.contains(&"gpt-6-sol".as_ref()));
+        let pos = args
+            .iter()
+            .position(|a| *a == "-m")
+            .expect("-m should be present when agent.codex.model is set");
+        assert_eq!(args[pos + 1], "gpt-6-sol");
     }
 }
