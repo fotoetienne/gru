@@ -23,7 +23,8 @@ use uuid::Uuid;
 /// OpenAI Codex CLI backend.
 ///
 /// Implements `AgentBackend` by spawning
-/// `codex exec --json --dangerously-bypass-approvals-and-sandbox` and parsing the resulting JSONL event stream.
+/// `codex exec --json --dangerously-bypass-approvals-and-sandbox` and
+/// parsing the resulting JSONL event stream.
 ///
 /// Codex reports input and cache token counts per-turn on `turn.completed`
 /// rather than once at session start, so this backend accumulates them
