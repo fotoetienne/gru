@@ -1532,8 +1532,9 @@ pub(crate) async fn has_gru_review_for_sha(
     // TODO: the authenticated user is stable for the lifetime of a process; a
     // OnceLock<String> or a caller-supplied parameter could avoid this extra
     // `gh api user` call on each invocation. Not worth the complexity at V1
-    // call frequency (once per monitor_pr_lifecycle entry), but revisit if
-    // has_gru_review_for_sha ever gets additional hot-path callers.
+    // call frequency (once per monitor_pr_lifecycle entry and once per explicit
+    // `gru review`), but revisit if has_gru_review_for_sha ever gets hot-path
+    // callers.
     let gh_user = match get_authenticated_user(host).await {
         Ok(u) => u,
         Err(e) => {
