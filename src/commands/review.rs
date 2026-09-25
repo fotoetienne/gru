@@ -186,12 +186,12 @@ pub(crate) async fn handle_review(pr_arg: Option<String>, agent_name: &str) -> R
     with_registry(move |registry| registry.register(minion_id_clone, registry_info)).await?;
 
     // Explicit reviews always post, but let the user know when this commit
-    // already has a review from us. Automated self-reviews are deduplicated
+    // already has a review from this gh account. Automated self-reviews are deduplicated
     // before spawning in `fix/monitor.rs`, so this only fires for explicit runs.
     if let Ok(head_sha) = ci::get_head_sha(&checkout_path).await {
         if github::has_gru_review_for_sha(&host, &owner, &repo, &pr_num, &head_sha).await {
             println!(
-                "ℹ️  A Minion review already exists for {}; posting another",
+                "ℹ️  This account already reviewed {}; posting another review",
                 head_sha
             );
         }
