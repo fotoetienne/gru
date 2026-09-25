@@ -36,6 +36,9 @@ pub(crate) struct CodexBackend {
     accumulated_usage: Mutex<TokenUsage>,
     /// Path or name of the Codex CLI binary to invoke (`agent.codex.binary` in config).
     binary: String,
+    /// Model to pass via `-m` (`agent.codex.model` in config). `None` lets
+    /// Codex use the default from its own `~/.codex/config.toml`.
+    model: Option<String>,
 }
 
 impl Default for CodexBackend {
@@ -43,15 +46,17 @@ impl Default for CodexBackend {
         Self {
             accumulated_usage: Mutex::default(),
             binary: "codex".to_string(),
+            model: None,
         }
     }
 }
 
 impl CodexBackend {
-    pub(crate) fn new(binary: Option<String>) -> Self {
+    pub(crate) fn new(binary: Option<String>, model: Option<String>) -> Self {
         Self {
             accumulated_usage: Mutex::default(),
             binary: binary.unwrap_or_else(|| "codex".to_string()),
+            model,
         }
     }
 }
@@ -72,7 +77,8 @@ impl AgentBackend for CodexBackend {
         prompt: &str,
         github_host: &str,
     ) -> TokioCommand {
-        let mut cmd = build_codex_command(&self.binary, worktree_path, prompt);
+        let mut cmd =
+            build_codex_command(&self.binary, self.model.as_deref(), worktree_path, prompt);
         cmd.env("GH_HOST", github_host);
         cmd
     }
@@ -92,7 +98,8 @@ impl AgentBackend for CodexBackend {
     ) -> Option<TokioCommand> {
         // Codex supports resume via `codex exec resume --last "prompt"`
         // but it relies on its own session persistence, not Gru's session ID.
-        let mut cmd = build_codex_resume_command(&self.binary, worktree_path, prompt);
+        let mut cmd =
+            build_codex_resume_command(&self.binary, self.model.as_deref(), worktree_path, prompt);
         cmd.env("GH_HOST", github_host);
         Some(cmd)
     }
@@ -130,6 +137,7 @@ impl AgentBackend for CodexBackend {
     ) -> TokioCommand {
         let mut cmd = TokioCommand::new(&self.binary);
         cmd.arg("exec").arg(CODEX_BYPASS_SANDBOX_FLAG);
+        add_model_arg(&mut cmd, self.model.as_deref());
 
         // When prompt_arg is "-", callers stream the actual prompt via stdin.
         if prompt_arg == "-" {
@@ -180,16 +188,28 @@ impl AgentBackend for CodexBackend {
 /// flag is accepted by both `codex exec` and `codex exec resume`.
 const CODEX_BYPASS_SANDBOX_FLAG: &str = "--dangerously-bypass-approvals-and-sandbox";
 
+/// Appends `-m <model>` when a model is configured. Accepted by both
+/// `codex exec` and `codex exec resume`.
+fn add_model_arg(cmd: &mut TokioCommand, model: Option<&str>) {
+    if let Some(model) = model {
+        cmd.arg("-m").arg(model);
+    }
+}
+
 /// Builds a Codex command for a new session.
 ///
 /// Uses `codex exec --json --dangerously-bypass-approvals-and-sandbox` for
 /// autonomous headless execution with JSONL streaming output.
-fn build_codex_command(binary: &str, worktree_path: &Path, prompt: &str) -> TokioCommand {
+fn build_codex_command(
+    binary: &str,
+    model: Option<&str>,
+    worktree_path: &Path,
+    prompt: &str,
+) -> TokioCommand {
     let mut cmd = TokioCommand::new(binary);
-    cmd.arg("exec")
-        .arg("--json")
-        .arg(CODEX_BYPASS_SANDBOX_FLAG)
-        .arg(prompt)
+    cmd.arg("exec").arg("--json").arg(CODEX_BYPASS_SANDBOX_FLAG);
+    add_model_arg(&mut cmd, model);
+    cmd.arg(prompt)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::inherit())
@@ -203,14 +223,20 @@ fn build_codex_command(binary: &str, worktree_path: &Path, prompt: &str) -> Toki
 }
 
 /// Builds a Codex command to resume the most recent session.
-fn build_codex_resume_command(binary: &str, worktree_path: &Path, prompt: &str) -> TokioCommand {
+fn build_codex_resume_command(
+    binary: &str,
+    model: Option<&str>,
+    worktree_path: &Path,
+    prompt: &str,
+) -> TokioCommand {
     let mut cmd = TokioCommand::new(binary);
     cmd.arg("exec")
         .arg("resume")
         .arg("--last")
         .arg("--json")
-        .arg(CODEX_BYPASS_SANDBOX_FLAG)
-        .arg(prompt)
+        .arg(CODEX_BYPASS_SANDBOX_FLAG);
+    add_model_arg(&mut cmd, model);
+    cmd.arg(prompt)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::inherit())
@@ -500,7 +526,7 @@ mod tests {
 
     #[test]
     fn test_binary_override_used_for_all_commands() {
-        let b = CodexBackend::new(Some("/opt/tools/codex".to_string()));
+        let b = CodexBackend::new(Some("/opt/tools/codex".to_string()), None);
         let path = std::path::PathBuf::from("/tmp/worktree");
         let session_id = Uuid::nil();
 
@@ -533,7 +559,7 @@ mod tests {
 
     #[test]
     fn test_binary_falls_back_to_codex_when_unset() {
-        let b = CodexBackend::new(None);
+        let b = CodexBackend::new(None, None);
         let path = std::path::PathBuf::from("/tmp/worktree");
         let session_id = Uuid::nil();
         assert_eq!(
@@ -542,6 +568,53 @@ mod tests {
                 .get_program(),
             "codex"
         );
+    }
+
+    #[test]
+    fn test_model_passed_to_all_commands_when_set() {
+        let b = CodexBackend::new(None, Some("gpt-6-sol".to_string()));
+        let path = std::path::PathBuf::from("/tmp/worktree");
+        let session_id = Uuid::nil();
+
+        let assert_model = |cmd: TokioCommand, prompt: &str| {
+            let args: Vec<&std::ffi::OsStr> = cmd.as_std().get_args().collect();
+            let pos = args
+                .iter()
+                .position(|a| *a == "-m")
+                .expect("-m should be present when a model is configured");
+            assert_eq!(args[pos + 1], "gpt-6-sol");
+            // The prompt must stay the final positional argument.
+            assert_eq!(*args.last().unwrap(), std::ffi::OsStr::new(prompt));
+        };
+
+        assert_model(b.build_command(&path, &session_id, "p", "github.com"), "p");
+        assert_model(
+            b.build_resume_command(&path, &session_id, "p", "github.com")
+                .unwrap(),
+            "p",
+        );
+        assert_model(b.build_oneshot_command(&path, "p", "github.com"), "p");
+        assert_model(b.build_ci_fix_command(&path, "p", "github.com"), "p");
+    }
+
+    #[test]
+    fn test_model_omitted_from_all_commands_when_unset() {
+        let b = CodexBackend::new(None, None);
+        let path = std::path::PathBuf::from("/tmp/worktree");
+        let session_id = Uuid::nil();
+
+        let cmds = [
+            b.build_command(&path, &session_id, "p", "github.com"),
+            b.build_resume_command(&path, &session_id, "p", "github.com")
+                .unwrap(),
+            b.build_oneshot_command(&path, "p", "github.com"),
+            b.build_ci_fix_command(&path, "p", "github.com"),
+        ];
+        for cmd in &cmds {
+            let args: Vec<&std::ffi::OsStr> = cmd.as_std().get_args().collect();
+            assert!(!args.contains(&"-m".as_ref()), "{args:?}");
+            assert!(!args.contains(&"--model".as_ref()), "{args:?}");
+        }
     }
 
     #[test]

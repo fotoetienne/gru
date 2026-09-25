@@ -27,6 +27,7 @@ struct AgentOverrides {
     pi_model: Option<String>,
     pi_thinking: Option<String>,
     codex_binary: Option<String>,
+    codex_model: Option<String>,
 }
 
 /// Constructs a backend for `agent_name` with the given per-backend config overrides.
@@ -42,7 +43,10 @@ fn construct_backend(agent_name: &str, overrides: AgentOverrides) -> Option<Box<
             overrides.claude_binary,
             overrides.claude_model,
         ))),
-        "codex" => Some(Box::new(CodexBackend::new(overrides.codex_binary))),
+        "codex" => Some(Box::new(CodexBackend::new(
+            overrides.codex_binary,
+            overrides.codex_model,
+        ))),
         "pi" => Some(Box::new(PiBackend::new(
             overrides.pi_binary,
             overrides.pi_model,
@@ -178,11 +182,9 @@ pub(crate) fn resolve_backend(agent_name: &str) -> anyhow::Result<Box<dyn AgentB
         claude_model: config.as_ref().and_then(|c| c.agent.claude.model.clone()),
         pi_binary: config.as_ref().and_then(|c| c.agent.pi.binary.clone()),
         pi_model: config.as_ref().and_then(|c| c.agent.pi.model.clone()),
-        // Clones (rather than moves out of `config`) because `codex_binary`
-        // below still needs `config` — don't change this to `.and_then(...)`
-        // without also reordering, or it won't compile.
         pi_thinking: config.as_ref().and_then(|c| c.agent.pi.thinking.clone()),
-        codex_binary: config.and_then(|c| c.agent.codex.binary),
+        codex_binary: config.as_ref().and_then(|c| c.agent.codex.binary.clone()),
+        codex_model: config.and_then(|c| c.agent.codex.model),
     };
     Ok(construct_backend(agent_name, overrides)
         .expect("agent_name validated against AVAILABLE_AGENTS above"))
@@ -371,5 +373,31 @@ mod tests {
             "github.com",
         );
         assert_eq!(cmd.as_std().get_program(), "/opt/tools/codex");
+    }
+
+    #[test]
+    fn test_resolve_backend_forwards_configured_codex_model() {
+        use std::io::Write;
+        use uuid::Uuid;
+
+        let mut temp_file = tempfile::NamedTempFile::new().unwrap();
+        temp_file
+            .write_all(b"[agent.codex]\nmodel = \"gpt-6-sol\"\n")
+            .unwrap();
+        temp_file.flush().unwrap();
+
+        let _guard = crate::config::set_test_config_path(temp_file.path().to_path_buf());
+
+        let backend = resolve_backend("codex").unwrap();
+        let cmd = backend.build_command(
+            std::path::Path::new("/tmp/worktree"),
+            &Uuid::nil(),
+            "prompt",
+            "github.com",
+        );
+        let inner = cmd.as_std();
+        let args: Vec<&std::ffi::OsStr> = inner.get_args().collect();
+        assert!(args.contains(&"-m".as_ref()));
+        assert!(args.contains(&"gpt-6-sol".as_ref()));
     }
 }

@@ -141,6 +141,10 @@
 # Override the Codex CLI binary path. Useful if codex is
 # installed somewhere other than your $PATH.
 # binary = "/usr/local/bin/codex"
+#
+# Model to pass via `-m` (e.g. "gpt-6-sol"). When unset (the default),
+# Codex uses the model from its own ~/.codex/config.toml.
+# model = "gpt-6-sol"
 
 # ─────────────────────────────────────────────────────────────────────
 # Merge readiness

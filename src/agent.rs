@@ -472,7 +472,7 @@ mod tests {
 
     #[test]
     fn test_spawn_error_context_appends_suffix() {
-        let backend = crate::codex_backend::CodexBackend::new(None);
+        let backend = crate::codex_backend::CodexBackend::new(None, None);
         let cmd = backend.build_oneshot_command(
             std::path::Path::new("/tmp/worktree"),
             "prompt",
@@ -494,7 +494,7 @@ mod tests {
         let msg = spawn_error_context(&backend, &cmd, "for gru chat");
         assert!(msg.contains("https://claude.com/claude-code"), "{msg}");
 
-        let codex = crate::codex_backend::CodexBackend::new(None);
+        let codex = crate::codex_backend::CodexBackend::new(None, None);
         let cmd = codex.build_oneshot_command(
             std::path::Path::new("/tmp/worktree"),
             "prompt",
