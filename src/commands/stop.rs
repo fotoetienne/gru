@@ -436,11 +436,11 @@ mod tests {
         let re = regex::Regex::new(&pattern).unwrap();
 
         assert!(
-            re.is_match("./codex-wrapper exec --json --full-auto fix the bug"),
+            re.is_match("./codex-wrapper exec --json --dangerously-bypass-approvals-and-sandbox fix the bug"),
             "should match the literal ./-prefixed relative binary as invoked"
         );
         assert!(
-            re.is_match("../codex-wrapper exec --json --full-auto fix the bug"),
+            re.is_match("../codex-wrapper exec --json --dangerously-bypass-approvals-and-sandbox fix the bug"),
             "should match a ../-prefixed relative binary the same way"
         );
     }

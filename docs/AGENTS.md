@@ -90,17 +90,23 @@ codex --help
 
 ### How Gru Uses It
 
-Gru spawns Codex in full-auto mode with JSON output:
+Gru spawns Codex with JSON output, no approval prompts, and no Codex sandbox:
 
 ```bash
-codex exec --json --full-auto "<prompt>"
+codex exec --json --dangerously-bypass-approvals-and-sandbox "<prompt>"
 ```
 
 Resume support uses:
 
 ```bash
-codex exec resume --last --json --full-auto "<prompt>"
+codex exec resume --last --json --dangerously-bypass-approvals-and-sandbox "<prompt>"
 ```
+
+This matches the Claude backend's `--dangerously-skip-permissions`. Codex's `workspace-write`
+sandbox (what the old `--full-auto` flag selected, removed in Codex CLI 0.156) blocks network
+access and writes outside the checkout, so Minions could not run `gh` or commit: a worktree's
+gitdir lives in the bare repo under `~/.gru/repos/`, outside the checkout. Isolation comes from
+the per-Minion git worktree, the same as for the other backends.
 
 Note: Codex does not support interactive sessions. `gru attach` will not work with Codex minions, and `gru chat`/`gru pm`/`gru tpm --agent codex` fail with an explanatory error rather than spawning anything — the Codex CLI has no interactive entry point that accepts a custom system prompt. Codex also ignores the `session_id` parameter — it relies on its own session persistence for both new and resumed sessions.
 

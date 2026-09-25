@@ -22,8 +22,9 @@ use uuid::Uuid;
 
 /// OpenAI Codex CLI backend.
 ///
-/// Implements `AgentBackend` by spawning `codex exec --json --full-auto`
-/// and parsing the resulting JSONL event stream.
+/// Implements `AgentBackend` by spawning
+/// `codex exec --json --dangerously-bypass-approvals-and-sandbox` and
+/// parsing the resulting JSONL event stream.
 ///
 /// Codex reports input and cache token counts per-turn on `turn.completed`
 /// rather than once at session start, so this backend accumulates them
@@ -128,7 +129,7 @@ impl AgentBackend for CodexBackend {
         github_host: &str,
     ) -> TokioCommand {
         let mut cmd = TokioCommand::new(&self.binary);
-        cmd.arg("exec").arg("--full-auto");
+        cmd.arg("exec").arg(CODEX_BYPASS_SANDBOX_FLAG);
 
         // When prompt_arg is "-", callers stream the actual prompt via stdin.
         if prompt_arg == "-" {
@@ -169,15 +170,25 @@ impl AgentBackend for CodexBackend {
 // Command builders
 // ---------------------------------------------------------------------------
 
+/// Runs Codex without approval prompts or its own sandbox, matching the
+/// Claude backend's `--dangerously-skip-permissions`.
+///
+/// Codex CLI 0.156 removed `--full-auto`, which only selected the
+/// `workspace-write` sandbox. That sandbox blocks network access and writes
+/// outside the checkout, so Minions could not run `gh` or commit (a
+/// worktree's gitdir lives in the bare repo under `~/.gru/repos/`). The
+/// flag is accepted by both `codex exec` and `codex exec resume`.
+const CODEX_BYPASS_SANDBOX_FLAG: &str = "--dangerously-bypass-approvals-and-sandbox";
+
 /// Builds a Codex command for a new session.
 ///
-/// Uses `codex exec --json --full-auto` for autonomous headless execution
-/// with JSONL streaming output.
+/// Uses `codex exec --json --dangerously-bypass-approvals-and-sandbox` for
+/// autonomous headless execution with JSONL streaming output.
 fn build_codex_command(binary: &str, worktree_path: &Path, prompt: &str) -> TokioCommand {
     let mut cmd = TokioCommand::new(binary);
     cmd.arg("exec")
         .arg("--json")
-        .arg("--full-auto")
+        .arg(CODEX_BYPASS_SANDBOX_FLAG)
         .arg(prompt)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
@@ -198,7 +209,7 @@ fn build_codex_resume_command(binary: &str, worktree_path: &Path, prompt: &str) 
         .arg("resume")
         .arg("--last")
         .arg("--json")
-        .arg("--full-auto")
+        .arg(CODEX_BYPASS_SANDBOX_FLAG)
         .arg(prompt)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
@@ -550,7 +561,8 @@ mod tests {
         let args: Vec<&std::ffi::OsStr> = inner.get_args().collect();
         assert!(args.contains(&"exec".as_ref()));
         assert!(args.contains(&"--json".as_ref()));
-        assert!(args.contains(&"--full-auto".as_ref()));
+        assert!(args.contains(&"--dangerously-bypass-approvals-and-sandbox".as_ref()));
+        assert!(!args.contains(&"--full-auto".as_ref()));
         assert!(args.contains(&"fix the bug".as_ref()));
         assert_eq!(*args.last().unwrap(), std::ffi::OsStr::new("fix the bug"));
 
@@ -593,7 +605,8 @@ mod tests {
         assert!(args.contains(&"resume".as_ref()));
         assert!(args.contains(&"--last".as_ref()));
         assert!(args.contains(&"--json".as_ref()));
-        assert!(args.contains(&"--full-auto".as_ref()));
+        assert!(args.contains(&"--dangerously-bypass-approvals-and-sandbox".as_ref()));
+        assert!(!args.contains(&"--full-auto".as_ref()));
 
         // Verify GH_HOST is set
         let envs: Vec<_> = inner.get_envs().collect();
@@ -643,7 +656,8 @@ mod tests {
         assert_eq!(inner.get_program(), "codex");
         let args: Vec<&std::ffi::OsStr> = inner.get_args().collect();
         assert!(args.contains(&"exec".as_ref()));
-        assert!(args.contains(&"--full-auto".as_ref()));
+        assert!(args.contains(&"--dangerously-bypass-approvals-and-sandbox".as_ref()));
+        assert!(!args.contains(&"--full-auto".as_ref()));
         assert!(args.contains(&"fix the tests".as_ref()));
 
         let envs: Vec<_> = inner.get_envs().collect();
@@ -664,7 +678,8 @@ mod tests {
         assert_eq!(inner.get_program(), "codex");
         let args: Vec<&std::ffi::OsStr> = inner.get_args().collect();
         assert!(args.contains(&"exec".as_ref()));
-        assert!(args.contains(&"--full-auto".as_ref()));
+        assert!(args.contains(&"--dangerously-bypass-approvals-and-sandbox".as_ref()));
+        assert!(!args.contains(&"--full-auto".as_ref()));
         // "-" should NOT appear as an argument when using stdin sentinel
         assert!(!args.contains(&"-".as_ref()));
     }
@@ -680,7 +695,8 @@ mod tests {
         let args: Vec<&std::ffi::OsStr> = inner.get_args().collect();
         assert!(args.contains(&"exec".as_ref()));
         assert!(args.contains(&"--json".as_ref()));
-        assert!(args.contains(&"--full-auto".as_ref()));
+        assert!(args.contains(&"--dangerously-bypass-approvals-and-sandbox".as_ref()));
+        assert!(!args.contains(&"--full-auto".as_ref()));
         assert!(args.contains(&"fix the CI".as_ref()));
         // GH_HOST must be set for GitHub Enterprise compatibility
         let envs: Vec<_> = inner.get_envs().collect();
