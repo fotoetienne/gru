@@ -1,6 +1,7 @@
 use crate::agent::AgentEvent;
 use crate::agent_registry;
 use crate::agent_runner::{run_agent_with_stream_monitoring, EXIT_CODE_SIGNAL_TERMINATED};
+use crate::ci;
 use crate::git;
 use crate::github;
 use crate::minion;
@@ -183,6 +184,28 @@ pub(crate) async fn handle_review(pr_arg: Option<String>, agent_name: &str) -> R
     // Register the Minion (spawn_blocking to avoid holding lock during review)
     let minion_id_clone = minion_id.clone();
     with_registry(move |registry| registry.register(minion_id_clone, registry_info)).await?;
+
+    // Explicit reviews always post, but let the user know when this commit
+    // already has a review from this gh account. Automated self-reviews are
+    // deduplicated before spawning in `fix/monitor.rs`, so this normally only
+    // fires for explicit runs. HEAD is the local checkout, which may lag the
+    // PR's remote head for a reused worktree; that matches what the agent reviews.
+    let head_sha = ci::get_head_sha(&checkout_path).await;
+    let (host_ref, owner_ref, repo_ref, pr_ref) = (&host, &owner, &repo, &pr_num);
+    if let Some(notice) = existing_review_notice(head_sha, |sha| async move {
+        // The notice is informational, so lookup failures are logged at debug
+        // level rather than surfaced as warnings.
+        github::check_gru_review_for_sha(host_ref, owner_ref, repo_ref, pr_ref, &sha)
+            .await
+            .unwrap_or_else(|e| {
+                log::debug!("Existing-review lookup failed: {:#}", e);
+                false
+            })
+    })
+    .await
+    {
+        println!("{}", notice);
+    }
 
     println!("🤖 Launching autonomous review agent...\n");
 
@@ -500,6 +523,26 @@ async fn fetch_pr_details(owner: &str, repo: &str, host: &str, pr_num: u64) -> R
     })
 }
 
+/// Returns the notice to print when HEAD already has a review from this gh account.
+///
+/// Fails open: returns `None` if HEAD can't be resolved, without calling
+/// `has_review`. The caller's `has_review` should return `false` on lookup errors.
+async fn existing_review_notice<F, Fut>(head_sha: Result<String>, has_review: F) -> Option<String>
+where
+    F: FnOnce(String) -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    let sha = head_sha.ok()?;
+    if has_review(sha.clone()).await {
+        Some(format!(
+            "ℹ️  This account already reviewed {}; posting another review",
+            sha
+        ))
+    } else {
+        None
+    }
+}
+
 /// Builds the review prompt using the prompt template system.
 ///
 /// Loads the "review" prompt template (built-in or overridden via `.gru/prompts/review.md`),
@@ -576,12 +619,40 @@ mod tests {
         assert!(prompt.contains("EXACTLY ONE review"));
         assert!(prompt.contains("do not post duplicate reviews"));
         assert!(prompt.contains("exit code 0"));
-        // Existing Minion review check: SHA-aware, paginated, regex filter
-        assert!(prompt.contains("gh api repos/octocat/hello-world/pulls/456/reviews --paginate"));
-        assert!(prompt.contains("jq -n --arg sha"));
-        assert!(prompt.contains("inputs[]"));
-        assert!(prompt.contains(r#"test("<sub>🤖 M[A-Za-z0-9]{3,}</sub>\\s*$")"#));
-        assert!(prompt.contains("commit_id == $sha"));
+        // No cross-session HEAD-SHA guard: explicit reviews always post (#942).
+        // Automated self-reviews are deduplicated in Rust before spawning.
+        assert!(!prompt.contains("commit_id == $sha"));
+        assert!(!prompt.contains("cross-session guard"));
+    }
+
+    #[tokio::test]
+    async fn test_existing_review_notice_when_reviewed() {
+        let notice =
+            existing_review_notice(
+                Ok("abc123".to_string()),
+                |sha| async move { sha == "abc123" },
+            )
+            .await;
+        assert_eq!(
+            notice.as_deref(),
+            Some("ℹ️  This account already reviewed abc123; posting another review")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_existing_review_notice_when_not_reviewed() {
+        // Also covers lookup errors: the caller maps them to false.
+        let notice = existing_review_notice(Ok("abc123".to_string()), |_| async { false }).await;
+        assert!(notice.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_existing_review_notice_head_sha_error_skips_lookup() {
+        let notice = existing_review_notice(Err(anyhow::anyhow!("no HEAD")), |_| async {
+            panic!("review lookup must not run when HEAD is unavailable")
+        })
+        .await;
+        assert!(notice.is_none());
     }
 
     #[test]
