@@ -190,13 +190,14 @@ pub(crate) async fn handle_review(pr_arg: Option<String>, agent_name: &str) -> R
     // deduplicated before spawning in `fix/monitor.rs`, so this normally only
     // fires for explicit runs. HEAD is the local checkout, which may lag the
     // PR's remote head for a reused worktree; that matches what the agent reviews.
-    if let Ok(head_sha) = ci::get_head_sha(&checkout_path).await {
-        if github::has_gru_review_for_sha(&host, &owner, &repo, &pr_num, &head_sha).await {
-            println!(
-                "ℹ️  This account already reviewed {}; posting another review",
-                head_sha
-            );
-        }
+    let head_sha = ci::get_head_sha(&checkout_path).await;
+    let (host_ref, owner_ref, repo_ref, pr_ref) = (&host, &owner, &repo, &pr_num);
+    if let Some(notice) = existing_review_notice(head_sha, |sha| async move {
+        github::has_gru_review_for_sha(host_ref, owner_ref, repo_ref, pr_ref, &sha).await
+    })
+    .await
+    {
+        println!("{}", notice);
     }
 
     println!("🤖 Launching autonomous review agent...\n");
@@ -520,6 +521,26 @@ async fn fetch_pr_details(owner: &str, repo: &str, host: &str, pr_num: u64) -> R
 /// Loads the "review" prompt template (built-in or overridden via `.gru/prompts/review.md`),
 /// builds a `PromptContext` from the PR details, and renders the template.
 /// Falls back to `/pr_review <pr_num>` when PR details are unavailable or no prompt is found.
+/// Returns the notice to print when HEAD already has a review from this gh account.
+///
+/// Fails open: returns `None` if HEAD can't be resolved, without calling
+/// `has_review`. `has_review` itself fails open (returns `false` on API errors).
+async fn existing_review_notice<F, Fut>(head_sha: Result<String>, has_review: F) -> Option<String>
+where
+    F: FnOnce(String) -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    let sha = head_sha.ok()?;
+    if has_review(sha.clone()).await {
+        Some(format!(
+            "ℹ️  This account already reviewed {}; posting another review",
+            sha
+        ))
+    } else {
+        None
+    }
+}
+
 fn build_review_prompt(
     owner: &str,
     repo: &str,
@@ -595,6 +616,36 @@ mod tests {
         // Automated self-reviews are deduplicated in Rust before spawning.
         assert!(!prompt.contains("commit_id == $sha"));
         assert!(!prompt.contains("cross-session guard"));
+    }
+
+    #[tokio::test]
+    async fn test_existing_review_notice_when_reviewed() {
+        let notice =
+            existing_review_notice(
+                Ok("abc123".to_string()),
+                |sha| async move { sha == "abc123" },
+            )
+            .await;
+        assert_eq!(
+            notice.as_deref(),
+            Some("ℹ️  This account already reviewed abc123; posting another review")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_existing_review_notice_when_not_reviewed() {
+        // Also covers API errors: has_gru_review_for_sha returns false on failure.
+        let notice = existing_review_notice(Ok("abc123".to_string()), |_| async { false }).await;
+        assert!(notice.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_existing_review_notice_head_sha_error_skips_lookup() {
+        let notice = existing_review_notice(Err(anyhow::anyhow!("no HEAD")), |_| async {
+            panic!("review lookup must not run when HEAD is unavailable")
+        })
+        .await;
+        assert!(notice.is_none());
     }
 
     #[test]
