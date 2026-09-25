@@ -116,6 +116,7 @@ impl AgentBackend for CodexBackend {
         _cwd: &Path,
         _system_prompt: &str,
         _initial_prompt: Option<&str>,
+        _github_host: Option<&str>,
     ) -> Option<TokioCommand> {
         // Codex CLI has no interactive entry point that accepts a custom
         // system prompt, so `gru chat`/`pm`/`tpm` are unsupported here.
@@ -642,7 +643,7 @@ mod tests {
         let b = backend();
         let path = std::path::PathBuf::from("/tmp/project");
         assert!(b
-            .build_interactive_command(&path, "you are a PM", Some("hi"))
+            .build_interactive_command(&path, "you are a PM", Some("hi"), None)
             .is_none());
     }
 
