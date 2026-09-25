@@ -1,6 +1,7 @@
 use crate::agent::AgentEvent;
 use crate::agent_registry;
 use crate::agent_runner::{run_agent_with_stream_monitoring, EXIT_CODE_SIGNAL_TERMINATED};
+use crate::ci;
 use crate::git;
 use crate::github;
 use crate::minion;
@@ -183,6 +184,18 @@ pub(crate) async fn handle_review(pr_arg: Option<String>, agent_name: &str) -> R
     // Register the Minion (spawn_blocking to avoid holding lock during review)
     let minion_id_clone = minion_id.clone();
     with_registry(move |registry| registry.register(minion_id_clone, registry_info)).await?;
+
+    // Explicit reviews always post, but let the user know when this commit
+    // already has a review from us. Automated self-reviews are deduplicated
+    // before spawning in `fix/monitor.rs`, so this only fires for explicit runs.
+    if let Ok(head_sha) = ci::get_head_sha(&checkout_path).await {
+        if github::has_gru_review_for_sha(&host, &owner, &repo, &pr_num, &head_sha).await {
+            println!(
+                "ℹ️  A Minion review already exists for {}; posting another",
+                head_sha
+            );
+        }
+    }
 
     println!("🤖 Launching autonomous review agent...\n");
 
@@ -576,12 +589,10 @@ mod tests {
         assert!(prompt.contains("EXACTLY ONE review"));
         assert!(prompt.contains("do not post duplicate reviews"));
         assert!(prompt.contains("exit code 0"));
-        // Existing Minion review check: SHA-aware, paginated, regex filter
-        assert!(prompt.contains("gh api repos/octocat/hello-world/pulls/456/reviews --paginate"));
-        assert!(prompt.contains("jq -n --arg sha"));
-        assert!(prompt.contains("inputs[]"));
-        assert!(prompt.contains(r#"test("<sub>🤖 M[A-Za-z0-9]{3,}</sub>\\s*$")"#));
-        assert!(prompt.contains("commit_id == $sha"));
+        // No cross-session HEAD-SHA guard: explicit reviews always post (#942).
+        // Automated self-reviews are deduplicated in Rust before spawning.
+        assert!(!prompt.contains("commit_id == $sha"));
+        assert!(!prompt.contains("cross-session guard"));
     }
 
     #[test]
