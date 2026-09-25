@@ -523,11 +523,6 @@ async fn fetch_pr_details(owner: &str, repo: &str, host: &str, pr_num: u64) -> R
     })
 }
 
-/// Builds the review prompt using the prompt template system.
-///
-/// Loads the "review" prompt template (built-in or overridden via `.gru/prompts/review.md`),
-/// builds a `PromptContext` from the PR details, and renders the template.
-/// Falls back to `/pr_review <pr_num>` when PR details are unavailable or no prompt is found.
 /// Returns the notice to print when HEAD already has a review from this gh account.
 ///
 /// Fails open: returns `None` if HEAD can't be resolved, without calling
@@ -548,6 +543,11 @@ where
     }
 }
 
+/// Builds the review prompt using the prompt template system.
+///
+/// Loads the "review" prompt template (built-in or overridden via `.gru/prompts/review.md`),
+/// builds a `PromptContext` from the PR details, and renders the template.
+/// Falls back to `/pr_review <pr_num>` when PR details are unavailable or no prompt is found.
 fn build_review_prompt(
     owner: &str,
     repo: &str,
