@@ -561,7 +561,7 @@ mod tests {
         let args: Vec<&std::ffi::OsStr> = inner.get_args().collect();
         assert!(args.contains(&"exec".as_ref()));
         assert!(args.contains(&"--json".as_ref()));
-        assert!(args.contains(&CODEX_BYPASS_SANDBOX_FLAG.as_ref()));
+        assert!(args.contains(&"--dangerously-bypass-approvals-and-sandbox".as_ref()));
         assert!(!args.contains(&"--full-auto".as_ref()));
         assert!(args.contains(&"fix the bug".as_ref()));
         assert_eq!(*args.last().unwrap(), std::ffi::OsStr::new("fix the bug"));
@@ -605,7 +605,7 @@ mod tests {
         assert!(args.contains(&"resume".as_ref()));
         assert!(args.contains(&"--last".as_ref()));
         assert!(args.contains(&"--json".as_ref()));
-        assert!(args.contains(&CODEX_BYPASS_SANDBOX_FLAG.as_ref()));
+        assert!(args.contains(&"--dangerously-bypass-approvals-and-sandbox".as_ref()));
         assert!(!args.contains(&"--full-auto".as_ref()));
 
         // Verify GH_HOST is set
@@ -656,7 +656,7 @@ mod tests {
         assert_eq!(inner.get_program(), "codex");
         let args: Vec<&std::ffi::OsStr> = inner.get_args().collect();
         assert!(args.contains(&"exec".as_ref()));
-        assert!(args.contains(&CODEX_BYPASS_SANDBOX_FLAG.as_ref()));
+        assert!(args.contains(&"--dangerously-bypass-approvals-and-sandbox".as_ref()));
         assert!(!args.contains(&"--full-auto".as_ref()));
         assert!(args.contains(&"fix the tests".as_ref()));
 
@@ -678,7 +678,7 @@ mod tests {
         assert_eq!(inner.get_program(), "codex");
         let args: Vec<&std::ffi::OsStr> = inner.get_args().collect();
         assert!(args.contains(&"exec".as_ref()));
-        assert!(args.contains(&CODEX_BYPASS_SANDBOX_FLAG.as_ref()));
+        assert!(args.contains(&"--dangerously-bypass-approvals-and-sandbox".as_ref()));
         assert!(!args.contains(&"--full-auto".as_ref()));
         // "-" should NOT appear as an argument when using stdin sentinel
         assert!(!args.contains(&"-".as_ref()));
@@ -695,7 +695,7 @@ mod tests {
         let args: Vec<&std::ffi::OsStr> = inner.get_args().collect();
         assert!(args.contains(&"exec".as_ref()));
         assert!(args.contains(&"--json".as_ref()));
-        assert!(args.contains(&CODEX_BYPASS_SANDBOX_FLAG.as_ref()));
+        assert!(args.contains(&"--dangerously-bypass-approvals-and-sandbox".as_ref()));
         assert!(!args.contains(&"--full-auto".as_ref()));
         assert!(args.contains(&"fix the CI".as_ref()));
         // GH_HOST must be set for GitHub Enterprise compatibility
