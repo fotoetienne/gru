@@ -154,10 +154,11 @@ pub(crate) async fn detect_git_repo() -> Result<PathBuf> {
     Ok(PathBuf::from(path_str))
 }
 
-/// Gets the GitHub remote URL from the current git repository
-/// Tries "origin" first, then falls back to the first GitHub remote found
-pub(crate) async fn get_github_remote(host_registry: &HostRegistry) -> Result<String> {
-    // Use `git remote -v` to get all remotes and their URLs in one call
+/// Lists every git remote in the current repository, in `git remote -v` order.
+///
+/// Returns `(name, url)` pairs with duplicate `(name, url)` combinations
+/// collapsed (`git remote -v` prints a fetch and a push line per remote).
+pub(crate) async fn list_remotes() -> Result<Vec<(String, String)>> {
     let output = Command::new("git")
         .arg("remote")
         .arg("-v")
@@ -172,38 +173,62 @@ pub(crate) async fn get_github_remote(host_registry: &HostRegistry) -> Result<St
     let remote_lines =
         String::from_utf8(output.stdout).context("Git remote -v output is not valid UTF-8")?;
 
-    // Parse remotes, prioritizing "origin"
-    let mut origin_url: Option<String> = None;
-    let mut first_github_url: Option<String> = None;
+    Ok(parse_remote_lines(&remote_lines))
+}
 
-    // Compute once, reuse across every remote line.
-    let url_hosts = host_registry.all_url_hosts();
-
-    // Each line format: <name> <url> (fetch|push)
-    for line in remote_lines.lines() {
+/// Parses `git remote -v` output into deduplicated `(name, url)` pairs.
+fn parse_remote_lines(output: &str) -> Vec<(String, String)> {
+    let mut remotes: Vec<(String, String)> = Vec::new();
+    for line in output.lines() {
         let mut parts = line.split_whitespace();
-        let remote_name = parts.next();
-        let remote_url = parts.next();
-
-        if let (Some(name), Some(url)) = (remote_name, remote_url) {
-            if url_matches_any_host(url, &url_hosts) {
-                // Prioritize "origin" remote
-                if name == "origin" && origin_url.is_none() {
-                    origin_url = Some(url.to_string());
-                } else if first_github_url.is_none() {
-                    first_github_url = Some(url.to_string());
-                }
-            }
+        let (Some(name), Some(url)) = (parts.next(), parts.next()) else {
+            continue;
+        };
+        if !remotes.iter().any(|(n, u)| n == name && u == url) {
+            remotes.push((name.to_string(), url.to_string()));
         }
     }
+    remotes
+}
 
-    // Return origin if found, otherwise return first GitHub remote
-    origin_url.or(first_github_url).ok_or_else(|| {
-        anyhow::anyhow!(
-            "No GitHub remote found. Add a GitHub remote or provide the full issue URL.\n\
+/// Orders recognized GitHub remote URLs with `origin` first.
+///
+/// Remotes whose host isn't in `host_registry` are dropped.
+pub(crate) fn github_remote_urls(
+    remotes: &[(String, String)],
+    host_registry: &HostRegistry,
+) -> Vec<String> {
+    // Compute once, reuse across every remote line.
+    let url_hosts = host_registry.all_url_hosts();
+    let mut origin: Vec<String> = Vec::new();
+    let mut others: Vec<String> = Vec::new();
+    for (name, url) in remotes {
+        if !url_matches_any_host(url, &url_hosts) {
+            continue;
+        }
+        if name == "origin" {
+            origin.push(url.clone());
+        } else {
+            others.push(url.clone());
+        }
+    }
+    origin.extend(others);
+    origin
+}
+
+/// Gets the GitHub remote URL from the current git repository
+/// Tries "origin" first, then falls back to the first GitHub remote found
+pub(crate) async fn get_github_remote(host_registry: &HostRegistry) -> Result<String> {
+    let remotes = list_remotes().await?;
+    github_remote_urls(&remotes, host_registry)
+        .into_iter()
+        .next()
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "No GitHub remote found. Add a GitHub remote or provide the full issue URL.\n\
                  Example: git remote add origin https://github.com/owner/repo.git"
-        )
-    })
+            )
+        })
 }
 
 /// Supported URL schemes for GitHub remotes and web URLs.
@@ -223,6 +248,10 @@ pub(crate) struct GitUrlParts<'a> {
     pub(crate) scheme: GitUrlScheme,
     /// Hostname with any port stripped.
     pub(crate) host: &'a str,
+    /// The explicit `:port` from the authority, without the colon, when the
+    /// URL carried one. Deliberately kept out of [`GitUrlParts::host`] so a
+    /// port never participates in host-identity comparisons.
+    pub(crate) port: Option<&'a str>,
     /// Everything after the authority. For HTTPS/HTTP URLs this includes the
     /// leading `/` (e.g. `/owner/repo.git`); for SSH (`git@host:path`) it's
     /// the path with no leading slash.
@@ -240,9 +269,11 @@ pub(crate) fn split_github_url(url: &str) -> Option<GitUrlParts<'_>> {
         if host.is_empty() {
             return None;
         }
+        // `git@host:owner/repo` has no port slot — the colon introduces the path.
         return Some(GitUrlParts {
             scheme: GitUrlScheme::Ssh,
             host,
+            port: None,
             rest: path,
         });
     }
@@ -260,17 +291,31 @@ pub(crate) fn split_github_url(url: &str) -> Option<GitUrlParts<'_>> {
     if authority.contains('@') {
         return None;
     }
-    // Strip optional `:port` from the authority.
-    let host = authority
-        .split_once(':')
-        .map(|(h, _)| h)
-        .unwrap_or(authority);
+    // Split an optional `:port` off the authority. The port is carried
+    // separately so host comparisons stay portless.
+    //
+    // A bracketed IPv6 literal (`[2001:db8::1]:8443`) is out of scope: the
+    // first colon lands inside the brackets, the digit check below fails, and
+    // the URL is rejected. GitHub remotes are hostnames in practice, and
+    // rejecting is safer than truncating a host at the wrong colon.
+    let (host, port) = match authority.split_once(':') {
+        Some((h, p)) => {
+            // Reject a malformed port rather than treating `host:` or
+            // `host:abc` as a valid authority.
+            if p.is_empty() || !p.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            (h, Some(p))
+        }
+        None => (authority, None),
+    };
     if host.is_empty() {
         return None;
     }
     Some(GitUrlParts {
         scheme,
         host,
+        port,
         rest: path,
     })
 }
@@ -285,7 +330,7 @@ fn url_matches_any_host(url: &str, hosts: &[String]) -> bool {
     let Some(parts) = split_github_url(url) else {
         return false;
     };
-    hosts.iter().any(|h| h == parts.host)
+    hosts.iter().any(|h| h.eq_ignore_ascii_case(parts.host))
 }
 
 /// Parses a GitHub remote URL to extract host, owner, and repo name.
@@ -308,7 +353,7 @@ pub(crate) fn parse_github_remote(
         split_github_url(url).ok_or_else(|| anyhow::anyhow!("Not a GitHub URL: {}", url))?;
 
     let url_hosts = host_registry.all_url_hosts();
-    if !url_hosts.iter().any(|h| h == parts.host) {
+    if !url_hosts.iter().any(|h| h.eq_ignore_ascii_case(parts.host)) {
         anyhow::bail!("Not a GitHub URL: {}", url);
     }
 
@@ -326,6 +371,29 @@ pub(crate) fn parse_github_remote(
         .canonical_host(parts.host)
         .expect("matched host is always resolvable");
     Ok((canonical, segs[0].to_string(), segs[1].to_string()))
+}
+
+/// Resolves the `GH_HOST` value for a remote URL.
+///
+/// Like [`parse_github_remote`] this canonicalizes a web UI hostname to its
+/// API host, but the returned string additionally carries the remote's
+/// explicit `:port` when the remote already pointed at the API host. `gh`
+/// needs the port to reach a GHES instance served off 443; host *identity*
+/// (config lookups, registry matching) never does, which is why the port is
+/// reattached only here and never in [`parse_github_remote`].
+///
+/// When the remote used a configured `web_url` host, its port belongs to the
+/// web UI and is dropped — the API host's port, if any, is the config's to
+/// state.
+pub(crate) fn remote_gh_host(url: &str, host_registry: &HostRegistry) -> Option<String> {
+    let parts = split_github_url(url)?;
+    let canonical = host_registry.canonical_host(parts.host)?;
+    match parts.port {
+        Some(port) if canonical.eq_ignore_ascii_case(parts.host) => {
+            Some(format!("{}:{}", canonical, port))
+        }
+        _ => Some(canonical),
+    }
 }
 
 /// Represents a single entry from `git worktree list --porcelain` output.
@@ -1299,6 +1367,131 @@ mod tests {
             },
         );
         HostRegistry::from_config(&config)
+    }
+
+    #[test]
+    fn test_parse_remote_lines_dedupes_fetch_and_push() {
+        let output = "origin\tgit@github.com:foo/bar.git (fetch)\n\
+                      origin\tgit@github.com:foo/bar.git (push)\n\
+                      upstream\thttps://github.com/up/bar.git (fetch)\n\
+                      upstream\thttps://github.com/up/bar.git (push)\n";
+        assert_eq!(
+            parse_remote_lines(output),
+            vec![
+                (
+                    "origin".to_string(),
+                    "git@github.com:foo/bar.git".to_string()
+                ),
+                (
+                    "upstream".to_string(),
+                    "https://github.com/up/bar.git".to_string()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_github_remote_urls_puts_origin_first_and_drops_unknown_hosts() {
+        let remotes = vec![
+            ("fork".to_string(), "https://gitlab.com/x/y.git".to_string()),
+            (
+                "upstream".to_string(),
+                "https://github.com/up/bar.git".to_string(),
+            ),
+            (
+                "origin".to_string(),
+                "git@github.com:foo/bar.git".to_string(),
+            ),
+        ];
+        assert_eq!(
+            github_remote_urls(&remotes, &default_hosts()),
+            vec![
+                "git@github.com:foo/bar.git".to_string(),
+                "https://github.com/up/bar.git".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_split_github_url_separates_port_from_host() {
+        let parts = split_github_url("https://ghe.example.com:8443/foo/bar.git").unwrap();
+        assert_eq!(parts.host, "ghe.example.com");
+        assert_eq!(parts.port, Some("8443"));
+    }
+
+    #[test]
+    fn test_split_github_url_rejects_bracketed_ipv6_literal() {
+        // Documents the out-of-scope behavior: rejected, never truncated at
+        // the wrong colon.
+        assert!(split_github_url("https://[2001:db8::1]:8443/foo/bar.git").is_none());
+    }
+
+    #[test]
+    fn test_split_github_url_rejects_non_numeric_port() {
+        assert!(split_github_url("https://ghe.example.com:https/foo/bar.git").is_none());
+        assert!(split_github_url("https://ghe.example.com:/foo/bar.git").is_none());
+    }
+
+    #[test]
+    fn test_parse_github_remote_is_case_insensitive() {
+        let (host, owner, repo) =
+            parse_github_remote("https://GitHub.COM/Foo/Bar.git", &default_hosts()).unwrap();
+        assert_eq!(host, "github.com");
+        assert_eq!(owner, "Foo");
+        assert_eq!(repo, "Bar");
+    }
+
+    #[test]
+    fn test_parse_github_remote_drops_port_from_host() {
+        // Host identity must stay portless — a ported host here is what
+        // corrupted `daemon.repos` entries in the first place.
+        let (host, owner, repo) = parse_github_remote(
+            "https://ghe.example.com:8443/foo/bar.git",
+            &hosts_with_ghe(),
+        )
+        .unwrap();
+        assert_eq!(host, "ghe.example.com");
+        assert_eq!(owner, "foo");
+        assert_eq!(repo, "bar");
+    }
+
+    #[test]
+    fn test_remote_gh_host_keeps_port() {
+        assert_eq!(
+            remote_gh_host(
+                "https://ghe.example.com:8443/foo/bar.git",
+                &hosts_with_ghe()
+            ),
+            Some("ghe.example.com:8443".to_string())
+        );
+    }
+
+    #[test]
+    fn test_remote_gh_host_without_port() {
+        assert_eq!(
+            remote_gh_host("git@ghe.example.com:foo/bar.git", &hosts_with_ghe()),
+            Some("ghe.example.com".to_string())
+        );
+    }
+
+    #[test]
+    fn test_remote_gh_host_canonicalizes_web_url_and_drops_its_port() {
+        // The port belonged to the web UI, not the API host.
+        assert_eq!(
+            remote_gh_host(
+                "https://github.netflix.net:8443/foo/bar.git",
+                &hosts_with_web_url()
+            ),
+            Some("git.netflix.net".to_string())
+        );
+    }
+
+    #[test]
+    fn test_remote_gh_host_unknown_host_is_none() {
+        assert_eq!(
+            remote_gh_host("https://gitlab.com/foo/bar.git", &default_hosts()),
+            None
+        );
     }
 
     fn hosts_with_web_url() -> HostRegistry {

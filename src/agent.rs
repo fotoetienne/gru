@@ -324,12 +324,21 @@ pub(crate) trait AgentBackend: Send + Sync {
     /// an argument terminator (`--`) so prompts that look like flags (e.g. `-h`)
     /// aren't parsed as CLI options.
     ///
+    /// `github_host`, when `Some`, is set as `GH_HOST` so `gh` inside the
+    /// session targets the right GitHub instance — matching what
+    /// `build_interactive_resume_command` does. It is `Option` because a fresh
+    /// session has no Minion to inherit a host from: when
+    /// [`crate::gh_host::resolve_interactive_gh_host`] can't identify one,
+    /// leaving the variable alone lets `gh` fall back to its own config rather
+    /// than being pinned to a guess.
+    ///
     /// Returns `None` if the backend has no interactive entry point (Codex).
     fn build_interactive_command(
         &self,
         cwd: &Path,
         system_prompt: &str,
         initial_prompt: Option<&str>,
+        github_host: Option<&str>,
     ) -> Option<TokioCommand>;
 
     /// Build a command for a one-shot utility task (no session tracking, text output).
@@ -489,7 +498,7 @@ mod tests {
         // the CLI was never installed, so the message must point somewhere.
         let backend = crate::claude_backend::ClaudeBackend::new(None, None, None);
         let cmd = backend
-            .build_interactive_command(std::path::Path::new("/tmp/project"), "sys", None)
+            .build_interactive_command(std::path::Path::new("/tmp/project"), "sys", None, None)
             .unwrap();
         let msg = spawn_error_context(&backend, &cmd, "for gru chat");
         assert!(msg.contains("https://claude.com/claude-code"), "{msg}");

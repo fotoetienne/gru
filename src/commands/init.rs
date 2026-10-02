@@ -90,12 +90,18 @@ fn validate_host(host: &str) -> Result<()> {
 /// 2. Host matches a named `[github_hosts.*]` entry → `name:owner/repo`
 /// 3. Host contains a dot → legacy `host/owner/repo`
 /// 4. Otherwise → `None` (caller should warn and skip)
+///
+/// Any `:port` is stripped first. A port belongs to a remote URL, not to a
+/// host's identity: leaving it on defeats the `[github_hosts.*]` lookup and
+/// writes a `host:port/owner/repo` entry that no later parse can match back to
+/// the remote it came from.
 fn build_repo_entry(
     host: &str,
     owner: &str,
     repo: &str,
     github_hosts: &HashMap<String, GhHostConfig>,
 ) -> Option<String> {
+    let host = crate::config::strip_host_port(host);
     if host.eq_ignore_ascii_case("github.com") {
         return Some(format!("{}/{}", owner, repo));
     }
@@ -397,6 +403,14 @@ async fn detect_current_repo() -> Result<(String, String, String)> {
     let (host, owner, repo) = parse_github_remote(&remote_url, &host_registry)
         .context("Could not parse GitHub owner/repo from remote URL")?;
 
+    // `parse_github_remote` returns the host's *identity*, which is portless
+    // by design. Everything init does with this value next has to actually
+    // reach the instance — the `gh` auth check, the label and issue calls, the
+    // bare clone URL — so hand back the endpoint form instead. The port is
+    // stripped again by `build_repo_entry` before anything is persisted, so
+    // config entries stay portless.
+    let host = crate::git::remote_gh_host(&remote_url, &host_registry).unwrap_or(host);
+
     println!("  Detected: {}/{}", owner, repo);
 
     Ok((owner, repo, host))
@@ -523,6 +537,129 @@ mod tests {
             host: h.to_string(),
             web_url: None,
         }
+    }
+
+    /// Every host string `gru init` can write to `daemon.repos` must parse
+    /// back to the same host the remote was derived from. This is the
+    /// round-trip that a ported host broke: the entry was written, but
+    /// `HostRegistry::from_config` then failed to match the very remote it
+    /// came from and every `gru do` reported "no GitHub remote".
+    /// `gru init` in a ported checkout must reach the instance *and* persist a
+    /// portless entry — the two halves of the same remote, used differently.
+    #[test]
+    fn detected_endpoint_keeps_the_port_while_the_entry_drops_it() {
+        let hosts = HashMap::from([("ghe".to_string(), host("ghe.example.com"))]);
+        let config = LabConfig {
+            github_hosts: hosts.clone(),
+            ..Default::default()
+        };
+        let registry = crate::config::HostRegistry::from_config(&config);
+        let remote_url = "https://ghe.example.com:8443/acme/widgets.git";
+
+        // What detect_current_repo hands to check_auth_via_cli and the clone.
+        let endpoint = crate::git::remote_gh_host(remote_url, &registry).unwrap();
+        assert_eq!(endpoint, "ghe.example.com:8443");
+
+        // What lands in daemon.repos.
+        let (_identity, owner, repo) =
+            crate::git::parse_github_remote(remote_url, &registry).unwrap();
+        let entry = build_repo_entry(&endpoint, &owner, &repo, &hosts).unwrap();
+        assert_eq!(entry, "ghe:acme/widgets");
+    }
+
+    fn assert_round_trips(remote_url: &str, hosts: &HashMap<String, GhHostConfig>) {
+        let mut config = LabConfig {
+            github_hosts: hosts.clone(),
+            ..Default::default()
+        };
+
+        // gru init: parse the remote, then persist an entry for it.
+        let registry = crate::config::HostRegistry::from_config(&config);
+        let (host, owner, repo) = crate::git::parse_github_remote(remote_url, &registry)
+            .unwrap_or_else(|e| panic!("remote {remote_url} did not parse: {e:#}"));
+        let entry = build_repo_entry(&host, &owner, &repo, hosts)
+            .unwrap_or_else(|| panic!("no daemon.repos entry built for host {host}"));
+
+        // Next run: the persisted entry is read back...
+        config.daemon.repos = vec![entry.clone()];
+        let (entry_host, entry_owner, entry_repo) =
+            crate::config::parse_repo_entry_with_hosts(&entry, hosts)
+                .unwrap_or_else(|| panic!("persisted entry {entry:?} did not parse back"));
+        assert_eq!(entry_host, host, "entry {entry:?} changed the host");
+        assert_eq!(entry_owner, owner);
+        assert_eq!(entry_repo, repo);
+
+        // ...and the registry built from it still recognizes the remote.
+        let registry = crate::config::HostRegistry::from_config(&config);
+        let (again_host, again_owner, again_repo) =
+            crate::git::parse_github_remote(remote_url, &registry).unwrap_or_else(|e| {
+                panic!("remote {remote_url} unrecognized after round-trip via {entry:?}: {e:#}")
+            });
+        assert_eq!((again_host, again_owner, again_repo), (host, owner, repo));
+    }
+
+    #[test]
+    fn test_repo_entry_round_trips_for_github_com() {
+        assert_round_trips("git@github.com:foo/bar.git", &HashMap::new());
+        assert_round_trips("https://github.com/foo/bar.git", &HashMap::new());
+    }
+
+    #[test]
+    fn test_repo_entry_round_trips_for_named_ghe_host() {
+        let hosts = HashMap::from([("ghe".to_string(), host("ghe.example.com"))]);
+        assert_round_trips("https://ghe.example.com/foo/bar.git", &hosts);
+        assert_round_trips("git@ghe.example.com:foo/bar.git", &hosts);
+    }
+
+    #[test]
+    fn test_repo_entry_round_trips_for_ported_remote() {
+        // The regression case: an explicit port must not reach the entry.
+        let hosts = HashMap::from([("ghe".to_string(), host("ghe.example.com"))]);
+        assert_round_trips("https://ghe.example.com:8443/foo/bar.git", &hosts);
+    }
+
+    #[test]
+    fn test_repo_entry_round_trips_for_legacy_unnamed_host() {
+        // An unnamed host is only recognized by the registry once it appears in
+        // daemon.repos, so seed it there before parsing the remote.
+        let mut config = LabConfig::default();
+        config
+            .daemon
+            .repos
+            .push("ghe.other.com/foo/bar".to_string());
+        let registry = crate::config::HostRegistry::from_config(&config);
+        let (host, owner, repo) =
+            crate::git::parse_github_remote("https://ghe.other.com/foo/bar.git", &registry)
+                .unwrap();
+        let entry = build_repo_entry(&host, &owner, &repo, &HashMap::new()).unwrap();
+        assert_eq!(entry, "ghe.other.com/foo/bar");
+    }
+
+    #[test]
+    fn test_build_repo_entry_strips_port_before_alias_lookup() {
+        let hosts = HashMap::from([("ghe".to_string(), host("ghe.example.com"))]);
+        assert_eq!(
+            build_repo_entry("ghe.example.com:8443", "foo", "bar", &hosts),
+            Some("ghe:foo/bar".to_string())
+        );
+    }
+
+    #[test]
+    fn test_build_repo_entry_strips_port_from_legacy_entry() {
+        let hosts = HashMap::new();
+        assert_eq!(
+            build_repo_entry("ghe.example.com:8443", "foo", "bar", &hosts),
+            Some("ghe.example.com/foo/bar".to_string())
+        );
+    }
+
+    #[test]
+    fn test_build_repo_entry_strips_port_from_github_com() {
+        let hosts = HashMap::new();
+        assert_eq!(
+            build_repo_entry("github.com:443", "foo", "bar", &hosts),
+            Some("foo/bar".to_string())
+        );
     }
 
     #[test]

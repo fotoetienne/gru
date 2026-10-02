@@ -44,6 +44,16 @@ gh auth status
 
 Gru sets `GH_HOST` on every `gh` CLI invocation, so the correct host is always targeted — you don't need to worry about which is the "default".
 
+Interactive sessions (`gru chat`, `gru pm`, `gru tpm`) get `GH_HOST` too, so `gh` run *inside* a session hits the same instance. The host is resolved in this order:
+
+1. A `daemon.repos` entry naming this exact `owner/repo`. Because you wrote this repo's host down, it outranks everything else — including when it resolves to `github.com` and the checkout's remote points elsewhere.
+2. A git remote in the checkout belonging to that same owner. An explicit port (`https://ghe.example.com:8443/...`) is carried through to `GH_HOST` on these interactive paths (see the port caveat in [Step 2](#step-2-configure-grucconfigtoml)).
+3. A `daemon.repos` entry naming only the owner. This is weaker than the repo's own remote: an entry for `acme/widgets` says nothing definite about where `acme/tools` lives, and one owner can legitimately straddle github.com and a GHES instance.
+4. A `GH_HOST` already exported in your environment.
+5. Any recognized remote, when no owner could be determined.
+
+If none of these identify a host, Gru leaves `GH_HOST` unset and `gh` applies its own configuration.
+
 ### Token scope requirements
 
 Your token needs the following scopes:
@@ -73,6 +83,10 @@ host = "github.netflix.com"
 ```
 
 The name (`netflix` in this example) is your shorthand — you'll use it when referencing repos.
+
+`host` is a bare hostname and must **not** include a port; Gru rejects the config if it does. A host's identity is portless, and a port written here would never match your repos' remotes. If your instance is served on a non-default port, put it in the git remote URL (`https://github.netflix.com:8443/myteam/myapp`) — that is where Gru reads it from.
+
+> **Non-default ports are only partly supported today.** Interactive sessions (`gru chat`, `gru pm`, `gru tpm`) and `gru init` read the port from the remote and use it when reaching your instance. The autonomous commands (`gru do`, `gru review`, `gru lab`) still invoke `gh` with the portless hostname, so they cannot reach an instance served on a non-default port. Tracked in [#938](https://github.com/fotoetienne/gru/issues/938). If your GHES instance is on the standard port (the usual case), nothing here affects you.
 
 ### Optional: `web_url`
 

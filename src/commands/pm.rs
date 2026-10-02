@@ -45,9 +45,26 @@ async fn launch_skill_session(
     // Strip YAML frontmatter from the skill content (delimited by --- lines)
     let system_prompt = strip_frontmatter(skill_content);
 
+    // PM/TPM sessions run `gh` against the repo they were launched from, so
+    // resolve its host the same way `gru chat` does.
+    let (owner, repo_name) = detect_owner_repo().await.unzip();
+    let github_host =
+        crate::gh_host::resolve_interactive_gh_host(owner.as_deref(), repo_name.as_deref()).await;
+    if verbose {
+        match &github_host {
+            Some(host) => eprintln!("GitHub host: {host}"),
+            None => eprintln!("GitHub host: unresolved (leaving GH_HOST unset)"),
+        }
+    }
+
     let backend = crate::agent_registry::resolve_backend(agent_name)?;
     let mut cmd = backend
-        .build_interactive_command(&repo_root, system_prompt, prompt.as_deref())
+        .build_interactive_command(
+            &repo_root,
+            system_prompt,
+            prompt.as_deref(),
+            github_host.as_deref(),
+        )
         .ok_or_else(|| {
             crate::agent_registry::interactive_unsupported_error(role_name, agent_name)
         })?;
@@ -59,6 +76,17 @@ async fn launch_skill_session(
     let status = child_process::wait_with_ctrlc_handling(&mut child).await?;
 
     Ok(if status.success() { 0 } else { 1 })
+}
+
+/// Resolves `(owner, repo)` from the current checkout's GitHub remote.
+///
+/// Returns `None` when no recognized remote exists; the caller then falls back
+/// to the non-owner-specific host resolution path.
+async fn detect_owner_repo() -> Option<(String, String)> {
+    let host_registry = crate::config::load_host_registry();
+    let remote_url = git::get_github_remote(&host_registry).await.ok()?;
+    let (_host, owner, repo) = git::parse_github_remote(&remote_url, &host_registry).ok()?;
+    Some((owner, repo))
 }
 
 /// Strips YAML frontmatter (delimited by `---`) from the beginning of a string.
