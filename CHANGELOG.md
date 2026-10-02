@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- An explicit `gru review` now posts a review even when the current HEAD already has one from this account, and prints a notice first. The built-in review prompt no longer tells the agent to skip in that case. Repos that override `.gru/prompts/review.md` with a copy of the old built-in prompt should remove its "cross-session guard" step. Automated self-reviews are still deduplicated before `gru review` is spawned (#942).
+
 ## [0.1.0] - 2026-03-19
 
 Initial release of Gru, a local-first LLM agent orchestrator that autonomously works on GitHub issues using Claude Code.
