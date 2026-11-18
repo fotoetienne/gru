@@ -582,11 +582,11 @@ async fn display_scan_results(ws: &workspace::Workspace, scan: &ScanResult) -> b
         for (minion_id, path) in &scan.orphaned_minions {
             println!("  {} (minion stopped, no git worktree)", minion_id);
             println!("    Path: {}", path.display());
-            if matches!(
-                classify_orphan_path(path, &work_dir),
-                OrphanDirAction::OutsideWorkspace
-            ) {
-                println!("    Registry entry only; directory is outside workspace and will be left in place");
+            if let Some(reason) = classify_orphan_path(path, &work_dir).kept_reason() {
+                println!(
+                    "    Registry entry only; {} and will be left in place",
+                    reason
+                );
             }
             println!();
         }
@@ -604,8 +604,21 @@ enum OrphanDirAction {
     Remove(PathBuf),
     /// Directory is outside the workspace; leave it, remove only the registry entry.
     OutsideWorkspace,
+    /// Path is the work dir itself; never remove it, remove only the registry entry.
+    WorkDirItself,
     /// Path exists but couldn't be canonicalized; skip the entry entirely.
     CanonicalizeFailed(std::io::Error),
+}
+
+impl OrphanDirAction {
+    /// Why the directory is kept while the registry entry is removed, if it is.
+    fn kept_reason(&self) -> Option<&'static str> {
+        match self {
+            Self::OutsideWorkspace => Some("directory is outside workspace"),
+            Self::WorkDirItself => Some("path is the workspace work dir"),
+            _ => None,
+        }
+    }
 }
 
 /// Canonical form of the workspace work dir, falling back to the raw path.
@@ -626,7 +639,8 @@ fn classify_orphan_path(path: &Path, work_dir: &Path) -> OrphanDirAction {
     }
     match path.canonicalize() {
         // Never remove the work dir itself, only directories beneath it.
-        Ok(p) if p != work_dir && p.starts_with(work_dir) => OrphanDirAction::Remove(p),
+        Ok(p) if p == work_dir => OrphanDirAction::WorkDirItself,
+        Ok(p) if p.starts_with(work_dir) => OrphanDirAction::Remove(p),
         Ok(_) => OrphanDirAction::OutsideWorkspace,
         Err(e) => OrphanDirAction::CanonicalizeFailed(e),
     }
@@ -949,8 +963,9 @@ async fn clean_orphans(
         print!("  Removing {} ({})... ", minion_id, path.display());
         std::io::stdout().flush()?;
 
-        let mut outside_workspace = false;
-        match classify_orphan_path(path, work_dir) {
+        let action = classify_orphan_path(path, work_dir);
+        let kept_reason = action.kept_reason();
+        match action {
             OrphanDirAction::Missing => {}
             OrphanDirAction::Remove(canonical_path) => {
                 if let Err(e) = tokio::fs::remove_dir_all(&canonical_path).await {
@@ -960,11 +975,10 @@ async fn clean_orphans(
                     continue;
                 }
             }
-            OrphanDirAction::OutsideWorkspace => {
-                // The directory isn't ours (e.g. a `gru prompt` session run in a
-                // regular checkout), so leave it alone but still drop the entry.
-                outside_workspace = true;
-            }
+            // The directory isn't ours to delete (e.g. a `gru prompt` session run in
+            // a regular checkout, or the work dir itself), so leave it alone but
+            // still drop the registry entry.
+            OrphanDirAction::OutsideWorkspace | OrphanDirAction::WorkDirItself => {}
             OrphanDirAction::CanonicalizeFailed(e) => {
                 println!("✗");
                 log::warn!(
@@ -978,8 +992,8 @@ async fn clean_orphans(
         }
 
         outcome.registry_ids.push(minion_id.clone());
-        if outside_workspace {
-            println!("✓ (registry only; directory outside workspace left in place)");
+        if let Some(reason) = kept_reason {
+            println!("✓ (registry only; {}, left in place)", reason);
         } else {
             println!("✓");
         }
@@ -1287,7 +1301,7 @@ mod tests {
         let work_dir = work.path().canonicalize().unwrap();
         assert!(matches!(
             classify_orphan_path(&work_dir, &work_dir),
-            OrphanDirAction::OutsideWorkspace
+            OrphanDirAction::WorkDirItself
         ));
     }
 
