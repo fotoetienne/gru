@@ -133,9 +133,9 @@ impl GruMcpServer {
             Ok(summaries) => {
                 let json = serde_json::to_string_pretty(&summaries)
                     .unwrap_or_else(|e| json!({"error": e.to_string()}).to_string());
-                Ok(CallToolResult::success(vec![Content::text(json)]))
+                Ok(CallToolResult::success(vec![ContentBlock::text(json)]))
             }
-            Err(e) => Ok(CallToolResult::error(vec![Content::text(
+            Err(e) => Ok(CallToolResult::error(vec![ContentBlock::text(
                 json!({"error": format!("Failed to load registry: {}", e)}).to_string(),
             )])),
         }
@@ -163,7 +163,7 @@ impl GruMcpServer {
         let events_path = match events_path {
             Ok(p) => p,
             Err(e) => {
-                return Ok(CallToolResult::error(vec![Content::text(
+                return Ok(CallToolResult::error(vec![ContentBlock::text(
                     json!({"error": e.to_string()}).to_string(),
                 )]));
             }
@@ -177,15 +177,15 @@ impl GruMcpServer {
 
         match result {
             Ok(Ok(content)) if content.is_empty() => {
-                Ok(CallToolResult::success(vec![Content::text(
+                Ok(CallToolResult::success(vec![ContentBlock::text(
                     "No events recorded yet",
                 )]))
             }
-            Ok(Ok(content)) => Ok(CallToolResult::success(vec![Content::text(content)])),
-            Ok(Err(e)) => Ok(CallToolResult::error(vec![Content::text(
+            Ok(Ok(content)) => Ok(CallToolResult::success(vec![ContentBlock::text(content)])),
+            Ok(Err(e)) => Ok(CallToolResult::error(vec![ContentBlock::text(
                 json!({"error": e.to_string()}).to_string(),
             )])),
-            Err(e) => Ok(CallToolResult::error(vec![Content::text(
+            Err(e) => Ok(CallToolResult::error(vec![ContentBlock::text(
                 json!({"error": format!("Task failed: {}", e)}).to_string(),
             )])),
         }
@@ -194,8 +194,8 @@ impl GruMcpServer {
 
 #[tool_handler(router = self.tool_router.clone())]
 impl ServerHandler for GruMcpServer {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(
             ServerCapabilities::builder()
                 .enable_tools()
                 .enable_resources()
@@ -215,50 +215,37 @@ impl ServerHandler for GruMcpServer {
         _request: Option<PaginatedRequestParams>,
         _: RequestContext<RoleServer>,
     ) -> Result<ListResourcesResult, McpError> {
-        Ok(ListResourcesResult {
-            resources: vec![
-                RawResource::new(GUIDE_URI, "Gru Guide".to_string())
+        Ok(ListResourcesResult::with_all_items(vec![
+                Resource::new(GUIDE_URI, "Gru Guide".to_string())
                     .with_description("Usage guide for Gru — install, configure, troubleshoot, and understand Gru commands and concepts")
-                    .with_mime_type("text/markdown")
-                    .no_annotation(),
-                RawResource::new(PM_SKILL_URI, "Product Manager Skill".to_string())
+                    .with_mime_type("text/markdown"),
+                Resource::new(PM_SKILL_URI, "Product Manager Skill".to_string())
                     .with_description("Product management skill — shapes features, writes PRDs, evaluates designs against Gru's core principles")
-                    .with_mime_type("text/markdown")
-                    .no_annotation(),
-                RawResource::new(TPM_SKILL_URI, "Project Manager Skill".to_string())
+                    .with_mime_type("text/markdown"),
+                Resource::new(TPM_SKILL_URI, "Project Manager Skill".to_string())
                     .with_description("Project management skill — understands issue dependencies, critical path, and helps prioritize work")
-                    .with_mime_type("text/markdown")
-                    .no_annotation(),
-            ],
-            next_cursor: None,
-            meta: None,
-        })
+                    .with_mime_type("text/markdown"),
+        ]))
     }
 
     async fn read_resource(
         &self,
         request: ReadResourceRequestParams,
         _: RequestContext<RoleServer>,
-    ) -> Result<ReadResourceResult, McpError> {
+    ) -> Result<ReadResourceResponse, McpError> {
         let uri = &request.uri;
-        match uri.as_str() {
-            GUIDE_URI => Ok(ReadResourceResult::new(vec![ResourceContents::text(
-                GUIDE_CONTENT,
-                uri.clone(),
-            )])),
-            PM_SKILL_URI => Ok(ReadResourceResult::new(vec![ResourceContents::text(
-                PM_SKILL_CONTENT,
-                uri.clone(),
-            )])),
-            TPM_SKILL_URI => Ok(ReadResourceResult::new(vec![ResourceContents::text(
-                TPM_SKILL_CONTENT,
-                uri.clone(),
-            )])),
-            _ => Err(McpError::resource_not_found(
-                "resource_not_found",
-                Some(serde_json::json!({ "uri": uri })),
-            )),
-        }
+        let content = match uri.as_str() {
+            GUIDE_URI => GUIDE_CONTENT,
+            PM_SKILL_URI => PM_SKILL_CONTENT,
+            TPM_SKILL_URI => TPM_SKILL_CONTENT,
+            _ => {
+                return Err(McpError::resource_not_found(
+                    "resource_not_found",
+                    Some(serde_json::json!({ "uri": uri })),
+                ))
+            }
+        };
+        Ok(ReadResourceResult::new(vec![ResourceContents::text(content, uri.clone())]).into())
     }
 }
 
