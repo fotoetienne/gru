@@ -495,7 +495,7 @@ async fn scan_worktrees(
 /// Display the scan results: skipped worktrees, cleanable worktrees, and orphaned entries.
 ///
 /// Returns `false` if there is nothing to clean (early exit).
-async fn display_scan_results(scan: &ScanResult) -> bool {
+async fn display_scan_results(ws: &workspace::Workspace, scan: &ScanResult) -> bool {
     // Display skipped worktrees with active minions
     if !scan.skipped_active_minions.is_empty() {
         println!(
@@ -578,14 +578,72 @@ async fn display_scan_results(scan: &ScanResult) -> bool {
     // Display orphaned registry entries
     if !scan.orphaned_minions.is_empty() {
         println!("Orphaned registry entries:\n");
+        let work_dir = canonical_work_dir(ws);
         for (minion_id, path) in &scan.orphaned_minions {
             println!("  {} (minion stopped, no git worktree)", minion_id);
             println!("    Path: {}", path.display());
+            if let Some(reason) = classify_orphan_path(path, &work_dir).kept_reason() {
+                println!(
+                    "    Registry entry only; {} and will be left in place",
+                    reason
+                );
+            }
             println!();
         }
     }
 
     true
+}
+
+/// What to do with the directory of an orphaned registry entry.
+#[derive(Debug)]
+enum OrphanDirAction {
+    /// Directory doesn't exist; only the registry entry needs removing.
+    Missing,
+    /// Directory is inside the workspace; remove it (canonical path).
+    Remove(PathBuf),
+    /// Directory is outside the workspace; leave it, remove only the registry entry.
+    OutsideWorkspace,
+    /// Path is the work dir itself; never remove it, remove only the registry entry.
+    WorkDirItself,
+    /// Path exists but couldn't be canonicalized; skip the entry entirely.
+    CanonicalizeFailed(std::io::Error),
+}
+
+impl OrphanDirAction {
+    /// Why the directory is kept while the registry entry is removed, if it is.
+    fn kept_reason(&self) -> Option<&'static str> {
+        match self {
+            Self::OutsideWorkspace => Some("directory is outside workspace"),
+            Self::WorkDirItself => Some("path is the workspace work dir"),
+            _ => None,
+        }
+    }
+}
+
+/// Canonical form of the workspace work dir, falling back to the raw path.
+fn canonical_work_dir(ws: &workspace::Workspace) -> PathBuf {
+    ws.work()
+        .canonicalize()
+        .unwrap_or_else(|_| ws.work().to_path_buf())
+}
+
+/// Decide how to handle an orphaned entry's directory.
+///
+/// Safety: only directories inside `work_dir` are ever removed, guarding against
+/// corrupt or hand-edited registry entries. The path is canonicalized to prevent
+/// traversal (e.g. "work/../../etc"). `work_dir` should already be canonical.
+fn classify_orphan_path(path: &Path, work_dir: &Path) -> OrphanDirAction {
+    if !path.exists() {
+        return OrphanDirAction::Missing;
+    }
+    match path.canonicalize() {
+        // Never remove the work dir itself, only directories beneath it.
+        Ok(p) if p == work_dir => OrphanDirAction::WorkDirItself,
+        Ok(p) if p.starts_with(work_dir) => OrphanDirAction::Remove(p),
+        Ok(_) => OrphanDirAction::OutsideWorkspace,
+        Err(e) => OrphanDirAction::CanonicalizeFailed(e),
+    }
 }
 
 /// Prompt the user for confirmation before removing worktrees.
@@ -833,53 +891,10 @@ async fn remove_worktrees(
     // Clean up orphaned registry entries
     if !scan.orphaned_minions.is_empty() {
         println!("\nCleaning orphaned registry entries...");
-        for (minion_id, path) in &scan.orphaned_minions {
-            print!("  Removing {} ({})... ", minion_id, path.display());
-            std::io::stdout().flush()?;
-
-            // Safety: only remove directories inside the workspace work directory
-            // to guard against corrupt or hand-edited registry entries.
-            // Canonicalize both paths to prevent traversal attacks (e.g., "work/../../etc").
-            if path.exists() {
-                let canonical_path = match path.canonicalize() {
-                    Ok(p) => p,
-                    Err(e) => {
-                        println!("✗");
-                        log::warn!(
-                            "  Skipping removal: failed to canonicalize {} ({})",
-                            path.display(),
-                            e
-                        );
-                        failed += 1;
-                        continue;
-                    }
-                };
-                let work_dir = ws
-                    .work()
-                    .canonicalize()
-                    .unwrap_or_else(|_| ws.work().to_path_buf());
-                if !canonical_path.starts_with(&work_dir) {
-                    println!("✗");
-                    log::warn!(
-                        "  Skipping removal: path {} is outside workspace ({})",
-                        canonical_path.display(),
-                        work_dir.display()
-                    );
-                    failed += 1;
-                    continue;
-                }
-                if let Err(e) = tokio::fs::remove_dir_all(&canonical_path).await {
-                    println!("✗");
-                    log::error!("  Error removing directory: {}", e);
-                    failed += 1;
-                    continue;
-                }
-            }
-
-            registry_ids_to_remove.push(minion_id.clone());
-            println!("✓");
-            removed += 1;
-        }
+        let outcome = clean_orphans(&scan.orphaned_minions, &canonical_work_dir(ws)).await?;
+        registry_ids_to_remove.extend(outcome.registry_ids);
+        removed += outcome.removed;
+        failed += outcome.failed;
     }
 
     // Batch-remove all cleaned minions from the registry in a single load/save cycle.
@@ -927,6 +942,66 @@ async fn remove_worktrees(
     Ok(if failed > 0 { 1 } else { 0 })
 }
 
+/// Result of cleaning orphaned registry entries.
+#[derive(Debug, Default)]
+struct OrphanCleanOutcome {
+    /// Minion IDs whose registry entries should be removed.
+    registry_ids: Vec<String>,
+    removed: usize,
+    failed: usize,
+}
+
+/// Remove orphaned entries' directories (when inside `work_dir`) and collect the
+/// IDs whose registry entries should be dropped. Directories outside the workspace
+/// are left in place, but their registry entries are still removed.
+async fn clean_orphans(
+    orphans: &[(String, PathBuf)],
+    work_dir: &Path,
+) -> Result<OrphanCleanOutcome> {
+    let mut outcome = OrphanCleanOutcome::default();
+    for (minion_id, path) in orphans {
+        print!("  Removing {} ({})... ", minion_id, path.display());
+        std::io::stdout().flush()?;
+
+        let action = classify_orphan_path(path, work_dir);
+        let kept_reason = action.kept_reason();
+        match action {
+            OrphanDirAction::Missing => {}
+            OrphanDirAction::Remove(canonical_path) => {
+                if let Err(e) = tokio::fs::remove_dir_all(&canonical_path).await {
+                    println!("✗");
+                    log::error!("  Error removing directory: {}", e);
+                    outcome.failed += 1;
+                    continue;
+                }
+            }
+            // The directory isn't ours to delete (e.g. a `gru prompt` session run in
+            // a regular checkout, or the work dir itself), so leave it alone but
+            // still drop the registry entry.
+            OrphanDirAction::OutsideWorkspace | OrphanDirAction::WorkDirItself => {}
+            OrphanDirAction::CanonicalizeFailed(e) => {
+                println!("✗");
+                log::warn!(
+                    "  Skipping removal: failed to canonicalize {} ({})",
+                    path.display(),
+                    e
+                );
+                outcome.failed += 1;
+                continue;
+            }
+        }
+
+        outcome.registry_ids.push(minion_id.clone());
+        if let Some(reason) = kept_reason {
+            println!("✓ (registry only; {}, left in place)", reason);
+        } else {
+            println!("✓");
+        }
+        outcome.removed += 1;
+    }
+    Ok(outcome)
+}
+
 /// Handles the clean command to remove merged/closed worktrees
 pub(crate) async fn handle_clean(dry_run: bool, force: bool, base_branch: &str) -> Result<i32> {
     let ws = workspace::Workspace::new().context("Failed to initialize workspace")?;
@@ -936,7 +1011,7 @@ pub(crate) async fn handle_clean(dry_run: bool, force: bool, base_branch: &str) 
         None => return Ok(0),
     };
 
-    if !display_scan_results(&scan).await {
+    if !display_scan_results(&ws, &scan).await {
         return Ok(0);
     }
 
@@ -1170,5 +1245,85 @@ mod tests {
     fn test_shorten_path_no_home_prefix() {
         let path = Path::new("/tmp/some/path");
         assert_eq!(shorten_path(path), "/tmp/some/path");
+    }
+
+    #[test]
+    fn test_classify_orphan_path_outside_workspace() {
+        let work = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let work_dir = work.path().canonicalize().unwrap();
+        assert!(matches!(
+            classify_orphan_path(outside.path(), &work_dir),
+            OrphanDirAction::OutsideWorkspace
+        ));
+        // Directory must be untouched by classification
+        assert!(outside.path().exists());
+    }
+
+    #[test]
+    fn test_classify_orphan_path_inside_workspace() {
+        let work = tempfile::tempdir().unwrap();
+        let work_dir = work.path().canonicalize().unwrap();
+        let minion_dir = work_dir.join("owner/repo/minion/issue-1-M001");
+        std::fs::create_dir_all(&minion_dir).unwrap();
+        match classify_orphan_path(&minion_dir, &work_dir) {
+            OrphanDirAction::Remove(p) => assert_eq!(p, minion_dir),
+            other => panic!("expected Remove, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_classify_orphan_path_traversal_is_outside() {
+        let work = tempfile::tempdir().unwrap();
+        let work_dir = work.path().canonicalize().unwrap();
+        std::fs::create_dir_all(work_dir.join("a")).unwrap();
+        // "work/a/../.." resolves to the parent of work_dir
+        let sneaky = work_dir.join("a").join("..").join("..");
+        assert!(matches!(
+            classify_orphan_path(&sneaky, &work_dir),
+            OrphanDirAction::OutsideWorkspace
+        ));
+    }
+
+    #[test]
+    fn test_classify_orphan_path_missing() {
+        let work = tempfile::tempdir().unwrap();
+        let work_dir = work.path().canonicalize().unwrap();
+        assert!(matches!(
+            classify_orphan_path(&work_dir.join("gone"), &work_dir),
+            OrphanDirAction::Missing
+        ));
+    }
+
+    #[test]
+    fn test_classify_orphan_path_work_dir_itself_not_removed() {
+        let work = tempfile::tempdir().unwrap();
+        let work_dir = work.path().canonicalize().unwrap();
+        assert!(matches!(
+            classify_orphan_path(&work_dir, &work_dir),
+            OrphanDirAction::WorkDirItself
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_clean_orphans_outside_workspace_registry_only() {
+        let work = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let work_dir = work.path().canonicalize().unwrap();
+        let inside = work_dir.join("owner/repo/minion/issue-2-M002");
+        std::fs::create_dir_all(&inside).unwrap();
+
+        let orphans = vec![
+            ("M001".to_string(), outside.path().to_path_buf()),
+            ("M002".to_string(), inside.clone()),
+            ("M003".to_string(), work_dir.join("missing")),
+        ];
+        let outcome = clean_orphans(&orphans, &work_dir).await.unwrap();
+
+        assert_eq!(outcome.registry_ids, vec!["M001", "M002", "M003"]);
+        assert_eq!(outcome.removed, 3);
+        assert_eq!(outcome.failed, 0);
+        assert!(outside.path().exists(), "outside dir must be left in place");
+        assert!(!inside.exists(), "inside dir should be removed");
     }
 }
