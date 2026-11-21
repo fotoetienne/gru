@@ -389,11 +389,17 @@ pub(crate) async fn sleep_until_rate_limit_reset(host: &str) -> SleepOutcome {
 async fn sleep_until_rate_limit_reset_with(host: &str, shutdown: &ShutdownSignal) -> SleepOutcome {
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    if shutdown.is_triggered() {
-        return SleepOutcome::Cancelled;
-    }
+    // Race the reset lookup against shutdown too: `gh api rate_limit` can take
+    // up to GH_TIMEOUT_SECS. `biased` polls shutdown first, so an
+    // already-triggered signal returns before `gh` is spawned; if shutdown
+    // wins later, dropping the lookup kills `gh` (kill_on_drop).
+    let rate_limit_info = tokio::select! {
+        biased;
+        _ = shutdown.wait() => return SleepOutcome::Cancelled,
+        info = get_rate_limit_reset(host) => info,
+    };
 
-    if let Some(info) = get_rate_limit_reset(host).await {
+    if let Some(info) = rate_limit_info {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
