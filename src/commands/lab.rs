@@ -318,15 +318,16 @@ pub(crate) async fn handle_lab(
                     log::warn!("SIGINT signal stream closed; CTRL-C will no longer be handled");
                     return;
                 }
-                // Force-exit if shutdown is already underway, whether from an
-                // earlier Ctrl-C or from SIGTERM.
-                if !flag.swap(true, Ordering::AcqRel) {
-                    notify.notify_one();
-                    crate::shutdown::request_shutdown();
-                } else {
-                    tprintln!("\n⚠️  Received second interrupt, exiting immediately");
-                    crate::tmux::restore_before_exit();
-                    std::process::exit(130);
+                match classify_interrupt(&flag) {
+                    InterruptAction::StartGracefulShutdown => {
+                        notify.notify_one();
+                        crate::shutdown::request_shutdown();
+                    }
+                    InterruptAction::ForceExit => {
+                        tprintln!("\n⚠️  Received second interrupt, exiting immediately");
+                        crate::tmux::restore_before_exit();
+                        std::process::exit(130);
+                    }
                 }
             }
         });
@@ -3077,8 +3078,46 @@ async fn is_pr_monitored_by_live_minion(full_repo: &str, pr_number: u64) -> bool
     }
 }
 
+/// What `gru lab` does with a SIGINT.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InterruptAction {
+    /// First signal: start a graceful shutdown.
+    StartGracefulShutdown,
+    /// Shutdown is already underway (from an earlier Ctrl-C or SIGTERM): exit now.
+    ForceExit,
+}
+
+/// Decide how to handle a SIGINT, latching `shutdown_flag`.
+fn classify_interrupt(shutdown_flag: &AtomicBool) -> InterruptAction {
+    if shutdown_flag.swap(true, Ordering::AcqRel) {
+        InterruptAction::ForceExit
+    } else {
+        InterruptAction::StartGracefulShutdown
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn test_classify_interrupt_first_then_second() {
+        let flag = AtomicBool::new(false);
+        assert_eq!(
+            classify_interrupt(&flag),
+            InterruptAction::StartGracefulShutdown
+        );
+        assert!(flag.load(Ordering::Acquire));
+        assert_eq!(classify_interrupt(&flag), InterruptAction::ForceExit);
+        assert_eq!(classify_interrupt(&flag), InterruptAction::ForceExit);
+    }
+
+    #[test]
+    fn test_classify_interrupt_after_sigterm_force_exits() {
+        // The SIGTERM handler sets the flag; the next Ctrl-C must force-exit.
+        let flag = AtomicBool::new(false);
+        flag.store(true, Ordering::Release);
+        assert_eq!(classify_interrupt(&flag), InterruptAction::ForceExit);
+    }
+
     use super::*;
     use crate::minion_registry::is_process_alive;
 
