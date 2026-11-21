@@ -1831,6 +1831,12 @@ async fn spawn_for_candidate_issues(
                 continue;
             }
 
+            // get_blockers may have run during a cancelled retry; don't start
+            // the eligibility call once shutdown has begun.
+            if shutdown_flag.load(Ordering::Acquire) {
+                break;
+            }
+
             // Revalidate issue state to prevent TOCTOU races between poll and dispatch
             if !github::is_issue_still_eligible(&ctx.owner, &ctx.repo, &ctx.host, candidate.number)
                 .await
@@ -2045,8 +2051,8 @@ async fn dispatch_due_retries(
     let mut dispatched = 0usize;
 
     for entry in due {
-        if *available == 0 {
-            // No slots left — re-insert with original due_at preserved
+        if *available == 0 || crate::shutdown::global().is_triggered() {
+            // No slots left (or shutting down) — re-insert with original due_at preserved
             // so the backoff timer isn't reset on every slot-full poll cycle.
             retry_queue.reinsert(entry);
             continue;
@@ -2067,6 +2073,11 @@ async fn dispatch_due_retries(
             continue;
         }
 
+        if crate::shutdown::global().is_triggered() {
+            retry_queue.reinsert(entry);
+            continue;
+        }
+
         // Validate issue is still open and eligible
         if !github::is_issue_still_eligible(
             &entry.owner,
@@ -2080,6 +2091,12 @@ async fn dispatch_due_retries(
                 "⏭️  Skipping retry for issue #{}: no longer eligible (closed or label changed)",
                 entry.issue_number
             );
+            continue;
+        }
+
+        // The eligibility check fails open; don't spawn during shutdown.
+        if crate::shutdown::global().is_triggered() {
+            retry_queue.reinsert(entry);
             continue;
         }
 
