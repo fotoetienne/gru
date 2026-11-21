@@ -74,9 +74,10 @@ pub(crate) fn gh_cli_command(host: &str) -> Command {
 /// Await `fut` unless `shutdown` fires first (checked before the first poll),
 /// in which case `fut` is dropped and an error is returned.
 ///
-/// For `gh` process futures built with `kill_on_drop(true)`: if shutdown was
-/// already requested the process is never spawned, and if it arrives mid-call
-/// the process is killed.
+/// For `gh` processes built with `kill_on_drop(true)`: if it arrives mid-call
+/// the process is killed. To avoid spawning at all after shutdown, pass
+/// `async { cmd.output().await }`, not `cmd.output()`: tokio's `output()`
+/// spawns the child as soon as it is called, before the future is polled.
 async fn unless_shutdown<F: std::future::Future>(
     shutdown: &ShutdownSignal,
     fut: F,
@@ -92,7 +93,8 @@ async fn unless_shutdown<F: std::future::Future>(
 /// first; see [`unless_shutdown`].
 pub(crate) async fn output_unless_shutdown(mut cmd: Command) -> Result<Output> {
     cmd.kill_on_drop(true);
-    Ok(unless_shutdown(crate::shutdown::global(), cmd.output()).await??)
+    // `output()` spawns synchronously, so defer it into the async block.
+    Ok(unless_shutdown(crate::shutdown::global(), async move { cmd.output().await }).await??)
 }
 
 /// Run a `gh` CLI command and return its stdout on success.
@@ -117,7 +119,14 @@ pub(crate) async fn run_gh(host: &str, args: &[&str]) -> Result<String> {
         .map(|a| if a.len() > 80 { &a[..80] } else { a })
         .collect::<Vec<_>>()
         .join(" ");
-    let child = gh_cli_command(host).args(args).kill_on_drop(true).output();
+    // `output()` spawns synchronously, so defer it into the async block.
+    let child = async {
+        gh_cli_command(host)
+            .args(args)
+            .kill_on_drop(true)
+            .output()
+            .await
+    };
     let output = unless_shutdown(
         crate::shutdown::global(),
         tokio::time::timeout(Duration::from_secs(GH_TIMEOUT_SECS), child),
@@ -247,10 +256,14 @@ impl RetryEnv for GhRetryEnv<'_> {
     async fn run(&mut self) -> Result<Output> {
         // Race the call against shutdown so a hung `gh` doesn't hold up the
         // first Ctrl-C; kill_on_drop stops it when shutdown wins.
-        let call = gh_cli_command(self.host)
-            .args(self.args)
-            .kill_on_drop(true)
-            .output();
+        // `output()` spawns synchronously, so defer it into the async block.
+        let call = async {
+            gh_cli_command(self.host)
+                .args(self.args)
+                .kill_on_drop(true)
+                .output()
+                .await
+        };
         unless_shutdown(crate::shutdown::global(), call)
             .await
             .with_context(|| format!("gh {} not run", self.args.join(" ")))?
@@ -2402,6 +2415,22 @@ mod tests {
         .await;
         assert!(res.is_err());
         assert!(!polled.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_unless_shutdown_does_not_spawn_when_triggered() {
+        let tmp = tempfile::tempdir().unwrap();
+        let marker = tmp.path().join("spawned");
+        let signal = ShutdownSignal::new();
+        signal.trigger();
+        let mut cmd = Command::new("touch");
+        cmd.arg(&marker).kill_on_drop(true);
+        let res = unless_shutdown(&signal, async move { cmd.output().await }).await;
+        assert!(res.is_err());
+        // Give a wrongly-spawned process time to run before checking.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!marker.exists(), "process was spawned after shutdown");
     }
 
     #[cfg(unix)]
