@@ -2436,19 +2436,58 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn test_unless_shutdown_kills_in_flight_process() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pid_file = tmp.path().join("pid");
         let signal = std::sync::Arc::new(ShutdownSignal::new());
+
+        // `exec` so the recorded PID is the long-running process itself.
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c")
+            .arg(format!("echo $$ > '{}'; exec sleep 30", pid_file.display()))
+            .kill_on_drop(true);
+
         let trigger = {
             let signal = signal.clone();
+            let pid_file = pid_file.clone();
             tokio::spawn(async move {
-                tokio::time::sleep(Duration::from_millis(100)).await;
+                // Trigger only once the child is running.
+                while !pid_file.exists() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
                 signal.trigger();
             })
         };
+
         let start = std::time::Instant::now();
-        let call = Command::new("sleep").arg("30").kill_on_drop(true).output();
-        assert!(unless_shutdown(&signal, call).await.is_err());
+        let res = unless_shutdown(&signal, async move { cmd.output().await }).await;
+        assert!(res.is_err());
         assert!(start.elapsed() < Duration::from_secs(5));
         trigger.await.unwrap();
+
+        let pid: i32 = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        // The child must be gone (killed and reaped), or at worst a zombie
+        // awaiting tokio's background reaper — not still running `sleep`.
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            let ps = std::process::Command::new("ps")
+                .args(["-o", "stat=", "-p", &pid.to_string()])
+                .output()
+                .unwrap();
+            let stat = String::from_utf8_lossy(&ps.stdout).trim().to_string();
+            if stat.is_empty() || stat.starts_with('Z') {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "child {pid} still running after shutdown (stat={stat})"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
     }
 
     // --- retry_gh_call shutdown tests ---
