@@ -155,7 +155,7 @@ pub(crate) fn clear_rate_limit(host: &str) {
 
 /// If another Minion has signalled a rate limit on `host`, sleep until the
 /// reset window passes. Intended to be called at the top of each attempt in
-/// `gh_api_with_retry` before spawning `gh`.
+/// `gh_api_with_retry` (via `retry_gh_call`) before spawning `gh`.
 ///
 /// Returns [`SleepOutcome::Cancelled`] if process shutdown has been requested
 /// (whether or not a shared window is active), so the caller can skip the call.

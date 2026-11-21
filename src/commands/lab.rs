@@ -538,7 +538,7 @@ async fn reap_children(children: &mut Vec<SpawnedChild>, retry_queue: &mut Retry
                         // slow one — the early-exit threshold is only relevant to
                         // the failure path.
                         retry_queue.cancel(&meta.host, &meta.owner, &meta.repo, meta.issue_number);
-                    } else if crate::shutdown::global().is_triggered() {
+                    } else if shutting_down() {
                         // handle_failed_exit makes several GitHub calls (label
                         // check, label restore, comment). Skip them during
                         // shutdown; the recovery scan resets the orphaned
@@ -1567,7 +1567,7 @@ async fn resume_interrupted_minions(
     let mut resumed = 0;
 
     for candidate in &resumable {
-        if *available == 0 || crate::shutdown::global().is_triggered() {
+        if *available == 0 || shutting_down() {
             break;
         }
 
@@ -1582,7 +1582,7 @@ async fn resume_interrupted_minions(
 
         // should_resume_candidate may have made GitHub calls whose retries
         // were cancelled; don't launch a resume once shutdown has begun.
-        if crate::shutdown::global().is_triggered() {
+        if shutting_down() {
             break;
         }
 
@@ -2077,7 +2077,7 @@ async fn dispatch_due_retries(
     let mut dispatched = 0usize;
 
     for entry in due {
-        if *available == 0 || crate::shutdown::global().is_triggered() {
+        if *available == 0 || shutting_down() {
             // No slots left (or shutting down) — re-insert with original due_at preserved
             // so the backoff timer isn't reset on every slot-full poll cycle.
             retry_queue.reinsert(entry);
@@ -2099,7 +2099,7 @@ async fn dispatch_due_retries(
             continue;
         }
 
-        if crate::shutdown::global().is_triggered() {
+        if shutting_down() {
             retry_queue.reinsert(entry);
             continue;
         }
@@ -2121,7 +2121,7 @@ async fn dispatch_due_retries(
         }
 
         // The eligibility check fails open; don't spawn during shutdown.
-        if crate::shutdown::global().is_triggered() {
+        if shutting_down() {
             retry_queue.reinsert(entry);
             continue;
         }
@@ -2674,7 +2674,7 @@ async fn recover_stuck_in_progress_issues(
     }
 
     for repo_spec in &config.daemon.repos {
-        if crate::shutdown::global().is_triggered() {
+        if shutting_down() {
             log::info!("Recovery scan: shutdown requested, stopping");
             return Ok(());
         }
@@ -2708,7 +2708,7 @@ async fn recover_stuck_in_progress_issues(
         };
 
         for issue in in_progress {
-            if crate::shutdown::global().is_triggered() {
+            if shutting_down() {
                 log::info!("Recovery scan: shutdown requested, stopping");
                 return Ok(());
             }
@@ -2760,7 +2760,7 @@ async fn recover_stuck_in_progress_issues(
 
             // The claim check above may have run during a cancelled retry;
             // don't reset or escalate labels once shutdown has begun.
-            if crate::shutdown::global().is_triggered() {
+            if shutting_down() {
                 log::info!("Recovery scan: shutdown requested, stopping");
                 return Ok(());
             }
@@ -2907,7 +2907,7 @@ async fn recover_stuck_in_progress_issues(
 /// Per-repo and per-PR errors are logged as warnings and do not abort the scan.
 async fn sweep_orphaned_auto_merge_prs(config: &LabConfig) {
     for repo_spec in &config.daemon.repos {
-        if crate::shutdown::global().is_triggered() {
+        if shutting_down() {
             log::info!("Auto-merge sweep: shutdown requested, stopping");
             return;
         }
@@ -2941,7 +2941,7 @@ async fn sweep_orphaned_auto_merge_prs(config: &LabConfig) {
         let full_repo = github::repo_slug(&owner, &repo);
 
         for pr in &prs {
-            if crate::shutdown::global().is_triggered() {
+            if shutting_down() {
                 log::info!("Auto-merge sweep: shutdown requested, stopping");
                 return;
             }
@@ -3000,7 +3000,7 @@ async fn sweep_orphaned_auto_merge_prs(config: &LabConfig) {
 
             // Readiness may have been judged from a cancelled call; don't queue
             // a merge once shutdown has begun.
-            if crate::shutdown::global().is_triggered() {
+            if shutting_down() {
                 log::info!("Auto-merge sweep: shutdown requested, stopping");
                 return;
             }
@@ -3088,6 +3088,11 @@ async fn is_pr_monitored_by_live_minion(full_repo: &str, pr_number: u64) -> bool
             true
         }
     }
+}
+
+/// Whether process shutdown has been requested (see [`crate::shutdown`]).
+fn shutting_down() -> bool {
+    crate::shutdown::global().is_triggered()
 }
 
 /// What `gru lab` does with a SIGINT.

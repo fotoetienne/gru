@@ -298,6 +298,9 @@ async fn retry_gh_call(
         // If another Minion has signalled a rate limit for this host, wait
         // for the reset window before spawning `gh`. Avoids the N×62s waste
         // of every Minion independently discovering the same limit.
+        // `Cancelled` here means shutdown has been requested, whether or not a
+        // shared window was active (see `wait_if_shared_rate_limited`), so no
+        // new request is started.
         if env.wait_shared_rate_limit().await == SleepOutcome::Cancelled {
             anyhow::bail!("Shutdown requested; skipped: gh {}", args_str);
         }
