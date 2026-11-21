@@ -325,7 +325,8 @@ pub(crate) async fn handle_lab(
                     }
                     InterruptAction::ForceExit => {
                         tprintln!("\n⚠️  Received second interrupt, exiting immediately");
-                        crate::tmux::restore_before_exit();
+                        // Bounded so a hung tmux server can't block the exit.
+                        crate::tmux::restore_before_exit_bounded(Duration::from_secs(1));
                         std::process::exit(130);
                     }
                 }

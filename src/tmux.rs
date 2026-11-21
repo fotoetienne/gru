@@ -150,6 +150,25 @@ pub(crate) fn restore_before_exit() {
     }
 }
 
+/// Like [`restore_before_exit`], but gives up after `timeout` so a hung
+/// `tmux` server can't block a forced exit. Returns `true` if the restore
+/// finished in time.
+pub(crate) fn restore_before_exit_bounded(timeout: std::time::Duration) -> bool {
+    run_bounded(restore_before_exit, timeout)
+}
+
+/// Run `f` on a helper thread and wait at most `timeout` for it to finish.
+/// If it times out, the thread is left running; callers use this right
+/// before exiting the process.
+fn run_bounded(f: impl FnOnce() + Send + 'static, timeout: std::time::Duration) -> bool {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        f();
+        let _ = tx.send(());
+    });
+    rx.recv_timeout(timeout).is_ok()
+}
+
 /// Check if a `$TMUX` env var value indicates we are inside tmux.
 fn is_tmux_env(val: Option<&OsStr>) -> bool {
     val.is_some_and(|v| !v.is_empty())
@@ -233,6 +252,22 @@ fn restore_automatic_rename_current_window() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_run_bounded_completes() {
+        assert!(run_bounded(|| {}, std::time::Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn test_run_bounded_times_out_on_hang() {
+        let start = std::time::Instant::now();
+        let finished = run_bounded(
+            || std::thread::sleep(std::time::Duration::from_secs(5)),
+            std::time::Duration::from_millis(100),
+        );
+        assert!(!finished);
+        assert!(start.elapsed() < std::time::Duration::from_secs(2));
+    }
 
     #[test]
     fn test_is_tmux_env() {
