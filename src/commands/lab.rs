@@ -304,7 +304,11 @@ pub(crate) async fn handle_lab(
             // so keep listening: a second Ctrl-C force-exits.
             loop {
                 if let Err(e) = tokio::signal::ctrl_c().await {
-                    log::warn!("Failed to register SIGINT handler: {e} — CTRL-C will not trigger graceful shutdown");
+                    if flag.load(Ordering::Acquire) {
+                        log::warn!("SIGINT handler failed after shutdown began: {e} — another CTRL-C will not force-exit");
+                    } else {
+                        log::warn!("Failed to register SIGINT handler: {e} — CTRL-C will not trigger graceful shutdown");
+                    }
                     return;
                 }
                 // Force-exit if shutdown is already underway, whether from an
@@ -1827,6 +1831,13 @@ async fn spawn_for_candidate_issues(
                 // re-claim starts from attempt zero.
                 retry_queue.cancel(&ctx.host, &ctx.owner, &ctx.repo, candidate.number);
                 continue;
+            }
+
+            // Re-check shutdown: the blocker and eligibility calls above fail
+            // open, and a Ctrl-C that cancels their retries must not lead to a
+            // claim and spawn during teardown.
+            if shutdown_flag.load(Ordering::Acquire) {
+                break;
             }
 
             if try_spawn_for_issue(

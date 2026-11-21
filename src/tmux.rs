@@ -133,8 +133,9 @@ async fn sigterm_listener() {
 
 /// Re-enable `automatic-rename` if a [`TmuxGuard`] is active.
 ///
-/// For paths that end the process without running destructors, such as a
-/// SIGTERM or a forced `std::process::exit`.
+/// Call this on any path that ends the process without running destructors
+/// (so `TmuxGuard::drop` never runs): the SIGTERM listener and `gru lab`'s
+/// forced `std::process::exit(130)` on a second Ctrl-C.
 pub(crate) fn restore_before_exit() {
     if TMUX_GUARD_ACTIVE.swap(false, Ordering::SeqCst) {
         #[cfg(unix)]
