@@ -301,14 +301,21 @@ pub(crate) async fn handle_lab(
         tokio::spawn(async move {
             // First Ctrl-C starts a graceful shutdown. Once tokio installs its
             // SIGINT handler the default "terminate" action never comes back,
-            // so keep listening: a second Ctrl-C force-exits.
+            // so keep listening: a second Ctrl-C force-exits. One stream is
+            // created up front so a SIGINT arriving between iterations isn't
+            // missed (a fresh ctrl_c() only sees signals after it's created).
+            let mut sigint = match tokio::signal::unix::signal(
+                tokio::signal::unix::SignalKind::interrupt(),
+            ) {
+                Ok(s) => s,
+                Err(e) => {
+                    log::warn!("Failed to register SIGINT handler: {e} — CTRL-C will not trigger graceful shutdown");
+                    return;
+                }
+            };
             loop {
-                if let Err(e) = tokio::signal::ctrl_c().await {
-                    if flag.load(Ordering::Acquire) {
-                        log::warn!("SIGINT handler failed after shutdown began: {e} — another CTRL-C will not force-exit");
-                    } else {
-                        log::warn!("Failed to register SIGINT handler: {e} — CTRL-C will not trigger graceful shutdown");
-                    }
+                if sigint.recv().await.is_none() {
+                    log::warn!("SIGINT signal stream closed; CTRL-C will no longer be handled");
                     return;
                 }
                 // Force-exit if shutdown is already underway, whether from an
