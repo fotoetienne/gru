@@ -2,9 +2,10 @@ use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
 use std::process::Output;
 use tokio::process::Command;
-use tokio::time::{sleep, Duration};
+use tokio::time::Duration;
 
 use crate::labels;
+use crate::shutdown::{ShutdownSignal, SleepOutcome};
 
 /// Default maximum number of retry attempts for GitHub API calls.
 pub(crate) const DEFAULT_MAX_RETRIES: u32 = 5;
@@ -189,7 +190,14 @@ pub(crate) async fn gh_api_with_retry(
         // If another Minion has signalled a rate limit for this host, wait
         // for the reset window before spawning `gh`. Avoids the N×62s waste
         // of every Minion independently discovering the same limit.
-        crate::shared_rate_limit::wait_if_shared_rate_limited(host).await;
+        if crate::shared_rate_limit::wait_if_shared_rate_limited(host).await
+            == SleepOutcome::Cancelled
+        {
+            anyhow::bail!(
+                "Shutdown requested while waiting out a shared rate limit; skipped: gh {}",
+                args_str
+            );
+        }
 
         let output = gh_cli_command(host)
             .args(args)
@@ -215,7 +223,13 @@ pub(crate) async fn gh_api_with_retry(
                 return Ok(output);
             }
             rate_limit_retried = true;
-            sleep_until_rate_limit_reset(host).await;
+            if sleep_until_rate_limit_reset(host).await == SleepOutcome::Cancelled {
+                log::info!(
+                    "Shutdown requested during rate-limit wait; not retrying: gh {}",
+                    args_str
+                );
+                return Ok(output);
+            }
             continue;
         }
 
@@ -231,7 +245,13 @@ pub(crate) async fn gh_api_with_retry(
                 stderr.trim(),
                 delay
             );
-            sleep(delay).await;
+            if crate::shutdown::global().sleep(delay).await == SleepOutcome::Cancelled {
+                log::info!(
+                    "Shutdown requested during retry backoff; not retrying: gh {}",
+                    args_str
+                );
+                return Ok(output);
+            }
         } else {
             // Either not retryable or max retries exceeded — return output for caller to handle
             return Ok(output);
@@ -356,8 +376,22 @@ async fn get_rate_limit_reset(host: &str) -> Option<RateLimitInfo> {
 ///    rate limit where the core quota is still available), falls back to
 ///    a fixed 60 s sleep to avoid oversleeping.
 /// 4. If the rate limit API itself fails, falls back to a fixed 60 s sleep.
-pub(crate) async fn sleep_until_rate_limit_reset(host: &str) {
+///
+/// The sleep races against the process-wide shutdown signal
+/// ([`crate::shutdown::global`]); returns [`SleepOutcome::Cancelled`] if
+/// shutdown was requested so the caller can skip the retry.
+pub(crate) async fn sleep_until_rate_limit_reset(host: &str) -> SleepOutcome {
+    sleep_until_rate_limit_reset_with(host, crate::shutdown::global()).await
+}
+
+/// [`sleep_until_rate_limit_reset`] with an explicit shutdown signal, so tests
+/// can use a local signal instead of the process-wide one.
+async fn sleep_until_rate_limit_reset_with(host: &str, shutdown: &ShutdownSignal) -> SleepOutcome {
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    if shutdown.is_triggered() {
+        return SleepOutcome::Cancelled;
+    }
 
     if let Some(info) = get_rate_limit_reset(host).await {
         let now = SystemTime::now()
@@ -399,8 +433,9 @@ pub(crate) async fn sleep_until_rate_limit_reset(host: &str) {
                 );
                 // Signal peer Minions so they skip their own doomed calls.
                 crate::shared_rate_limit::write_rate_limit_until(host, info.reset);
-                tokio::time::sleep(std::time::Duration::from_secs(sleep_secs)).await;
-                return;
+                return shutdown
+                    .sleep(std::time::Duration::from_secs(sleep_secs))
+                    .await;
             }
 
             log::warn!(
@@ -436,10 +471,11 @@ pub(crate) async fn sleep_until_rate_limit_reset(host: &str) {
         );
     }
 
-    tokio::time::sleep(std::time::Duration::from_secs(
-        RATE_LIMIT_FALLBACK_SLEEP_SECS,
-    ))
-    .await;
+    shutdown
+        .sleep(std::time::Duration::from_secs(
+            RATE_LIMIT_FALLBACK_SLEEP_SECS,
+        ))
+        .await
 }
 
 /// Build a full GitHub issue URL for a repo in "owner/repo" format, with an explicit host.
@@ -2240,6 +2276,21 @@ mod tests {
         assert!(!contains_standalone_429("14290"));
         assert!(!contains_standalone_429("42"));
         assert!(!contains_standalone_429(""));
+    }
+
+    // --- sleep_until_rate_limit_reset shutdown tests ---
+
+    #[tokio::test(start_paused = true)]
+    async fn test_rate_limit_sleep_skipped_after_shutdown() {
+        // With shutdown already requested, the helper returns Cancelled right
+        // away, without querying `gh api rate_limit` or sleeping, so
+        // gh_api_with_retry returns the rate-limited output instead of retrying.
+        let signal = ShutdownSignal::new();
+        signal.trigger();
+        let start = tokio::time::Instant::now();
+        let outcome = sleep_until_rate_limit_reset_with("github.com", &signal).await;
+        assert_eq!(outcome, SleepOutcome::Cancelled);
+        assert_eq!(start.elapsed(), Duration::ZERO);
     }
 
     // --- RateLimitResponse deserialization test ---

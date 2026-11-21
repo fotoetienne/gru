@@ -121,21 +121,31 @@ async fn sigterm_listener() {
     };
     sigterm.recv().await;
 
-    // Re-enable automatic-rename if a guard was active.
-    if TMUX_GUARD_ACTIVE.swap(false, Ordering::SeqCst) {
-        let window_id = TMUX_WINDOW_ID.lock().ok().and_then(|guard| guard.clone());
-        if let Some(id) = window_id {
-            set_automatic_rename(&id, true);
-        } else {
-            restore_automatic_rename_current_window();
-        }
-    }
+    restore_before_exit();
 
     // Re-raise SIGTERM with default handler so the process exits
     // with the correct status for the parent.
     unsafe {
         libc::signal(libc::SIGTERM, libc::SIG_DFL);
         libc::raise(libc::SIGTERM);
+    }
+}
+
+/// Re-enable `automatic-rename` if a [`TmuxGuard`] is active.
+///
+/// For paths that end the process without running destructors, such as a
+/// SIGTERM or a forced `std::process::exit`.
+pub(crate) fn restore_before_exit() {
+    if TMUX_GUARD_ACTIVE.swap(false, Ordering::SeqCst) {
+        #[cfg(unix)]
+        let window_id = TMUX_WINDOW_ID.lock().ok().and_then(|guard| guard.clone());
+        #[cfg(not(unix))]
+        let window_id: Option<String> = None;
+        if let Some(id) = window_id {
+            set_automatic_rename(&id, true);
+        } else {
+            restore_automatic_rename_current_window();
+        }
     }
 }
 

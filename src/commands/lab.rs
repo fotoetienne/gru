@@ -293,18 +293,29 @@ pub(crate) async fn handle_lab(
 
     // Background signal handlers that set the flag and wake the main loop.
     // Uses notify_one() so the permit is stored even if no one is waiting yet
-    // (e.g. signal arrives during poll_and_spawn).
+    // (e.g. signal arrives during poll_and_spawn). They also trigger the
+    // process-wide shutdown signal so in-flight rate-limit sleeps return early.
     {
         let flag = shutdown_flag.clone();
         let notify = shutdown_notify.clone();
         tokio::spawn(async move {
-            match tokio::signal::ctrl_c().await {
-                Ok(()) => {
-                    flag.store(true, Ordering::Release);
-                    notify.notify_one();
-                }
-                Err(e) => {
+            // First Ctrl-C starts a graceful shutdown. Once tokio installs its
+            // SIGINT handler the default "terminate" action never comes back,
+            // so keep listening: a second Ctrl-C force-exits.
+            loop {
+                if let Err(e) = tokio::signal::ctrl_c().await {
                     log::warn!("Failed to register SIGINT handler: {e} — CTRL-C will not trigger graceful shutdown");
+                    return;
+                }
+                // Force-exit if shutdown is already underway, whether from an
+                // earlier Ctrl-C or from SIGTERM.
+                if !flag.swap(true, Ordering::AcqRel) {
+                    notify.notify_one();
+                    crate::shutdown::request_shutdown();
+                } else {
+                    tprintln!("\n⚠️  Received second interrupt, exiting immediately");
+                    crate::tmux::restore_before_exit();
+                    std::process::exit(130);
                 }
             }
         });
@@ -318,6 +329,7 @@ pub(crate) async fn handle_lab(
                     if sigterm.recv().await.is_some() {
                         flag.store(true, Ordering::Release);
                         notify.notify_one();
+                        crate::shutdown::request_shutdown();
                     } else {
                         log::warn!("SIGTERM signal stream closed without receiving SIGTERM; not triggering graceful shutdown");
                     }
@@ -433,6 +445,15 @@ pub(crate) async fn handle_lab(
                     log_retry_queue_status(&retry_queue);
                 }
 
+                // Check if a signal arrived during poll_and_spawn. Do this before the
+                // periodic scans so they don't issue GitHub calls during shutdown.
+                if shutdown_flag.load(Ordering::Acquire) {
+                    tprintln!();
+                    tprintln!("🛑 Received shutdown signal during polling, stopping daemon...");
+                    shutdown_children(&mut children, stop_minions).await;
+                    break;
+                }
+
                 // Periodic recovery scan: reset orphaned gru:in-progress issues.
                 // None  → first main-loop iteration after the initial startup poll:
                 //         start the timer without scanning so minions can re-register
@@ -473,13 +494,6 @@ pub(crate) async fn handle_lab(
                     Some(_) => {}
                 }
 
-                // Check if a signal arrived during poll_and_spawn
-                if shutdown_flag.load(Ordering::Acquire) {
-                    tprintln!();
-                    tprintln!("🛑 Received shutdown signal during polling, stopping daemon...");
-                    shutdown_children(&mut children, stop_minions).await;
-                    break;
-                }
             }
         }
     }

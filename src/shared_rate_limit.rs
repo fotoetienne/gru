@@ -27,6 +27,7 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use crate::shutdown::{ShutdownSignal, SleepOutcome};
 use crate::workspace::Workspace;
 
 /// Small jitter added after the reset timestamp to avoid thundering herd
@@ -155,9 +156,18 @@ pub(crate) fn clear_rate_limit(host: &str) {
 /// If another Minion has signalled a rate limit on `host`, sleep until the
 /// reset window passes. Intended to be called at the top of each attempt in
 /// `gh_api_with_retry` before spawning `gh`.
-pub(crate) async fn wait_if_shared_rate_limited(host: &str) {
+///
+/// Returns [`SleepOutcome::Cancelled`] if process shutdown was requested
+/// before the window passed, so the caller can skip the doomed call.
+pub(crate) async fn wait_if_shared_rate_limited(host: &str) -> SleepOutcome {
+    wait_if_shared_rate_limited_with(host, crate::shutdown::global()).await
+}
+
+/// [`wait_if_shared_rate_limited`] with an explicit shutdown signal, so tests
+/// can use a local signal instead of the process-wide one.
+async fn wait_if_shared_rate_limited_with(host: &str, shutdown: &ShutdownSignal) -> SleepOutcome {
     let Some(reset_epoch) = read_rate_limit_until(host) else {
-        return;
+        return SleepOutcome::Elapsed;
     };
     let now = now_secs();
     // read_rate_limit_until already filtered past/stale values; reset > now.
@@ -168,7 +178,10 @@ pub(crate) async fn wait_if_shared_rate_limited(host: &str) {
         host,
         wait_secs,
     );
-    tokio::time::sleep(Duration::from_secs(wait_secs)).await;
+    if shutdown.sleep(Duration::from_secs(wait_secs)).await == SleepOutcome::Cancelled {
+        // Leave the shared signal in place: the window hasn't passed.
+        return SleepOutcome::Cancelled;
+    }
     // A peer may have written a *later* reset epoch while we slept (e.g., a
     // shorter fallback window first, then a longer real reset). Only clear
     // the file if the current stored epoch is no later than the one we slept
@@ -180,6 +193,7 @@ pub(crate) async fn wait_if_shared_rate_limited(host: &str) {
             clear_rate_limit(host);
         }
     }
+    SleepOutcome::Elapsed
 }
 
 #[cfg(test)]
@@ -330,7 +344,10 @@ mod tests {
 
         // Missing file — should return immediately without sleeping.
         let start = std::time::Instant::now();
-        wait_if_shared_rate_limited("github.com").await;
+        assert_eq!(
+            wait_if_shared_rate_limited("github.com").await,
+            SleepOutcome::Elapsed
+        );
         assert!(start.elapsed() < Duration::from_millis(500));
     }
 
@@ -361,7 +378,10 @@ mod tests {
 
         let host = "github.com".to_string();
         let wait_task = tokio::spawn(async move {
-            wait_if_shared_rate_limited(&host).await;
+            assert_eq!(
+                wait_if_shared_rate_limited(&host).await,
+                SleepOutcome::Elapsed
+            );
         });
 
         // Race in the newer signal before the sleeper wakes.
@@ -389,9 +409,39 @@ mod tests {
         fs::write(&path, (now_secs() - 10).to_string()).unwrap();
 
         let start = std::time::Instant::now();
-        wait_if_shared_rate_limited("github.com").await;
+        assert_eq!(
+            wait_if_shared_rate_limited("github.com").await,
+            SleepOutcome::Elapsed
+        );
         assert!(start.elapsed() < Duration::from_millis(500));
         // Expired file should have been cleaned up.
         assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn wait_cancelled_by_shutdown_keeps_signal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = set_test_workspace(tmp.path().to_path_buf()).unwrap();
+
+        let reset = now_secs() + 600;
+        let path = rate_limit_path("github.com").unwrap();
+        fs::write(&path, reset.to_string()).unwrap();
+
+        let signal = std::sync::Arc::new(ShutdownSignal::new());
+        let waiter = {
+            let signal = signal.clone();
+            tokio::spawn(
+                async move { wait_if_shared_rate_limited_with("github.com", &signal).await },
+            )
+        };
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let start = std::time::Instant::now();
+        signal.trigger();
+        assert_eq!(waiter.await.unwrap(), SleepOutcome::Cancelled);
+        assert!(start.elapsed() < Duration::from_secs(1));
+
+        // The window hasn't passed, so the shared signal must survive.
+        assert_eq!(fs::read_to_string(&path).unwrap().trim(), reset.to_string());
     }
 }
