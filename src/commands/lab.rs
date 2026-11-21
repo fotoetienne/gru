@@ -293,18 +293,44 @@ pub(crate) async fn handle_lab(
 
     // Background signal handlers that set the flag and wake the main loop.
     // Uses notify_one() so the permit is stored even if no one is waiting yet
-    // (e.g. signal arrives during poll_and_spawn).
+    // (e.g. signal arrives during poll_and_spawn). They also trigger the
+    // process-wide shutdown signal so in-flight rate-limit sleeps return early.
     {
         let flag = shutdown_flag.clone();
         let notify = shutdown_notify.clone();
         tokio::spawn(async move {
-            match tokio::signal::ctrl_c().await {
-                Ok(()) => {
-                    flag.store(true, Ordering::Release);
-                    notify.notify_one();
-                }
+            // First Ctrl-C starts a graceful shutdown. Once tokio installs its
+            // SIGINT handler the default "terminate" action never comes back,
+            // so keep listening: a second Ctrl-C force-exits. One stream is
+            // created up front so a SIGINT arriving between iterations isn't
+            // missed (a fresh ctrl_c() only sees signals after it's created).
+            let mut sigint = match tokio::signal::unix::signal(
+                tokio::signal::unix::SignalKind::interrupt(),
+            ) {
+                Ok(s) => s,
                 Err(e) => {
                     log::warn!("Failed to register SIGINT handler: {e} — CTRL-C will not trigger graceful shutdown");
+                    return;
+                }
+            };
+            loop {
+                if sigint.recv().await.is_none() {
+                    log::warn!("SIGINT signal stream closed; CTRL-C will no longer be handled");
+                    return;
+                }
+                match classify_interrupt(&flag) {
+                    InterruptAction::StartGracefulShutdown => {
+                        // Trigger the global first so in-flight rate-limit
+                        // sleeps are already cancelled when the main loop wakes.
+                        crate::shutdown::request_shutdown();
+                        notify.notify_one();
+                    }
+                    InterruptAction::ForceExit => {
+                        tprintln!("\n⚠️  Received second interrupt, exiting immediately");
+                        // Bounded so a hung tmux server can't block the exit.
+                        crate::tmux::restore_before_exit_bounded(Duration::from_secs(1));
+                        std::process::exit(130);
+                    }
                 }
             }
         });
@@ -317,6 +343,7 @@ pub(crate) async fn handle_lab(
                 Ok(mut sigterm) => {
                     if sigterm.recv().await.is_some() {
                         flag.store(true, Ordering::Release);
+                        crate::shutdown::request_shutdown();
                         notify.notify_one();
                     } else {
                         log::warn!("SIGTERM signal stream closed without receiving SIGTERM; not triggering graceful shutdown");
@@ -433,6 +460,15 @@ pub(crate) async fn handle_lab(
                     log_retry_queue_status(&retry_queue);
                 }
 
+                // Check if a signal arrived during poll_and_spawn. Do this before the
+                // periodic scans so they don't issue GitHub calls during shutdown.
+                if shutdown_flag.load(Ordering::Acquire) {
+                    tprintln!();
+                    tprintln!("🛑 Received shutdown signal during polling, stopping daemon...");
+                    shutdown_children(&mut children, stop_minions).await;
+                    break;
+                }
+
                 // Periodic recovery scan: reset orphaned gru:in-progress issues.
                 // None  → first main-loop iteration after the initial startup poll:
                 //         start the timer without scanning so minions can re-register
@@ -461,8 +497,10 @@ pub(crate) async fn handle_lab(
                 }
 
                 // Periodic auto-merge sweep: queue merges for orphaned auto-merge PRs.
-                // Same timer semantics as last_recovery_scan.
+                // Same timer semantics as last_recovery_scan. Skipped if a signal
+                // arrived during the recovery scan.
                 match last_auto_merge_sweep {
+                    _ if shutdown_flag.load(Ordering::Acquire) => {}
                     None => {
                         last_auto_merge_sweep = Some(Instant::now());
                     }
@@ -473,13 +511,6 @@ pub(crate) async fn handle_lab(
                     Some(_) => {}
                 }
 
-                // Check if a signal arrived during poll_and_spawn
-                if shutdown_flag.load(Ordering::Acquire) {
-                    tprintln!();
-                    tprintln!("🛑 Received shutdown signal during polling, stopping daemon...");
-                    shutdown_children(&mut children, stop_minions).await;
-                    break;
-                }
             }
         }
     }
@@ -507,6 +538,15 @@ async fn reap_children(children: &mut Vec<SpawnedChild>, retry_queue: &mut Retry
                         // slow one — the early-exit threshold is only relevant to
                         // the failure path.
                         retry_queue.cancel(&meta.host, &meta.owner, &meta.repo, meta.issue_number);
+                    } else if shutting_down() {
+                        // handle_failed_exit makes several GitHub calls (label
+                        // check, label restore, comment). Skip them during
+                        // shutdown; the recovery scan resets the orphaned
+                        // gru:in-progress issue after the next lab start.
+                        log::info!(
+                            "Shutdown in progress; skipping failure handling for issue #{}",
+                            meta.issue_number
+                        );
                     } else {
                         let elapsed = meta.spawned_at.elapsed();
                         handle_failed_exit(meta, status, elapsed, retry_queue).await;
@@ -1527,7 +1567,7 @@ async fn resume_interrupted_minions(
     let mut resumed = 0;
 
     for candidate in &resumable {
-        if *available == 0 {
+        if *available == 0 || shutting_down() {
             break;
         }
 
@@ -1538,6 +1578,12 @@ async fn resume_interrupted_minions(
 
         if !should_resume_candidate(candidate, &host, max_attempts).await {
             continue;
+        }
+
+        // should_resume_candidate may have made GitHub calls whose retries
+        // were cancelled; don't launch a resume once shutdown has begun.
+        if shutting_down() {
+            break;
         }
 
         tprintln!(
@@ -1804,6 +1850,12 @@ async fn spawn_for_candidate_issues(
                 continue;
             }
 
+            // get_blockers may have run during a cancelled retry; don't start
+            // the eligibility call once shutdown has begun.
+            if shutdown_flag.load(Ordering::Acquire) {
+                break;
+            }
+
             // Revalidate issue state to prevent TOCTOU races between poll and dispatch
             if !github::is_issue_still_eligible(&ctx.owner, &ctx.repo, &ctx.host, candidate.number)
                 .await
@@ -1813,6 +1865,13 @@ async fn spawn_for_candidate_issues(
                 // re-claim starts from attempt zero.
                 retry_queue.cancel(&ctx.host, &ctx.owner, &ctx.repo, candidate.number);
                 continue;
+            }
+
+            // Re-check shutdown: the blocker and eligibility calls above fail
+            // open, and a Ctrl-C that cancels their retries must not lead to a
+            // claim and spawn during teardown.
+            if shutdown_flag.load(Ordering::Acquire) {
+                break;
             }
 
             if try_spawn_for_issue(
@@ -1933,6 +1992,13 @@ async fn poll_and_spawn(
         });
     }
 
+    if shutdown_flag.load(Ordering::Acquire) {
+        return Ok(PollResult {
+            spawned,
+            slots_full: false,
+        });
+    }
+
     // Resume interrupted minions, before claiming new issues
     let resumed = if no_resume {
         0
@@ -2011,8 +2077,8 @@ async fn dispatch_due_retries(
     let mut dispatched = 0usize;
 
     for entry in due {
-        if *available == 0 {
-            // No slots left — re-insert with original due_at preserved
+        if *available == 0 || shutting_down() {
+            // No slots left (or shutting down) — re-insert with original due_at preserved
             // so the backoff timer isn't reset on every slot-full poll cycle.
             retry_queue.reinsert(entry);
             continue;
@@ -2033,6 +2099,11 @@ async fn dispatch_due_retries(
             continue;
         }
 
+        if shutting_down() {
+            retry_queue.reinsert(entry);
+            continue;
+        }
+
         // Validate issue is still open and eligible
         if !github::is_issue_still_eligible(
             &entry.owner,
@@ -2046,6 +2117,12 @@ async fn dispatch_due_retries(
                 "⏭️  Skipping retry for issue #{}: no longer eligible (closed or label changed)",
                 entry.issue_number
             );
+            continue;
+        }
+
+        // The eligibility check fails open; don't spawn during shutdown.
+        if shutting_down() {
+            retry_queue.reinsert(entry);
             continue;
         }
 
@@ -2491,22 +2568,22 @@ async fn fallback_list_issues(
     label: &str,
 ) -> Result<Vec<github::CandidateIssue>> {
     let repo_full = github::repo_slug(owner, repo);
-    let output = github::gh_cli_command(host)
-        .args([
-            "issue",
-            "list",
-            "--repo",
-            &repo_full,
-            "--label",
-            label,
-            "--state",
-            "open",
-            "--json",
-            "number,body,labels",
-            "--limit",
-            "100",
-        ])
-        .output()
+    let mut cmd = github::gh_cli_command(host);
+    cmd.args([
+        "issue",
+        "list",
+        "--repo",
+        &repo_full,
+        "--label",
+        label,
+        "--state",
+        "open",
+        "--json",
+        "number,body,labels",
+        "--limit",
+        "100",
+    ]);
+    let output = github::output_unless_shutdown(cmd)
         .await
         .context("Failed to execute gh issue list command")?;
 
@@ -2597,6 +2674,11 @@ async fn recover_stuck_in_progress_issues(
     }
 
     for repo_spec in &config.daemon.repos {
+        if shutting_down() {
+            log::info!("Recovery scan: shutdown requested, stopping");
+            return Ok(());
+        }
+
         let Some((host, owner, repo)) =
             crate::config::parse_repo_entry_with_hosts(repo_spec, &config.github_hosts)
         else {
@@ -2626,6 +2708,11 @@ async fn recover_stuck_in_progress_issues(
         };
 
         for issue in in_progress {
+            if shutting_down() {
+                log::info!("Recovery scan: shutdown requested, stopping");
+                return Ok(());
+            }
+
             // If this issue was previously escalated to gru:blocked but is now back
             // in gru:in-progress, a human cleared gru:blocked and it was picked up
             // again. Clear the history so it gets a fresh slate.
@@ -2669,6 +2756,13 @@ async fn recover_stuck_in_progress_issues(
                     );
                     continue;
                 }
+            }
+
+            // The claim check above may have run during a cancelled retry;
+            // don't reset or escalate labels once shutdown has begun.
+            if shutting_down() {
+                log::info!("Recovery scan: shutdown requested, stopping");
+                return Ok(());
             }
 
             // Record this reset and check whether we've exceeded the threshold.
@@ -2813,6 +2907,11 @@ async fn recover_stuck_in_progress_issues(
 /// Per-repo and per-PR errors are logged as warnings and do not abort the scan.
 async fn sweep_orphaned_auto_merge_prs(config: &LabConfig) {
     for repo_spec in &config.daemon.repos {
+        if shutting_down() {
+            log::info!("Auto-merge sweep: shutdown requested, stopping");
+            return;
+        }
+
         let Some((host, owner, repo)) =
             parse_repo_entry_with_hosts(repo_spec, &config.github_hosts)
         else {
@@ -2842,6 +2941,11 @@ async fn sweep_orphaned_auto_merge_prs(config: &LabConfig) {
         let full_repo = github::repo_slug(&owner, &repo);
 
         for pr in &prs {
+            if shutting_down() {
+                log::info!("Auto-merge sweep: shutdown requested, stopping");
+                return;
+            }
+
             // Skip if a live Minion is already monitoring this PR.
             if is_pr_monitored_by_live_minion(&full_repo, pr.number).await {
                 log::debug!(
@@ -2892,6 +2996,13 @@ async fn sweep_orphaned_auto_merge_prs(config: &LabConfig) {
                     readiness,
                 );
                 continue;
+            }
+
+            // Readiness may have been judged from a cancelled call; don't queue
+            // a merge once shutdown has begun.
+            if shutting_down() {
+                log::info!("Auto-merge sweep: shutdown requested, stopping");
+                return;
             }
 
             tprintln!(
@@ -2979,10 +3090,53 @@ async fn is_pr_monitored_by_live_minion(full_repo: &str, pr_number: u64) -> bool
     }
 }
 
+/// Whether process shutdown has been requested (see [`crate::shutdown`]).
+fn shutting_down() -> bool {
+    crate::shutdown::global().is_triggered()
+}
+
+/// What `gru lab` does with a SIGINT.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InterruptAction {
+    /// First signal: start a graceful shutdown.
+    StartGracefulShutdown,
+    /// Shutdown is already underway (from an earlier Ctrl-C or SIGTERM): exit now.
+    ForceExit,
+}
+
+/// Decide how to handle a SIGINT, latching `shutdown_flag`.
+fn classify_interrupt(shutdown_flag: &AtomicBool) -> InterruptAction {
+    if shutdown_flag.swap(true, Ordering::AcqRel) {
+        InterruptAction::ForceExit
+    } else {
+        InterruptAction::StartGracefulShutdown
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::minion_registry::is_process_alive;
+
+    #[test]
+    fn test_classify_interrupt_first_then_second() {
+        let flag = AtomicBool::new(false);
+        assert_eq!(
+            classify_interrupt(&flag),
+            InterruptAction::StartGracefulShutdown
+        );
+        assert!(flag.load(Ordering::Acquire));
+        assert_eq!(classify_interrupt(&flag), InterruptAction::ForceExit);
+        assert_eq!(classify_interrupt(&flag), InterruptAction::ForceExit);
+    }
+
+    #[test]
+    fn test_classify_interrupt_after_sigterm_force_exits() {
+        // The SIGTERM handler sets the flag; the next Ctrl-C must force-exit.
+        let flag = AtomicBool::new(false);
+        flag.store(true, Ordering::Release);
+        assert_eq!(classify_interrupt(&flag), InterruptAction::ForceExit);
+    }
 
     #[tokio::test]
     async fn test_reap_children_empty() {
