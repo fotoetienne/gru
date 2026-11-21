@@ -174,7 +174,8 @@ fn calculate_retry_delay(attempt: u32) -> u64 {
 /// Callers **must** check `output.status.success()` to distinguish the two.
 ///
 /// Once process shutdown has been requested ([`crate::shutdown`]), no new
-/// request is started (returns `Err`) and pending retries are skipped.
+/// request is started, an in-flight `gh` call is killed (both return `Err`),
+/// and pending retries are skipped.
 ///
 /// # Arguments
 /// * `host` - GitHub hostname (e.g., "github.com" or "ghe.example.com")
@@ -216,11 +217,20 @@ impl RetryEnv for GhRetryEnv<'_> {
     }
 
     async fn run(&mut self) -> Result<Output> {
-        gh_cli_command(self.host)
+        // Race the call against shutdown so a hung `gh` doesn't hold up the
+        // first Ctrl-C; kill_on_drop stops it when shutdown wins.
+        let call = gh_cli_command(self.host)
             .args(self.args)
-            .output()
-            .await
-            .with_context(|| format!("Failed to execute: gh {}", self.args.join(" ")))
+            .kill_on_drop(true)
+            .output();
+        tokio::select! {
+            biased;
+            _ = crate::shutdown::global().wait() => {
+                anyhow::bail!("Shutdown requested; cancelled: gh {}", self.args.join(" "))
+            }
+            out = call => out
+                .with_context(|| format!("Failed to execute: gh {}", self.args.join(" "))),
+        }
     }
 
     async fn sleep_rate_limit(&mut self) -> SleepOutcome {

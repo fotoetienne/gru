@@ -320,8 +320,10 @@ pub(crate) async fn handle_lab(
                 }
                 match classify_interrupt(&flag) {
                     InterruptAction::StartGracefulShutdown => {
-                        notify.notify_one();
+                        // Trigger the global first so in-flight rate-limit
+                        // sleeps are already cancelled when the main loop wakes.
                         crate::shutdown::request_shutdown();
+                        notify.notify_one();
                     }
                     InterruptAction::ForceExit => {
                         tprintln!("\n⚠️  Received second interrupt, exiting immediately");
@@ -341,8 +343,8 @@ pub(crate) async fn handle_lab(
                 Ok(mut sigterm) => {
                     if sigterm.recv().await.is_some() {
                         flag.store(true, Ordering::Release);
-                        notify.notify_one();
                         crate::shutdown::request_shutdown();
+                        notify.notify_one();
                     } else {
                         log::warn!("SIGTERM signal stream closed without receiving SIGTERM; not triggering graceful shutdown");
                     }
@@ -3099,6 +3101,9 @@ fn classify_interrupt(shutdown_flag: &AtomicBool) -> InterruptAction {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use crate::minion_registry::is_process_alive;
+
     #[test]
     fn test_classify_interrupt_first_then_second() {
         let flag = AtomicBool::new(false);
@@ -3118,9 +3123,6 @@ mod tests {
         flag.store(true, Ordering::Release);
         assert_eq!(classify_interrupt(&flag), InterruptAction::ForceExit);
     }
-
-    use super::*;
-    use crate::minion_registry::is_process_alive;
 
     #[tokio::test]
     async fn test_reap_children_empty() {
