@@ -157,8 +157,8 @@ pub(crate) fn clear_rate_limit(host: &str) {
 /// reset window passes. Intended to be called at the top of each attempt in
 /// `gh_api_with_retry` before spawning `gh`.
 ///
-/// Returns [`SleepOutcome::Cancelled`] if process shutdown was requested
-/// before the window passed, so the caller can skip the doomed call.
+/// Returns [`SleepOutcome::Cancelled`] if process shutdown has been requested
+/// (whether or not a shared window is active), so the caller can skip the call.
 pub(crate) async fn wait_if_shared_rate_limited(host: &str) -> SleepOutcome {
     wait_if_shared_rate_limited_with(host, crate::shutdown::global()).await
 }
@@ -166,6 +166,11 @@ pub(crate) async fn wait_if_shared_rate_limited(host: &str) -> SleepOutcome {
 /// [`wait_if_shared_rate_limited`] with an explicit shutdown signal, so tests
 /// can use a local signal instead of the process-wide one.
 async fn wait_if_shared_rate_limited_with(host: &str, shutdown: &ShutdownSignal) -> SleepOutcome {
+    // Once shutdown has begun, report Cancelled even with no shared window so
+    // gh_api_with_retry doesn't start fresh requests during teardown.
+    if shutdown.is_triggered() {
+        return SleepOutcome::Cancelled;
+    }
     let Some(reset_epoch) = read_rate_limit_until(host) else {
         return SleepOutcome::Elapsed;
     };
@@ -443,5 +448,18 @@ mod tests {
 
         // The window hasn't passed, so the shared signal must survive.
         assert_eq!(fs::read_to_string(&path).unwrap().trim(), reset.to_string());
+    }
+
+    #[tokio::test]
+    async fn wait_returns_cancelled_after_shutdown_without_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = set_test_workspace(tmp.path().to_path_buf()).unwrap();
+
+        let signal = ShutdownSignal::new();
+        signal.trigger();
+        assert_eq!(
+            wait_if_shared_rate_limited_with("github.com", &signal).await,
+            SleepOutcome::Cancelled
+        );
     }
 }

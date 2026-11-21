@@ -486,8 +486,10 @@ pub(crate) async fn handle_lab(
                 }
 
                 // Periodic auto-merge sweep: queue merges for orphaned auto-merge PRs.
-                // Same timer semantics as last_recovery_scan.
+                // Same timer semantics as last_recovery_scan. Skipped if a signal
+                // arrived during the recovery scan.
                 match last_auto_merge_sweep {
+                    _ if shutdown_flag.load(Ordering::Acquire) => {}
                     None => {
                         last_auto_merge_sweep = Some(Instant::now());
                     }
@@ -2622,6 +2624,11 @@ async fn recover_stuck_in_progress_issues(
     }
 
     for repo_spec in &config.daemon.repos {
+        if crate::shutdown::global().is_triggered() {
+            log::info!("Recovery scan: shutdown requested, stopping");
+            return Ok(());
+        }
+
         let Some((host, owner, repo)) =
             crate::config::parse_repo_entry_with_hosts(repo_spec, &config.github_hosts)
         else {
@@ -2651,6 +2658,11 @@ async fn recover_stuck_in_progress_issues(
         };
 
         for issue in in_progress {
+            if crate::shutdown::global().is_triggered() {
+                log::info!("Recovery scan: shutdown requested, stopping");
+                return Ok(());
+            }
+
             // If this issue was previously escalated to gru:blocked but is now back
             // in gru:in-progress, a human cleared gru:blocked and it was picked up
             // again. Clear the history so it gets a fresh slate.
@@ -2694,6 +2706,13 @@ async fn recover_stuck_in_progress_issues(
                     );
                     continue;
                 }
+            }
+
+            // The claim check above may have run during a cancelled retry;
+            // don't reset or escalate labels once shutdown has begun.
+            if crate::shutdown::global().is_triggered() {
+                log::info!("Recovery scan: shutdown requested, stopping");
+                return Ok(());
             }
 
             // Record this reset and check whether we've exceeded the threshold.
@@ -2838,6 +2857,11 @@ async fn recover_stuck_in_progress_issues(
 /// Per-repo and per-PR errors are logged as warnings and do not abort the scan.
 async fn sweep_orphaned_auto_merge_prs(config: &LabConfig) {
     for repo_spec in &config.daemon.repos {
+        if crate::shutdown::global().is_triggered() {
+            log::info!("Auto-merge sweep: shutdown requested, stopping");
+            return;
+        }
+
         let Some((host, owner, repo)) =
             parse_repo_entry_with_hosts(repo_spec, &config.github_hosts)
         else {
@@ -2867,6 +2891,11 @@ async fn sweep_orphaned_auto_merge_prs(config: &LabConfig) {
         let full_repo = github::repo_slug(&owner, &repo);
 
         for pr in &prs {
+            if crate::shutdown::global().is_triggered() {
+                log::info!("Auto-merge sweep: shutdown requested, stopping");
+                return;
+            }
+
             // Skip if a live Minion is already monitoring this PR.
             if is_pr_monitored_by_live_minion(&full_repo, pr.number).await {
                 log::debug!(
@@ -2917,6 +2946,13 @@ async fn sweep_orphaned_auto_merge_prs(config: &LabConfig) {
                     readiness,
                 );
                 continue;
+            }
+
+            // Readiness may have been judged from a cancelled call; don't queue
+            // a merge once shutdown has begun.
+            if crate::shutdown::global().is_triggered() {
+                log::info!("Auto-merge sweep: shutdown requested, stopping");
+                return;
             }
 
             tprintln!(

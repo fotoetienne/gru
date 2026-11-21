@@ -173,6 +173,9 @@ fn calculate_retry_delay(attempt: u32) -> u64 {
 /// responses and non-retryable failures are returned as `Ok(Output)`.
 /// Callers **must** check `output.status.success()` to distinguish the two.
 ///
+/// Once process shutdown has been requested ([`crate::shutdown`]), no new
+/// request is started (returns `Err`) and pending retries are skipped.
+///
 /// # Arguments
 /// * `host` - GitHub hostname (e.g., "github.com" or "ghe.example.com")
 /// * `args` - The arguments to pass to the gh command
@@ -193,10 +196,7 @@ pub(crate) async fn gh_api_with_retry(
         if crate::shared_rate_limit::wait_if_shared_rate_limited(host).await
             == SleepOutcome::Cancelled
         {
-            anyhow::bail!(
-                "Shutdown requested while waiting out a shared rate limit; skipped: gh {}",
-                args_str
-            );
+            anyhow::bail!("Shutdown requested; skipped: gh {}", args_str);
         }
 
         let output = gh_cli_command(host)
