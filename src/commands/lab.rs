@@ -538,6 +538,15 @@ async fn reap_children(children: &mut Vec<SpawnedChild>, retry_queue: &mut Retry
                         // slow one — the early-exit threshold is only relevant to
                         // the failure path.
                         retry_queue.cancel(&meta.host, &meta.owner, &meta.repo, meta.issue_number);
+                    } else if crate::shutdown::global().is_triggered() {
+                        // handle_failed_exit makes several GitHub calls (label
+                        // check, label restore, comment). Skip them during
+                        // shutdown; the recovery scan resets the orphaned
+                        // gru:in-progress issue after the next lab start.
+                        log::info!(
+                            "Shutdown in progress; skipping failure handling for issue #{}",
+                            meta.issue_number
+                        );
                     } else {
                         let elapsed = meta.spawned_at.elapsed();
                         handle_failed_exit(meta, status, elapsed, retry_queue).await;
