@@ -71,6 +71,30 @@ pub(crate) fn gh_cli_command(host: &str) -> Command {
     cmd
 }
 
+/// Await `fut` unless `shutdown` fires first (checked before the first poll),
+/// in which case `fut` is dropped and an error is returned.
+///
+/// For `gh` process futures built with `kill_on_drop(true)`: if shutdown was
+/// already requested the process is never spawned, and if it arrives mid-call
+/// the process is killed.
+async fn unless_shutdown<F: std::future::Future>(
+    shutdown: &ShutdownSignal,
+    fut: F,
+) -> Result<F::Output> {
+    tokio::select! {
+        biased;
+        _ = shutdown.wait() => Err(anyhow!("shutdown requested")),
+        out = fut => Ok(out),
+    }
+}
+
+/// Run `cmd` (with `kill_on_drop`) unless process shutdown is requested
+/// first; see [`unless_shutdown`].
+pub(crate) async fn output_unless_shutdown(mut cmd: Command) -> Result<Output> {
+    cmd.kill_on_drop(true);
+    Ok(unless_shutdown(crate::shutdown::global(), cmd.output()).await??)
+}
+
 /// Run a `gh` CLI command and return its stdout on success.
 ///
 /// This is the standard helper for executing `gh` commands. It handles the
@@ -94,10 +118,14 @@ pub(crate) async fn run_gh(host: &str, args: &[&str]) -> Result<String> {
         .collect::<Vec<_>>()
         .join(" ");
     let child = gh_cli_command(host).args(args).kill_on_drop(true).output();
-    let output = tokio::time::timeout(Duration::from_secs(GH_TIMEOUT_SECS), child)
-        .await
-        .with_context(|| format!("gh {} timed out after {}s", args_display, GH_TIMEOUT_SECS))?
-        .with_context(|| format!("Failed to execute: gh {}", args_display))?;
+    let output = unless_shutdown(
+        crate::shutdown::global(),
+        tokio::time::timeout(Duration::from_secs(GH_TIMEOUT_SECS), child),
+    )
+    .await
+    .with_context(|| format!("gh {} not run", args_display))?
+    .with_context(|| format!("gh {} timed out after {}s", args_display, GH_TIMEOUT_SECS))?
+    .with_context(|| format!("Failed to execute: gh {}", args_display))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -223,14 +251,10 @@ impl RetryEnv for GhRetryEnv<'_> {
             .args(self.args)
             .kill_on_drop(true)
             .output();
-        tokio::select! {
-            biased;
-            _ = crate::shutdown::global().wait() => {
-                anyhow::bail!("Shutdown requested; cancelled: gh {}", self.args.join(" "))
-            }
-            out = call => out
-                .with_context(|| format!("Failed to execute: gh {}", self.args.join(" "))),
-        }
+        unless_shutdown(crate::shutdown::global(), call)
+            .await
+            .with_context(|| format!("gh {} not run", self.args.join(" ")))?
+            .with_context(|| format!("Failed to execute: gh {}", self.args.join(" ")))
     }
 
     async fn sleep_rate_limit(&mut self) -> SleepOutcome {
@@ -2357,6 +2381,45 @@ mod tests {
         let outcome = sleep_until_rate_limit_reset_with("github.com", &signal).await;
         assert_eq!(outcome, SleepOutcome::Cancelled);
         assert_eq!(start.elapsed(), Duration::ZERO);
+    }
+
+    // --- unless_shutdown tests ---
+
+    #[tokio::test]
+    async fn test_unless_shutdown_runs_future_when_not_triggered() {
+        let signal = ShutdownSignal::new();
+        assert_eq!(unless_shutdown(&signal, async { 7 }).await.unwrap(), 7);
+    }
+
+    #[tokio::test]
+    async fn test_unless_shutdown_never_polls_future_when_triggered() {
+        let signal = ShutdownSignal::new();
+        signal.trigger();
+        let polled = std::sync::atomic::AtomicBool::new(false);
+        let res = unless_shutdown(&signal, async {
+            polled.store(true, std::sync::atomic::Ordering::SeqCst);
+        })
+        .await;
+        assert!(res.is_err());
+        assert!(!polled.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_unless_shutdown_kills_in_flight_process() {
+        let signal = std::sync::Arc::new(ShutdownSignal::new());
+        let trigger = {
+            let signal = signal.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                signal.trigger();
+            })
+        };
+        let start = std::time::Instant::now();
+        let call = Command::new("sleep").arg("30").kill_on_drop(true).output();
+        assert!(unless_shutdown(&signal, call).await.is_err());
+        assert!(start.elapsed() < Duration::from_secs(5));
+        trigger.await.unwrap();
     }
 
     // --- retry_gh_call shutdown tests ---

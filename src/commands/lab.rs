@@ -2568,22 +2568,22 @@ async fn fallback_list_issues(
     label: &str,
 ) -> Result<Vec<github::CandidateIssue>> {
     let repo_full = github::repo_slug(owner, repo);
-    let output = github::gh_cli_command(host)
-        .args([
-            "issue",
-            "list",
-            "--repo",
-            &repo_full,
-            "--label",
-            label,
-            "--state",
-            "open",
-            "--json",
-            "number,body,labels",
-            "--limit",
-            "100",
-        ])
-        .output()
+    let mut cmd = github::gh_cli_command(host);
+    cmd.args([
+        "issue",
+        "list",
+        "--repo",
+        &repo_full,
+        "--label",
+        label,
+        "--state",
+        "open",
+        "--json",
+        "number,body,labels",
+        "--limit",
+        "100",
+    ]);
+    let output = github::output_unless_shutdown(cmd)
         .await
         .context("Failed to execute gh issue list command")?;
 

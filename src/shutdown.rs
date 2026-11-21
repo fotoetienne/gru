@@ -84,10 +84,11 @@ pub(crate) fn global() -> &'static ShutdownSignal {
 /// Trigger the process-wide shutdown signal.
 ///
 /// This is a one-way latch for the whole process. After it fires,
-/// `github::gh_api_with_retry` refuses to start new requests (returns `Err`)
-/// and skips pending retries. Code that must still reach GitHub during
+/// `github::run_gh` and `github::gh_api_with_retry` refuse to start new
+/// requests and kill in-flight ones (both return `Err`), and retries are
+/// skipped. Code that must still reach GitHub during
 /// teardown (e.g. posting a final status comment) has to run before this is
-/// called or use a path other than `gh_api_with_retry`.
+/// called or use a path other than those helpers.
 pub(crate) fn request_shutdown() {
     GLOBAL.trigger();
 }
