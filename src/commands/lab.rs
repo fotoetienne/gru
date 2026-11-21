@@ -1554,7 +1554,7 @@ async fn resume_interrupted_minions(
     let mut resumed = 0;
 
     for candidate in &resumable {
-        if *available == 0 {
+        if *available == 0 || crate::shutdown::global().is_triggered() {
             break;
         }
 
@@ -1565,6 +1565,12 @@ async fn resume_interrupted_minions(
 
         if !should_resume_candidate(candidate, &host, max_attempts).await {
             continue;
+        }
+
+        // should_resume_candidate may have made GitHub calls whose retries
+        // were cancelled; don't launch a resume once shutdown has begun.
+        if crate::shutdown::global().is_triggered() {
+            break;
         }
 
         tprintln!(
@@ -1967,6 +1973,13 @@ async fn poll_and_spawn(
         if spawned > 0 {
             tprintln!();
         }
+        return Ok(PollResult {
+            spawned,
+            slots_full: false,
+        });
+    }
+
+    if shutdown_flag.load(Ordering::Acquire) {
         return Ok(PollResult {
             spawned,
             slots_full: false,
