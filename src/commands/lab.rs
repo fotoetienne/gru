@@ -3088,17 +3088,9 @@ async fn sweep_policy_allows_merge(
             return None;
         }
     };
-    let mut changed_files = None;
-    if policy.is_none() {
+    let changed_files =
         match merge_judge::fetch_pr_changed_files(host, owner, repo, pr_number).await {
-            Ok(files) if !sweep_needs_judge(policy.as_ref(), &files) => {
-                return Some(merge_judge::PendingMerge {
-                    head_sha: listed_head_sha.to_string(),
-                    direct: false,
-                });
-            }
-            // The PR changes a policy file: the judge escalates it below.
-            Ok(files) => changed_files = Some(files),
+            Ok(files) => files,
             Err(e) => {
                 log::warn!(
                     "⚠️  Auto-merge sweep: could not list changed files for PR #{} in {}/{}: {:#}",
@@ -3109,7 +3101,53 @@ async fn sweep_policy_allows_merge(
                 );
                 return None;
             }
+        };
+    if !sweep_needs_judge(policy.as_ref(), &changed_files) {
+        return Some(merge_judge::PendingMerge {
+            head_sha: listed_head_sha.to_string(),
+            direct: false,
+        });
+    }
+
+    // A PR that changes the policy file always escalates and needs no LLM,
+    // so handle it here: a missing backend or temp dir must not leave it
+    // silently unmerged with no label.
+    if let Some(path) = merge_judge::find_policy_file_change(&changed_files) {
+        let response = merge_judge::policy_change_escalation(path);
+        if config.merge.policy_mode == PolicyMode::Observe {
+            merge_judge::post_observe_verdict_at(
+                host,
+                owner,
+                repo,
+                pr_number,
+                listed_head_sha,
+                judge_state,
+                &response,
+                minion_id,
+            )
+            .await;
+        } else if !judge_state.protected_escalated_for(listed_head_sha) {
+            tprintln!(
+                "🚨 Auto-merge sweep: PR #{} in {}/{} changes {} — escalating for human review",
+                pr_number,
+                owner,
+                repo,
+                path,
+            );
+            judge_state.mark_protected_escalated(listed_head_sha);
+            merge_judge::escalate_pr_at(
+                host,
+                owner,
+                repo,
+                pr_number,
+                Some(listed_head_sha.to_string()),
+                &response,
+                minion_id,
+                judge_state,
+            )
+            .await;
         }
+        return None;
     }
 
     let backend = match crate::agent_registry::resolve_backend_with_config(
@@ -3148,7 +3186,7 @@ async fn sweep_policy_allows_merge(
         config.merge.confidence_threshold.clamp(1, 10),
         // Reuse what was fetched above instead of fetching it again.
         merge_judge::PolicyInputs {
-            changed_files,
+            changed_files: Some(changed_files),
             policy: Some(policy),
         },
     )
