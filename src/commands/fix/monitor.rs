@@ -1196,9 +1196,14 @@ async fn handle_new_reviews(
         Err(e) => log::warn!("⚠️  Duplicate inline reply sweep failed: {:#}", e),
     }
 
-    push_agent_commits(ctx).await;
+    let pushed = push_agent_commits(ctx).await;
 
     match agent_result {
+        Ok(()) if !pushed => {
+            // Keep the baseline: the feedback isn't handled until the fix is on the PR.
+            println!("❌ Changes could not be pushed; stopping monitoring (see PR comment)");
+            LoopAction::Break
+        }
         Ok(()) => {
             println!("\n✅ Finished addressing review comments");
             println!("🔄 Continuing to monitor PR...\n");
@@ -1222,34 +1227,59 @@ async fn handle_new_reviews(
     }
 }
 
-/// After a review/comment agent round, pushes the agent's commits through
-/// Gru (`git::sync_and_push`): integrate anything others pushed, push with a
-/// lease, and record what was pushed. Agents are told not to push, so this
-/// is where their work reaches the PR. On failure nothing is pushed and the
-/// PR gets an escalation comment; monitoring continues.
-async fn push_agent_commits(ctx: &MonitorContext<'_>) {
-    match crate::git::sync_and_push(&ctx.wt_ctx.checkout_path, &ctx.wt_ctx.branch_name).await {
-        Ok(crate::git::SyncedPush::Pushed) => println!("📤 Pushed the agent's commits"),
-        Ok(crate::git::SyncedPush::NothingToPush) => {}
+/// Pushes commits in the worktree that aren't on the PR yet, through Gru
+/// (`git::sync_and_push`): integrate anything others pushed, push with a
+/// lease, and record what was pushed.
+///
+/// Returns `false` if that failed; nothing was pushed and the PR has an
+/// escalation comment. Callers must then stop monitoring without advancing
+/// the review baseline: the PR on GitHub doesn't contain the fix, so the
+/// feedback isn't handled and merge readiness would judge stale code. The
+/// next monitor entry (`gru resume`, lab wake-up) retries the push.
+async fn push_pending_commits(
+    issue_ctx: &IssueContext,
+    wt_ctx: &WorktreeContext,
+    pr_number: &str,
+    what: &str,
+) -> bool {
+    match crate::git::sync_and_push(&wt_ctx.checkout_path, &wt_ctx.branch_name).await {
+        Ok(crate::git::SyncedPush::Pushed) => {
+            println!("📤 Pushed {}", what);
+            true
+        }
+        Ok(crate::git::SyncedPush::NothingToPush) => true,
         Err(e) => {
-            log::warn!("⚠️  Could not push the agent's commits: {:#}", e);
+            log::warn!("⚠️  Could not push {}: {:#}", what, e);
             post_escalation_comment(
-                &ctx.issue_ctx.owner,
-                &ctx.issue_ctx.repo,
-                &ctx.issue_ctx.host,
-                ctx.pr_number,
+                &issue_ctx.owner,
+                &issue_ctx.repo,
+                &issue_ctx.host,
+                pr_number,
                 &format!(
-                    "Could not push the changes made for the latest feedback to `{}`: the \
-                     branch changed in a way Gru won't merge automatically (for example a \
-                     force-push), or the push was rejected. The commits are in the Minion's \
-                     worktree. Manual intervention required.",
-                    ctx.wt_ctx.branch_name
+                    "Could not push {} to `{}`: the branch changed in a way Gru won't merge \
+                     automatically (for example a force-push), or the push was rejected. The \
+                     commits are in the Minion's worktree, and the Minion has stopped monitoring \
+                     this PR. Resolve the branch, then run `gru resume {}` to retry the push.",
+                    what, wt_ctx.branch_name, wt_ctx.minion_id
                 ),
-                &ctx.wt_ctx.minion_id,
+                &wt_ctx.minion_id,
             )
             .await;
+            false
         }
     }
+}
+
+/// After a review/comment agent round, pushes the agent's commits (agents
+/// are told not to push). See [`push_pending_commits`].
+async fn push_agent_commits(ctx: &MonitorContext<'_>) -> bool {
+    push_pending_commits(
+        ctx.issue_ctx,
+        ctx.wt_ctx,
+        ctx.pr_number,
+        "the changes made for the latest feedback",
+    )
+    .await
 }
 
 async fn handle_new_issue_comments(
@@ -1307,9 +1337,14 @@ async fn handle_new_issue_comments(
         &ctx.issue_ctx.host,
     )
     .await;
-    push_agent_commits(ctx).await;
+    let pushed = push_agent_commits(ctx).await;
 
     match agent_result {
+        Ok(()) if !pushed => {
+            // Keep the baseline: the feedback isn't handled until the fix is on the PR.
+            println!("❌ Changes could not be pushed; stopping monitoring (see PR comment)");
+            LoopAction::Break
+        }
         Ok(()) => {
             println!("\n✅ Finished addressing PR comments");
             println!("🔄 Continuing to monitor PR...\n");
@@ -1719,6 +1754,13 @@ pub(crate) async fn monitor_pr_lifecycle(
     review_timeout: Option<Duration>,
     monitor_timeout: Duration,
 ) -> Option<MonitorResult> {
+    // Push commits left unpushed by an earlier session (e.g. a push that was
+    // refused). Don't monitor, review or judge merge readiness on a PR that
+    // is missing them.
+    if !push_pending_commits(issue_ctx, wt_ctx, pr_number, "local commits").await {
+        return None;
+    }
+
     // Ensure the gru:ready-to-merge label exists in the repo
     if let Err(e) =
         pr_monitor::ensure_ready_to_merge_label(&issue_ctx.host, &issue_ctx.owner, &issue_ctx.repo)
