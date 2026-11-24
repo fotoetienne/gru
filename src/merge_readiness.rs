@@ -123,9 +123,25 @@ pub(crate) async fn check_merge_readiness(
     repo: &str,
     pr_number: u64,
 ) -> Result<MergeReadiness> {
+    Ok(
+        check_merge_readiness_with_head(host, owner, repo, pr_number)
+            .await?
+            .0,
+    )
+}
+
+/// Like [`check_merge_readiness`], but also returns the head SHA the
+/// readiness was evaluated against (the data may be briefly cached), so
+/// callers can confirm it matches the commit they are about to merge.
+pub(crate) async fn check_merge_readiness_with_head(
+    host: &str,
+    owner: &str,
+    repo: &str,
+    pr_number: u64,
+) -> Result<(MergeReadiness, String)> {
     match graphql::fetch_pr_merge_data(host, owner, repo, pr_number).await {
         Ok(graphql::FetchOutcome::Available(data)) if !data.has_more_pages => {
-            return Ok(evaluate_graphql_data(&data));
+            return Ok((evaluate_graphql_data(&data), data.head_sha.clone()));
         }
         Ok(graphql::FetchOutcome::Available(_)) => {
             log::info!(
@@ -159,7 +175,7 @@ async fn check_merge_readiness_rest(
     owner: &str,
     repo: &str,
     pr_number: u64,
-) -> Result<MergeReadiness> {
+) -> Result<(MergeReadiness, String)> {
     let pr_str = pr_number.to_string();
 
     // Fetch PR details (for draft, mergeable, head SHA) and reviews concurrently
@@ -170,12 +186,15 @@ async fn check_merge_readiness_rest(
 
     // Fast bail-out: draft PRs are never ready
     if pr.draft {
-        return Ok(MergeReadiness {
-            not_draft: false,
-            ci_passing: false,
-            review_approved: false,
-            no_conflicts: false,
-        });
+        return Ok((
+            MergeReadiness {
+                not_draft: false,
+                ci_passing: false,
+                review_approved: false,
+                no_conflicts: false,
+            },
+            pr.head_sha,
+        ));
     }
 
     // Sequential: needs head SHA from get_pr_details above
@@ -188,12 +207,15 @@ async fn check_merge_readiness_rest(
     let review_approved = evaluate_reviews(&reviews, &pr.author_login);
     let no_conflicts = pr.mergeable == Some(true);
 
-    Ok(MergeReadiness {
-        not_draft: true,
-        ci_passing,
-        review_approved,
-        no_conflicts,
-    })
+    Ok((
+        MergeReadiness {
+            not_draft: true,
+            ci_passing,
+            review_approved,
+            no_conflicts,
+        },
+        pr.head_sha,
+    ))
 }
 
 /// Check merge readiness using pre-fetched poll cycle data.

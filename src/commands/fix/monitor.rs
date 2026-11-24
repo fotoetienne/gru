@@ -3,7 +3,7 @@ use super::agent::invoke_agent_for_reviews;
 use super::types::{IssueContext, WorktreeContext, MAX_REBASE_ATTEMPTS, MAX_REVIEW_ROUNDS};
 use crate::agent::AgentBackend;
 use crate::ci;
-use crate::config::LabConfig;
+use crate::config::PolicyMode;
 use crate::github;
 use crate::merge_judge::{self, JudgeAction, JudgeResponse, JudgeState};
 use crate::minion_registry;
@@ -619,6 +619,7 @@ struct MonitorLoopState {
     review_baseline: Option<DateTime<Utc>>,
     monitor_start: tokio::time::Instant,
     confidence_threshold: u8,
+    policy_mode: PolicyMode,
     /// Number of poll cycles to skip merge-conflict detection after a successful
     /// rebase + force-push. GitHub takes time to recompute the `mergeable` field,
     /// so stale `mergeable: false` would otherwise trigger redundant rebase cycles.
@@ -653,7 +654,11 @@ const MAX_CONSECUTIVE_ERRORS: u32 = 10;
 const RATE_LIMIT_BACKOFF_SECS: u64 = 300;
 
 impl MonitorLoopState {
-    fn new(initial_baseline: DateTime<Utc>, confidence_threshold: u8) -> Self {
+    fn new(
+        initial_baseline: DateTime<Utc>,
+        confidence_threshold: u8,
+        policy_mode: PolicyMode,
+    ) -> Self {
         Self {
             review_round: 0,
             issue_comment_round: 0,
@@ -667,6 +672,7 @@ impl MonitorLoopState {
             review_baseline: Some(initial_baseline),
             monitor_start: tokio::time::Instant::now(),
             confidence_threshold,
+            policy_mode,
             rebase_cooldown_cycles: 0,
         }
     }
@@ -728,6 +734,18 @@ async fn handle_ready_to_merge(
         state.judge_label_ensured = true;
     }
 
+    // Finish an escalation whose label or comment failed earlier. Done
+    // before the label check below, which would otherwise skip the PR.
+    merge_judge::retry_pending_escalation(
+        &ctx.issue_ctx.host,
+        &ctx.issue_ctx.owner,
+        &ctx.issue_ctx.repo,
+        ctx.pr_number,
+        Some(&ctx.wt_ctx.minion_id),
+        &mut state.judge_state,
+    )
+    .await;
+
     // Check if gru:needs-human-review was previously applied and
     // not yet cleared — skip judge until human removes it.
     // On API failure, be conservative and skip (don't proceed).
@@ -765,7 +783,12 @@ async fn handle_ready_to_merge(
 
     // If a previous failure escalation failed to apply the label, retry now
     // before invoking the judge (which would skip at the failure cap).
-    if state.judge_state.should_escalate_on_failure() && !state.judge_state.label_was_applied() {
+    let observing =
+        state.policy_mode == PolicyMode::Observe && state.judge_state.policy_may_apply();
+    if state.judge_state.should_escalate_on_failure()
+        && !state.judge_state.label_was_applied()
+        && !observing
+    {
         log::info!("Retrying failed escalation label application...");
         match merge_judge::add_needs_human_review_label(
             &ctx.issue_ctx.host,
@@ -797,52 +820,45 @@ async fn handle_ready_to_merge(
         &ctx.wt_ctx.checkout_path,
         &mut state.judge_state,
         state.confidence_threshold,
+        merge_judge::PolicyInputs::default(),
     )
     .await
     {
+        Ok(Some(response))
+            if response.policy_applied && state.policy_mode == PolicyMode::Observe =>
+        {
+            println!(
+                "👁️  Observe mode: merge policy applies to PR #{} — reporting verdict without acting",
+                ctx.pr_number
+            );
+            merge_judge::post_observe_verdict(
+                &ctx.issue_ctx.host,
+                &ctx.issue_ctx.owner,
+                &ctx.issue_ctx.repo,
+                ctx.pr_number,
+                &mut state.judge_state,
+                &response,
+                Some(&ctx.wt_ctx.minion_id),
+            )
+            .await;
+        }
         Ok(Some(response)) => match &response.action {
             JudgeAction::Merge => {
                 println!(
                     "🚀 Judge approved merge for PR #{} (confidence: {}/10)",
                     ctx.pr_number, response.confidence
                 );
-                let repo_full = github::repo_slug(&ctx.issue_ctx.owner, &ctx.issue_ctx.repo);
-                match crate::github::gh_cli_command(&ctx.issue_ctx.host)
-                    .args([
-                        "pr",
-                        "merge",
-                        ctx.pr_number,
-                        "--squash",
-                        "--auto",
-                        "-R",
-                        &repo_full,
-                    ])
-                    .output()
-                    .await
-                {
-                    Ok(output) if output.status.success() => {
-                        println!("✅ Auto-merge queued for PR #{}!", ctx.pr_number);
-                        println!(
-                            "🎉 Issue {} is complete!",
-                            ctx.issue_ctx
-                                .issue_num
-                                .map_or("?".to_string(), |n| n.to_string())
-                        );
-                        return LoopAction::Break;
-                    }
-                    Ok(output) => {
-                        let stderr = String::from_utf8_lossy(&output.stderr);
-                        log::warn!(
-                            "⚠️  Auto-merge failed for PR #{}: {}",
-                            ctx.pr_number,
-                            stderr.trim()
-                        );
-                        println!("🔄 Will retry on next poll cycle...");
-                    }
-                    Err(e) => {
-                        log::warn!("⚠️  Failed to run merge command: {}", e);
-                        println!("🔄 Will retry on next poll cycle...");
-                    }
+                let Some(head_sha) = state.judge_state.last_head_sha().map(str::to_string) else {
+                    return LoopAction::Continue;
+                };
+                // Policy-governed PRs merge directly, never via a pending
+                // auto-merge that would also take later, unjudged pushes.
+                let pending = merge_judge::PendingMerge {
+                    head_sha,
+                    direct: response.policy_applied,
+                };
+                if try_judged_merge(state, ctx, pending).await {
+                    return LoopAction::Break;
                 }
             }
             JudgeAction::Wait(duration) => {
@@ -858,27 +874,16 @@ async fn handle_ready_to_merge(
                     "🚨 Judge escalated PR #{} for human review (confidence: {}/10)",
                     ctx.pr_number, response.confidence
                 );
-                // Apply label and post comment on PR.
-                match merge_judge::add_needs_human_review_label(
-                    &ctx.issue_ctx.host,
-                    &ctx.issue_ctx.owner,
-                    &ctx.issue_ctx.repo,
-                    ctx.pr_number,
-                )
-                .await
-                {
-                    Ok(()) => state.judge_state.mark_label_applied(),
-                    Err(e) => {
-                        log::warn!("Failed to add needs-human-review label: {:#}", e);
-                    }
-                }
-                merge_judge::post_judge_escalation_comment(
+                // Apply label and post comment on PR; whatever fails is
+                // retried on later polls.
+                merge_judge::escalate_pr(
                     &ctx.issue_ctx.host,
                     &ctx.issue_ctx.owner,
                     &ctx.issue_ctx.repo,
                     ctx.pr_number,
                     &response,
-                    &ctx.wt_ctx.minion_id,
+                    Some(&ctx.wt_ctx.minion_id),
+                    &mut state.judge_state,
                 )
                 .await;
                 // Also post an explanatory comment on the issue.
@@ -901,10 +906,60 @@ async fn handle_ready_to_merge(
         Ok(None) => {
             // Judge invocation skipped (same state, no timer expired).
             log::debug!("Judge invocation skipped — PR state unchanged");
+            // Retry an approved merge GitHub didn't accept yet. The PR is
+            // unchanged, so the approval still covers this head.
+            if let Some(pending) = state.judge_state.pending_merge().cloned() {
+                if try_judged_merge(state, ctx, pending).await {
+                    return LoopAction::Break;
+                }
+            }
+            // Deliver an observe verdict whose earlier post failed.
+            merge_judge::retry_pending_observe(
+                &ctx.issue_ctx.host,
+                &ctx.issue_ctx.owner,
+                &ctx.issue_ctx.repo,
+                ctx.pr_number,
+                &mut state.judge_state,
+                Some(&ctx.wt_ctx.minion_id),
+            )
+            .await;
         }
         Err(e) => {
             log::warn!("⚠️  Merge judge failed: {:#}", e);
-            if state.judge_state.should_escalate_on_failure() {
+            if state.judge_state.should_escalate_on_failure()
+                && state.policy_mode == PolicyMode::Observe
+                && state.judge_state.policy_may_apply()
+            {
+                // Observe mode is the trial mode: judge failures in a repo
+                // where a policy applies (or may) must not label PRs. Report
+                // in an observe comment instead; merging stays blocked.
+                println!(
+                    "👁️  Observe mode: merge judge failed for PR #{} — reporting without labeling",
+                    ctx.pr_number
+                );
+                let response = JudgeResponse {
+                    confidence: 0,
+                    action: JudgeAction::Escalate,
+                    reasoning: format!(
+                        "The merge judge failed {} consecutive times (last error: {e:#}). \
+                         In enforce mode this PR would be escalated for human review.",
+                        state.judge_state.consecutive_failures()
+                    ),
+                    policy_rule: None,
+                    policy_applied: true,
+                };
+                merge_judge::post_observe_verdict(
+                    &ctx.issue_ctx.host,
+                    &ctx.issue_ctx.owner,
+                    &ctx.issue_ctx.repo,
+                    ctx.pr_number,
+                    &mut state.judge_state,
+                    &response,
+                    Some(&ctx.wt_ctx.minion_id),
+                )
+                .await;
+                state.judge_state.mark_failure_escalated();
+            } else if state.judge_state.should_escalate_on_failure() {
                 log::warn!(
                     "Judge failed {} consecutive times — escalating for human review",
                     state.judge_state.consecutive_failures()
@@ -940,8 +995,10 @@ async fn handle_ready_to_merge(
                             state.judge_state.consecutive_failures(),
                             e
                         ),
+                        policy_rule: None,
+                        policy_applied: false,
                     },
-                    &ctx.wt_ctx.minion_id,
+                    Some(&ctx.wt_ctx.minion_id),
                 )
                 .await;
                 // Only mark escalation complete if the label was applied.
@@ -963,6 +1020,95 @@ async fn handle_ready_to_merge(
         }
     }
     LoopAction::Continue
+}
+
+/// Merge a judge-approved PR. Returns true on success; on failure the merge
+/// is kept pending and retried on later polls while the PR is unchanged.
+async fn try_judged_merge(
+    state: &mut MonitorLoopState,
+    ctx: &MonitorContext<'_>,
+    pending: merge_judge::PendingMerge,
+) -> bool {
+    // pr_monitor's ReadyToMerge came from its own poll, which doesn't name
+    // a commit. Re-check readiness now and require it to be for the head
+    // the judge approved, so a push in between can't merge unchecked.
+    let pr_num: u64 = match ctx.pr_number.parse() {
+        Ok(n) => n,
+        Err(_) => return false,
+    };
+    match crate::merge_readiness::check_merge_readiness_with_head(
+        &ctx.issue_ctx.host,
+        &ctx.issue_ctx.owner,
+        &ctx.issue_ctx.repo,
+        pr_num,
+    )
+    .await
+    {
+        Ok((readiness, head)) if head == pending.head_sha && readiness.is_ready() => {}
+        Ok((_, head)) if head != pending.head_sha => {
+            // Either readiness is briefly cached at an older head, or the PR
+            // really moved. Keep the SHA-pinned approval: if the head did
+            // move, the next snapshot changes the fingerprint and the new
+            // evaluation replaces it; the merge itself stays pinned.
+            log::info!(
+                "PR #{} readiness is for {}, approval is for {}; will re-check",
+                ctx.pr_number,
+                head,
+                pending.head_sha
+            );
+            state.judge_state.set_pending_merge(pending);
+            return false;
+        }
+        Ok((readiness, _)) => {
+            println!(
+                "⏳ PR #{} not ready to merge yet ({}); will retry",
+                ctx.pr_number, readiness
+            );
+            state.judge_state.set_pending_merge(pending);
+            return false;
+        }
+        Err(e) => {
+            log::warn!(
+                "⚠️  Readiness re-check failed for PR #{}: {:#}",
+                ctx.pr_number,
+                e
+            );
+            state.judge_state.set_pending_merge(pending);
+            return false;
+        }
+    }
+
+    match merge_judge::merge_pr(
+        &ctx.issue_ctx.host,
+        &ctx.issue_ctx.owner,
+        &ctx.issue_ctx.repo,
+        ctx.pr_number,
+        &pending,
+    )
+    .await
+    {
+        Ok(()) => {
+            state.judge_state.clear_pending_merge();
+            if pending.direct {
+                println!("✅ Merged PR #{}!", ctx.pr_number);
+            } else {
+                println!("✅ Auto-merge queued for PR #{}!", ctx.pr_number);
+            }
+            println!(
+                "🎉 Issue {} is complete!",
+                ctx.issue_ctx
+                    .issue_num
+                    .map_or("?".to_string(), |n| n.to_string())
+            );
+            true
+        }
+        Err(e) => {
+            log::warn!("⚠️  Merge failed for PR #{}: {:#}", ctx.pr_number, e);
+            println!("🔄 Will retry on next poll cycle...");
+            state.judge_state.set_pending_merge(pending);
+            false
+        }
+    }
 }
 
 /// Apply the #867 idempotency filter to review feedback before invoking the
@@ -1776,20 +1922,15 @@ pub(crate) async fn monitor_pr_lifecycle(
     println!("\n👀 Monitoring PR for updates (polling every 30s)...");
     println!("   Press Ctrl+C to stop monitoring\n");
 
-    // Load merge confidence threshold from config (falls back to default).
-    // Uses load_partial to avoid requiring [daemon].repos for non-daemon commands.
-    let confidence_threshold = LabConfig::default_path()
-        .ok()
-        .and_then(|p| {
-            LabConfig::load_partial(&p)
-                .map_err(|e| {
-                    log::warn!("Failed to load config for merge threshold: {e}, using default");
-                    e
-                })
-                .ok()
-        })
-        .map(|c| c.merge.confidence_threshold.clamp(1, 10))
+    // Load merge judge settings from config (falls back to defaults).
+    // try_load_config honors GRU_CONFIG_PATH, so a worker spawned by
+    // `gru lab --config <path>` uses the same policy_mode as the Lab.
+    let merge_config = crate::config::try_load_config().map(|c| c.merge);
+    let confidence_threshold = merge_config
+        .as_ref()
+        .map(|m| m.confidence_threshold.clamp(1, 10))
         .unwrap_or(merge_judge::DEFAULT_CONFIDENCE_THRESHOLD);
+    let policy_mode = merge_config.map(|m| m.policy_mode).unwrap_or_default();
 
     // Track review baseline across monitor_pr re-entries so reviews posted
     // before/during event handling (e.g. rebase) are not silently dropped.
@@ -1851,7 +1992,7 @@ pub(crate) async fn monitor_pr_lifecycle(
         pre_review_time
     };
 
-    let mut state = MonitorLoopState::new(initial_baseline, confidence_threshold);
+    let mut state = MonitorLoopState::new(initial_baseline, confidence_threshold, policy_mode);
     let ctx = MonitorContext {
         backend,
         issue_ctx,
@@ -2099,7 +2240,7 @@ mod tests {
             timeout_opt: None,
             monitor_timeout: Duration::from_secs(7200),
         };
-        let mut state = MonitorLoopState::new(Utc::now(), 0);
+        let mut state = MonitorLoopState::new(Utc::now(), 0, PolicyMode::Enforce);
 
         // Simulate 15 consecutive rate-limit errors (more than MAX_CONSECUTIVE_ERRORS)
         for _ in 0..15 {
@@ -2133,7 +2274,7 @@ mod tests {
             timeout_opt: None,
             monitor_timeout: Duration::from_secs(7200),
         };
-        let mut state = MonitorLoopState::new(Utc::now(), 0);
+        let mut state = MonitorLoopState::new(Utc::now(), 0, PolicyMode::Enforce);
 
         let error = anyhow::anyhow!("Failed to fetch PR: connection refused");
         let action = handle_monitor_error(&mut state, &ctx, error).await;
@@ -2156,7 +2297,7 @@ mod tests {
             timeout_opt: None,
             monitor_timeout: Duration::from_secs(7200),
         };
-        let mut state = MonitorLoopState::new(Utc::now(), 0);
+        let mut state = MonitorLoopState::new(Utc::now(), 0, PolicyMode::Enforce);
 
         for i in 0..MAX_CONSECUTIVE_ERRORS {
             let error = anyhow::anyhow!("Failed to fetch PR: server error");
@@ -2196,7 +2337,7 @@ mod tests {
 
     #[test]
     fn test_rebase_cooldown_initial_state() {
-        let state = MonitorLoopState::new(Utc::now(), 80);
+        let state = MonitorLoopState::new(Utc::now(), 80, PolicyMode::Enforce);
         assert_eq!(state.rebase_cooldown_cycles, 0);
     }
 
@@ -2219,7 +2360,7 @@ mod tests {
 
         let stale_baseline = Utc::now() - chrono::Duration::seconds(60);
         let check_time = Utc::now();
-        let mut state = MonitorLoopState::new(stale_baseline, 0);
+        let mut state = MonitorLoopState::new(stale_baseline, 0, PolicyMode::Enforce);
         state.review_baseline = Some(stale_baseline);
         state.rebase_attempts = MAX_REBASE_ATTEMPTS; // trigger early-exit path
 
@@ -2266,7 +2407,7 @@ mod tests {
 
         let stale_baseline = Utc::now() - chrono::Duration::seconds(60);
         let check_time = Utc::now();
-        let mut state = MonitorLoopState::new(stale_baseline, 0);
+        let mut state = MonitorLoopState::new(stale_baseline, 0, PolicyMode::Enforce);
         state.review_baseline = Some(stale_baseline);
         // rebase_attempts = 0 (< MAX) so we enter auto_rebase_pr and hit Err
 
@@ -2292,7 +2433,7 @@ mod tests {
     fn test_monitor_loop_state_stores_assigned_baseline() {
         let stale = Utc::now() - chrono::Duration::seconds(60);
         let check_time = Utc::now();
-        let mut state = MonitorLoopState::new(stale, 0);
+        let mut state = MonitorLoopState::new(stale, 0, PolicyMode::Enforce);
         assert_eq!(
             state.review_baseline,
             Some(stale),
@@ -2329,7 +2470,7 @@ mod tests {
 
         let stale_baseline = Utc::now() - chrono::Duration::seconds(60);
         let check_time = Utc::now();
-        let mut state = MonitorLoopState::new(stale_baseline, 0);
+        let mut state = MonitorLoopState::new(stale_baseline, 0, PolicyMode::Enforce);
         state.review_baseline = Some(stale_baseline);
         state.rebase_cooldown_cycles = 2; // active cooldown
 
@@ -2553,7 +2694,7 @@ mod tests {
         // Structural check: the two fields that the bypass resets must exist
         // on MonitorLoopState so any future rename is caught at compile time.
         let stale = Utc::now() - chrono::Duration::seconds(60);
-        let mut state = MonitorLoopState::new(stale, 0);
+        let mut state = MonitorLoopState::new(stale, 0, PolicyMode::Enforce);
         state.rebase_attempts = 1;
         state.rebase_cooldown_cycles = 0;
         // Replicate what the bypass does.
