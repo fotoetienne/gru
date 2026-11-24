@@ -51,6 +51,10 @@ pub(crate) async fn handle_rebase(
         return Ok(0);
     }
 
+    // Recorded so the force-push can refuse if the remote branch has commits
+    // that weren't part of this rebase.
+    let pre_rebase_head = crate::git::head_sha(&worktree_path).await?;
+
     // Attempt the rebase
     let rebase_result = attempt_rebase(&worktree_path, &base_branch).await?;
 
@@ -63,7 +67,7 @@ pub(crate) async fn handle_rebase(
             );
 
             if push {
-                if !maybe_force_push(&worktree_path, yes).await? {
+                if !maybe_force_push(&worktree_path, &pre_rebase_head, yes).await? {
                     return Ok(1);
                 }
             } else {
@@ -111,7 +115,7 @@ pub(crate) async fn handle_rebase(
 
                 if push {
                     // Defensively force push in case the /rebase skill didn't push
-                    if !maybe_force_push(&worktree_path, yes).await? {
+                    if !maybe_force_push(&worktree_path, &pre_rebase_head, yes).await? {
                         return Ok(1);
                     }
                 } else {
@@ -679,7 +683,7 @@ pub(crate) async fn abort_rebase(worktree_path: &Path) -> Result<()> {
 /// Confirms with the user, then force-pushes. Skips the prompt when `yes` is true.
 ///
 /// Returns `true` if the push happened, `false` if the user cancelled.
-async fn maybe_force_push(worktree_path: &Path, yes: bool) -> Result<bool> {
+async fn maybe_force_push(worktree_path: &Path, pre_rebase_head: &str, yes: bool) -> Result<bool> {
     let branch = get_current_branch(worktree_path).await?;
 
     if !yes {
@@ -703,7 +707,7 @@ async fn maybe_force_push(worktree_path: &Path, yes: bool) -> Result<bool> {
         }
     }
 
-    force_push(worktree_path).await?;
+    crate::git::force_push_rebased(worktree_path, &branch, pre_rebase_head).await?;
     println!("🚀 Force-pushed rebased branch");
     Ok(true)
 }
@@ -733,32 +737,6 @@ async fn confirm_force_push() -> bool {
         }
         _ = tokio::signal::ctrl_c() => false,
     }
-}
-
-/// Force-pushes the current branch using --force-with-lease.
-///
-/// Explicitly specifies `origin HEAD` to avoid relying on upstream tracking
-/// configuration, which may not be set in worktrees created from bare repos.
-pub(crate) async fn force_push(worktree_path: &Path) -> Result<()> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(worktree_path)
-        .args(["push", "--force-with-lease", "origin", "HEAD"])
-        .output()
-        .await
-        .context("Failed to execute git push --force-with-lease")?;
-
-    if output.status.success() {
-        return Ok(());
-    }
-
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    anyhow::bail!(
-        "git push --force-with-lease failed: {}\n\
-         The remote branch may have been updated since your last fetch.\n\
-         Run `git fetch origin <base_branch>` and try again.",
-        stderr.trim()
-    );
 }
 
 /// Default timeout for agent conflict resolution (30 minutes).

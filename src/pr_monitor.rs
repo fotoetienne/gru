@@ -1402,7 +1402,12 @@ pub(crate) fn format_push_safety_note(branch: &str) -> String {
 Other people may have pushed to this branch since your last push. Before pushing, run \
 `git pull --rebase origin {branch}` to put your commits on top of theirs, then push with \
 `git push origin HEAD:{branch}`. Never force-push, and never rewrite, squash or drop commits \
-you did not author.\n"
+you did not author.\n\n\
+If the fetch reports `(forced update)` for `{branch}`, the author rewrote the branch. Don't \
+`git pull --rebase` then: it would replay commits the author removed. Instead move only the \
+commits you made in this session onto the new tip with \
+`git rebase --onto origin/{branch} <commit before your first one>`, check `git log` shows \
+nothing else came along, then push.\n"
     )
 }
 
@@ -1631,6 +1636,7 @@ mod tests {
         assert!(note.contains("git pull --rebase origin feature/my-change"));
         assert!(note.contains("git push origin HEAD:feature/my-change"));
         assert!(note.contains("Never force-push"));
+        assert!(note.contains("(forced update)"));
     }
 
     #[test]

@@ -99,11 +99,15 @@ struct PrCommit {
 
 const PR_META_FIELDS: &str = "number,title,body,state,url,headRefName,isCrossRepository,author,closingIssuesReferences,commits";
 
-/// Review baseline for a newly adopted PR: the time of its latest commit.
+/// Review baseline for a newly adopted PR: the commit date of its latest
+/// commit.
 ///
-/// Reviews and comments posted after the author last pushed are probably
-/// still unaddressed, so the Minion picks them up. Earlier ones are assumed
-/// handled. `None` (no commits) falls back to "from now on".
+/// Reviews and comments posted after the author's latest commit are probably
+/// still unaddressed, so the Minion picks them up; earlier ones are assumed
+/// handled. This is commit time, not push time: a commit made before a
+/// review but pushed after it makes that review look new. That errs toward
+/// re-reading feedback rather than skipping it. `None` (no commits) falls
+/// back to "from now on".
 fn initial_review_baseline(meta: &PrMeta) -> Option<chrono::DateTime<Utc>> {
     meta.commits.iter().map(|c| c.committed_date).max()
 }
@@ -254,9 +258,14 @@ async fn current_gh_user(host: &str) -> Result<String> {
 /// or the PR, so two Minions never push to the same branch.
 fn check_no_live_minion(existing: &[(String, MinionInfo)], issue_num: u64, pr: u64) -> Result<()> {
     let pr_str = pr.to_string();
+    // An entry for this same PR blocks unless it failed: a Completed one
+    // (e.g. its monitor timed out) can be resumed, and the PR is still open
+    // or adopt would have refused it. Other entries for the issue block only
+    // while non-terminal.
     if let Some((id, info)) = existing.iter().find(|(_, info)| {
-        !info.orchestration_phase.is_terminal()
-            && (info.issue == Some(issue_num) || info.pr.as_deref() == Some(pr_str.as_str()))
+        let same_pr = info.pr.as_deref() == Some(pr_str.as_str());
+        (same_pr && info.orchestration_phase != OrchestrationPhase::Failed)
+            || (!info.orchestration_phase.is_terminal() && info.issue == Some(issue_num))
     }) {
         let state = if info.is_running() {
             "running"
@@ -436,14 +445,20 @@ pub(crate) async fn handle_adopt(pr_arg: &str, opts: AdoptOptions) -> Result<i32
         log::warn!("⚠️  Could not sync with origin/{}: {:#}", branch, e);
     }
     let upstream = format!("origin/{}", branch);
-    if let Err(e) = tokio::process::Command::new("git")
+    match tokio::process::Command::new("git")
         .arg("-C")
         .arg(&checkout_path)
         .args(["branch", "--set-upstream-to", &upstream])
         .output()
         .await
     {
-        log::warn!("⚠️  Could not set upstream to {}: {}", upstream, e);
+        Ok(out) if out.status.success() => {}
+        Ok(out) => log::warn!(
+            "⚠️  Could not set upstream to {}: {}",
+            upstream,
+            String::from_utf8_lossy(&out.stderr).trim()
+        ),
+        Err(e) => log::warn!("⚠️  Could not set upstream to {}: {}", upstream, e),
     }
 
     println!("📂 Workspace created at: {}", checkout_path.display());
@@ -887,11 +902,26 @@ mod tests {
     }
 
     #[test]
-    fn test_terminal_minion_does_not_block_adopt() {
+    fn test_completed_minion_on_same_pr_blocks_adopt() {
         let existing = vec![(
             "M001".to_string(),
             registry_entry(Some(3), Some("7"), OrchestrationPhase::Completed),
         )];
+        assert!(check_no_live_minion(&existing, 3, 7).is_err());
+    }
+
+    #[test]
+    fn test_terminal_minion_does_not_block_adopt() {
+        let existing = vec![
+            (
+                "M001".to_string(),
+                registry_entry(Some(3), Some("7"), OrchestrationPhase::Failed),
+            ),
+            (
+                "M002".to_string(),
+                registry_entry(Some(3), Some("5"), OrchestrationPhase::Completed),
+            ),
+        ];
         assert!(check_no_live_minion(&existing, 3, 7).is_ok());
     }
 

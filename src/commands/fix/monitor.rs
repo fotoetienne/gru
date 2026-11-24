@@ -174,9 +174,9 @@ async fn auto_rebase_pr(checkout_path: &Path, minion_dir: &Path) -> Result<AutoR
         }
         crate::git::RemoteSync::UpToDate | crate::git::RemoteSync::NoRemoteBranch => {}
     }
-    // The remote tip this rebase starts from. The force-push at the end only
-    // replaces this exact commit (see `force_push_rebased`).
-    let rebased_from = crate::git::remote_tracking_sha(checkout_path, &pr_branch).await?;
+    // What gets rebased. The force-push at the end refuses if the remote has
+    // anything not in here (see `force_push_rebased`).
+    let pre_rebase_head = crate::git::head_sha(checkout_path).await?;
 
     // Detect the base branch first so we can fetch only what we need
     let base_branch = detect_base_branch(checkout_path).await?;
@@ -207,8 +207,7 @@ async fn auto_rebase_pr(checkout_path: &Path, minion_dir: &Path) -> Result<AutoR
                 if commit_count == 1 { "" } else { "s" }
             );
             log::info!("Auto force-pushing rebased branch (autonomous mode, --force-with-lease)");
-            crate::git::force_push_rebased(checkout_path, &pr_branch, rebased_from.as_deref())
-                .await?;
+            crate::git::force_push_rebased(checkout_path, &pr_branch, &pre_rebase_head).await?;
             println!("🚀 Force-pushed rebased branch");
             Ok(AutoRebaseResult::RebasedAndPushed)
         }
@@ -305,8 +304,7 @@ async fn auto_rebase_pr(checkout_path: &Path, minion_dir: &Path) -> Result<AutoR
                 // The rebase agent is told not to push; Gru pushes, after
                 // checking nobody else pushed to the branch during the rebase.
                 log::info!("Auto force-pushing after conflict resolution (autonomous mode, --force-with-lease)");
-                crate::git::force_push_rebased(checkout_path, &pr_branch, rebased_from.as_deref())
-                    .await?;
+                crate::git::force_push_rebased(checkout_path, &pr_branch, &pre_rebase_head).await?;
                 println!("🚀 Force-pushed rebased branch");
                 Ok(AutoRebaseResult::RebasedAndPushed)
             } else {
