@@ -1029,6 +1029,52 @@ async fn try_judged_merge(
     ctx: &MonitorContext<'_>,
     pending: merge_judge::PendingMerge,
 ) -> bool {
+    // pr_monitor's ReadyToMerge came from its own poll, which doesn't name
+    // a commit. Re-check readiness now and require it to be for the head
+    // the judge approved, so a push in between can't merge unchecked.
+    let pr_num: u64 = match ctx.pr_number.parse() {
+        Ok(n) => n,
+        Err(_) => return false,
+    };
+    match crate::merge_readiness::check_merge_readiness_with_head(
+        &ctx.issue_ctx.host,
+        &ctx.issue_ctx.owner,
+        &ctx.issue_ctx.repo,
+        pr_num,
+    )
+    .await
+    {
+        Ok((readiness, head)) if head == pending.head_sha && readiness.is_ready() => {}
+        Ok((_, head)) if head != pending.head_sha => {
+            // Stale approval; the new head gets judged on its own.
+            log::info!(
+                "PR #{} head moved from {} to {} before merge; dropping approval",
+                ctx.pr_number,
+                pending.head_sha,
+                head
+            );
+            state.judge_state.clear_pending_merge();
+            return false;
+        }
+        Ok((readiness, _)) => {
+            println!(
+                "⏳ PR #{} not ready to merge yet ({}); will retry",
+                ctx.pr_number, readiness
+            );
+            state.judge_state.set_pending_merge(pending);
+            return false;
+        }
+        Err(e) => {
+            log::warn!(
+                "⚠️  Readiness re-check failed for PR #{}: {:#}",
+                ctx.pr_number,
+                e
+            );
+            state.judge_state.set_pending_merge(pending);
+            return false;
+        }
+    }
+
     match merge_judge::merge_pr(
         &ctx.issue_ctx.host,
         &ctx.issue_ctx.owner,
