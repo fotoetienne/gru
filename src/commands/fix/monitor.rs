@@ -1046,14 +1046,17 @@ async fn try_judged_merge(
     {
         Ok((readiness, head)) if head == pending.head_sha && readiness.is_ready() => {}
         Ok((_, head)) if head != pending.head_sha => {
-            // Stale approval; the new head gets judged on its own.
+            // Either readiness is briefly cached at an older head, or the PR
+            // really moved. Keep the SHA-pinned approval: if the head did
+            // move, the next snapshot changes the fingerprint and the new
+            // evaluation replaces it; the merge itself stays pinned.
             log::info!(
-                "PR #{} head moved from {} to {} before merge; dropping approval",
+                "PR #{} readiness is for {}, approval is for {}; will re-check",
                 ctx.pr_number,
-                pending.head_sha,
-                head
+                head,
+                pending.head_sha
             );
-            state.judge_state.clear_pending_merge();
+            state.judge_state.set_pending_merge(pending);
             return false;
         }
         Ok((readiness, _)) => {
