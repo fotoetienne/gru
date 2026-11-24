@@ -3036,13 +3036,14 @@ async fn sweep_policy_allows_merge(
             return None;
         }
     };
+    let mut changed_files = None;
     if policy.is_none() {
         match merge_judge::fetch_pr_changed_files(host, owner, repo, pr_number).await {
             Ok(files) if !sweep_needs_judge(policy.as_ref(), &files) => {
                 return Some(listed_head_sha.to_string())
             }
             // The PR changes a policy file: the judge escalates it below.
-            Ok(_) => {}
+            Ok(files) => changed_files = Some(files),
             Err(e) => {
                 log::warn!(
                     "⚠️  Auto-merge sweep: could not list changed files for PR #{} in {}/{}: {:#}",
@@ -3087,6 +3088,11 @@ async fn sweep_policy_allows_merge(
         workdir.path(),
         judge_state,
         config.merge.confidence_threshold.clamp(1, 10),
+        // Reuse what was fetched above instead of fetching it again.
+        merge_judge::PolicyInputs {
+            changed_files,
+            policy: Some(policy),
+        },
     )
     .await
     {

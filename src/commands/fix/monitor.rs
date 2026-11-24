@@ -803,6 +803,7 @@ async fn handle_ready_to_merge(
         &ctx.wt_ctx.checkout_path,
         &mut state.judge_state,
         state.confidence_threshold,
+        merge_judge::PolicyInputs::default(),
     )
     .await
     {
@@ -934,7 +935,38 @@ async fn handle_ready_to_merge(
         }
         Err(e) => {
             log::warn!("⚠️  Merge judge failed: {:#}", e);
-            if state.judge_state.should_escalate_on_failure() {
+            if state.judge_state.should_escalate_on_failure()
+                && state.policy_mode == PolicyMode::Observe
+                && merge_judge::is_policy_load_error(&e)
+            {
+                // Observe mode is the trial mode: a malformed policy must not
+                // label PRs. Report it in an observe comment instead.
+                println!(
+                    "👁️  Observe mode: merge policy could not be read for PR #{} — reporting without labeling",
+                    ctx.pr_number
+                );
+                let response = JudgeResponse {
+                    confidence: 0,
+                    action: JudgeAction::Escalate,
+                    reasoning: format!(
+                        "The repo merge policy could not be read (last error: {e:#}). \
+                         In enforce mode this PR would be escalated for human review."
+                    ),
+                    policy_rule: None,
+                    policy_applied: true,
+                };
+                merge_judge::post_observe_verdict(
+                    &ctx.issue_ctx.host,
+                    &ctx.issue_ctx.owner,
+                    &ctx.issue_ctx.repo,
+                    ctx.pr_number,
+                    &mut state.judge_state,
+                    &response,
+                    Some(&ctx.wt_ctx.minion_id),
+                )
+                .await;
+                state.judge_state.mark_failure_escalated();
+            } else if state.judge_state.should_escalate_on_failure() {
                 log::warn!(
                     "Judge failed {} consecutive times — escalating for human review",
                     state.judge_state.consecutive_failures()
