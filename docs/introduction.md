@@ -50,8 +50,8 @@ For a full walkthrough, see [Getting Started](GETTING_STARTED.md).
 5. After committing, a code-reviewer subagent checks for correctness, security, and convention issues before the PR is created
 6. Gru opens a PR, watches CI, and feeds failures back to the agent for auto-fix (up to 2 attempts before escalating)
 7. Review comments and merge conflicts wake the Minion to respond or rebase
-8. With `gru:auto-merge`, an LLM merge judge decides whether the PR is safe to merge; otherwise it waits for you
-9. Labels (`gru:in-progress` → `gru:done` / `gru:failed` / `gru:blocked`) track state on GitHub
+8. With `gru:auto-merge`, the monitoring Minion asks an LLM merge judge whether the PR is safe to merge; otherwise it waits for you
+9. Labels track state on GitHub: `gru:in-progress` while the Minion works, `gru:done` once the PR is open, `gru:failed` or `gru:blocked` when it needs help
 
 To run one issue in the foreground without the Lab, use `gru do 42`.
 

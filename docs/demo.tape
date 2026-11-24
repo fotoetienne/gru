@@ -1,7 +1,7 @@
 # Gru demo recording
 # Run with: just demo (from repo root)
 # Requires: vhs (brew install vhs)
-# Regenerates docs/demo.gif: file two chained gru:todo issues → gru lab picks
+# Regenerates docs/demo.gif: file two gru:todo issues, mark #102 blocked by #101 → gru lab picks
 # up #101, then #102 once its blocker merges → gru status
 
 Output docs/demo.gif
@@ -30,10 +30,19 @@ Sleep 400ms
 Enter
 Sleep 1.8s
 
-Type `gh issue create -l gru:todo -t "Show limits in CLI" -b "**Blocked by:** #101"`
+Type `gh issue create -l gru:todo -t "Show limits in CLI"`
 Sleep 400ms
 Enter
-Sleep 2s
+Sleep 1.8s
+
+Type `ID=$(gh api repos/owner/myapp/issues/101 -q .id)`
+Sleep 300ms
+Enter
+Sleep 500ms
+Type `gh api repos/owner/myapp/issues/102/dependencies/blocked_by -F issue_id=$ID --silent`
+Sleep 400ms
+Enter
+Sleep 1.5s
 
 Type "clear" Enter
 Sleep 300ms

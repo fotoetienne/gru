@@ -54,9 +54,9 @@ max_slots = 4            # default is 2
 
 While it runs, the Lab:
 
-- **Respects dependencies.** An issue with open blockers is skipped until they close. Blockers come from GitHub's native issue dependencies, or from a `**Blocked by:** #101, #102` line in the issue body.
+- **Respects dependencies.** An issue with open blockers is skipped until they close. Blockers come from GitHub's native issue dependencies (see [Filing issues](#filing-issues-from-an-llm-session) for the fallback when that API isn't available).
 - **Keeps PRs moving.** Minions watch CI and feed failures back to the agent (up to 2 fix attempts). New reviews or merge conflicts wake the Minion up to respond or rebase.
-- **Merges when told to.** Add `gru:auto-merge` to an issue and Gru merges its PR once checks pass and an LLM merge judge clears it. If the judge isn't confident, the PR gets `gru:needs-human-review` instead.
+- **Merges when told to.** Put `gru:auto-merge` on the issue before the Minion opens its PR, or on the PR itself afterwards. While a Minion is monitoring the PR, it merges once checks pass and an LLM merge judge clears it; if the judge isn't confident, the PR gets `gru:needs-human-review` instead. If no Minion is monitoring the PR anymore, the Lab's periodic sweep queues the merge on readiness checks alone, without the judge.
 - **Survives restarts.** Minions keep running if the Lab stops. On startup the Lab resumes interrupted Minions and resets issues left orphaned in `gru:in-progress`.
 - **Escalates instead of looping.** After repeated failures an issue is labeled `gru:blocked` and left for a human.
 
@@ -66,7 +66,7 @@ While it runs, the Lab:
 |---|---|
 | `gru:todo` | Ready for a Minion to pick up |
 | `gru:in-progress` | Claimed by a Minion |
-| `gru:done` | Work complete |
+| `gru:done` | PR opened; the Minion keeps monitoring it |
 | `gru:failed` | The Minion hit a failure |
 | `gru:blocked` | Needs a human |
 | `gru:auto-merge` | Merge the PR automatically when it's ready |
@@ -79,7 +79,14 @@ Any agent that can run `gh` can feed the Lab. Something like this works well at 
 
 > File this as three GitHub issues in owner/repo, labeled `gru:todo`. The API change goes first; the CLI and docs issues are each blocked by it.
 
-The agent can set the dependency through GitHub's blocked-by API, or by putting `**Blocked by:** #101` on a single line in the issue body. `#` prefixes are required, and cross-repo references are ignored.
+The agent should set the dependency with GitHub's native blocked-by relationship. With `gh`, that takes the blocker's internal issue ID rather than its number:
+
+```bash
+gh api repos/owner/repo/issues/102/dependencies/blocked_by \
+  -F issue_id="$(gh api repos/owner/repo/issues/101 --jq .id)"
+```
+
+On GitHub Enterprise Server versions without the dependencies API, Gru falls back to a `**Blocked by:** #101, #102` line in the issue body (one line, `#` prefixes required, cross-repo references ignored). When the native API is available, the body line is ignored. On the fallback path Gru doesn't check whether the listed issues are closed, so remove the line once the blockers are done.
 
 ## 👀 Watching Minions
 
@@ -251,14 +258,14 @@ Key options: watched repos, polling intervals, concurrency slots, default agent 
 5. After committing, the agent spawns a `code-reviewer` subagent to check for correctness, security, conventions, and test coverage, and addresses what it finds before the PR is created
 6. Gru opens a PR, watches CI, and feeds failures back to the agent for auto-fix (up to 2 attempts before escalating)
 7. Review comments and merge conflicts wake the Minion to respond or rebase
-8. With `gru:auto-merge`, an LLM merge judge decides whether the PR is safe to merge; otherwise it waits for you
-9. Labels (`gru:in-progress` → `gru:done` / `gru:failed` / `gru:blocked`) track state on GitHub, which is the only source of truth
+8. With `gru:auto-merge`, the monitoring Minion asks an LLM merge judge whether the PR is safe to merge; otherwise it waits for you
+9. Labels track state on GitHub, which is the only source of truth: `gru:in-progress` while the Minion works, `gru:done` once the PR is open, `gru:failed` or `gru:blocked` when it needs help
 
 ## 🗺️ Roadmap
 
 V1 is feature-complete: Lab mode, autonomous issue fixing, worktree isolation, issue dependencies, CI monitoring, PR lifecycle management, multi-agent backends, and Minion management.
 
-Future plans include multi-Lab coordination (V2), a web UI (V3), and multi-repo orchestration (V5). See [docs/DESIGN.md](docs/DESIGN.md) for the full architecture vision.
+Future plans include multi-Lab coordination (V2), a web UI (V3), RAG embeddings and learned prioritization (V4), and multi-repo orchestration (V5). See [docs/DESIGN.md](docs/DESIGN.md) for the full architecture vision.
 
 ## 🤝 Contributing
 

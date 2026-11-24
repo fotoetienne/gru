@@ -4,6 +4,7 @@
 # a blocked issue being picked up after its blocker merges.
 #
 # Usage: demo-script.sh gh issue create ...
+#        demo-script.sh gh api ...
 #        demo-script.sh gru lab
 #        demo-script.sh gru status
 
@@ -28,6 +29,15 @@ gh_issue_create() {
 }
 
 # Mirrors tprintln! in src/commands/lab.rs: blank lines carry no timestamp.
+gh_api() {
+    # Nested lookup of the blocker's internal ID, or a silent POST of the
+    # blocked-by relationship.
+    case " $* " in
+        *" --silent "*) sleep 0.6 ;;
+        *) echo "3047751961" ;;
+    esac
+}
+
 lab_line() {
     if [ -z "$2" ]; then echo ""; else echo -e "[$1] $2"; fi
 }
@@ -74,6 +84,7 @@ gru_status() {
 
 case "$1 $2" in
     "gh issue") gh_issue_create ;;
+    "gh api") shift; gh_api "$@" ;;
     "gru lab") gru_lab ;;
     "gru status") gru_status ;;
     *) echo -e "${DIM}demo-script: unsupported command: $*${RESET}" >&2; exit 1 ;;
