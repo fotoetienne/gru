@@ -282,7 +282,10 @@ pub(crate) async fn handle_lab(
     let mut last_auto_merge_sweep: Option<Instant> = None;
     // Merge-judge state for orphaned PRs in repos with a MERGE_POLICY.md,
     // kept across sweeps so the judge is only re-invoked on PR state changes.
-    let mut sweep_judge_states: HashMap<String, JudgeState> = HashMap::new();
+    // The sweep runs as a background task (it may wait on LLM judge runs),
+    // so the state is handed to the task and returned when it finishes.
+    let mut sweep_judge_states: Option<HashMap<String, JudgeState>> = Some(HashMap::new());
+    let mut sweep_task: Option<tokio::task::JoinHandle<HashMap<String, JudgeState>>> = None;
 
     if no_resume {
         tprintln!("⏭️  Auto-resume disabled (--no-resume)");
@@ -472,7 +475,29 @@ pub(crate) async fn handle_lab(
                     }
                     Some(t) if t.elapsed() >= AUTO_MERGE_SWEEP_INTERVAL => {
                         last_auto_merge_sweep = Some(Instant::now());
-                        sweep_orphaned_auto_merge_prs(&config, &mut sweep_judge_states).await;
+                        // Run the sweep off the scheduling loop so a slow
+                        // judge can't stall dispatch, reaping, or shutdown.
+                        // Skip this round if the previous sweep is still busy.
+                        if sweep_task.as_ref().is_some_and(|t| t.is_finished()) {
+                            let task = sweep_task.take().expect("checked above");
+                            sweep_judge_states = Some(task.await.unwrap_or_else(|e| {
+                                log::warn!("⚠️  Auto-merge sweep task failed: {e}");
+                                HashMap::new()
+                            }));
+                        }
+                        match sweep_judge_states.take() {
+                            Some(mut states) => {
+                                let sweep_config = config.clone();
+                                sweep_task = Some(tokio::spawn(async move {
+                                    sweep_orphaned_auto_merge_prs(&sweep_config, &mut states)
+                                        .await;
+                                    states
+                                }));
+                            }
+                            None => log::debug!(
+                                "Auto-merge sweep: previous sweep still running, skipping"
+                            ),
+                        }
                     }
                     Some(_) => {}
                 }
@@ -486,6 +511,12 @@ pub(crate) async fn handle_lab(
                 }
             }
         }
+    }
+
+    // Stop an in-flight auto-merge sweep. Aborting drops any running judge
+    // subprocess, which is spawned with kill_on_drop.
+    if let Some(task) = sweep_task.take() {
+        task.abort();
     }
 
     Ok(0)
@@ -2853,12 +2884,12 @@ async fn sweep_orphaned_auto_merge_prs(
         let full_repo = github::repo_slug(&owner, &repo);
 
         // Drop judge state for PRs that are no longer open auto-merge PRs.
-        let repo_key_prefix = format!("{full_repo}#");
+        let repo_key_prefix = format!("{host}/{full_repo}#");
         judge_states.retain(|key, _| {
             !key.starts_with(&repo_key_prefix)
                 || prs
                     .iter()
-                    .any(|pr| *key == sweep_judge_key(&full_repo, pr.number))
+                    .any(|pr| *key == sweep_judge_key(&host, &full_repo, pr.number))
         });
 
         for pr in &prs {
@@ -2915,7 +2946,7 @@ async fn sweep_orphaned_auto_merge_prs(
             }
 
             let pr_num_str = pr.number.to_string();
-            let judge_key = sweep_judge_key(&full_repo, pr.number);
+            let judge_key = sweep_judge_key(&host, &full_repo, pr.number);
             let judge_state = judge_states.entry(judge_key.clone()).or_default();
             let Some(merge_sha) = sweep_policy_allows_merge(
                 config,
@@ -2988,8 +3019,10 @@ async fn sweep_orphaned_auto_merge_prs(
     }
 }
 
-fn sweep_judge_key(full_repo: &str, pr_number: u64) -> String {
-    format!("{full_repo}#{pr_number}")
+/// Key for per-PR sweeper judge state. Includes the host because one Lab can
+/// watch the same `owner/repo` on several GitHub hosts.
+fn sweep_judge_key(host: &str, full_repo: &str, pr_number: u64) -> String {
+    format!("{host}/{full_repo}#{pr_number}")
 }
 
 /// Decide whether the sweeper may queue a merge for a deterministically
@@ -3097,9 +3130,40 @@ async fn sweep_policy_allows_merge(
     .await
     {
         Ok(response) => match classify_sweep_verdict(response.as_ref(), observe) {
-            // Pin to the head the judge actually evaluated.
-            SweepVerdict::Merge => judge_state.last_head_sha().map(str::to_string),
-            SweepVerdict::Skip => None,
+            SweepVerdict::Merge => {
+                // The readiness checks ran against the head listed at the
+                // start of this sweep. Only merge if the judge evaluated that
+                // same head; otherwise the new head never passed readiness.
+                if judge_state.last_head_sha() == Some(listed_head_sha) {
+                    Some(listed_head_sha.to_string())
+                } else {
+                    log::info!(
+                        "Auto-merge sweep: PR #{} in {}/{} moved to a new head during the sweep; re-checking next sweep",
+                        pr_number,
+                        owner,
+                        repo
+                    );
+                    // Forget the verdict so the next sweep judges again
+                    // after re-running readiness on the new head.
+                    *judge_state = JudgeState::default();
+                    None
+                }
+            }
+            SweepVerdict::Skip => {
+                if response.is_none() {
+                    // Deliver an observe verdict whose earlier post failed.
+                    merge_judge::retry_pending_observe(
+                        host,
+                        owner,
+                        repo,
+                        pr_number,
+                        judge_state,
+                        minion_id,
+                    )
+                    .await;
+                }
+                None
+            }
             SweepVerdict::Observe => {
                 if let Some(response) = &response {
                     merge_judge::post_observe_verdict(
@@ -3145,7 +3209,32 @@ async fn sweep_policy_allows_merge(
                 repo,
                 e
             );
-            if judge_state.should_escalate_on_failure() {
+            if judge_state.should_escalate_on_failure() && observe && judge_state.policy_may_apply()
+            {
+                // Observe mode never labels: report the failure instead.
+                let response = JudgeResponse {
+                    confidence: 0,
+                    action: JudgeAction::Escalate,
+                    reasoning: format!(
+                        "The merge judge failed {} consecutive times (last error: {e:#}). \
+                         In enforce mode this PR would be escalated for human review.",
+                        judge_state.consecutive_failures()
+                    ),
+                    policy_rule: None,
+                    policy_applied: true,
+                };
+                merge_judge::post_observe_verdict(
+                    host,
+                    owner,
+                    repo,
+                    pr_number,
+                    judge_state,
+                    &response,
+                    minion_id,
+                )
+                .await;
+                judge_state.mark_failure_escalated();
+            } else if judge_state.should_escalate_on_failure() {
                 let response = JudgeResponse {
                     confidence: 0,
                     action: JudgeAction::Escalate,
@@ -3385,7 +3474,14 @@ mod tests {
 
     #[test]
     fn test_sweep_judge_key() {
-        assert_eq!(sweep_judge_key("o/r", 12), "o/r#12");
+        assert_eq!(
+            sweep_judge_key("github.com", "o/r", 12),
+            "github.com/o/r#12"
+        );
+        assert_ne!(
+            sweep_judge_key("github.com", "o/r", 12),
+            sweep_judge_key("ghe.corp.com", "o/r", 12)
+        );
     }
 
     #[tokio::test]

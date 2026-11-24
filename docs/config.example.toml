@@ -164,9 +164,9 @@
 #   "observe"           - post the verdict the judge would have reached (once
 #                         per head SHA) without merging or labeling. Gru does
 #                         not auto-merge PRs in a repo with a policy while in
-#                         this mode; merge them by hand. A policy file Gru
-#                         can't read is reported in a comment instead of
-#                         labeling PRs.
+#                         this mode; merge them by hand. Judge failures,
+#                         including a policy file Gru can't read, are
+#                         reported in a comment instead of labeling PRs.
 # Repos without a MERGE_POLICY.md are unaffected.
 # policy_mode = "enforce"
 

@@ -771,7 +771,12 @@ async fn handle_ready_to_merge(
 
     // If a previous failure escalation failed to apply the label, retry now
     // before invoking the judge (which would skip at the failure cap).
-    if state.judge_state.should_escalate_on_failure() && !state.judge_state.label_was_applied() {
+    let observing =
+        state.policy_mode == PolicyMode::Observe && state.judge_state.policy_may_apply();
+    if state.judge_state.should_escalate_on_failure()
+        && !state.judge_state.label_was_applied()
+        && !observing
+    {
         log::info!("Retrying failed escalation label application...");
         match merge_judge::add_needs_human_review_label(
             &ctx.issue_ctx.host,
@@ -932,25 +937,37 @@ async fn handle_ready_to_merge(
         Ok(None) => {
             // Judge invocation skipped (same state, no timer expired).
             log::debug!("Judge invocation skipped — PR state unchanged");
+            // Deliver an observe verdict whose earlier post failed.
+            merge_judge::retry_pending_observe(
+                &ctx.issue_ctx.host,
+                &ctx.issue_ctx.owner,
+                &ctx.issue_ctx.repo,
+                ctx.pr_number,
+                &mut state.judge_state,
+                Some(&ctx.wt_ctx.minion_id),
+            )
+            .await;
         }
         Err(e) => {
             log::warn!("⚠️  Merge judge failed: {:#}", e);
             if state.judge_state.should_escalate_on_failure()
                 && state.policy_mode == PolicyMode::Observe
-                && merge_judge::is_policy_load_error(&e)
+                && state.judge_state.policy_may_apply()
             {
-                // Observe mode is the trial mode: a malformed policy must not
-                // label PRs. Report it in an observe comment instead.
+                // Observe mode is the trial mode: judge failures in a repo
+                // where a policy applies (or may) must not label PRs. Report
+                // in an observe comment instead; merging stays blocked.
                 println!(
-                    "👁️  Observe mode: merge policy could not be read for PR #{} — reporting without labeling",
+                    "👁️  Observe mode: merge judge failed for PR #{} — reporting without labeling",
                     ctx.pr_number
                 );
                 let response = JudgeResponse {
                     confidence: 0,
                     action: JudgeAction::Escalate,
                     reasoning: format!(
-                        "The repo merge policy could not be read (last error: {e:#}). \
-                         In enforce mode this PR would be escalated for human review."
+                        "The merge judge failed {} consecutive times (last error: {e:#}). \
+                         In enforce mode this PR would be escalated for human review.",
+                        state.judge_state.consecutive_failures()
                     ),
                     policy_rule: None,
                     policy_applied: true,
