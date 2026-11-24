@@ -162,6 +162,19 @@ pub(crate) struct JudgeState {
     /// Observe-mode verdict whose comment failed to post; retried on later
     /// polls even though the judge itself won't re-run.
     pending_observe: Option<JudgeResponse>,
+    /// Merge the judge approved but that GitHub hasn't accepted yet (e.g.
+    /// a branch rule still pending). Retried while the PR state is
+    /// unchanged; any new evaluation clears it.
+    pending_merge: Option<PendingMerge>,
+}
+
+/// A judge-approved merge awaiting a successful merge call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PendingMerge {
+    /// Head SHA the judge approved; the merge is pinned to it.
+    pub(crate) head_sha: String,
+    /// Merge immediately instead of enabling auto-merge. See [`merge_pr`].
+    pub(crate) direct: bool,
 }
 
 impl Default for JudgeState {
@@ -184,7 +197,23 @@ impl JudgeState {
             own_comments: 0,
             policy_applies: None,
             pending_observe: None,
+            pending_merge: None,
         }
+    }
+
+    /// Remember an approved merge that GitHub didn't accept yet.
+    pub(crate) fn set_pending_merge(&mut self, pending: PendingMerge) {
+        self.pending_merge = Some(pending);
+    }
+
+    /// The approved merge to retry, if any. Only valid while the PR state
+    /// matches the evaluated one; new evaluations clear it.
+    pub(crate) fn pending_merge(&self) -> Option<&PendingMerge> {
+        self.pending_merge.as_ref()
+    }
+
+    pub(crate) fn clear_pending_merge(&mut self) {
+        self.pending_merge = None;
     }
 
     /// True unless the last policy check found the repo has no policy.
@@ -265,6 +294,7 @@ impl JudgeState {
         self.last_fingerprint = Some(fingerprint);
         self.own_comments = 0;
         self.pending_observe = None;
+        self.pending_merge = None;
     }
 
     /// Returns the number of consecutive failures on the current fingerprint.
@@ -314,6 +344,7 @@ impl JudgeState {
         self.last_fingerprint = Some(fingerprint);
         self.own_comments = 0;
         self.pending_observe = None;
+        self.pending_merge = None;
 
         match &response.action {
             JudgeAction::Wait(duration) => {
@@ -1739,6 +1770,61 @@ pub(crate) async fn retry_pending_observe(
     }
 }
 
+/// Build `gh pr merge` arguments for a judge-approved merge.
+///
+/// `direct` merges now instead of enabling auto-merge. Use it when a merge
+/// policy applies: `--match-head-commit` only checks the head at call time,
+/// and a pending auto-merge would also merge later pushes the judge never
+/// saw. A direct merge either lands the approved head or fails, and the
+/// caller retries while the head is unchanged.
+fn merge_command_args(
+    pr_number: &str,
+    repo_full: &str,
+    head_sha: &str,
+    direct: bool,
+) -> Vec<String> {
+    let mut args: Vec<String> = vec![
+        "pr".into(),
+        "merge".into(),
+        pr_number.into(),
+        "--squash".into(),
+    ];
+    if !direct {
+        args.push("--auto".into());
+    }
+    args.extend([
+        "--match-head-commit".into(),
+        head_sha.into(),
+        "-R".into(),
+        repo_full.into(),
+    ]);
+    args
+}
+
+/// Merge (or queue auto-merge for) a judge-approved PR, pinned to `head_sha`.
+pub(crate) async fn merge_pr(
+    host: &str,
+    owner: &str,
+    repo: &str,
+    pr_number: &str,
+    pending: &PendingMerge,
+) -> Result<()> {
+    let repo_full = github::repo_slug(owner, repo);
+    let args = merge_command_args(pr_number, &repo_full, &pending.head_sha, pending.direct);
+    let output = github::gh_cli_command(host)
+        .args(&args)
+        .output()
+        .await
+        .context("Failed to run gh pr merge")?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "gh pr merge failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
 /// Extract the Minion ID from a Minion branch name
 /// (`minion/issue-42-M001` → `M001`).
 pub(crate) fn minion_id_from_branch(branch: &str) -> Option<&str> {
@@ -2953,5 +3039,57 @@ That's my verdict."#;
         // A new evaluation supersedes it.
         state.record_response(fp("def", 1), &resp);
         assert!(state.pending_observe.is_none());
+    }
+
+    #[test]
+    fn test_merge_command_args_direct_has_no_auto() {
+        let args = merge_command_args("7", "o/r", "abc", true);
+        assert!(!args.contains(&"--auto".to_string()));
+        assert_eq!(
+            args,
+            vec![
+                "pr",
+                "merge",
+                "7",
+                "--squash",
+                "--match-head-commit",
+                "abc",
+                "-R",
+                "o/r"
+            ]
+        );
+    }
+
+    #[test]
+    fn test_merge_command_args_auto_is_pinned() {
+        let args = merge_command_args("7", "o/r", "abc", false);
+        assert!(args.contains(&"--auto".to_string()));
+        let i = args
+            .iter()
+            .position(|a| a == "--match-head-commit")
+            .unwrap();
+        assert_eq!(args[i + 1], "abc");
+    }
+
+    #[test]
+    fn test_pending_merge_cleared_by_new_evaluation() {
+        let mut state = JudgeState::new();
+        let resp = policy_change_escalation("MERGE_POLICY.md");
+        state.record_response(fp("abc", 1), &resp);
+        state.set_pending_merge(PendingMerge {
+            head_sha: "abc".to_string(),
+            direct: true,
+        });
+        // Unchanged state: the judge is skipped and the merge stays pending.
+        assert!(!state.should_invoke(&fp("abc", 1)));
+        assert!(state.pending_merge().is_some());
+        state.record_response(fp("def", 1), &resp);
+        assert!(state.pending_merge().is_none());
+        state.set_pending_merge(PendingMerge {
+            head_sha: "def".to_string(),
+            direct: false,
+        });
+        state.record_failure(fp("ghi", 1));
+        assert!(state.pending_merge().is_none());
     }
 }

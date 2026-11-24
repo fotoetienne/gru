@@ -836,49 +836,17 @@ async fn handle_ready_to_merge(
                     "🚀 Judge approved merge for PR #{} (confidence: {}/10)",
                     ctx.pr_number, response.confidence
                 );
-                let repo_full = github::repo_slug(&ctx.issue_ctx.owner, &ctx.issue_ctx.repo);
-                let mut merge_args = vec![
-                    "pr",
-                    "merge",
-                    ctx.pr_number,
-                    "--squash",
-                    "--auto",
-                    "-R",
-                    &repo_full,
-                ];
-                // Pin to the head the judge evaluated so a later push can't
-                // ride along on this verdict.
-                if let Some(sha) = state.judge_state.last_head_sha() {
-                    merge_args.extend(["--match-head-commit", sha]);
-                }
-                match crate::github::gh_cli_command(&ctx.issue_ctx.host)
-                    .args(&merge_args)
-                    .output()
-                    .await
-                {
-                    Ok(output) if output.status.success() => {
-                        println!("✅ Auto-merge queued for PR #{}!", ctx.pr_number);
-                        println!(
-                            "🎉 Issue {} is complete!",
-                            ctx.issue_ctx
-                                .issue_num
-                                .map_or("?".to_string(), |n| n.to_string())
-                        );
-                        return LoopAction::Break;
-                    }
-                    Ok(output) => {
-                        let stderr = String::from_utf8_lossy(&output.stderr);
-                        log::warn!(
-                            "⚠️  Auto-merge failed for PR #{}: {}",
-                            ctx.pr_number,
-                            stderr.trim()
-                        );
-                        println!("🔄 Will retry on next poll cycle...");
-                    }
-                    Err(e) => {
-                        log::warn!("⚠️  Failed to run merge command: {}", e);
-                        println!("🔄 Will retry on next poll cycle...");
-                    }
+                let Some(head_sha) = state.judge_state.last_head_sha().map(str::to_string) else {
+                    return LoopAction::Continue;
+                };
+                // Policy-governed PRs merge directly, never via a pending
+                // auto-merge that would also take later, unjudged pushes.
+                let pending = merge_judge::PendingMerge {
+                    head_sha,
+                    direct: response.policy_applied,
+                };
+                if try_judged_merge(state, ctx, pending).await {
+                    return LoopAction::Break;
                 }
             }
             JudgeAction::Wait(duration) => {
@@ -937,6 +905,13 @@ async fn handle_ready_to_merge(
         Ok(None) => {
             // Judge invocation skipped (same state, no timer expired).
             log::debug!("Judge invocation skipped — PR state unchanged");
+            // Retry an approved merge GitHub didn't accept yet. The PR is
+            // unchanged, so the approval still covers this head.
+            if let Some(pending) = state.judge_state.pending_merge().cloned() {
+                if try_judged_merge(state, ctx, pending).await {
+                    return LoopAction::Break;
+                }
+            }
             // Deliver an observe verdict whose earlier post failed.
             merge_judge::retry_pending_observe(
                 &ctx.issue_ctx.host,
@@ -1044,6 +1019,46 @@ async fn handle_ready_to_merge(
         }
     }
     LoopAction::Continue
+}
+
+/// Merge a judge-approved PR. Returns true on success; on failure the merge
+/// is kept pending and retried on later polls while the PR is unchanged.
+async fn try_judged_merge(
+    state: &mut MonitorLoopState,
+    ctx: &MonitorContext<'_>,
+    pending: merge_judge::PendingMerge,
+) -> bool {
+    match merge_judge::merge_pr(
+        &ctx.issue_ctx.host,
+        &ctx.issue_ctx.owner,
+        &ctx.issue_ctx.repo,
+        ctx.pr_number,
+        &pending,
+    )
+    .await
+    {
+        Ok(()) => {
+            state.judge_state.clear_pending_merge();
+            if pending.direct {
+                println!("✅ Merged PR #{}!", ctx.pr_number);
+            } else {
+                println!("✅ Auto-merge queued for PR #{}!", ctx.pr_number);
+            }
+            println!(
+                "🎉 Issue {} is complete!",
+                ctx.issue_ctx
+                    .issue_num
+                    .map_or("?".to_string(), |n| n.to_string())
+            );
+            true
+        }
+        Err(e) => {
+            log::warn!("⚠️  Merge failed for PR #{}: {:#}", ctx.pr_number, e);
+            println!("🔄 Will retry on next poll cycle...");
+            state.judge_state.set_pending_merge(pending);
+            false
+        }
+    }
 }
 
 /// Apply the #867 idempotency filter to review feedback before invoking the

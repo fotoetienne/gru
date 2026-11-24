@@ -2948,7 +2948,7 @@ async fn sweep_orphaned_auto_merge_prs(
             let pr_num_str = pr.number.to_string();
             let judge_key = sweep_judge_key(&host, &full_repo, pr.number);
             let judge_state = judge_states.entry(judge_key.clone()).or_default();
-            let Some(merge_sha) = sweep_policy_allows_merge(
+            let Some(pending) = sweep_policy_allows_merge(
                 config,
                 &host,
                 &owner,
@@ -2964,55 +2964,44 @@ async fn sweep_orphaned_auto_merge_prs(
             };
 
             tprintln!(
-                "🔀 Auto-merge sweep: queueing merge for orphaned PR #{} in {}",
+                "🔀 Auto-merge sweep: {} orphaned PR #{} in {}",
+                if pending.direct {
+                    "merging"
+                } else {
+                    "queueing merge for"
+                },
                 pr.number,
                 repo_spec,
             );
 
-            match github::gh_cli_command(&host)
-                .args([
-                    "pr",
-                    "merge",
-                    &pr_num_str,
-                    "--squash",
-                    "--auto",
-                    // Pin to the checked head so a later push can't ride
-                    // along on an approval it never received.
-                    "--match-head-commit",
-                    &merge_sha,
-                    "-R",
-                    &full_repo,
-                ])
-                .output()
-                .await
-            {
-                Ok(output) if output.status.success() => {
+            match merge_judge::merge_pr(&host, &owner, &repo, &pr_num_str, &pending).await {
+                Ok(()) => {
+                    judge_state.clear_pending_merge();
                     tprintln!(
-                        "✅ Auto-merge queued for orphaned PR #{} in {}",
+                        "✅ {} orphaned PR #{} in {}",
+                        if pending.direct {
+                            "Merged"
+                        } else {
+                            "Auto-merge queued for"
+                        },
                         pr.number,
                         repo_spec,
                     );
-                }
-                Ok(output) => {
-                    let stderr = String::from_utf8_lossy(&output.stderr);
-                    log::warn!(
-                        "⚠️  Auto-merge sweep: merge command failed for PR #{} in {}: {}",
-                        pr.number,
-                        repo_spec,
-                        stderr.trim(),
-                    );
-                    // Forget the judge's verdict so the next sweep re-evaluates
-                    // instead of skipping an unchanged PR forever.
-                    judge_states.remove(&judge_key);
                 }
                 Err(e) => {
                     log::warn!(
-                        "⚠️  Auto-merge sweep: failed to run merge command for PR #{} in {}: {:#}",
+                        "⚠️  Auto-merge sweep: merge failed for PR #{} in {}: {:#}",
                         pr.number,
                         repo_spec,
                         e,
                     );
-                    judge_states.remove(&judge_key);
+                    if pending.direct {
+                        // Judge-approved: retry the merge on later sweeps
+                        // while the PR is unchanged, without re-judging.
+                        judge_state.set_pending_merge(pending);
+                    } else {
+                        judge_states.remove(&judge_key);
+                    }
                 }
             }
         }
@@ -3033,9 +3022,9 @@ fn sweep_judge_key(host: &str, full_repo: &str, pr_number: u64) -> String {
 ///   allows the merge; Escalate applies `gru:needs-human-review`; observe
 ///   mode posts the verdict and never merges.
 ///
-/// Returns the head SHA the merge must be pinned to, or `None` to skip the
-/// PR. Any lookup failure returns `None`: the sweeper never merges a PR
-/// whose policy it could not check.
+/// Returns the merge to perform (pinned to the checked head; direct when a
+/// policy applies), or `None` to skip the PR. Any lookup failure returns
+/// `None`: the sweeper never merges a PR whose policy it could not check.
 #[allow(clippy::too_many_arguments)]
 async fn sweep_policy_allows_merge(
     config: &LabConfig,
@@ -3046,7 +3035,7 @@ async fn sweep_policy_allows_merge(
     listed_head_sha: &str,
     minion_id: Option<&str>,
     judge_state: &mut JudgeState,
-) -> Option<String> {
+) -> Option<merge_judge::PendingMerge> {
     if listed_head_sha.is_empty() {
         log::warn!(
             "⚠️  Auto-merge sweep: no head SHA for PR #{} in {}/{}; skipping",
@@ -3073,7 +3062,10 @@ async fn sweep_policy_allows_merge(
     if policy.is_none() {
         match merge_judge::fetch_pr_changed_files(host, owner, repo, pr_number).await {
             Ok(files) if !sweep_needs_judge(policy.as_ref(), &files) => {
-                return Some(listed_head_sha.to_string())
+                return Some(merge_judge::PendingMerge {
+                    head_sha: listed_head_sha.to_string(),
+                    direct: false,
+                });
             }
             // The PR changes a policy file: the judge escalates it below.
             Ok(files) => changed_files = Some(files),
@@ -3138,7 +3130,11 @@ async fn sweep_policy_allows_merge(
                 // start of this sweep. Only merge if the judge evaluated that
                 // same head; otherwise the new head never passed readiness.
                 if judge_state.last_head_sha() == Some(listed_head_sha) {
-                    Some(listed_head_sha.to_string())
+                    Some(merge_judge::PendingMerge {
+                        head_sha: listed_head_sha.to_string(),
+                        // A pending auto-merge would also take later pushes.
+                        direct: response.as_ref().is_some_and(|r| r.policy_applied),
+                    })
                 } else {
                     log::info!(
                         "Auto-merge sweep: PR #{} in {}/{} moved to a new head during the sweep; re-checking next sweep",
@@ -3164,6 +3160,13 @@ async fn sweep_policy_allows_merge(
                         minion_id,
                     )
                     .await;
+                    // Retry an approved merge GitHub didn't accept yet, as
+                    // long as the head is still the one the judge approved.
+                    if let Some(pending) = judge_state.pending_merge() {
+                        if pending.head_sha == listed_head_sha {
+                            return Some(pending.clone());
+                        }
+                    }
                 }
                 None
             }
