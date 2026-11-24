@@ -282,6 +282,32 @@ pub(crate) async fn monitor_pr_phase(
             // Blocked on a human (the PR has the details). Failed keeps lab
             // from waking it and re-posting; `gru resume` retries the push.
             update_orchestration_phase(&wt_ctx.minion_id, OrchestrationPhase::Failed).await;
+            // Keep the lab's auto-merge sweep (which handles `gru:auto-merge`
+            // PRs with no live Minion) from merging the PR without the fix.
+            let label_result = async {
+                crate::merge_judge::ensure_needs_human_review_label(
+                    &issue_ctx.host,
+                    &issue_ctx.owner,
+                    &issue_ctx.repo,
+                )
+                .await?;
+                crate::merge_judge::add_needs_human_review_label(
+                    &issue_ctx.host,
+                    &issue_ctx.owner,
+                    &issue_ctx.repo,
+                    pr_num,
+                )
+                .await
+            }
+            .await;
+            if let Err(e) = label_result {
+                log::warn!(
+                    "⚠️  Failed to add {} to PR #{}: {:#}",
+                    crate::labels::NEEDS_HUMAN_REVIEW,
+                    pr_num,
+                    e
+                );
+            }
             if let Some(issue_num) = issue_ctx.issue_num {
                 try_mark_issue_blocked(
                     &issue_ctx.host,
