@@ -1,10 +1,9 @@
 #!/bin/bash
-# Simulates gh / gru output for the README demo (docs/demo.tape).
+# Simulates claude / gru output for the README demo (docs/demo.tape).
 # Output formats mirror the real commands; timestamps are staged to show
 # a blocked issue being picked up after its blocker merges.
 #
-# Usage: demo-script.sh gh issue create ...
-#        demo-script.sh gh api ...
+# Usage: demo-script.sh claude -p "<prompt>"
 #        demo-script.sh gru lab
 #        demo-script.sh gru status
 
@@ -14,18 +13,17 @@ RESET='\033[0m'
 
 REPO="owner/myapp"
 
-gh_issue_create() {
-    # Remember how many issues we've created so far to pick the number.
-    local n_file="/tmp/gru-demo-issue-count"
-    local n
-    n=$(( $(cat "$n_file" 2>/dev/null || echo 100) + 1 ))
-    echo "$n" > "$n_file"
-    sleep 0.6
+claude_print() {
+    # Stands in for an agent filing issues with gh. The agent's reply is
+    # free-form; this is a plausible example.
+    sleep 2.2
     echo ""
-    echo "Creating issue in ${REPO}"
+    echo "Filed two issues in ${REPO}, both labeled gru:todo:"
     echo ""
-    sleep 0.5
-    echo "https://github.com/${REPO}/issues/${n}"
+    sleep 0.3
+    echo "- #101 Add rate-limit headers to API responses"
+    sleep 0.3
+    echo "- #102 Show rate limits in CLI output (blocked by #101)"
 }
 
 # Mirrors tprintln! in src/commands/lab.rs: blank lines carry no timestamp.
@@ -70,7 +68,6 @@ gru_lab_shutdown() {
     lab_line "09:53:10" "🛑 Received shutdown signal, stopping daemon..."
     lab_line "09:53:10" "👋 1 Minion(s) still running — they will continue independently."
     lab_line "09:53:10" "   Use \`gru status\` to check on them, or \`gru stop <id>\` to stop one."
-    rm -f /tmp/gru-demo-issue-count
     exit 0
 }
 
@@ -83,8 +80,7 @@ gru_status() {
 }
 
 case "$1 $2" in
-    "gh issue") gh_issue_create ;;
-    "gh api") shift; gh_api "$@" ;;
+    "claude -p") claude_print ;;
     "gru lab") gru_lab ;;
     "gru status") gru_status ;;
     *) echo -e "${DIM}demo-script: unsupported command: $*${RESET}" >&2; exit 1 ;;

@@ -8,7 +8,7 @@
 
 Gru Lab is a local daemon that watches your repos for issues labeled `gru:todo`. For each one it spawns a Minion, a coding agent in its own git worktree, which implements the change, opens a PR, fixes CI failures, answers review comments, and rebases until the PR is ready to merge. You stay in GitHub, or in whatever LLM session you were already using to think through the work.
 
-![Animated terminal demo: two issues are filed with the gru:todo label, the second blocked by the first. gru lab spawns a Minion for the first issue, then for the second once its blocker merges, and gru status shows the second Minion working](https://raw.githubusercontent.com/fotoetienne/gru/main/docs/demo.gif)
+![Animated terminal demo: claude -p files two gru:todo issues, the second blocked by the first. gru lab spawns a Minion for the first issue, then for the second once its blocker merges, and gru status shows the second Minion working](https://raw.githubusercontent.com/fotoetienne/gru/main/docs/demo.gif)
 
 Gru is **agent-agnostic**. It ships with backends for [Claude Code](https://github.com/anthropics/claude-code), [OpenAI Codex](https://github.com/openai/codex), and [Pi](https://github.com/earendil-works/pi-mono), and its pluggable architecture makes it straightforward to add more.
 
@@ -21,6 +21,17 @@ Gru is **agent-agnostic**. It ships with backends for [Claude Code](https://gith
 ```
 you + an LLM ──▶ issues labeled gru:todo ──▶ gru lab ──▶ Minions ──▶ PRs ──▶ merged
 ```
+
+## What a Minion Does
+
+Each issue gets its own Minion, which carries the work from issue to merge:
+
+- **Implements and tests** the change in an isolated git worktree, so your own checkout is never touched
+- **Reviews its own work** with a code-reviewer subagent before opening the PR, then posts a review on the PR and addresses what it finds
+- **Fixes CI failures** by feeding the logs back to the agent (up to 2 attempts before escalating)
+- **Responds to review comments** from you or anyone else on the PR
+- **Rebases and resolves merge conflicts** when the base branch moves
+- **Merges** when the PR is labeled `gru:auto-merge` and an LLM merge judge decides it's safe; otherwise it waits for you
 
 ## 🚀 Quick Start
 
@@ -36,11 +47,7 @@ gru init owner/repo
 gru lab --repos owner/repo
 ```
 
-Then hand it work, from GitHub or from the terminal:
-
-```bash
-gh issue edit 42 --add-label gru:todo --repo owner/repo
-```
+Then hand it work: ask your agent to file an issue labeled `gru:todo`, or add the label to an existing issue in GitHub.
 
 ## 🧪 Lab Mode
 
@@ -55,7 +62,7 @@ max_slots = 4            # default is 2
 While it runs, the Lab:
 
 - **Respects dependencies.** An issue with open blockers is skipped until they close. Blockers come from GitHub's native issue dependencies (see [Filing issues](#filing-issues-from-an-llm-session) for the fallback when that API isn't available).
-- **Keeps PRs moving.** Minions watch CI and feed failures back to the agent (up to 2 fix attempts). New reviews or merge conflicts wake the Minion up to respond or rebase.
+- **Wakes Minions up.** New reviews or merge conflicts on a PR whose Minion has already exited bring it back to respond or rebase.
 - **Merges when told to.** Put `gru:auto-merge` on the issue before the Minion opens its PR, or on the PR itself afterwards. While a Minion is monitoring the PR, it merges once checks pass and an LLM merge judge clears it; if the judge isn't confident, the PR gets `gru:needs-human-review` instead. If no Minion is monitoring the PR anymore, the Lab's periodic sweep queues the merge on readiness checks alone, without the judge.
 - **Survives restarts.** Minions keep running if the Lab stops. On startup the Lab resumes interrupted Minions and resets issues left orphaned in `gru:in-progress`.
 - **Escalates instead of looping.** After repeated failures an issue is labeled `gru:blocked` and left for a human.
@@ -75,11 +82,11 @@ While it runs, the Lab:
 
 ### Filing issues from an LLM session
 
-Any agent that can run `gh` can feed the Lab. Something like this works well at the end of a planning conversation:
+You don't need to write issues by hand. Any agent that can run `gh` can file them; ask at the end of a planning conversation:
 
 > File this as three GitHub issues in owner/repo, labeled `gru:todo`. The API change goes first; the CLI and docs issues are each blocked by it.
 
-The agent should set the dependency with GitHub's native blocked-by relationship. With `gh`, that takes the blocker's internal issue ID rather than its number:
+Ask the agent to use GitHub's native blocked-by relationship. If it needs a hint, this is the call (it takes the blocker's internal issue ID, not its number):
 
 ```bash
 gh api repos/owner/repo/issues/102/dependencies/blocked_by \
