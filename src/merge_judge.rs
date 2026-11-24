@@ -1069,6 +1069,9 @@ pub(crate) async fn evaluate(
         None => match fetch_pr_changed_files(host, owner, repo, pr_number).await {
             Ok(files) => files,
             Err(e) => {
+                // The new head may add a policy file; don't let an earlier
+                // "no policy" result stand (observe mode would then label).
+                state.policy_applies = None;
                 state.record_failure(fingerprint);
                 return Err(e);
             }

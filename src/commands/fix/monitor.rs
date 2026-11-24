@@ -3,7 +3,7 @@ use super::agent::invoke_agent_for_reviews;
 use super::types::{IssueContext, WorktreeContext, MAX_REBASE_ATTEMPTS, MAX_REVIEW_ROUNDS};
 use crate::agent::AgentBackend;
 use crate::ci;
-use crate::config::{LabConfig, PolicyMode};
+use crate::config::PolicyMode;
 use crate::github;
 use crate::merge_judge::{self, JudgeAction, JudgeResponse, JudgeState};
 use crate::minion_registry;
@@ -1858,20 +1858,9 @@ pub(crate) async fn monitor_pr_lifecycle(
     println!("   Press Ctrl+C to stop monitoring\n");
 
     // Load merge judge settings from config (falls back to defaults).
-    // Uses load_partial to avoid requiring [daemon].repos for non-daemon commands.
-    let merge_config = LabConfig::default_path()
-        .ok()
-        .and_then(|p| {
-            LabConfig::load_partial(&p)
-                .map_err(|e| {
-                    log::warn!(
-                        "Failed to load config for merge judge settings: {e}, using defaults"
-                    );
-                    e
-                })
-                .ok()
-        })
-        .map(|c| c.merge);
+    // try_load_config honors GRU_CONFIG_PATH, so a worker spawned by
+    // `gru lab --config <path>` uses the same policy_mode as the Lab.
+    let merge_config = crate::config::try_load_config().map(|c| c.merge);
     let confidence_threshold = merge_config
         .as_ref()
         .map(|m| m.confidence_threshold.clamp(1, 10))

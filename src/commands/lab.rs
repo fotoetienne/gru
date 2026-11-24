@@ -3090,7 +3090,10 @@ async fn sweep_policy_allows_merge(
         }
     }
 
-    let backend = match crate::agent_registry::resolve_backend(&config.agent.default) {
+    let backend = match crate::agent_registry::resolve_backend_with_config(
+        &config.agent.default,
+        Some(config),
+    ) {
         Ok(b) => b,
         Err(e) => {
             log::warn!(

@@ -174,6 +174,20 @@ pub(crate) fn resolve_backend(agent_name: &str) -> anyhow::Result<Box<dyn AgentB
     } else {
         None
     };
+    resolve_backend_with_config(agent_name, config.as_ref())
+}
+
+/// Like [`resolve_backend`], but takes agent overrides from an already-loaded
+/// config instead of reloading it. Used by the Lab, whose config may come
+/// from `--config <path>` rather than the process default.
+pub(crate) fn resolve_backend_with_config(
+    agent_name: &str,
+    config: Option<&crate::config::LabConfig>,
+) -> anyhow::Result<Box<dyn AgentBackend>> {
+    if !AVAILABLE_AGENTS.contains(&agent_name) {
+        let available = AVAILABLE_AGENTS.join(", ");
+        anyhow::bail!("Unknown agent '{}'. Available: {}", agent_name, available);
+    }
     let overrides = AgentOverrides {
         claude_ci_fix_max_turns: config
             .as_ref()
@@ -184,7 +198,7 @@ pub(crate) fn resolve_backend(agent_name: &str) -> anyhow::Result<Box<dyn AgentB
         pi_model: config.as_ref().and_then(|c| c.agent.pi.model.clone()),
         pi_thinking: config.as_ref().and_then(|c| c.agent.pi.thinking.clone()),
         codex_binary: config.as_ref().and_then(|c| c.agent.codex.binary.clone()),
-        codex_model: config.and_then(|c| c.agent.codex.model),
+        codex_model: config.and_then(|c| c.agent.codex.model.clone()),
     };
     Ok(construct_backend(agent_name, overrides)
         .expect("agent_name validated against AVAILABLE_AGENTS above"))
@@ -193,6 +207,20 @@ pub(crate) fn resolve_backend(agent_name: &str) -> anyhow::Result<Box<dyn AgentB
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_resolve_backend_with_config_uses_given_config() {
+        let mut config = crate::config::LabConfig::default();
+        config.agent.claude.binary = Some("/custom/bin/claude".to_string());
+        let backend = resolve_backend_with_config("claude", Some(&config)).unwrap();
+        let cmd = backend.build_oneshot_command(std::path::Path::new("/tmp"), "-", "github.com");
+        assert_eq!(cmd.as_std().get_program(), "/custom/bin/claude");
+    }
+
+    #[test]
+    fn test_resolve_backend_with_config_rejects_unknown_agent() {
+        assert!(resolve_backend_with_config("nope", None).is_err());
+    }
 
     #[test]
     fn test_resolve_claude() {
