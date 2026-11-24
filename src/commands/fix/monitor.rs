@@ -1776,7 +1776,27 @@ pub(crate) async fn monitor_pr_lifecycle(
     // Push commits left unpushed by an earlier session (e.g. a push that was
     // refused). Don't monitor, review or judge merge readiness on a PR that
     // is missing them.
-    if !push_pending_commits(issue_ctx, wt_ctx, pr_number, "local commits").await {
+    //
+    // Only for an open PR: after merge or close, leftover local commits are
+    // obsolete and pushing them would publish work nobody will review. The
+    // monitor loop below reports the merged/closed state. If the state can't
+    // be fetched, try the push anyway (it still refuses unsafe cases).
+    let pr_open = pr_monitor::get_pr_info_for_exit_notification(
+        &issue_ctx.host,
+        &issue_ctx.owner,
+        &issue_ctx.repo,
+        pr_number,
+    )
+    .await
+    .unwrap_or_else(|e| {
+        log::warn!(
+            "⚠️  Could not check PR #{} state before pushing: {:#}",
+            pr_number,
+            e
+        );
+        true
+    });
+    if pr_open && !push_pending_commits(issue_ctx, wt_ctx, pr_number, "local commits").await {
         return Some(MonitorResult::PushRefused);
     }
 
