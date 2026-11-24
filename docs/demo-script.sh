@@ -1,70 +1,86 @@
 #!/bin/bash
-# Simulates gru do output for demo purposes
+# Simulates claude / gru output for the README demo (docs/demo.tape).
+# Output formats mirror the real commands; timestamps are staged to show
+# a blocked issue being picked up after its blocker merges.
+#
+# Usage: demo-script.sh claude -p "<prompt>"
+#        demo-script.sh gru lab
+#        demo-script.sh gru status
 
 DIM='\033[2m'
-BOLD='\033[1m'
-GREEN='\033[0;32m'
-BLUE='\033[0;34m'
 RESET='\033[0m'
 
-echo ""
-echo -e "${DIM}[gru]${RESET} Fetching issue #47..."
-sleep 0.4
-echo -e "${DIM}[gru]${RESET} ${BOLD}Fix: nil pointer dereference in user login${RESET}"
-echo -e "${DIM}[gru]${RESET} labels: bug, gru:todo"
-sleep 0.4
-echo ""
-echo -e "${DIM}[gru]${RESET} Claiming issue #47..."
-sleep 0.3
-echo -e "${DIM}[gru]${RESET} Setting up worktree..."
-sleep 0.5
-echo -e "${DIM}[gru]${RESET} Worktree ready: ~/.gru/work/owner/myapp/minion/issue-47-M003/"
-sleep 0.4
-echo ""
-echo -e "${DIM}[gru]${RESET} Spawning Claude Code agent..."
-sleep 0.7
-echo ""
-echo -e "${GREEN}◆${RESET} Reading issue and exploring codebase..."
-sleep 0.5
-echo -e "  ${DIM}→ src/handlers/auth.rs${RESET}"
-sleep 0.3
-echo -e "  ${DIM}→ src/models/user.rs${RESET}"
-sleep 0.3
-echo -e "  ${DIM}→ tests/auth_test.rs${RESET}"
-sleep 0.6
-echo ""
-echo -e "${GREEN}◆${RESET} Found the bug — unwrap() on Option in auth.rs:47"
-sleep 0.5
-echo -e "${GREEN}◆${RESET} Applying fix..."
-sleep 0.6
-echo -e "  ${DIM}→ Replace unwrap() with proper error handling${RESET}"
-sleep 0.3
-echo -e "  ${DIM}→ Add test case for missing user scenario${RESET}"
-sleep 0.6
-echo ""
-echo -e "${GREEN}◆${RESET} Running tests..."
-sleep 1.0
-echo -e "  ${GREEN}✓${RESET} 47 tests passed in 2.3s"
-sleep 0.5
-echo ""
-echo -e "${GREEN}◆${RESET} Running code review..."
-sleep 0.8
-echo -e "  ${GREEN}✓${RESET} No issues found"
-sleep 0.5
-echo ""
-echo -e "${GREEN}◆${RESET} Committing changes..."
-sleep 0.4
-echo -e "${GREEN}◆${RESET} Opening pull request..."
-sleep 0.7
-echo ""
-echo -e "${BOLD}${GREEN}✓ PR #48 opened${RESET}"
-echo -e "  Fix: nil pointer dereference in user login"
-echo -e "  ${BLUE}https://github.com/owner/myapp/pull/48${RESET}"
-sleep 0.7
-echo ""
-echo -e "${DIM}[gru]${RESET} Monitoring CI and reviews..."
-sleep 0.9
-echo -e "  ${GREEN}✓${RESET} CI passed"
-sleep 0.4
-echo -e "  ${GREEN}✓${RESET} PR auto-merged"
-echo ""
+REPO="owner/myapp"
+
+claude_print() {
+    # Stands in for an agent filing issues with gh. The agent's reply is
+    # free-form; this is a plausible example.
+    sleep 2.2
+    echo ""
+    echo "Filed two issues in ${REPO}, both labeled gru:todo:"
+    echo ""
+    sleep 0.3
+    echo "- #101 Add rate-limit headers to API responses"
+    sleep 0.3
+    echo "- #102 Show rate limits in CLI output (blocked by #101)"
+}
+
+# Mirrors tprintln! in src/commands/lab.rs: blank lines carry no timestamp.
+gh_api() {
+    # Nested lookup of the blocker's internal ID, or a silent POST of the
+    # blocked-by relationship.
+    case " $* " in
+        *" --silent "*) sleep 0.6 ;;
+        *) echo "3047751961" ;;
+    esac
+}
+
+lab_line() {
+    if [ -z "$2" ]; then echo ""; else echo -e "[$1] $2"; fi
+}
+
+gru_lab() {
+    trap gru_lab_shutdown INT
+    local t="09:14:01"
+    lab_line "$t" "🚀 Starting Gru Lab daemon"
+    lab_line "$t" "📋 Monitoring 1 repository(ies)"
+    lab_line "$t" "🔄 Poll interval: 30s"
+    lab_line "$t" "🎰 Max concurrent slots: 2"
+    lab_line "$t" "🏷️  Watching for label: gru:todo"
+    lab_line "$t" ""
+    lab_line "$t" "  • ${REPO}"
+    lab_line "$t" ""
+    lab_line "$t" "Press Ctrl-C to stop..."
+    lab_line "$t" ""
+    sleep 1.5
+    lab_line "09:14:03" "✨ Spawned Minion for ${REPO}/issues/101"
+    lab_line "09:14:03" ""
+    sleep 3.5
+    lab_line "09:52:34" "✨ Spawned Minion for ${REPO}/issues/102"
+    lab_line "09:52:34" ""
+    while true; do sleep 1; done
+}
+
+gru_lab_shutdown() {
+    echo ""
+    lab_line "09:53:10" ""
+    lab_line "09:53:10" "🛑 Received shutdown signal, stopping daemon..."
+    lab_line "09:53:10" "👋 1 Minion(s) still running — they will continue independently."
+    lab_line "09:53:10" "   Use \`gru status\` to check on them, or \`gru stop <id>\` to stop one."
+    exit 0
+}
+
+gru_status() {
+    # Matches the default table in src/commands/status.rs: columns sized to
+    # their content, separated by one space.
+    sleep 0.4
+    echo "MINION AGENT  REPO        ISSUE TASK PR BRANCH                MODE                 UPTIME TOKENS"
+    echo "M002   claude ${REPO} #102  do   -  minion/issue-102-M002 running (autonomous) 1m     12 in / 2.4k out"
+}
+
+case "$1 $2" in
+    "claude -p") claude_print ;;
+    "gru lab") gru_lab ;;
+    "gru status") gru_status ;;
+    *) echo -e "${DIM}demo-script: unsupported command: $*${RESET}" >&2; exit 1 ;;
+esac
