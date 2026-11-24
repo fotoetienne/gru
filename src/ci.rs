@@ -1660,7 +1660,26 @@ async fn run_ci_fix_attempt(
             eprintln!("🔀 Rebased CI fix onto new commits from origin/{}", branch)
         }
         Ok(_) => {}
-        Err(e) => log::warn!("⚠️  Could not sync with origin/{}: {:#}", branch, e),
+        Err(e) => {
+            // Don't push: if the author rewound the branch, a plain push of
+            // our fix would fast-forward it and bring back what they removed.
+            eprintln!(
+                "🚨 Could not sync with origin/{}; not pushing CI fix",
+                branch
+            );
+            let reason = format!(
+                "Could not integrate the latest commits on `{}` before pushing a CI fix \
+                 (attempt {}/{}), so the fix was not pushed.\n\n```\n{}\n```",
+                branch,
+                attempt,
+                MAX_CI_FIX_ATTEMPTS,
+                sanitize_push_failure_stderr(&format!("{:#}", e))
+            );
+            return Ok(escalate_exhaustion(
+                host, owner, repo, pr_number, &reason, attempt, minion_id,
+            )
+            .await);
+        }
     }
 
     // Push the fix
@@ -1685,6 +1704,12 @@ async fn run_ci_fix_attempt(
         return Ok(
             escalate_exhaustion(host, owner, repo, pr_number, &reason, attempt, minion_id).await,
         );
+    }
+
+    // The remote now holds HEAD; remember that so a later rewind of this
+    // commit by the author is recognised as a rewrite.
+    if let Err(e) = crate::git::record_pushed_head(worktree_path).await {
+        log::warn!("⚠️  Could not record pushed commit: {:#}", e);
     }
 
     // Wait for GitHub to register checks for the new commit

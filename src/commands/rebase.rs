@@ -53,6 +53,8 @@ pub(crate) async fn handle_rebase(
 
     // Recorded so the force-push can refuse if the remote branch has commits
     // that weren't part of this rebase.
+    let rebase_branch = get_current_branch(&worktree_path).await?;
+    let remote_before = crate::git::fetch_remote_tip(&worktree_path, &rebase_branch).await?;
     let pre_rebase_head = crate::git::head_sha(&worktree_path).await?;
 
     // Attempt the rebase
@@ -67,7 +69,14 @@ pub(crate) async fn handle_rebase(
             );
 
             if push {
-                if !maybe_force_push(&worktree_path, &pre_rebase_head, yes).await? {
+                if !maybe_force_push(
+                    &worktree_path,
+                    remote_before.as_deref(),
+                    &pre_rebase_head,
+                    yes,
+                )
+                .await?
+                {
                     return Ok(1);
                 }
             } else {
@@ -115,7 +124,14 @@ pub(crate) async fn handle_rebase(
 
                 if push {
                     // Defensively force push in case the /rebase skill didn't push
-                    if !maybe_force_push(&worktree_path, &pre_rebase_head, yes).await? {
+                    if !maybe_force_push(
+                        &worktree_path,
+                        remote_before.as_deref(),
+                        &pre_rebase_head,
+                        yes,
+                    )
+                    .await?
+                    {
                         return Ok(1);
                     }
                 } else {
@@ -683,7 +699,12 @@ pub(crate) async fn abort_rebase(worktree_path: &Path) -> Result<()> {
 /// Confirms with the user, then force-pushes. Skips the prompt when `yes` is true.
 ///
 /// Returns `true` if the push happened, `false` if the user cancelled.
-async fn maybe_force_push(worktree_path: &Path, pre_rebase_head: &str, yes: bool) -> Result<bool> {
+async fn maybe_force_push(
+    worktree_path: &Path,
+    remote_before: Option<&str>,
+    pre_rebase_head: &str,
+    yes: bool,
+) -> Result<bool> {
     let branch = get_current_branch(worktree_path).await?;
 
     if !yes {
@@ -707,7 +728,7 @@ async fn maybe_force_push(worktree_path: &Path, pre_rebase_head: &str, yes: bool
         }
     }
 
-    crate::git::force_push_rebased(worktree_path, &branch, pre_rebase_head).await?;
+    crate::git::force_push_rebased(worktree_path, &branch, remote_before, pre_rebase_head).await?;
     println!("🚀 Force-pushed rebased branch");
     Ok(true)
 }

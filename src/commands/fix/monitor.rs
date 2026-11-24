@@ -174,8 +174,10 @@ async fn auto_rebase_pr(checkout_path: &Path, minion_dir: &Path) -> Result<AutoR
         }
         crate::git::RemoteSync::UpToDate | crate::git::RemoteSync::NoRemoteBranch => {}
     }
-    // What gets rebased. The force-push at the end refuses if the remote has
-    // anything not in here (see `force_push_rebased`).
+    // The remote tip and HEAD before rebasing. The force-push at the end
+    // refuses if the remote has anything not in HEAD, or changed during the
+    // rebase (see `force_push_rebased`).
+    let remote_before = crate::git::fetch_remote_tip(checkout_path, &pr_branch).await?;
     let pre_rebase_head = crate::git::head_sha(checkout_path).await?;
 
     // Detect the base branch first so we can fetch only what we need
@@ -207,7 +209,13 @@ async fn auto_rebase_pr(checkout_path: &Path, minion_dir: &Path) -> Result<AutoR
                 if commit_count == 1 { "" } else { "s" }
             );
             log::info!("Auto force-pushing rebased branch (autonomous mode, --force-with-lease)");
-            crate::git::force_push_rebased(checkout_path, &pr_branch, &pre_rebase_head).await?;
+            crate::git::force_push_rebased(
+                checkout_path,
+                &pr_branch,
+                remote_before.as_deref(),
+                &pre_rebase_head,
+            )
+            .await?;
             println!("🚀 Force-pushed rebased branch");
             Ok(AutoRebaseResult::RebasedAndPushed)
         }
@@ -304,7 +312,13 @@ async fn auto_rebase_pr(checkout_path: &Path, minion_dir: &Path) -> Result<AutoR
                 // The rebase agent is told not to push; Gru pushes, after
                 // checking nobody else pushed to the branch during the rebase.
                 log::info!("Auto force-pushing after conflict resolution (autonomous mode, --force-with-lease)");
-                crate::git::force_push_rebased(checkout_path, &pr_branch, &pre_rebase_head).await?;
+                crate::git::force_push_rebased(
+                    checkout_path,
+                    &pr_branch,
+                    remote_before.as_deref(),
+                    &pre_rebase_head,
+                )
+                .await?;
                 println!("🚀 Force-pushed rebased branch");
                 Ok(AutoRebaseResult::RebasedAndPushed)
             } else {
@@ -1178,6 +1192,8 @@ async fn handle_new_reviews(
         Err(e) => log::warn!("⚠️  Duplicate inline reply sweep failed: {:#}", e),
     }
 
+    note_agent_pushes(ctx).await;
+
     match agent_result {
         Ok(()) => {
             println!("\n✅ Finished addressing review comments");
@@ -1199,6 +1215,18 @@ async fn handle_new_reviews(
             log::warn!("   You can address them manually");
             LoopAction::Break
         }
+    }
+}
+
+/// After an agent round that may have pushed by itself, records the remote
+/// tip as integrated if it only moved forward (see
+/// `git::note_remote_progress`), so a later rewind of those commits by the
+/// author is detected as a rewrite.
+async fn note_agent_pushes(ctx: &MonitorContext<'_>) {
+    if let Err(e) =
+        crate::git::note_remote_progress(&ctx.wt_ctx.checkout_path, &ctx.wt_ctx.branch_name).await
+    {
+        log::warn!("⚠️  Could not record pushed commits: {:#}", e);
     }
 }
 
@@ -1247,7 +1275,7 @@ async fn handle_new_issue_comments(
 
     println!("🔄 Re-invoking to address PR comments...\n");
 
-    match invoke_agent_for_reviews(
+    let agent_result = invoke_agent_for_reviews(
         ctx.backend,
         &ctx.wt_ctx.checkout_path,
         &ctx.wt_ctx.minion_dir,
@@ -1256,8 +1284,10 @@ async fn handle_new_issue_comments(
         ctx.timeout_opt,
         &ctx.issue_ctx.host,
     )
-    .await
-    {
+    .await;
+    note_agent_pushes(ctx).await;
+
+    match agent_result {
         Ok(()) => {
             println!("\n✅ Finished addressing PR comments");
             println!("🔄 Continuing to monitor PR...\n");
