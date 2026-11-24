@@ -166,6 +166,17 @@ pub(crate) struct JudgeState {
     /// a branch rule still pending). Retried while the PR state is
     /// unchanged; any new evaluation clears it.
     pending_merge: Option<PendingMerge>,
+    /// Escalation whose label or comment failed to land; retried on later
+    /// polls (an unchanged PR never re-runs the judge to escalate again).
+    pending_escalation: Option<PendingEscalation>,
+}
+
+/// An escalation that is not fully applied yet.
+#[derive(Debug, Clone)]
+pub(crate) struct PendingEscalation {
+    response: JudgeResponse,
+    label_done: bool,
+    comment_done: bool,
 }
 
 /// A judge-approved merge awaiting a successful merge call.
@@ -198,6 +209,7 @@ impl JudgeState {
             policy_applies: None,
             pending_observe: None,
             pending_merge: None,
+            pending_escalation: None,
         }
     }
 
@@ -295,6 +307,7 @@ impl JudgeState {
         self.own_comments = 0;
         self.pending_observe = None;
         self.pending_merge = None;
+        self.pending_escalation = None;
     }
 
     /// Returns the number of consecutive failures on the current fingerprint.
@@ -345,6 +358,7 @@ impl JudgeState {
         self.own_comments = 0;
         self.pending_observe = None;
         self.pending_merge = None;
+        self.pending_escalation = None;
 
         match &response.action {
             JudgeAction::Wait(duration) => {
@@ -436,6 +450,16 @@ async fn run_gh_parallel(host: &str, arg_sets: Vec<Vec<String>>) -> Result<Vec<S
         .enumerate()
         .map(|(i, opt)| opt.ok_or_else(|| anyhow::anyhow!("missing result at index {i}")))
         .collect()
+}
+
+/// Current head SHA of a PR, uncached.
+async fn fetch_head_sha(host: &str, owner: &str, repo: &str, pr_number: &str) -> Result<String> {
+    let repo_full = github::repo_slug(owner, repo);
+    let endpoint = format!("repos/{repo_full}/pulls/{pr_number}");
+    let sha = github::run_gh(host, &["api", &endpoint, "--jq", ".head.sha"])
+        .await
+        .with_context(|| format!("Failed to fetch head SHA for PR #{pr_number}"))?;
+    Ok(sha.trim().to_string())
 }
 
 /// Lightweight snapshot fetch: fingerprint + authoritative current facts.
@@ -1141,6 +1165,26 @@ pub(crate) async fn evaluate(
 
     let context = fetch_pr_context(host, owner, repo, pr_number).await?;
 
+    // The changed files and diff were fetched after the snapshot. If the PR
+    // head moved in between, they may describe a different commit than the
+    // one a Merge verdict would be pinned to, so don't judge this round.
+    match fetch_head_sha(host, owner, repo, pr_number).await {
+        Ok(sha) if sha == fingerprint.head_sha => {}
+        Ok(sha) => {
+            log::info!(
+                "PR #{} head moved from {} to {} while gathering judge context; re-evaluating next poll",
+                pr_number,
+                fingerprint.head_sha,
+                sha
+            );
+            return Ok(None);
+        }
+        Err(e) => {
+            state.record_failure(fingerprint);
+            return Err(e);
+        }
+    }
+
     let prompt = build_judge_prompt(
         pr_number,
         &context,
@@ -1331,7 +1375,7 @@ pub(crate) async fn post_judge_escalation_comment(
     pr_number: &str,
     response: &JudgeResponse,
     minion_id: Option<&str>,
-) {
+) -> bool {
     let repo_full = github::repo_slug(owner, repo);
     let body = format_escalation_comment(response, minion_id);
 
@@ -1345,6 +1389,7 @@ pub(crate) async fn post_judge_escalation_comment(
     {
         Ok(_) => {
             log::info!("Posted merge judge escalation comment on PR #{}", pr_number);
+            true
         }
         Err(e) => {
             log::warn!(
@@ -1352,8 +1397,89 @@ pub(crate) async fn post_judge_escalation_comment(
                 pr_number,
                 e
             );
+            false
         }
     }
+}
+
+/// Escalate a PR for human review: apply `gru:needs-human-review` and post
+/// the verdict. Whatever fails is kept pending on `state` and retried by
+/// [`retry_pending_escalation`], so a transient error can't leave the PR
+/// unmerged with no label or explanation.
+pub(crate) async fn escalate_pr(
+    host: &str,
+    owner: &str,
+    repo: &str,
+    pr_number: &str,
+    response: &JudgeResponse,
+    minion_id: Option<&str>,
+    state: &mut JudgeState,
+) {
+    let pending = PendingEscalation {
+        response: response.clone(),
+        label_done: false,
+        comment_done: false,
+    };
+    run_escalation(host, owner, repo, pr_number, pending, minion_id, state).await;
+}
+
+/// Retry an escalation whose label or comment failed earlier. No-op if
+/// nothing is pending. Call on every poll, before skipping labeled PRs.
+pub(crate) async fn retry_pending_escalation(
+    host: &str,
+    owner: &str,
+    repo: &str,
+    pr_number: &str,
+    minion_id: Option<&str>,
+    state: &mut JudgeState,
+) {
+    if let Some(pending) = state.pending_escalation.take() {
+        run_escalation(host, owner, repo, pr_number, pending, minion_id, state).await;
+    }
+}
+
+async fn run_escalation(
+    host: &str,
+    owner: &str,
+    repo: &str,
+    pr_number: &str,
+    mut pending: PendingEscalation,
+    minion_id: Option<&str>,
+    state: &mut JudgeState,
+) {
+    if !pending.label_done {
+        if let Err(e) = ensure_needs_human_review_label(host, owner, repo).await {
+            log::warn!(
+                "Failed to ensure {} label: {:#}",
+                NEEDS_HUMAN_REVIEW_LABEL,
+                e
+            );
+        }
+        match add_needs_human_review_label(host, owner, repo, pr_number).await {
+            Ok(()) => {
+                pending.label_done = true;
+                state.mark_label_applied();
+            }
+            Err(e) => log::warn!(
+                "Failed to add {} to PR #{}: {:#}",
+                NEEDS_HUMAN_REVIEW_LABEL,
+                pr_number,
+                e
+            ),
+        }
+    }
+    if !pending.comment_done {
+        pending.comment_done = post_judge_escalation_comment(
+            host,
+            owner,
+            repo,
+            pr_number,
+            &pending.response,
+            minion_id,
+        )
+        .await;
+    }
+    state.pending_escalation = (!(pending.label_done && pending.comment_done)).then_some(pending);
 }
 
 /// Optional trailing signature. The bookkeeping filter only drops comments
@@ -3149,5 +3275,22 @@ That's my verdict."#;
         });
         state.record_failure(fp("ghi", 1));
         assert!(state.pending_merge().is_none());
+    }
+
+    #[test]
+    fn test_pending_escalation_cleared_by_new_evaluation() {
+        let mut state = JudgeState::new();
+        let resp = policy_change_escalation("MERGE_POLICY.md");
+        state.record_response(fp("abc", 1), &resp);
+        state.pending_escalation = Some(PendingEscalation {
+            response: resp.clone(),
+            label_done: false,
+            comment_done: true,
+        });
+        // Unchanged state keeps it for retry.
+        assert!(!state.should_invoke(&fp("abc", 1)));
+        assert!(state.pending_escalation.is_some());
+        state.record_response(fp("def", 1), &resp);
+        assert!(state.pending_escalation.is_none());
     }
 }

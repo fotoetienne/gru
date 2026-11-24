@@ -2903,6 +2903,23 @@ async fn sweep_orphaned_auto_merge_prs(
                 continue;
             }
 
+            let pr_num_str = pr.number.to_string();
+            let judge_key = sweep_judge_key(&host, &full_repo, pr.number);
+
+            // Finish an escalation whose label or comment failed on an
+            // earlier sweep, before the label check below skips the PR.
+            if let Some(state) = judge_states.get_mut(&judge_key) {
+                merge_judge::retry_pending_escalation(
+                    &host,
+                    &owner,
+                    &repo,
+                    &pr_num_str,
+                    merge_judge::minion_id_from_branch(&pr.head_ref_name),
+                    state,
+                )
+                .await;
+            }
+
             // Skip if gru:needs-human-review is present.
             if pr
                 .labels
@@ -2945,8 +2962,6 @@ async fn sweep_orphaned_auto_merge_prs(
                 continue;
             }
 
-            let pr_num_str = pr.number.to_string();
-            let judge_key = sweep_judge_key(&host, &full_repo, pr.number);
             let judge_state = judge_states.entry(judge_key.clone()).or_default();
             let Some(pending) = sweep_policy_allows_merge(
                 config,
@@ -3193,7 +3208,7 @@ async fn sweep_policy_allows_merge(
                     repo,
                 );
                 if let Some(response) = &response {
-                    sweep_escalate(
+                    merge_judge::escalate_pr(
                         host,
                         owner,
                         repo,
@@ -3253,7 +3268,7 @@ async fn sweep_policy_allows_merge(
                     policy_rule: None,
                     policy_applied: false,
                 };
-                sweep_escalate(
+                merge_judge::escalate_pr(
                     host,
                     owner,
                     repo,
@@ -3306,31 +3321,6 @@ fn classify_sweep_verdict(response: Option<&JudgeResponse>, observe: bool) -> Sw
         JudgeAction::Wait(_) => SweepVerdict::Skip,
         JudgeAction::Escalate => SweepVerdict::Escalate,
     }
-}
-
-/// Apply `gru:needs-human-review` and post the judge's verdict on the PR.
-async fn sweep_escalate(
-    host: &str,
-    owner: &str,
-    repo: &str,
-    pr_number: &str,
-    response: &JudgeResponse,
-    minion_id: Option<&str>,
-    judge_state: &mut JudgeState,
-) {
-    if let Err(e) = merge_judge::ensure_needs_human_review_label(host, owner, repo).await {
-        log::warn!("⚠️  Failed to ensure gru:needs-human-review label: {:#}", e);
-    }
-    match merge_judge::add_needs_human_review_label(host, owner, repo, pr_number).await {
-        Ok(()) => judge_state.mark_label_applied(),
-        Err(e) => log::warn!(
-            "⚠️  Auto-merge sweep: failed to add needs-human-review label to PR #{}: {:#}",
-            pr_number,
-            e
-        ),
-    }
-    merge_judge::post_judge_escalation_comment(host, owner, repo, pr_number, response, minion_id)
-        .await;
 }
 
 /// Scratch working directory for a judge run outside any Minion worktree.

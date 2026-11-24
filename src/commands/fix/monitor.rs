@@ -734,6 +734,18 @@ async fn handle_ready_to_merge(
         state.judge_label_ensured = true;
     }
 
+    // Finish an escalation whose label or comment failed earlier. Done
+    // before the label check below, which would otherwise skip the PR.
+    merge_judge::retry_pending_escalation(
+        &ctx.issue_ctx.host,
+        &ctx.issue_ctx.owner,
+        &ctx.issue_ctx.repo,
+        ctx.pr_number,
+        Some(&ctx.wt_ctx.minion_id),
+        &mut state.judge_state,
+    )
+    .await;
+
     // Check if gru:needs-human-review was previously applied and
     // not yet cleared — skip judge until human removes it.
     // On API failure, be conservative and skip (don't proceed).
@@ -862,27 +874,16 @@ async fn handle_ready_to_merge(
                     "🚨 Judge escalated PR #{} for human review (confidence: {}/10)",
                     ctx.pr_number, response.confidence
                 );
-                // Apply label and post comment on PR.
-                match merge_judge::add_needs_human_review_label(
-                    &ctx.issue_ctx.host,
-                    &ctx.issue_ctx.owner,
-                    &ctx.issue_ctx.repo,
-                    ctx.pr_number,
-                )
-                .await
-                {
-                    Ok(()) => state.judge_state.mark_label_applied(),
-                    Err(e) => {
-                        log::warn!("Failed to add needs-human-review label: {:#}", e);
-                    }
-                }
-                merge_judge::post_judge_escalation_comment(
+                // Apply label and post comment on PR; whatever fails is
+                // retried on later polls.
+                merge_judge::escalate_pr(
                     &ctx.issue_ctx.host,
                     &ctx.issue_ctx.owner,
                     &ctx.issue_ctx.repo,
                     ctx.pr_number,
                     &response,
                     Some(&ctx.wt_ctx.minion_id),
+                    &mut state.judge_state,
                 )
                 .await;
                 // Also post an explanatory comment on the issue.
