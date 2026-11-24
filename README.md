@@ -47,7 +47,7 @@ gru init owner/repo
 gru lab --repos owner/repo
 ```
 
-Then hand it work: ask your agent to file an issue labeled `gru:todo`, or add the label to an existing issue in GitHub.
+`gru lab` runs in the foreground. Leave it running, and from another terminal or GitHub, hand it work: ask your agent to file an issue labeled `gru:todo`, or add the label to an existing issue.
 
 ## 🧪 Lab Mode
 
@@ -63,9 +63,9 @@ While it runs, the Lab:
 
 - **Respects dependencies.** An issue with open blockers is skipped until they close. Blockers come from GitHub's native issue dependencies (see [Filing issues](#filing-issues-from-an-llm-session) for the fallback when that API isn't available).
 - **Wakes Minions up.** New reviews or merge conflicts on a PR whose Minion has already exited bring it back to respond or rebase.
-- **Merges when told to.** Put `gru:auto-merge` on the issue before the Minion opens its PR, or on the PR itself afterwards. While a Minion is monitoring the PR, it merges once checks pass and an LLM merge judge clears it; if the judge isn't confident, the PR gets `gru:needs-human-review` instead. If no Minion is monitoring the PR anymore, the Lab's periodic sweep queues the merge on readiness checks alone, without the judge.
+- **Merges when told to.** Put `gru:auto-merge` on the issue before the Lab picks it up, or on the PR once it exists. A Minion reads the issue's labels when it starts, so adding the label to the issue mid-run has no effect. While a Minion is monitoring the PR, it merges once checks pass and an LLM merge judge clears it; if the judge isn't confident, the PR gets `gru:needs-human-review` instead. If no Minion is monitoring the PR anymore, the Lab's periodic sweep queues the merge on readiness checks alone, without the judge.
 - **Survives restarts.** Minions keep running if the Lab stops. On startup the Lab resumes interrupted Minions and resets issues left orphaned in `gru:in-progress`.
-- **Escalates instead of looping.** After repeated failures an issue is labeled `gru:blocked` and left for a human.
+- **Stops instead of looping.** When CI fixes run out, or an issue keeps getting stuck, it's labeled `gru:blocked`. A Minion that crashes or runs out of resume attempts marks its issue `gru:failed`. After 5 rounds of review feedback or 2 failed rebases, the Minion stops watching the PR without changing labels, and the PR waits for you.
 
 ### Labels
 
@@ -112,9 +112,9 @@ gru clean               # Remove worktrees for merged/closed PRs
 ```
 
 ```
-MINION   AGENT    REPO         ISSUE  TASK  PR    BRANCH                MODE                   UPTIME   TOKENS
-M001     claude   owner/repo   #42    do    #43   minion/issue-42-M001  monitoring (PR ready)  5m       1.2M
-M002     codex    owner/repo   #44    do    -     minion/issue-44-M002  working                2m       -
+MINION AGENT  REPO       ISSUE TASK PR  BRANCH               MODE                 UPTIME TOKENS
+M001   claude owner/repo #42   do   #43 minion/issue-42-M001 running (autonomous) 5h     68 in / 16.1k out
+M002   codex  owner/repo #44   do   -   minion/issue-44-M002 running (autonomous) 2m     -
 ```
 
 ### MCP Server
@@ -178,7 +178,7 @@ For a detailed walkthrough, see [docs/GETTING_STARTED.md](docs/GETTING_STARTED.m
 
 ### Run a single issue
 
-`gru do` runs one Minion in the foreground, outside the Lab. It goes through the same lifecycle (worktree, PR, CI, reviews) and streams progress to your terminal.
+`gru do` runs one Minion outside the Lab. The Minion goes through the same lifecycle (worktree, PR, CI, reviews) as a background worker, and `gru do` streams its progress to your terminal. Ctrl-C only stops the stream; use `gru stop <id>` to stop the Minion.
 
 ```bash
 gru do 42                                        # By issue number (from within the repo)

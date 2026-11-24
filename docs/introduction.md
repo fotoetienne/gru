@@ -45,7 +45,7 @@ gru init owner/repo
 gru lab --repos owner/repo
 ```
 
-Then hand it work: ask your agent to file an issue labeled `gru:todo`, or add the label to an existing issue in GitHub.
+`gru lab` runs in the foreground. Leave it running, and from another terminal or GitHub, hand it work: ask your agent to file an issue labeled `gru:todo`, or add the label to an existing issue.
 
 Prebuilt binaries for macOS x86_64 and Linux are on the [Releases page](https://github.com/fotoetienne/gru/releases/latest).
 
@@ -63,7 +63,7 @@ For a full walkthrough, see [Getting Started](GETTING_STARTED.md).
 8. With `gru:auto-merge`, the monitoring Minion asks an LLM merge judge whether the PR is safe to merge; otherwise it waits for you
 9. Labels track state on GitHub: `gru:in-progress` while the Minion works, `gru:done` once the PR is open, `gru:failed` or `gru:blocked` when it needs help
 
-To run one issue in the foreground without the Lab, use `gru do 42`.
+To run one issue without the Lab, use `gru do 42`. It starts a Minion in the background and streams its progress; Ctrl-C stops the stream, and `gru stop <id>` stops the Minion.
 
 ## Links
 

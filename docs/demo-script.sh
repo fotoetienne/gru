@@ -8,7 +8,6 @@
 #        demo-script.sh gru status
 
 DIM='\033[2m'
-BOLD='\033[1m'
 RESET='\033[0m'
 
 REPO="owner/myapp"
@@ -72,11 +71,11 @@ gru_lab_shutdown() {
 }
 
 gru_status() {
+    # Matches the default table in src/commands/status.rs: columns sized to
+    # their content, separated by one space.
     sleep 0.4
-    printf "${BOLD}%-6s %-7s %-12s %-6s %-5s %-5s %-22s %-8s %-7s %s${RESET}\n" \
-        MINION AGENT REPO ISSUE TASK PR BRANCH MODE UPTIME TOKENS
-    printf "%-6s %-7s %-12s %-6s %-5s %-5s %-22s %-8s %-7s %s\n" \
-        M002 claude "$REPO" "#102" do "-" "minion/issue-102-M002" working 1m 84K
+    echo "MINION AGENT  REPO        ISSUE TASK PR BRANCH                MODE                 UPTIME TOKENS"
+    echo "M002   claude ${REPO} #102  do   -  minion/issue-102-M002 running (autonomous) 1m     12 in / 2.4k out"
 }
 
 case "$1 $2" in
