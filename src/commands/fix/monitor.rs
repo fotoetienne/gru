@@ -831,16 +831,22 @@ async fn handle_ready_to_merge(
                     ctx.pr_number, response.confidence
                 );
                 let repo_full = github::repo_slug(&ctx.issue_ctx.owner, &ctx.issue_ctx.repo);
+                let mut merge_args = vec![
+                    "pr",
+                    "merge",
+                    ctx.pr_number,
+                    "--squash",
+                    "--auto",
+                    "-R",
+                    &repo_full,
+                ];
+                // Pin to the head the judge evaluated so a later push can't
+                // ride along on this verdict.
+                if let Some(sha) = state.judge_state.last_head_sha() {
+                    merge_args.extend(["--match-head-commit", sha]);
+                }
                 match crate::github::gh_cli_command(&ctx.issue_ctx.host)
-                    .args([
-                        "pr",
-                        "merge",
-                        ctx.pr_number,
-                        "--squash",
-                        "--auto",
-                        "-R",
-                        &repo_full,
-                    ])
+                    .args(&merge_args)
                     .output()
                     .await
                 {

@@ -886,6 +886,8 @@ pub(crate) struct AutoMergePr {
     pub(crate) labels: Vec<IssueLabel>,
     #[serde(default, rename = "headRefName")]
     pub(crate) head_ref_name: String,
+    #[serde(default, rename = "headRefOid")]
+    pub(crate) head_ref_oid: String,
 }
 
 /// List open PRs that carry the `gru:auto-merge` label.
@@ -911,7 +913,7 @@ pub(crate) async fn list_auto_merge_prs(
             "--state",
             "open",
             "--json",
-            "number,labels,headRefName",
+            "number,labels,headRefName,headRefOid",
             "--limit",
             "100",
         ],

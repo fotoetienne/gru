@@ -2917,19 +2917,20 @@ async fn sweep_orphaned_auto_merge_prs(
             let pr_num_str = pr.number.to_string();
             let judge_key = sweep_judge_key(&full_repo, pr.number);
             let judge_state = judge_states.entry(judge_key.clone()).or_default();
-            if !sweep_policy_allows_merge(
+            let Some(merge_sha) = sweep_policy_allows_merge(
                 config,
                 &host,
                 &owner,
                 &repo,
                 &pr_num_str,
+                &pr.head_ref_oid,
                 merge_judge::minion_id_from_branch(&pr.head_ref_name),
                 judge_state,
             )
             .await
-            {
+            else {
                 continue;
-            }
+            };
 
             tprintln!(
                 "🔀 Auto-merge sweep: queueing merge for orphaned PR #{} in {}",
@@ -2944,6 +2945,10 @@ async fn sweep_orphaned_auto_merge_prs(
                     &pr_num_str,
                     "--squash",
                     "--auto",
+                    // Pin to the checked head so a later push can't ride
+                    // along on an approval it never received.
+                    "--match-head-commit",
+                    &merge_sha,
                     "-R",
                     &full_repo,
                 ])
@@ -2995,17 +3000,29 @@ fn sweep_judge_key(full_repo: &str, pr_number: u64) -> String {
 ///   allows the merge; Escalate applies `gru:needs-human-review`; observe
 ///   mode posts the verdict and never merges.
 ///
-/// Any lookup failure returns `false`: the sweeper never merges a PR whose
-/// policy it could not check.
+/// Returns the head SHA the merge must be pinned to, or `None` to skip the
+/// PR. Any lookup failure returns `None`: the sweeper never merges a PR
+/// whose policy it could not check.
+#[allow(clippy::too_many_arguments)]
 async fn sweep_policy_allows_merge(
     config: &LabConfig,
     host: &str,
     owner: &str,
     repo: &str,
     pr_number: &str,
+    listed_head_sha: &str,
     minion_id: Option<&str>,
     judge_state: &mut JudgeState,
-) -> bool {
+) -> Option<String> {
+    if listed_head_sha.is_empty() {
+        log::warn!(
+            "⚠️  Auto-merge sweep: no head SHA for PR #{} in {}/{}; skipping",
+            pr_number,
+            owner,
+            repo
+        );
+        return None;
+    }
     let policy = match merge_judge::load_merge_policy(host, owner, repo).await {
         Ok(p) => p,
         Err(e) => {
@@ -3016,12 +3033,14 @@ async fn sweep_policy_allows_merge(
                 repo,
                 e
             );
-            return false;
+            return None;
         }
     };
     if policy.is_none() {
         match merge_judge::fetch_pr_changed_files(host, owner, repo, pr_number).await {
-            Ok(files) if !sweep_needs_judge(policy.as_ref(), &files) => return true,
+            Ok(files) if !sweep_needs_judge(policy.as_ref(), &files) => {
+                return Some(listed_head_sha.to_string())
+            }
             // The PR changes a policy file: the judge escalates it below.
             Ok(_) => {}
             Err(e) => {
@@ -3032,7 +3051,7 @@ async fn sweep_policy_allows_merge(
                     repo,
                     e
                 );
-                return false;
+                return None;
             }
         }
     }
@@ -3047,14 +3066,14 @@ async fn sweep_policy_allows_merge(
                 repo,
                 e
             );
-            return false;
+            return None;
         }
     };
     let workdir = match judge_workdir().await {
         Ok(d) => d,
         Err(e) => {
             log::warn!("⚠️  Auto-merge sweep: {:#}", e);
-            return false;
+            return None;
         }
     };
 
@@ -3072,8 +3091,9 @@ async fn sweep_policy_allows_merge(
     .await
     {
         Ok(response) => match classify_sweep_verdict(response.as_ref(), observe) {
-            SweepVerdict::Merge => true,
-            SweepVerdict::Skip => false,
+            // Pin to the head the judge actually evaluated.
+            SweepVerdict::Merge => judge_state.last_head_sha().map(str::to_string),
+            SweepVerdict::Skip => None,
             SweepVerdict::Observe => {
                 if let Some(response) = &response {
                     merge_judge::post_observe_verdict(
@@ -3087,7 +3107,7 @@ async fn sweep_policy_allows_merge(
                     )
                     .await;
                 }
-                false
+                None
             }
             SweepVerdict::Escalate => {
                 tprintln!(
@@ -3108,7 +3128,7 @@ async fn sweep_policy_allows_merge(
                     )
                     .await;
                 }
-                false
+                None
             }
         },
         Err(e) => {
@@ -3146,7 +3166,7 @@ async fn sweep_policy_allows_merge(
                     judge_state.mark_failure_escalated();
                 }
             }
-            false
+            None
         }
     }
 }

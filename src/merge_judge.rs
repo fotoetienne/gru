@@ -1313,7 +1313,7 @@ fn policy_lookup_query() -> String {
         .enumerate()
         .map(|(i, path)| {
             format!(
-                " p{i}: object(expression: \"HEAD:{path}\") {{ ... on Blob {{ text isBinary }} }}"
+                " p{i}: object(expression: \"HEAD:{path}\") {{ ... on Blob {{ text isBinary isTruncated byteSize }} }}"
             )
         })
         .collect();
@@ -1323,7 +1323,11 @@ fn policy_lookup_query() -> String {
 }
 
 /// Pick the policy from a `policy_lookup_query` response, honoring the
-/// lookup order. Missing, empty, binary, and non-file entries are skipped.
+/// lookup order. Missing paths, directories, and empty files are skipped.
+///
+/// A policy file the judge cannot read in full (binary, truncated by the
+/// API, or over `MAX_POLICY_BYTES`) is an error rather than "no policy":
+/// falling through would let the judge merge what the policy escalates.
 fn select_policy(json: &str) -> Result<Option<MergePolicy>> {
     let val: serde_json::Value =
         serde_json::from_str(json).context("Failed to parse merge policy query response")?;
@@ -1339,13 +1343,27 @@ fn select_policy(json: &str) -> Result<Option<MergePolicy>> {
         let Some(blob) = repository.get(format!("p{i}")).filter(|v| !v.is_null()) else {
             continue;
         };
-        if blob.get("isBinary").and_then(|b| b.as_bool()) == Some(true) {
-            log::warn!("Ignoring binary merge policy file {path}");
+        // A tree (directory) at the path matches none of the Blob fields.
+        if blob.get("isBinary").is_none() {
             continue;
         }
-        let text = blob.get("text").and_then(|t| t.as_str()).unwrap_or("");
+        if blob.get("isBinary").and_then(|b| b.as_bool()) == Some(true) {
+            anyhow::bail!("Merge policy {path} is a binary file; it must be plain text");
+        }
+        if blob.get("isTruncated").and_then(|b| b.as_bool()) == Some(true) {
+            anyhow::bail!("Merge policy {path} is too large for the GitHub API to return");
+        }
+        let Some(text) = blob.get("text").and_then(|t| t.as_str()) else {
+            anyhow::bail!("Merge policy {path} has no readable text");
+        };
         if text.trim().is_empty() {
             continue;
+        }
+        if text.len() > MAX_POLICY_BYTES {
+            anyhow::bail!(
+                "Merge policy {path} is {} bytes; the limit is {MAX_POLICY_BYTES}. Shorten it.",
+                text.len()
+            );
         }
         return Ok(Some(MergePolicy {
             path,
@@ -1369,7 +1387,8 @@ pub(crate) async fn load_merge_policy(
     let output = github::run_gh(
         host,
         &[
-            "api", "graphql", "--cache", "60s", "-f", &query_arg, "-f", &owner_arg, "-f", &repo_arg,
+            // No --cache: a stale answer could miss a just-merged policy.
+            "api", "graphql", "-f", &query_arg, "-f", &owner_arg, "-f", &repo_arg,
         ],
     )
     .await
@@ -1377,8 +1396,14 @@ pub(crate) async fn load_merge_policy(
     select_policy(&output)
 }
 
+/// The pull request files API returns at most this many files.
+const MAX_PR_FILES_LISTED: usize = 3000;
+
 /// List the files a PR touches. Renamed files contribute both the old and
 /// the new path.
+///
+/// Errors when the list may be incomplete (the API caps it at 3000 files),
+/// since a missing entry could hide a change to the policy file.
 pub(crate) async fn fetch_pr_changed_files(
     host: &str,
     owner: &str,
@@ -1390,23 +1415,39 @@ pub(crate) async fn fetch_pr_changed_files(
     let output = github::run_gh(
         host,
         &[
+            // No --cache: a list cached against an older head could miss a
+            // freshly pushed policy edit.
             "api",
             &endpoint,
-            "--cache",
-            "20s",
             "--paginate",
             "--jq",
-            ".[] | .filename, (.previous_filename // empty)",
+            ".[] | \"f\\t\" + .filename, (.previous_filename // empty | \"p\\t\" + .)",
         ],
     )
     .await
     .with_context(|| format!("Failed to list changed files for PR #{pr_number}"))?;
-    Ok(output
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty())
-        .map(str::to_string)
-        .collect())
+    parse_changed_files(&output)
+}
+
+/// Parse `fetch_pr_changed_files` output: `f\t<filename>` per file plus
+/// `p\t<previous_filename>` for renames.
+fn parse_changed_files(output: &str) -> Result<Vec<String>> {
+    let mut files = Vec::new();
+    let mut file_count = 0;
+    for line in output.lines() {
+        if let Some(name) = line.strip_prefix("f\t") {
+            file_count += 1;
+            files.push(name.to_string());
+        } else if let Some(name) = line.strip_prefix("p\t") {
+            files.push(name.to_string());
+        }
+    }
+    if file_count >= MAX_PR_FILES_LISTED {
+        anyhow::bail!(
+            "PR touches {file_count}+ files, more than GitHub lists; cannot confirm it leaves MERGE_POLICY.md unchanged"
+        );
+    }
+    Ok(files)
 }
 
 /// Return the first changed path that is a merge policy location. Matching
@@ -2338,7 +2379,7 @@ That's my verdict."#;
     }
 
     fn blob(text: &str) -> serde_json::Value {
-        serde_json::json!({ "text": text, "isBinary": false })
+        serde_json::json!({ "text": text, "isBinary": false, "isTruncated": false })
     }
 
     fn test_ctx() -> PrContext {
@@ -2404,14 +2445,59 @@ That's my verdict."#;
     }
 
     #[test]
-    fn test_select_policy_skips_empty_binary_and_non_blob() {
+    fn test_select_policy_skips_empty_and_directories() {
         let json = policy_response([
             blob("  \n "),
-            serde_json::json!({ "text": null, "isBinary": true }),
             // A directory at the path matches no Blob fields.
             serde_json::json!({}),
+            serde_json::Value::Null,
         ]);
         assert_eq!(select_policy(&json).unwrap(), None);
+    }
+
+    #[test]
+    fn test_select_policy_unreadable_is_error_not_fallthrough() {
+        let null = || serde_json::Value::Null;
+        // Each unreadable variant at .github/ must not fall through to the
+        // root policy (or to "no policy").
+        for bad in [
+            serde_json::json!({ "text": null, "isBinary": true, "isTruncated": false }),
+            serde_json::json!({ "text": null, "isBinary": false, "isTruncated": true }),
+            serde_json::json!({ "text": null, "isBinary": false, "isTruncated": false }),
+        ] {
+            let json = policy_response([bad.clone(), blob("root rules"), null()]);
+            assert!(select_policy(&json).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn test_select_policy_oversized_is_error() {
+        let big = "x".repeat(MAX_POLICY_BYTES + 1);
+        let json = policy_response([blob(&big), serde_json::Value::Null, serde_json::Value::Null]);
+        assert!(select_policy(&json).is_err());
+    }
+
+    #[test]
+    fn test_parse_changed_files_includes_renames() {
+        let out = "f\tsrc/a.rs\nf\tdocs/new.md\np\tMERGE_POLICY.md\n";
+        let files = parse_changed_files(out).unwrap();
+        assert_eq!(files, vec!["src/a.rs", "docs/new.md", "MERGE_POLICY.md"]);
+        assert_eq!(find_policy_file_change(&files), Some("MERGE_POLICY.md"));
+    }
+
+    #[test]
+    fn test_parse_changed_files_rejects_capped_list() {
+        let out: String = (0..MAX_PR_FILES_LISTED)
+            .map(|i| format!("f\tfile{i}.rs\n"))
+            .collect();
+        assert!(parse_changed_files(&out).is_err());
+        let out: String = (0..MAX_PR_FILES_LISTED - 1)
+            .map(|i| format!("f\tfile{i}.rs\n"))
+            .collect();
+        assert_eq!(
+            parse_changed_files(&out).unwrap().len(),
+            MAX_PR_FILES_LISTED - 1
+        );
     }
 
     #[test]

@@ -162,7 +162,9 @@
 # how the judge applies that policy:
 #   "enforce" (default) - merge or escalate according to the verdict
 #   "observe"           - post the verdict the judge would have reached (once
-#                         per head SHA) without merging or labeling
+#                         per head SHA) without merging or labeling. Gru does
+#                         not auto-merge PRs in a repo with a policy while in
+#                         this mode; merge them by hand.
 # Repos without a MERGE_POLICY.md are unaffected.
 # policy_mode = "enforce"
 
