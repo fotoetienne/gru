@@ -20,7 +20,7 @@ use super::worktree::format_branch_name;
 use super::{spawn_worker, FixOptions};
 use crate::agent::AgentBackend;
 use crate::agent_registry;
-use crate::agent_runner::parse_timeout;
+use crate::agent_runner::{parse_timeout, EXIT_CODE_SIGNAL_TERMINATED};
 use crate::config::HostRegistry;
 use crate::git;
 use crate::github;
@@ -645,6 +645,17 @@ pub(crate) async fn run_adopted_pipeline(
         // watching if it fails, so log and carry on to monitoring.
         match result {
             Ok(r) if r.status.success() => {}
+            // Killed by a signal: `gru stop` (or Ctrl-C / shutdown) signals the
+            // registered agent child. That's a request to stop, not a failed
+            // orientation, so don't go on to monitoring and spawn more agents.
+            Ok(r) if r.status.code().is_none() => {
+                println!(
+                    "🛑 Orientation session was stopped; not monitoring PR #{}",
+                    pr
+                );
+                clear_ownership(&wt_ctx.minion_id).await;
+                return Ok(EXIT_CODE_SIGNAL_TERMINATED);
+            }
             Ok(r) => log::warn!(
                 "⚠️  Orientation session exited with {:?}; continuing to monitor PR #{}",
                 r.status.code(),

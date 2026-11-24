@@ -1182,6 +1182,16 @@ pub(crate) async fn monitor_and_fix_ci(
     let mut post_push = false;
 
     for attempt in 1..=MAX_CI_FIX_ATTEMPTS {
+        // Pick up commits others pushed to the PR branch (e.g. the author of
+        // an adopted PR) before choosing which commit's CI to check. Without
+        // this, a failing commit on the remote is missed while the local
+        // checkout still sits on an older, passing one. If the sync fails,
+        // stop here: fixing a stale checkout would be wasted work and its
+        // push would be rejected anyway.
+        crate::git::sync_with_remote_branch(worktree_path, branch)
+            .await
+            .with_context(|| format!("Failed to sync with origin/{} before CI check", branch))?;
+
         // Get the current HEAD SHA
         let head_sha = get_head_sha(worktree_path).await?;
 
