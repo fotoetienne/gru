@@ -197,6 +197,59 @@ enum Commands {
         )]
         worker: Option<String>,
     },
+    #[command(
+        about = "Hand an existing PR to a Minion to shepherd to merge",
+        long_about = "Hand an existing PR to a Minion to shepherd to merge.\n\n\
+The Minion checks out the PR's own branch and skips implementation: it fixes CI \
+failures, responds to review comments and rebases on conflicts until the PR is merged. \
+The PR must be in this repository (not a fork), link an issue (e.g. `Fixes #123`), and \
+be authored by you unless --any-author is given."
+    )]
+    Adopt {
+        #[arg(help = "PR number or URL")]
+        pr: String,
+
+        #[arg(
+            short,
+            long,
+            help = "Maximum duration for each agent session (e.g., '10s', '5m', '1h')"
+        )]
+        timeout: Option<String>,
+
+        #[arg(
+            long,
+            help = "Timeout for the automated PR review subprocess (e.g., '30m', '1h'). No timeout by default."
+        )]
+        review_timeout: Option<String>,
+
+        #[arg(
+            long,
+            help = "Maximum duration for PR monitoring (e.g., '30m', '2h', '24h'). Defaults to 24 hours."
+        )]
+        monitor_timeout: Option<String>,
+
+        #[arg(
+            long,
+            help = "Agent backend to use (claude, codex, pi). Overrides config.toml agent.default (falls back to claude if unset)."
+        )]
+        agent: Option<String>,
+
+        #[arg(
+            long,
+            help = "Auto-merge PR when all readiness checks pass (adds gru:auto-merge label)"
+        )]
+        auto_merge: bool,
+
+        #[arg(
+            short = 'd',
+            long,
+            help = "Detach immediately after spawning the background worker (don't follow logs)"
+        )]
+        detach: bool,
+
+        #[arg(long, help = "Allow adopting a PR authored by someone else")]
+        any_author: bool,
+    },
     #[command(about = "View logs from a Minion's event stream", alias = "lg")]
     Logs {
         #[arg(help = "Minion ID, issue number, or PR number (e.g., M001, 42)")]
@@ -534,6 +587,32 @@ async fn main() {
                     discuss,
                     ignore_deps,
                     worker,
+                },
+            )
+            .await
+        }
+        Commands::Adopt {
+            pr,
+            timeout,
+            review_timeout,
+            monitor_timeout,
+            agent,
+            auto_merge,
+            detach,
+            any_author,
+        } => {
+            let agent_name = agent.unwrap_or_else(agent_registry::resolve_default_agent_name);
+            fix::handle_adopt(
+                &pr,
+                fix::AdoptOptions {
+                    timeout,
+                    review_timeout,
+                    monitor_timeout,
+                    quiet: cli.quiet,
+                    agent_name,
+                    auto_merge,
+                    detach,
+                    any_author,
                 },
             )
             .await

@@ -1347,6 +1347,91 @@ impl GitRepo {
     }
 }
 
+/// Outcome of [`sync_with_remote_branch`].
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum RemoteSync {
+    /// The remote branch does not exist (nothing to integrate).
+    NoRemoteBranch,
+    /// HEAD already contains every commit on the remote branch.
+    UpToDate,
+    /// The remote branch had commits HEAD lacked; local commits were rebased
+    /// on top of it.
+    Integrated,
+}
+
+/// Runs git in `worktree_path` with repo-selection env vars cleared, so the
+/// command targets the worktree even when invoked from inside a git hook.
+async fn run_git_in(worktree_path: &Path, args: &[&str]) -> Result<std::process::Output> {
+    Command::new("git")
+        .arg("-C")
+        .arg(worktree_path)
+        .args(args)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .env_remove("GIT_COMMON_DIR")
+        .output()
+        .await
+        .with_context(|| format!("Failed to execute git {}", args.join(" ")))
+}
+
+/// Pulls commits that someone else pushed to `origin/<branch>` into HEAD.
+///
+/// Fetches the remote branch into `refs/remotes/origin/<branch>` and, if it
+/// is not already an ancestor of HEAD, rebases the local-only commits on top
+/// of it. This keeps a later push a fast-forward (or keeps a
+/// `--force-with-lease` push from discarding the other author's commits,
+/// since the lease is checked against the ref just fetched).
+///
+/// On rebase conflicts the rebase is aborted, the worktree is left as it was,
+/// and an error is returned.
+pub(crate) async fn sync_with_remote_branch(
+    worktree_path: &Path,
+    branch: &str,
+) -> Result<RemoteSync> {
+    validate_branch_name(branch)?;
+    let refspec = format!("+refs/heads/{branch}:refs/remotes/origin/{branch}");
+    let fetch = run_git_in(worktree_path, &["fetch", "origin", "--refmap=", &refspec]).await?;
+    if !fetch.status.success() {
+        let stderr = String::from_utf8_lossy(&fetch.stderr);
+        if stderr.contains("couldn't find remote ref") {
+            return Ok(RemoteSync::NoRemoteBranch);
+        }
+        anyhow::bail!(
+            "git fetch of origin/{} failed: {}",
+            branch,
+            redact_credentials(stderr.trim())
+        );
+    }
+
+    let remote_ref = format!("refs/remotes/origin/{branch}");
+    let ancestor = run_git_in(
+        worktree_path,
+        &["merge-base", "--is-ancestor", &remote_ref, "HEAD"],
+    )
+    .await?;
+    match ancestor.status.code() {
+        Some(0) => return Ok(RemoteSync::UpToDate),
+        Some(1) => {}
+        _ => anyhow::bail!(
+            "git merge-base --is-ancestor failed: {}",
+            String::from_utf8_lossy(&ancestor.stderr).trim()
+        ),
+    }
+
+    let rebase = run_git_in(worktree_path, &["rebase", &remote_ref]).await?;
+    if !rebase.status.success() {
+        let _ = run_git_in(worktree_path, &["rebase", "--abort"]).await;
+        anyhow::bail!(
+            "Could not rebase local commits onto origin/{} (new commits were pushed \
+             to the branch and they conflict with local work): {}",
+            branch,
+            String::from_utf8_lossy(&rebase.stderr).trim()
+        );
+    }
+    Ok(RemoteSync::Integrated)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2443,5 +2528,130 @@ mod tests {
             "fetch refspec should be updated to refs/remotes/origin/* after ensure_bare_clone"
         );
         // `tmp` drops here, cleaning up all directories automatically.
+    }
+
+    /// Runs a git command synchronously in `dir`, panicking on failure.
+    fn git_ok(dir: &Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
+            .env_remove("GIT_COMMON_DIR")
+            .output()
+            .expect("git failed to spawn");
+        assert!(
+            out.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// Creates a bare `origin` with a `feature` branch and two clones of it:
+    /// `mine` (the Minion's checkout) and `theirs` (the PR author's checkout).
+    fn setup_shared_branch(dir: &Path) -> (PathBuf, PathBuf) {
+        let bare = dir.join("origin.git");
+        git_ok(
+            dir,
+            &["init", "--bare", "-b", "main", bare.to_str().unwrap()],
+        );
+        let mut clones = Vec::new();
+        for name in ["theirs", "mine"] {
+            let wt = dir.join(name);
+            std::fs::create_dir_all(&wt).unwrap();
+            git_ok(&wt, &["init", "-b", "main"]);
+            git_ok(&wt, &["config", "user.email", "t@t"]);
+            git_ok(&wt, &["config", "user.name", "t"]);
+            git_ok(&wt, &["remote", "add", "origin", bare.to_str().unwrap()]);
+            clones.push(wt);
+        }
+        let theirs = clones[0].clone();
+        let mine = clones[1].clone();
+        std::fs::write(theirs.join("base.txt"), "base").unwrap();
+        git_ok(&theirs, &["add", "."]);
+        git_ok(&theirs, &["commit", "-m", "base"]);
+        git_ok(&theirs, &["push", "origin", "HEAD:refs/heads/feature"]);
+        git_ok(&mine, &["fetch", "origin"]);
+        git_ok(&mine, &["checkout", "-b", "feature", "origin/feature"]);
+        (mine, theirs)
+    }
+
+    fn log_subjects(dir: &Path) -> Vec<String> {
+        let out = std::process::Command::new("git")
+            .args(["log", "--format=%s"])
+            .current_dir(dir)
+            .env_remove("GIT_DIR")
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(String::from)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn test_sync_with_remote_branch_up_to_date() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mine, _theirs) = setup_shared_branch(tmp.path());
+        let result = sync_with_remote_branch(&mine, "feature").await.unwrap();
+        assert_eq!(result, RemoteSync::UpToDate);
+    }
+
+    #[tokio::test]
+    async fn test_sync_with_remote_branch_missing_remote() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mine, _theirs) = setup_shared_branch(tmp.path());
+        let result = sync_with_remote_branch(&mine, "no-such-branch")
+            .await
+            .unwrap();
+        assert_eq!(result, RemoteSync::NoRemoteBranch);
+    }
+
+    #[tokio::test]
+    async fn test_sync_with_remote_branch_preserves_other_authors_commits() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mine, theirs) = setup_shared_branch(tmp.path());
+
+        // The PR author pushes a new commit while the Minion has a local fix.
+        std::fs::write(theirs.join("theirs.txt"), "theirs").unwrap();
+        git_ok(&theirs, &["add", "."]);
+        git_ok(&theirs, &["commit", "-m", "author commit"]);
+        git_ok(&theirs, &["push", "origin", "HEAD:refs/heads/feature"]);
+
+        std::fs::write(mine.join("mine.txt"), "mine").unwrap();
+        git_ok(&mine, &["add", "."]);
+        git_ok(&mine, &["commit", "-m", "minion fix"]);
+
+        let result = sync_with_remote_branch(&mine, "feature").await.unwrap();
+        assert_eq!(result, RemoteSync::Integrated);
+        assert_eq!(
+            log_subjects(&mine),
+            vec!["minion fix", "author commit", "base"]
+        );
+
+        // A plain (non-force) push now fast-forwards without losing anything.
+        git_ok(&mine, &["push", "origin", "HEAD:refs/heads/feature"]);
+    }
+
+    #[tokio::test]
+    async fn test_sync_with_remote_branch_conflict_aborts_and_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mine, theirs) = setup_shared_branch(tmp.path());
+
+        std::fs::write(theirs.join("base.txt"), "theirs").unwrap();
+        git_ok(&theirs, &["commit", "-am", "author edit"]);
+        git_ok(&theirs, &["push", "origin", "HEAD:refs/heads/feature"]);
+
+        std::fs::write(mine.join("base.txt"), "mine").unwrap();
+        git_ok(&mine, &["commit", "-am", "minion edit"]);
+
+        let err = sync_with_remote_branch(&mine, "feature").await.unwrap_err();
+        assert!(format!("{:#}", err).contains("Could not rebase"));
+        // Rebase was aborted: local history is untouched.
+        assert_eq!(log_subjects(&mine), vec!["minion edit", "base"]);
+        assert!(!mine.join(".git/rebase-merge").exists());
+        assert!(!mine.join(".git/rebase-apply").exists());
     }
 }

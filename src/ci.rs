@@ -1638,6 +1638,18 @@ async fn run_ci_fix_attempt(
         }
     }
 
+    // Pick up commits someone else pushed to the branch while the fix was
+    // being made (e.g. the author of an adopted PR), so the push below is a
+    // fast-forward instead of being rejected. On conflict the push fails and
+    // escalates as before.
+    match crate::git::sync_with_remote_branch(worktree_path, branch).await {
+        Ok(crate::git::RemoteSync::Integrated) => {
+            eprintln!("🔀 Rebased CI fix onto new commits from origin/{}", branch)
+        }
+        Ok(_) => {}
+        Err(e) => log::warn!("⚠️  Could not sync with origin/{}: {:#}", branch, e),
+    }
+
     // Push the fix
     eprintln!("📤 Pushing CI fix...");
     let push_output = Command::new("git")

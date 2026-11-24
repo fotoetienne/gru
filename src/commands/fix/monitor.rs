@@ -148,6 +148,21 @@ async fn auto_rebase_pr(checkout_path: &Path, minion_dir: &Path) -> Result<AutoR
         .await
         .context("Cannot auto-rebase: worktree has uncommitted changes")?;
 
+    // Integrate any commits pushed to the PR branch by someone else (e.g. the
+    // author of an adopted PR) before rebasing. This also refreshes the
+    // remote-tracking ref that `--force-with-lease` checks against, so the
+    // force-push below can only replace commits this rebase already contains.
+    let pr_branch = get_current_branch(checkout_path).await?;
+    match crate::git::sync_with_remote_branch(checkout_path, &pr_branch)
+        .await
+        .context("Cannot auto-rebase: failed to integrate new commits from the PR branch")?
+    {
+        crate::git::RemoteSync::Integrated => {
+            println!("🔀 Pulled new commits from origin/{}", pr_branch)
+        }
+        crate::git::RemoteSync::UpToDate | crate::git::RemoteSync::NoRemoteBranch => {}
+    }
+
     // Detect the base branch first so we can fetch only what we need
     let base_branch = detect_base_branch(checkout_path).await?;
 
@@ -1113,7 +1128,7 @@ async fn handle_new_reviews(
         return LoopAction::Break;
     }
 
-    let review_prompt = pr_monitor::format_review_prompt(
+    let mut review_prompt = pr_monitor::format_review_prompt(
         ctx.issue_ctx.issue_num,
         ctx.pr_number,
         &feedback,
@@ -1121,6 +1136,9 @@ async fn handle_new_reviews(
         &ctx.issue_ctx.repo,
         &ctx.wt_ctx.minion_id,
     );
+    review_prompt.push_str(&pr_monitor::format_push_safety_note(
+        &ctx.wt_ctx.branch_name,
+    ));
 
     println!("🔄 Re-invoking to address review feedback...\n");
 
@@ -1225,7 +1243,7 @@ async fn handle_new_issue_comments(
         MAX_REVIEW_ROUNDS
     );
 
-    let prompt = pr_monitor::format_issue_comments_prompt(
+    let mut prompt = pr_monitor::format_issue_comments_prompt(
         ctx.issue_ctx.issue_num,
         ctx.pr_number,
         &comments,
@@ -1233,6 +1251,9 @@ async fn handle_new_issue_comments(
         &ctx.issue_ctx.repo,
         &ctx.wt_ctx.minion_id,
     );
+    prompt.push_str(&pr_monitor::format_push_safety_note(
+        &ctx.wt_ctx.branch_name,
+    ));
 
     println!("🔄 Re-invoking to address PR comments...\n");
 

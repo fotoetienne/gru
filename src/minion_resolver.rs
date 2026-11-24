@@ -13,6 +13,14 @@ static ISSUE_LINK_REGEX: Lazy<Regex> = Lazy::new(|| {
         .expect("Failed to compile issue link regex")
 });
 
+/// Returns the first issue referenced as `Fixes #N` / `Closes #N` /
+/// `Resolves #N` in a PR body.
+pub(crate) fn parse_linked_issue(body: &str) -> Option<u64> {
+    ISSUE_LINK_REGEX
+        .captures(body)
+        .and_then(|c| c[1].parse::<u64>().ok())
+}
+
 /// Information about a resolved Minion worktree
 #[derive(Debug, Clone)]
 pub(crate) struct MinionInfo {

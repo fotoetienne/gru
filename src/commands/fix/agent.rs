@@ -131,6 +131,27 @@ pub(super) async fn run_agent_session(
     run_agent_session_inner(backend, issue_ctx, wt_ctx, cmd, quiet, timeout_opt).await
 }
 
+/// Starts a new agent session with an explicit prompt (instead of the `do`
+/// prompt). Used by `gru adopt` for its orientation session.
+pub(super) async fn run_agent_session_with_prompt(
+    backend: &dyn AgentBackend,
+    issue_ctx: &IssueContext,
+    wt_ctx: &WorktreeContext,
+    prompt: &str,
+    quiet: bool,
+    timeout_opt: Option<&str>,
+) -> Result<AgentResult> {
+    println!("🤖 Launching {}...\n", backend.name());
+    let mut cmd = backend.build_command(
+        &wt_ctx.checkout_path,
+        &wt_ctx.session_id,
+        prompt,
+        &issue_ctx.host,
+    );
+    cmd.env("GRU_WORKSPACE", &wt_ctx.minion_id);
+    run_agent_session_inner(backend, issue_ctx, wt_ctx, cmd, quiet, timeout_opt).await
+}
+
 /// Runs a resumed agent session, continuing from a previous interrupted session.
 ///
 /// Uses the backend's resume command to continue the existing conversation.

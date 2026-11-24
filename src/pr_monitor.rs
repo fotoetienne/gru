@@ -1391,6 +1391,21 @@ async fn get_review_feedback(
     })
 }
 
+/// Push instructions appended to every feedback prompt (reviews, PR comments).
+///
+/// Other people may push to the PR branch while the Minion works — always for
+/// adopted PRs (`gru adopt`), where the author keeps working on their branch.
+/// The agent must integrate those commits rather than overwrite them.
+pub(crate) fn format_push_safety_note(branch: &str) -> String {
+    format!(
+        "\n\n## Pushing\n\
+Other people may have pushed to this branch since your last push. Before pushing, run \
+`git pull --rebase origin {branch}` to put your commits on top of theirs, then push with \
+`git push origin HEAD:{branch}`. Never force-push, and never rewrite, squash or drop commits \
+you did not author.\n"
+    )
+}
+
 /// Format review feedback (bodies + inline comments) into a prompt for Claude
 pub(crate) fn format_review_prompt(
     issue_num: Option<u64>,
@@ -1609,6 +1624,14 @@ pub(crate) async fn get_pr_created_at(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_format_push_safety_note_names_branch_and_forbids_force_push() {
+        let note = format_push_safety_note("feature/my-change");
+        assert!(note.contains("git pull --rebase origin feature/my-change"));
+        assert!(note.contains("git push origin HEAD:feature/my-change"));
+        assert!(note.contains("Never force-push"));
+    }
 
     #[test]
     fn test_pull_request_has_label() {

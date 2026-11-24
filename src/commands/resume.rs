@@ -312,6 +312,30 @@ async fn run_resume_pipeline(ctx: ResumeContext, quiet: bool) -> Result<i32> {
         _minion_lock,
     } = ctx;
 
+    // Adopted PRs have their own pipeline: no implementation, no PR creation,
+    // and no failure-path branch rescue (which force-pushes).
+    if command == crate::commands::fix::ADOPT_COMMAND {
+        let _tmux_guard = TmuxGuard::new(&format!("gru:{}", wt_ctx.minion_id));
+        println!(
+            "🔄 Resuming adopted Minion {} in autonomous mode...",
+            wt_ctx.minion_id
+        );
+        if resume_prompt.is_some() {
+            println!("   (extra instructions are ignored for adopted PRs)");
+        }
+        return crate::commands::fix::run_adopted_pipeline(
+            &*backend,
+            &issue_ctx,
+            &wt_ctx,
+            &start_phase,
+            quiet,
+            effective_timeout.as_deref(),
+            None,
+            Duration::from_secs(24 * 3600),
+        )
+        .await;
+    }
+
     // Non-"do" minions (e.g., "prompt", "review") only run the agent phase —
     // they should not create PRs or enter the monitoring lifecycle.
     let agent_only = !crate::minion_registry::is_pr_monitoring_command(&command);
@@ -595,6 +619,11 @@ mod tests {
     #[test]
     fn test_is_pr_monitoring_command_legacy_fix() {
         assert!(crate::minion_registry::is_pr_monitoring_command("fix"));
+    }
+
+    #[test]
+    fn test_is_pr_monitoring_command_adopt() {
+        assert!(crate::minion_registry::is_pr_monitoring_command("adopt"));
     }
 
     #[test]

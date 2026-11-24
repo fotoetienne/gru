@@ -187,6 +187,18 @@ gru do 42 --timeout 30m                          # With a timeout
 gru do 42 --discuss                              # Review the prompt before launching
 ```
 
+### Hand off your own PR
+
+`gru adopt` gives a PR you wrote yourself (by hand or in an interactive agent session) to a Minion. The Minion checks out the PR's branch and skips implementation: it fixes CI failures, responds to review comments and rebases on conflicts until the PR merges. You can keep pushing to the branch; the Minion pulls your commits before each push and never force-pushes over them.
+
+```bash
+gru adopt 43                                       # By PR number (from within the repo)
+gru adopt https://github.com/owner/repo/pull/43    # By URL (from anywhere)
+gru adopt 43 --auto-merge                          # Merge once readiness checks pass
+```
+
+The PR must link an issue (`Fixes #42`), come from a branch in the same repo (not a fork), and be authored by you. Pass `--any-author` to adopt someone else's PR. `gru clean` removes the worktree after merge but never deletes the remote branch.
+
 ### Review PRs
 
 ```bash
