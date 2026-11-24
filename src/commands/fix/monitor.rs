@@ -128,10 +128,16 @@ enum AutoRebaseResult {
 /// directory where `events.jsonl` is written — passing it explicitly keeps
 /// the rebase agent's stream events co-located with the main agent's
 /// events instead of landing inside the checkout.
+/// Appended to the conflict-resolution prompt during auto-rebase: Gru does
+/// the push itself so it can refuse when someone else pushed meanwhile.
+const AUTO_REBASE_NO_PUSH_NOTE: &str = "\n\n## Do not push\n\
+Skip the force-push step. Gru pushes the rebased branch itself, after checking that nobody \
+else pushed to it while you were working. Do not run `git push` at all.\n";
+
 async fn auto_rebase_pr(checkout_path: &Path, minion_dir: &Path) -> Result<AutoRebaseResult> {
     use super::super::rebase::{
         abort_rebase, attempt_rebase, check_clean_worktree, detect_base_branch, ensure_on_branch,
-        force_push, get_current_branch, is_rebase_in_progress, run_agent_rebase, RebaseOutcome,
+        get_current_branch, is_rebase_in_progress, run_agent_rebase, RebaseOutcome,
     };
 
     // Abort any stale in-progress rebase left by a previous crashed attempt.
@@ -147,6 +153,39 @@ async fn auto_rebase_pr(checkout_path: &Path, minion_dir: &Path) -> Result<AutoR
     check_clean_worktree(checkout_path)
         .await
         .context("Cannot auto-rebase: worktree has uncommitted changes")?;
+
+    // Integrate any commits pushed to the PR branch by someone else (e.g. the
+    // author of an adopted PR) before rebasing. This also refreshes the
+    // remote-tracking ref that `--force-with-lease` checks against, so the
+    // force-push below can only replace commits this rebase already contains.
+    let pr_branch = get_current_branch(checkout_path).await?;
+    let synced = crate::git::sync_with_remote_branch(checkout_path, &pr_branch)
+        .await
+        .context("Cannot auto-rebase: failed to integrate new commits from the PR branch")?;
+    match synced {
+        crate::git::RemoteSync::Integrated => {
+            println!("🔀 Pulled new commits from origin/{}", pr_branch)
+        }
+        crate::git::RemoteSync::ResetToRemote => {
+            println!(
+                "🔀 origin/{} was force-pushed; moved to its new tip",
+                pr_branch
+            )
+        }
+        crate::git::RemoteSync::UpToDate => {}
+        // Auto-rebase only runs for an open PR, so a missing branch was
+        // deleted (e.g. after merge). Don't force-push it back into existence.
+        crate::git::RemoteSync::NoRemoteBranch => anyhow::bail!(
+            "Cannot auto-rebase: origin/{} no longer exists; not recreating it",
+            pr_branch
+        ),
+    }
+    // The remote tip the sync integrated (not a fresh fetch, which could
+    // pick up a rewind the rebase never saw) and HEAD before rebasing. The
+    // force-push at the end refuses if the remote changed since, other than
+    // moving forward to commits already in HEAD (see `force_push_rebased`).
+    let remote_before = crate::git::integrated_tip(checkout_path, &pr_branch).await?;
+    let pre_rebase_head = crate::git::head_sha(checkout_path).await?;
 
     // Detect the base branch first so we can fetch only what we need
     let base_branch = detect_base_branch(checkout_path).await?;
@@ -177,7 +216,13 @@ async fn auto_rebase_pr(checkout_path: &Path, minion_dir: &Path) -> Result<AutoR
                 if commit_count == 1 { "" } else { "s" }
             );
             log::info!("Auto force-pushing rebased branch (autonomous mode, --force-with-lease)");
-            force_push(checkout_path).await?;
+            crate::git::force_push_rebased(
+                checkout_path,
+                &pr_branch,
+                remote_before.as_deref(),
+                &pre_rebase_head,
+            )
+            .await?;
             println!("🚀 Force-pushed rebased branch");
             Ok(AutoRebaseResult::RebasedAndPushed)
         }
@@ -190,7 +235,14 @@ async fn auto_rebase_pr(checkout_path: &Path, minion_dir: &Path) -> Result<AutoR
             let local_branch = get_current_branch(checkout_path).await?;
 
             // None uses the 30m default inside run_agent_rebase
-            let exit_code = run_agent_rebase(checkout_path, minion_dir, &base_branch, None).await?;
+            let exit_code = run_agent_rebase(
+                checkout_path,
+                minion_dir,
+                &base_branch,
+                None,
+                Some(AUTO_REBASE_NO_PUSH_NOTE),
+            )
+            .await?;
 
             // Defensive check: agent may have checked out a remote tracking ref
             // (e.g. `origin/<branch>`) leaving the worktree in detached HEAD.
@@ -263,43 +315,17 @@ async fn auto_rebase_pr(checkout_path: &Path, minion_dir: &Path) -> Result<AutoR
                         );
                         return Ok(AutoRebaseResult::ConflictUnresolved);
                     }
-                    // Refresh the PR branch tracking ref before force_push. The
-                    // primary agent may have already pushed a merge commit, making
-                    // our local tracking ref stale. Without this fetch,
-                    // --force-with-lease would see a lease mismatch and fail.
-                    //
-                    // Use --refmap= (empty) + explicit refspec so only this one
-                    // branch is fetched, independent of remote.origin.fetch config
-                    // (mirrors the approach used by fetch_base_branch).
-                    let pr_refspec = format!(
-                        "refs/heads/{}:refs/remotes/origin/{}",
-                        local_branch, local_branch
-                    );
-                    let fetch_out = TokioCommand::new("git")
-                        .arg("-C")
-                        .arg(checkout_path)
-                        .args(["fetch", "--refmap=", "origin", pr_refspec.as_str()])
-                        .output()
-                        .await;
-                    match fetch_out {
-                        Ok(out) if !out.status.success() => {
-                            log::warn!(
-                                "Could not refresh PR branch tracking ref before push: {}",
-                                String::from_utf8_lossy(&out.stderr).trim()
-                            );
-                        }
-                        Err(e) => {
-                            log::warn!(
-                                "Could not refresh PR branch tracking ref before push: {:#}",
-                                e
-                            );
-                        }
-                        Ok(_) => {}
-                    }
                 }
-                // Defensively force push in case the rebase agent didn't push.
+                // The rebase agent is told not to push; Gru pushes, after
+                // checking nobody else pushed to the branch during the rebase.
                 log::info!("Auto force-pushing after conflict resolution (autonomous mode, --force-with-lease)");
-                force_push(checkout_path).await?;
+                crate::git::force_push_rebased(
+                    checkout_path,
+                    &pr_branch,
+                    remote_before.as_deref(),
+                    &pre_rebase_head,
+                )
+                .await?;
                 println!("🚀 Force-pushed rebased branch");
                 Ok(AutoRebaseResult::RebasedAndPushed)
             } else {
@@ -1113,7 +1139,7 @@ async fn handle_new_reviews(
         return LoopAction::Break;
     }
 
-    let review_prompt = pr_monitor::format_review_prompt(
+    let mut review_prompt = pr_monitor::format_review_prompt(
         ctx.issue_ctx.issue_num,
         ctx.pr_number,
         &feedback,
@@ -1121,6 +1147,9 @@ async fn handle_new_reviews(
         &ctx.issue_ctx.repo,
         &ctx.wt_ctx.minion_id,
     );
+    review_prompt.push_str(&pr_monitor::format_push_safety_note(
+        &ctx.wt_ctx.branch_name,
+    ));
 
     println!("🔄 Re-invoking to address review feedback...\n");
 
@@ -1170,7 +1199,15 @@ async fn handle_new_reviews(
         Err(e) => log::warn!("⚠️  Duplicate inline reply sweep failed: {:#}", e),
     }
 
+    let pushed = push_agent_commits(ctx).await;
+
     match agent_result {
+        Ok(()) if !pushed => {
+            // Keep the baseline: the feedback isn't handled until the fix is on the PR.
+            println!("❌ Changes could not be pushed; stopping monitoring (see PR comment)");
+            state.terminal_result = Some(MonitorResult::PushRefused);
+            LoopAction::Break
+        }
         Ok(()) => {
             println!("\n✅ Finished addressing review comments");
             println!("🔄 Continuing to monitor PR...\n");
@@ -1192,6 +1229,73 @@ async fn handle_new_reviews(
             LoopAction::Break
         }
     }
+}
+
+/// Pushes commits in the worktree that aren't on the PR yet, through Gru
+/// (`git::sync_and_push`): integrate anything others pushed, push with a
+/// lease, and record what was pushed.
+///
+/// Returns `false` if that failed; nothing was pushed and the PR has an
+/// escalation comment. Callers must then stop monitoring without advancing
+/// the review baseline (the PR on GitHub doesn't contain the fix, so the
+/// feedback isn't handled and merge readiness would judge stale code), and
+/// report `MonitorResult::PushRefused`. `monitor_pr_phase` then marks the
+/// Minion Failed and the issue blocked, so lab doesn't wake it and repeat
+/// the comment; `gru resume` retries the push.
+async fn push_pending_commits(
+    issue_ctx: &IssueContext,
+    wt_ctx: &WorktreeContext,
+    pr_number: &str,
+    what: &str,
+) -> bool {
+    match crate::git::sync_and_push(&wt_ctx.checkout_path, &wt_ctx.branch_name).await {
+        Ok(crate::git::SyncedPush::Pushed) => {
+            println!("📤 Pushed {}", what);
+            true
+        }
+        Ok(crate::git::SyncedPush::NothingToPush) => true,
+        Ok(crate::git::SyncedPush::RemoteBranchMissing) => {
+            // Deleted on the remote, usually auto-deleted after merge. Don't
+            // recreate it; the monitor's next poll sees the PR state.
+            log::warn!(
+                "⚠️  origin/{} no longer exists; not pushing {}",
+                wt_ctx.branch_name,
+                what
+            );
+            true
+        }
+        Err(e) => {
+            log::warn!("⚠️  Could not push {}: {:#}", what, e);
+            post_escalation_comment(
+                &issue_ctx.owner,
+                &issue_ctx.repo,
+                &issue_ctx.host,
+                pr_number,
+                &format!(
+                    "Could not push {} to `{}`: the branch changed in a way Gru won't merge \
+                     automatically (for example a force-push), or the push was rejected. The \
+                     commits are in the Minion's worktree, and the Minion has stopped monitoring \
+                     this PR. Resolve the branch, then run `gru resume {}` to retry the push.",
+                    what, wt_ctx.branch_name, wt_ctx.minion_id
+                ),
+                &wt_ctx.minion_id,
+            )
+            .await;
+            false
+        }
+    }
+}
+
+/// After a review/comment agent round, pushes the agent's commits (agents
+/// are told not to push). See [`push_pending_commits`].
+async fn push_agent_commits(ctx: &MonitorContext<'_>) -> bool {
+    push_pending_commits(
+        ctx.issue_ctx,
+        ctx.wt_ctx,
+        ctx.pr_number,
+        "the changes made for the latest feedback",
+    )
+    .await
 }
 
 async fn handle_new_issue_comments(
@@ -1225,7 +1329,7 @@ async fn handle_new_issue_comments(
         MAX_REVIEW_ROUNDS
     );
 
-    let prompt = pr_monitor::format_issue_comments_prompt(
+    let mut prompt = pr_monitor::format_issue_comments_prompt(
         ctx.issue_ctx.issue_num,
         ctx.pr_number,
         &comments,
@@ -1233,10 +1337,13 @@ async fn handle_new_issue_comments(
         &ctx.issue_ctx.repo,
         &ctx.wt_ctx.minion_id,
     );
+    prompt.push_str(&pr_monitor::format_push_safety_note(
+        &ctx.wt_ctx.branch_name,
+    ));
 
     println!("🔄 Re-invoking to address PR comments...\n");
 
-    match invoke_agent_for_reviews(
+    let agent_result = invoke_agent_for_reviews(
         ctx.backend,
         &ctx.wt_ctx.checkout_path,
         &ctx.wt_ctx.minion_dir,
@@ -1245,8 +1352,16 @@ async fn handle_new_issue_comments(
         ctx.timeout_opt,
         &ctx.issue_ctx.host,
     )
-    .await
-    {
+    .await;
+    let pushed = push_agent_commits(ctx).await;
+
+    match agent_result {
+        Ok(()) if !pushed => {
+            // Keep the baseline: the feedback isn't handled until the fix is on the PR.
+            println!("❌ Changes could not be pushed; stopping monitoring (see PR comment)");
+            state.terminal_result = Some(MonitorResult::PushRefused);
+            LoopAction::Break
+        }
         Ok(()) => {
             println!("\n✅ Finished addressing PR comments");
             println!("🔄 Continuing to monitor PR...\n");
@@ -1351,7 +1466,7 @@ async fn handle_failed_checks(
             println!("🔄 Continuing to monitor PR for other events...\n");
         }
         Err(e) => {
-            println!("⚠️  CI auto-fix error: {}", e);
+            println!("⚠️  CI auto-fix error: {:#}", e);
             println!(
                 "   Review the checks at: https://{}/{}/{}/pull/{}/checks",
                 ctx.issue_ctx.host, ctx.issue_ctx.owner, ctx.issue_ctx.repo, ctx.pr_number
@@ -1637,6 +1752,8 @@ async fn handle_pr_event(
         }
         Ok((MonitorResult::Timeout, _)) => handle_timeout(state, ctx),
         Ok((MonitorResult::Interrupted, _)) => handle_interrupted(ctx),
+        // Never produced by `monitor_pr`; only set by the monitor itself.
+        Ok((MonitorResult::PushRefused, _)) => LoopAction::Break,
         Err(e) => handle_monitor_error(state, ctx, e).await,
     }
 }
@@ -1656,6 +1773,33 @@ pub(crate) async fn monitor_pr_lifecycle(
     review_timeout: Option<Duration>,
     monitor_timeout: Duration,
 ) -> Option<MonitorResult> {
+    // Push commits left unpushed by an earlier session (e.g. a push that was
+    // refused). Don't monitor, review or judge merge readiness on a PR that
+    // is missing them.
+    //
+    // Only for an open PR: after merge or close, leftover local commits are
+    // obsolete and pushing them would publish work nobody will review. The
+    // monitor loop below reports the merged/closed state. If the state can't
+    // be fetched, try the push anyway (it still refuses unsafe cases).
+    let pr_open = pr_monitor::get_pr_info_for_exit_notification(
+        &issue_ctx.host,
+        &issue_ctx.owner,
+        &issue_ctx.repo,
+        pr_number,
+    )
+    .await
+    .unwrap_or_else(|e| {
+        log::warn!(
+            "⚠️  Could not check PR #{} state before pushing: {:#}",
+            pr_number,
+            e
+        );
+        true
+    });
+    if pr_open && !push_pending_commits(issue_ctx, wt_ctx, pr_number, "local commits").await {
+        return Some(MonitorResult::PushRefused);
+    }
+
     // Ensure the gru:ready-to-merge label exists in the repo
     if let Err(e) =
         pr_monitor::ensure_ready_to_merge_label(&issue_ctx.host, &issue_ctx.owner, &issue_ctx.repo)
@@ -1671,6 +1815,23 @@ pub(crate) async fn monitor_pr_lifecycle(
     // Capture timestamp before self-review so that any reviews submitted
     // during the review are not missed when the monitoring loop starts.
     let pre_review_time = chrono::Utc::now();
+
+    // A persisted baseline earlier than now means feedback may have arrived
+    // that no session has handled yet: posted while the Minion was stopped,
+    // or, for an adopted PR, after the author's last commit. Start from it
+    // so that feedback isn't skipped.
+    let mid = wt_ctx.minion_id.clone();
+    let persisted_baseline = minion_registry::with_registry(move |registry| {
+        Ok(registry
+            .get(&mid)
+            .and_then(|info| info.last_review_check_time))
+    })
+    .await
+    .ok()
+    .flatten();
+    let fresh_baseline = persisted_baseline
+        .filter(|t| *t < pre_review_time)
+        .unwrap_or(pre_review_time);
 
     // Guard: skip self-review if a review was already triggered or posted for the
     // current HEAD SHA.
@@ -1741,7 +1902,7 @@ pub(crate) async fn monitor_pr_lifecycle(
         // Done here (not before the already_reviewed guard) so that on re-entry
         // we don't overwrite a stored baseline with the current time, which would
         // cause reviews posted while the minion was stopped to be skipped.
-        save_review_check_time(&wt_ctx.minion_id, pre_review_time).await;
+        save_review_check_time(&wt_ctx.minion_id, fresh_baseline).await;
         // Persist the pending SHA *before* spawning the subprocess.  Setting it
         // after spawn would miss the primary crash scenario (session dies while the
         // child is running).  The trade-off: a crash in the narrow window *after*
@@ -1848,7 +2009,7 @@ pub(crate) async fn monitor_pr_lifecycle(
             }
         }
     } else {
-        pre_review_time
+        fresh_baseline
     };
 
     let mut state = MonitorLoopState::new(initial_baseline, confidence_threshold);

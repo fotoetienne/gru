@@ -17,6 +17,11 @@ pub(crate) struct Worktree {
     pub(crate) host: String,
     /// Path to the bare repository
     pub(crate) bare_repo_path: PathBuf,
+    /// PR number from the registry, set for adopted Minions (`gru adopt`).
+    /// Their branches have human-chosen names that earlier PRs may have used
+    /// too, so PR state checks query this PR directly instead of matching by
+    /// head branch name.
+    pub(crate) pr_number: Option<String>,
 }
 
 /// Status of a worktree indicating whether it can be cleaned
@@ -44,7 +49,14 @@ impl Worktree {
     /// and parses the number immediately after the prefix. This correctly handles
     /// branches like `minion/issue-42-M001` and avoids false positives on
     /// branches like `issue-fix-42`.
+    ///
+    /// Returns `None` for adopted Minions (`pr_number` set): their branch names
+    /// are chosen by people, so an `issue-N` segment needn't be the linked
+    /// issue. Their cleanup is decided by the PR's state alone.
     pub(crate) fn extract_issue_number(&self) -> Option<u32> {
+        if self.pr_number.is_some() {
+            return None;
+        }
         self.branch.split('/').find_map(|segment| {
             segment
                 .strip_prefix("issue-")
@@ -157,13 +169,24 @@ impl Worktree {
 
     /// Count PRs in a given state for this branch on GitHub.
     ///
-    /// Runs `gh pr list --state <state> --head <branch> --json number --jq length`.
+    /// Runs `gh pr list --state <state> --head <branch> --json number --jq length`,
+    /// or, when `pr_number` is set, checks that one PR's state (0 or 1).
     ///
     /// # Error behavior
     /// - Failure to spawn the `gh` process propagates as `Err`.
     /// - Non-zero CLI exit (e.g., auth failure, network error) propagates as `Err`.
     ///   Callers decide the conservative default for their use case.
     async fn count_prs_in_state(&self, state: &str) -> Result<u64> {
+        if let Some(pr) = &self.pr_number {
+            let pr_state = github::run_gh(
+                &self.host,
+                &[
+                    "pr", "view", pr, "--repo", &self.repo, "--json", "state", "--jq", ".state",
+                ],
+            )
+            .await?;
+            return Ok(u64::from(pr_state.trim().eq_ignore_ascii_case(state)));
+        }
         let child = github::gh_cli_command(&self.host)
             .kill_on_drop(true)
             .args([
@@ -500,6 +523,7 @@ fn parse_worktree_list(
                 repo: repo.to_string(),
                 host: host.to_string(),
                 bare_repo_path: bare_repo_path.to_path_buf(),
+                pr_number: None,
             })
         })
         .collect()
@@ -517,6 +541,7 @@ mod tests {
             repo: "owner/repo".to_string(),
             host: "github.com".to_string(),
             bare_repo_path: PathBuf::from("/tmp/repo.git"),
+            pr_number: None,
         };
         assert_eq!(wt.extract_issue_number(), Some(36));
 
@@ -526,6 +551,7 @@ mod tests {
             repo: "owner/repo".to_string(),
             host: "github.com".to_string(),
             bare_repo_path: PathBuf::from("/tmp/repo.git"),
+            pr_number: None,
         };
         assert_eq!(wt.extract_issue_number(), Some(42));
 
@@ -535,6 +561,7 @@ mod tests {
             repo: "owner/repo".to_string(),
             host: "github.com".to_string(),
             bare_repo_path: PathBuf::from("/tmp/repo.git"),
+            pr_number: None,
         };
         assert_eq!(wt.extract_issue_number(), Some(123));
 
@@ -544,6 +571,7 @@ mod tests {
             repo: "owner/repo".to_string(),
             host: "github.com".to_string(),
             bare_repo_path: PathBuf::from("/tmp/repo.git"),
+            pr_number: None,
         };
         assert_eq!(wt.extract_issue_number(), None);
 
@@ -554,6 +582,7 @@ mod tests {
             repo: "owner/repo".to_string(),
             host: "github.com".to_string(),
             bare_repo_path: PathBuf::from("/tmp/repo.git"),
+            pr_number: None,
         };
         assert_eq!(wt.extract_issue_number(), Some(42));
 
@@ -564,6 +593,19 @@ mod tests {
             repo: "owner/repo".to_string(),
             host: "github.com".to_string(),
             bare_repo_path: PathBuf::from("/tmp/repo.git"),
+            pr_number: None,
+        };
+        assert_eq!(wt.extract_issue_number(), None);
+
+        // Adopted Minion: a human branch name that happens to look like a
+        // Minion branch must not be trusted for the issue number.
+        let wt = Worktree {
+            path: PathBuf::from("/tmp/work"),
+            branch: "fix/issue-5-wip".to_string(),
+            repo: "owner/repo".to_string(),
+            host: "github.com".to_string(),
+            bare_repo_path: PathBuf::from("/tmp/repo.git"),
+            pr_number: Some("12".to_string()),
         };
         assert_eq!(wt.extract_issue_number(), None);
     }
@@ -645,6 +687,7 @@ mod tests {
             repo: "owner/repo".to_string(),
             host: "github.com".to_string(),
             bare_repo_path: bare_path,
+            pr_number: None,
         };
 
         // A fresh branch with no diverging commits IS "merged" by git's definition
@@ -675,6 +718,7 @@ mod tests {
             repo: "owner/repo".to_string(),
             host: "github.com".to_string(),
             bare_repo_path: bare_path,
+            pr_number: None,
         };
 
         let merged = wt.check_merged("main").await.unwrap();

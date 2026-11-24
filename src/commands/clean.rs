@@ -3,7 +3,7 @@ use crate::minion_registry::with_registry;
 use crate::workspace;
 use crate::worktree_scanner;
 use anyhow::{Context, Result};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use tokio::io::AsyncBufReadExt;
@@ -275,7 +275,7 @@ async fn scan_worktrees(
     // Load registry and get active minion worktrees
     // Note: There's a narrow race condition where a minion could start between registry load
     // and worktree checks. This is acceptable given the trade-offs and typical usage patterns.
-    let (active_minion_worktrees, stopped_minion_worktrees, stopped_minion_ids) =
+    let (active_minion_worktrees, stopped_minion_worktrees, stopped_minion_ids, adopted_prs) =
         with_registry(|registry| {
             // Partition registry into active (live process) and stopped minion worktree paths.
             // Active minions are protected from cleanup; stopped minions are cleanable as a fallback
@@ -284,6 +284,8 @@ async fn scan_worktrees(
             let mut stopped = HashSet::new();
             // Track stopped minions by ID for orphan cleanup (registry entries with no git worktree)
             let mut stopped_ids: Vec<(String, std::path::PathBuf)> = Vec::new();
+            // Adopted Minions' checkout path → PR number (see Worktree::pr_number)
+            let mut adopted: HashMap<PathBuf, String> = HashMap::new();
 
             for (minion_id, info) in registry.list() {
                 let is_alive = match info.pid {
@@ -321,6 +323,12 @@ async fn scan_worktrees(
                     }
                 };
 
+                if info.command == crate::commands::fix::ADOPT_COMMAND {
+                    if let Some(pr) = &info.pr {
+                        adopted.insert(canonical.clone(), pr.clone());
+                    }
+                }
+
                 if is_alive {
                     active.insert(canonical);
                 } else {
@@ -329,7 +337,7 @@ async fn scan_worktrees(
                 }
             }
 
-            Ok((active, stopped, stopped_ids))
+            Ok((active, stopped, stopped_ids, adopted))
         })
         .await
         .context(
@@ -339,8 +347,13 @@ async fn scan_worktrees(
         )?;
 
     // Detect stale worktree references (directory no longer exists on disk)
-    let (stale, worktrees): (Vec<_>, Vec<_>) =
+    let (stale, mut worktrees): (Vec<_>, Vec<_>) =
         worktrees.into_iter().partition(|wt| !wt.path.exists());
+
+    for wt in &mut worktrees {
+        let canonical = wt.path.canonicalize().unwrap_or_else(|_| wt.path.clone());
+        wt.pr_number = adopted_prs.get(&canonical).cloned();
+    }
 
     let mut stale_bare_repos = HashSet::new();
     let stale_count = stale.len();

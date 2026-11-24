@@ -51,6 +51,25 @@ pub(crate) async fn handle_rebase(
         return Ok(0);
     }
 
+    // With --push: integrate commits others pushed to the branch, and record
+    // the tip that was integrated, so the force-push can refuse if the remote
+    // changed since (new commits, or a rewind/rewrite by the author). A
+    // local-only rebase leaves the branch's relation to its remote alone.
+    let rebase_branch = get_current_branch(&worktree_path).await?;
+    let remote_before = if push {
+        match crate::git::sync_with_remote_branch(&worktree_path, &rebase_branch)
+            .await
+            .with_context(|| {
+                format!("Failed to integrate new commits from origin/{rebase_branch}")
+            })? {
+            crate::git::RemoteSync::NoRemoteBranch => None,
+            _ => crate::git::integrated_tip(&worktree_path, &rebase_branch).await?,
+        }
+    } else {
+        None
+    };
+    let pre_rebase_head = crate::git::head_sha(&worktree_path).await?;
+
     // Attempt the rebase
     let rebase_result = attempt_rebase(&worktree_path, &base_branch).await?;
 
@@ -63,7 +82,14 @@ pub(crate) async fn handle_rebase(
             );
 
             if push {
-                if !maybe_force_push(&worktree_path, yes).await? {
+                if !maybe_force_push(
+                    &worktree_path,
+                    remote_before.as_deref(),
+                    &pre_rebase_head,
+                    yes,
+                )
+                .await?
+                {
                     return Ok(1);
                 }
             } else {
@@ -90,7 +116,7 @@ pub(crate) async fn handle_rebase(
             // session's events land next to the main agent's events.
             let events_dir = derive_events_dir(&worktree_path);
             let exit_code =
-                run_agent_rebase(&worktree_path, &events_dir, &base_branch, timeout).await?;
+                run_agent_rebase(&worktree_path, &events_dir, &base_branch, timeout, None).await?;
 
             if exit_code == 0 {
                 // Agent succeeded: enforce branch recovery (any failure is a real error).
@@ -111,7 +137,14 @@ pub(crate) async fn handle_rebase(
 
                 if push {
                     // Defensively force push in case the /rebase skill didn't push
-                    if !maybe_force_push(&worktree_path, yes).await? {
+                    if !maybe_force_push(
+                        &worktree_path,
+                        remote_before.as_deref(),
+                        &pre_rebase_head,
+                        yes,
+                    )
+                    .await?
+                    {
                         return Ok(1);
                     }
                 } else {
@@ -679,7 +712,12 @@ pub(crate) async fn abort_rebase(worktree_path: &Path) -> Result<()> {
 /// Confirms with the user, then force-pushes. Skips the prompt when `yes` is true.
 ///
 /// Returns `true` if the push happened, `false` if the user cancelled.
-async fn maybe_force_push(worktree_path: &Path, yes: bool) -> Result<bool> {
+async fn maybe_force_push(
+    worktree_path: &Path,
+    remote_before: Option<&str>,
+    pre_rebase_head: &str,
+    yes: bool,
+) -> Result<bool> {
     let branch = get_current_branch(worktree_path).await?;
 
     if !yes {
@@ -703,7 +741,7 @@ async fn maybe_force_push(worktree_path: &Path, yes: bool) -> Result<bool> {
         }
     }
 
-    force_push(worktree_path).await?;
+    crate::git::force_push_rebased(worktree_path, &branch, remote_before, pre_rebase_head).await?;
     println!("🚀 Force-pushed rebased branch");
     Ok(true)
 }
@@ -733,32 +771,6 @@ async fn confirm_force_push() -> bool {
         }
         _ = tokio::signal::ctrl_c() => false,
     }
-}
-
-/// Force-pushes the current branch using --force-with-lease.
-///
-/// Explicitly specifies `origin HEAD` to avoid relying on upstream tracking
-/// configuration, which may not be set in worktrees created from bare repos.
-pub(crate) async fn force_push(worktree_path: &Path) -> Result<()> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(worktree_path)
-        .args(["push", "--force-with-lease", "origin", "HEAD"])
-        .output()
-        .await
-        .context("Failed to execute git push --force-with-lease")?;
-
-    if output.status.success() {
-        return Ok(());
-    }
-
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    anyhow::bail!(
-        "git push --force-with-lease failed: {}\n\
-         The remote branch may have been updated since your last fetch.\n\
-         Run `git fetch origin <base_branch>` and try again.",
-        stderr.trim()
-    );
 }
 
 /// Default timeout for agent conflict resolution (30 minutes).
@@ -817,12 +829,16 @@ pub(crate) async fn run_agent_rebase(
     events_dir: &Path,
     base_branch: &str,
     timeout: Option<&str>,
+    extra_instructions: Option<&str>,
 ) -> Result<i32> {
     let backend = agent_registry::resolve_backend(agent_registry::DEFAULT_AGENT)?;
     let session_id = Uuid::new_v4();
     let github_host = super::resume::resolve_host_from_worktree(checkout_path, "").await;
 
-    let prompt = REBASE_PROMPT_TEMPLATE.replace("<BASE_BRANCH>", base_branch);
+    let mut prompt = REBASE_PROMPT_TEMPLATE.replace("<BASE_BRANCH>", base_branch);
+    if let Some(extra) = extra_instructions {
+        prompt.push_str(extra);
+    }
     let cmd = backend.build_command(checkout_path, &session_id, &prompt, &github_host);
 
     let effective_timeout = Some(timeout.unwrap_or(DEFAULT_CONFLICT_TIMEOUT));

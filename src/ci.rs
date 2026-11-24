@@ -563,7 +563,7 @@ pub(crate) fn build_ci_fix_prompt(
         prompt.push(' ');
         prompt.push_str(&hints);
     }
-    prompt.push_str("\n\nAfter fixing, commit and push the changes.\n");
+    prompt.push_str("\n\nAfter fixing, commit the changes.\n");
 
     prompt
 }
@@ -956,10 +956,12 @@ pub(crate) async fn invoke_ci_fix(
     worktree_path: &Path,
     events_dir: &Path,
     github_host: &str,
+    branch: &str,
     failed_checks: &[CheckRun],
     attempt: u32,
 ) -> Result<i32> {
-    let prompt = build_ci_fix_prompt(failed_checks, attempt, worktree_path);
+    let mut prompt = build_ci_fix_prompt(failed_checks, attempt, worktree_path);
+    prompt.push_str(&crate::pr_monitor::format_push_safety_note(branch));
     let cmd = backend.build_ci_fix_command(worktree_path, &prompt, github_host);
     let timeout_str = format!("{}s", CI_FIX_TIMEOUT_SECS);
 
@@ -1180,6 +1182,16 @@ pub(crate) async fn monitor_and_fix_ci(
     let mut post_push = false;
 
     for attempt in 1..=MAX_CI_FIX_ATTEMPTS {
+        // Pick up commits others pushed to the PR branch (e.g. the author of
+        // an adopted PR) before choosing which commit's CI to check. Without
+        // this, a failing commit on the remote is missed while the local
+        // checkout still sits on an older, passing one. If the sync fails,
+        // stop here: fixing a stale checkout would be wasted work and its
+        // push would be rejected anyway.
+        crate::git::sync_with_remote_branch(worktree_path, branch)
+            .await
+            .with_context(|| format!("Failed to sync with origin/{} before CI check", branch))?;
+
         // Get the current HEAD SHA
         let head_sha = get_head_sha(worktree_path).await?;
 
@@ -1573,6 +1585,7 @@ async fn run_ci_fix_attempt(
         worktree_path,
         events_dir,
         host,
+        branch,
         &failed_checks,
         attempt,
     )
@@ -1638,25 +1651,24 @@ async fn run_ci_fix_attempt(
         }
     }
 
-    // Push the fix
+    // Push through Gru: integrate commits others pushed meanwhile (e.g. the
+    // author of an adopted PR), then push with a lease on what was
+    // integrated. If that fails (conflict, or the author rewound the branch
+    // under our fix) nothing is pushed and the attempt escalates.
     eprintln!("📤 Pushing CI fix...");
-    let push_output = Command::new("git")
-        .args(["push", "origin", branch])
-        .current_dir(worktree_path)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .await
-        .context("Failed to push CI fix")?;
-
-    if !push_output.status.success() {
-        let stderr = String::from_utf8_lossy(&push_output.stderr);
-        eprintln!(
-            "⚠️  Push failed: {}",
-            sanitize_push_failure_stderr(stderr.trim())
-        );
+    let pushed = match crate::git::sync_and_push(worktree_path, branch).await {
+        Ok(crate::git::SyncedPush::RemoteBranchMissing) => Err(anyhow::anyhow!(
+            "origin/{} no longer exists (deleted, e.g. after merge); not recreating it",
+            branch
+        )),
+        Ok(_) => Ok(()),
+        Err(e) => Err(e),
+    };
+    if let Err(e) = pushed {
+        let msg = format!("{:#}", e);
+        eprintln!("⚠️  Push failed: {}", sanitize_push_failure_stderr(&msg));
         eprintln!("🚨 Escalating to human due to push failure");
-        let reason = format_push_failure_reason(attempt, MAX_CI_FIX_ATTEMPTS, stderr.trim());
+        let reason = format_push_failure_reason(attempt, MAX_CI_FIX_ATTEMPTS, &msg);
         return Ok(
             escalate_exhaustion(host, owner, repo, pr_number, &reason, attempt, minion_id).await,
         );
@@ -1915,7 +1927,7 @@ mod tests {
         assert!(!prompt.contains("cargo"));
         assert!(!prompt.contains("npm"));
         assert!(prompt.contains("Please fix the failing checks."));
-        assert!(prompt.contains("After fixing, commit and push"));
+        assert!(prompt.contains("After fixing, commit the changes"));
     }
 
     #[test]

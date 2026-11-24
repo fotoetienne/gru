@@ -1347,6 +1347,381 @@ impl GitRepo {
     }
 }
 
+/// Outcome of [`sync_with_remote_branch`].
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum RemoteSync {
+    /// The remote branch does not exist (nothing to integrate).
+    NoRemoteBranch,
+    /// HEAD already contains every commit on the remote branch.
+    UpToDate,
+    /// The remote branch had commits HEAD lacked; local commits were rebased
+    /// on top of it.
+    Integrated,
+    /// Someone rewrote the remote branch (force-push) and HEAD had no
+    /// local-only commits, so HEAD was moved to the new remote tip.
+    ResetToRemote,
+}
+
+/// Runs git in `worktree_path` with repo-selection env vars cleared, so the
+/// command targets the worktree even when invoked from inside a git hook.
+/// `LC_ALL=C` keeps stderr in English for the few messages we match on.
+async fn run_git_in(worktree_path: &Path, args: &[&str]) -> Result<std::process::Output> {
+    Command::new("git")
+        .arg("-C")
+        .arg(worktree_path)
+        .args(args)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .env_remove("GIT_COMMON_DIR")
+        .env("LC_ALL", "C")
+        .output()
+        .await
+        .with_context(|| format!("Failed to execute git {}", args.join(" ")))
+}
+
+/// Like [`run_git_in`], for commands that talk to the remote (fetch, push):
+/// authenticates with `GRU_GITHUB_TOKEN` via `GIT_ASKPASS` when it's set, the
+/// same way `ensure_bare_clone` and `fetch_branch` do.
+async fn run_git_remote_in(worktree_path: &Path, args: &[&str]) -> Result<std::process::Output> {
+    let token = std::env::var("GRU_GITHUB_TOKEN")
+        .ok()
+        .filter(|t| !t.is_empty());
+    // `_askpass_file` must outlive the command: dropping it deletes the script.
+    let AuthenticatedGitCommand {
+        mut cmd,
+        _askpass_file,
+    } = git_command_with_auth(token.as_deref())?;
+    cmd.arg("-C")
+        .arg(worktree_path)
+        .args(args)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .env_remove("GIT_COMMON_DIR")
+        .env("LC_ALL", "C")
+        .output()
+        .await
+        .with_context(|| format!("Failed to execute git {}", args.join(" ")))
+}
+
+/// Resolves a ref to a commit SHA in the worktree, or `None` if it doesn't exist.
+async fn resolve_ref(worktree_path: &Path, refname: &str) -> Result<Option<String>> {
+    let spec = format!("{refname}^{{commit}}");
+    let out = run_git_in(worktree_path, &["rev-parse", "--verify", "--quiet", &spec]).await?;
+    if !out.status.success() {
+        return Ok(None);
+    }
+    let sha = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    Ok((!sha.is_empty()).then_some(sha))
+}
+
+/// Returns whether `ancestor` is an ancestor of (or equal to) `descendant`.
+async fn is_ancestor(worktree_path: &Path, ancestor: &str, descendant: &str) -> Result<bool> {
+    let out = run_git_in(
+        worktree_path,
+        &["merge-base", "--is-ancestor", ancestor, descendant],
+    )
+    .await?;
+    match out.status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => anyhow::bail!(
+            "git merge-base --is-ancestor {} {} failed: {}",
+            ancestor,
+            descendant,
+            String::from_utf8_lossy(&out.stderr).trim()
+        ),
+    }
+}
+
+/// Fetches `origin/<branch>` into `refs/remotes/origin/<branch>` and returns
+/// its SHA, or `None` if the branch doesn't exist on the remote.
+async fn fetch_remote_branch(worktree_path: &Path, branch: &str) -> Result<Option<String>> {
+    validate_branch_name(branch)?;
+    let refspec = format!("+refs/heads/{branch}:refs/remotes/origin/{branch}");
+    let fetch =
+        run_git_remote_in(worktree_path, &["fetch", "origin", "--refmap=", &refspec]).await?;
+    if !fetch.status.success() {
+        let stderr = String::from_utf8_lossy(&fetch.stderr);
+        if stderr.contains("couldn't find remote ref") {
+            return Ok(None);
+        }
+        anyhow::bail!(
+            "git fetch of origin/{} failed: {}",
+            branch,
+            redact_credentials(stderr.trim())
+        );
+    }
+    resolve_ref(worktree_path, &format!("refs/remotes/origin/{branch}")).await
+}
+
+/// Per-worktree ref holding the remote tip this worktree last integrated.
+///
+/// Refs under `refs/worktree/` are private to each worktree, unlike
+/// `refs/remotes/origin/*`, which every worktree of the shared bare repo (and
+/// any plain `git fetch origin` in one of them) updates. Comparing against the
+/// shared ref can't tell a force-push from a fast-forward once another
+/// process has fetched; this ref only changes when this worktree syncs or
+/// pushes.
+///
+/// Keyed by branch, so a record made while one branch was checked out is
+/// never compared with another branch's remote tip.
+fn synced_ref(branch: &str) -> String {
+    format!("refs/worktree/gru-synced/{branch}")
+}
+
+/// Records `sha` as the tip of `origin/<branch>` this worktree has integrated.
+async fn record_synced(worktree_path: &Path, branch: &str, sha: &str) -> Result<()> {
+    let refname = synced_ref(branch);
+    let out = run_git_in(worktree_path, &["update-ref", &refname, sha]).await?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "git update-ref {} failed: {}",
+            refname,
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+/// Outcome of [`sync_and_push`].
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum SyncedPush {
+    /// HEAD was already on the remote.
+    NothingToPush,
+    /// HEAD was pushed.
+    Pushed,
+    /// `origin/<branch>` doesn't exist, so nothing was pushed. Every caller
+    /// works on an existing PR; a missing branch means it was deleted (e.g.
+    /// auto-deleted after merge), and pushing would recreate it.
+    RemoteBranchMissing,
+}
+
+/// Integrates the remote branch into HEAD, then pushes HEAD if it's ahead.
+///
+/// This is the one way Gru pushes ordinary (non-rebase) work: CI fixes and
+/// the commits an agent makes in review/comment rounds (agents are told not
+/// to push themselves). Because Gru pushes, it can record exactly what it
+/// pushed, so a later rewind of those commits by the author is recognised
+/// as a rewrite by the next [`sync_with_remote_branch`].
+///
+/// The push leases against the tip just integrated, so a rewind or a new push
+/// that lands between the sync and the push is rejected rather than
+/// fast-forwarded over. Any sync or push failure is returned as an error and
+/// nothing is pushed. A missing remote branch is never created
+/// ([`SyncedPush::RemoteBranchMissing`]).
+pub(crate) async fn sync_and_push(worktree_path: &Path, branch: &str) -> Result<SyncedPush> {
+    if sync_with_remote_branch(worktree_path, branch).await? == RemoteSync::NoRemoteBranch {
+        return Ok(SyncedPush::RemoteBranchMissing);
+    }
+    let remote = resolve_ref(worktree_path, &synced_ref(branch))
+        .await?
+        .context("sync did not record the integrated remote tip")?;
+    let head = head_sha(worktree_path).await?;
+    if remote == head {
+        return Ok(SyncedPush::NothingToPush);
+    }
+    let lease = format!("--force-with-lease=refs/heads/{branch}:{remote}");
+    let target = format!("HEAD:refs/heads/{branch}");
+    let push = run_git_remote_in(worktree_path, &["push", &lease, "origin", &target]).await?;
+    if !push.status.success() {
+        anyhow::bail!(
+            "git push to origin/{} failed: {}",
+            branch,
+            redact_credentials(String::from_utf8_lossy(&push.stderr).trim())
+        );
+    }
+    record_synced(worktree_path, branch, &head).await?;
+    Ok(SyncedPush::Pushed)
+}
+
+/// Returns the remote tip this worktree last integrated or pushed (the
+/// per-worktree record kept by [`sync_with_remote_branch`] and the push
+/// helpers), or `None` if there is no record yet.
+///
+/// Use this, not a fresh fetch, as the baseline for a rebase push: a fetch
+/// after the sync could pick up an author's rewind that the rebase never
+/// saw, and the push would then put the removed commits back.
+pub(crate) async fn integrated_tip(worktree_path: &Path, branch: &str) -> Result<Option<String>> {
+    validate_branch_name(branch)?;
+    resolve_ref(worktree_path, &synced_ref(branch)).await
+}
+
+/// Fetches `origin/<branch>` and returns its tip, or `None` if it doesn't exist.
+#[cfg(test)]
+async fn fetch_remote_tip(worktree_path: &Path, branch: &str) -> Result<Option<String>> {
+    fetch_remote_branch(worktree_path, branch).await
+}
+
+/// Returns the commit HEAD points at.
+pub(crate) async fn head_sha(worktree_path: &Path) -> Result<String> {
+    resolve_ref(worktree_path, "HEAD")
+        .await?
+        .context("HEAD does not point at a commit")
+}
+
+/// Pulls commits that someone else pushed to `origin/<branch>` into HEAD.
+///
+/// Fetches the remote branch and compares it with the tip this worktree last
+/// integrated (see [`synced_ref`]). If HEAD doesn't already contain it:
+/// - if the remote was only fast-forwarded, rebases the local-only commits on
+///   top of it ([`RemoteSync::Integrated`]);
+/// - if the remote was rewritten (force-pushed) and HEAD has nothing beyond
+///   what was last integrated, moves HEAD to the new tip
+///   ([`RemoteSync::ResetToRemote`]) — replaying the old commits would undo
+///   the rewrite;
+/// - if the remote was rewritten and HEAD has local-only commits, returns an
+///   error so a human can sort it out.
+///
+/// The first sync in a worktree has no record yet and falls back to the
+/// shared tracking ref, which may already have moved; `gru adopt` syncs once
+/// right after creating the worktree so the record exists from the start.
+///
+/// On rebase conflicts the rebase is aborted, the worktree is left as it was,
+/// and an error is returned. Uncommitted changes are never discarded.
+pub(crate) async fn sync_with_remote_branch(
+    worktree_path: &Path,
+    branch: &str,
+) -> Result<RemoteSync> {
+    let remote_ref = format!("refs/remotes/origin/{branch}");
+    let previous = match resolve_ref(worktree_path, &synced_ref(branch)).await? {
+        Some(sha) => Some(sha),
+        None => resolve_ref(worktree_path, &remote_ref).await?,
+    };
+    let Some(current) = fetch_remote_branch(worktree_path, branch).await? else {
+        return Ok(RemoteSync::NoRemoteBranch);
+    };
+
+    // HEAD is exactly the remote tip: nothing to integrate, and nothing in
+    // HEAD can have been dropped by the remote. Checked before the rewrite
+    // test so a stale first-sync baseline can't turn this into an error.
+    if head_sha(worktree_path).await? == current {
+        record_synced(worktree_path, branch, &current).await?;
+        return Ok(RemoteSync::UpToDate);
+    }
+
+    // Check for a rewrite first: if the author dropped commits, the new tip
+    // is still an ancestor of HEAD, and "up to date" would keep (and later
+    // push back) what they removed.
+    let rewritten = match &previous {
+        Some(prev) => !is_ancestor(worktree_path, prev, &current).await?,
+        None => false,
+    };
+    let outcome = if rewritten {
+        let prev = previous.as_deref().unwrap_or_default();
+        if !is_ancestor(worktree_path, "HEAD", prev).await? {
+            anyhow::bail!(
+                "origin/{} was force-pushed while there are local commits not on the new \
+                 tip. Not rebasing automatically, since that could bring back commits the \
+                 author removed.",
+                branch
+            );
+        }
+        // `--keep` refuses rather than discarding uncommitted changes.
+        let reset = run_git_in(worktree_path, &["reset", "--keep", &current]).await?;
+        if !reset.status.success() {
+            anyhow::bail!(
+                "origin/{} was force-pushed, and moving to the new tip failed: {}",
+                branch,
+                String::from_utf8_lossy(&reset.stderr).trim()
+            );
+        }
+        RemoteSync::ResetToRemote
+    } else if is_ancestor(worktree_path, &current, "HEAD").await? {
+        RemoteSync::UpToDate
+    } else {
+        // Rebase onto the exact SHA just fetched, not the shared tracking ref:
+        // another worktree's fetch could move that ref to a newer tip, and
+        // the checkpoint recorded below would then not match what HEAD
+        // actually contains.
+        let rebase = run_git_in(worktree_path, &["rebase", &current]).await?;
+        if !rebase.status.success() {
+            let _ = run_git_in(worktree_path, &["rebase", "--abort"]).await;
+            anyhow::bail!(
+                "Could not rebase local commits onto origin/{} (new commits were pushed \
+                 to the branch and they conflict with local work): {}",
+                branch,
+                String::from_utf8_lossy(&rebase.stderr).trim()
+            );
+        }
+        RemoteSync::Integrated
+    };
+    record_synced(worktree_path, branch, &current).await?;
+    Ok(outcome)
+}
+
+/// Force-pushes a rebased HEAD to `origin/<branch>` without losing commits
+/// someone else pushed or removed in the meantime.
+///
+/// `remote_before` is the remote tip fetched just before the rebase and
+/// `pre_rebase_head` is HEAD at that point. The push is refused if:
+/// - the remote had commits that weren't part of the rebase
+///   (`remote_before` not in `pre_rebase_head`);
+/// - the remote moved during the rebase, unless it only moved forward to
+///   commits already in HEAD (another process pushed this same work). A
+///   rewind or rewrite during the rebase is refused, since pushing would
+///   restore what the author removed.
+///
+/// The lease names the exact SHA just checked, so a push that lands between
+/// the check and our push is rejected by the server.
+pub(crate) async fn force_push_rebased(
+    worktree_path: &Path,
+    branch: &str,
+    remote_before: Option<&str>,
+    pre_rebase_head: &str,
+) -> Result<()> {
+    if let Some(before) = remote_before {
+        if !is_ancestor(worktree_path, before, pre_rebase_head).await? {
+            anyhow::bail!(
+                "origin/{} has commits that were not part of the rebase; not force-pushing \
+                 over them.",
+                branch
+            );
+        }
+    }
+    let target = format!("HEAD:refs/heads/{branch}");
+    let current = fetch_remote_branch(worktree_path, branch).await?;
+    let lease = match (&current, remote_before) {
+        (None, None) => format!("--force-with-lease=refs/heads/{branch}:"),
+        (None, Some(_)) => anyhow::bail!(
+            "origin/{} was deleted during the rebase; not pushing.",
+            branch
+        ),
+        (Some(sha), before) => {
+            let unchanged = before == Some(sha.as_str());
+            let moved_forward_to_ours = match before {
+                Some(b) => {
+                    is_ancestor(worktree_path, b, sha).await?
+                        && is_ancestor(worktree_path, sha, "HEAD").await?
+                }
+                None => is_ancestor(worktree_path, sha, "HEAD").await?,
+            };
+            if !unchanged && !moved_forward_to_ours {
+                anyhow::bail!(
+                    "origin/{} changed during the rebase (new commits, or a rewind/rewrite by \
+                     the author); not force-pushing over it.",
+                    branch
+                );
+            }
+            format!("--force-with-lease=refs/heads/{branch}:{sha}")
+        }
+    };
+    let push = run_git_remote_in(worktree_path, &["push", &lease, "origin", &target]).await?;
+    if !push.status.success() {
+        anyhow::bail!(
+            "git push {} failed: {}",
+            lease,
+            redact_credentials(String::from_utf8_lossy(&push.stderr).trim())
+        );
+    }
+    // The remote now holds our rewrite; record it so the next sync doesn't
+    // mistake it for someone else's force-push.
+    let pushed = head_sha(worktree_path).await?;
+    record_synced(worktree_path, branch, &pushed).await?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2443,5 +2818,515 @@ mod tests {
             "fetch refspec should be updated to refs/remotes/origin/* after ensure_bare_clone"
         );
         // `tmp` drops here, cleaning up all directories automatically.
+    }
+
+    /// Runs a git command synchronously in `dir`, panicking on failure.
+    fn git_ok(dir: &Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
+            .env_remove("GIT_COMMON_DIR")
+            .output()
+            .expect("git failed to spawn");
+        assert!(
+            out.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// Creates a bare `origin` with a `feature` branch and two clones of it:
+    /// `mine` (the Minion's checkout) and `theirs` (the PR author's checkout).
+    fn setup_shared_branch(dir: &Path) -> (PathBuf, PathBuf) {
+        let bare = dir.join("origin.git");
+        git_ok(
+            dir,
+            &["init", "--bare", "-b", "main", bare.to_str().unwrap()],
+        );
+        let mut clones = Vec::new();
+        for name in ["theirs", "mine"] {
+            let wt = dir.join(name);
+            std::fs::create_dir_all(&wt).unwrap();
+            git_ok(&wt, &["init", "-b", "main"]);
+            git_ok(&wt, &["config", "user.email", "t@t"]);
+            git_ok(&wt, &["config", "user.name", "t"]);
+            git_ok(&wt, &["remote", "add", "origin", bare.to_str().unwrap()]);
+            clones.push(wt);
+        }
+        let theirs = clones[0].clone();
+        let mine = clones[1].clone();
+        std::fs::write(theirs.join("base.txt"), "base").unwrap();
+        git_ok(&theirs, &["add", "."]);
+        git_ok(&theirs, &["commit", "-m", "base"]);
+        git_ok(&theirs, &["push", "origin", "HEAD:refs/heads/feature"]);
+        git_ok(&mine, &["fetch", "origin"]);
+        git_ok(&mine, &["checkout", "-b", "feature", "origin/feature"]);
+        (mine, theirs)
+    }
+
+    fn log_subjects(dir: &Path) -> Vec<String> {
+        let out = std::process::Command::new("git")
+            .args(["log", "--format=%s"])
+            .current_dir(dir)
+            .env_remove("GIT_DIR")
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(String::from)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn test_sync_with_remote_branch_up_to_date() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mine, _theirs) = setup_shared_branch(tmp.path());
+        let result = sync_with_remote_branch(&mine, "feature").await.unwrap();
+        assert_eq!(result, RemoteSync::UpToDate);
+    }
+
+    #[tokio::test]
+    async fn test_sync_with_remote_branch_missing_remote() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mine, _theirs) = setup_shared_branch(tmp.path());
+        let result = sync_with_remote_branch(&mine, "no-such-branch")
+            .await
+            .unwrap();
+        assert_eq!(result, RemoteSync::NoRemoteBranch);
+    }
+
+    #[tokio::test]
+    async fn test_sync_with_remote_branch_preserves_other_authors_commits() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mine, theirs) = setup_shared_branch(tmp.path());
+
+        // The PR author pushes a new commit while the Minion has a local fix.
+        std::fs::write(theirs.join("theirs.txt"), "theirs").unwrap();
+        git_ok(&theirs, &["add", "."]);
+        git_ok(&theirs, &["commit", "-m", "author commit"]);
+        git_ok(&theirs, &["push", "origin", "HEAD:refs/heads/feature"]);
+
+        std::fs::write(mine.join("mine.txt"), "mine").unwrap();
+        git_ok(&mine, &["add", "."]);
+        git_ok(&mine, &["commit", "-m", "minion fix"]);
+
+        let result = sync_with_remote_branch(&mine, "feature").await.unwrap();
+        assert_eq!(result, RemoteSync::Integrated);
+        assert_eq!(
+            log_subjects(&mine),
+            vec!["minion fix", "author commit", "base"]
+        );
+
+        // A plain (non-force) push now fast-forwards without losing anything.
+        git_ok(&mine, &["push", "origin", "HEAD:refs/heads/feature"]);
+    }
+
+    /// Rewrites `feature` on the remote from `theirs` (amend + force-push).
+    fn force_push_rewrite(theirs: &Path) {
+        git_ok(theirs, &["fetch", "origin"]);
+        git_ok(theirs, &["reset", "--hard", "origin/feature"]);
+        std::fs::write(theirs.join("base.txt"), "amended").unwrap();
+        git_ok(theirs, &["commit", "-a", "--amend", "-m", "base amended"]);
+        git_ok(
+            theirs,
+            &["push", "--force", "origin", "HEAD:refs/heads/feature"],
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sync_with_remote_branch_follows_force_push_without_local_commits() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mine, theirs) = setup_shared_branch(tmp.path());
+        force_push_rewrite(&theirs);
+
+        let result = sync_with_remote_branch(&mine, "feature").await.unwrap();
+        assert_eq!(result, RemoteSync::ResetToRemote);
+        // The old "base" commit is not replayed on top of the rewrite.
+        assert_eq!(log_subjects(&mine), vec!["base amended"]);
+    }
+
+    #[tokio::test]
+    async fn test_sync_detects_force_push_after_shared_tracking_ref_moved() {
+        // Another process (lab, another Minion) fetches into the shared
+        // tracking ref after the author's force-push but before this sync.
+        let tmp = tempfile::tempdir().unwrap();
+        let (mine, theirs) = setup_shared_branch(tmp.path());
+        assert_eq!(
+            sync_with_remote_branch(&mine, "feature").await.unwrap(),
+            RemoteSync::UpToDate
+        );
+        std::fs::write(theirs.join("extra.txt"), "x").unwrap();
+        git_ok(&theirs, &["add", "."]);
+        git_ok(&theirs, &["commit", "-m", "author commit to drop"]);
+        git_ok(&theirs, &["push", "origin", "HEAD:refs/heads/feature"]);
+        assert_eq!(
+            sync_with_remote_branch(&mine, "feature").await.unwrap(),
+            RemoteSync::Integrated
+        );
+
+        // The author drops that commit and force-pushes; someone else fetches.
+        git_ok(&theirs, &["reset", "--hard", "HEAD~1"]);
+        git_ok(
+            &theirs,
+            &["push", "--force", "origin", "HEAD:refs/heads/feature"],
+        );
+        git_ok(&mine, &["fetch", "origin"]);
+
+        let result = sync_with_remote_branch(&mine, "feature").await.unwrap();
+        assert_eq!(result, RemoteSync::ResetToRemote);
+        assert_eq!(log_subjects(&mine), vec!["base"]);
+    }
+
+    #[tokio::test]
+    async fn test_sync_refuses_after_shared_ref_moved_with_local_commits() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mine, theirs) = setup_shared_branch(tmp.path());
+        sync_with_remote_branch(&mine, "feature").await.unwrap();
+        std::fs::write(mine.join("mine.txt"), "mine").unwrap();
+        git_ok(&mine, &["add", "."]);
+        git_ok(&mine, &["commit", "-m", "minion fix"]);
+        force_push_rewrite(&theirs);
+        git_ok(&mine, &["fetch", "origin"]);
+
+        assert!(sync_with_remote_branch(&mine, "feature").await.is_err());
+        assert_eq!(log_subjects(&mine), vec!["minion fix", "base"]);
+    }
+
+    #[tokio::test]
+    async fn test_sync_after_own_force_push_is_not_a_rewrite() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mine, theirs) = setup_shared_branch(tmp.path());
+        sync_with_remote_branch(&mine, "feature").await.unwrap();
+        let remote = fetch_remote_tip(&mine, "feature").await.unwrap();
+        let from = head_sha(&mine).await.unwrap();
+        rebase_onto_new_main(&mine, &theirs);
+        force_push_rebased(&mine, "feature", remote.as_deref(), &from)
+            .await
+            .unwrap();
+
+        // The author pulls the rebase and pushes on top; the Minion has a local fix.
+        git_ok(&theirs, &["fetch", "origin"]);
+        git_ok(&theirs, &["checkout", "-B", "feature", "origin/feature"]);
+        std::fs::write(theirs.join("theirs.txt"), "t").unwrap();
+        git_ok(&theirs, &["add", "."]);
+        git_ok(&theirs, &["commit", "-m", "author commit"]);
+        git_ok(&theirs, &["push", "origin", "HEAD:refs/heads/feature"]);
+        std::fs::write(mine.join("mine.txt"), "m").unwrap();
+        git_ok(&mine, &["add", "."]);
+        git_ok(&mine, &["commit", "-m", "minion fix"]);
+
+        let result = sync_with_remote_branch(&mine, "feature").await.unwrap();
+        assert_eq!(result, RemoteSync::Integrated);
+        assert_eq!(log_subjects(&mine)[..2], ["minion fix", "author commit"]);
+    }
+
+    #[tokio::test]
+    async fn test_sync_with_remote_branch_refuses_force_push_with_local_commits() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mine, theirs) = setup_shared_branch(tmp.path());
+        std::fs::write(mine.join("mine.txt"), "mine").unwrap();
+        git_ok(&mine, &["add", "."]);
+        git_ok(&mine, &["commit", "-m", "minion fix"]);
+        force_push_rewrite(&theirs);
+
+        let err = sync_with_remote_branch(&mine, "feature").await.unwrap_err();
+        assert!(format!("{:#}", err).contains("force-pushed"));
+        assert_eq!(log_subjects(&mine), vec!["minion fix", "base"]);
+    }
+
+    /// Rebases `mine` onto a new commit on `main`, the way auto-rebase does.
+    fn rebase_onto_new_main(mine: &Path, theirs: &Path) {
+        std::fs::write(theirs.join("main.txt"), "main").unwrap();
+        git_ok(theirs, &["checkout", "-b", "main-work", "main"]);
+        git_ok(theirs, &["add", "."]);
+        git_ok(theirs, &["commit", "-m", "main commit"]);
+        git_ok(theirs, &["push", "origin", "HEAD:refs/heads/main"]);
+        git_ok(theirs, &["checkout", "main"]);
+        git_ok(mine, &["fetch", "origin"]);
+        git_ok(mine, &["rebase", "origin/main"]);
+    }
+
+    #[tokio::test]
+    async fn test_force_push_rebased_pushes_when_remote_unchanged() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mine, theirs) = setup_shared_branch(tmp.path());
+        let remote = fetch_remote_tip(&mine, "feature").await.unwrap();
+        let from = head_sha(&mine).await.unwrap();
+        rebase_onto_new_main(&mine, &theirs);
+
+        force_push_rebased(&mine, "feature", remote.as_deref(), &from)
+            .await
+            .unwrap();
+        let head = resolve_ref(&mine, "HEAD").await.unwrap();
+        let remote = fetch_remote_branch(&mine, "feature").await.unwrap();
+        assert_eq!(head, remote);
+    }
+
+    #[tokio::test]
+    async fn test_force_push_rebased_refuses_when_author_pushed_meanwhile() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mine, theirs) = setup_shared_branch(tmp.path());
+        let before = fetch_remote_tip(&mine, "feature").await.unwrap();
+        let from = head_sha(&mine).await.unwrap();
+        rebase_onto_new_main(&mine, &theirs);
+
+        // The author pushes to the PR branch while the rebase is in progress.
+        git_ok(&theirs, &["fetch", "origin"]);
+        git_ok(&theirs, &["checkout", "-B", "feature", "origin/feature"]);
+        std::fs::write(theirs.join("late.txt"), "late").unwrap();
+        git_ok(&theirs, &["add", "."]);
+        git_ok(&theirs, &["commit", "-m", "late author commit"]);
+        git_ok(&theirs, &["push", "origin", "HEAD:refs/heads/feature"]);
+        let author_tip = resolve_ref(&theirs, "HEAD").await.unwrap();
+
+        let err = force_push_rebased(&mine, "feature", before.as_deref(), &from)
+            .await
+            .unwrap_err();
+        assert!(format!("{:#}", err).contains("not force-pushing"));
+        // The author's commit is still the remote tip.
+        let remote = fetch_remote_branch(&mine, "feature").await.unwrap();
+        assert_eq!(remote, author_tip);
+    }
+
+    /// Pushes one more commit to `feature` from `theirs` and syncs `mine`.
+    fn author_adds_commit(theirs: &Path, msg: &str) {
+        git_ok(theirs, &["fetch", "origin"]);
+        git_ok(theirs, &["checkout", "-B", "feature", "origin/feature"]);
+        std::fs::write(theirs.join(format!("{msg}.txt")), msg).unwrap();
+        git_ok(theirs, &["add", "."]);
+        git_ok(theirs, &["commit", "-m", msg]);
+        git_ok(theirs, &["push", "origin", "HEAD:refs/heads/feature"]);
+    }
+
+    #[tokio::test]
+    async fn test_force_push_rebased_refuses_rewind_during_rebase() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mine, theirs) = setup_shared_branch(tmp.path());
+        author_adds_commit(&theirs, "b");
+        sync_with_remote_branch(&mine, "feature").await.unwrap();
+        let before = fetch_remote_tip(&mine, "feature").await.unwrap();
+        let from = head_sha(&mine).await.unwrap();
+        rebase_onto_new_main(&mine, &theirs);
+
+        // The author drops "b" (rewinds to "base") while the rebase runs.
+        git_ok(&theirs, &["checkout", "-B", "feature", "origin/feature"]);
+        git_ok(&theirs, &["reset", "--hard", "HEAD~1"]);
+        git_ok(
+            &theirs,
+            &["push", "--force", "origin", "HEAD:refs/heads/feature"],
+        );
+        let rewound = resolve_ref(&theirs, "HEAD").await.unwrap();
+
+        let err = force_push_rebased(&mine, "feature", before.as_deref(), &from)
+            .await
+            .unwrap_err();
+        assert!(format!("{:#}", err).contains("changed during the rebase"));
+        assert_eq!(fetch_remote_tip(&mine, "feature").await.unwrap(), rewound);
+    }
+
+    #[tokio::test]
+    async fn test_force_push_rebased_refuses_rewind_between_sync_and_rebase() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mine, theirs) = setup_shared_branch(tmp.path());
+        author_adds_commit(&theirs, "b");
+        sync_with_remote_branch(&mine, "feature").await.unwrap();
+        // The author drops "b" right after the sync, before the rebase starts.
+        git_ok(&theirs, &["reset", "--hard", "HEAD~1"]);
+        git_ok(
+            &theirs,
+            &["push", "--force", "origin", "HEAD:refs/heads/feature"],
+        );
+        let rewound = resolve_ref(&theirs, "HEAD").await.unwrap();
+
+        let before = integrated_tip(&mine, "feature").await.unwrap();
+        let from = head_sha(&mine).await.unwrap();
+        rebase_onto_new_main(&mine, &theirs);
+
+        assert!(
+            force_push_rebased(&mine, "feature", before.as_deref(), &from)
+                .await
+                .is_err()
+        );
+        assert_eq!(fetch_remote_tip(&mine, "feature").await.unwrap(), rewound);
+    }
+
+    #[tokio::test]
+    async fn test_sync_up_to_date_when_head_is_remote_tip_despite_stale_baseline() {
+        // No checkpoint yet, and the shared tracking ref is stale and not an
+        // ancestor of the remote tip (rewritten), but HEAD already is the tip.
+        let tmp = tempfile::tempdir().unwrap();
+        let (mine, theirs) = setup_shared_branch(tmp.path());
+        force_push_rewrite(&theirs);
+        let tip = resolve_ref(&theirs, "HEAD").await.unwrap().unwrap();
+        git_ok(&mine, &["fetch", "origin", "feature"]);
+        git_ok(&mine, &["reset", "--hard", &tip]);
+        // Make the tracking ref stale: point it back at the pre-rewrite base.
+        git_ok(
+            &mine,
+            &["update-ref", "refs/remotes/origin/feature", "HEAD@{1}"],
+        );
+
+        assert_eq!(
+            sync_with_remote_branch(&mine, "feature").await.unwrap(),
+            RemoteSync::UpToDate
+        );
+    }
+
+    #[tokio::test]
+    async fn test_checkpoint_is_per_branch() {
+        // Sync `feature`, then switch the same checkout to an unrelated
+        // branch. Its first sync must not be compared with `feature`'s record.
+        let tmp = tempfile::tempdir().unwrap();
+        let (mine, theirs) = setup_shared_branch(tmp.path());
+        author_adds_commit(&theirs, "feature-only");
+        sync_with_remote_branch(&mine, "feature").await.unwrap();
+
+        git_ok(&theirs, &["checkout", "--orphan", "other"]);
+        git_ok(&theirs, &["rm", "-rf", "--cached", "."]);
+        std::fs::write(theirs.join("other.txt"), "o").unwrap();
+        git_ok(&theirs, &["add", "other.txt"]);
+        git_ok(&theirs, &["commit", "-m", "other root"]);
+        git_ok(&theirs, &["push", "origin", "HEAD:refs/heads/other"]);
+        git_ok(&mine, &["fetch", "origin"]);
+        git_ok(&mine, &["checkout", "-b", "other", "origin/other"]);
+
+        assert_eq!(
+            sync_with_remote_branch(&mine, "other").await.unwrap(),
+            RemoteSync::UpToDate
+        );
+        assert_ne!(
+            integrated_tip(&mine, "other").await.unwrap(),
+            integrated_tip(&mine, "feature").await.unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_force_push_rebased_refuses_when_remote_ahead_before_rebase() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mine, theirs) = setup_shared_branch(tmp.path());
+        author_adds_commit(&theirs, "unpulled");
+        // `mine` never integrated "unpulled".
+        let before = fetch_remote_tip(&mine, "feature").await.unwrap();
+        let from = head_sha(&mine).await.unwrap();
+        rebase_onto_new_main(&mine, &theirs);
+
+        let err = force_push_rebased(&mine, "feature", before.as_deref(), &from)
+            .await
+            .unwrap_err();
+        assert!(format!("{:#}", err).contains("not part of the rebase"));
+    }
+
+    #[tokio::test]
+    async fn test_rewind_of_gru_push_is_detected() {
+        // Synced at A, Gru pushes B, the author rewinds to A.
+        let tmp = tempfile::tempdir().unwrap();
+        let (mine, _theirs) = setup_shared_branch(tmp.path());
+        sync_with_remote_branch(&mine, "feature").await.unwrap();
+        let a = head_sha(&mine).await.unwrap();
+        std::fs::write(mine.join("b.txt"), "b").unwrap();
+        git_ok(&mine, &["add", "."]);
+        git_ok(&mine, &["commit", "-m", "agent b"]);
+        assert_eq!(
+            sync_and_push(&mine, "feature").await.unwrap(),
+            SyncedPush::Pushed
+        );
+
+        let bare = tmp.path().join("origin.git");
+        git_ok(&bare, &["update-ref", "refs/heads/feature", &a]);
+
+        // Not "up to date": HEAD would push "agent b" back. HEAD has nothing
+        // beyond what was pushed, so it follows the rewind.
+        let result = sync_with_remote_branch(&mine, "feature").await.unwrap();
+        assert_eq!(result, RemoteSync::ResetToRemote);
+        assert_eq!(log_subjects(&mine), vec!["base"]);
+        assert_eq!(
+            sync_and_push(&mine, "feature").await.unwrap(),
+            SyncedPush::NothingToPush
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sync_and_push_integrates_author_commits_then_pushes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mine, theirs) = setup_shared_branch(tmp.path());
+        sync_with_remote_branch(&mine, "feature").await.unwrap();
+        author_adds_commit(&theirs, "author");
+        std::fs::write(mine.join("fix.txt"), "fix").unwrap();
+        git_ok(&mine, &["add", "."]);
+        git_ok(&mine, &["commit", "-m", "fix"]);
+
+        assert_eq!(
+            sync_and_push(&mine, "feature").await.unwrap(),
+            SyncedPush::Pushed
+        );
+        assert_eq!(
+            fetch_remote_tip(&mine, "feature").await.unwrap(),
+            Some(head_sha(&mine).await.unwrap())
+        );
+        assert_eq!(log_subjects(&mine), vec!["fix", "author", "base"]);
+    }
+
+    #[tokio::test]
+    async fn test_sync_and_push_does_not_recreate_deleted_branch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mine, _theirs) = setup_shared_branch(tmp.path());
+        sync_with_remote_branch(&mine, "feature").await.unwrap();
+        std::fs::write(mine.join("fix.txt"), "fix").unwrap();
+        git_ok(&mine, &["add", "."]);
+        git_ok(&mine, &["commit", "-m", "fix"]);
+        // The PR merged and GitHub auto-deleted its branch.
+        let bare = tmp.path().join("origin.git");
+        git_ok(&bare, &["update-ref", "-d", "refs/heads/feature"]);
+
+        assert_eq!(
+            sync_and_push(&mine, "feature").await.unwrap(),
+            SyncedPush::RemoteBranchMissing
+        );
+        assert_eq!(fetch_remote_tip(&mine, "feature").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn test_sync_and_push_refuses_on_rewind_with_local_commits() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mine, theirs) = setup_shared_branch(tmp.path());
+        author_adds_commit(&theirs, "b");
+        sync_with_remote_branch(&mine, "feature").await.unwrap();
+        std::fs::write(mine.join("c.txt"), "c").unwrap();
+        git_ok(&mine, &["add", "."]);
+        git_ok(&mine, &["commit", "-m", "minion c"]);
+        // Author drops "b".
+        git_ok(&theirs, &["reset", "--hard", "HEAD~1"]);
+        git_ok(
+            &theirs,
+            &["push", "--force", "origin", "HEAD:refs/heads/feature"],
+        );
+        let rewound = resolve_ref(&theirs, "HEAD").await.unwrap();
+
+        assert!(sync_and_push(&mine, "feature").await.is_err());
+        assert_eq!(fetch_remote_tip(&mine, "feature").await.unwrap(), rewound);
+    }
+
+    #[tokio::test]
+    async fn test_sync_with_remote_branch_conflict_aborts_and_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mine, theirs) = setup_shared_branch(tmp.path());
+
+        std::fs::write(theirs.join("base.txt"), "theirs").unwrap();
+        git_ok(&theirs, &["commit", "-am", "author edit"]);
+        git_ok(&theirs, &["push", "origin", "HEAD:refs/heads/feature"]);
+
+        std::fs::write(mine.join("base.txt"), "mine").unwrap();
+        git_ok(&mine, &["commit", "-am", "minion edit"]);
+
+        let err = sync_with_remote_branch(&mine, "feature").await.unwrap_err();
+        assert!(format!("{:#}", err).contains("Could not rebase"));
+        // Rebase was aborted: local history is untouched.
+        assert_eq!(log_subjects(&mine), vec!["minion edit", "base"]);
+        assert!(!mine.join(".git/rebase-merge").exists());
+        assert!(!mine.join(".git/rebase-apply").exists());
     }
 }

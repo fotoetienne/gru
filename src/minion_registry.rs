@@ -717,9 +717,9 @@ impl MinionInfo {
     /// Returns `true` if this minion's command has a PR monitoring lifecycle
     /// (i.e., it creates PRs and should be woken for reviews/conflicts).
     ///
-    /// Only `"do"` and the legacy `"fix"` alias qualify. One-shot commands
-    /// like `"review"` and `"prompt"` exit immediately when resumed past the
-    /// agent phase.
+    /// Only `"do"`, the legacy `"fix"` alias, and `"adopt"` qualify. One-shot
+    /// commands like `"review"` and `"prompt"` exit immediately when resumed
+    /// past the agent phase.
     pub(crate) fn has_pr_monitoring_lifecycle(&self) -> bool {
         is_pr_monitoring_command(&self.command)
     }
@@ -743,11 +743,11 @@ impl MinionInfo {
 /// Returns `true` if the given command has a PR monitoring lifecycle
 /// (creates PRs and should be woken for reviews/conflicts).
 ///
-/// Only `"do"` and the legacy `"fix"` alias qualify. One-shot commands
-/// like `"review"` and `"prompt"` exit immediately when resumed past the
-/// agent phase.
+/// Only `"do"`, the legacy `"fix"` alias, and `"adopt"` (an existing PR
+/// handed to a Minion) qualify. One-shot commands like `"review"` and
+/// `"prompt"` exit immediately when resumed past the agent phase.
 pub(crate) fn is_pr_monitoring_command(command: &str) -> bool {
-    command == "do" || command == "fix"
+    command == "do" || command == "fix" || command == "adopt"
 }
 
 /// Checks whether a process with the given PID is still alive.

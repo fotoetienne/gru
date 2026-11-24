@@ -1,3 +1,4 @@
+mod adopt;
 mod agent;
 mod helpers;
 mod monitor;
@@ -8,6 +9,7 @@ mod worker;
 mod worktree;
 
 // Re-export public API used by other modules (e.g., resume.rs)
+pub(crate) use adopt::{handle_adopt, run_adopted_pipeline, AdoptOptions, ADOPT_COMMAND};
 pub(crate) use helpers::update_orchestration_phase;
 pub(crate) use resolve::fetch_issue_details;
 use resolve::{check_existing_minions, claim_issue, resolve_issue};
@@ -220,6 +222,21 @@ async fn run_worker(minion_id: &str, issue: &str, opts: FixOptions) -> Result<i3
 
     // Determine resume phase from registry
     let start_phase = info.orchestration_phase.clone();
+
+    // Adopted PRs (`gru adopt`) skip implementation and PR creation.
+    if info.command == ADOPT_COMMAND {
+        return run_adopted_pipeline(
+            &*backend,
+            &issue_ctx,
+            &wt_ctx,
+            &start_phase,
+            quiet,
+            timeout_opt.as_deref(),
+            review_timeout,
+            monitor_timeout,
+        )
+        .await;
+    }
 
     // Phase 3: Run agent
     let agent_result = match worker::run_agent_phase(

@@ -791,6 +791,9 @@ pub(crate) enum MonitorResult {
     Timeout,
     /// Monitoring was interrupted by the user (e.g., Ctrl+C)
     Interrupted,
+    /// Local commits could not be pushed to the PR (set by the monitor
+    /// itself, never returned by `monitor_pr`). The Minion needs a human.
+    PushRefused,
 }
 
 /// Fetch PR details using gh CLI with retry logic for transient failures
@@ -1391,6 +1394,21 @@ async fn get_review_feedback(
     })
 }
 
+/// Push instructions appended to every feedback prompt (reviews, PR comments).
+///
+/// Other people may push to the PR branch while the Minion works — always for
+/// adopted PRs (`gru adopt`), where the author keeps working on their branch.
+/// So the agent only commits; Gru pushes afterwards via `git::sync_and_push`,
+/// which integrates their commits and refuses to drop any.
+pub(crate) fn format_push_safety_note(branch: &str) -> String {
+    format!(
+        "\n\n## Pushing\n\
+Commit your changes but do not push. When this session ends, Gru integrates anything others \
+pushed to `{branch}` and pushes your commits itself, refusing if that would drop someone \
+else's work. Never force-push, and never rewrite, squash or drop commits you did not author.\n"
+    )
+}
+
 /// Format review feedback (bodies + inline comments) into a prompt for Claude
 pub(crate) fn format_review_prompt(
     issue_num: Option<u64>,
@@ -1609,6 +1627,14 @@ pub(crate) async fn get_pr_created_at(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_format_push_safety_note_tells_agent_not_to_push() {
+        let note = format_push_safety_note("feature/my-change");
+        assert!(note.contains("do not push"));
+        assert!(note.contains("`feature/my-change`"));
+        assert!(note.contains("Never force-push"));
+    }
 
     #[test]
     fn test_pull_request_has_label() {
