@@ -1656,7 +1656,15 @@ async fn run_ci_fix_attempt(
     // integrated. If that fails (conflict, or the author rewound the branch
     // under our fix) nothing is pushed and the attempt escalates.
     eprintln!("📤 Pushing CI fix...");
-    if let Err(e) = crate::git::sync_and_push(worktree_path, branch).await {
+    let pushed = match crate::git::sync_and_push(worktree_path, branch).await {
+        Ok(crate::git::SyncedPush::RemoteBranchMissing) => Err(anyhow::anyhow!(
+            "origin/{} no longer exists (deleted, e.g. after merge); not recreating it",
+            branch
+        )),
+        Ok(_) => Ok(()),
+        Err(e) => Err(e),
+    };
+    if let Err(e) = pushed {
         let msg = format!("{:#}", e);
         eprintln!("⚠️  Push failed: {}", sanitize_push_failure_stderr(&msg));
         eprintln!("🚨 Escalating to human due to push failure");

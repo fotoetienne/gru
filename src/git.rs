@@ -1492,6 +1492,10 @@ pub(crate) enum SyncedPush {
     NothingToPush,
     /// HEAD was pushed.
     Pushed,
+    /// `origin/<branch>` doesn't exist, so nothing was pushed. Every caller
+    /// works on an existing PR; a missing branch means it was deleted (e.g.
+    /// auto-deleted after merge), and pushing would recreate it.
+    RemoteBranchMissing,
 }
 
 /// Integrates the remote branch into HEAD, then pushes HEAD if it's ahead.
@@ -1505,20 +1509,20 @@ pub(crate) enum SyncedPush {
 /// The push leases against the tip just integrated, so a rewind or a new push
 /// that lands between the sync and the push is rejected rather than
 /// fast-forwarded over. Any sync or push failure is returned as an error and
-/// nothing is pushed.
+/// nothing is pushed. A missing remote branch is never created
+/// ([`SyncedPush::RemoteBranchMissing`]).
 pub(crate) async fn sync_and_push(worktree_path: &Path, branch: &str) -> Result<SyncedPush> {
-    let remote = match sync_with_remote_branch(worktree_path, branch).await? {
-        RemoteSync::NoRemoteBranch => None,
-        _ => resolve_ref(worktree_path, &synced_ref(branch)).await?,
-    };
+    if sync_with_remote_branch(worktree_path, branch).await? == RemoteSync::NoRemoteBranch {
+        return Ok(SyncedPush::RemoteBranchMissing);
+    }
+    let remote = resolve_ref(worktree_path, &synced_ref(branch))
+        .await?
+        .context("sync did not record the integrated remote tip")?;
     let head = head_sha(worktree_path).await?;
-    if remote.as_deref() == Some(head.as_str()) {
+    if remote == head {
         return Ok(SyncedPush::NothingToPush);
     }
-    let lease = format!(
-        "--force-with-lease=refs/heads/{branch}:{}",
-        remote.as_deref().unwrap_or("")
-    );
+    let lease = format!("--force-with-lease=refs/heads/{branch}:{remote}");
     let target = format!("HEAD:refs/heads/{branch}");
     let push = run_git_remote_in(worktree_path, &["push", &lease, "origin", &target]).await?;
     if !push.status.success() {
@@ -3234,6 +3238,25 @@ mod tests {
             Some(head_sha(&mine).await.unwrap())
         );
         assert_eq!(log_subjects(&mine), vec!["fix", "author", "base"]);
+    }
+
+    #[tokio::test]
+    async fn test_sync_and_push_does_not_recreate_deleted_branch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mine, _theirs) = setup_shared_branch(tmp.path());
+        sync_with_remote_branch(&mine, "feature").await.unwrap();
+        std::fs::write(mine.join("fix.txt"), "fix").unwrap();
+        git_ok(&mine, &["add", "."]);
+        git_ok(&mine, &["commit", "-m", "fix"]);
+        // The PR merged and GitHub auto-deleted its branch.
+        let bare = tmp.path().join("origin.git");
+        git_ok(&bare, &["update-ref", "-d", "refs/heads/feature"]);
+
+        assert_eq!(
+            sync_and_push(&mine, "feature").await.unwrap(),
+            SyncedPush::RemoteBranchMissing
+        );
+        assert_eq!(fetch_remote_tip(&mine, "feature").await.unwrap(), None);
     }
 
     #[tokio::test]

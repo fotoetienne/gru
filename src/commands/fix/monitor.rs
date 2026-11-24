@@ -1248,6 +1248,16 @@ async fn push_pending_commits(
             true
         }
         Ok(crate::git::SyncedPush::NothingToPush) => true,
+        Ok(crate::git::SyncedPush::RemoteBranchMissing) => {
+            // Deleted on the remote, usually auto-deleted after merge. Don't
+            // recreate it; the monitor's next poll sees the PR state.
+            log::warn!(
+                "⚠️  origin/{} no longer exists; not pushing {}",
+                wt_ctx.branch_name,
+                what
+            );
+            true
+        }
         Err(e) => {
             log::warn!("⚠️  Could not push {}: {:#}", what, e);
             post_escalation_comment(
