@@ -159,10 +159,10 @@ async fn auto_rebase_pr(checkout_path: &Path, minion_dir: &Path) -> Result<AutoR
     // remote-tracking ref that `--force-with-lease` checks against, so the
     // force-push below can only replace commits this rebase already contains.
     let pr_branch = get_current_branch(checkout_path).await?;
-    match crate::git::sync_with_remote_branch(checkout_path, &pr_branch)
+    let synced = crate::git::sync_with_remote_branch(checkout_path, &pr_branch)
         .await
-        .context("Cannot auto-rebase: failed to integrate new commits from the PR branch")?
-    {
+        .context("Cannot auto-rebase: failed to integrate new commits from the PR branch")?;
+    match synced {
         crate::git::RemoteSync::Integrated => {
             println!("🔀 Pulled new commits from origin/{}", pr_branch)
         }
@@ -174,10 +174,14 @@ async fn auto_rebase_pr(checkout_path: &Path, minion_dir: &Path) -> Result<AutoR
         }
         crate::git::RemoteSync::UpToDate | crate::git::RemoteSync::NoRemoteBranch => {}
     }
-    // The remote tip and HEAD before rebasing. The force-push at the end
-    // refuses if the remote has anything not in HEAD, or changed during the
-    // rebase (see `force_push_rebased`).
-    let remote_before = crate::git::fetch_remote_tip(checkout_path, &pr_branch).await?;
+    // The remote tip the sync integrated (not a fresh fetch, which could
+    // pick up a rewind the rebase never saw) and HEAD before rebasing. The
+    // force-push at the end refuses if the remote changed since, other than
+    // moving forward to commits already in HEAD (see `force_push_rebased`).
+    let remote_before = match synced {
+        crate::git::RemoteSync::NoRemoteBranch => None,
+        _ => crate::git::integrated_tip(checkout_path).await?,
+    };
     let pre_rebase_head = crate::git::head_sha(checkout_path).await?;
 
     // Detect the base branch first so we can fetch only what we need

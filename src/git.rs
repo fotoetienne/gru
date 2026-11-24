@@ -1526,8 +1526,20 @@ pub(crate) async fn sync_and_push(worktree_path: &Path, branch: &str) -> Result<
     Ok(SyncedPush::Pushed)
 }
 
+/// Returns the remote tip this worktree last integrated or pushed (the
+/// per-worktree record kept by [`sync_with_remote_branch`] and the push
+/// helpers), or `None` if there is no record yet.
+///
+/// Use this, not a fresh fetch, as the baseline for a rebase push: a fetch
+/// after the sync could pick up an author's rewind that the rebase never
+/// saw, and the push would then put the removed commits back.
+pub(crate) async fn integrated_tip(worktree_path: &Path) -> Result<Option<String>> {
+    resolve_ref(worktree_path, SYNCED_REF).await
+}
+
 /// Fetches `origin/<branch>` and returns its tip, or `None` if it doesn't exist.
-pub(crate) async fn fetch_remote_tip(worktree_path: &Path, branch: &str) -> Result<Option<String>> {
+#[cfg(test)]
+async fn fetch_remote_tip(worktree_path: &Path, branch: &str) -> Result<Option<String>> {
     fetch_remote_branch(worktree_path, branch).await
 }
 
@@ -3090,6 +3102,32 @@ mod tests {
             .await
             .unwrap_err();
         assert!(format!("{:#}", err).contains("changed during the rebase"));
+        assert_eq!(fetch_remote_tip(&mine, "feature").await.unwrap(), rewound);
+    }
+
+    #[tokio::test]
+    async fn test_force_push_rebased_refuses_rewind_between_sync_and_rebase() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mine, theirs) = setup_shared_branch(tmp.path());
+        author_adds_commit(&theirs, "b");
+        sync_with_remote_branch(&mine, "feature").await.unwrap();
+        // The author drops "b" right after the sync, before the rebase starts.
+        git_ok(&theirs, &["reset", "--hard", "HEAD~1"]);
+        git_ok(
+            &theirs,
+            &["push", "--force", "origin", "HEAD:refs/heads/feature"],
+        );
+        let rewound = resolve_ref(&theirs, "HEAD").await.unwrap();
+
+        let before = integrated_tip(&mine).await.unwrap();
+        let from = head_sha(&mine).await.unwrap();
+        rebase_onto_new_main(&mine, &theirs);
+
+        assert!(
+            force_push_rebased(&mine, "feature", before.as_deref(), &from)
+                .await
+                .is_err()
+        );
         assert_eq!(fetch_remote_tip(&mine, "feature").await.unwrap(), rewound);
     }
 

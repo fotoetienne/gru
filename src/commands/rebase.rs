@@ -51,10 +51,17 @@ pub(crate) async fn handle_rebase(
         return Ok(0);
     }
 
-    // Recorded so the force-push can refuse if the remote branch has commits
-    // that weren't part of this rebase.
+    // Integrate commits others pushed to the branch, and record the tip that
+    // was integrated, so the force-push can refuse if the remote changed
+    // since (new commits, or a rewind/rewrite by the author).
     let rebase_branch = get_current_branch(&worktree_path).await?;
-    let remote_before = crate::git::fetch_remote_tip(&worktree_path, &rebase_branch).await?;
+    let remote_before = match crate::git::sync_with_remote_branch(&worktree_path, &rebase_branch)
+        .await
+        .with_context(|| format!("Failed to integrate new commits from origin/{rebase_branch}"))?
+    {
+        crate::git::RemoteSync::NoRemoteBranch => None,
+        _ => crate::git::integrated_tip(&worktree_path).await?,
+    };
     let pre_rebase_head = crate::git::head_sha(&worktree_path).await?;
 
     // Attempt the rebase
