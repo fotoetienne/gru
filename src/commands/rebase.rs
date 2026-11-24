@@ -60,7 +60,7 @@ pub(crate) async fn handle_rebase(
         .with_context(|| format!("Failed to integrate new commits from origin/{rebase_branch}"))?
     {
         crate::git::RemoteSync::NoRemoteBranch => None,
-        _ => crate::git::integrated_tip(&worktree_path).await?,
+        _ => crate::git::integrated_tip(&worktree_path, &rebase_branch).await?,
     };
     let pre_rebase_head = crate::git::head_sha(&worktree_path).await?;
 

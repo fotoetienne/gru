@@ -1464,15 +1464,21 @@ async fn fetch_remote_branch(worktree_path: &Path, branch: &str) -> Result<Optio
 /// shared ref can't tell a force-push from a fast-forward once another
 /// process has fetched; this ref only changes when this worktree syncs or
 /// pushes.
-const SYNCED_REF: &str = "refs/worktree/gru/synced";
+///
+/// Keyed by branch, so a record made while one branch was checked out is
+/// never compared with another branch's remote tip.
+fn synced_ref(branch: &str) -> String {
+    format!("refs/worktree/gru-synced/{branch}")
+}
 
-/// Records `sha` as the remote tip this worktree has integrated.
-async fn record_synced(worktree_path: &Path, sha: &str) -> Result<()> {
-    let out = run_git_in(worktree_path, &["update-ref", SYNCED_REF, sha]).await?;
+/// Records `sha` as the tip of `origin/<branch>` this worktree has integrated.
+async fn record_synced(worktree_path: &Path, branch: &str, sha: &str) -> Result<()> {
+    let refname = synced_ref(branch);
+    let out = run_git_in(worktree_path, &["update-ref", &refname, sha]).await?;
     if !out.status.success() {
         anyhow::bail!(
             "git update-ref {} failed: {}",
-            SYNCED_REF,
+            refname,
             String::from_utf8_lossy(&out.stderr).trim()
         );
     }
@@ -1503,7 +1509,7 @@ pub(crate) enum SyncedPush {
 pub(crate) async fn sync_and_push(worktree_path: &Path, branch: &str) -> Result<SyncedPush> {
     let remote = match sync_with_remote_branch(worktree_path, branch).await? {
         RemoteSync::NoRemoteBranch => None,
-        _ => resolve_ref(worktree_path, SYNCED_REF).await?,
+        _ => resolve_ref(worktree_path, &synced_ref(branch)).await?,
     };
     let head = head_sha(worktree_path).await?;
     if remote.as_deref() == Some(head.as_str()) {
@@ -1522,7 +1528,7 @@ pub(crate) async fn sync_and_push(worktree_path: &Path, branch: &str) -> Result<
             redact_credentials(String::from_utf8_lossy(&push.stderr).trim())
         );
     }
-    record_synced(worktree_path, &head).await?;
+    record_synced(worktree_path, branch, &head).await?;
     Ok(SyncedPush::Pushed)
 }
 
@@ -1533,8 +1539,9 @@ pub(crate) async fn sync_and_push(worktree_path: &Path, branch: &str) -> Result<
 /// Use this, not a fresh fetch, as the baseline for a rebase push: a fetch
 /// after the sync could pick up an author's rewind that the rebase never
 /// saw, and the push would then put the removed commits back.
-pub(crate) async fn integrated_tip(worktree_path: &Path) -> Result<Option<String>> {
-    resolve_ref(worktree_path, SYNCED_REF).await
+pub(crate) async fn integrated_tip(worktree_path: &Path, branch: &str) -> Result<Option<String>> {
+    validate_branch_name(branch)?;
+    resolve_ref(worktree_path, &synced_ref(branch)).await
 }
 
 /// Fetches `origin/<branch>` and returns its tip, or `None` if it doesn't exist.
@@ -1553,7 +1560,7 @@ pub(crate) async fn head_sha(worktree_path: &Path) -> Result<String> {
 /// Pulls commits that someone else pushed to `origin/<branch>` into HEAD.
 ///
 /// Fetches the remote branch and compares it with the tip this worktree last
-/// integrated (see [`SYNCED_REF`]). If HEAD doesn't already contain it:
+/// integrated (see [`synced_ref`]). If HEAD doesn't already contain it:
 /// - if the remote was only fast-forwarded, rebases the local-only commits on
 ///   top of it ([`RemoteSync::Integrated`]);
 /// - if the remote was rewritten (force-pushed) and HEAD has nothing beyond
@@ -1574,7 +1581,7 @@ pub(crate) async fn sync_with_remote_branch(
     branch: &str,
 ) -> Result<RemoteSync> {
     let remote_ref = format!("refs/remotes/origin/{branch}");
-    let previous = match resolve_ref(worktree_path, SYNCED_REF).await? {
+    let previous = match resolve_ref(worktree_path, &synced_ref(branch)).await? {
         Some(sha) => Some(sha),
         None => resolve_ref(worktree_path, &remote_ref).await?,
     };
@@ -1612,7 +1619,11 @@ pub(crate) async fn sync_with_remote_branch(
     } else if is_ancestor(worktree_path, &current, "HEAD").await? {
         RemoteSync::UpToDate
     } else {
-        let rebase = run_git_in(worktree_path, &["rebase", &remote_ref]).await?;
+        // Rebase onto the exact SHA just fetched, not the shared tracking ref:
+        // another worktree's fetch could move that ref to a newer tip, and
+        // the checkpoint recorded below would then not match what HEAD
+        // actually contains.
+        let rebase = run_git_in(worktree_path, &["rebase", &current]).await?;
         if !rebase.status.success() {
             let _ = run_git_in(worktree_path, &["rebase", "--abort"]).await;
             anyhow::bail!(
@@ -1624,7 +1635,7 @@ pub(crate) async fn sync_with_remote_branch(
         }
         RemoteSync::Integrated
     };
-    record_synced(worktree_path, &current).await?;
+    record_synced(worktree_path, branch, &current).await?;
     Ok(outcome)
 }
 
@@ -1695,7 +1706,7 @@ pub(crate) async fn force_push_rebased(
     // The remote now holds our rewrite; record it so the next sync doesn't
     // mistake it for someone else's force-push.
     let pushed = head_sha(worktree_path).await?;
-    record_synced(worktree_path, &pushed).await?;
+    record_synced(worktree_path, branch, &pushed).await?;
     Ok(())
 }
 
@@ -3119,7 +3130,7 @@ mod tests {
         );
         let rewound = resolve_ref(&theirs, "HEAD").await.unwrap();
 
-        let before = integrated_tip(&mine).await.unwrap();
+        let before = integrated_tip(&mine, "feature").await.unwrap();
         let from = head_sha(&mine).await.unwrap();
         rebase_onto_new_main(&mine, &theirs);
 
@@ -3129,6 +3140,34 @@ mod tests {
                 .is_err()
         );
         assert_eq!(fetch_remote_tip(&mine, "feature").await.unwrap(), rewound);
+    }
+
+    #[tokio::test]
+    async fn test_checkpoint_is_per_branch() {
+        // Sync `feature`, then switch the same checkout to an unrelated
+        // branch. Its first sync must not be compared with `feature`'s record.
+        let tmp = tempfile::tempdir().unwrap();
+        let (mine, theirs) = setup_shared_branch(tmp.path());
+        author_adds_commit(&theirs, "feature-only");
+        sync_with_remote_branch(&mine, "feature").await.unwrap();
+
+        git_ok(&theirs, &["checkout", "--orphan", "other"]);
+        git_ok(&theirs, &["rm", "-rf", "--cached", "."]);
+        std::fs::write(theirs.join("other.txt"), "o").unwrap();
+        git_ok(&theirs, &["add", "other.txt"]);
+        git_ok(&theirs, &["commit", "-m", "other root"]);
+        git_ok(&theirs, &["push", "origin", "HEAD:refs/heads/other"]);
+        git_ok(&mine, &["fetch", "origin"]);
+        git_ok(&mine, &["checkout", "-b", "other", "origin/other"]);
+
+        assert_eq!(
+            sync_with_remote_branch(&mine, "other").await.unwrap(),
+            RemoteSync::UpToDate
+        );
+        assert_ne!(
+            integrated_tip(&mine, "other").await.unwrap(),
+            integrated_tip(&mine, "feature").await.unwrap()
+        );
     }
 
     #[tokio::test]

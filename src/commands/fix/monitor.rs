@@ -180,7 +180,7 @@ async fn auto_rebase_pr(checkout_path: &Path, minion_dir: &Path) -> Result<AutoR
     // moving forward to commits already in HEAD (see `force_push_rebased`).
     let remote_before = match synced {
         crate::git::RemoteSync::NoRemoteBranch => None,
-        _ => crate::git::integrated_tip(checkout_path).await?,
+        _ => crate::git::integrated_tip(checkout_path, &pr_branch).await?,
     };
     let pre_rebase_head = crate::git::head_sha(checkout_path).await?;
 
