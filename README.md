@@ -266,7 +266,7 @@ Key options: watched repos, polling intervals, concurrency slots, default agent 
 6. Gru opens a PR, watches CI, and feeds failures back to the agent for auto-fix (up to 2 attempts before escalating)
 7. Review comments and merge conflicts wake the Minion to respond or rebase
 8. With `gru:auto-merge`, the monitoring Minion asks an LLM merge judge whether the PR is safe to merge; otherwise it waits for you
-9. Labels track state on GitHub, which is the only source of truth: `gru:in-progress` while the Minion works, `gru:done` once the PR is open, `gru:failed` or `gru:blocked` when it needs help
+9. Labels track issue state on GitHub: `gru:in-progress` while the Minion works, `gru:done` once the PR is open, `gru:failed` or `gru:blocked` when it needs help
 
 ## 🗺️ Roadmap
 
