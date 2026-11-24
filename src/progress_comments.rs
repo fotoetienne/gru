@@ -20,7 +20,7 @@ pub(crate) fn has_minion_signature_for(body: &str, minion_id: &str) -> bool {
 ///
 /// A valid Minion ID starts with `M` followed by at least 3 ASCII alphanumeric
 /// characters (base36: `0-9` and `a-z`; legacy IDs may use uppercase `A-Z`).
-fn is_minion_id(id: &str) -> bool {
+pub(crate) fn is_minion_id(id: &str) -> bool {
     let mut chars = id.chars();
     matches!(chars.next(), Some('M')) && {
         let rest: &str = &id[1..];

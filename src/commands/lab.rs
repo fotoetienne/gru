@@ -1,7 +1,8 @@
 use crate::agent_runner::EXIT_ALREADY_RUNNING;
-use crate::config::{parse_repo_entry_with_hosts, LabConfig};
+use crate::config::{parse_repo_entry_with_hosts, LabConfig, PolicyMode};
 use crate::github::{self, list_ready_issues_via_cli};
 use crate::labels;
+use crate::merge_judge::{self, JudgeAction, JudgeResponse, JudgeState};
 use crate::minion_registry::{with_registry, MinionInfo, MinionMode, OrchestrationPhase};
 use crate::pr_monitor;
 use crate::retry_queue::RetryQueue;
@@ -279,6 +280,9 @@ pub(crate) async fn handle_lab(
     //           registry before the first sweep runs.
     //   Some  → sweep when AUTO_MERGE_SWEEP_INTERVAL has elapsed, then reset.
     let mut last_auto_merge_sweep: Option<Instant> = None;
+    // Merge-judge state for orphaned PRs in repos with a MERGE_POLICY.md,
+    // kept across sweeps so the judge is only re-invoked on PR state changes.
+    let mut sweep_judge_states: HashMap<String, JudgeState> = HashMap::new();
 
     if no_resume {
         tprintln!("⏭️  Auto-resume disabled (--no-resume)");
@@ -468,7 +472,7 @@ pub(crate) async fn handle_lab(
                     }
                     Some(t) if t.elapsed() >= AUTO_MERGE_SWEEP_INTERVAL => {
                         last_auto_merge_sweep = Some(Instant::now());
-                        sweep_orphaned_auto_merge_prs(&config).await;
+                        sweep_orphaned_auto_merge_prs(&config, &mut sweep_judge_states).await;
                     }
                     Some(_) => {}
                 }
@@ -2810,8 +2814,15 @@ async fn recover_stuck_in_progress_issues(
 /// This handles PRs that were labelled outside of `gru do` (e.g., by a human or
 /// a Minion that has since exited) and whose label therefore has no consumer.
 ///
+/// When the repo has a `MERGE_POLICY.md` (or the PR changes one), the PR is
+/// routed through the merge judge so the policy is honored; otherwise the
+/// deterministic checks alone decide, as before.
+///
 /// Per-repo and per-PR errors are logged as warnings and do not abort the scan.
-async fn sweep_orphaned_auto_merge_prs(config: &LabConfig) {
+async fn sweep_orphaned_auto_merge_prs(
+    config: &LabConfig,
+    judge_states: &mut HashMap<String, JudgeState>,
+) {
     for repo_spec in &config.daemon.repos {
         let Some((host, owner, repo)) =
             parse_repo_entry_with_hosts(repo_spec, &config.github_hosts)
@@ -2840,6 +2851,15 @@ async fn sweep_orphaned_auto_merge_prs(config: &LabConfig) {
         }
 
         let full_repo = github::repo_slug(&owner, &repo);
+
+        // Drop judge state for PRs that are no longer open auto-merge PRs.
+        let repo_key_prefix = format!("{full_repo}#");
+        judge_states.retain(|key, _| {
+            !key.starts_with(&repo_key_prefix)
+                || prs
+                    .iter()
+                    .any(|pr| *key == sweep_judge_key(&full_repo, pr.number))
+        });
 
         for pr in &prs {
             // Skip if a live Minion is already monitoring this PR.
@@ -2894,13 +2914,29 @@ async fn sweep_orphaned_auto_merge_prs(config: &LabConfig) {
                 continue;
             }
 
+            let pr_num_str = pr.number.to_string();
+            let judge_key = sweep_judge_key(&full_repo, pr.number);
+            let judge_state = judge_states.entry(judge_key.clone()).or_default();
+            if !sweep_policy_allows_merge(
+                config,
+                &host,
+                &owner,
+                &repo,
+                &pr_num_str,
+                merge_judge::minion_id_from_branch(&pr.head_ref_name),
+                judge_state,
+            )
+            .await
+            {
+                continue;
+            }
+
             tprintln!(
                 "🔀 Auto-merge sweep: queueing merge for orphaned PR #{} in {}",
                 pr.number,
                 repo_spec,
             );
 
-            let pr_num_str = pr.number.to_string();
             match github::gh_cli_command(&host)
                 .args([
                     "pr",
@@ -2929,6 +2965,9 @@ async fn sweep_orphaned_auto_merge_prs(config: &LabConfig) {
                         repo_spec,
                         stderr.trim(),
                     );
+                    // Forget the judge's verdict so the next sweep re-evaluates
+                    // instead of skipping an unchanged PR forever.
+                    judge_states.remove(&judge_key);
                 }
                 Err(e) => {
                     log::warn!(
@@ -2937,10 +2976,259 @@ async fn sweep_orphaned_auto_merge_prs(config: &LabConfig) {
                         repo_spec,
                         e,
                     );
+                    judge_states.remove(&judge_key);
                 }
             }
         }
     }
+}
+
+fn sweep_judge_key(full_repo: &str, pr_number: u64) -> String {
+    format!("{full_repo}#{pr_number}")
+}
+
+/// Decide whether the sweeper may queue a merge for a deterministically
+/// ready orphaned PR, honoring the repo's merge policy.
+///
+/// - No policy file and the PR doesn't change one: merge (unchanged behavior).
+/// - Otherwise: run the merge judge. Only a Merge verdict in enforce mode
+///   allows the merge; Escalate applies `gru:needs-human-review`; observe
+///   mode posts the verdict and never merges.
+///
+/// Any lookup failure returns `false`: the sweeper never merges a PR whose
+/// policy it could not check.
+async fn sweep_policy_allows_merge(
+    config: &LabConfig,
+    host: &str,
+    owner: &str,
+    repo: &str,
+    pr_number: &str,
+    minion_id: Option<&str>,
+    judge_state: &mut JudgeState,
+) -> bool {
+    let policy = match merge_judge::load_merge_policy(host, owner, repo).await {
+        Ok(p) => p,
+        Err(e) => {
+            log::warn!(
+                "⚠️  Auto-merge sweep: could not check merge policy for PR #{} in {}/{}: {:#}",
+                pr_number,
+                owner,
+                repo,
+                e
+            );
+            return false;
+        }
+    };
+    if policy.is_none() {
+        match merge_judge::fetch_pr_changed_files(host, owner, repo, pr_number).await {
+            Ok(files) if !sweep_needs_judge(policy.as_ref(), &files) => return true,
+            // The PR changes a policy file: the judge escalates it below.
+            Ok(_) => {}
+            Err(e) => {
+                log::warn!(
+                    "⚠️  Auto-merge sweep: could not list changed files for PR #{} in {}/{}: {:#}",
+                    pr_number,
+                    owner,
+                    repo,
+                    e
+                );
+                return false;
+            }
+        }
+    }
+
+    let backend = match crate::agent_registry::resolve_backend(&config.agent.default) {
+        Ok(b) => b,
+        Err(e) => {
+            log::warn!(
+                "⚠️  Auto-merge sweep: cannot run merge judge for PR #{} in {}/{}: {:#}",
+                pr_number,
+                owner,
+                repo,
+                e
+            );
+            return false;
+        }
+    };
+    let workdir = match judge_workdir().await {
+        Ok(d) => d,
+        Err(e) => {
+            log::warn!("⚠️  Auto-merge sweep: {:#}", e);
+            return false;
+        }
+    };
+
+    let observe = config.merge.policy_mode == PolicyMode::Observe;
+    match merge_judge::evaluate(
+        backend.as_ref(),
+        host,
+        owner,
+        repo,
+        pr_number,
+        workdir.path(),
+        judge_state,
+        config.merge.confidence_threshold.clamp(1, 10),
+    )
+    .await
+    {
+        Ok(response) => match classify_sweep_verdict(response.as_ref(), observe) {
+            SweepVerdict::Merge => true,
+            SweepVerdict::Skip => false,
+            SweepVerdict::Observe => {
+                if let Some(response) = &response {
+                    merge_judge::post_observe_verdict(
+                        host,
+                        owner,
+                        repo,
+                        pr_number,
+                        judge_state,
+                        response,
+                        minion_id,
+                    )
+                    .await;
+                }
+                false
+            }
+            SweepVerdict::Escalate => {
+                tprintln!(
+                    "🚨 Auto-merge sweep: merge judge escalated PR #{} in {}/{} for human review",
+                    pr_number,
+                    owner,
+                    repo,
+                );
+                if let Some(response) = &response {
+                    sweep_escalate(
+                        host,
+                        owner,
+                        repo,
+                        pr_number,
+                        response,
+                        minion_id,
+                        judge_state,
+                    )
+                    .await;
+                }
+                false
+            }
+        },
+        Err(e) => {
+            log::warn!(
+                "⚠️  Auto-merge sweep: merge judge failed for PR #{} in {}/{}: {:#}",
+                pr_number,
+                owner,
+                repo,
+                e
+            );
+            if judge_state.should_escalate_on_failure() {
+                let response = JudgeResponse {
+                    confidence: 0,
+                    action: JudgeAction::Escalate,
+                    reasoning: format!(
+                        "Merge judge failed {} consecutive times (last error: {}). \
+                         Unable to evaluate merge readiness automatically.",
+                        judge_state.consecutive_failures(),
+                        e
+                    ),
+                    policy_rule: None,
+                    policy_applied: false,
+                };
+                sweep_escalate(
+                    host,
+                    owner,
+                    repo,
+                    pr_number,
+                    &response,
+                    minion_id,
+                    judge_state,
+                )
+                .await;
+                if judge_state.label_was_applied() {
+                    judge_state.mark_failure_escalated();
+                }
+            }
+            false
+        }
+    }
+}
+
+/// True when an orphaned PR must go through the merge judge: the repo has a
+/// merge policy, or the PR changes a policy file (which always escalates).
+fn sweep_needs_judge(policy: Option<&merge_judge::MergePolicy>, changed_files: &[String]) -> bool {
+    policy.is_some() || merge_judge::find_policy_file_change(changed_files).is_some()
+}
+
+/// What the sweeper does with a judge result.
+#[derive(Debug, PartialEq, Eq)]
+enum SweepVerdict {
+    /// Queue the merge.
+    Merge,
+    /// Leave the PR alone this sweep (wait verdict, or judge skipped).
+    Skip,
+    /// Apply `gru:needs-human-review` and post the verdict.
+    Escalate,
+    /// Observe mode: post the hypothetical verdict, take no action.
+    Observe,
+}
+
+fn classify_sweep_verdict(response: Option<&JudgeResponse>, observe: bool) -> SweepVerdict {
+    let Some(response) = response else {
+        // Judge skipped (PR unchanged since its last verdict). A previous
+        // Merge verdict either queued the merge or cleared this state, so
+        // there is nothing to do.
+        return SweepVerdict::Skip;
+    };
+    if observe && response.policy_applied {
+        return SweepVerdict::Observe;
+    }
+    match response.action {
+        JudgeAction::Merge => SweepVerdict::Merge,
+        JudgeAction::Wait(_) => SweepVerdict::Skip,
+        JudgeAction::Escalate => SweepVerdict::Escalate,
+    }
+}
+
+/// Apply `gru:needs-human-review` and post the judge's verdict on the PR.
+async fn sweep_escalate(
+    host: &str,
+    owner: &str,
+    repo: &str,
+    pr_number: &str,
+    response: &JudgeResponse,
+    minion_id: Option<&str>,
+    judge_state: &mut JudgeState,
+) {
+    if let Err(e) = merge_judge::ensure_needs_human_review_label(host, owner, repo).await {
+        log::warn!("⚠️  Failed to ensure gru:needs-human-review label: {:#}", e);
+    }
+    match merge_judge::add_needs_human_review_label(host, owner, repo, pr_number).await {
+        Ok(()) => judge_state.mark_label_applied(),
+        Err(e) => log::warn!(
+            "⚠️  Auto-merge sweep: failed to add needs-human-review label to PR #{}: {:#}",
+            pr_number,
+            e
+        ),
+    }
+    merge_judge::post_judge_escalation_comment(host, owner, repo, pr_number, response, minion_id)
+        .await;
+}
+
+/// Scratch working directory for a judge run outside any Minion worktree.
+/// The judge prompt carries all PR context, so the directory only needs to
+/// exist; it is a git repo because some backends refuse to run elsewhere.
+async fn judge_workdir() -> Result<tempfile::TempDir> {
+    let dir = tempfile::Builder::new()
+        .prefix("gru-merge-judge-")
+        .tempdir()
+        .context("Failed to create merge judge working directory")?;
+    if let Err(e) = tokio::process::Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(dir.path())
+        .output()
+        .await
+    {
+        log::debug!("git init in merge judge workdir failed: {e}");
+    }
+    Ok(dir)
 }
 
 /// Pure predicate: returns `true` if any non-archived entry in `minions`
@@ -2983,6 +3271,96 @@ async fn is_pr_monitored_by_live_minion(full_repo: &str, pr_number: u64) -> bool
 mod tests {
     use super::*;
     use crate::minion_registry::is_process_alive;
+
+    // --- auto-merge sweeper merge-policy gating (#951) ---
+
+    fn judge_response(action: JudgeAction, policy_applied: bool) -> JudgeResponse {
+        JudgeResponse {
+            confidence: 9,
+            action,
+            reasoning: "r".to_string(),
+            policy_rule: None,
+            policy_applied,
+        }
+    }
+
+    #[test]
+    fn test_sweep_needs_judge_without_policy_or_policy_change() {
+        let files = vec!["src/main.rs".to_string(), "README.md".to_string()];
+        assert!(!sweep_needs_judge(None, &files));
+    }
+
+    #[test]
+    fn test_sweep_needs_judge_when_policy_exists() {
+        let policy = merge_judge::MergePolicy {
+            path: "MERGE_POLICY.md",
+            content: "Auth changes need a human.".to_string(),
+        };
+        assert!(sweep_needs_judge(
+            Some(&policy),
+            &["src/auth.rs".to_string()]
+        ));
+    }
+
+    #[test]
+    fn test_sweep_needs_judge_when_pr_changes_policy_file() {
+        let files = vec!["docs/MERGE_POLICY.md".to_string()];
+        assert!(sweep_needs_judge(None, &files));
+    }
+
+    #[test]
+    fn test_classify_sweep_verdict_enforce() {
+        let merge = judge_response(JudgeAction::Merge, true);
+        let escalate = judge_response(JudgeAction::Escalate, true);
+        let wait = judge_response(JudgeAction::Wait(Duration::from_secs(60)), true);
+        assert_eq!(
+            classify_sweep_verdict(Some(&merge), false),
+            SweepVerdict::Merge
+        );
+        assert_eq!(
+            classify_sweep_verdict(Some(&escalate), false),
+            SweepVerdict::Escalate
+        );
+        assert_eq!(
+            classify_sweep_verdict(Some(&wait), false),
+            SweepVerdict::Skip
+        );
+        assert_eq!(classify_sweep_verdict(None, false), SweepVerdict::Skip);
+    }
+
+    #[test]
+    fn test_classify_sweep_verdict_policy_change_never_merges() {
+        let response = merge_judge::policy_change_escalation("MERGE_POLICY.md");
+        assert_eq!(
+            classify_sweep_verdict(Some(&response), false),
+            SweepVerdict::Escalate
+        );
+    }
+
+    #[test]
+    fn test_classify_sweep_verdict_observe_never_acts() {
+        for action in [JudgeAction::Merge, JudgeAction::Escalate] {
+            let response = judge_response(action, true);
+            assert_eq!(
+                classify_sweep_verdict(Some(&response), true),
+                SweepVerdict::Observe
+            );
+        }
+    }
+
+    #[test]
+    fn test_classify_sweep_verdict_observe_ignored_without_policy() {
+        let response = judge_response(JudgeAction::Merge, false);
+        assert_eq!(
+            classify_sweep_verdict(Some(&response), true),
+            SweepVerdict::Merge
+        );
+    }
+
+    #[test]
+    fn test_sweep_judge_key() {
+        assert_eq!(sweep_judge_key("o/r", 12), "o/r#12");
+    }
 
     #[tokio::test]
     async fn test_reap_children_empty() {

@@ -38,14 +38,32 @@ pub(crate) struct MergeConfig {
     /// Only merge when the judge's confidence >= this value.
     #[serde(default = "default_confidence_threshold")]
     pub(crate) confidence_threshold: u8,
+
+    /// How the judge acts on a repo's `MERGE_POLICY.md`. `enforce` (default)
+    /// merges or escalates per the verdict; `observe` posts the hypothetical
+    /// verdict once per head SHA and takes no merge or label action.
+    #[serde(default)]
+    pub(crate) policy_mode: PolicyMode,
 }
 
 impl Default for MergeConfig {
     fn default() -> Self {
         Self {
             confidence_threshold: default_confidence_threshold(),
+            policy_mode: PolicyMode::default(),
         }
     }
+}
+
+/// Merge policy mode (`[merge] policy_mode`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum PolicyMode {
+    /// Act on the judge's verdict (merge or escalate).
+    #[default]
+    Enforce,
+    /// Report the verdict the judge would have reached without acting on it.
+    Observe,
 }
 
 fn default_confidence_threshold() -> u8 {
@@ -781,6 +799,10 @@ impl LabConfig {
 # [merge]
 # # Confidence threshold (1-10) for the merge-readiness judge (default: 8)
 # confidence_threshold = 8
+#
+# # How to apply a repo's MERGE_POLICY.md: "enforce" (default) or "observe"
+# # (post the would-be verdict once per head SHA, never merge or label)
+# policy_mode = "enforce"
 "#
     }
 
@@ -1918,6 +1940,7 @@ repos = ["owner/repo"]
 
         let config = LabConfig::load(temp_file.path()).unwrap();
         assert_eq!(config.merge.confidence_threshold, 8);
+        assert_eq!(config.merge.policy_mode, PolicyMode::Enforce);
     }
 
     #[test]
@@ -2001,6 +2024,7 @@ repos = ["owner/repo"]
 
 [merge]
 confidence_threshold = 6
+policy_mode = "observe"
 "#;
         let mut temp_file = NamedTempFile::new().unwrap();
         temp_file.write_all(config_toml.as_bytes()).unwrap();
@@ -2008,6 +2032,7 @@ confidence_threshold = 6
 
         let config = LabConfig::load(temp_file.path()).unwrap();
         assert_eq!(config.merge.confidence_threshold, 6);
+        assert_eq!(config.merge.policy_mode, PolicyMode::Observe);
     }
 
     #[test]

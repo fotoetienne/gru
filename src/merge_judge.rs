@@ -61,6 +61,8 @@ struct JudgeResponseRaw {
     #[serde(default)]
     wait_minutes: Option<u64>,
     reasoning: String,
+    #[serde(default)]
+    policy_rule: Option<String>,
 }
 
 /// Parsed judge response with typed action.
@@ -69,6 +71,12 @@ pub(crate) struct JudgeResponse {
     pub(crate) confidence: u8,
     pub(crate) action: JudgeAction,
     pub(crate) reasoning: String,
+    /// The repo merge-policy rule the verdict relied on, if any.
+    pub(crate) policy_rule: Option<String>,
+    /// True when a repo merge policy shaped this verdict: a policy file was
+    /// loaded from the default branch, or the PR changes a policy file.
+    /// Callers use this to decide whether `policy_mode = "observe"` applies.
+    pub(crate) policy_applied: bool,
 }
 
 /// Fingerprint of PR state used to avoid redundant judge invocations.
@@ -132,6 +140,15 @@ pub(crate) struct JudgeState {
     /// Whether a failure-triggered escalation has already been performed
     /// for the current fingerprint (prevents repeated label/comment spam).
     failure_escalated: bool,
+    /// Head SHA for which an observe-mode verdict comment was posted (or
+    /// found already present). Limits observe comments to one per head.
+    observed_head_sha: Option<String>,
+}
+
+impl Default for JudgeState {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl JudgeState {
@@ -144,7 +161,13 @@ impl JudgeState {
             retry_after: None,
             label_applied: false,
             failure_escalated: false,
+            observed_head_sha: None,
         }
+    }
+
+    /// Head SHA of the most recently evaluated PR state, if any.
+    pub(crate) fn last_head_sha(&self) -> Option<&str> {
+        self.last_fingerprint.as_ref().map(|f| f.head_sha.as_str())
     }
 
     /// Returns true if the judge should be invoked for the given PR state.
@@ -707,6 +730,7 @@ fn build_judge_prompt(
     facts: &CurrentFacts,
     consecutive_waits: u32,
     confidence_threshold: u8,
+    policy: Option<&MergePolicy>,
 ) -> String {
     let force_decide = if consecutive_waits >= MAX_CONSECUTIVE_WAITS - 1 {
         format!(
@@ -722,12 +746,21 @@ fn build_judge_prompt(
 
     let current_facts = format_current_facts(facts);
 
+    let (policy_scope, policy_section, policy_output_field) = match policy {
+        Some(p) => (
+            " This repository also has a merge policy (see \"Repository merge policy\" below); apply it as well.",
+            format_policy_section(p),
+            ",\n  \"policy_rule\": \"<the merge policy rule your decision relied on, quoted briefly, or null>\"",
+        ),
+        None => ("", String::new(), ""),
+    };
+
     format!(
         r#"You are a merge-readiness judge for PR #{pr_number}. Deterministic repository state (CI, labels, mergeability, draft status) is provided in the authoritative "Current facts" block below — defer to it in all cases.
 
 ## Scope
 
-Your job is **reviewer-feedback satisfaction only**. You do NOT re-adjudicate deterministic gates (CI, mergeability, labels) — those are captured in the "Current facts" block below and are authoritative. Focus exclusively on whether human reviewer comments have been genuinely addressed.
+Your job is **reviewer-feedback satisfaction only**. You do NOT re-adjudicate deterministic gates (CI, mergeability, labels) — those are captured in the "Current facts" block below and are authoritative. Focus exclusively on whether human reviewer comments have been genuinely addressed.{policy_scope}
 
 {current_facts}
 Evaluate whether review feedback has been **genuinely addressed** — not just mechanically replied to.
@@ -739,7 +772,7 @@ Evaluate whether review feedback has been **genuinely addressed** — not just m
 3. Did the reviewer indicate satisfaction (even implicitly, e.g., "looks good", emoji reaction, no further comments after a reasonable time)?
 4. Are there "nit" or "optional" comments that don't need to block?
 5. How recently did the last interaction happen? Is the reviewer likely still reviewing?
-
+{policy_section}
 ## Confidence threshold
 
 The merge confidence threshold is {confidence_threshold}/10. Only recommend "merge" if your confidence is >= {confidence_threshold}.
@@ -784,7 +817,7 @@ Respond with ONLY a JSON object, no other text:
   "confidence": <1-10>,
   "action": "merge" | "wait" | "escalate",
   "wait_minutes": <number, only if action is "wait">,
-  "reasoning": "<brief explanation>"
+  "reasoning": "<brief explanation>"{policy_output_field}
 }}
 ```"#,
         pr_number = pr_number,
@@ -792,6 +825,9 @@ Respond with ONLY a JSON object, no other text:
         confidence_threshold = confidence_threshold,
         max_wait = MAX_WAIT_MINUTES,
         force_decide = force_decide,
+        policy_scope = policy_scope,
+        policy_section = policy_section,
+        policy_output_field = policy_output_field,
         diff = truncate_if_needed(&context.diff, 50_000),
         comments = truncate_if_needed(&context.comments, 20_000),
         reviews = truncate_if_needed(&context.reviews, 20_000),
@@ -878,10 +914,17 @@ fn parse_judge_response(text: &str) -> Result<JudgeResponse> {
         other => anyhow::bail!("Unknown judge action: {}", other),
     };
 
+    let policy_rule = raw
+        .policy_rule
+        .map(|r| r.trim().to_string())
+        .filter(|r| !r.is_empty() && !r.eq_ignore_ascii_case("null"));
+
     Ok(JudgeResponse {
         confidence: raw.confidence.min(10),
         action,
         reasoning: raw.reasoning,
+        policy_rule,
+        policy_applied: false,
     })
 }
 
@@ -953,6 +996,41 @@ pub(crate) async fn evaluate(
 
     println!("🧑‍⚖️ Invoking merge-readiness judge for PR #{}...", pr_number);
 
+    // The policy file is protected: a PR that changes it always escalates,
+    // whatever the policy (old or new) says. Checked before loading the
+    // policy so it holds even when the PR is the one adding the file.
+    let changed_files = match fetch_pr_changed_files(host, owner, repo, pr_number).await {
+        Ok(files) => files,
+        Err(e) => {
+            state.record_failure(fingerprint);
+            return Err(e);
+        }
+    };
+    if let Some(path) = find_policy_file_change(&changed_files) {
+        let response = policy_change_escalation(path);
+        state.record_response(fingerprint, &response);
+        print_verdict(&response);
+        return Ok(Some(response));
+    }
+
+    // Read from the default branch, never the PR head, so a PR cannot
+    // loosen its own merge rules. A failed lookup is a judge failure: we
+    // must not judge without a policy that may exist.
+    let policy = match load_merge_policy(host, owner, repo).await {
+        Ok(p) => p,
+        Err(e) => {
+            log::warn!("Failed to load merge policy: {:#}", e);
+            state.record_failure(fingerprint);
+            return Err(e);
+        }
+    };
+    if let Some(p) = &policy {
+        println!(
+            "📜 Applying repo merge policy from {} (default branch)",
+            p.path
+        );
+    }
+
     let context = fetch_pr_context(host, owner, repo, pr_number).await?;
 
     let prompt = build_judge_prompt(
@@ -961,6 +1039,7 @@ pub(crate) async fn evaluate(
         &facts,
         state.consecutive_waits(),
         confidence_threshold,
+        policy.as_ref(),
     );
 
     let raw_response = match invoke_judge_cli_raw(backend, worktree_path, &prompt, host).await {
@@ -1004,9 +1083,21 @@ pub(crate) async fn evaluate(
         }
     }
 
+    response.policy_applied = policy.is_some();
+    if policy.is_none() {
+        // Without a policy there is no rule to cite.
+        response.policy_rule = None;
+    }
+
     // Update state with the same fingerprint used for gating.
     state.record_response(fingerprint, &response);
 
+    print_verdict(&response);
+
+    Ok(Some(response))
+}
+
+fn print_verdict(response: &JudgeResponse) {
     println!(
         "🧑‍⚖️ Judge verdict: {} (confidence: {}/10)",
         match &response.action {
@@ -1017,8 +1108,9 @@ pub(crate) async fn evaluate(
         response.confidence
     );
     println!("   Reasoning: {}", response.reasoning);
-
-    Ok(Some(response))
+    if let Some(rule) = &response.policy_rule {
+        println!("   Policy rule: {}", rule);
+    }
 }
 
 /// Apply the `gru:needs-human-review` label to a PR.
@@ -1127,17 +1219,10 @@ pub(crate) async fn post_judge_escalation_comment(
     repo: &str,
     pr_number: &str,
     response: &JudgeResponse,
-    minion_id: &str,
+    minion_id: Option<&str>,
 ) {
     let repo_full = github::repo_slug(owner, repo);
-    let body = format!(
-        "{MERGE_READINESS_MARKER}: {}/10 — needs human review**\n\n{}\n\n\
-         _To proceed, remove the `gru:needs-human-review` label. \
-         The judge will re-evaluate on the next PR state change._{}",
-        response.confidence,
-        response.reasoning,
-        crate::progress_comments::minion_signature(minion_id),
-    );
+    let body = format_escalation_comment(response, minion_id);
 
     match github::run_gh(
         host,
@@ -1158,6 +1243,322 @@ pub(crate) async fn post_judge_escalation_comment(
             );
         }
     }
+}
+
+/// Optional trailing signature. The bookkeeping filter only drops comments
+/// that carry one, so callers should pass a Minion ID whenever they have it.
+fn signature(minion_id: Option<&str>) -> String {
+    minion_id
+        .map(crate::progress_comments::minion_signature)
+        .unwrap_or_default()
+}
+
+/// Render the "Policy rule" citation for a verdict comment, or an empty
+/// string when the verdict did not rely on a policy rule.
+fn format_policy_rule_citation(response: &JudgeResponse) -> String {
+    match &response.policy_rule {
+        Some(rule) => {
+            let quoted: Vec<String> = rule.lines().map(|l| format!("> {l}")).collect();
+            format!("\n\n**Policy rule:**\n{}", quoted.join("\n"))
+        }
+        None => String::new(),
+    }
+}
+
+fn format_escalation_comment(response: &JudgeResponse, minion_id: Option<&str>) -> String {
+    format!(
+        "{MERGE_READINESS_MARKER}: {}/10 — needs human review**\n\n{}{}\n\n\
+         _To proceed, remove the `gru:needs-human-review` label. \
+         The judge will re-evaluate on the next PR state change._{}",
+        response.confidence,
+        response.reasoning,
+        format_policy_rule_citation(response),
+        signature(minion_id),
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Repo merge policy (MERGE_POLICY.md)
+// ---------------------------------------------------------------------------
+
+/// Where to look for the repo merge policy, in order. Same order GitHub uses
+/// for community health files; the first file found wins.
+pub(crate) const MERGE_POLICY_PATHS: [&str; 3] = [
+    ".github/MERGE_POLICY.md",
+    "MERGE_POLICY.md",
+    "docs/MERGE_POLICY.md",
+];
+
+/// Maximum policy size injected into the judge prompt.
+const MAX_POLICY_BYTES: usize = 20_000;
+
+/// Hidden marker embedded in observe-mode comments, followed by the head SHA.
+/// Used to post at most one observe comment per head SHA across restarts.
+const OBSERVE_MARKER_PREFIX: &str = "<!-- gru-merge-policy-observe sha=";
+
+/// A repo merge policy loaded from the default branch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MergePolicy {
+    /// Which of `MERGE_POLICY_PATHS` the policy was read from.
+    pub(crate) path: &'static str,
+    pub(crate) content: String,
+}
+
+/// GraphQL query fetching every policy candidate in one call. Each
+/// `HEAD:<path>` expression resolves against the repository's default
+/// branch, never the PR head, so a PR cannot loosen its own merge rules.
+fn policy_lookup_query() -> String {
+    let fields: String = MERGE_POLICY_PATHS
+        .iter()
+        .enumerate()
+        .map(|(i, path)| {
+            format!(
+                " p{i}: object(expression: \"HEAD:{path}\") {{ ... on Blob {{ text isBinary }} }}"
+            )
+        })
+        .collect();
+    format!(
+        "query($owner: String!, $repo: String!) {{ repository(owner: $owner, name: $repo) {{{fields} }} }}"
+    )
+}
+
+/// Pick the policy from a `policy_lookup_query` response, honoring the
+/// lookup order. Missing, empty, binary, and non-file entries are skipped.
+fn select_policy(json: &str) -> Result<Option<MergePolicy>> {
+    let val: serde_json::Value =
+        serde_json::from_str(json).context("Failed to parse merge policy query response")?;
+    if let Some(errors) = val.get("errors").filter(|e| !e.is_null()) {
+        anyhow::bail!("Merge policy query returned errors: {errors}");
+    }
+    let repository = val
+        .pointer("/data/repository")
+        .filter(|v| !v.is_null())
+        .context("Merge policy query returned no repository")?;
+
+    for (i, path) in MERGE_POLICY_PATHS.iter().enumerate() {
+        let Some(blob) = repository.get(format!("p{i}")).filter(|v| !v.is_null()) else {
+            continue;
+        };
+        if blob.get("isBinary").and_then(|b| b.as_bool()) == Some(true) {
+            log::warn!("Ignoring binary merge policy file {path}");
+            continue;
+        }
+        let text = blob.get("text").and_then(|t| t.as_str()).unwrap_or("");
+        if text.trim().is_empty() {
+            continue;
+        }
+        return Ok(Some(MergePolicy {
+            path,
+            content: text.to_string(),
+        }));
+    }
+    Ok(None)
+}
+
+/// Load the repo merge policy from the default branch, or `None` if the repo
+/// has no policy file. Errors mean the lookup itself failed; callers must not
+/// treat that as "no policy".
+pub(crate) async fn load_merge_policy(
+    host: &str,
+    owner: &str,
+    repo: &str,
+) -> Result<Option<MergePolicy>> {
+    let query_arg = format!("query={}", policy_lookup_query());
+    let owner_arg = format!("owner={owner}");
+    let repo_arg = format!("repo={repo}");
+    let output = github::run_gh(
+        host,
+        &[
+            "api", "graphql", "--cache", "60s", "-f", &query_arg, "-f", &owner_arg, "-f", &repo_arg,
+        ],
+    )
+    .await
+    .context("Failed to look up MERGE_POLICY.md on the default branch")?;
+    select_policy(&output)
+}
+
+/// List the files a PR touches. Renamed files contribute both the old and
+/// the new path.
+pub(crate) async fn fetch_pr_changed_files(
+    host: &str,
+    owner: &str,
+    repo: &str,
+    pr_number: &str,
+) -> Result<Vec<String>> {
+    let repo_full = github::repo_slug(owner, repo);
+    let endpoint = format!("repos/{repo_full}/pulls/{pr_number}/files");
+    let output = github::run_gh(
+        host,
+        &[
+            "api",
+            &endpoint,
+            "--cache",
+            "20s",
+            "--paginate",
+            "--jq",
+            ".[] | .filename, (.previous_filename // empty)",
+        ],
+    )
+    .await
+    .with_context(|| format!("Failed to list changed files for PR #{pr_number}"))?;
+    Ok(output
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
+/// Return the first changed path that is a merge policy location. Matching
+/// is case-insensitive so case-only variants cannot slip past the guard.
+pub(crate) fn find_policy_file_change(changed_files: &[String]) -> Option<&str> {
+    changed_files
+        .iter()
+        .map(String::as_str)
+        .find(|f| MERGE_POLICY_PATHS.iter().any(|p| f.eq_ignore_ascii_case(p)))
+}
+
+/// Deterministic verdict for a PR that changes the merge policy file.
+pub(crate) fn policy_change_escalation(path: &str) -> JudgeResponse {
+    JudgeResponse {
+        confidence: 10,
+        action: JudgeAction::Escalate,
+        reasoning: format!(
+            "This PR changes `{path}`, the repo's merge policy. Changes to the merge \
+             policy always need human review, whatever the policy says."
+        ),
+        policy_rule: Some(
+            "Protected file: a PR that changes MERGE_POLICY.md always needs human review."
+                .to_string(),
+        ),
+        policy_applied: true,
+    }
+}
+
+/// Render the `## Repository merge policy` prompt section.
+fn format_policy_section(policy: &MergePolicy) -> String {
+    format!(
+        "\n## Repository merge policy\n\n\
+         The maintainers of this repository wrote the rules below in `{path}` (read from \
+         the default branch). Apply them in addition to the evaluation criteria above:\n\n\
+         - The rules add to the deterministic gates in \"Current facts\" and never \
+         override them.\n\
+         - If a rule says a kind of change needs human review and this PR contains that \
+         kind of change, choose \"escalate\".\n\
+         - If a rule explicitly allows a routine kind of change to merge, and this PR \
+         contains only that kind of change with no unresolved reviewer feedback, that \
+         rule can support \"merge\".\n\
+         - If your decision relied on a rule, quote it briefly in the \"policy_rule\" \
+         field. Otherwise set \"policy_rule\" to null.\n\n\
+         <merge_policy>\n{content}\n</merge_policy>\n",
+        path = policy.path,
+        content = truncate_if_needed(policy.content.trim(), MAX_POLICY_BYTES),
+    )
+}
+
+fn observe_marker(head_sha: &str) -> String {
+    format!("{OBSERVE_MARKER_PREFIX}{head_sha} -->")
+}
+
+fn format_observe_comment(
+    head_sha: &str,
+    response: &JudgeResponse,
+    minion_id: Option<&str>,
+) -> String {
+    let verdict = match response.action {
+        JudgeAction::Merge => "would merge",
+        JudgeAction::Escalate => "would escalate for human review",
+        JudgeAction::Wait(_) => "would wait",
+    };
+    format!(
+        "{MERGE_READINESS_MARKER} (observe mode): {verdict}** — confidence {}/10\n\n{}{}\n\n\
+         _`[merge] policy_mode = \"observe\"`: Gru took no merge or label action. \
+         Evaluated at {}._\n{}{}",
+        response.confidence,
+        response.reasoning,
+        format_policy_rule_citation(response),
+        head_sha,
+        observe_marker(head_sha),
+        signature(minion_id),
+    )
+}
+
+/// True if a comment body list already contains an observe comment for `head_sha`.
+fn observe_comment_present(bodies: &str, head_sha: &str) -> bool {
+    bodies.contains(&observe_marker(head_sha))
+}
+
+/// Observe mode: post the judge's hypothetical verdict, at most once per head
+/// SHA. Wait verdicts are not posted since they are not decisions. Takes no
+/// merge or label action.
+pub(crate) async fn post_observe_verdict(
+    host: &str,
+    owner: &str,
+    repo: &str,
+    pr_number: &str,
+    state: &mut JudgeState,
+    response: &JudgeResponse,
+    minion_id: Option<&str>,
+) {
+    if matches!(response.action, JudgeAction::Wait(_)) {
+        return;
+    }
+    let Some(head_sha) = state.last_head_sha().map(str::to_string) else {
+        return;
+    };
+    if state.observed_head_sha.as_deref() == Some(head_sha.as_str()) {
+        return;
+    }
+
+    // Check the PR itself so restarts (and the lab sweeper, which may pick
+    // up the PR later) don't post a second comment for the same head.
+    let repo_full = github::repo_slug(owner, repo);
+    let endpoint = format!("repos/{repo_full}/issues/{pr_number}/comments");
+    match github::run_gh(host, &["api", &endpoint, "--paginate", "--jq", ".[].body"]).await {
+        Ok(bodies) if observe_comment_present(&bodies, &head_sha) => {
+            state.observed_head_sha = Some(head_sha);
+            return;
+        }
+        Ok(_) => {}
+        Err(e) => {
+            log::warn!(
+                "Failed to check for existing observe comment on PR #{}: {:#}",
+                pr_number,
+                e
+            );
+            return;
+        }
+    }
+
+    let body = format_observe_comment(&head_sha, response, minion_id);
+    match github::run_gh(
+        host,
+        &[
+            "pr", "comment", pr_number, "--repo", &repo_full, "--body", &body,
+        ],
+    )
+    .await
+    {
+        Ok(_) => {
+            log::info!("Posted observe-mode verdict on PR #{}", pr_number);
+            state.observed_head_sha = Some(head_sha);
+        }
+        Err(e) => {
+            log::warn!(
+                "Failed to post observe-mode verdict on PR #{}: {:#}",
+                pr_number,
+                e
+            );
+        }
+    }
+}
+
+/// Extract the Minion ID from a Minion branch name
+/// (`minion/issue-42-M001` → `M001`).
+pub(crate) fn minion_id_from_branch(branch: &str) -> Option<&str> {
+    let rest = branch.strip_prefix("minion/")?;
+    let id = rest.rsplit('-').next()?;
+    crate::progress_comments::is_minion_id(id).then_some(id)
 }
 
 #[cfg(test)]
@@ -1279,6 +1680,8 @@ That's my verdict."#;
             confidence: 9,
             action: JudgeAction::Merge,
             reasoning: "ok".to_string(),
+            policy_rule: None,
+            policy_applied: false,
         };
         state.record_response(fp.clone(), &response);
         assert!(!state.should_invoke(&fp));
@@ -1296,6 +1699,8 @@ That's my verdict."#;
             confidence: 9,
             action: JudgeAction::Merge,
             reasoning: "ok".to_string(),
+            policy_rule: None,
+            policy_applied: false,
         };
         state.record_response(fp1, &response);
 
@@ -1319,6 +1724,8 @@ That's my verdict."#;
             confidence: 5,
             action: JudgeAction::Wait(Duration::from_secs(60)),
             reasoning: "waiting".to_string(),
+            policy_rule: None,
+            policy_applied: false,
         };
 
         state.record_response(fp.clone(), &wait_resp);
@@ -1357,6 +1764,8 @@ That's my verdict."#;
             confidence: 3,
             action: JudgeAction::Escalate,
             reasoning: "needs review".to_string(),
+            policy_rule: None,
+            policy_applied: false,
         };
         state.record_response(fp.clone(), &resp);
         assert!(!state.should_invoke(&fp)); // Same state, shouldn't invoke.
@@ -1378,6 +1787,8 @@ That's my verdict."#;
             confidence: 9,
             action: JudgeAction::Merge,
             reasoning: "ok".to_string(),
+            policy_rule: None,
+            policy_applied: false,
         };
         state.record_response(fp.clone(), &resp);
 
@@ -1466,6 +1877,8 @@ That's my verdict."#;
             confidence: 9,
             action: JudgeAction::Merge,
             reasoning: "ok".to_string(),
+            policy_rule: None,
+            policy_applied: false,
         };
         state.record_response(fp, &resp);
         assert_eq!(state.consecutive_failures(), 0);
@@ -1547,6 +1960,8 @@ That's my verdict."#;
             confidence: 5,
             action: JudgeAction::Wait(Duration::from_secs(60)),
             reasoning: "waiting".to_string(),
+            policy_rule: None,
+            policy_applied: false,
         };
         state.record_response(fp1, &wait_resp);
         assert_eq!(state.consecutive_waits(), 1);
@@ -1667,7 +2082,7 @@ That's my verdict."#;
             reviews: "[]".to_string(),
             review_comments: "[]".to_string(),
         };
-        let prompt = build_judge_prompt("42", &ctx, &test_facts(), 0, 8);
+        let prompt = build_judge_prompt("42", &ctx, &test_facts(), 0, 8, None);
         assert!(prompt.contains("confidence threshold is 8/10"));
         assert!(!prompt.contains("IMPORTANT: This is your final evaluation"));
         assert!(prompt.contains("## Current facts"));
@@ -1684,7 +2099,7 @@ That's my verdict."#;
             review_comments: "[]".to_string(),
         };
         // MAX_CONSECUTIVE_WAITS - 1 = 2, so at 2 consecutive waits, force decide.
-        let prompt = build_judge_prompt("42", &ctx, &test_facts(), 2, 8);
+        let prompt = build_judge_prompt("42", &ctx, &test_facts(), 2, 8, None);
         assert!(prompt.contains("IMPORTANT: This is your final evaluation"));
         assert!(prompt.contains("attempt 3 of 3"));
     }
@@ -1845,6 +2260,8 @@ That's my verdict."#;
             confidence: 3,
             action: JudgeAction::Escalate,
             reasoning: "CI red".to_string(),
+            policy_rule: None,
+            policy_applied: false,
         };
         state.record_response(red_fp, &response);
 
@@ -1875,6 +2292,8 @@ That's my verdict."#;
             confidence: 5,
             action: JudgeAction::Wait(Duration::ZERO),
             reasoning: "need more time".to_string(),
+            policy_rule: None,
+            policy_applied: false,
         };
         state.record_response(fp.clone(), &response);
 
@@ -1898,6 +2317,8 @@ That's my verdict."#;
             confidence: 5,
             action: JudgeAction::Wait(Duration::from_secs(3600)),
             reasoning: "need more time".to_string(),
+            policy_rule: None,
+            policy_applied: false,
         };
         state.record_response(fp.clone(), &response);
 
@@ -1906,5 +2327,269 @@ That's my verdict."#;
             !state.should_invoke(&fp),
             "should_invoke must return false while wait timer is active"
         );
+    }
+
+    // --- Repo merge policy (#951) ---
+
+    fn policy_response(entries: [serde_json::Value; 3]) -> String {
+        let [p0, p1, p2] = entries;
+        serde_json::json!({ "data": { "repository": { "p0": p0, "p1": p1, "p2": p2 } } })
+            .to_string()
+    }
+
+    fn blob(text: &str) -> serde_json::Value {
+        serde_json::json!({ "text": text, "isBinary": false })
+    }
+
+    fn test_ctx() -> PrContext {
+        PrContext {
+            diff: "diff".to_string(),
+            comments: "[]".to_string(),
+            reviews: "[]".to_string(),
+            review_comments: "[]".to_string(),
+        }
+    }
+
+    #[test]
+    fn test_policy_lookup_query_reads_default_branch_in_order() {
+        let q = policy_lookup_query();
+        let p0 = q.find("p0: object(expression: \"HEAD:.github/MERGE_POLICY.md\")");
+        let p1 = q.find("p1: object(expression: \"HEAD:MERGE_POLICY.md\")");
+        let p2 = q.find("p2: object(expression: \"HEAD:docs/MERGE_POLICY.md\")");
+        assert!(p0.is_some() && p1.is_some() && p2.is_some(), "{q}");
+        // HEAD: resolves to the default branch; the PR head ref never appears.
+        assert!(!q.contains("headRef"));
+        assert!(!q.contains("refs/pull"));
+    }
+
+    #[test]
+    fn test_select_policy_github_dir_wins() {
+        let json = policy_response([blob("github rules"), blob("root rules"), blob("docs rules")]);
+        let policy = select_policy(&json).unwrap().unwrap();
+        assert_eq!(policy.path, ".github/MERGE_POLICY.md");
+        assert_eq!(policy.content, "github rules");
+    }
+
+    #[test]
+    fn test_select_policy_root_before_docs() {
+        let json = policy_response([
+            serde_json::Value::Null,
+            blob("root rules"),
+            blob("docs rules"),
+        ]);
+        let policy = select_policy(&json).unwrap().unwrap();
+        assert_eq!(policy.path, "MERGE_POLICY.md");
+    }
+
+    #[test]
+    fn test_select_policy_docs_fallback() {
+        let json = policy_response([
+            serde_json::Value::Null,
+            serde_json::Value::Null,
+            blob("docs rules"),
+        ]);
+        let policy = select_policy(&json).unwrap().unwrap();
+        assert_eq!(policy.path, "docs/MERGE_POLICY.md");
+        assert_eq!(policy.content, "docs rules");
+    }
+
+    #[test]
+    fn test_select_policy_absent() {
+        let json = policy_response([
+            serde_json::Value::Null,
+            serde_json::Value::Null,
+            serde_json::Value::Null,
+        ]);
+        assert_eq!(select_policy(&json).unwrap(), None);
+    }
+
+    #[test]
+    fn test_select_policy_skips_empty_binary_and_non_blob() {
+        let json = policy_response([
+            blob("  \n "),
+            serde_json::json!({ "text": null, "isBinary": true }),
+            // A directory at the path matches no Blob fields.
+            serde_json::json!({}),
+        ]);
+        assert_eq!(select_policy(&json).unwrap(), None);
+    }
+
+    #[test]
+    fn test_select_policy_errors_are_not_absence() {
+        let json = r#"{"data": null, "errors": [{"message": "boom"}]}"#;
+        assert!(select_policy(json).is_err());
+        let json = r#"{"data": {"repository": null}}"#;
+        assert!(select_policy(json).is_err());
+        assert!(select_policy("not json").is_err());
+    }
+
+    #[test]
+    fn test_find_policy_file_change_each_location() {
+        for path in MERGE_POLICY_PATHS {
+            let files = vec!["src/lib.rs".to_string(), path.to_string()];
+            assert_eq!(find_policy_file_change(&files), Some(path));
+        }
+    }
+
+    #[test]
+    fn test_find_policy_file_change_case_insensitive() {
+        let files = vec![".GitHub/merge_policy.MD".to_string()];
+        assert!(find_policy_file_change(&files).is_some());
+    }
+
+    #[test]
+    fn test_find_policy_file_change_ignores_other_paths() {
+        let files = vec![
+            "src/MERGE_POLICY.md".to_string(),
+            "MERGE_POLICY.md.bak".to_string(),
+            "CONTRIBUTING.md".to_string(),
+        ];
+        assert_eq!(find_policy_file_change(&files), None);
+        assert_eq!(find_policy_file_change(&[]), None);
+    }
+
+    #[test]
+    fn test_policy_change_escalation_always_escalates() {
+        let resp = policy_change_escalation("MERGE_POLICY.md");
+        assert_eq!(resp.action, JudgeAction::Escalate);
+        assert!(resp.policy_applied);
+        assert!(resp.reasoning.contains("`MERGE_POLICY.md`"));
+        assert!(resp.policy_rule.is_some());
+    }
+
+    #[test]
+    fn test_build_judge_prompt_without_policy_unchanged() {
+        let prompt = build_judge_prompt("42", &test_ctx(), &test_facts(), 0, 8, None);
+        assert!(!prompt.contains("Repository merge policy"));
+        assert!(!prompt.contains("policy_rule"));
+        assert!(!prompt.contains("<merge_policy>"));
+    }
+
+    #[test]
+    fn test_build_judge_prompt_with_policy() {
+        let policy = MergePolicy {
+            path: ".github/MERGE_POLICY.md",
+            content: "Changes under migrations/ need a human.\n".to_string(),
+        };
+        let prompt = build_judge_prompt("42", &test_ctx(), &test_facts(), 0, 8, Some(&policy));
+        assert!(prompt.contains("## Repository merge policy"));
+        assert!(prompt.contains("`.github/MERGE_POLICY.md`"));
+        assert!(prompt
+            .contains("<merge_policy>\nChanges under migrations/ need a human.\n</merge_policy>"));
+        assert!(prompt.contains("never override them"));
+        assert!(prompt.contains("\"policy_rule\":"));
+        // The policy section sits before the PR diff.
+        assert!(prompt.find("## Repository merge policy") < prompt.find("## PR diff"));
+    }
+
+    #[test]
+    fn test_build_judge_prompt_policy_with_braces() {
+        // Policy text is inserted as a value, so braces must survive intact.
+        let policy = MergePolicy {
+            path: "MERGE_POLICY.md",
+            content: "Never merge {{secret}} or {x}".to_string(),
+        };
+        let prompt = build_judge_prompt("1", &test_ctx(), &test_facts(), 0, 8, Some(&policy));
+        assert!(prompt.contains("Never merge {{secret}} or {x}"));
+    }
+
+    #[test]
+    fn test_parse_judge_response_policy_rule() {
+        let text = r#"{"confidence": 3, "action": "escalate", "reasoning": "Touches auth.", "policy_rule": "Auth changes need human review."}"#;
+        let resp = parse_judge_response(text).unwrap();
+        assert_eq!(
+            resp.policy_rule.as_deref(),
+            Some("Auth changes need human review.")
+        );
+    }
+
+    #[test]
+    fn test_parse_judge_response_policy_rule_null_or_blank() {
+        for rule in ["null", "\"\"", "\"  \"", "\"null\""] {
+            let text = format!(
+                r#"{{"confidence": 9, "action": "merge", "reasoning": "ok", "policy_rule": {rule}}}"#
+            );
+            assert_eq!(
+                parse_judge_response(&text).unwrap().policy_rule,
+                None,
+                "{rule}"
+            );
+        }
+        let text = r#"{"confidence": 9, "action": "merge", "reasoning": "ok"}"#;
+        assert_eq!(parse_judge_response(text).unwrap().policy_rule, None);
+    }
+
+    #[test]
+    fn test_escalation_comment_cites_policy_rule() {
+        let resp = JudgeResponse {
+            confidence: 4,
+            action: JudgeAction::Escalate,
+            reasoning: "Touches src/auth.rs.".to_string(),
+            policy_rule: Some("Auth code always needs human review.".to_string()),
+            policy_applied: true,
+        };
+        let body = format_escalation_comment(&resp, Some("M042"));
+        assert!(body.contains("**Policy rule:**\n> Auth code always needs human review."));
+        assert!(is_bookkeeping_body(&body));
+    }
+
+    #[test]
+    fn test_escalation_comment_without_policy_rule() {
+        let resp = JudgeResponse {
+            confidence: 4,
+            action: JudgeAction::Escalate,
+            reasoning: "Open question.".to_string(),
+            policy_rule: None,
+            policy_applied: false,
+        };
+        let body = format_escalation_comment(&resp, Some("M042"));
+        assert!(!body.contains("Policy rule"));
+        assert!(body.ends_with("<sub>🤖 M042</sub>"));
+        // Without a Minion ID there is no signature.
+        let body = format_escalation_comment(&resp, None);
+        assert!(!body.contains("<sub>"));
+    }
+
+    #[test]
+    fn test_observe_comment_marker_and_dedupe() {
+        let resp = JudgeResponse {
+            confidence: 9,
+            action: JudgeAction::Merge,
+            reasoning: "Docs-only change.".to_string(),
+            policy_rule: Some("Docs-only changes can auto-merge.".to_string()),
+            policy_applied: true,
+        };
+        let body = format_observe_comment("abc123", &resp, Some("M042"));
+        assert!(body.contains("(observe mode): would merge**"));
+        assert!(body.contains("Gru took no merge or label action"));
+        assert!(body.contains("> Docs-only changes can auto-merge."));
+        // Observe verdicts are bookkeeping, so they don't feed later judge runs.
+        assert!(is_bookkeeping_body(&body));
+        // One per head SHA: present for this head, absent for a new one.
+        assert!(observe_comment_present(&body, "abc123"));
+        assert!(!observe_comment_present(&body, "def456"));
+        assert!(!observe_comment_present(&body, "abc"));
+    }
+
+    #[test]
+    fn test_judge_state_last_head_sha() {
+        let mut state = JudgeState::new();
+        assert_eq!(state.last_head_sha(), None);
+        let fp = PrStateFingerprint {
+            head_sha: "abc123".to_string(),
+            comment_count: 0,
+            ci_label_hash: 0,
+        };
+        state.record_response(fp, &policy_change_escalation("MERGE_POLICY.md"));
+        assert_eq!(state.last_head_sha(), Some("abc123"));
+    }
+
+    #[test]
+    fn test_minion_id_from_branch() {
+        assert_eq!(minion_id_from_branch("minion/issue-42-M001"), Some("M001"));
+        assert_eq!(minion_id_from_branch("minion/issue-951-M23k"), Some("M23k"));
+        assert_eq!(minion_id_from_branch("feature/foo-M001"), None);
+        assert_eq!(minion_id_from_branch("minion/issue-42-bad"), None);
+        assert_eq!(minion_id_from_branch(""), None);
     }
 }

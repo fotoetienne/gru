@@ -3,7 +3,7 @@ use super::agent::invoke_agent_for_reviews;
 use super::types::{IssueContext, WorktreeContext, MAX_REBASE_ATTEMPTS, MAX_REVIEW_ROUNDS};
 use crate::agent::AgentBackend;
 use crate::ci;
-use crate::config::LabConfig;
+use crate::config::{LabConfig, PolicyMode};
 use crate::github;
 use crate::merge_judge::{self, JudgeAction, JudgeResponse, JudgeState};
 use crate::minion_registry;
@@ -619,6 +619,7 @@ struct MonitorLoopState {
     review_baseline: Option<DateTime<Utc>>,
     monitor_start: tokio::time::Instant,
     confidence_threshold: u8,
+    policy_mode: PolicyMode,
     /// Number of poll cycles to skip merge-conflict detection after a successful
     /// rebase + force-push. GitHub takes time to recompute the `mergeable` field,
     /// so stale `mergeable: false` would otherwise trigger redundant rebase cycles.
@@ -653,7 +654,11 @@ const MAX_CONSECUTIVE_ERRORS: u32 = 10;
 const RATE_LIMIT_BACKOFF_SECS: u64 = 300;
 
 impl MonitorLoopState {
-    fn new(initial_baseline: DateTime<Utc>, confidence_threshold: u8) -> Self {
+    fn new(
+        initial_baseline: DateTime<Utc>,
+        confidence_threshold: u8,
+        policy_mode: PolicyMode,
+    ) -> Self {
         Self {
             review_round: 0,
             issue_comment_round: 0,
@@ -667,6 +672,7 @@ impl MonitorLoopState {
             review_baseline: Some(initial_baseline),
             monitor_start: tokio::time::Instant::now(),
             confidence_threshold,
+            policy_mode,
             rebase_cooldown_cycles: 0,
         }
     }
@@ -800,6 +806,24 @@ async fn handle_ready_to_merge(
     )
     .await
     {
+        Ok(Some(response))
+            if response.policy_applied && state.policy_mode == PolicyMode::Observe =>
+        {
+            println!(
+                "👁️  Observe mode: merge policy applies to PR #{} — reporting verdict without acting",
+                ctx.pr_number
+            );
+            merge_judge::post_observe_verdict(
+                &ctx.issue_ctx.host,
+                &ctx.issue_ctx.owner,
+                &ctx.issue_ctx.repo,
+                ctx.pr_number,
+                &mut state.judge_state,
+                &response,
+                Some(&ctx.wt_ctx.minion_id),
+            )
+            .await;
+        }
         Ok(Some(response)) => match &response.action {
             JudgeAction::Merge => {
                 println!(
@@ -878,7 +902,7 @@ async fn handle_ready_to_merge(
                     &ctx.issue_ctx.repo,
                     ctx.pr_number,
                     &response,
-                    &ctx.wt_ctx.minion_id,
+                    Some(&ctx.wt_ctx.minion_id),
                 )
                 .await;
                 // Also post an explanatory comment on the issue.
@@ -940,8 +964,10 @@ async fn handle_ready_to_merge(
                             state.judge_state.consecutive_failures(),
                             e
                         ),
+                        policy_rule: None,
+                        policy_applied: false,
                     },
-                    &ctx.wt_ctx.minion_id,
+                    Some(&ctx.wt_ctx.minion_id),
                 )
                 .await;
                 // Only mark escalation complete if the label was applied.
@@ -1776,20 +1802,26 @@ pub(crate) async fn monitor_pr_lifecycle(
     println!("\n👀 Monitoring PR for updates (polling every 30s)...");
     println!("   Press Ctrl+C to stop monitoring\n");
 
-    // Load merge confidence threshold from config (falls back to default).
+    // Load merge judge settings from config (falls back to defaults).
     // Uses load_partial to avoid requiring [daemon].repos for non-daemon commands.
-    let confidence_threshold = LabConfig::default_path()
+    let merge_config = LabConfig::default_path()
         .ok()
         .and_then(|p| {
             LabConfig::load_partial(&p)
                 .map_err(|e| {
-                    log::warn!("Failed to load config for merge threshold: {e}, using default");
+                    log::warn!(
+                        "Failed to load config for merge judge settings: {e}, using defaults"
+                    );
                     e
                 })
                 .ok()
         })
-        .map(|c| c.merge.confidence_threshold.clamp(1, 10))
+        .map(|c| c.merge);
+    let confidence_threshold = merge_config
+        .as_ref()
+        .map(|m| m.confidence_threshold.clamp(1, 10))
         .unwrap_or(merge_judge::DEFAULT_CONFIDENCE_THRESHOLD);
+    let policy_mode = merge_config.map(|m| m.policy_mode).unwrap_or_default();
 
     // Track review baseline across monitor_pr re-entries so reviews posted
     // before/during event handling (e.g. rebase) are not silently dropped.
@@ -1851,7 +1883,7 @@ pub(crate) async fn monitor_pr_lifecycle(
         pre_review_time
     };
 
-    let mut state = MonitorLoopState::new(initial_baseline, confidence_threshold);
+    let mut state = MonitorLoopState::new(initial_baseline, confidence_threshold, policy_mode);
     let ctx = MonitorContext {
         backend,
         issue_ctx,
@@ -2099,7 +2131,7 @@ mod tests {
             timeout_opt: None,
             monitor_timeout: Duration::from_secs(7200),
         };
-        let mut state = MonitorLoopState::new(Utc::now(), 0);
+        let mut state = MonitorLoopState::new(Utc::now(), 0, PolicyMode::Enforce);
 
         // Simulate 15 consecutive rate-limit errors (more than MAX_CONSECUTIVE_ERRORS)
         for _ in 0..15 {
@@ -2133,7 +2165,7 @@ mod tests {
             timeout_opt: None,
             monitor_timeout: Duration::from_secs(7200),
         };
-        let mut state = MonitorLoopState::new(Utc::now(), 0);
+        let mut state = MonitorLoopState::new(Utc::now(), 0, PolicyMode::Enforce);
 
         let error = anyhow::anyhow!("Failed to fetch PR: connection refused");
         let action = handle_monitor_error(&mut state, &ctx, error).await;
@@ -2156,7 +2188,7 @@ mod tests {
             timeout_opt: None,
             monitor_timeout: Duration::from_secs(7200),
         };
-        let mut state = MonitorLoopState::new(Utc::now(), 0);
+        let mut state = MonitorLoopState::new(Utc::now(), 0, PolicyMode::Enforce);
 
         for i in 0..MAX_CONSECUTIVE_ERRORS {
             let error = anyhow::anyhow!("Failed to fetch PR: server error");
@@ -2196,7 +2228,7 @@ mod tests {
 
     #[test]
     fn test_rebase_cooldown_initial_state() {
-        let state = MonitorLoopState::new(Utc::now(), 80);
+        let state = MonitorLoopState::new(Utc::now(), 80, PolicyMode::Enforce);
         assert_eq!(state.rebase_cooldown_cycles, 0);
     }
 
@@ -2219,7 +2251,7 @@ mod tests {
 
         let stale_baseline = Utc::now() - chrono::Duration::seconds(60);
         let check_time = Utc::now();
-        let mut state = MonitorLoopState::new(stale_baseline, 0);
+        let mut state = MonitorLoopState::new(stale_baseline, 0, PolicyMode::Enforce);
         state.review_baseline = Some(stale_baseline);
         state.rebase_attempts = MAX_REBASE_ATTEMPTS; // trigger early-exit path
 
@@ -2266,7 +2298,7 @@ mod tests {
 
         let stale_baseline = Utc::now() - chrono::Duration::seconds(60);
         let check_time = Utc::now();
-        let mut state = MonitorLoopState::new(stale_baseline, 0);
+        let mut state = MonitorLoopState::new(stale_baseline, 0, PolicyMode::Enforce);
         state.review_baseline = Some(stale_baseline);
         // rebase_attempts = 0 (< MAX) so we enter auto_rebase_pr and hit Err
 
@@ -2292,7 +2324,7 @@ mod tests {
     fn test_monitor_loop_state_stores_assigned_baseline() {
         let stale = Utc::now() - chrono::Duration::seconds(60);
         let check_time = Utc::now();
-        let mut state = MonitorLoopState::new(stale, 0);
+        let mut state = MonitorLoopState::new(stale, 0, PolicyMode::Enforce);
         assert_eq!(
             state.review_baseline,
             Some(stale),
@@ -2329,7 +2361,7 @@ mod tests {
 
         let stale_baseline = Utc::now() - chrono::Duration::seconds(60);
         let check_time = Utc::now();
-        let mut state = MonitorLoopState::new(stale_baseline, 0);
+        let mut state = MonitorLoopState::new(stale_baseline, 0, PolicyMode::Enforce);
         state.review_baseline = Some(stale_baseline);
         state.rebase_cooldown_cycles = 2; // active cooldown
 
@@ -2553,7 +2585,7 @@ mod tests {
         // Structural check: the two fields that the bypass resets must exist
         // on MonitorLoopState so any future rename is caught at compile time.
         let stale = Utc::now() - chrono::Duration::seconds(60);
-        let mut state = MonitorLoopState::new(stale, 0);
+        let mut state = MonitorLoopState::new(stale, 0, PolicyMode::Enforce);
         state.rebase_attempts = 1;
         state.rebase_cooldown_cycles = 0;
         // Replicate what the bypass does.

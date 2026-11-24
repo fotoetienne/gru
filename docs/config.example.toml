@@ -156,6 +156,15 @@
 # Higher = more conservative. The judge must score >= this value
 # before Gru will merge a PR.
 # confidence_threshold = 8
+#
+# Repos can add merge rules in prose in a MERGE_POLICY.md file, read from the
+# default branch (.github/, then the root, then docs/). This setting controls
+# how the judge applies that policy:
+#   "enforce" (default) - merge or escalate according to the verdict
+#   "observe"           - post the verdict the judge would have reached (once
+#                         per head SHA) without merging or labeling
+# Repos without a MERGE_POLICY.md are unaffected.
+# policy_mode = "enforce"
 
 # ─────────────────────────────────────────────────────────────────────
 # Full GHES example
