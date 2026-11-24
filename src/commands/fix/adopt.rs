@@ -501,7 +501,21 @@ pub(crate) async fn handle_adopt(pr_arg: &str, opts: AdoptOptions) -> Result<i32
         pending_review_sha: None,
     };
     let mid = minion_id.clone();
-    if let Err(e) = with_registry(move |reg| reg.register(mid, info)).await {
+    let repo_for_register = repo_name.clone();
+    // Re-check under the registry lock: two `gru adopt` runs for the same
+    // issue on different branches could both pass the earlier check. (Two
+    // runs for the same branch are already stopped by git's worktree lock.)
+    if let Err(e) = with_registry(move |reg| {
+        let existing: Vec<_> = reg
+            .list()
+            .into_iter()
+            .filter(|(_, i)| i.repo == repo_for_register)
+            .collect();
+        check_no_live_minion(&existing, issue_num, pr)?;
+        reg.register(mid, info)
+    })
+    .await
+    {
         // Without a registry entry nothing would ever clean this worktree up,
         // and it would block the next `gru adopt` of this branch.
         let _ = tokio::process::Command::new("git")
