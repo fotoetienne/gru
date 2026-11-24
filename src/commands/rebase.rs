@@ -90,7 +90,7 @@ pub(crate) async fn handle_rebase(
             // session's events land next to the main agent's events.
             let events_dir = derive_events_dir(&worktree_path);
             let exit_code =
-                run_agent_rebase(&worktree_path, &events_dir, &base_branch, timeout).await?;
+                run_agent_rebase(&worktree_path, &events_dir, &base_branch, timeout, None).await?;
 
             if exit_code == 0 {
                 // Agent succeeded: enforce branch recovery (any failure is a real error).
@@ -817,12 +817,16 @@ pub(crate) async fn run_agent_rebase(
     events_dir: &Path,
     base_branch: &str,
     timeout: Option<&str>,
+    extra_instructions: Option<&str>,
 ) -> Result<i32> {
     let backend = agent_registry::resolve_backend(agent_registry::DEFAULT_AGENT)?;
     let session_id = Uuid::new_v4();
     let github_host = super::resume::resolve_host_from_worktree(checkout_path, "").await;
 
-    let prompt = REBASE_PROMPT_TEMPLATE.replace("<BASE_BRANCH>", base_branch);
+    let mut prompt = REBASE_PROMPT_TEMPLATE.replace("<BASE_BRANCH>", base_branch);
+    if let Some(extra) = extra_instructions {
+        prompt.push_str(extra);
+    }
     let cmd = backend.build_command(checkout_path, &session_id, &prompt, &github_host);
 
     let effective_timeout = Some(timeout.unwrap_or(DEFAULT_CONFLICT_TIMEOUT));

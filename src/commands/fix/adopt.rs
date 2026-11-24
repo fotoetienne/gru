@@ -20,7 +20,7 @@ use super::worktree::format_branch_name;
 use super::{spawn_worker, FixOptions};
 use crate::agent::AgentBackend;
 use crate::agent_registry;
-use crate::agent_runner::{is_stuck_or_timeout_error, parse_timeout, EXIT_CODE_SIGNAL_TERMINATED};
+use crate::agent_runner::parse_timeout;
 use crate::config::HostRegistry;
 use crate::git;
 use crate::github;
@@ -87,10 +87,26 @@ struct PrMeta {
     author: Option<Login>,
     #[serde(default)]
     closing_issues_references: Vec<ClosingIssue>,
+    #[serde(default)]
+    commits: Vec<PrCommit>,
 }
 
-const PR_META_FIELDS: &str =
-    "number,title,body,state,url,headRefName,isCrossRepository,author,closingIssuesReferences";
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PrCommit {
+    committed_date: chrono::DateTime<Utc>,
+}
+
+const PR_META_FIELDS: &str = "number,title,body,state,url,headRefName,isCrossRepository,author,closingIssuesReferences,commits";
+
+/// Review baseline for a newly adopted PR: the time of its latest commit.
+///
+/// Reviews and comments posted after the author last pushed are probably
+/// still unaddressed, so the Minion picks them up. Earlier ones are assumed
+/// handled. `None` (no commits) falls back to "from now on".
+fn initial_review_baseline(meta: &PrMeta) -> Option<chrono::DateTime<Utc>> {
+    meta.commits.iter().map(|c| c.committed_date).max()
+}
 
 /// Finds the issue the PR is linked to in the same repository.
 ///
@@ -465,7 +481,7 @@ pub(crate) async fn handle_adopt(pr_arg: &str, opts: AdoptOptions) -> Result<i32
         timeout_deadline,
         attempt_count: 1,
         no_watch: false,
-        last_review_check_time: None,
+        last_review_check_time: initial_review_baseline(&meta),
         wake_reason: None,
         archived_at: None,
         pending_review_sha: None,
@@ -583,6 +599,7 @@ pub(crate) async fn run_adopted_pipeline(
             let pr_num: u64 = pr.parse().context("Invalid PR number in registry")?;
             let meta = fetch_pr_meta(&issue_ctx.host, &issue_ctx.owner, &issue_ctx.repo, pr_num)
                 .await
+                .map_err(|e| log::warn!("⚠️  Could not fetch PR #{} details: {:#}", pr, e))
                 .ok();
             let (title, url) = meta
                 .map(|m| (m.title, m.url))
@@ -609,22 +626,20 @@ pub(crate) async fn run_adopted_pipeline(
             )
             .await
         };
+        // Orientation only gives later sessions context; the PR still needs
+        // watching if it fails, so log and carry on to monitoring.
         match result {
             Ok(r) if r.status.success() => {}
-            Ok(r) => {
-                update_orchestration_phase(&wt_ctx.minion_id, OrchestrationPhase::Failed).await;
-                clear_ownership(&wt_ctx.minion_id).await;
-                return Ok(r.status.code().unwrap_or(EXIT_CODE_SIGNAL_TERMINATED));
-            }
-            Err(e) => {
-                update_orchestration_phase(&wt_ctx.minion_id, OrchestrationPhase::Failed).await;
-                clear_ownership(&wt_ctx.minion_id).await;
-                if is_stuck_or_timeout_error(&e) {
-                    log::error!("🚨 {:#}", e);
-                    return Ok(1);
-                }
-                return Err(e);
-            }
+            Ok(r) => log::warn!(
+                "⚠️  Orientation session exited with {:?}; continuing to monitor PR #{}",
+                r.status.code(),
+                pr
+            ),
+            Err(e) => log::warn!(
+                "⚠️  Orientation session failed: {:#}; continuing to monitor PR #{}",
+                e,
+                pr
+            ),
         }
     }
 
@@ -782,6 +797,26 @@ mod tests {
             }"#,
         );
         assert_eq!(find_linked_issue(&pr, "octo", "app"), None);
+    }
+
+    #[test]
+    fn test_initial_review_baseline_is_latest_commit() {
+        let pr = meta(
+            r#"{
+                "number": 1, "title": "t", "state": "OPEN", "url": "u",
+                "headRefName": "b", "isCrossRepository": false,
+                "commits": [
+                    {"committedDate": "2026-01-02T00:00:00Z"},
+                    {"committedDate": "2026-01-05T00:00:00Z"},
+                    {"committedDate": "2026-01-03T00:00:00Z"}
+                ]
+            }"#,
+        );
+        assert_eq!(
+            initial_review_baseline(&pr).unwrap().to_rfc3339(),
+            "2026-01-05T00:00:00+00:00"
+        );
+        assert!(initial_review_baseline(&own_pr()).is_none());
     }
 
     #[test]

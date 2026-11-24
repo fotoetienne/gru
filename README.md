@@ -189,7 +189,7 @@ gru do 42 --discuss                              # Review the prompt before laun
 
 ### Hand off your own PR
 
-`gru adopt` gives a PR you wrote yourself (by hand or in an interactive agent session) to a Minion. The Minion checks out the PR's branch and skips implementation: it fixes CI failures, responds to review comments and rebases on conflicts until the PR merges. You can keep pushing to the branch; the Minion pulls your commits before each push and never force-pushes over them.
+`gru adopt` gives a PR you wrote yourself (by hand or in an interactive agent session) to a Minion. The Minion checks out the PR's branch and skips implementation: it fixes CI failures, responds to review comments and rebases on conflicts until the PR merges. You can keep pushing to the branch: the Minion pulls your commits before each push, and refuses to push if that would drop any of them. When the PR conflicts with the base branch, the Minion rebases the whole branch (your commits included) and force-pushes, so run `git pull --rebase` before pushing again.
 
 ```bash
 gru adopt 43                                       # By PR number (from within the repo)

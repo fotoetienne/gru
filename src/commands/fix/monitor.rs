@@ -128,10 +128,16 @@ enum AutoRebaseResult {
 /// directory where `events.jsonl` is written — passing it explicitly keeps
 /// the rebase agent's stream events co-located with the main agent's
 /// events instead of landing inside the checkout.
+/// Appended to the conflict-resolution prompt during auto-rebase: Gru does
+/// the push itself so it can refuse when someone else pushed meanwhile.
+const AUTO_REBASE_NO_PUSH_NOTE: &str = "\n\n## Do not push\n\
+Skip the force-push step. Gru pushes the rebased branch itself, after checking that nobody \
+else pushed to it while you were working. Do not run `git push` at all.\n";
+
 async fn auto_rebase_pr(checkout_path: &Path, minion_dir: &Path) -> Result<AutoRebaseResult> {
     use super::super::rebase::{
         abort_rebase, attempt_rebase, check_clean_worktree, detect_base_branch, ensure_on_branch,
-        force_push, get_current_branch, is_rebase_in_progress, run_agent_rebase, RebaseOutcome,
+        get_current_branch, is_rebase_in_progress, run_agent_rebase, RebaseOutcome,
     };
 
     // Abort any stale in-progress rebase left by a previous crashed attempt.
@@ -160,8 +166,17 @@ async fn auto_rebase_pr(checkout_path: &Path, minion_dir: &Path) -> Result<AutoR
         crate::git::RemoteSync::Integrated => {
             println!("🔀 Pulled new commits from origin/{}", pr_branch)
         }
+        crate::git::RemoteSync::ResetToRemote => {
+            println!(
+                "🔀 origin/{} was force-pushed; moved to its new tip",
+                pr_branch
+            )
+        }
         crate::git::RemoteSync::UpToDate | crate::git::RemoteSync::NoRemoteBranch => {}
     }
+    // The remote tip this rebase starts from. The force-push at the end only
+    // replaces this exact commit (see `force_push_rebased`).
+    let rebased_from = crate::git::remote_tracking_sha(checkout_path, &pr_branch).await?;
 
     // Detect the base branch first so we can fetch only what we need
     let base_branch = detect_base_branch(checkout_path).await?;
@@ -192,7 +207,8 @@ async fn auto_rebase_pr(checkout_path: &Path, minion_dir: &Path) -> Result<AutoR
                 if commit_count == 1 { "" } else { "s" }
             );
             log::info!("Auto force-pushing rebased branch (autonomous mode, --force-with-lease)");
-            force_push(checkout_path).await?;
+            crate::git::force_push_rebased(checkout_path, &pr_branch, rebased_from.as_deref())
+                .await?;
             println!("🚀 Force-pushed rebased branch");
             Ok(AutoRebaseResult::RebasedAndPushed)
         }
@@ -205,7 +221,14 @@ async fn auto_rebase_pr(checkout_path: &Path, minion_dir: &Path) -> Result<AutoR
             let local_branch = get_current_branch(checkout_path).await?;
 
             // None uses the 30m default inside run_agent_rebase
-            let exit_code = run_agent_rebase(checkout_path, minion_dir, &base_branch, None).await?;
+            let exit_code = run_agent_rebase(
+                checkout_path,
+                minion_dir,
+                &base_branch,
+                None,
+                Some(AUTO_REBASE_NO_PUSH_NOTE),
+            )
+            .await?;
 
             // Defensive check: agent may have checked out a remote tracking ref
             // (e.g. `origin/<branch>`) leaving the worktree in detached HEAD.
@@ -278,43 +301,12 @@ async fn auto_rebase_pr(checkout_path: &Path, minion_dir: &Path) -> Result<AutoR
                         );
                         return Ok(AutoRebaseResult::ConflictUnresolved);
                     }
-                    // Refresh the PR branch tracking ref before force_push. The
-                    // primary agent may have already pushed a merge commit, making
-                    // our local tracking ref stale. Without this fetch,
-                    // --force-with-lease would see a lease mismatch and fail.
-                    //
-                    // Use --refmap= (empty) + explicit refspec so only this one
-                    // branch is fetched, independent of remote.origin.fetch config
-                    // (mirrors the approach used by fetch_base_branch).
-                    let pr_refspec = format!(
-                        "refs/heads/{}:refs/remotes/origin/{}",
-                        local_branch, local_branch
-                    );
-                    let fetch_out = TokioCommand::new("git")
-                        .arg("-C")
-                        .arg(checkout_path)
-                        .args(["fetch", "--refmap=", "origin", pr_refspec.as_str()])
-                        .output()
-                        .await;
-                    match fetch_out {
-                        Ok(out) if !out.status.success() => {
-                            log::warn!(
-                                "Could not refresh PR branch tracking ref before push: {}",
-                                String::from_utf8_lossy(&out.stderr).trim()
-                            );
-                        }
-                        Err(e) => {
-                            log::warn!(
-                                "Could not refresh PR branch tracking ref before push: {:#}",
-                                e
-                            );
-                        }
-                        Ok(_) => {}
-                    }
                 }
-                // Defensively force push in case the rebase agent didn't push.
+                // The rebase agent is told not to push; Gru pushes, after
+                // checking nobody else pushed to the branch during the rebase.
                 log::info!("Auto force-pushing after conflict resolution (autonomous mode, --force-with-lease)");
-                force_push(checkout_path).await?;
+                crate::git::force_push_rebased(checkout_path, &pr_branch, rebased_from.as_deref())
+                    .await?;
                 println!("🚀 Force-pushed rebased branch");
                 Ok(AutoRebaseResult::RebasedAndPushed)
             } else {
@@ -1693,6 +1685,23 @@ pub(crate) async fn monitor_pr_lifecycle(
     // during the review are not missed when the monitoring loop starts.
     let pre_review_time = chrono::Utc::now();
 
+    // A persisted baseline earlier than now means feedback may have arrived
+    // that no session has handled yet: posted while the Minion was stopped,
+    // or, for an adopted PR, after the author's last commit. Start from it
+    // so that feedback isn't skipped.
+    let mid = wt_ctx.minion_id.clone();
+    let persisted_baseline = minion_registry::with_registry(move |registry| {
+        Ok(registry
+            .get(&mid)
+            .and_then(|info| info.last_review_check_time))
+    })
+    .await
+    .ok()
+    .flatten();
+    let fresh_baseline = persisted_baseline
+        .filter(|t| *t < pre_review_time)
+        .unwrap_or(pre_review_time);
+
     // Guard: skip self-review if a review was already triggered or posted for the
     // current HEAD SHA.
     //
@@ -1762,7 +1771,7 @@ pub(crate) async fn monitor_pr_lifecycle(
         // Done here (not before the already_reviewed guard) so that on re-entry
         // we don't overwrite a stored baseline with the current time, which would
         // cause reviews posted while the minion was stopped to be skipped.
-        save_review_check_time(&wt_ctx.minion_id, pre_review_time).await;
+        save_review_check_time(&wt_ctx.minion_id, fresh_baseline).await;
         // Persist the pending SHA *before* spawning the subprocess.  Setting it
         // after spawn would miss the primary crash scenario (session dies while the
         // child is running).  The trade-off: a crash in the narrow window *after*
@@ -1869,7 +1878,7 @@ pub(crate) async fn monitor_pr_lifecycle(
             }
         }
     } else {
-        pre_review_time
+        fresh_baseline
     };
 
     let mut state = MonitorLoopState::new(initial_baseline, confidence_threshold);

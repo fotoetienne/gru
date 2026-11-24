@@ -956,10 +956,12 @@ pub(crate) async fn invoke_ci_fix(
     worktree_path: &Path,
     events_dir: &Path,
     github_host: &str,
+    branch: &str,
     failed_checks: &[CheckRun],
     attempt: u32,
 ) -> Result<i32> {
-    let prompt = build_ci_fix_prompt(failed_checks, attempt, worktree_path);
+    let mut prompt = build_ci_fix_prompt(failed_checks, attempt, worktree_path);
+    prompt.push_str(&crate::pr_monitor::format_push_safety_note(branch));
     let cmd = backend.build_ci_fix_command(worktree_path, &prompt, github_host);
     let timeout_str = format!("{}s", CI_FIX_TIMEOUT_SECS);
 
@@ -1573,6 +1575,7 @@ async fn run_ci_fix_attempt(
         worktree_path,
         events_dir,
         host,
+        branch,
         &failed_checks,
         attempt,
     )
