@@ -2,9 +2,10 @@ use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
 use std::process::Output;
 use tokio::process::Command;
-use tokio::time::{sleep, Duration};
+use tokio::time::Duration;
 
 use crate::labels;
+use crate::shutdown::{ShutdownSignal, SleepOutcome};
 
 /// Default maximum number of retry attempts for GitHub API calls.
 pub(crate) const DEFAULT_MAX_RETRIES: u32 = 5;
@@ -70,6 +71,32 @@ pub(crate) fn gh_cli_command(host: &str) -> Command {
     cmd
 }
 
+/// Await `fut` unless `shutdown` fires first (checked before the first poll),
+/// in which case `fut` is dropped and an error is returned.
+///
+/// For `gh` processes built with `kill_on_drop(true)`: if it arrives mid-call
+/// the process is killed. To avoid spawning at all after shutdown, pass
+/// `async { cmd.output().await }`, not `cmd.output()`: tokio's `output()`
+/// spawns the child as soon as it is called, before the future is polled.
+async fn unless_shutdown<F: std::future::Future>(
+    shutdown: &ShutdownSignal,
+    fut: F,
+) -> Result<F::Output> {
+    tokio::select! {
+        biased;
+        _ = shutdown.wait() => Err(anyhow!("shutdown requested")),
+        out = fut => Ok(out),
+    }
+}
+
+/// Run `cmd` (with `kill_on_drop`) unless process shutdown is requested
+/// first; see [`unless_shutdown`].
+pub(crate) async fn output_unless_shutdown(mut cmd: Command) -> Result<Output> {
+    cmd.kill_on_drop(true);
+    // `output()` spawns synchronously, so defer it into the async block.
+    Ok(unless_shutdown(crate::shutdown::global(), async move { cmd.output().await }).await??)
+}
+
 /// Run a `gh` CLI command and return its stdout on success.
 ///
 /// This is the standard helper for executing `gh` commands. It handles the
@@ -92,11 +119,22 @@ pub(crate) async fn run_gh(host: &str, args: &[&str]) -> Result<String> {
         .map(|a| if a.len() > 80 { &a[..80] } else { a })
         .collect::<Vec<_>>()
         .join(" ");
-    let child = gh_cli_command(host).args(args).kill_on_drop(true).output();
-    let output = tokio::time::timeout(Duration::from_secs(GH_TIMEOUT_SECS), child)
-        .await
-        .with_context(|| format!("gh {} timed out after {}s", args_display, GH_TIMEOUT_SECS))?
-        .with_context(|| format!("Failed to execute: gh {}", args_display))?;
+    // `output()` spawns synchronously, so defer it into the async block.
+    let child = async {
+        gh_cli_command(host)
+            .args(args)
+            .kill_on_drop(true)
+            .output()
+            .await
+    };
+    let output = unless_shutdown(
+        crate::shutdown::global(),
+        tokio::time::timeout(Duration::from_secs(GH_TIMEOUT_SECS), child),
+    )
+    .await
+    .with_context(|| format!("gh {} not run", args_display))?
+    .with_context(|| format!("gh {} timed out after {}s", args_display, GH_TIMEOUT_SECS))?
+    .with_context(|| format!("Failed to execute: gh {}", args_display))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -172,6 +210,10 @@ fn calculate_retry_delay(attempt: u32) -> u64 {
 /// responses and non-retryable failures are returned as `Ok(Output)`.
 /// Callers **must** check `output.status.success()` to distinguish the two.
 ///
+/// Once process shutdown has been requested ([`crate::shutdown`]), no new
+/// request is started, an in-flight `gh` call is killed (both return `Err`),
+/// and pending retries are skipped.
+///
 /// # Arguments
 /// * `host` - GitHub hostname (e.g., "github.com" or "ghe.example.com")
 /// * `args` - The arguments to pass to the gh command
@@ -181,29 +223,95 @@ pub(crate) async fn gh_api_with_retry(
     args: &[&str],
     max_retries: u32,
 ) -> Result<Output> {
+    let args_str = args.join(" ");
+    let mut env = GhRetryEnv { host, args };
+    retry_gh_call(&mut env, &args_str, max_retries).await
+}
+
+/// The side effects of [`gh_api_with_retry`], behind a trait so tests can
+/// script `gh` results and shutdown timing without spawning processes.
+trait RetryEnv {
+    /// Wait out a rate limit signalled by a peer Minion.
+    async fn wait_shared_rate_limit(&mut self) -> SleepOutcome;
+    /// Run the `gh` command once.
+    async fn run(&mut self) -> Result<Output>;
+    /// Sleep until the rate-limit window resets.
+    async fn sleep_rate_limit(&mut self) -> SleepOutcome;
+    /// Sleep for a transient-error backoff.
+    async fn sleep_backoff(&mut self, delay: Duration) -> SleepOutcome;
+    /// Called after a successful call.
+    fn on_success(&mut self);
+}
+
+struct GhRetryEnv<'a> {
+    host: &'a str,
+    args: &'a [&'a str],
+}
+
+impl RetryEnv for GhRetryEnv<'_> {
+    async fn wait_shared_rate_limit(&mut self) -> SleepOutcome {
+        crate::shared_rate_limit::wait_if_shared_rate_limited(self.host).await
+    }
+
+    async fn run(&mut self) -> Result<Output> {
+        // Race the call against shutdown so a hung `gh` doesn't hold up the
+        // first Ctrl-C; kill_on_drop stops it when shutdown wins.
+        // `output()` spawns synchronously, so defer it into the async block.
+        let call = async {
+            gh_cli_command(self.host)
+                .args(self.args)
+                .kill_on_drop(true)
+                .output()
+                .await
+        };
+        unless_shutdown(crate::shutdown::global(), call)
+            .await
+            .with_context(|| format!("gh {} not run", self.args.join(" ")))?
+            .with_context(|| format!("Failed to execute: gh {}", self.args.join(" ")))
+    }
+
+    async fn sleep_rate_limit(&mut self) -> SleepOutcome {
+        sleep_until_rate_limit_reset(self.host).await
+    }
+
+    async fn sleep_backoff(&mut self, delay: Duration) -> SleepOutcome {
+        crate::shutdown::global().sleep(delay).await
+    }
+
+    fn on_success(&mut self) {
+        // Clear any shared rate-limit signal: the window has passed
+        // (otherwise this call would have failed).
+        crate::shared_rate_limit::clear_rate_limit(self.host);
+    }
+}
+
+/// The retry loop behind [`gh_api_with_retry`].
+async fn retry_gh_call(
+    env: &mut impl RetryEnv,
+    args_str: &str,
+    max_retries: u32,
+) -> Result<Output> {
     let mut attempts = 0;
     let mut rate_limit_retried = false;
-    let args_str = args.join(" ");
 
     loop {
         // If another Minion has signalled a rate limit for this host, wait
         // for the reset window before spawning `gh`. Avoids the N×62s waste
         // of every Minion independently discovering the same limit.
-        crate::shared_rate_limit::wait_if_shared_rate_limited(host).await;
+        // `Cancelled` here means shutdown has been requested, whether or not a
+        // shared window was active (see `wait_if_shared_rate_limited`), so no
+        // new request is started.
+        if env.wait_shared_rate_limit().await == SleepOutcome::Cancelled {
+            anyhow::bail!("Shutdown requested; skipped: gh {}", args_str);
+        }
 
-        let output = gh_cli_command(host)
-            .args(args)
-            .output()
-            .await
-            .with_context(|| format!("Failed to execute: gh {}", args_str))?;
+        let output = env.run().await?;
 
         if output.status.success() {
             if attempts > 0 || rate_limit_retried {
                 log::info!("GitHub API call succeeded after retries: gh {}", args_str);
             }
-            // Clear any shared rate-limit signal: the window has passed
-            // (otherwise this call would have failed).
-            crate::shared_rate_limit::clear_rate_limit(host);
+            env.on_success();
             return Ok(output);
         }
 
@@ -215,7 +323,13 @@ pub(crate) async fn gh_api_with_retry(
                 return Ok(output);
             }
             rate_limit_retried = true;
-            sleep_until_rate_limit_reset(host).await;
+            if env.sleep_rate_limit().await == SleepOutcome::Cancelled {
+                log::info!(
+                    "Shutdown requested during rate-limit wait; not retrying: gh {}",
+                    args_str
+                );
+                return Ok(output);
+            }
             continue;
         }
 
@@ -231,7 +345,13 @@ pub(crate) async fn gh_api_with_retry(
                 stderr.trim(),
                 delay
             );
-            sleep(delay).await;
+            if env.sleep_backoff(delay).await == SleepOutcome::Cancelled {
+                log::info!(
+                    "Shutdown requested during retry backoff; not retrying: gh {}",
+                    args_str
+                );
+                return Ok(output);
+            }
         } else {
             // Either not retryable or max retries exceeded — return output for caller to handle
             return Ok(output);
@@ -356,10 +476,30 @@ async fn get_rate_limit_reset(host: &str) -> Option<RateLimitInfo> {
 ///    rate limit where the core quota is still available), falls back to
 ///    a fixed 60 s sleep to avoid oversleeping.
 /// 4. If the rate limit API itself fails, falls back to a fixed 60 s sleep.
-pub(crate) async fn sleep_until_rate_limit_reset(host: &str) {
+///
+/// The sleep races against the process-wide shutdown signal
+/// ([`crate::shutdown::global`]); returns [`SleepOutcome::Cancelled`] if
+/// shutdown was requested so the caller can skip the retry.
+pub(crate) async fn sleep_until_rate_limit_reset(host: &str) -> SleepOutcome {
+    sleep_until_rate_limit_reset_with(host, crate::shutdown::global()).await
+}
+
+/// [`sleep_until_rate_limit_reset`] with an explicit shutdown signal, so tests
+/// can use a local signal instead of the process-wide one.
+async fn sleep_until_rate_limit_reset_with(host: &str, shutdown: &ShutdownSignal) -> SleepOutcome {
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    if let Some(info) = get_rate_limit_reset(host).await {
+    // Race the reset lookup against shutdown too: `gh api rate_limit` can take
+    // up to GH_TIMEOUT_SECS. `biased` polls shutdown first, so an
+    // already-triggered signal returns before `gh` is spawned; if shutdown
+    // wins later, dropping the lookup kills `gh` (kill_on_drop).
+    let rate_limit_info = tokio::select! {
+        biased;
+        _ = shutdown.wait() => return SleepOutcome::Cancelled,
+        info = get_rate_limit_reset(host) => info,
+    };
+
+    if let Some(info) = rate_limit_info {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -399,8 +539,9 @@ pub(crate) async fn sleep_until_rate_limit_reset(host: &str) {
                 );
                 // Signal peer Minions so they skip their own doomed calls.
                 crate::shared_rate_limit::write_rate_limit_until(host, info.reset);
-                tokio::time::sleep(std::time::Duration::from_secs(sleep_secs)).await;
-                return;
+                return shutdown
+                    .sleep(std::time::Duration::from_secs(sleep_secs))
+                    .await;
             }
 
             log::warn!(
@@ -436,10 +577,11 @@ pub(crate) async fn sleep_until_rate_limit_reset(host: &str) {
         );
     }
 
-    tokio::time::sleep(std::time::Duration::from_secs(
-        RATE_LIMIT_FALLBACK_SLEEP_SECS,
-    ))
-    .await;
+    shutdown
+        .sleep(std::time::Duration::from_secs(
+            RATE_LIMIT_FALLBACK_SLEEP_SECS,
+        ))
+        .await
 }
 
 /// Build a full GitHub issue URL for a repo in "owner/repo" format, with an explicit host.
@@ -2240,6 +2382,231 @@ mod tests {
         assert!(!contains_standalone_429("14290"));
         assert!(!contains_standalone_429("42"));
         assert!(!contains_standalone_429(""));
+    }
+
+    // --- sleep_until_rate_limit_reset shutdown tests ---
+
+    #[tokio::test(start_paused = true)]
+    async fn test_rate_limit_sleep_skipped_after_shutdown() {
+        // With shutdown already requested, the helper returns Cancelled right
+        // away, without querying `gh api rate_limit` or sleeping, so
+        // gh_api_with_retry returns the rate-limited output instead of retrying.
+        let signal = ShutdownSignal::new();
+        signal.trigger();
+        let start = tokio::time::Instant::now();
+        let outcome = sleep_until_rate_limit_reset_with("github.com", &signal).await;
+        assert_eq!(outcome, SleepOutcome::Cancelled);
+        assert_eq!(start.elapsed(), Duration::ZERO);
+    }
+
+    // --- unless_shutdown tests ---
+
+    #[tokio::test]
+    async fn test_unless_shutdown_runs_future_when_not_triggered() {
+        let signal = ShutdownSignal::new();
+        assert_eq!(unless_shutdown(&signal, async { 7 }).await.unwrap(), 7);
+    }
+
+    #[tokio::test]
+    async fn test_unless_shutdown_never_polls_future_when_triggered() {
+        let signal = ShutdownSignal::new();
+        signal.trigger();
+        let polled = std::sync::atomic::AtomicBool::new(false);
+        let res = unless_shutdown(&signal, async {
+            polled.store(true, std::sync::atomic::Ordering::SeqCst);
+        })
+        .await;
+        assert!(res.is_err());
+        assert!(!polled.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_unless_shutdown_does_not_spawn_when_triggered() {
+        let tmp = tempfile::tempdir().unwrap();
+        let marker = tmp.path().join("spawned");
+        let signal = ShutdownSignal::new();
+        signal.trigger();
+        let mut cmd = Command::new("touch");
+        cmd.arg(&marker).kill_on_drop(true);
+        let res = unless_shutdown(&signal, async move { cmd.output().await }).await;
+        assert!(res.is_err());
+        // Give a wrongly-spawned process time to run before checking.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!marker.exists(), "process was spawned after shutdown");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_unless_shutdown_kills_in_flight_process() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pid_file = tmp.path().join("pid");
+        let signal = std::sync::Arc::new(ShutdownSignal::new());
+
+        // `exec` so the recorded PID is the long-running process itself.
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c")
+            .arg(format!("echo $$ > '{}'; exec sleep 30", pid_file.display()))
+            .kill_on_drop(true);
+
+        let trigger = {
+            let signal = signal.clone();
+            let pid_file = pid_file.clone();
+            tokio::spawn(async move {
+                // Trigger only once the child is running.
+                while !pid_file.exists() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                signal.trigger();
+            })
+        };
+
+        let start = std::time::Instant::now();
+        let res = unless_shutdown(&signal, async move { cmd.output().await }).await;
+        assert!(res.is_err());
+        assert!(start.elapsed() < Duration::from_secs(5));
+        trigger.await.unwrap();
+
+        let pid: i32 = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        // The child must be gone (killed and reaped), or at worst a zombie
+        // awaiting tokio's background reaper — not still running `sleep`.
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            let ps = std::process::Command::new("ps")
+                .args(["-o", "stat=", "-p", &pid.to_string()])
+                .output()
+                .unwrap();
+            let stat = String::from_utf8_lossy(&ps.stdout).trim().to_string();
+            if stat.is_empty() || stat.starts_with('Z') {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "child {pid} still running after shutdown (stat={stat})"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    // --- retry_gh_call shutdown tests ---
+
+    /// Scripted [`RetryEnv`]: `run` pops results in order, and each sleep
+    /// returns the outcome the test chose (Cancelled = shutdown arrived).
+    #[cfg(unix)]
+    struct FakeRetryEnv {
+        outputs: std::collections::VecDeque<Output>,
+        runs: usize,
+        shared_wait: SleepOutcome,
+        rate_limit_sleep: SleepOutcome,
+        backoff_sleep: SleepOutcome,
+        successes: usize,
+    }
+
+    #[cfg(unix)]
+    impl FakeRetryEnv {
+        fn new(outputs: Vec<Output>) -> Self {
+            Self {
+                outputs: outputs.into(),
+                runs: 0,
+                shared_wait: SleepOutcome::Elapsed,
+                rate_limit_sleep: SleepOutcome::Elapsed,
+                backoff_sleep: SleepOutcome::Elapsed,
+                successes: 0,
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    impl RetryEnv for FakeRetryEnv {
+        async fn wait_shared_rate_limit(&mut self) -> SleepOutcome {
+            self.shared_wait
+        }
+        async fn run(&mut self) -> Result<Output> {
+            self.runs += 1;
+            self.outputs
+                .pop_front()
+                .ok_or_else(|| anyhow!("unexpected extra gh call"))
+        }
+        async fn sleep_rate_limit(&mut self) -> SleepOutcome {
+            self.rate_limit_sleep
+        }
+        async fn sleep_backoff(&mut self, _delay: Duration) -> SleepOutcome {
+            self.backoff_sleep
+        }
+        fn on_success(&mut self) {
+            self.successes += 1;
+        }
+    }
+
+    #[cfg(unix)]
+    fn fake_output(code: i32, stderr: &str) -> Output {
+        use std::os::unix::process::ExitStatusExt;
+        Output {
+            status: std::process::ExitStatus::from_raw(code << 8),
+            stdout: Vec::new(),
+            stderr: stderr.as_bytes().to_vec(),
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_retry_rate_limit_retries_once_when_not_cancelled() {
+        let mut env = FakeRetryEnv::new(vec![
+            fake_output(1, "HTTP 403: API rate limit exceeded"),
+            fake_output(0, ""),
+        ]);
+        let out = retry_gh_call(&mut env, "api x", 3).await.unwrap();
+        assert!(out.status.success());
+        assert_eq!(env.runs, 2);
+        assert_eq!(env.successes, 1);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_retry_rate_limit_cancelled_returns_failure_without_retry() {
+        let mut env = FakeRetryEnv::new(vec![
+            fake_output(1, "HTTP 403: API rate limit exceeded"),
+            fake_output(0, ""),
+        ]);
+        env.rate_limit_sleep = SleepOutcome::Cancelled;
+        let out = retry_gh_call(&mut env, "api x", 3).await.unwrap();
+        // The original rate-limited failure is returned unchanged.
+        assert_eq!(out.status.code(), Some(1));
+        assert_eq!(
+            String::from_utf8_lossy(&out.stderr),
+            "HTTP 403: API rate limit exceeded"
+        );
+        assert_eq!(env.runs, 1, "must not retry after shutdown");
+        assert_eq!(env.successes, 0);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_retry_backoff_cancelled_returns_failure_without_retry() {
+        let mut env = FakeRetryEnv::new(vec![
+            fake_output(1, "HTTP 502 Bad Gateway"),
+            fake_output(0, ""),
+        ]);
+        env.backoff_sleep = SleepOutcome::Cancelled;
+        let out = retry_gh_call(&mut env, "api x", 3).await.unwrap();
+        assert_eq!(out.status.code(), Some(1));
+        assert_eq!(String::from_utf8_lossy(&out.stderr), "HTTP 502 Bad Gateway");
+        assert_eq!(env.runs, 1, "must not retry after shutdown");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_retry_shared_wait_cancelled_skips_call() {
+        let mut env = FakeRetryEnv::new(vec![fake_output(0, "")]);
+        env.shared_wait = SleepOutcome::Cancelled;
+        let err = retry_gh_call(&mut env, "api x", 3).await.unwrap_err();
+        assert!(err.to_string().contains("Shutdown requested"), "{err}");
+        assert_eq!(env.runs, 0, "no gh call after shutdown");
     }
 
     // --- RateLimitResponse deserialization test ---

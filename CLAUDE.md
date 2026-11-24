@@ -138,6 +138,7 @@ git commit --no-verify
 - `src/merge_judge.rs` - Merge readiness evaluation
 - `src/merge_readiness.rs` - PR merge readiness assessment
 - `src/session_claim.rs` - Session/workspace claiming logic
+- `src/shutdown.rs` - Process-wide shutdown signal; lets long sleeps (e.g. rate-limit backoff) return early on Ctrl-C
 
 ### Key Architectural Decisions
 
