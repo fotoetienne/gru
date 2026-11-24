@@ -172,16 +172,19 @@ async fn auto_rebase_pr(checkout_path: &Path, minion_dir: &Path) -> Result<AutoR
                 pr_branch
             )
         }
-        crate::git::RemoteSync::UpToDate | crate::git::RemoteSync::NoRemoteBranch => {}
+        crate::git::RemoteSync::UpToDate => {}
+        // Auto-rebase only runs for an open PR, so a missing branch was
+        // deleted (e.g. after merge). Don't force-push it back into existence.
+        crate::git::RemoteSync::NoRemoteBranch => anyhow::bail!(
+            "Cannot auto-rebase: origin/{} no longer exists; not recreating it",
+            pr_branch
+        ),
     }
     // The remote tip the sync integrated (not a fresh fetch, which could
     // pick up a rewind the rebase never saw) and HEAD before rebasing. The
     // force-push at the end refuses if the remote changed since, other than
     // moving forward to commits already in HEAD (see `force_push_rebased`).
-    let remote_before = match synced {
-        crate::git::RemoteSync::NoRemoteBranch => None,
-        _ => crate::git::integrated_tip(checkout_path, &pr_branch).await?,
-    };
+    let remote_before = crate::git::integrated_tip(checkout_path, &pr_branch).await?;
     let pre_rebase_head = crate::git::head_sha(checkout_path).await?;
 
     // Detect the base branch first so we can fetch only what we need
