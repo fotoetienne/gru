@@ -1770,38 +1770,33 @@ pub(crate) async fn retry_pending_observe(
     }
 }
 
-/// Build `gh pr merge` arguments for a judge-approved merge.
-///
-/// `direct` merges now instead of enabling auto-merge. Use it when a merge
-/// policy applies: `--match-head-commit` only checks the head at call time,
-/// and a pending auto-merge would also merge later pushes the judge never
-/// saw. A direct merge either lands the approved head or fails, and the
-/// caller retries while the head is unchanged.
-fn merge_command_args(
-    pr_number: &str,
-    repo_full: &str,
-    head_sha: &str,
-    direct: bool,
-) -> Vec<String> {
-    let mut args: Vec<String> = vec![
-        "pr".into(),
-        "merge".into(),
-        pr_number.into(),
-        "--squash".into(),
-    ];
-    if !direct {
-        args.push("--auto".into());
-    }
-    args.extend([
-        "--match-head-commit".into(),
-        head_sha.into(),
-        "-R".into(),
-        repo_full.into(),
-    ]);
-    args
+/// Build `gh pr merge --auto` arguments for a judge-approved merge in a repo
+/// without a merge policy (the pre-policy behavior), pinned to `head_sha`.
+fn auto_merge_command_args(pr_number: &str, repo_full: &str, head_sha: &str) -> Vec<String> {
+    [
+        "pr",
+        "merge",
+        pr_number,
+        "--squash",
+        "--auto",
+        "--match-head-commit",
+        head_sha,
+        "-R",
+        repo_full,
+    ]
+    .iter()
+    .map(|a| a.to_string())
+    .collect()
 }
 
-/// Merge (or queue auto-merge for) a judge-approved PR, pinned to `head_sha`.
+/// Merge (or queue auto-merge for) a judge-approved PR, pinned to its head.
+///
+/// `pending.direct` (used when a merge policy applies) never creates an
+/// auto-merge request, since one would survive later pushes the judge never
+/// saw. It merges through the REST merge endpoint pinned with `sha`, or, on
+/// branches that require a merge queue, enqueues with `expectedHeadOid`.
+/// Both either act on the approved head or fail; the caller retries while
+/// the head is unchanged. GitHub drops a queued PR when new commits land.
 pub(crate) async fn merge_pr(
     host: &str,
     owner: &str,
@@ -1810,7 +1805,10 @@ pub(crate) async fn merge_pr(
     pending: &PendingMerge,
 ) -> Result<()> {
     let repo_full = github::repo_slug(owner, repo);
-    let args = merge_command_args(pr_number, &repo_full, &pending.head_sha, pending.direct);
+    if pending.direct {
+        return direct_merge(host, &repo_full, pr_number, &pending.head_sha).await;
+    }
+    let args = auto_merge_command_args(pr_number, &repo_full, &pending.head_sha);
     let output = github::gh_cli_command(host)
         .args(&args)
         .output()
@@ -1822,77 +1820,67 @@ pub(crate) async fn merge_pr(
             String::from_utf8_lossy(&output.stderr).trim()
         );
     }
-    if pending.direct {
-        verify_direct_merge(host, &repo_full, pr_number).await?;
-    }
     Ok(())
 }
 
-/// What a "direct" `gh pr merge` actually did.
-#[derive(Debug, PartialEq, Eq)]
-enum DirectMergeOutcome {
-    /// The PR merged.
-    Merged,
-    /// The PR is open with no auto-merge request: it was added to a merge
-    /// queue. GitHub removes a PR from the queue when new commits are
-    /// pushed, so no authorization outlives the approved head.
-    Queued,
-    /// gh fell back to enabling auto-merge (e.g. on a merge-queue branch
-    /// with checks pending). That request survives later pushes.
-    AutoMergeEnabled,
-}
-
-fn classify_direct_merge(json: &str) -> Result<DirectMergeOutcome> {
-    let val: serde_json::Value =
-        serde_json::from_str(json).context("Failed to parse gh pr view JSON")?;
-    if val.get("state").and_then(|s| s.as_str()) == Some("MERGED") {
-        return Ok(DirectMergeOutcome::Merged);
-    }
-    if val.get("autoMergeRequest").is_some_and(|a| !a.is_null()) {
-        return Ok(DirectMergeOutcome::AutoMergeEnabled);
-    }
-    Ok(DirectMergeOutcome::Queued)
-}
-
-/// After a direct merge, make sure gh didn't leave an auto-merge request
-/// behind. If it did, cancel it and fail so the caller retries the direct
-/// merge later; the approval must not cover pushes the judge never saw.
-async fn verify_direct_merge(host: &str, repo_full: &str, pr_number: &str) -> Result<()> {
-    let json = github::run_gh(
+async fn direct_merge(host: &str, repo_full: &str, pr_number: &str, head_sha: &str) -> Result<()> {
+    let endpoint = format!("repos/{repo_full}/pulls/{pr_number}/merge");
+    let sha_field = format!("sha={head_sha}");
+    match github::run_gh(
         host,
         &[
-            "pr",
-            "view",
-            pr_number,
-            "-R",
-            repo_full,
-            "--json",
-            "state,autoMergeRequest",
+            "api",
+            "-X",
+            "PUT",
+            &endpoint,
+            "-f",
+            "merge_method=squash",
+            "-f",
+            &sha_field,
         ],
     )
     .await
-    .context("Failed to confirm merge result")?;
-    match classify_direct_merge(&json)? {
-        DirectMergeOutcome::Merged | DirectMergeOutcome::Queued => Ok(()),
-        DirectMergeOutcome::AutoMergeEnabled => {
-            if let Err(e) = github::run_gh(
-                host,
-                &["pr", "merge", pr_number, "--disable-auto", "-R", repo_full],
-            )
-            .await
-            {
-                log::warn!(
-                    "Failed to disable auto-merge on PR #{} after direct merge: {:#}",
-                    pr_number,
-                    e
-                );
-            }
-            anyhow::bail!(
-                "GitHub enabled auto-merge instead of merging PR #{pr_number}; cancelled it \
-                 so later pushes can't merge unjudged. Will retry the direct merge."
-            )
+    {
+        Ok(_) => Ok(()),
+        Err(e) if is_merge_queue_required(&format!("{e:#}")) => {
+            enqueue_pr(host, repo_full, pr_number, head_sha).await
         }
+        Err(e) => Err(e.context(format!("Failed to merge PR #{pr_number}"))),
     }
+}
+
+/// True if a merge error says the branch only accepts merges via a queue.
+fn is_merge_queue_required(error: &str) -> bool {
+    error.to_ascii_lowercase().contains("merge queue")
+}
+
+/// GraphQL mutation adding a PR to the merge queue, pinned to its head.
+const ENQUEUE_MUTATION: &str = "mutation($id: ID!, $oid: GitObjectID!) { \
+     enqueuePullRequest(input: {pullRequestId: $id, expectedHeadOid: $oid}) { \
+     mergeQueueEntry { id } } }";
+
+async fn enqueue_pr(host: &str, repo_full: &str, pr_number: &str, head_sha: &str) -> Result<()> {
+    let node_id = github::run_gh(
+        host,
+        &[
+            "api",
+            &format!("repos/{repo_full}/pulls/{pr_number}"),
+            "--jq",
+            ".node_id",
+        ],
+    )
+    .await
+    .context("Failed to look up PR node ID")?;
+    let query = format!("query={ENQUEUE_MUTATION}");
+    let id = format!("id={}", node_id.trim());
+    let oid = format!("oid={head_sha}");
+    github::run_gh(
+        host,
+        &["api", "graphql", "-f", &query, "-f", &id, "-f", &oid],
+    )
+    .await
+    .with_context(|| format!("Failed to add PR #{pr_number} to the merge queue"))?;
+    Ok(())
 }
 
 /// Extract the Minion ID from a Minion branch name
@@ -3112,33 +3100,33 @@ That's my verdict."#;
     }
 
     #[test]
-    fn test_merge_command_args_direct_has_no_auto() {
-        let args = merge_command_args("7", "o/r", "abc", true);
-        assert!(!args.contains(&"--auto".to_string()));
-        assert_eq!(
-            args,
-            vec![
-                "pr",
-                "merge",
-                "7",
-                "--squash",
-                "--match-head-commit",
-                "abc",
-                "-R",
-                "o/r"
-            ]
-        );
-    }
-
-    #[test]
-    fn test_merge_command_args_auto_is_pinned() {
-        let args = merge_command_args("7", "o/r", "abc", false);
+    fn test_auto_merge_command_args_is_pinned() {
+        let args = auto_merge_command_args("7", "o/r", "abc");
         assert!(args.contains(&"--auto".to_string()));
         let i = args
             .iter()
             .position(|a| a == "--match-head-commit")
             .unwrap();
         assert_eq!(args[i + 1], "abc");
+    }
+
+    #[test]
+    fn test_is_merge_queue_required() {
+        assert!(is_merge_queue_required(
+            "gh api failed: Changes must be made through the merge queue (HTTP 405)"
+        ));
+        assert!(!is_merge_queue_required(
+            "Head branch was modified. Review and try the merge again. (HTTP 409)"
+        ));
+        assert!(!is_merge_queue_required(
+            "Required status check is expected (HTTP 405)"
+        ));
+    }
+
+    #[test]
+    fn test_enqueue_mutation_pins_head() {
+        assert!(ENQUEUE_MUTATION.contains("enqueuePullRequest"));
+        assert!(ENQUEUE_MUTATION.contains("expectedHeadOid: $oid"));
     }
 
     #[test]
@@ -3161,25 +3149,5 @@ That's my verdict."#;
         });
         state.record_failure(fp("ghi", 1));
         assert!(state.pending_merge().is_none());
-    }
-
-    #[test]
-    fn test_classify_direct_merge() {
-        assert_eq!(
-            classify_direct_merge(r#"{"state":"MERGED","autoMergeRequest":null}"#).unwrap(),
-            DirectMergeOutcome::Merged
-        );
-        assert_eq!(
-            classify_direct_merge(r#"{"state":"OPEN","autoMergeRequest":null}"#).unwrap(),
-            DirectMergeOutcome::Queued
-        );
-        assert_eq!(
-            classify_direct_merge(
-                r#"{"state":"OPEN","autoMergeRequest":{"mergeMethod":"SQUASH"}}"#
-            )
-            .unwrap(),
-            DirectMergeOutcome::AutoMergeEnabled
-        );
-        assert!(classify_direct_merge("nope").is_err());
     }
 }
