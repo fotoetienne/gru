@@ -1205,6 +1205,7 @@ async fn handle_new_reviews(
         Ok(()) if !pushed => {
             // Keep the baseline: the feedback isn't handled until the fix is on the PR.
             println!("❌ Changes could not be pushed; stopping monitoring (see PR comment)");
+            state.terminal_result = Some(MonitorResult::PushRefused);
             LoopAction::Break
         }
         Ok(()) => {
@@ -1236,9 +1237,11 @@ async fn handle_new_reviews(
 ///
 /// Returns `false` if that failed; nothing was pushed and the PR has an
 /// escalation comment. Callers must then stop monitoring without advancing
-/// the review baseline: the PR on GitHub doesn't contain the fix, so the
-/// feedback isn't handled and merge readiness would judge stale code. The
-/// next monitor entry (`gru resume`, lab wake-up) retries the push.
+/// the review baseline (the PR on GitHub doesn't contain the fix, so the
+/// feedback isn't handled and merge readiness would judge stale code), and
+/// report `MonitorResult::PushRefused`. `monitor_pr_phase` then marks the
+/// Minion Failed and the issue blocked, so lab doesn't wake it and repeat
+/// the comment; `gru resume` retries the push.
 async fn push_pending_commits(
     issue_ctx: &IssueContext,
     wt_ctx: &WorktreeContext,
@@ -1356,6 +1359,7 @@ async fn handle_new_issue_comments(
         Ok(()) if !pushed => {
             // Keep the baseline: the feedback isn't handled until the fix is on the PR.
             println!("❌ Changes could not be pushed; stopping monitoring (see PR comment)");
+            state.terminal_result = Some(MonitorResult::PushRefused);
             LoopAction::Break
         }
         Ok(()) => {
@@ -1462,7 +1466,7 @@ async fn handle_failed_checks(
             println!("🔄 Continuing to monitor PR for other events...\n");
         }
         Err(e) => {
-            println!("⚠️  CI auto-fix error: {}", e);
+            println!("⚠️  CI auto-fix error: {:#}", e);
             println!(
                 "   Review the checks at: https://{}/{}/{}/pull/{}/checks",
                 ctx.issue_ctx.host, ctx.issue_ctx.owner, ctx.issue_ctx.repo, ctx.pr_number
@@ -1748,6 +1752,8 @@ async fn handle_pr_event(
         }
         Ok((MonitorResult::Timeout, _)) => handle_timeout(state, ctx),
         Ok((MonitorResult::Interrupted, _)) => handle_interrupted(ctx),
+        // Never produced by `monitor_pr`; only set by the monitor itself.
+        Ok((MonitorResult::PushRefused, _)) => LoopAction::Break,
         Err(e) => handle_monitor_error(state, ctx, e).await,
     }
 }
@@ -1771,7 +1777,7 @@ pub(crate) async fn monitor_pr_lifecycle(
     // refused). Don't monitor, review or judge merge readiness on a PR that
     // is missing them.
     if !push_pending_commits(issue_ctx, wt_ctx, pr_number, "local commits").await {
-        return None;
+        return Some(MonitorResult::PushRefused);
     }
 
     // Ensure the gru:ready-to-merge label exists in the repo

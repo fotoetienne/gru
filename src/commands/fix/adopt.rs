@@ -501,7 +501,19 @@ pub(crate) async fn handle_adopt(pr_arg: &str, opts: AdoptOptions) -> Result<i32
         pending_review_sha: None,
     };
     let mid = minion_id.clone();
-    with_registry(move |reg| reg.register(mid, info)).await?;
+    if let Err(e) = with_registry(move |reg| reg.register(mid, info)).await {
+        // Without a registry entry nothing would ever clean this worktree up,
+        // and it would block the next `gru adopt` of this branch.
+        let _ = tokio::process::Command::new("git")
+            .arg("-C")
+            .arg(ws.repos().join(&owner).join(format!("{}.git", repo)))
+            .args(["worktree", "remove", "--force"])
+            .arg(&checkout_path)
+            .output()
+            .await;
+        let _ = tokio::fs::remove_dir_all(&minion_dir).await;
+        return Err(e.context("Failed to register the adopted Minion"));
+    }
     println!("📝 Registered Minion {} in registry", minion_id);
 
     claim_issue(&host, &owner, &repo, Some(issue_num)).await;
@@ -588,14 +600,6 @@ pub(crate) async fn run_adopted_pipeline(
                 wt_ctx.minion_id
             )
         })?;
-
-    if *start_phase == OrchestrationPhase::Failed {
-        println!(
-            "❌ Minion {} previously failed. Adopt the PR again after `gru clean`.",
-            wt_ctx.minion_id
-        );
-        return Ok(1);
-    }
 
     if *start_phase <= OrchestrationPhase::RunningAgent {
         update_orchestration_phase(&wt_ctx.minion_id, OrchestrationPhase::RunningAgent).await;

@@ -791,6 +791,9 @@ pub(crate) enum MonitorResult {
     Timeout,
     /// Monitoring was interrupted by the user (e.g., Ctrl+C)
     Interrupted,
+    /// Local commits could not be pushed to the PR (set by the monitor
+    /// itself, never returned by `monitor_pr`). The Minion needs a human.
+    PushRefused,
 }
 
 /// Fetch PR details using gh CLI with retry logic for transient failures

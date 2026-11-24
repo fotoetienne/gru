@@ -1593,6 +1593,14 @@ pub(crate) async fn sync_with_remote_branch(
         return Ok(RemoteSync::NoRemoteBranch);
     };
 
+    // HEAD is exactly the remote tip: nothing to integrate, and nothing in
+    // HEAD can have been dropped by the remote. Checked before the rewrite
+    // test so a stale first-sync baseline can't turn this into an error.
+    if head_sha(worktree_path).await? == current {
+        record_synced(worktree_path, branch, &current).await?;
+        return Ok(RemoteSync::UpToDate);
+    }
+
     // Check for a rewrite first: if the author dropped commits, the new tip
     // is still an ancestor of HEAD, and "up to date" would keep (and later
     // push back) what they removed.
@@ -3144,6 +3152,28 @@ mod tests {
                 .is_err()
         );
         assert_eq!(fetch_remote_tip(&mine, "feature").await.unwrap(), rewound);
+    }
+
+    #[tokio::test]
+    async fn test_sync_up_to_date_when_head_is_remote_tip_despite_stale_baseline() {
+        // No checkpoint yet, and the shared tracking ref is stale and not an
+        // ancestor of the remote tip (rewritten), but HEAD already is the tip.
+        let tmp = tempfile::tempdir().unwrap();
+        let (mine, theirs) = setup_shared_branch(tmp.path());
+        force_push_rewrite(&theirs);
+        let tip = resolve_ref(&theirs, "HEAD").await.unwrap().unwrap();
+        git_ok(&mine, &["fetch", "origin", "feature"]);
+        git_ok(&mine, &["reset", "--hard", &tip]);
+        // Make the tracking ref stale: point it back at the pre-rewrite base.
+        git_ok(
+            &mine,
+            &["update-ref", "refs/remotes/origin/feature", "HEAD@{1}"],
+        );
+
+        assert_eq!(
+            sync_with_remote_branch(&mine, "feature").await.unwrap(),
+            RemoteSync::UpToDate
+        );
     }
 
     #[tokio::test]

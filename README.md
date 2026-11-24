@@ -199,6 +199,8 @@ gru adopt 43 --auto-merge                          # Merge once readiness checks
 
 The PR must link an issue (`Fixes #42`), come from a branch in the same repo (not a fork), and be authored by you. Pass `--any-author` to adopt someone else's PR. `gru clean` removes the worktree after merge but never deletes the remote branch.
 
+On adoption the Minion treats review comments posted after the PR's latest commit as new, so on a long-running PR its first round may revisit threads you already resolved.
+
 ### Review PRs
 
 ```bash
