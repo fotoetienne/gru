@@ -2935,22 +2935,37 @@ async fn sweep_orphaned_auto_merge_prs(
             }
 
             // Check deterministic merge readiness.
-            let readiness = match crate::merge_readiness::check_merge_readiness(
-                &host, &owner, &repo, pr.number,
-            )
-            .await
-            {
-                Ok(r) => r,
-                Err(e) => {
-                    log::warn!(
+            let (readiness, readiness_head) =
+                match crate::merge_readiness::check_merge_readiness_with_head(
+                    &host, &owner, &repo, pr.number,
+                )
+                .await
+                {
+                    Ok(r) => r,
+                    Err(e) => {
+                        log::warn!(
                         "⚠️  Auto-merge sweep: failed to check readiness for PR #{} in {}: {:#}",
                         pr.number,
                         repo_spec,
                         e
                     );
-                    continue;
-                }
-            };
+                        continue;
+                    }
+                };
+
+            // Readiness data can be briefly cached. Only trust it for the
+            // head listed at the start of this sweep, which is the head the
+            // judge and the merge are pinned to.
+            if readiness_head != pr.head_ref_oid {
+                log::info!(
+                    "Auto-merge sweep: PR #{} in {} readiness was for {}, head is {}; re-checking next sweep",
+                    pr.number,
+                    repo_spec,
+                    readiness_head,
+                    pr.head_ref_oid,
+                );
+                continue;
+            }
 
             if !readiness.is_ready() {
                 log::debug!(

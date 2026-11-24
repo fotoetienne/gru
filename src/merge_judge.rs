@@ -110,6 +110,9 @@ pub(crate) struct CurrentFacts {
     /// GitHub's `mergeable` flag: Some(true) clean, Some(false) conflicts,
     /// None when still computing.
     pub(crate) mergeable: Option<bool>,
+    /// Base branch the PR targets. Part of the fingerprint so retargeting
+    /// a PR invalidates any earlier verdict or pending merge.
+    pub(crate) base_ref: String,
 }
 
 impl CurrentFacts {
@@ -119,6 +122,7 @@ impl CurrentFacts {
         // Include mergeable so `None → Some(true)` transitions on the same
         // head also re-trigger the judge.
         self.mergeable.hash(&mut hasher);
+        self.base_ref.hash(&mut hasher);
         let mut sorted = self.labels.clone();
         sorted.sort();
         sorted.dedup();
@@ -525,6 +529,8 @@ pub(crate) async fn get_pr_snapshot(
     struct PrJson {
         head: Head,
         #[serde(default)]
+        base: Option<Base>,
+        #[serde(default)]
         mergeable: Option<bool>,
         #[serde(default)]
         labels: Vec<LabelJson>,
@@ -532,6 +538,11 @@ pub(crate) async fn get_pr_snapshot(
     #[derive(Deserialize)]
     struct Head {
         sha: String,
+    }
+    #[derive(Deserialize)]
+    struct Base {
+        #[serde(rename = "ref")]
+        ref_name: String,
     }
     #[derive(Deserialize)]
     struct LabelJson {
@@ -542,6 +553,7 @@ pub(crate) async fn get_pr_snapshot(
     let head_sha = pr.head.sha;
     let labels: Vec<String> = pr.labels.into_iter().map(|l| l.name).collect();
     let mergeable = pr.mergeable;
+    let base_ref = pr.base.map(|b| b.ref_name).unwrap_or_default();
 
     let ic = parse_paginated_lengths(phase1[1].as_bytes());
     let rv = parse_paginated_lengths(phase1[2].as_bytes());
@@ -555,6 +567,7 @@ pub(crate) async fn get_pr_snapshot(
         ci_conclusion,
         labels,
         mergeable,
+        base_ref,
     };
 
     let fingerprint = PrStateFingerprint {
@@ -819,6 +832,7 @@ fn format_current_facts(facts: &CurrentFacts) -> String {
     format!(
         "## Current facts (authoritative — supersedes any claims in comments below)\n\
          - head SHA: {}\n\
+         - Base branch: {}\n\
          - CI status: {}\n\
          - Labels: {}\n\
          - Mergeable: {}\n\n\
@@ -827,7 +841,7 @@ fn format_current_facts(facts: &CurrentFacts) -> String {
          that `gru:blocked` is present, or that merge is blocked for a reason \
          contradicting the facts above is **stale and superseded** — it describes \
          a previous head or a transient state that has since cleared.\n",
-        facts.head_sha, facts.ci_conclusion, labels, mergeable,
+        facts.head_sha, facts.base_ref, facts.ci_conclusion, labels, mergeable,
     )
 }
 
@@ -2561,6 +2575,7 @@ That's my verdict."#;
             ci_conclusion: "SUCCESS".to_string(),
             labels: vec!["gru:auto-merge".to_string()],
             mergeable: Some(true),
+            base_ref: "main".to_string(),
         }
     }
 
@@ -2713,6 +2728,7 @@ That's my verdict."#;
             ci_conclusion: "SUCCESS".to_string(),
             labels: vec!["gru:auto-merge".to_string()],
             mergeable: Some(true),
+            base_ref: "main".to_string(),
         };
         let red = CurrentFacts {
             ci_conclusion: "FAILURE".to_string(),
@@ -2728,6 +2744,7 @@ That's my verdict."#;
             ci_conclusion: "SUCCESS".to_string(),
             labels: vec!["a".to_string(), "b".to_string()],
             mergeable: Some(true),
+            base_ref: "main".to_string(),
         };
         let b = CurrentFacts {
             labels: vec!["b".to_string(), "a".to_string()],
@@ -3333,5 +3350,16 @@ That's my verdict."#;
     fn test_escalation_still_current() {
         assert!(escalation_still_current("abc", "abc"));
         assert!(!escalation_still_current("abc", "def"));
+    }
+
+    #[test]
+    fn test_ci_label_hash_differs_for_retargeted_base() {
+        let a = test_facts();
+        let b = CurrentFacts {
+            base_ref: "release".to_string(),
+            ..a.clone()
+        };
+        assert_ne!(a.ci_label_hash(), b.ci_label_hash());
+        assert!(format_current_facts(&b).contains("Base branch: release"));
     }
 }
