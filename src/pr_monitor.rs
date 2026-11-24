@@ -1395,19 +1395,14 @@ async fn get_review_feedback(
 ///
 /// Other people may push to the PR branch while the Minion works — always for
 /// adopted PRs (`gru adopt`), where the author keeps working on their branch.
-/// The agent must integrate those commits rather than overwrite them.
+/// So the agent only commits; Gru pushes afterwards via `git::sync_and_push`,
+/// which integrates their commits and refuses to drop any.
 pub(crate) fn format_push_safety_note(branch: &str) -> String {
     format!(
         "\n\n## Pushing\n\
-Other people may have pushed to this branch since your last push. Before pushing, run \
-`git pull --rebase origin {branch}` to put your commits on top of theirs, then push with \
-`git push origin HEAD:{branch}`. Never force-push, and never rewrite, squash or drop commits \
-you did not author.\n\n\
-If the fetch reports `(forced update)` for `{branch}`, the author rewrote the branch. Don't \
-`git pull --rebase` then: it would replay commits the author removed. Instead move only the \
-commits you made in this session onto the new tip with \
-`git rebase --onto origin/{branch} <commit before your first one>`, check `git log` shows \
-nothing else came along, then push.\n"
+Commit your changes but do not push. When this session ends, Gru integrates anything others \
+pushed to `{branch}` and pushes your commits itself, refusing if that would drop someone \
+else's work. Never force-push, and never rewrite, squash or drop commits you did not author.\n"
     )
 }
 
@@ -1631,12 +1626,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_format_push_safety_note_names_branch_and_forbids_force_push() {
+    fn test_format_push_safety_note_tells_agent_not_to_push() {
         let note = format_push_safety_note("feature/my-change");
-        assert!(note.contains("git pull --rebase origin feature/my-change"));
-        assert!(note.contains("git push origin HEAD:feature/my-change"));
+        assert!(note.contains("do not push"));
+        assert!(note.contains("`feature/my-change`"));
         assert!(note.contains("Never force-push"));
-        assert!(note.contains("(forced update)"));
     }
 
     #[test]

@@ -319,9 +319,8 @@ Gru will watch the PR and resume this session when CI fails, when reviewers leav
 when the branch needs a rebase. When that happens, make the smallest change that addresses it.\n\n\
 ## Rules for this PR\n\n\
 - Do not re-implement the issue, restructure the PR, or edit the PR title or description.\n\
-- The author may keep pushing to `{branch}`. Before every push, run \
-`git pull --rebase origin {branch}` so their commits stay, then push with \
-`git push origin HEAD:{branch}`.\n\
+- The author may keep pushing to `{branch}`. Commit your changes but do not push: when your \
+session ends, Gru integrates the author's new commits and pushes yours itself.\n\
 - Never force-push. Never rewrite, squash or drop commits you did not author.\n\
 - Do not create or switch branches, and do not write PR_DESCRIPTION.md.\n\n\
 ## Right now\n\n\
@@ -966,7 +965,8 @@ mod tests {
         );
         assert!(prompt.starts_with("# Adopted PR #7: Add widget"));
         assert!(prompt.contains("Linked issue #3: Widgets"));
-        assert!(prompt.contains("git pull --rebase origin feature/widget"));
+        assert!(prompt.contains("do not push"));
+        assert!(prompt.contains("`feature/widget`"));
         assert!(prompt.contains("Never force-push"));
         assert!(prompt.contains("gh pr view 7 --repo octo/app"));
         assert!(prompt.contains("Do not edit files"));

@@ -1192,7 +1192,7 @@ async fn handle_new_reviews(
         Err(e) => log::warn!("⚠️  Duplicate inline reply sweep failed: {:#}", e),
     }
 
-    note_agent_pushes(ctx).await;
+    push_agent_commits(ctx).await;
 
     match agent_result {
         Ok(()) => {
@@ -1218,15 +1218,33 @@ async fn handle_new_reviews(
     }
 }
 
-/// After an agent round that may have pushed by itself, records the remote
-/// tip as integrated if it only moved forward (see
-/// `git::note_remote_progress`), so a later rewind of those commits by the
-/// author is detected as a rewrite.
-async fn note_agent_pushes(ctx: &MonitorContext<'_>) {
-    if let Err(e) =
-        crate::git::note_remote_progress(&ctx.wt_ctx.checkout_path, &ctx.wt_ctx.branch_name).await
-    {
-        log::warn!("⚠️  Could not record pushed commits: {:#}", e);
+/// After a review/comment agent round, pushes the agent's commits through
+/// Gru (`git::sync_and_push`): integrate anything others pushed, push with a
+/// lease, and record what was pushed. Agents are told not to push, so this
+/// is where their work reaches the PR. On failure nothing is pushed and the
+/// PR gets an escalation comment; monitoring continues.
+async fn push_agent_commits(ctx: &MonitorContext<'_>) {
+    match crate::git::sync_and_push(&ctx.wt_ctx.checkout_path, &ctx.wt_ctx.branch_name).await {
+        Ok(crate::git::SyncedPush::Pushed) => println!("📤 Pushed the agent's commits"),
+        Ok(crate::git::SyncedPush::NothingToPush) => {}
+        Err(e) => {
+            log::warn!("⚠️  Could not push the agent's commits: {:#}", e);
+            post_escalation_comment(
+                &ctx.issue_ctx.owner,
+                &ctx.issue_ctx.repo,
+                &ctx.issue_ctx.host,
+                ctx.pr_number,
+                &format!(
+                    "Could not push the changes made for the latest feedback to `{}`: the \
+                     branch changed in a way Gru won't merge automatically (for example a \
+                     force-push), or the push was rejected. The commits are in the Minion's \
+                     worktree. Manual intervention required.",
+                    ctx.wt_ctx.branch_name
+                ),
+                &ctx.wt_ctx.minion_id,
+            )
+            .await;
+        }
     }
 }
 
@@ -1285,7 +1303,7 @@ async fn handle_new_issue_comments(
         &ctx.issue_ctx.host,
     )
     .await;
-    note_agent_pushes(ctx).await;
+    push_agent_commits(ctx).await;
 
     match agent_result {
         Ok(()) => {

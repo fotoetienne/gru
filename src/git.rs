@@ -1380,6 +1380,31 @@ async fn run_git_in(worktree_path: &Path, args: &[&str]) -> Result<std::process:
         .with_context(|| format!("Failed to execute git {}", args.join(" ")))
 }
 
+/// Like [`run_git_in`], for commands that talk to the remote (fetch, push):
+/// authenticates with `GRU_GITHUB_TOKEN` via `GIT_ASKPASS` when it's set, the
+/// same way `ensure_bare_clone` and `fetch_branch` do.
+async fn run_git_remote_in(worktree_path: &Path, args: &[&str]) -> Result<std::process::Output> {
+    let token = std::env::var("GRU_GITHUB_TOKEN")
+        .ok()
+        .filter(|t| !t.is_empty());
+    // `_askpass_file` must outlive the command: dropping it deletes the script.
+    let AuthenticatedGitCommand {
+        mut cmd,
+        _askpass_file,
+    } = git_command_with_auth(token.as_deref())?;
+    cmd.arg("-C")
+        .arg(worktree_path)
+        .args(args)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .env_remove("GIT_COMMON_DIR")
+        .env("LC_ALL", "C")
+        .output()
+        .await
+        .with_context(|| format!("Failed to execute git {}", args.join(" ")))
+}
+
 /// Resolves a ref to a commit SHA in the worktree, or `None` if it doesn't exist.
 async fn resolve_ref(worktree_path: &Path, refname: &str) -> Result<Option<String>> {
     let spec = format!("{refname}^{{commit}}");
@@ -1415,7 +1440,8 @@ async fn is_ancestor(worktree_path: &Path, ancestor: &str, descendant: &str) -> 
 async fn fetch_remote_branch(worktree_path: &Path, branch: &str) -> Result<Option<String>> {
     validate_branch_name(branch)?;
     let refspec = format!("+refs/heads/{branch}:refs/remotes/origin/{branch}");
-    let fetch = run_git_in(worktree_path, &["fetch", "origin", "--refmap=", &refspec]).await?;
+    let fetch =
+        run_git_remote_in(worktree_path, &["fetch", "origin", "--refmap=", &refspec]).await?;
     if !fetch.status.success() {
         let stderr = String::from_utf8_lossy(&fetch.stderr);
         if stderr.contains("couldn't find remote ref") {
@@ -1453,32 +1479,51 @@ async fn record_synced(worktree_path: &Path, sha: &str) -> Result<()> {
     Ok(())
 }
 
-/// Records HEAD as integrated, after a successful push of HEAD to the branch.
-pub(crate) async fn record_pushed_head(worktree_path: &Path) -> Result<()> {
-    let head = head_sha(worktree_path).await?;
-    record_synced(worktree_path, &head).await
+/// Outcome of [`sync_and_push`].
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum SyncedPush {
+    /// HEAD was already on the remote.
+    NothingToPush,
+    /// HEAD was pushed.
+    Pushed,
 }
 
-/// Advances the integrated-tip record to the current remote tip when the
-/// remote only moved forward from it, without touching HEAD.
+/// Integrates the remote branch into HEAD, then pushes HEAD if it's ahead.
 ///
-/// Call after an agent session that may have pushed by itself (review and
-/// comment rounds), so that if the author later drops those commits the next
-/// [`sync_with_remote_branch`] sees a rewrite instead of "up to date". A
-/// rewrite seen here is left for that sync to handle.
-pub(crate) async fn note_remote_progress(worktree_path: &Path, branch: &str) -> Result<()> {
-    let Some(previous) = resolve_ref(worktree_path, SYNCED_REF).await? else {
-        return Ok(());
+/// This is the one way Gru pushes ordinary (non-rebase) work: CI fixes and
+/// the commits an agent makes in review/comment rounds (agents are told not
+/// to push themselves). Because Gru pushes, it can record exactly what it
+/// pushed, so a later rewind of those commits by the author is recognised
+/// as a rewrite by the next [`sync_with_remote_branch`].
+///
+/// The push leases against the tip just integrated, so a rewind or a new push
+/// that lands between the sync and the push is rejected rather than
+/// fast-forwarded over. Any sync or push failure is returned as an error and
+/// nothing is pushed.
+pub(crate) async fn sync_and_push(worktree_path: &Path, branch: &str) -> Result<SyncedPush> {
+    let remote = match sync_with_remote_branch(worktree_path, branch).await? {
+        RemoteSync::NoRemoteBranch => None,
+        _ => resolve_ref(worktree_path, SYNCED_REF).await?,
     };
-    let Some(current) = fetch_remote_branch(worktree_path, branch).await? else {
-        return Ok(());
-    };
-    if is_ancestor(worktree_path, &previous, &current).await?
-        && is_ancestor(worktree_path, &current, "HEAD").await?
-    {
-        record_synced(worktree_path, &current).await?;
+    let head = head_sha(worktree_path).await?;
+    if remote.as_deref() == Some(head.as_str()) {
+        return Ok(SyncedPush::NothingToPush);
     }
-    Ok(())
+    let lease = format!(
+        "--force-with-lease=refs/heads/{branch}:{}",
+        remote.as_deref().unwrap_or("")
+    );
+    let target = format!("HEAD:refs/heads/{branch}");
+    let push = run_git_remote_in(worktree_path, &["push", &lease, "origin", &target]).await?;
+    if !push.status.success() {
+        anyhow::bail!(
+            "git push to origin/{} failed: {}",
+            branch,
+            redact_credentials(String::from_utf8_lossy(&push.stderr).trim())
+        );
+    }
+    record_synced(worktree_path, &head).await?;
+    Ok(SyncedPush::Pushed)
 }
 
 /// Fetches `origin/<branch>` and returns its tip, or `None` if it doesn't exist.
@@ -1627,7 +1672,7 @@ pub(crate) async fn force_push_rebased(
             format!("--force-with-lease=refs/heads/{branch}:{sha}")
         }
     };
-    let push = run_git_in(worktree_path, &["push", &lease, "origin", &target]).await?;
+    let push = run_git_remote_in(worktree_path, &["push", &lease, "origin", &target]).await?;
     if !push.status.success() {
         anyhow::bail!(
             "git push {} failed: {}",
@@ -3065,8 +3110,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_rewind_of_minion_push_detected_after_note_remote_progress() {
-        // Sync at A, the agent pushes B by itself, the author rewinds to A.
+    async fn test_rewind_of_gru_push_is_detected() {
+        // Synced at A, Gru pushes B, the author rewinds to A.
         let tmp = tempfile::tempdir().unwrap();
         let (mine, _theirs) = setup_shared_branch(tmp.path());
         sync_with_remote_branch(&mine, "feature").await.unwrap();
@@ -3074,37 +3119,65 @@ mod tests {
         std::fs::write(mine.join("b.txt"), "b").unwrap();
         git_ok(&mine, &["add", "."]);
         git_ok(&mine, &["commit", "-m", "agent b"]);
-        git_ok(&mine, &["push", "origin", "HEAD:refs/heads/feature"]);
-        note_remote_progress(&mine, "feature").await.unwrap();
+        assert_eq!(
+            sync_and_push(&mine, "feature").await.unwrap(),
+            SyncedPush::Pushed
+        );
 
         let bare = tmp.path().join("origin.git");
         git_ok(&bare, &["update-ref", "refs/heads/feature", &a]);
 
         // Not "up to date": HEAD would push "agent b" back. HEAD has nothing
-        // beyond what was integrated, so it follows the rewind.
+        // beyond what was pushed, so it follows the rewind.
         let result = sync_with_remote_branch(&mine, "feature").await.unwrap();
         assert_eq!(result, RemoteSync::ResetToRemote);
         assert_eq!(log_subjects(&mine), vec!["base"]);
+        assert_eq!(
+            sync_and_push(&mine, "feature").await.unwrap(),
+            SyncedPush::NothingToPush
+        );
     }
 
     #[tokio::test]
-    async fn test_record_pushed_head_marks_push_as_integrated() {
+    async fn test_sync_and_push_integrates_author_commits_then_pushes() {
         let tmp = tempfile::tempdir().unwrap();
-        let (mine, _theirs) = setup_shared_branch(tmp.path());
+        let (mine, theirs) = setup_shared_branch(tmp.path());
         sync_with_remote_branch(&mine, "feature").await.unwrap();
-        let a = head_sha(&mine).await.unwrap();
+        author_adds_commit(&theirs, "author");
+        std::fs::write(mine.join("fix.txt"), "fix").unwrap();
+        git_ok(&mine, &["add", "."]);
+        git_ok(&mine, &["commit", "-m", "fix"]);
+
+        assert_eq!(
+            sync_and_push(&mine, "feature").await.unwrap(),
+            SyncedPush::Pushed
+        );
+        assert_eq!(
+            fetch_remote_tip(&mine, "feature").await.unwrap(),
+            Some(head_sha(&mine).await.unwrap())
+        );
+        assert_eq!(log_subjects(&mine), vec!["fix", "author", "base"]);
+    }
+
+    #[tokio::test]
+    async fn test_sync_and_push_refuses_on_rewind_with_local_commits() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mine, theirs) = setup_shared_branch(tmp.path());
+        author_adds_commit(&theirs, "b");
+        sync_with_remote_branch(&mine, "feature").await.unwrap();
         std::fs::write(mine.join("c.txt"), "c").unwrap();
         git_ok(&mine, &["add", "."]);
-        git_ok(&mine, &["commit", "-m", "ci fix"]);
-        git_ok(&mine, &["push", "origin", "HEAD:refs/heads/feature"]);
-        record_pushed_head(&mine).await.unwrap();
-
-        let bare = tmp.path().join("origin.git");
-        git_ok(&bare, &["update-ref", "refs/heads/feature", &a]);
-        assert_eq!(
-            sync_with_remote_branch(&mine, "feature").await.unwrap(),
-            RemoteSync::ResetToRemote
+        git_ok(&mine, &["commit", "-m", "minion c"]);
+        // Author drops "b".
+        git_ok(&theirs, &["reset", "--hard", "HEAD~1"]);
+        git_ok(
+            &theirs,
+            &["push", "--force", "origin", "HEAD:refs/heads/feature"],
         );
+        let rewound = resolve_ref(&theirs, "HEAD").await.unwrap();
+
+        assert!(sync_and_push(&mine, "feature").await.is_err());
+        assert_eq!(fetch_remote_tip(&mine, "feature").await.unwrap(), rewound);
     }
 
     #[tokio::test]

@@ -563,7 +563,7 @@ pub(crate) fn build_ci_fix_prompt(
         prompt.push(' ');
         prompt.push_str(&hints);
     }
-    prompt.push_str("\n\nAfter fixing, commit and push the changes.\n");
+    prompt.push_str("\n\nAfter fixing, commit the changes.\n");
 
     prompt
 }
@@ -1651,65 +1651,19 @@ async fn run_ci_fix_attempt(
         }
     }
 
-    // Pick up commits someone else pushed to the branch while the fix was
-    // being made (e.g. the author of an adopted PR), so the push below is a
-    // fast-forward instead of being rejected. On conflict the push fails and
-    // escalates as before.
-    match crate::git::sync_with_remote_branch(worktree_path, branch).await {
-        Ok(crate::git::RemoteSync::Integrated) => {
-            eprintln!("🔀 Rebased CI fix onto new commits from origin/{}", branch)
-        }
-        Ok(_) => {}
-        Err(e) => {
-            // Don't push: if the author rewound the branch, a plain push of
-            // our fix would fast-forward it and bring back what they removed.
-            eprintln!(
-                "🚨 Could not sync with origin/{}; not pushing CI fix",
-                branch
-            );
-            let reason = format!(
-                "Could not integrate the latest commits on `{}` before pushing a CI fix \
-                 (attempt {}/{}), so the fix was not pushed.\n\n```\n{}\n```",
-                branch,
-                attempt,
-                MAX_CI_FIX_ATTEMPTS,
-                sanitize_push_failure_stderr(&format!("{:#}", e))
-            );
-            return Ok(escalate_exhaustion(
-                host, owner, repo, pr_number, &reason, attempt, minion_id,
-            )
-            .await);
-        }
-    }
-
-    // Push the fix
+    // Push through Gru: integrate commits others pushed meanwhile (e.g. the
+    // author of an adopted PR), then push with a lease on what was
+    // integrated. If that fails (conflict, or the author rewound the branch
+    // under our fix) nothing is pushed and the attempt escalates.
     eprintln!("📤 Pushing CI fix...");
-    let push_output = Command::new("git")
-        .args(["push", "origin", branch])
-        .current_dir(worktree_path)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .await
-        .context("Failed to push CI fix")?;
-
-    if !push_output.status.success() {
-        let stderr = String::from_utf8_lossy(&push_output.stderr);
-        eprintln!(
-            "⚠️  Push failed: {}",
-            sanitize_push_failure_stderr(stderr.trim())
-        );
+    if let Err(e) = crate::git::sync_and_push(worktree_path, branch).await {
+        let msg = format!("{:#}", e);
+        eprintln!("⚠️  Push failed: {}", sanitize_push_failure_stderr(&msg));
         eprintln!("🚨 Escalating to human due to push failure");
-        let reason = format_push_failure_reason(attempt, MAX_CI_FIX_ATTEMPTS, stderr.trim());
+        let reason = format_push_failure_reason(attempt, MAX_CI_FIX_ATTEMPTS, &msg);
         return Ok(
             escalate_exhaustion(host, owner, repo, pr_number, &reason, attempt, minion_id).await,
         );
-    }
-
-    // The remote now holds HEAD; remember that so a later rewind of this
-    // commit by the author is recognised as a rewrite.
-    if let Err(e) = crate::git::record_pushed_head(worktree_path).await {
-        log::warn!("⚠️  Could not record pushed commit: {:#}", e);
     }
 
     // Wait for GitHub to register checks for the new commit
@@ -1965,7 +1919,7 @@ mod tests {
         assert!(!prompt.contains("cargo"));
         assert!(!prompt.contains("npm"));
         assert!(prompt.contains("Please fix the failing checks."));
-        assert!(prompt.contains("After fixing, commit and push"));
+        assert!(prompt.contains("After fixing, commit the changes"));
     }
 
     #[test]
