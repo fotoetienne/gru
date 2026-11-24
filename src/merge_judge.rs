@@ -174,6 +174,9 @@ pub(crate) struct JudgeState {
 /// An escalation that is not fully applied yet.
 #[derive(Debug, Clone)]
 pub(crate) struct PendingEscalation {
+    /// Head SHA the escalation was decided for. A retry is dropped once the
+    /// PR moves past it, so a stale label can't block judging the new head.
+    head_sha: Option<String>,
     response: JudgeResponse,
     label_done: bool,
     comment_done: bool,
@@ -1416,6 +1419,7 @@ pub(crate) async fn escalate_pr(
     state: &mut JudgeState,
 ) {
     let pending = PendingEscalation {
+        head_sha: state.last_head_sha().map(str::to_string),
         response: response.clone(),
         label_done: false,
         comment_done: false,
@@ -1433,9 +1437,39 @@ pub(crate) async fn retry_pending_escalation(
     minion_id: Option<&str>,
     state: &mut JudgeState,
 ) {
-    if let Some(pending) = state.pending_escalation.take() {
-        run_escalation(host, owner, repo, pr_number, pending, minion_id, state).await;
+    let Some(pending) = state.pending_escalation.take() else {
+        return;
+    };
+    if let Some(expected) = &pending.head_sha {
+        match fetch_head_sha(host, owner, repo, pr_number).await {
+            Ok(current) if escalation_still_current(expected, &current) => {}
+            Ok(current) => {
+                log::info!(
+                    "Dropping pending escalation for PR #{}: head moved from {} to {}",
+                    pr_number,
+                    expected,
+                    current
+                );
+                return;
+            }
+            Err(e) => {
+                log::warn!(
+                    "Could not check PR #{} head before retrying escalation: {:#}",
+                    pr_number,
+                    e
+                );
+                state.pending_escalation = Some(pending);
+                return;
+            }
+        }
     }
+    run_escalation(host, owner, repo, pr_number, pending, minion_id, state).await;
+}
+
+/// A pending escalation applies only while the PR is still at the head the
+/// judge escalated.
+fn escalation_still_current(escalated_head: &str, current_head: &str) -> bool {
+    escalated_head == current_head
 }
 
 async fn run_escalation(
@@ -3283,6 +3317,7 @@ That's my verdict."#;
         let resp = policy_change_escalation("MERGE_POLICY.md");
         state.record_response(fp("abc", 1), &resp);
         state.pending_escalation = Some(PendingEscalation {
+            head_sha: Some("abc".to_string()),
             response: resp.clone(),
             label_done: false,
             comment_done: true,
@@ -3292,5 +3327,11 @@ That's my verdict."#;
         assert!(state.pending_escalation.is_some());
         state.record_response(fp("def", 1), &resp);
         assert!(state.pending_escalation.is_none());
+    }
+
+    #[test]
+    fn test_escalation_still_current() {
+        assert!(escalation_still_current("abc", "abc"));
+        assert!(!escalation_still_current("abc", "def"));
     }
 }
