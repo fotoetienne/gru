@@ -1822,7 +1822,77 @@ pub(crate) async fn merge_pr(
             String::from_utf8_lossy(&output.stderr).trim()
         );
     }
+    if pending.direct {
+        verify_direct_merge(host, &repo_full, pr_number).await?;
+    }
     Ok(())
+}
+
+/// What a "direct" `gh pr merge` actually did.
+#[derive(Debug, PartialEq, Eq)]
+enum DirectMergeOutcome {
+    /// The PR merged.
+    Merged,
+    /// The PR is open with no auto-merge request: it was added to a merge
+    /// queue. GitHub removes a PR from the queue when new commits are
+    /// pushed, so no authorization outlives the approved head.
+    Queued,
+    /// gh fell back to enabling auto-merge (e.g. on a merge-queue branch
+    /// with checks pending). That request survives later pushes.
+    AutoMergeEnabled,
+}
+
+fn classify_direct_merge(json: &str) -> Result<DirectMergeOutcome> {
+    let val: serde_json::Value =
+        serde_json::from_str(json).context("Failed to parse gh pr view JSON")?;
+    if val.get("state").and_then(|s| s.as_str()) == Some("MERGED") {
+        return Ok(DirectMergeOutcome::Merged);
+    }
+    if val.get("autoMergeRequest").is_some_and(|a| !a.is_null()) {
+        return Ok(DirectMergeOutcome::AutoMergeEnabled);
+    }
+    Ok(DirectMergeOutcome::Queued)
+}
+
+/// After a direct merge, make sure gh didn't leave an auto-merge request
+/// behind. If it did, cancel it and fail so the caller retries the direct
+/// merge later; the approval must not cover pushes the judge never saw.
+async fn verify_direct_merge(host: &str, repo_full: &str, pr_number: &str) -> Result<()> {
+    let json = github::run_gh(
+        host,
+        &[
+            "pr",
+            "view",
+            pr_number,
+            "-R",
+            repo_full,
+            "--json",
+            "state,autoMergeRequest",
+        ],
+    )
+    .await
+    .context("Failed to confirm merge result")?;
+    match classify_direct_merge(&json)? {
+        DirectMergeOutcome::Merged | DirectMergeOutcome::Queued => Ok(()),
+        DirectMergeOutcome::AutoMergeEnabled => {
+            if let Err(e) = github::run_gh(
+                host,
+                &["pr", "merge", pr_number, "--disable-auto", "-R", repo_full],
+            )
+            .await
+            {
+                log::warn!(
+                    "Failed to disable auto-merge on PR #{} after direct merge: {:#}",
+                    pr_number,
+                    e
+                );
+            }
+            anyhow::bail!(
+                "GitHub enabled auto-merge instead of merging PR #{pr_number}; cancelled it \
+                 so later pushes can't merge unjudged. Will retry the direct merge."
+            )
+        }
+    }
 }
 
 /// Extract the Minion ID from a Minion branch name
@@ -3091,5 +3161,25 @@ That's my verdict."#;
         });
         state.record_failure(fp("ghi", 1));
         assert!(state.pending_merge().is_none());
+    }
+
+    #[test]
+    fn test_classify_direct_merge() {
+        assert_eq!(
+            classify_direct_merge(r#"{"state":"MERGED","autoMergeRequest":null}"#).unwrap(),
+            DirectMergeOutcome::Merged
+        );
+        assert_eq!(
+            classify_direct_merge(r#"{"state":"OPEN","autoMergeRequest":null}"#).unwrap(),
+            DirectMergeOutcome::Queued
+        );
+        assert_eq!(
+            classify_direct_merge(
+                r#"{"state":"OPEN","autoMergeRequest":{"mergeMethod":"SQUASH"}}"#
+            )
+            .unwrap(),
+            DirectMergeOutcome::AutoMergeEnabled
+        );
+        assert!(classify_direct_merge("nope").is_err());
     }
 }
